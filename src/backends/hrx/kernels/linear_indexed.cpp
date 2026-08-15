@@ -4,12 +4,24 @@
 
 #include "lse/backends/hrx/kernels/lds_linear.hpp"
 #include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
+
+// The value leaves through the wrapper's per-element return; the Out member
+// only names the slot the binding contract requires.
+template <class E>
+struct LinearIndexedArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> w;
+  env::In<kir::f32, E> idx;
+  env::Out<kir::f32, E> out;
+};
 
 // out[t, n] = x[t] · W[idx[t, slot], n]. W is stacked [E, N, K].
 struct LinearIndexedKernel final : KernelPrimitive<LinearIndexedKernel> {
@@ -39,20 +51,18 @@ struct LinearIndexedKernel final : KernelPrimitive<LinearIndexedKernel> {
     if (kdim == 0 || nout == 0 || keep == 0 || slot >= keep) return {};
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto w = k.input<kir::f32>(1);
-    const auto idx = k.input<kir::f32>(2);
-    const auto row = k.let<kir::u32>("row", k.thread_id() / nout);
-    const auto col = k.let<kir::u32>("col", k.thread_id() % nout);
-    const auto e = k.let<kir::u32>(
-        "e", cast<kir::u32>(
-                 idx[row * keep + k.constant<kir::u32>(slot)].read()));
-    const auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-    const auto base =
-        k.let<kir::u32>("base", (e * nout + col) * k.constant<kir::u32>(kdim));
-    emit_dot_f32(k, x, w, row * kdim, base, acc, kdim,
+    LinearIndexedArgs<env::Emit> args;
+    env::bind(k, args);
+    env::Emit e{&k};
+    const auto row = e.let(e.thread_id() / nout);
+    const auto col = e.let(e.thread_id() % nout);
+    const auto expert =
+        e.let(kir::cast<kir::u32>(args.idx[row * keep + e.u32(slot)]));
+    auto acc = e.var(0.0f);
+    const auto base = e.let((expert * nout + col) * kdim);
+    emit_dot_f32(e, args.x, args.w, row * kdim, base, acc, kdim,
                  device_load_bytes(s.device));
-    k.ret(acc.read());
+    e.ret(acc.read());
     return k.str();
   }
 

@@ -58,7 +58,7 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
     const auto x1 = e.let(a.x[base + 1u]);
     const auto c = e.let(a.cos[ang]);
     const auto s0 = e.let(a.sin[ang]);
-    k.ret(select((d % 2u) == 0u, x0 * c - x1 * s0, x1 * c + x0 * s0));
+    e.ret(select((d % 2u) == 0u, x0 * c - x1 * s0, x1 * c + x0 * s0));
     return k.str();
   }
 

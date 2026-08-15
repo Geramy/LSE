@@ -123,8 +123,19 @@ struct Emit {
     return k->var<kir::f32>(next("v"), k->lit(init));
   }
   template <typename T>
+  [[nodiscard]] kir::LValue<T> var(const kir::Val<T>& init) {
+    return k->var<T>(next("v"), init);
+  }
+  template <typename T>
   [[nodiscard]] kir::Val<T> let(const kir::Val<T>& v) {
     return k->let<T>(next("t"), v);
+  }
+
+  // The per-element protocol: a kernel that does not own indexing returns
+  // the value for its output element instead of storing it.
+  template <typename T>
+  void ret(const kir::Val<T>& v) {
+    k->ret(v);
   }
 
   [[nodiscard]] kir::Val<kir::u32> u32(std::uint32_t v) const {

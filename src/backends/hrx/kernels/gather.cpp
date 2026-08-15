@@ -39,7 +39,7 @@ std::string emit_row_gather(const KernelShapes& s) {
   const auto slot = i / width;
   const auto col = i % width;
   const auto row = cast<kir::u32>(a.rows[slot]);
-  k.ret(a.src[row * width + col]);
+  e.ret(a.src[row * width + col]);
   return k.str();
 }
 

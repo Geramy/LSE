@@ -84,7 +84,7 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
     // iattrs[0] selects the zero-centered form, where the stored weight is an
     // offset from 1 rather than the scale itself.
     const auto w = s.iattrs[0] != 0 ? e.f32(1.0f) + a.g[col] : a.g[col];
-    k.ret(a.x[e.thread_id()] * scale * w);
+    e.ret(a.x[e.thread_id()] * scale * w);
     return k.str();
   }
 
@@ -138,7 +138,7 @@ struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
     const auto acc = sum_of_squares(e, a.x, row, d);
     const auto inv = e.let(
         e.f32(1.0f) / math::max(math::sqrt(acc.read()), e.f32(s.attrs[0])));
-    k.ret(a.x[e.thread_id()] * inv);
+    e.ret(a.x[e.thread_id()] * inv);
     return k.str();
   }
 
@@ -200,7 +200,7 @@ struct SoftmaxKernel final : KernelPrimitive<SoftmaxKernel> {
       denom = denom.read() + math::exp(a.x[row + t] - m.read());
     }
 
-    k.ret(math::exp(a.x[e.thread_id()] - m.read()) / denom.read());
+    e.ret(math::exp(a.x[e.thread_id()] - m.read()) / denom.read());
     return k.str();
   }
 

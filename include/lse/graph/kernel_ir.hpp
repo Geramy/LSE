@@ -402,15 +402,18 @@ class KernelBody {
   [[nodiscard]] Val<u32> thread_id() const { return {types_, "i"}; }
 
   template <typename T>
+  [[deprecated("declare an env::In member and env::bind the args struct")]]
   [[nodiscard]] Buffer<T> input(std::size_t index) {
     return {this, types_, "in" + std::to_string(index)};
   }
   template <typename T>
+  [[deprecated("declare an env::Out member and env::bind the args struct")]]
   [[nodiscard]] Buffer<T> output() {
     return {this, types_, "out"};
   }
 
   template <typename T>
+  [[deprecated("use env::Emit::u32 or a bare literal in a Val expression")]]
   [[nodiscard]] Val<T> constant(std::uint32_t v) {
     return {types_, detail::literal_u32(v)};
   }
@@ -459,17 +462,21 @@ class KernelBody {
   }
 
   template <typename F>
+  [[deprecated("use if (auto g = e.when(cond)) { ... }")]]
   void when(const Val<boolean>& cond, F&& body);
 
   // A counted loop. `step` defaults to 1; `unroll` asks the target to unroll,
   // which is what makes fragment indices constant.
   template <typename F>
+  [[deprecated("use range-for over env::Emit::range")]]
   void loop(std::string_view var, const Val<u32>& lo, const Val<u32>& hi,
             std::uint32_t step, F&& body);
   template <typename F>
+  [[deprecated("use range-for over env::Emit::range")]]
   void loop(std::string_view var, const Val<u32>& lo, const Val<u32>& hi,
             const Val<u32>& step, F&& body);
   template <typename F>
+  [[deprecated("use range-for over env::Emit::unroll")]]
   void unroll(std::string_view var, std::uint32_t count, F&& body);
 
   // An intrinsic, spelled by the backend's table. `$0`.. are the arguments, so

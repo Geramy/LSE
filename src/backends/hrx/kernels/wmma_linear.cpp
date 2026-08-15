@@ -112,8 +112,9 @@ struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
     const auto M = static_cast<std::uint32_t>(d.m);
     const auto N = static_cast<std::uint32_t>(d.n);
     const auto K = static_cast<std::uint32_t>(d.k);
-    const std::uint32_t tiles_n = (N + kTile - 1) / kTile;
-    const std::uint32_t tiles = ((M + kTile - 1) / kTile) * tiles_n;
+    constexpr auto kT = static_cast<std::uint32_t>(kTile);
+    const std::uint32_t tiles_n = (N + kT - 1u) / kT;
+    const std::uint32_t tiles = ((M + kT - 1u) / kT) * tiles_n;
 
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);

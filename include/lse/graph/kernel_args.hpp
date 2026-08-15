@@ -110,8 +110,10 @@ void bind(kir::KernelBody& k, A& args) {
       args.[:m:].tt = &k.types();
     }
   }
-  static_assert(output_count<A>() == 1,
-                "a kernel stores through exactly one output");
+  // At most one: kernels that return their element value or store through
+  // the emitter's hook declare no Out at all.
+  static_assert(output_count<A>() <= 1,
+                "a kernel stores through at most one output");
 }
 
 }  // namespace lse::graph::env

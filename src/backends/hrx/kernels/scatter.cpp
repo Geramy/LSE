@@ -50,16 +50,14 @@ struct ScatterAddKernel final : KernelPrimitive<ScatterAddKernel> {
     const auto i = e.thread_id();
     const auto dst_row = e.let(i / width);
     const auto col = e.let(i % width);
-    // env::Emit::var only takes a float literal; the accumulator starts from
-    // a buffer read, so it stays on the recorder directly.
-    auto v = k.var<kir::f32>("v", a.base[i]);
+    auto v = e.var(a.base[i]);
     for (std::uint32_t sidx = 0; sidx < count; ++sidx) {
       const auto src_row = e.let(cast<kir::u32>(a.rows[sidx]));
       if (auto g = e.when(src_row == dst_row)) {
         v = v.read() + a.values[sidx * width + col];
       }
     }
-    k.ret(v.read());
+    e.ret(v.read());
     return k.str();
   }
 

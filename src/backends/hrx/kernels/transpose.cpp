@@ -66,7 +66,7 @@ struct TransposeKernel final : KernelPrimitive<TransposeKernel> {
     TransposeArgs<env::Emit> a;
     env::bind(k, a);
     env::Emit e{&k};
-    k.ret(transpose_element(e, a, out.rank(), out_stride, out_dim, src_stride));
+    e.ret(transpose_element(e, a, out.rank(), out_stride, out_dim, src_stride));
     return k.str();
   }
 

@@ -9,6 +9,8 @@
 
 #include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {
@@ -95,57 +97,98 @@ ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave) {
   return tp;
 }
 
-void emit_tile(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
-               const kir::Buffer<kir::f32>& w, const kir::Val<kir::u32>& w_base,
-               const kir::Val<kir::u32>& tile, const kir::Val<kir::u32>& row,
-               const kir::Val<kir::u32>& wave_id, const kir::Val<kir::u32>& lane,
-               std::uint32_t N, std::uint32_t K, std::uint32_t wave,
-               std::uint32_t load_bytes) {
+using F32In = env::In<kir::f32, env::Emit>;
+
+void emit_tile(env::Emit& e, const F32In& x, const F32In& w,
+               const kir::Val<kir::u32>& w_base, const kir::Val<kir::u32>& tile,
+               const kir::Val<kir::u32>& row, const kir::Val<kir::u32>& wave_id,
+               const kir::Val<kir::u32>& lane, std::uint32_t N, std::uint32_t K,
+               std::uint32_t wave, std::uint32_t load_bytes) {
   const auto waves = kBlock / wave;
-  const auto col = k.let<kir::u32>("col", tile * waves + wave_id);
+  const auto col = e.let(tile * waves + wave_id);
   const auto step = kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
   const auto span = wave * step;
   const auto aligned = (K / span) * span;
 
-  auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-  k.when(col < N, [&] {
-    k.loop("k0", k.constant<kir::u32>(0), k.constant<kir::u32>(aligned), span,
-           [&](kir::Val<kir::u32> k0) {
-             const auto kk = k.let<kir::u32>("kk", k0 + lane * step);
-             const auto xv = math::load(x, row * K + kk, load_bytes);
-             const auto wv = math::load(w, (w_base + col) * K + kk, load_bytes);
-             k.unroll("e", step, [&](kir::Val<kir::u32> e) {
-               acc = math::fma(xv[e], wv[e], acc.read());
-             });
-           });
-    if (aligned < K) {
-      k.loop("kt", k.constant<kir::u32>(aligned) + lane,
-             k.constant<kir::u32>(K), wave, [&](kir::Val<kir::u32> kt) {
-               acc = math::fma(x[row * K + kt].read(),
-                               w[(w_base + col) * K + kt].read(), acc.read());
-             });
+  auto acc = e.var(0.0f);
+  if (auto in_cols = e.when(col < N)) {
+    for (auto k0 : e.range(0u, aligned, span)) {
+      const auto kk = e.let(k0 + lane * step);
+      const auto xv = e.load(x, row * K + kk, load_bytes);
+      const auto wv = e.load(w, (w_base + col) * K + kk, load_bytes);
+      for (auto elem : e.unroll(step)) {
+        acc = math::fma(xv[elem], wv[elem], acc.read());
+      }
     }
-  });
+    if (aligned < K) {
+      for (auto kt : e.range(e.u32(aligned) + lane, e.u32(K), wave)) {
+        acc = math::fma(x[row * K + kt], w[(w_base + col) * K + kt],
+                        acc.read());
+      }
+    }
+  }
 
   // Wave xor-reduce: columns stay independent, no LDS, no WG barrier.
   for (std::uint32_t m = 1; m < wave; m <<= 1) {
-    acc = acc.read() + math::shfl_xor(acc.read(), k.constant<kir::u32>(m));
+    acc = acc.read() + math::shfl_xor(acc.read(), e.u32(m));
   }
-  k.when(lane == 0 && col < N, [&] { k.store(row * N + col, acc.read()); });
+  if (auto lane0 = e.when(lane == 0 && col < N)) {
+    e.store(row * N + col, acc.read());
+  }
 }
 
-kir::Val<kir::u32> gemv_w_base(kir::KernelBody& k,
-                               const kir::Buffer<kir::f32>* idx,
+kir::Val<kir::u32> gemv_w_base(env::Emit& e, const F32In* idx,
                                std::uint32_t keep, std::uint32_t slot,
                                const kir::Val<kir::u32>& row, std::uint32_t N) {
-  if (idx == nullptr) return k.constant<kir::u32>(0);
-  const auto e = k.let<kir::u32>(
-      "e", kir::cast<kir::u32>(
-               (*idx)[row * keep + k.constant<kir::u32>(slot)].read()));
-  return k.let<kir::u32>("wb", e * N);
+  if (idx == nullptr) return e.u32(0);
+  const auto expert =
+      e.let(kir::cast<kir::u32>((*idx)[row * keep + e.u32(slot)]));
+  return e.let(expert * N);
 }
 
 }  // namespace
+
+void emit_gemv(env::Emit& e, const F32In& x, const F32In& w, const F32In* idx,
+               std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
+               std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
+               bool grid, std::uint32_t wave, bool persist,
+               std::uint32_t persist_wgs) {
+  if (wave != 32 && wave != 64) wave = 32;
+  if (persist_wgs == 0) persist_wgs = 1;
+  const auto lid = e.let(math::local_id());
+  const auto wave_id = e.let(lid / wave);
+  const auto lane = e.let(lid % wave);
+  const auto ntiles = (N + (kBlock / wave) - 1) / (kBlock / wave);
+
+  auto run = [&](const kir::Val<kir::u32>& tile, const kir::Val<kir::u32>& row) {
+    const auto w_base = gemv_w_base(e, idx, keep, slot, row, N);
+    emit_tile(e, x, w, w_base, tile, row, wave_id, lane, N, K, wave,
+              load_bytes);
+  };
+
+  if (persist) {
+    for (auto row : e.range(M)) {
+      for (auto tile :
+           e.range(math::workgroup_id_x(), e.u32(ntiles), persist_wgs)) {
+        run(tile, row);
+      }
+    }
+    return;
+  }
+  if (grid) {
+    const auto tile = e.let(math::workgroup_id_x());
+    const auto row = e.let(math::workgroup_id_y());
+    if (auto in_grid = e.when(tile < ntiles && row < M)) {
+      run(tile, row);
+    }
+    return;
+  }
+  for (auto row : e.range(M)) {
+    for (auto tile : e.range(ntiles)) {
+      run(tile, row);
+    }
+  }
+}
 
 void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
                const kir::Buffer<kir::f32>& w, const kir::Buffer<kir::f32>* idx,
@@ -153,43 +196,29 @@ void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
                std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
                bool grid, std::uint32_t wave, bool persist,
                std::uint32_t persist_wgs) {
-  if (wave != 32 && wave != 64) wave = 32;
-  if (persist_wgs == 0) persist_wgs = 1;
-  const auto lid = k.let<kir::u32>("lid", math::local_id());
-  const auto wave_id = k.let<kir::u32>("wave", lid / wave);
-  const auto lane = k.let<kir::u32>("lane", lid % wave);
-  const auto ntiles = (N + (kBlock / wave) - 1) / (kBlock / wave);
-
-  auto run = [&](const kir::Val<kir::u32>& tile, const kir::Val<kir::u32>& row) {
-    const auto w_base = gemv_w_base(k, idx, keep, slot, row, N);
-    emit_tile(k, x, w, w_base, tile, row, wave_id, lane, N, K, wave,
-              load_bytes);
-  };
-
-  if (persist) {
-    k.loop("row", k.constant<kir::u32>(0), k.constant<kir::u32>(M), 1,
-           [&](kir::Val<kir::u32> row) {
-             k.loop("tile", math::workgroup_id_x(),
-                    k.constant<kir::u32>(ntiles),
-                    k.constant<kir::u32>(persist_wgs),
-                    [&](kir::Val<kir::u32> tile) { run(tile, row); });
-           });
-    return;
+  env::Emit e{&k};
+  const F32In xi{x, &k.types()};
+  const F32In wi{w, &k.types()};
+  F32In ii;
+  const F32In* idxp = nullptr;
+  if (idx != nullptr) {
+    ii = F32In{*idx, &k.types()};
+    idxp = &ii;
   }
-  if (grid) {
-    const auto tile = k.let<kir::u32>("tile", math::workgroup_id_x());
-    const auto row = k.let<kir::u32>("row", math::workgroup_id_y());
-    k.when(tile < ntiles && row < M, [&] { run(tile, row); });
-    return;
-  }
-  k.loop("row", k.constant<kir::u32>(0), k.constant<kir::u32>(M), 1,
-         [&](kir::Val<kir::u32> row) {
-           k.loop("tile", k.constant<kir::u32>(0), k.constant<kir::u32>(ntiles),
-                  1, [&](kir::Val<kir::u32> tile) { run(tile, row); });
-         });
+  emit_gemv(e, xi, wi, idxp, keep, slot, N, K, M, load_bytes, grid, wave,
+            persist, persist_wgs);
 }
 
 namespace {
+
+// The output leaves through the emitter's store hook; the Out member only
+// names the slot the binding contract requires.
+template <class E>
+struct LinearLdsArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> w;
+  env::Out<kir::f32, E> out;
+};
 
 struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   static constexpr std::string_view kName = "linear.lds";
@@ -207,9 +236,10 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
     }
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    const auto x = k.input<kir::f32>(0);
-    const auto w = k.input<kir::f32>(1);
-    emit_gemv(k, x, w, nullptr, 0, 0, static_cast<std::uint32_t>(d.n),
+    LinearLdsArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    emit_gemv(e, a.x, a.w, nullptr, 0, 0, static_cast<std::uint32_t>(d.n),
               static_cast<std::uint32_t>(d.k),
               static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
               true, wave_of(s.device));
@@ -230,6 +260,14 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     return gemv_plan(dims_of_linear(s), wave_of(s.device));
   }
+};
+
+template <class E>
+struct LinearIndexedLdsArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> w;
+  env::In<kir::f32, E> idx;
+  env::Out<kir::f32, E> out;
 };
 
 struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
@@ -253,10 +291,10 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    const auto x = k.input<kir::f32>(0);
-    const auto w = k.input<kir::f32>(1);
-    const auto idx = k.input<kir::f32>(2);
-    emit_gemv(k, x, w, &idx, keep, slot, static_cast<std::uint32_t>(d.n),
+    LinearIndexedLdsArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    emit_gemv(e, a.x, a.w, &a.idx, keep, slot, static_cast<std::uint32_t>(d.n),
               static_cast<std::uint32_t>(d.k),
               static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
               true, wave_of(s.device));

@@ -56,7 +56,7 @@ struct CausalConv1dKernel final : KernelPrimitive<CausalConv1dKernel> {
         acc = math::fma(a.x[src], a.w[c * kernel + j], acc);
       }
     }
-    k.ret(acc.read());
+    e.ret(acc.read());
     return k.str();
   }
 

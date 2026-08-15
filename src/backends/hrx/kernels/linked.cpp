@@ -230,49 +230,23 @@ struct SwigluKernel final : KernelPrimitive<SwigluKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    const auto x = k.input<kir::f32>(0);
-    const auto wg = k.input<kir::f32>(1);
-    const auto wu = k.input<kir::f32>(2);
-    const auto wd = k.input<kir::f32>(3);
-    const auto hid = k.input<kir::f32>(hid_i);
+    env::Emit e{&k};
     const auto load_bytes = device_load_bytes(s.device);
+    const auto lid = e.let(math::local_id());
+    const auto row = e.let(math::workgroup_id_y());
 
-    const auto lid = k.let<kir::u32>("lid", math::local_id());
-    const auto row = k.let<kir::u32>("row", math::workgroup_id_y());
-
-    kir::Val<kir::u32> e_up;
-    kir::Val<kir::u32> e_down;
-    if (indexed && s.inputs.size() >= 5) {
-      const auto idx = k.input<kir::f32>(4);
-      const auto e = k.let<kir::u32>(
-          "e", kir::cast<kir::u32>(
-                   idx[row * keep + k.constant<kir::u32>(slot)].read()));
-      e_up = k.let<kir::u32>("eu", e * N);
-      e_down = k.let<kir::u32>("ed", e * D);
+    if (indexed) {
+      SwigluIndexedArgs<env::Emit> a;
+      env::bind(k, a);
+      const auto expert = e.let(kir::cast<kir::u32>(a.idx[row * keep + slot]));
+      swiglu_stages(k, e, a, lid, row, e.let(expert * N), e.let(expert * D), K,
+                    N, D, load_bytes);
     } else {
-      e_up = k.constant<kir::u32>(0);
-      e_down = k.constant<kir::u32>(0);
+      SwigluArgs<env::Emit> a;
+      env::bind(k, a);
+      swiglu_stages(k, e, a, lid, row, e.u32(0), e.u32(0), K, N, D,
+                    load_bytes);
     }
-
-    k.loop("n", lid, k.constant<kir::u32>(N), kBlock,
-           [&](kir::Val<kir::u32> n) {
-             auto g = k.var<kir::f32>("g", k.lit(0.0f));
-             auto u = k.var<kir::f32>("u", k.lit(0.0f));
-             emit_row_dot(k, x, wg, row * K, (e_up + n) * K, g, K, load_bytes);
-             emit_row_dot(k, x, wu, row * K, (e_up + n) * K, u, K, load_bytes);
-             const auto gate =
-                 g.read() / (k.lit(1.0f) + math::exp(k.lit(0.0f) - g.read()));
-             hid[row * N + n] = gate * u.read();
-           });
-    math::barrier();
-
-    k.loop("d", lid, k.constant<kir::u32>(D), kBlock,
-           [&](kir::Val<kir::u32> d) {
-             auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-             emit_row_dot(k, hid, wd, row * N, (e_down + d) * N, acc, N,
-                         load_bytes);
-             k.store(row * D + d, acc.read());
-           });
     return k.str();
   }
 
@@ -301,8 +275,14 @@ struct SwigluKernel final : KernelPrimitive<SwigluKernel> {
   }
 };
 
-// The first emit_kernel draft called emit_row_dot against a dummy buffer for
-// hidden; the real walk is emit_dot_lds. Strip the dead call.
+template <class E>
+struct RmsLinearArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> rw;
+  env::In<kir::f32, E> w;
+  env::Out<kir::f32, E> out;
+};
+
 struct RmsLinearKernel final : KernelPrimitive<RmsLinearKernel> {
   static constexpr std::string_view kName = "rms_linear.linked";
   static constexpr std::string_view kEntry = "lse_rms_linear";
@@ -326,67 +306,59 @@ struct RmsLinearKernel final : KernelPrimitive<RmsLinearKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    const auto x = k.input<kir::f32>(0);
-    const auto rw = k.input<kir::f32>(1);
-    const auto w = k.input<kir::f32>(2);
-    const auto lid = k.let<kir::u32>("lid", math::local_id());
-    const auto row = k.let<kir::u32>("row", math::workgroup_id_y());
-    auto xs = k.lds().array<kir::f32>("xs", K);
-    auto red = k.lds().array<kir::f32>("red", kBlock);
+    RmsLinearArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto lid = e.let(math::local_id());
+    const auto row = e.let(math::workgroup_id_y());
+    auto xs = e.lds<kir::f32>(K);
+    auto red = e.lds<kir::f32>(kBlock);
     if (!xs || !red) return {};
 
-    k.loop("t", lid, k.constant<kir::u32>(K), kBlock,
-           [&](kir::Val<kir::u32> t) {
-             const auto v = x[row * K + t].read();
-             xs[t] = v;
-           });
-    math::barrier();
+    for (auto t : e.range(lid, e.u32(K), kBlock)) {
+      xs[t] = a.x[row * K + t];
+    }
+    e.barrier();
 
-    auto ss = k.var<kir::f32>("ss", k.lit(0.0f));
-    k.loop("t2", lid, k.constant<kir::u32>(K), kBlock,
-           [&](kir::Val<kir::u32> t) {
-             const auto v = xs[t].read();
-             ss = math::fma(v, v, ss.read());
-           });
+    auto ss = e.var(0.0f);
+    for (auto t : e.range(lid, e.u32(K), kBlock)) {
+      const auto v = xs[t].read();
+      ss = math::fma(v, v, ss);
+    }
     red[lid] = ss.read();
-    math::barrier();
-    k.when(lid == 0, [&] {
-      auto tot = k.var<kir::f32>("tot", k.lit(0.0f));
-      k.loop("r", k.constant<kir::u32>(0), k.constant<kir::u32>(kBlock), 1,
-             [&](kir::Val<kir::u32> r) { tot = tot.read() + red[r].read(); });
+    e.barrier();
+    if (auto lead = e.when(lid == 0)) {
+      auto tot = e.var(0.0f);
+      for (auto r : e.range(kBlock)) {
+        tot = tot.read() + red[r].read();
+      }
       red[0] = math::rsqrt(tot.read() / static_cast<float>(K) + eps);
-    });
-    math::barrier();
-    const auto scale = k.let<kir::f32>("sc", red[0].read());
-    k.loop("t3", lid, k.constant<kir::u32>(K), kBlock,
-           [&](kir::Val<kir::u32> t) {
-             const auto gain =
-                 zc ? k.lit(1.0f) + rw[t].read() : rw[t].read();
-             xs[t] = xs[t].read() * scale * gain;
-           });
-    math::barrier();
+    }
+    e.barrier();
+    const auto scale = e.let(red[0].read());
+    for (auto t : e.range(lid, e.u32(K), kBlock)) {
+      const auto gain = zc ? 1.0f + a.rw[t] : a.rw[t];
+      xs[t] = xs[t].read() * scale * gain;
+    }
+    e.barrier();
 
-    k.loop("n", lid, k.constant<kir::u32>(N), kBlock,
-           [&](kir::Val<kir::u32> n) {
-             auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-             const auto vn = kir::pack_n(load_bytes, 4);
-             const auto aligned = (K / vn) * vn;
-             k.loop("tt", k.constant<kir::u32>(0), k.constant<kir::u32>(aligned),
-                    vn, [&](kir::Val<kir::u32> t) {
-                      const auto wv = math::load(w, n * K + t, load_bytes);
-                      k.unroll("e", vn, [&](kir::Val<kir::u32> e) {
-                        acc = math::fma(xs[t + e].read(), wv[e], acc.read());
-                      });
-                    });
-             if (aligned < K) {
-               k.loop("tt", k.constant<kir::u32>(aligned),
-                      k.constant<kir::u32>(K), 1, [&](kir::Val<kir::u32> t) {
-                        acc = math::fma(xs[t].read(), w[n * K + t].read(),
-                                        acc.read());
-                      });
-             }
-             k.store(row * N + n, acc.read());
-           });
+    const auto vn = kir::pack_n(load_bytes, 4);
+    const auto aligned = (K / vn) * vn;
+    for (auto n : e.range(lid, e.u32(N), kBlock)) {
+      auto acc = e.var(0.0f);
+      for (auto t : e.range(0u, aligned, vn)) {
+        const auto wv = e.load(a.w, n * K + t, load_bytes);
+        for (auto j : e.unroll(vn)) {
+          acc = math::fma(xs[t + j], wv[j], acc);
+        }
+      }
+      if (aligned < K) {
+        for (auto t : e.range(aligned, K)) {
+          acc = math::fma(xs[t], a.w[n * K + t], acc);
+        }
+      }
+      e.store(row * N + n, acc.read());
+    }
     return k.str();
   }
 

@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {
@@ -24,58 +26,57 @@ std::uint32_t bitonic_n(std::uint32_t n) {
   return p;
 }
 
-void emit_swap(kir::KernelBody& body, kir::LValue<kir::f32>& va,
-               kir::LValue<kir::u32>& ia, kir::LValue<kir::f32>& vb,
-               kir::LValue<kir::u32>& ib, const std::string& tag) {
-  auto tv = body.var<kir::f32>("tv" + tag, va.read());
-  auto ti = body.var<kir::u32>("ti" + tag, ia.read());
+void emit_swap(env::Emit& e, kir::LValue<kir::f32>& va, kir::LValue<kir::u32>& ia,
+               kir::LValue<kir::f32>& vb, kir::LValue<kir::u32>& ib) {
+  const auto tv = e.let(va.read());
+  const auto ti = e.let(ia.read());
   va = vb.read();
   ia = ib.read();
-  vb = tv.read();
-  ib = ti.read();
+  vb = tv;
+  ib = ti;
 }
 
 // Descending: higher value first, smaller index on a tie.
-void emit_cmp_swap(kir::KernelBody& body, std::vector<kir::LValue<kir::f32>>& pv,
+void emit_cmp_swap(env::Emit& e, std::vector<kir::LValue<kir::f32>>& pv,
                    std::vector<kir::LValue<kir::u32>>& pi, int a, int b,
-                   bool want_a_greater, const std::string& tag) {
+                   bool want_a_greater) {
   const auto va = pv[static_cast<std::size_t>(a)].read();
   const auto vb = pv[static_cast<std::size_t>(b)].read();
   const auto ia = pi[static_cast<std::size_t>(a)].read();
   const auto ib = pi[static_cast<std::size_t>(b)].read();
   const auto a_better = (va > vb) || (va == vb && ia < ib);
   const auto b_better = (vb > va) || (vb == va && ib < ia);
-  body.when(want_a_greater ? b_better : a_better, [&] {
-    emit_swap(body, pv[static_cast<std::size_t>(a)],
+  if (auto g = e.when(want_a_greater ? b_better : a_better)) {
+    emit_swap(e, pv[static_cast<std::size_t>(a)],
               pi[static_cast<std::size_t>(a)], pv[static_cast<std::size_t>(b)],
-              pi[static_cast<std::size_t>(b)], tag);
-  });
+              pi[static_cast<std::size_t>(b)]);
+  }
 }
 
-void emit_bitonic(kir::KernelBody& body, std::vector<kir::LValue<kir::f32>>& pv,
+void emit_bitonic(env::Emit& e, std::vector<kir::LValue<kir::f32>>& pv,
                   std::vector<kir::LValue<kir::u32>>& pi, std::uint32_t n) {
-  int step = 0;
   for (std::uint32_t ksz = 2; ksz <= n; ksz <<= 1) {
     for (std::uint32_t j = ksz >> 1; j > 0; j >>= 1) {
       for (std::uint32_t i = 0; i < n; ++i) {
         const std::uint32_t l = i ^ j;
         if (l <= i) continue;
         const bool ascending = (i & ksz) == 0;
-        emit_cmp_swap(body, pv, pi, static_cast<int>(i), static_cast<int>(l),
-                      !ascending, std::to_string(step++));
+        emit_cmp_swap(e, pv, pi, static_cast<int>(i), static_cast<int>(l),
+                      !ascending);
       }
     }
   }
 }
 
-void emit_band(kir::KernelBody& body, std::vector<kir::LValue<kir::f32>>& pv,
+void emit_band(env::Emit& e, std::vector<kir::LValue<kir::f32>>& pv,
                std::uint32_t k, float score_band) {
   if (score_band >= 1.0f || k == 0) return;
-  const auto thresh =
-      body.let<kir::f32>("thr", pv[0].read() * body.lit(1.0f - score_band));
-  auto total = body.var<kir::f32>("tot", body.lit(1e-9f));
+  const auto thresh = e.let(pv[0].read() * e.f32(1.0f - score_band));
+  auto total = e.var(1e-9f);
   for (std::uint32_t s = 0; s < k; ++s) {
-    body.when(pv[s].read() < thresh, [&] { pv[s] = 0.0f; });
+    if (auto g = e.when(pv[s].read() < thresh)) {
+      pv[s] = 0.0f;
+    }
     total = total.read() + pv[s].read();
   }
   for (std::uint32_t s = 0; s < k; ++s) {
@@ -84,6 +85,14 @@ void emit_band(kir::KernelBody& body, std::vector<kir::LValue<kir::f32>>& pv,
 }
 
 }  // namespace
+
+// Not self-indexing: the element comes back through `ret` and the emitter
+// stores it, so `out` is bound but never written here.
+template <class E>
+struct TopKArgs {
+  env::In<kir::f32, E> x;
+  env::Out<kir::f32, E> out;
+};
 
 struct TopKKernel final : KernelPrimitive<TopKKernel> {
   static constexpr std::string_view kName = "topk";
@@ -110,11 +119,13 @@ struct TopKKernel final : KernelPrimitive<TopKKernel> {
     const float score_band = s.attrs[0] == 0.0f ? 1.0f : s.attrs[0];
 
     kir::KernelBody body(s.types, *s.intrinsics);
-    const auto x = body.input<kir::f32>(0);
-    const auto i = body.thread_id();
-    const auto row = body.let<kir::u32>("row", (i / k) * n);
-    const auto slot = body.let<kir::u32>("slot", i % k);
-    auto outv = body.var<kir::f32>("outv", body.lit(0.0f));
+    TopKArgs<env::Emit> a;
+    env::bind(body, a);
+    env::Emit e{&body};
+    const auto i = e.thread_id();
+    const auto row = e.let((i / k) * n);
+    const auto slot = e.let(i % k);
+    auto outv = e.var(0.0f);
 
     if (n <= kBitonicLimit) {
       const auto N = bitonic_n(n);
@@ -122,17 +133,12 @@ struct TopKKernel final : KernelPrimitive<TopKKernel> {
       std::vector<kir::LValue<kir::u32>> pi;
       pv.reserve(N);
       pi.reserve(N);
-      for (std::uint32_t e = 0; e < N; ++e) {
-        const std::string es = std::to_string(e);
-        if (e < n) {
-          pv.push_back(body.var<kir::f32>("pv" + es, x[row + e].read()));
-          pi.push_back(body.var<kir::u32>("pi" + es, body.constant<kir::u32>(e)));
-        } else {
-          pv.push_back(body.var<kir::f32>("pv" + es, math::neg_inf()));
-          pi.push_back(body.var<kir::u32>("pi" + es, body.constant<kir::u32>(e)));
-        }
+      for (std::uint32_t el = 0; el < N; ++el) {
+        auto v = el < n ? e.var(a.x[row + el]) : e.var(math::neg_inf());
+        pv.push_back(v);
+        pi.push_back(e.var(e.u32(el)));
       }
-      emit_bitonic(body, pv, pi, N);
+      emit_bitonic(e, pv, pi, N);
       // Network is ascending (smallest at 0). Top-k sits at the high end.
       std::vector<kir::LValue<kir::f32>> topv;
       std::vector<kir::LValue<kir::u32>> topi;
@@ -142,13 +148,13 @@ struct TopKKernel final : KernelPrimitive<TopKKernel> {
         topv.push_back(pv[N - 1 - sl]);
         topi.push_back(pi[N - 1 - sl]);
       }
-      if (!write_idx) emit_band(body, topv, k, score_band);
+      if (!write_idx) emit_band(e, topv, k, score_band);
       for (std::uint32_t sl = 0; sl < k; ++sl) {
-        body.when(slot == body.constant<kir::u32>(sl), [&] {
+        if (auto g = e.when(slot == sl)) {
           outv = write_idx ? cast<kir::f32>(topi[sl].read()) : topv[sl].read();
-        });
+        }
       }
-      body.ret(outv.read());
+      e.ret(outv.read());
       return body.str();
     }
 
@@ -157,37 +163,33 @@ struct TopKKernel final : KernelPrimitive<TopKKernel> {
     win_e.reserve(k);
     win_v.reserve(k);
     for (std::uint32_t p = 0; p < k; ++p) {
-      const std::string ps = std::to_string(p);
-      auto bv = body.var<kir::f32>("bv" + ps, math::neg_inf());
-      auto be = body.var<kir::u32>("be" + ps, body.constant<kir::u32>(0));
-      body.loop("e", body.constant<kir::u32>(0), body.constant<kir::u32>(n), 1,
-                [&](kir::Val<kir::u32> e) {
-                  auto taken =
-                      body.var<kir::u32>("tk" + ps, body.constant<kir::u32>(0));
-                  for (std::uint32_t q = 0; q < p; ++q) {
-                    body.when(e == win_e[static_cast<std::size_t>(q)].read(),
-                              [&] { taken = body.constant<kir::u32>(1); });
-                  }
-                  const auto v =
-                      body.let<kir::f32>("v" + ps, x[row + e].read());
-                  body.when(taken.read() == body.constant<kir::u32>(0) &&
-                                (v > bv.read() ||
-                                 (v == bv.read() && e < be.read())),
-                            [&] {
-                              bv = v;
-                              be = e;
-                            });
-                });
+      auto bv = e.var(math::neg_inf());
+      auto be = e.var(e.u32(0));
+      for (auto el : e.range(n)) {
+        auto taken = e.var(e.u32(0));
+        for (std::uint32_t q = 0; q < p; ++q) {
+          if (auto g = e.when(el == win_e[static_cast<std::size_t>(q)].read())) {
+            taken = e.u32(1);
+          }
+        }
+        const auto v = e.let(a.x[row + el]);
+        if (auto g = e.when(taken.read() == 0u &&
+                            (v > bv.read() ||
+                             (v == bv.read() && el < be.read())))) {
+          bv = v;
+          be = el;
+        }
+      }
       win_e.push_back(be);
       win_v.push_back(bv);
     }
-    if (!write_idx) emit_band(body, win_v, k, score_band);
+    if (!write_idx) emit_band(e, win_v, k, score_band);
     for (std::uint32_t sl = 0; sl < k; ++sl) {
-      body.when(slot == body.constant<kir::u32>(sl), [&] {
+      if (auto g = e.when(slot == sl)) {
         outv = write_idx ? cast<kir::f32>(win_e[sl].read()) : win_v[sl].read();
-      });
+      }
     }
-    body.ret(outv.read());
+    e.ret(outv.read());
     return body.str();
   }
 

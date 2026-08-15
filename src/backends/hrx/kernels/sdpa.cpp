@@ -74,8 +74,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     const auto used = e.let(offset + tq);
     const auto hi = e.let(select(used < e.u32(ts), used, e.u32(ts)));
 
-    // env::var only takes a float literal init; neg_inf() is a recorded call.
-    const auto m = k.var<kir::f32>("m", math::neg_inf());
+    const auto m = e.var(math::neg_inf());
     for (auto j : e.range(live_off ? hi : e.u32(ts))) {
       auto score = e.var(0.0f);
       for (auto dd : e.range(dh)) {
@@ -121,7 +120,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
       const auto vb = ((b * kvh + kh) * ts + j) * dv + d;
       acc = math::fma(w.read(), a.v[vb], acc.read());
     }
-    k.ret(acc.read() / select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
+    e.ret(acc.read() / select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
     return k.str();
   }
 

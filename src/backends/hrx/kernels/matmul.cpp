@@ -6,11 +6,22 @@
 #include "lse/backends/hrx/kernels/lds_linear.hpp"
 #include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/kernels/wmma.hpp"
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
+
+// The value leaves through the wrapper's per-element return; the Out member
+// only names the slot the binding contract requires.
+template <class E>
+struct MatMulArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> y;
+  env::Out<kir::f32, E> out;
+};
 
 // Device implementation of the matmul barrier op. Lives with the backend, not
 // with the graph: the graph layer decides *that* a matmul runs, this decides
@@ -40,19 +51,18 @@ struct MatMulKernel final : KernelPrimitive<MatMulKernel> {
     const auto cols = static_cast<std::uint32_t>(b.dim(b.rank() - 1));
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto y = k.input<kir::f32>(1);
-    const auto row = k.let<kir::u32>("row", k.thread_id() / cols);
-    const auto col = k.let<kir::u32>("col", k.thread_id() % cols);
-    const auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
+    MatMulArgs<env::Emit> args;
+    env::bind(k, args);
+    env::Emit e{&k};
+    const auto row = e.let(e.thread_id() / cols);
+    const auto col = e.let(e.thread_id() % cols);
+    auto acc = e.var(0.0f);
     // B is [K, cols] in the usual matmul, so the inner walk on y is strided
     // and cannot be a wide load. x is contiguous in k.
-    k.loop("t", k.constant<kir::u32>(0), k.constant<kir::u32>(kdim), 1,
-           [&](kir::Val<kir::u32> t) {
-             acc = math::fma(x[row * kdim + t].read(),
-                             y[t * cols + col].read(), acc.read());
-           });
-    k.ret(acc.read());
+    for (auto t : e.range(kdim)) {
+      acc = math::fma(args.x[row * kdim + t], args.y[t * cols + col], acc);
+    }
+    e.ret(acc.read());
     return k.str();
   }
 
@@ -80,6 +90,13 @@ struct MatMulKernel final : KernelPrimitive<MatMulKernel> {
 };
 
 LSE_REGISTER_PRIMITIVE(MatMulKernel);
+
+template <class E>
+struct LinearArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> w;
+  env::Out<kir::f32, E> out;
+};
 
 // x [.., K] against w [N, K] -> [.., N]. The weight is stored transposed, the
 // layout every checkpoint in this engine uses, so the inner loop walks both
@@ -115,14 +132,15 @@ struct LinearKernel final : KernelPrimitive<LinearKernel> {
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto w = k.input<kir::f32>(1);
-    const auto row = k.let<kir::u32>("row", k.thread_id() / n);
-    const auto col = k.let<kir::u32>("col", k.thread_id() % n);
-    const auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-    emit_dot_f32(k, x, w, row * kdim, col * kdim, acc, kdim,
+    LinearArgs<env::Emit> args;
+    env::bind(k, args);
+    env::Emit e{&k};
+    const auto row = e.let(e.thread_id() / n);
+    const auto col = e.let(e.thread_id() % n);
+    auto acc = e.var(0.0f);
+    emit_dot_f32(e, args.x, args.w, row * kdim, col * kdim, acc, kdim,
                  device_load_bytes(s.device));
-    k.ret(acc.read());
+    e.ret(acc.read());
     return k.str();
   }
 

@@ -424,8 +424,9 @@ LSE_TEST(a_row_normalization_emits_a_kernel) {
       continue;
     }
     emitted = true;
-    // The reduction loop and the extent baked in as a literal.
-    LSE_EXPECT(e->source.find("t < 16u") != std::string::npos);
+    // The reduction loop and the extent baked in as a literal. Loop vars are
+    // auto-named by the env, so match the bound, not the name.
+    LSE_EXPECT(e->source.find(" < 16u") != std::string::npos);
     LSE_EXPECT(e->source.find("rsqrtf") != std::string::npos);
   }
   LSE_EXPECT(emitted);
@@ -469,8 +470,8 @@ LSE_TEST(a_matmul_kernel_becomes_a_device_function_the_emitter_wraps) {
   LSE_EXPECT(e->source.find("extern \"C\" __global__ void lse_fused_") !=
              std::string::npos);
   LSE_EXPECT(e->source.find("lse_matmul(i,") != std::string::npos);
-  // Extents baked in, not read from a constant.
-  LSE_EXPECT(e->source.find("t < 8u") != std::string::npos);
+  // Extents baked in, not read from a constant; the env names the loop var.
+  LSE_EXPECT(e->source.find(" < 8u") != std::string::npos);
 }
 
 LSE_TEST(elementwise_work_after_a_matmul_fuses_into_its_kernel) {
