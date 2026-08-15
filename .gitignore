@@ -13,3 +13,10 @@ README.md
 WORK.md
 .venv/
 tests/data/
+
+# Local tooling state — never uploaded.
+.claude/
+CLAUDE.md
+.vscode/
+.idea/
+*.log
