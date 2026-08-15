@@ -65,6 +65,9 @@ inline Val<graph::kir::u32> workgroup_id_y() {
 inline Val<graph::kir::u32> workgroup_size() {
   return detail::invoke<graph::kir::u32>("thread.workgroup_size");
 }
+inline Val<graph::kir::u32> grid_dim_x() {
+  return detail::invoke<graph::kir::u32>("thread.grid_dim.x");
+}
 inline void barrier() {
   graph::kir::KernelBody* body = graph::kir::KernelBody::try_current();
   if (body != nullptr) body->barrier();

@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <vector>
 
 namespace lse::backend {
 
@@ -95,6 +96,7 @@ std::string gemv_stage(const std::string& x, const std::string& w,
                        const std::string& out, const std::string& idx,
                        std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
                        std::uint32_t K, std::uint32_t M, DType odt, bool grid,
+                       bool persist, std::uint32_t persist_wgs,
                        const DeviceInfo& device,
                        const kir::TypeTable& types,
                        const DialectSourceTable& spellings) {
@@ -117,21 +119,29 @@ std::string gemv_stage(const std::string& x, const std::string& w,
     }
   }
   hrx_kernels::emit_gemv(body, xb, wb, idxp, keep, slot, N, K, M,
-                         hrx_kernels::device_load_bytes(&device), grid, wave);
+                         hrx_kernels::device_load_bytes(&device), grid, wave,
+                         persist, persist_wgs);
   if (!body.lds().ok()) return {};
   return "    {\n" + body.str() + "\n    }\n";
 }
 
-std::string elem_loop(std::uint32_t count, const std::string& body, bool grid) {
+std::string elem_loop(std::uint32_t count, const std::string& body, bool grid,
+                      bool persist, std::uint32_t persist_wgs) {
   std::ostringstream s;
   s << "    {\n      const unsigned n = " << count << "u;\n";
-  if (grid) {
+  if (persist) {
+    if (persist_wgs == 0) persist_wgs = 1;
+    s << "      const unsigned stride = " << persist_wgs << "u * 256u;\n"
+      << "      for (unsigned i = blockIdx.x * 256u + threadIdx.x; i < n; "
+         "i += stride) {\n"
+      << body << "      }\n    }\n";
+  } else if (grid) {
     s << "      const unsigned i = blockIdx.x * 256u + threadIdx.x;\n"
       << "      if (i < n) {\n"
       << body << "      }\n    }\n";
   } else {
     s << "      for (unsigned i = threadIdx.x; i < n; i += 256u) {\n"
-      << body << "      }\n      __syncthreads();\n    }\n";
+      << body << "      }\n    }\n";
   }
   return s.str();
 }
@@ -139,7 +149,8 @@ std::string elem_loop(std::uint32_t count, const std::string& body, bool grid) {
 // Repeat is host-only in the library. Stage the index map so a GQA GDN
 // does not punch a host hole in the phase.
 std::string repeat_stage(const Node& n, const std::string& in,
-                         const std::string& out, bool grid) {
+                         const std::string& out, bool grid, bool persist,
+                         std::uint32_t persist_wgs) {
   const Shape& src = n.inputs[0]->shape;
   const auto axis = static_cast<std::size_t>(n.iattrs[0]);
   const auto count = static_cast<std::uint32_t>(n.iattrs[1]);
@@ -165,7 +176,7 @@ std::string repeat_stage(const Node& n, const std::string& in,
        << "        " << store_elem(out, "i", n.dtype, load_elem(in, "src", n.inputs[0]->dtype))
        << "\n";
   return elem_loop(static_cast<std::uint32_t>(n.element_count()), body.str(),
-                   grid);
+                   grid, persist, persist_wgs);
 }
 
 const Node* skip_view(const Node* n) noexcept {
@@ -173,6 +184,55 @@ const Node* skip_view(const Node* n) noexcept {
     n = n->inputs[0].get();
   }
   return n;
+}
+
+// How a stage touches memory. Lane: thread i only reads/writes element i.
+// Gather: some thread reads (or writes) an element another thread produced.
+enum class LaneUse : std::uint8_t { kLane, kGather };
+
+struct StageUse {
+  LaneUse write = LaneUse::kLane;
+  LaneUse read = LaneUse::kLane;
+  std::uint32_t elems = 0;
+};
+
+StageUse stage_use(const Node& n) noexcept {
+  StageUse u;
+  u.elems = static_cast<std::uint32_t>(n.element_count());
+  if (is_elementwise(n.kind) || n.kind == OpKind::kCast ||
+      n.kind == OpKind::kBroadcast) {
+    return u;
+  }
+  const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
+  if (kp != nullptr && kp->owns_indexing()) {
+    u.write = LaneUse::kGather;
+    u.read = LaneUse::kGather;
+    return u;
+  }
+  // rms / softmax / slice / rope / transpose / repeat: store at i, gather
+  // inputs. Anything we cannot prove is per-lane is treated as a gather.
+  u.read = LaneUse::kGather;
+  if (is_reduction(n.kind)) u.write = LaneUse::kGather;
+  return u;
+}
+
+// Any recorded RAW/WAR/WAW needs a barrier. Bindings are __restrict__, so
+// two nodes that share a slot look like distinct pointers; skipping the
+// barrier lets the compiler reorder those accesses.
+bool needs_sync(const StageUse&, const StageUse&) noexcept { return true; }
+
+bool needs_sync_war(const StageUse&, const StageUse&) noexcept { return true; }
+
+bool needs_sync_waw(const StageUse&, const StageUse&) noexcept { return true; }
+
+const Node* written_buf(const Node& n) noexcept {
+  if (n.prim != nullptr) {
+    const int a = n.prim->inplace_input();
+    if (a >= 0 && static_cast<std::size_t>(a) < n.inputs.size()) {
+      return skip_view(n.inputs[static_cast<std::size_t>(a)].get());
+    }
+  }
+  return &n;
 }
 
 }  // namespace
@@ -313,18 +373,102 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     if (N > max_n) max_n = N;
     if (M > max_m) max_m = M;
   }
-  // A grid is legal when no stage reads another stage in this launch.
-  // Dependent stages share one workgroup so __syncthreads is enough.
-  const bool grid_gemv = only_linears && compute > 0 && max_n >= 256;
-  const bool grid_elem = !grid_gemv && !dependent && max_elems >= 512;
+  // Independent stages can use a fat grid. Dependent stages share one
+  // workgroup so __syncthreads is enough. A multi-WG software barrier
+  // deadlocks here: this launch path does not keep the whole grid resident.
+  const bool persist = false;
+  const bool grid_gemv =
+      !persist && only_linears && compute > 0 && max_n >= 256;
+  const bool grid_elem =
+      !persist && !grid_gemv && !dependent && max_elems >= 512;
+  std::uint32_t persist_wgs = 1;
+  if (persist) {
+    const std::uint32_t tiles = max_n == 0 ? 1u : (max_n + 7u) / 8u;
+    const std::uint32_t gemv_wgs = tiles * (max_m == 0 ? 1u : max_m);
+    const std::uint32_t elem_wgs =
+        max_elems == 0 ? 1u : (max_elems + 255u) / 256u;
+    const std::uint32_t work = gemv_wgs > elem_wgs ? gemv_wgs : elem_wgs;
+    const std::uint32_t cap =
+        device.compute_units == 0 ? 1u : device.compute_units;
+    persist_wgs = work < cap ? work : cap;
+    if (persist_wgs == 0) persist_wgs = 1;
+  }
 
   std::ostringstream preamble;
   std::ostringstream stages;
   std::uint32_t stage_id = 0;
 
+  std::vector<const Node*> staged;
+  std::vector<StageUse> uses;
+  for (const NodePtr& n : group.nodes) {
+    if (n->kind == OpKind::kConstant || n->kind == OpKind::kBuffer ||
+        n->kind == OpKind::kReshape) {
+      continue;
+    }
+    staged.push_back(n.get());
+    uses.push_back(stage_use(*n));
+  }
+  std::unordered_map<const Node*, int> last_writer;
+  std::unordered_map<const Node*, int> last_reader;
+  int visible_through = -1;
+  int stage_i = 0;
+  const bool grid_stages = grid_gemv || grid_elem;
+
+  auto sync_before = [&]() {
+    if (grid_stages || stage_i >= static_cast<int>(staged.size())) return;
+    const StageUse& me = uses[static_cast<std::size_t>(stage_i)];
+    const Node* dest =
+        written_buf(*staged[static_cast<std::size_t>(stage_i)]);
+    bool need = false;
+    for (const NodePtr& in : staged[static_cast<std::size_t>(stage_i)]->inputs) {
+      const Node* p = skip_view(in.get());
+      const auto it = last_writer.find(p);
+      if (it == last_writer.end()) continue;
+      if (it->second > visible_through &&
+          needs_sync(uses[static_cast<std::size_t>(it->second)], me)) {
+        need = true;
+        break;
+      }
+    }
+    if (!need && dest != nullptr) {
+      if (const auto rd = last_reader.find(dest); rd != last_reader.end() &&
+          rd->second > visible_through &&
+          needs_sync_war(uses[static_cast<std::size_t>(rd->second)], me)) {
+        need = true;
+      } else if (const auto wr = last_writer.find(dest);
+                 wr != last_writer.end() && wr->second > visible_through &&
+                 needs_sync_waw(uses[static_cast<std::size_t>(wr->second)],
+                                me)) {
+        need = true;
+      }
+    }
+    if (!need) return;
+    if (persist) {
+      stages << "    lse_grid_sync(gbar);\n";
+    } else {
+      stages << "    __syncthreads();\n";
+    }
+    visible_through = stage_i - 1;
+  };
+
+  auto record_write = [&]() {
+    if (stage_i >= static_cast<int>(staged.size())) return;
+    const Node* n = staged[static_cast<std::size_t>(stage_i)];
+    last_writer[n] = stage_i;
+    const Node* dest = written_buf(*n);
+    if (dest != nullptr) last_writer[dest] = stage_i;
+    for (const NodePtr& in : n->inputs) {
+      const Node* p = skip_view(in.get());
+      if (p != nullptr) last_reader[p] = stage_i;
+    }
+    ++stage_i;
+  };
+
   for (const NodePtr& n : group.nodes) {
     if (n->kind == OpKind::kConstant || n->kind == OpKind::kBuffer) continue;
     if (n->kind == OpKind::kReshape) continue;
+
+    sync_before();
 
     if (n->kind == OpKind::kRepeat) {
       if (n->inputs.size() != 1) {
@@ -335,11 +479,13 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       if (in.empty() || ob.empty()) {
         return LSE_ERROR(kInternal, "repeat stage is not bound");
       }
-      const std::string body = repeat_stage(*n, in, ob, grid_elem);
+      const std::string body =
+          repeat_stage(*n, in, ob, grid_elem, persist, persist_wgs);
       if (body.empty()) {
         return LSE_ERROR(kUnimplemented, "repeat stage has a bad shape");
       }
       stages << body;
+      record_write();
       continue;
     }
 
@@ -392,12 +538,12 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       }
       const std::string body =
           gemv_stage(xb, wb, ob, idx, keep, slot, N, K, M, n->dtype, grid_gemv,
-                     device, type_table, spellings);
+                     persist, persist_wgs, device, type_table, spellings);
       if (body.empty()) {
         return LSE_ERROR(kInternal, "linear stage exceeded LDS");
       }
       stages << body;
-      if (!grid_gemv) stages << "    __syncthreads();\n";
+      record_write();
       continue;
     }
 
@@ -435,9 +581,18 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
         }
         stages << "      float* in" << a << " = " << b << ";\n";
       }
-      stages << "      const unsigned n = " << nthreads << "u;\n"
-             << "      for (unsigned i = threadIdx.x; i < n; i += 256u) {\n"
-             << body << "      }\n      __syncthreads();\n    }\n";
+      stages << "      const unsigned n = " << nthreads << "u;\n";
+      if (persist) {
+        stages << "      const unsigned stride = " << persist_wgs
+               << "u * 256u;\n"
+               << "      for (unsigned i = blockIdx.x * 256u + threadIdx.x; "
+                  "i < n; i += stride) {\n"
+               << body << "      }\n    }\n";
+      } else {
+        stages << "      for (unsigned i = threadIdx.x; i < n; i += 256u) {\n"
+               << body << "      }\n    }\n";
+      }
+      record_write();
       continue;
     }
 
@@ -475,7 +630,8 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
         call << ", (" << device_scalar(in->dtype) << "*)" << b;
       }
       call << ");\n        " << store_elem(ob, "i", n->dtype, "v") << "\n";
-      stages << elem_loop(count, call.str(), grid_elem);
+      stages << elem_loop(count, call.str(), grid_elem, persist, persist_wgs);
+      record_write();
       continue;
     }
 
@@ -511,7 +667,8 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       std::ostringstream loop;
       loop << "        float v; " << body << "\n        "
            << store_elem(ob, "i", n->dtype, "v") << "\n";
-      stages << elem_loop(count, loop.str(), grid_elem);
+      stages << elem_loop(count, loop.str(), grid_elem, persist, persist_wgs);
+      record_write();
       continue;
     }
     if (n->kind == OpKind::kCast || n->kind == OpKind::kBroadcast) {
@@ -519,7 +676,8 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       loop << "        "
            << store_elem(ob, "i", n->dtype, args.empty() ? "0.0f" : args[0])
            << "\n";
-      stages << elem_loop(count, loop.str(), grid_elem);
+      stages << elem_loop(count, loop.str(), grid_elem, persist, persist_wgs);
+      record_write();
       continue;
     }
     return LSE_ERROR(kUnimplemented, "phase kernel cannot stage ",
@@ -530,27 +688,49 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   src << "#include <hip/hip_runtime.h>\n"
       << "#include <hip/hip_bf16.h>\n\n"
       << HipEmitter::constants_decl(out.constants) << "\n"
-      << preamble.str()
-      << "extern \"C\" __global__ void " << out.entry_name << "(\n";
+      << preamble.str();
+  if (persist) {
+    src << "__device__ void lse_grid_sync(unsigned* ctr) {\n"
+        << "  __syncthreads();\n"
+        << "  if (threadIdx.x == 0) {\n"
+        << "    const unsigned ticket = atomicAdd(ctr, 1u);\n"
+        << "    const unsigned nx = " << persist_wgs << "u;\n"
+        << "    const unsigned goal = ((ticket / nx) + 1u) * nx;\n"
+        // atomicCAS cannot fold into a cached load. HIP gridDim is also
+        // not filled by this launch path, so nx is a source literal.
+        << "    while (atomicCAS(ctr, goal, goal) < goal) ;\n"
+        << "  }\n"
+        << "  __syncthreads();\n"
+        << "}\n\n";
+  }
+  src << "extern \"C\" __global__ void " << out.entry_name << "(\n";
   for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
     src << "    float* __restrict__ b" << i << ",\n";
   }
+  if (persist) src << "    unsigned* gbar,\n";
   src << "    LseConstants k) {\n"
       << "  (void)k;\n"
       << stages.str() << "}\n";
   out.source = src.str();
+  out.persist_grid = persist;
   out.dims.workgroup_size[0] = 256;
-  if (grid_gemv) {
+  if (persist) {
+    out.dims.workgroup_count[0] = persist_wgs;
+    out.dims.workgroup_count[1] = 1;
+    out.lds_bytes = 0;
+  } else if (grid_gemv) {
     out.dims.workgroup_count[0] = (max_n + 7u) / 8u;
     out.dims.workgroup_count[1] = max_m == 0 ? 1u : max_m;
+    out.lds_bytes = 256 * 4;
   } else if (grid_elem) {
     out.dims.workgroup_count[0] = max_elems == 0 ? 1u : (max_elems + 255u) / 256u;
     out.dims.workgroup_count[1] = 1;
+    out.lds_bytes = 256 * 4;
   } else {
     out.dims.workgroup_count[0] = 1;
     out.dims.workgroup_count[1] = 1;
+    out.lds_bytes = 256 * 4;
   }
-  out.lds_bytes = 256 * 4;
   if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
     out.dims.subgroup_size = amd->wavefront_size;
   }

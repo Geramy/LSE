@@ -125,6 +125,88 @@ LSE_TEST(emitter_produces_a_complete_translation_unit) {
   LSE_EXPECT(e->entry_name.rfind("lse_fused_", 0) == 0);
 }
 
+LSE_TEST(phase_emits_syncthreads_only_on_cross_lane_deps) {
+  auto nsync = [](const std::string& src) {
+    std::size_t n = 0, pos = 0;
+    while ((pos = src.find("__syncthreads", pos)) != std::string::npos) {
+      ++n;
+      pos += 13;
+    }
+    return n;
+  };
+
+  // One CU cannot host a persist grid; this is the __syncthreads path.
+  backend::DeviceInfo one = gfx1151();
+  one.compute_units = 1;
+
+  Array x = Array::full(Shape{32}, DType::kF32, 1.0f);
+  Array y = silu(x * x + x);
+  const NodePtr elem_roots[] = {y.node()};
+  const auto elem_wgs = Partitioner::phases(elem_roots);
+  LSE_EXPECT(!elem_wgs.empty());
+  if (!elem_wgs.empty()) {
+    const FusionGroup g = Partitioner::phase_group(elem_wgs[0], elem_roots);
+    auto e = backend::HipEmitter::emit_phase(g, one);
+    LSE_EXPECT(e.ok());
+    if (e.ok()) {
+      LSE_EXPECT(!e->persist_grid);
+      // No barrier after the last store; at most one per RAW edge.
+      LSE_EXPECT(nsync(e->source) < 3u);
+    }
+  }
+
+  Array h = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
+  Array rw = Array::full(Shape{32}, DType::kF32, 1.0f);
+  Array w1 = Array::full(Shape{64, 32}, DType::kF32, 0.1f);
+  Array w2 = Array::full(Shape{32, 64}, DType::kF32, 0.2f);
+  Array z = linear(silu(linear(rms_norm(h, rw, 1e-6f), w1)), w2);
+  const NodePtr ffn_roots[] = {z.node()};
+  const auto ffn_wgs = Partitioner::phases(ffn_roots);
+  LSE_EXPECT(!ffn_wgs.empty());
+  if (ffn_wgs.empty()) return;
+  const FusionGroup g = Partitioner::phase_group(ffn_wgs[0], ffn_roots);
+  auto e = backend::HipEmitter::emit_phase(g, one);
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) return;
+  LSE_EXPECT(!e->persist_grid);
+  const auto n = nsync(e->source);
+  LSE_EXPECT(n >= 1u);
+  LSE_EXPECT(n < 6u);
+}
+
+LSE_TEST(phase_dependent_kernel_stays_one_workgroup) {
+  Array h = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
+  Array rw = Array::full(Shape{32}, DType::kF32, 1.0f);
+  Array w1 = Array::full(Shape{64, 32}, DType::kF32, 0.1f);
+  Array w2 = Array::full(Shape{32, 64}, DType::kF32, 0.2f);
+  Array z = linear(silu(linear(rms_norm(h, rw, 1e-6f), w1)), w2);
+  const NodePtr ffn_roots[] = {z.node()};
+  const auto ffn_wgs = Partitioner::phases(ffn_roots);
+  LSE_EXPECT(!ffn_wgs.empty());
+  if (ffn_wgs.empty()) return;
+  const FusionGroup g = Partitioner::phase_group(ffn_wgs[0], ffn_roots);
+  auto e = backend::HipEmitter::emit_phase(g, gfx1151());
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) return;
+  LSE_EXPECT(!e->persist_grid);
+  LSE_EXPECT(e->source.find("lse_grid_sync") == std::string::npos);
+  LSE_EXPECT(e->dims.workgroup_count[0] == 1u);
+
+  Array x = Array::full(Shape{1, 256}, DType::kF32, 1.0f);
+  Array w = Array::full(Shape{256, 256}, DType::kF32, 0.1f);
+  Array y = linear(x, w);
+  const NodePtr lin_roots[] = {y.node()};
+  const auto lin_wgs = Partitioner::phases(lin_roots);
+  LSE_EXPECT(!lin_wgs.empty());
+  if (lin_wgs.empty()) return;
+  const FusionGroup lg = Partitioner::phase_group(lin_wgs[0], lin_roots);
+  auto le = backend::HipEmitter::emit_phase(lg, gfx1151());
+  LSE_EXPECT(le.ok());
+  if (!le.ok()) return;
+  LSE_EXPECT(!le->persist_grid);
+  LSE_EXPECT(le->dims.workgroup_count[0] > 1u);
+}
+
 LSE_TEST(rdna_is_wave32_cdna_is_wave64_rdna4_can_be_either) {
   LSE_EXPECT(backend::arch_family("gfx1100") == backend::ArchFamily::kRdna3);
   LSE_EXPECT(backend::arch_family("gfx1151") == backend::ArchFamily::kRdna35);
@@ -645,7 +727,6 @@ LSE_TEST(debug_writes_generated_hip_for_review) {
   fs::create_directories(dump);
   fs::create_directories(cache);
   ::setenv("LSE_HIP_DUMP", dump.string().c_str(), 1);
-  set_debug(true);
 
   CacheStubBackend be;
   CountingCompiler cc;
@@ -660,7 +741,6 @@ LSE_TEST(debug_writes_generated_hip_for_review) {
   const auto bytes = fs::file_size(hip);
   LSE_EXPECT_EQ(bytes, ek.source.size());
 
-  set_debug(false);
   ::unsetenv("LSE_HIP_DUMP");
   std::error_code ec;
   fs::remove_all(dump, ec);
@@ -698,8 +778,9 @@ LSE_TEST(live_arch_picks_the_widest_load) {
   LSE_EXPECT_EQ(backend::max_load_bytes(any_gfx), 16u);
 }
 
-// Decode-shaped (M < 16): LDS K-panel, not the 16x16 matrix core.
-LSE_TEST(small_m_linear_stages_weights_through_lds) {
+// Decode-shaped (M=1): still WMMA. One wave owns a 16-wide N tile;
+// padding the M side is cheaper than a scalar column walk.
+LSE_TEST(decode_linear_uses_wmma_row_tiles) {
   ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{64, 32}, DType::kF32, 1.0f);
@@ -707,12 +788,11 @@ LSE_TEST(small_m_linear_stages_weights_through_lds) {
   auto e = emit_last_for(y);
   LSE_EXPECT(e.ok());
   if (!e.ok()) return;
-  LSE_EXPECT(e->source.find("__shfl_xor") != std::string::npos);
-  LSE_EXPECT(e->source.find("wmma") == std::string::npos);
+  LSE_EXPECT(e->source.find("__builtin_amdgcn_wmma_f32_16x16x16_f16_w32") !=
+             std::string::npos);
   LSE_EXPECT(e->dims.workgroup_size[0] == 256u);
-  // 64 columns, 8 waves per group.
-  LSE_EXPECT(e->dims.workgroup_count[0] == 8u);
-  LSE_EXPECT(e->dims.workgroup_count[1] == 1u);
+  // 64/16 = 4 column tiles, 8 waves to a group → one workgroup.
+  LSE_EXPECT(e->dims.workgroup_count[0] == 1u);
   if (!kCompiler.available()) return;
   auto code = kCompiler.compile(e->source, "gfx1151");
   if (!code.ok()) {

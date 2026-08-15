@@ -256,6 +256,13 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
     h ^= amd->wavefront_size;
     h *= 1099511628211ull;
   }
+  // Persist-grid source (gbar, lse_grid_sync, grid-stride walks) is a
+  // different kernel from the one-workgroup walk. Disk and emit caches
+  // key on this, so a 1-CU box cannot reuse a 40-CU object.
+  if (group.is_phase && device.compute_units >= 2) {
+    h ^= 2;
+    h *= 1099511628211ull;
+  }
   return h;
 }
 
@@ -281,13 +288,15 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.pointer_table = false;
       out.constants.add("count", 4);
       out.scratch_bytes = it->second.scratch_bytes;
+      out.persist_grid = it->second.persist_grid;
       bind_phase(group, out);
       return out;
     }
     auto emitted = emit_phase(group, device);
     if (emitted.ok()) {
       emit_cache_[key] = CachedEmit{emitted->source, emitted->entry_name,
-                                    emitted->dims, emitted->scratch_bytes};
+                                    emitted->dims, emitted->scratch_bytes,
+                                    emitted->persist_grid};
     }
     return emitted;
   }

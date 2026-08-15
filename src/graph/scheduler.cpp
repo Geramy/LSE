@@ -23,6 +23,7 @@ namespace lse::graph {
 struct Scheduler::Impl {
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
+  backend::DeviceBuffer grid_bar;
 
   Program program;
 
@@ -79,6 +80,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group) {
   const auto t_emit = std::chrono::steady_clock::now();
   auto emitted = emitter->emit(group, backend_.device_info());
   if (!emitted.ok()) return emitted.status();
+  dump_hip_source(*emitted, ident);
 
   // Compile only when this kernel is not already loaded for this device.
   // Disk miss / source change / arch change still go through get_or_compile.
@@ -174,6 +176,20 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group) {
         backend::BufferRef{&table_buf, 0, table_buf.size_bytes});
     impl_->phase_tables.push_back(std::move(table_buf));
     table_bindings.back().buffer = &impl_->phase_tables.back();
+  }
+
+  if (emitted->persist_grid) {
+    if (!impl_->grid_bar.valid()) {
+      auto bar = backend_.allocate(sizeof(std::uint32_t),
+                                   backend::MemoryClass::kDevice);
+      if (!bar.ok()) return bar.status();
+      impl_->grid_bar = bar.release();
+      const std::uint32_t zero = 0;
+      LSE_RETURN_IF_ERROR(backend_.copy_h2d(&zero, impl_->grid_bar,
+                                            sizeof(zero), 0));
+    }
+    bindings.push_back(
+        backend::BufferRef{&impl_->grid_bar, 0, impl_->grid_bar.size_bytes});
   }
 
   backend::DispatchArgs args;
@@ -463,9 +479,10 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         return true;
       };
       for (const NodePtr& n : g.nodes) {
-        // Vocab-wide GEMV keeps its own grid. Hidden-width linears stay
-        // in the phase body as sequential stages.
-        const bool wide = linear_n(*n) >= 65536;
+        // N>=128 matches Workgroup::is_wide_linear. Those GEMVs get a
+        // fat grid; stream visibility is the barrier. A software grid
+        // sync deadlocks without a cooperative launch.
+        const bool wide = linear_n(*n) >= 128;
         if (wide) {
           flush_staged();
           if (join_wide_linear(n)) continue;

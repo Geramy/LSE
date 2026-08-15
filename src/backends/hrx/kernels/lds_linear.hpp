@@ -6,14 +6,17 @@
 namespace lse::backend::hrx_kernels {
 
 // One wave per output column, lanes on consecutive K. `grid` maps tile/row
-// onto the launch; otherwise the same body walks every tile in one workgroup.
+// onto the launch; `persist` grid-strides tiles by `persist_wgs` so every
+// resident block works. Otherwise the same body walks every tile in one
+// workgroup. `persist_wgs` is a literal — HIP gridDim is not reliable here.
 void emit_gemv(graph::kir::KernelBody& k,
                const graph::kir::Buffer<graph::kir::f32>& x,
                const graph::kir::Buffer<graph::kir::f32>& w,
                const graph::kir::Buffer<graph::kir::f32>* idx, std::uint32_t keep,
                std::uint32_t slot, std::uint32_t N, std::uint32_t K,
                std::uint32_t M, std::uint32_t load_bytes, bool grid,
-               std::uint32_t wave);
+               std::uint32_t wave, bool persist = false,
+               std::uint32_t persist_wgs = 1);
 
 // Small-M linear through an LDS K-panel. Null when the tile does not fit or
 // the device has no workgroup scratch.

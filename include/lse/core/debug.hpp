@@ -2,8 +2,8 @@
 
 namespace lse {
 
-// Process-wide debug. `--debug` or LSE_DEBUG=1. When on, each generated HIP
-// translation unit is written under the build directory for review.
+// Process-wide debug. `--debug` or LSE_DEBUG=1. HIP dumps are always written;
+// this flag only adds path/count prints.
 void set_debug(bool on) noexcept;
 [[nodiscard]] bool debug() noexcept;
 

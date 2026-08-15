@@ -94,11 +94,12 @@ struct LinearKernel final : KernelPrimitive<LinearKernel> {
   // Hands over to the matrix cores where they exist and the layout has been
   // verified; everywhere else this scalar loop stands.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
-    // Decode (and short prefill) is a GEMV: LDS-panel beats a 16x16 matrix
-    // core that would spend 15/16 of the tile on padding.
+    // W is [N, K], x is [.., K]: both rows are contiguous in K, which is
+    // the WMMA A/B layout. Decode M=1 pads the M tile; that is still one
+    // wave per 16 output columns and a fat grid, not a scalar GEMV.
+    if (const KernelPrimitiveBase* wmma = wmma_linear_for(s)) return wmma;
     if (const KernelPrimitiveBase* lds = lds_linear_for(s)) return lds;
-    const KernelPrimitiveBase* wmma = wmma_linear_for(s);
-    return wmma != nullptr ? wmma : this;
+    return this;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {

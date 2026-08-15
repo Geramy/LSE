@@ -151,8 +151,10 @@ void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
                const kir::Buffer<kir::f32>& w, const kir::Buffer<kir::f32>* idx,
                std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
                std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
-               bool grid, std::uint32_t wave) {
+               bool grid, std::uint32_t wave, bool persist,
+               std::uint32_t persist_wgs) {
   if (wave != 32 && wave != 64) wave = 32;
+  if (persist_wgs == 0) persist_wgs = 1;
   const auto lid = k.let<kir::u32>("lid", math::local_id());
   const auto wave_id = k.let<kir::u32>("wave", lid / wave);
   const auto lane = k.let<kir::u32>("lane", lid % wave);
@@ -164,6 +166,16 @@ void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
               load_bytes);
   };
 
+  if (persist) {
+    k.loop("row", k.constant<kir::u32>(0), k.constant<kir::u32>(M), 1,
+           [&](kir::Val<kir::u32> row) {
+             k.loop("tile", math::workgroup_id_x(),
+                    k.constant<kir::u32>(ntiles),
+                    k.constant<kir::u32>(persist_wgs),
+                    [&](kir::Val<kir::u32> tile) { run(tile, row); });
+           });
+    return;
+  }
   if (grid) {
     const auto tile = k.let<kir::u32>("tile", math::workgroup_id_x());
     const auto row = k.let<kir::u32>("row", math::workgroup_id_y());

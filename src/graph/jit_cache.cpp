@@ -1,7 +1,5 @@
 #include "lse/graph/jit.hpp"
 
-#include "lse/core/debug.hpp"
-
 #include <unistd.h>
 
 #include <cctype>
@@ -10,7 +8,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace lse::graph {
 
@@ -108,8 +108,10 @@ void write_text(const fs::path& path, std::string_view text) {
   if (ec) fs::remove(tmp, ec);
 }
 
+}  // namespace
+
 void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key) {
-  if (!debug() || emitted.source.empty()) return;
+  if (emitted.source.empty()) return;
   const fs::path dir = hip_dump_directory();
   if (dir.empty()) return;
 
@@ -123,12 +125,17 @@ void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key) {
     }
   }
 
+  static std::mutex mu;
+  static std::unordered_set<std::string> written;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!written.insert(name).second) return;
+  }
+
   std::error_code ec;
   fs::create_directories(dir, ec);
   write_text(dir / (name + ".hip"), emitted.source);
 }
-
-}  // namespace
 
 std::string hip_dump_directory() {
   if (const char* env = std::getenv("LSE_HIP_DUMP"); env != nullptr && env[0] != '\0') {
@@ -139,6 +146,27 @@ std::string hip_dump_directory() {
 #else
   return {};
 #endif
+}
+
+void purge_kernel_artifacts() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const auto wipe = [](const fs::path& dir) {
+      if (dir.empty()) return;
+      const fs::path n = dir.lexically_normal();
+      if (n.empty() || n == n.root_path()) return;
+      const std::string s = n.generic_string();
+      if (s.find("lse") == std::string::npos &&
+          s.find("hip") == std::string::npos &&
+          s.find("kernel") == std::string::npos) {
+        return;
+      }
+      std::error_code ec;
+      fs::remove_all(n, ec);
+    };
+    wipe(default_cache_dir());
+    wipe(hip_dump_directory());
+  });
 }
 
 std::string default_cache_dir() {
@@ -166,7 +194,9 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
     : backend_(backend),
       compiler_(compiler),
       cache_dir_(std::move(cache_dir)),
-      impl_(std::make_unique<Impl>()) {}
+      impl_(std::make_unique<Impl>()) {
+  purge_kernel_artifacts();
+}
 
 JitCache::~JitCache() = default;
 

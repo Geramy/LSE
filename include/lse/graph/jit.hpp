@@ -21,8 +21,16 @@ namespace lse::graph {
 // $LSE_CACHE_DIR, else $XDG_CACHE_HOME/lse/kernels, else ~/.cache/lse/kernels.
 std::string default_cache_dir();
 
-// Directory used when debug() is on. $LSE_HIP_DUMP, else ${CMAKE_BINARY_DIR}/hip.
+// $LSE_HIP_DUMP, else ${CMAKE_BINARY_DIR}/hip.
 std::string hip_dump_directory();
+
+// Writes `emitted.source` under hip_dump_directory(). One file per
+// entry name per process; later launches of the same kernel skip.
+void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key = 0);
+
+// Drops on-disk code objects and HIP dumps from the previous process.
+// Called once the first time this process constructs a JitCache.
+void purge_kernel_artifacts();
 
 class JitCache {
  public:

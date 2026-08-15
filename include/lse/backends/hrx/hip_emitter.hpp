@@ -58,6 +58,7 @@ class HipEmitter final : public graph::IKernelEmitter {
     std::string entry_name;
     LaunchDims dims{};
     std::size_t scratch_bytes = 0;
+    bool persist_grid = false;
   };
   mutable std::unordered_map<std::uint64_t, CachedEmit> emit_cache_;
 };

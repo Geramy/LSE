@@ -55,7 +55,7 @@ void usage() {
       "      --kv-len N         allocate the KV cache for N tokens and keep\n"
       "                         that shape (default: max(2*train_seq, 2048))\n"
       "      --stats            print timings when done\n"
-      "      --debug            write generated HIP to the build directory\n"
+      "      --debug            print the HIP dump path and file count\n"
       "      --devices          list available backends and exit\n"
       "  -h, --help             this message");
 }
@@ -289,17 +289,19 @@ int main(int argc, char** argv) {
       if (++shown == 12) break;
     }
   }
-  if (opt.debug) {
+  {
     const std::string dir = lse::graph::hip_dump_directory();
     std::error_code ec;
     std::size_t n = 0;
-    if (!dir.empty()) {
+    if (!dir.empty() && std::filesystem::exists(dir, ec)) {
       for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
         if (!ec && e.path().extension() == ".hip") ++n;
       }
     }
-    std::fprintf(stderr, "debug: wrote %zu HIP file%s to %s\n", n,
-                 n == 1 ? "" : "s", dir.c_str());
+    if (n > 0 || opt.debug) {
+      std::fprintf(stderr, "hip: %zu file%s in %s\n", n, n == 1 ? "" : "s",
+                   dir.c_str());
+    }
   }
   return 0;
 }

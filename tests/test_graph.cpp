@@ -829,9 +829,10 @@ LSE_TEST(sibling_linears_at_hidden_width) {
   LSE_EXPECT_EQ(qv.size(), 4096u);
   LSE_EXPECT_EQ(kv.size(), 1024u);
   LSE_EXPECT_EQ(av.size(), 128u);
-  for (float e : qv) LSE_EXPECT_NEAR(e, 10.24, 1e-3);
-  for (float e : kv) LSE_EXPECT_NEAR(e, 20.48, 1e-3);
-  for (float e : av) LSE_EXPECT_NEAR(e, 40.96, 1e-3);
+  // WMMA multiplies f16 fragments; 1024 terms of 0.01 sit about 2e-3 off.
+  for (float e : qv) LSE_EXPECT_NEAR(e, 10.24, 5e-3);
+  for (float e : kv) LSE_EXPECT_NEAR(e, 20.48, 5e-3);
+  for (float e : av) LSE_EXPECT_NEAR(e, 40.96, 5e-3);
 }
 
 LSE_TEST(a_small_decode_ffn_is_one_cut) {

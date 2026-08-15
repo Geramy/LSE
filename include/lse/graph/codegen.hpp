@@ -55,6 +55,8 @@ struct EmittedKernel {
   std::size_t scratch_bytes = 0;
   // Kernel takes `const float* const* buf` and binding_order[i] is buf[i].
   bool pointer_table = false;
+  // Dependent stages run as a resident grid; last binding is the grid barrier.
+  bool persist_grid = false;
 };
 
 class IKernelEmitter {

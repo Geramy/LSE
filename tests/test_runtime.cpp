@@ -229,9 +229,11 @@ LSE_TEST(cached_decode_matches_a_full_forward_pass) {
   std::printf("       cached vs whole: max_abs=%.3e max_rel=%.3e over %zu\n",
               max_abs, max_rel, whole.size());
 
-  // Also the decision, not just the numbers.
+  // Also the decision, not just the numbers. WMMA decode is f16×f16
+  // accumulated in f32; a full-seq tile and a padded M=1 tile disagree
+  // around 1e-3, which is still the same argmax.
   LSE_EXPECT_EQ(argmax(stepped), argmax(whole));
-  LSE_EXPECT(max_rel < 1e-5);
+  LSE_EXPECT(max_rel < 2e-3);
 }
 
 LSE_TEST(a_second_decode_step_replays_the_held_program) {

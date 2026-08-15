@@ -467,6 +467,9 @@ class KernelBody {
   void loop(std::string_view var, const Val<u32>& lo, const Val<u32>& hi,
             std::uint32_t step, F&& body);
   template <typename F>
+  void loop(std::string_view var, const Val<u32>& lo, const Val<u32>& hi,
+            const Val<u32>& step, F&& body);
+  template <typename F>
   void unroll(std::string_view var, std::uint32_t count, F&& body);
 
   // An intrinsic, spelled by the backend's table. `$0`.. are the arguments, so
@@ -690,10 +693,17 @@ void KernelBody::when(const Val<boolean>& cond, F&& body) {
 template <typename F>
 void KernelBody::loop(std::string_view var, const Val<u32>& lo,
                       const Val<u32>& hi, std::uint32_t step, F&& body) {
+  loop(var, lo, hi, Val<u32>{types_, detail::literal_u32(step)},
+       std::forward<F>(body));
+}
+
+template <typename F>
+void KernelBody::loop(std::string_view var, const Val<u32>& lo,
+                      const Val<u32>& hi, const Val<u32>& step, F&& body) {
   const std::string v(var);
   const std::string ty(types_->scalar(Scalar::kU32));
   statement("for (" + ty + " " + v + " = " + lo.text() + "; " + v + " < " +
-            hi.text() + "; " + v + " += " + detail::literal_u32(step) + ") {");
+            hi.text() + "; " + v + " += " + step.text() + ") {");
   ++depth_;
   std::forward<F>(body)(Val<u32>{types_, v});
   --depth_;
