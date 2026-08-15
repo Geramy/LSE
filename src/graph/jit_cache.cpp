@@ -245,7 +245,6 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   }
 
   const fs::path stem = fs::path(cache_dir_) / std::to_string(key);
-  const fs::path co_path = stem.string() + ".co";
   const fs::path meta_path = stem.string() + ".meta";
 
   DiskMeta meta;
@@ -253,6 +252,15 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   const bool source_matches =
       src_hash == 0 || (meta_ok && src_hash == meta.source_hash);
   const bool device_matches = meta_ok && meta.arch == arch;
+
+  // The object is named by the source hash it was built from, so a load can
+  // never pair one source's meta with another source's code: the two renames
+  // below are individually atomic but not atomic as a pair, and a crash
+  // between them must not be able to poison the key forever.
+  const std::uint64_t co_hash =
+      src_hash != 0 ? src_hash : (meta_ok ? meta.source_hash : 0);
+  const fs::path co_path =
+      stem.string() + "." + std::to_string(co_hash) + ".co";
 
   std::vector<std::byte> code;
   if (device_matches && source_matches) {
@@ -277,6 +285,19 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
 
     std::error_code ec;
     fs::create_directories(cache_dir_, ec);
+    // Best-effort reclaim of objects this key no longer references (older
+    // source revisions); the hash-suffixed name makes them dead, not wrong.
+    for (fs::directory_iterator it(cache_dir_, ec), end; !ec && it != end;
+         ++it) {
+      const std::string name = it->path().filename().string();
+      const std::string prefix = std::to_string(key) + ".";
+      if (name.rfind(prefix, 0) == 0 && name.size() > 3 &&
+          name.compare(name.size() - 3, 3, ".co") == 0 &&
+          it->path() != co_path) {
+        std::error_code rm;
+        fs::remove(it->path(), rm);
+      }
+    }
     write_code(co_path, code);
     write_meta(meta_path, DiskMeta{arch, src_hash, emitted.entry_name});
   }

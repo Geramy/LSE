@@ -271,10 +271,11 @@ struct Emit {
   }
 
  private:
+  // Ids come from the body, not this object: a helper that builds its own
+  // Emit over the same body (the shims do) stays collision-free.
   [[nodiscard]] std::string next(const char* stem) {
-    return std::string(stem) + std::to_string(counter_++);
+    return std::string(stem) + std::to_string(k->fresh_id());
   }
-  int counter_ = 0;
 };
 
 // --------------------------------------------------------------------------

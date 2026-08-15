@@ -386,7 +386,6 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       accumulate(acc_, trace_);
       return OkStatus();
     }
-    phase_groups = rec.groups();
     replayed = true;
     trace_.replayed = true;
     trace_.phase_groups = static_cast<std::uint32_t>(rec.phases().size());
@@ -519,15 +518,22 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   }
 
   std::vector<FusionGroup> ran;
+  // Replays run the retained groups in place: no copy of the group list, and
+  // no re-retain afterwards — retain() re-walks the whole reachable graph and
+  // was most of the host-side churn of a decode token.
+  const std::vector<FusionGroup>& staged_groups =
+      replayed ? rec.groups() : phase_groups;
   if (mode_ == Mode::kDeviceFirst && backend_.emitter() != nullptr &&
-      !phase_groups.empty()) {
+      !staged_groups.empty()) {
       bool launched_phase = true;
-      for (const FusionGroup& g : phase_groups) {
+      std::size_t done = 0;
+      for (const FusionGroup& g : staged_groups) {
         if (views_only(g)) {
           alias_ready_reshapes(g);
           ++trace_.views_aliased;
           trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
-          ran.push_back(g);
+          if (!replayed) ran.push_back(g);
+          ++done;
           continue;
         }
         Status st = try_dispatch_group(g);
@@ -543,11 +549,12 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         ++trace_.device_groups;
         ++trace_.kernels_launched;
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
-        ran.push_back(g);
+        if (!replayed) ran.push_back(g);
+        ++done;
       }
       if (launched_phase) {
-        rec.retain(roots, std::move(planned), ran, order);
         if (!replayed) {
+          rec.retain(roots, std::move(planned), ran, order);
           trace_.partition_ns = static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - t_part)
@@ -572,7 +579,12 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         return OkStatus();
       }
     // Prefix in `ran` already launched. Partition only the rest; retain
-    // prefix + suffix so the next reset_compute has a full cover.
+    // prefix + suffix so the next reset_compute has a full cover. A failed
+    // replay recovers its launched prefix from the retained groups here.
+    if (replayed) {
+      ran.assign(staged_groups.begin(),
+                 staged_groups.begin() + static_cast<std::ptrdiff_t>(done));
+    }
   }
 
   std::vector<FusionGroup> groups =

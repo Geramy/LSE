@@ -509,7 +509,13 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
             if (in_n.get() == want) found = in_n;
           }
         }
-        if (found) bind(found);
+        // Skipping would shift every later slot while the kernel text keeps
+        // its own numbering — a silent misbind, so it must be fatal.
+        if (!found) {
+          return LSE_ERROR(kInternal,
+                           "linked pipeline input is outside the group closure");
+        }
+        bind(found);
       }
     } else if (anchor) {
       for (const NodePtr& in : anchor->inputs) bind(in);

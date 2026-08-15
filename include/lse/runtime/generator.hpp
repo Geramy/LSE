@@ -15,6 +15,7 @@
 
 #include "lse/core/status.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/graph/program.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/runtime/sampler.hpp"
 #include "lse/runtime/session.hpp"
@@ -97,11 +98,38 @@ class Generator {
   Result<std::vector<float>> step(Session& session,
                                   const std::vector<std::uint32_t>& tokens);
 
+  // One decode token through the retained head program, returning its root:
+  // the logit row, or the argmax index when `greedy`. Built once against the
+  // forward cache's hidden root, then replayed — this is what keeps the
+  // per-token lm_head off the partitioner.
+  Result<graph::Array> decode_head(Session& session, std::uint32_t token,
+                                   bool greedy);
+  // Device-greedy decode step: forward + argmax on device, 4 bytes back.
+  Result<std::uint32_t> greedy_step(Session& session, std::uint32_t token);
+  Status poke_decode_ids(std::uint32_t token);
+
   HybridLM& model_;
   Sampler sampler_;
   std::unique_ptr<Session> owned_;
   GenerationStats stats_;
   std::vector<std::string> host_reasons_;
+
+  // The lm_head subgraph, retained like HybridLM's forward program so decode
+  // token 2 onward replays instead of re-partitioning. `compute` is exactly
+  // the head's own nodes: clearing only those leaves the forward graph's
+  // materialized flags alone.
+  struct DecodeHead {
+    graph::Program program;
+    graph::Array hidden;
+    graph::Array logits;
+    graph::Array pick;
+    std::vector<graph::NodePtr> compute;
+    bool greedy = false;
+  };
+  DecodeHead head_;
+  // Persistent [1,1] token slot for decode; poked on the host and uploaded by
+  // whichever program consumes it, never re-allocated per token.
+  graph::Array decode_ids_;
 };
 
 }  // namespace lse::runtime

@@ -78,6 +78,13 @@ Array overwrite_slice(const Array& dst, const Array& src, int axis,
 Array topk(const Array& x, int k, int axis = -1, Array* indices = nullptr,
            float score_band = 1.0f);
 
+// Index of the row maximum over the last axis, as f32 (the engine's index
+// convention — see topk). Ties take the smallest index, matching the host
+// sampler's argmax exactly. Two nodes: a per-chunk partial reduce to
+// [.., nchunks, 2] (value, index) and a final combine to [..] (or [1] for a
+// rank-1 input), so greedy decode reads back one float instead of the row.
+Array argmax(const Array& x);
+
 // Interleaved-pair RoPE over [B, H, T, D]; cos/sin are [max_T, D].
 Array rope(const Array& x, const Array& cos, const Array& sin, int offset);
 // `offset` is a 1-element tensor so decode can poke it without a new kernel.
@@ -91,9 +98,17 @@ Array l2_normalize(const Array& x, float eps = 1e-12f);
 Array softplus(const Array& x);
 
 // Causal depthwise conv over the time axis. x [B,T,C], weight [C,K], bias [C].
-// Left-pads with K-1 zeros (or `state`, the previous tail) so output[t] depends
-// only on inputs <= t.
+// Left-pads with K-1 zeros (or `tail`, the previous K-1 inputs) so output[t]
+// depends only on inputs <= t.
 Array causal_conv1d(const Array& x, const Array& weight, const Array& bias);
+// Streaming form: window positions before x's start read `tail` [B,K-1,C]
+// instead of the zero pad. Same values, same accumulation order.
+Array causal_conv1d(const Array& x, const Array& weight, const Array& bias,
+                    const Array& tail);
+
+// The advanced conv window: the last tail-many columns of tail ++ x, without
+// materializing the concatenation. Output shape == tail's.
+Array conv_tail(const Array& tail, const Array& x);
 
 // Gated delta rule, run per token:
 //   S = S*alpha; S += ((v - S k) * beta) k^T; o = S q

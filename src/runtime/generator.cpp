@@ -87,8 +87,91 @@ Result<Array> Generator::last_hidden(const Array& hidden) {
   return graph::reshape(row, flat);
 }
 
+Status Generator::poke_decode_ids(std::uint32_t token) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no usable backend to hold token ids");
+  }
+  if (!decode_ids_.valid()) {
+    const std::size_t bytes = dtype_storage_bytes(DType::kF32, 1);
+    auto buf = sched->backend().allocate(bytes, backend::MemoryClass::kDevice);
+    if (!buf.ok()) return buf.status();
+    decode_ids_ = Array::from_buffer(buf.release(), Shape{1, 1}, DType::kF32);
+  }
+  graph::Node& n = *decode_ids_.node();
+  const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
+  if (n.host_mirror.size() < bytes) n.host_mirror.resize(bytes);
+  graph::interpreter::store_element(n, 0, static_cast<float>(token));
+  n.materialized = true;
+  // No upload here: the forward replay pokes the slot (its own 4-byte H2D)
+  // and a rebuild syncs it when the embedding group binds it.
+  return OkStatus();
+}
+
+Result<graph::Array> Generator::decode_head(Session& session,
+                                            std::uint32_t token, bool greedy) {
+  LSE_RETURN_IF_ERROR(poke_decode_ids(token));
+  LSE_ASSIGN_OR(Array hidden,
+                model_.hidden(decode_ids_, &session.states(), nullptr));
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no usable backend for the lm_head");
+  }
+
+  const bool reuse = head_.hidden.valid() && head_.logits.valid() &&
+                     head_.hidden.node().get() == hidden.node().get() &&
+                     head_.greedy == greedy && (!greedy || head_.pick.valid());
+  if (!reuse) {
+    head_ = DecodeHead{};
+    head_.hidden = hidden;
+    head_.greedy = greedy;
+    // T == 1, so the last row is the whole tensor: a reshape view suffices
+    // and the slice copy of the general path is never built.
+    const Shape& s = hidden.shape();
+    Shape flat;
+    for (std::size_t i = 0; i < s.rank(); ++i) {
+      if (i + 2 == s.rank()) continue;
+      flat.push_back(s.dim(i));
+    }
+    Array last = graph::reshape(hidden, flat);
+    LSE_ASSIGN_OR(head_.logits, model_.lm_head(last));
+    head_.compute = {last.node(), head_.logits.node()};
+    if (greedy) {
+      head_.pick = graph::argmax(head_.logits);
+      if (!head_.pick.valid()) {
+        return LSE_ERROR(kInternal, "argmax over an empty logit row");
+      }
+      head_.compute.push_back(head_.pick.node()->inputs[0]);
+      head_.compute.push_back(head_.pick.node());
+    }
+  }
+
+  Array root = greedy ? head_.pick : head_.logits;
+  for (const graph::NodePtr& n : head_.compute) {
+    if (n) n->materialized = false;
+  }
+  const graph::NodePtr roots[] = {root.node()};
+  LSE_RETURN_IF_ERROR(sched->eval(roots, true, &head_.program));
+  return root;
+}
+
+Result<std::uint32_t> Generator::greedy_step(Session& session,
+                                             std::uint32_t token) {
+  LSE_ASSIGN_OR(Array pick, decode_head(session, token, true));
+  const float id = graph::interpreter::load_element(*pick.node(), 0);
+  return static_cast<std::uint32_t>(id);
+}
+
 Result<std::vector<float>> Generator::step(
     Session& session, const std::vector<std::uint32_t>& tokens) {
+  if (tokens.size() == 1) {
+    LSE_ASSIGN_OR(Array logits, decode_head(session, tokens[0], false));
+    std::vector<float> out(logits.shape().elem_count());
+    LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
+        *logits.node(), out.data(), out.size() * sizeof(float)));
+    return out;
+  }
+
   LSE_ASSIGN_OR(Array ids, token_array(tokens));
   LSE_ASSIGN_OR(Array hidden, model_.hidden(ids, &session.states(), nullptr));
   LSE_ASSIGN_OR(Array last, last_hidden(hidden));
@@ -158,9 +241,19 @@ Result<std::vector<std::uint32_t>> Generator::generate(
            limits.stop_tokens.end();
   };
 
+  // Pure greedy with the repetition penalty at its no-op setting is the one
+  // mode where the sampler never reads more than the argmax, so the index can
+  // come back from the device instead of the whole logit row. Any other knob
+  // keeps the host path. (The penalty's condition in Sampler::sample is
+  // `repetition_penalty != 1.0f`.)
+  const SamplingParams& sp = sampler_.params();
+  const bool device_greedy =
+      sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+
   const std::uint64_t decode_start = now_ns();
+  std::uint32_t next = 0;
+  if (limits.max_tokens > 0) next = sampler_.sample(logits, session.history());
   for (std::int32_t n = 0; n < limits.max_tokens; ++n) {
-    const std::uint32_t next = sampler_.sample(logits, session.history());
     if (is_stop(next)) break;
 
     generated.push_back(next);
@@ -171,7 +264,12 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     if (n + 1 == limits.max_tokens) break;
 
     // Only the new token goes in: every block's state already holds the rest.
-    LSE_ASSIGN_OR(logits, step(session, {next}));
+    if (device_greedy) {
+      LSE_ASSIGN_OR(next, greedy_step(session, next));
+    } else {
+      LSE_ASSIGN_OR(logits, step(session, {next}));
+      next = sampler_.sample(logits, session.history());
+    }
     session.advance(1);
   }
   stats_.decode_ns = now_ns() - decode_start;

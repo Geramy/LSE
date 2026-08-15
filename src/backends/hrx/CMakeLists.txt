@@ -20,6 +20,7 @@ add_library(lse_backend_hrx
   kernels/gather.cpp
   kernels/scatter.cpp
   kernels/topk.cpp
+  kernels/argmax.cpp
   kernels/linear_indexed.cpp
   kernels/conv.cpp
   kernels/rope.cpp

@@ -294,6 +294,34 @@ Array topk(const Array& x, int k, int axis, Array* indices, float score_band) {
   return values;
 }
 
+Array argmax(const Array& x) {
+  const Shape& in = x.shape();
+  if (in.rank() == 0) return {};
+  const std::int64_t n = in.dim(in.rank() - 1);
+  if (n <= 0) return {};
+  // One workgroup reduces one chunk; must agree with the device kernel's
+  // per-workgroup span and the host interpreter (both read iattrs[1]).
+  constexpr std::int64_t kChunk = 4096;
+  const std::int64_t nchunks = (n + kChunk - 1) / kChunk;
+
+  Shape partial_shape;
+  for (std::size_t i = 0; i + 1 < in.rank(); ++i) partial_shape.push_back(in.dim(i));
+  partial_shape.push_back(nchunks);
+  partial_shape.push_back(2);
+  auto p = make(OpKind::kArgMax, partial_shape, DType::kF32, {x.node()});
+  p->iattrs[0] = 0;
+  p->iattrs[1] = static_cast<std::int32_t>(kChunk);
+  p->prim = find_primitive("argmax.partial");
+
+  Shape final_shape;
+  for (std::size_t i = 0; i + 1 < in.rank(); ++i) final_shape.push_back(in.dim(i));
+  if (final_shape.rank() == 0) final_shape.push_back(1);
+  auto f = make(OpKind::kArgMax, final_shape, DType::kF32, {NodePtr(p)});
+  f->iattrs[0] = 1;
+  f->prim = find_primitive("argmax.final");
+  return Array(f);
+}
+
 Array linear_indexed(const Array& x, const Array& w, const Array& idx,
                      int slot) {
   Shape out;
@@ -414,6 +442,21 @@ Array causal_conv1d(const Array& x, const Array& weight, const Array& bias) {
   auto n = make(OpKind::kCausalConv1d, x.shape(), x.dtype(),
                 {x.node(), weight.node(), bias.node()});
   n->prim = find_primitive("causal_conv1d");
+  return Array(n);
+}
+
+Array causal_conv1d(const Array& x, const Array& weight, const Array& bias,
+                    const Array& tail) {
+  auto n = make(OpKind::kCausalConv1d, x.shape(), x.dtype(),
+                {x.node(), weight.node(), bias.node(), tail.node()});
+  n->prim = find_primitive("causal_conv1d");
+  return Array(n);
+}
+
+Array conv_tail(const Array& tail, const Array& x) {
+  auto n = make(OpKind::kConvTailShift, tail.shape(), x.dtype(),
+                {tail.node(), x.node()});
+  n->prim = find_primitive("conv_tail");
   return Array(n);
 }
 

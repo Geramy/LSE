@@ -157,6 +157,58 @@ Status eval_topk(Node& n) {
   return OkStatus();
 }
 
+// Both argmax stages share one comparator: higher value wins, equal values
+// keep the smaller index. This must match runtime::argmax and the device
+// kernels exactly or greedy decode diverges between backends.
+Status eval_argmax(Node& n) {
+  const Node& src = *n.inputs[0];
+  if (n.iattrs[0] == 0) {
+    const auto d = static_cast<std::size_t>(src.shape.dim(src.shape.rank() - 1));
+    const auto chunk = static_cast<std::size_t>(n.iattrs[1]);
+    if (d == 0 || chunk == 0) {
+      return LSE_ERROR(kInvalidArgument, "argmax over an empty axis");
+    }
+    const std::size_t nchunks = (d + chunk - 1) / chunk;
+    const std::size_t rows = src.element_count() / d;
+    for (std::size_t r = 0; r < rows; ++r) {
+      for (std::size_t c = 0; c < nchunks; ++c) {
+        float best_v = -std::numeric_limits<float>::infinity();
+        float best_i = static_cast<float>(d);
+        const std::size_t hi = std::min(d, (c + 1) * chunk);
+        for (std::size_t e = c * chunk; e < hi; ++e) {
+          const float v = load_element(src, r * d + e);
+          const auto idx = static_cast<float>(e);
+          if (v > best_v || (v == best_v && idx < best_i)) {
+            best_v = v;
+            best_i = idx;
+          }
+        }
+        store_element(n, (r * nchunks + c) * 2, best_v);
+        store_element(n, (r * nchunks + c) * 2 + 1, best_i);
+      }
+    }
+    return OkStatus();
+  }
+  const auto nchunks =
+      static_cast<std::size_t>(src.shape.dim(src.shape.rank() - 2));
+  if (nchunks == 0) return LSE_ERROR(kInvalidArgument, "argmax has no partials");
+  const std::size_t rows = src.element_count() / (nchunks * 2);
+  for (std::size_t r = 0; r < rows; ++r) {
+    float best_v = -std::numeric_limits<float>::infinity();
+    float best_i = std::numeric_limits<float>::max();
+    for (std::size_t c = 0; c < nchunks; ++c) {
+      const float v = load_element(src, (r * nchunks + c) * 2);
+      const float idx = load_element(src, (r * nchunks + c) * 2 + 1);
+      if (v > best_v || (v == best_v && idx < best_i)) {
+        best_v = v;
+        best_i = idx;
+      }
+    }
+    store_element(n, r, best_i);
+  }
+  return OkStatus();
+}
+
 Status eval_rms_norm(Node& n) {
   const Node& x = *n.inputs[0];
   const Node& w = *n.inputs[1];
@@ -218,11 +270,13 @@ Status eval_l2_norm(Node& n) {
 }
 
 // x [B,T,C], weight [C,K], bias [C]. Left-padded with zeros so out[t] sees only
-// inputs <= t.
+// inputs <= t. An optional 4th input [B,K-1,C] is the carried tail: window
+// positions before x's start read it instead of the zero pad.
 Status eval_causal_conv1d(Node& n) {
   const Node& x = *n.inputs[0];
   const Node& w = *n.inputs[1];
   const Node& b = *n.inputs[2];
+  const Node* tail = n.inputs.size() > 3 ? n.inputs[3].get() : nullptr;
   const std::size_t rank = x.shape.rank();
   const auto channels = static_cast<std::size_t>(x.shape.dim(rank - 1));
   const auto seq = static_cast<std::size_t>(x.shape.dim(rank - 2));
@@ -235,14 +289,48 @@ Status eval_causal_conv1d(Node& n) {
         double acc = static_cast<double>(load_element(b, c));
         for (std::size_t j = 0; j < kernel; ++j) {
           // weight[c][j] pairs with the input j steps before t; positions
-          // before the start are the zero pad.
+          // before the start are the zero pad or the tail.
           const std::size_t back = kernel - 1 - j;
-          if (t < back) continue;
-          const std::size_t src = ((bi * seq) + (t - back)) * channels + c;
-          acc += static_cast<double>(load_element(x, src)) *
-                 static_cast<double>(load_element(w, c * kernel + j));
+          double in;
+          if (t >= back) {
+            in = static_cast<double>(load_element(
+                x, ((bi * seq) + (t - back)) * channels + c));
+          } else if (tail != nullptr) {
+            // t < back <= K-1 puts t+j inside the K-1 tail columns.
+            in = static_cast<double>(load_element(
+                *tail, ((bi * (kernel - 1)) + (t + j)) * channels + c));
+          } else {
+            continue;
+          }
+          acc += in * static_cast<double>(load_element(w, c * kernel + j));
         }
         store_element(n, (bi * seq + t) * channels + c, static_cast<float>(acc));
+      }
+    }
+  }
+  return OkStatus();
+}
+
+// out == last tail_len columns of tail ++ x, copied.
+Status eval_conv_tail(Node& n) {
+  const Node& tail = *n.inputs[0];
+  const Node& x = *n.inputs[1];
+  const std::size_t rank = x.shape.rank();
+  const auto channels = static_cast<std::size_t>(x.shape.dim(rank - 1));
+  const auto seq = static_cast<std::size_t>(x.shape.dim(rank - 2));
+  const auto keep = static_cast<std::size_t>(n.shape.dim(n.shape.rank() - 2));
+  const std::size_t batch = n.element_count() / (keep * channels);
+
+  for (std::size_t bi = 0; bi < batch; ++bi) {
+    for (std::size_t p = 0; p < keep; ++p) {
+      // Position seq + p in tail ++ x, counted so the window ends at x's end.
+      const std::size_t g = seq + p;
+      for (std::size_t c = 0; c < channels; ++c) {
+        const float v =
+            g >= keep
+                ? load_element(x, ((bi * seq) + (g - keep)) * channels + c)
+                : load_element(tail, ((bi * keep) + g) * channels + c);
+        store_element(n, ((bi * keep) + p) * channels + c, v);
       }
     }
   }
@@ -875,6 +963,10 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
       LSE_RETURN_IF_ERROR(eval_causal_conv1d(n));
       break;
 
+    case OpKind::kConvTailShift:
+      LSE_RETURN_IF_ERROR(eval_conv_tail(n));
+      break;
+
     case OpKind::kGDNChunkScan:
       LSE_RETURN_IF_ERROR(eval_gated_delta(n));
       break;
@@ -929,6 +1021,10 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
 
     case OpKind::kTopK:
       LSE_RETURN_IF_ERROR(eval_topk(n));
+      break;
+
+    case OpKind::kArgMax:
+      LSE_RETURN_IF_ERROR(eval_argmax(n));
       break;
 
     default:

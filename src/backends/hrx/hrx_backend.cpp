@@ -1,5 +1,6 @@
 #include "lse/backends/hrx/hrx_backend.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -135,10 +136,32 @@ Status HrxBackend::init_impl(int device_ordinal) {
   info_.extension_id = AmdDeviceInfo::kExtensionId;
   info_.extension = &amd_;
 
+  flush_interval_ = 16;
+  if (const char* env = std::getenv("LSE_FLUSH_INTERVAL");
+      env != nullptr && env[0] != '\0') {
+    char* end = nullptr;
+    const long v = std::strtol(env, &end, 10);
+    if (end != env && *end == '\0' && v >= 0) {
+      flush_interval_ = static_cast<std::uint32_t>(v);
+    }
+  }
+
   initialized_ = true;
   return OkStatus();
 #endif
 }
+
+#if LSE_HRX_LINKED
+Status HrxBackend::flush_pending() {
+  unflushed_launches_ = 0;
+  return from_hrx(hrx_stream_flush(static_cast<hrx_stream_t>(stream_)),
+                  "hrx_stream_flush");
+}
+#else
+Status HrxBackend::flush_pending() {
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+}
+#endif
 
 void HrxBackend::adopt(DeviceBuffer& buf, std::uint64_t handle,
                        std::size_t bytes) {
@@ -153,8 +176,11 @@ void HrxBackend::adopt(DeviceBuffer& buf, std::uint64_t handle,
 void HrxBackend::release_buffer(std::uint64_t handle) noexcept {
 #if LSE_HRX_LINKED
   if (handle == 0) return;
-  // Stream-ordered: the device free waits for work already recorded on
-  // stream_, matching hipFreeAsync.
+  // Safe against in-flight AND still-unflushed dispatches: hrx command
+  // buffers are ONE_SHOT (not UNRETAINED), so recording a dispatch inserts
+  // its buffers into the CB's resource set, which keeps the hal buffer (and
+  // its backing pool) alive until the CB itself retires. This release only
+  // drops our reference.
   hrx_buffer_release(reinterpret_cast<hrx_buffer_t>(handle));
 #else
   (void)handle;
@@ -199,10 +225,13 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
   hrx_buffer_t buffer = nullptr;
   if (!staging) {
     // hipMallocAsync: ordered against work already on this stream.
+    // hrx_buffer_allocate flushes the stream internally (libhrx buffer.c), so
+    // an allocation mid-batch submits the open command buffer for us.
     LSE_RETURN_IF_ERROR(from_hrx(
         hrx_buffer_allocate(static_cast<hrx_stream_t>(stream_), bytes,
                             HRX_MEMORY_TYPE_DEVICE_LOCAL, usage, &buffer),
         "hrx_buffer_allocate"));
+    unflushed_launches_ = 0;
   } else {
     // Staging has to stay mapped; the stream-ordered path is device-local.
     hrx_buffer_params_t params = {};
@@ -272,6 +301,10 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   if (dst_offset + bytes > dst.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_h2d writes past the end of the buffer");
   }
+  // hrx_synchronous_* is a separate device submission with no ordering
+  // against the stream's unflushed command buffer; submit pending dispatches
+  // first or the transfer races them.
+  LSE_RETURN_IF_ERROR(flush_pending());
   return from_hrx(hrx_synchronous_h2d(static_cast<hrx_device_t>(device_), src,
                                       reinterpret_cast<hrx_buffer_t>(dst.handle),
                                       dst.offset + dst_offset, bytes),
@@ -291,6 +324,9 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   if (src_offset + bytes > src.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_d2h reads past the end of the buffer");
   }
+  // Same ordering hazard as copy_h2d: unflushed dispatches must be submitted
+  // before the transfer reads their results.
+  LSE_RETURN_IF_ERROR(flush_pending());
   return from_hrx(hrx_synchronous_d2h(static_cast<hrx_device_t>(device_),
                                       reinterpret_cast<hrx_buffer_t>(src.handle),
                                       src.offset + src_offset, dst, bytes),
@@ -397,11 +433,17 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
                           bindings.empty() ? nullptr : bindings.data(),
                           bindings.size(), args.flags),
       "hrx_stream_dispatch"));
-  // Submit now so the GPU runs this kernel while the host records the next
-  // one. Leaving everything in pending_cb until synchronize() keeps the
-  // device idle for the whole emit/alloc walk.
-  return from_hrx(hrx_stream_flush(static_cast<hrx_stream_t>(stream_)),
-                  "hrx_stream_flush");
+  // Dispatches accumulate in the stream's open command buffer: hrx already
+  // records a dispatch->dispatch barrier per launch, so batching preserves
+  // execution order while paying one queue_execute + semaphore hop per batch
+  // instead of per kernel. The periodic flush keeps the GPU fed while the
+  // host records the rest of the token's launches. Do not reach for
+  // hrx_stream_begin_capture/hrx_graph_exec_update to go further: both are
+  // UNIMPLEMENTED stubs in libhrx (graph.c) as of this writing.
+  if (flush_interval_ != 0 && ++unflushed_launches_ >= flush_interval_) {
+    return flush_pending();
+  }
+  return OkStatus();
 #endif
 }
 
@@ -426,6 +468,9 @@ Status HrxBackend::synchronize_impl() {
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
   if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
+  // hrx_stream_synchronize flushes the open command buffer itself before
+  // waiting (libhrx stream.c), so no explicit flush_pending() here.
+  unflushed_launches_ = 0;
   return from_hrx(hrx_stream_synchronize(static_cast<hrx_stream_t>(stream_)),
                   "hrx_stream_synchronize");
 #endif

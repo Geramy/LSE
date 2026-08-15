@@ -13,6 +13,7 @@
 
 #include "harness.hpp"
 #include "lse/graph/interpreter.hpp"
+#include "lse/graph/ops.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/lemonseed.hpp"
@@ -280,6 +281,111 @@ LSE_TEST(a_second_decode_step_replays_the_held_program) {
   sched->reset_accumulated_trace();
   LSE_EXPECT(run(7));
   LSE_EXPECT(!sched->last_trace().replayed);
+}
+
+LSE_TEST(graph_argmax_matches_the_host_sampler_argmax) {
+  // 5000 elements crosses the 4096-per-chunk partial stage, so both the
+  // in-chunk reduce and the cross-chunk combine are exercised. The duplicated
+  // maximum checks the tie rule: smallest index, exactly like runtime::argmax.
+  const std::int64_t n = 5000;
+  std::vector<float> row(static_cast<std::size_t>(n));
+  for (std::size_t i = 0; i < row.size(); ++i) {
+    row[i] = 3.0f * std::sin(static_cast<float>(i) * 0.7f);
+  }
+  row[1234] = 9.5f;
+  row[4321] = 9.5f;
+
+  const auto pick_of = [](const std::vector<float>& values) -> std::uint32_t {
+    graph::Array a = graph::Array::zeros(
+        Shape{1, static_cast<std::int64_t>(values.size())}, DType::kF32);
+    if (!a.eval().ok()) return 0xffffffffu;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      graph::interpreter::store_element(*a.node(), i, values[i]);
+    }
+    graph::Array pick = graph::argmax(a);
+    if (!pick.valid()) return 0xffffffffu;
+    auto v = pick.item();
+    if (!v.ok()) return 0xffffffffu;
+    return static_cast<std::uint32_t>(*v);
+  };
+
+  LSE_EXPECT_EQ(pick_of(row), argmax(row));
+  LSE_EXPECT_EQ(pick_of(row), 1234u);
+
+  // Maximum inside the trailing, partial chunk.
+  row[4321] = 11.0f;
+  LSE_EXPECT_EQ(pick_of(row), argmax(row));
+  LSE_EXPECT_EQ(pick_of(row), 4321u);
+
+  // All-negative row: nothing beats index ordering on the way down.
+  for (float& v : row) v = -std::abs(v) - 1.0f;
+  LSE_EXPECT_EQ(pick_of(row), argmax(row));
+}
+
+LSE_TEST(greedy_device_decode_matches_the_host_argmax_path) {
+  // The device path reads back one f32 index; it must pick exactly the token
+  // the host sampler picks from the full logit row, step for step.
+  if (!have_model()) return;
+
+  auto paths = model::resolve_model(model_dir());
+  if (!paths.ok()) return;
+  auto ckpt = model::SafeTensors::open(paths->weights);
+  auto cfg = model::Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) return;
+
+  auto lm = model::make_lemonseed(*cfg);
+  model::WeightBinder binder(*ckpt);
+  if (!lm->load(binder).ok()) return;
+
+  const std::vector<std::uint32_t> prompt{1, 42, 1337};
+  constexpr std::int32_t kSteps = 4;
+
+  const auto logits_of = [&](const std::vector<std::uint32_t>& ids,
+                             std::vector<model::MixerState>* states) {
+    graph::Array a = graph::Array::zeros(
+        Shape{1, static_cast<std::int64_t>(ids.size())}, DType::kF32);
+    std::vector<float> out;
+    if (!a.eval().ok()) return out;
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      graph::interpreter::store_element(*a.node(), i, static_cast<float>(ids[i]));
+    }
+    auto h = lm->hidden(a, states, nullptr);
+    if (!h.ok()) return out;
+    auto last = Generator::last_hidden(h.release());
+    if (!last.ok()) return out;
+    auto lg = lm->lm_head(*last);
+    if (!lg.ok()) return out;
+    graph::Array logits = lg.release();
+    out.resize(logits.shape().elem_count());
+    if (!logits.to_host(out.data(), out.size() * sizeof(float)).ok()) out.clear();
+    return out;
+  };
+
+  Session ref("greedy-ref", lm->num_layers());
+  std::vector<std::uint32_t> want;
+  std::vector<float> logits = logits_of(prompt, &ref.states());
+  LSE_EXPECT(!logits.empty());
+  if (logits.empty()) return;
+  std::uint32_t next = argmax(logits);
+  want.push_back(next);
+  for (std::int32_t i = 1; i < kSteps; ++i) {
+    logits = logits_of({next}, &ref.states());
+    LSE_EXPECT(!logits.empty());
+    if (logits.empty()) return;
+    next = argmax(logits);
+    want.push_back(next);
+  }
+
+  SamplingParams sp;
+  sp.temperature = 0.0f;  // repetition_penalty stays at its 1.0 no-op
+  Generator gen(*lm, sp);
+  Session dev("greedy-dev", lm->num_layers());
+  GenerationLimits limits;
+  limits.max_tokens = kSteps;
+  auto got = gen.generate(dev, prompt, limits);
+  LSE_EXPECT(got.ok());
+  if (!got.ok()) return;
+  LSE_EXPECT(*got == want);
 }
 
 LSE_TEST(a_continued_session_only_scores_the_new_tokens) {

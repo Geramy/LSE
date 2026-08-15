@@ -496,6 +496,10 @@ class KernelBody {
 
   [[nodiscard]] const TypeTable& types() const noexcept { return *types_; }
 
+  // One id sequence per body, shared by every generator layered on it, so
+  // two recorders on the same body cannot mint the same name.
+  [[nodiscard]] int fresh_id() noexcept { return temp_++; }
+
   // The body text, with any vector typedefs the kernel used declared at the
   // top. Function-scope typedefs keep this self-contained: a kernel authored
   // here needs nothing added to the emitter's preamble.

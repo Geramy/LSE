@@ -35,7 +35,7 @@ bool is_structural(OpKind k) noexcept {
   switch (k) {
     case OpKind::kReshape: case OpKind::kTranspose: case OpKind::kBroadcast:
     case OpKind::kSlice: case OpKind::kConcat: case OpKind::kGather:
-    case OpKind::kScatter: case OpKind::kRepeat:
+    case OpKind::kScatter: case OpKind::kRepeat: case OpKind::kConvTailShift:
       return true;
     default:
       return false;
@@ -58,7 +58,7 @@ bool is_barrier(OpKind k) noexcept {
     case OpKind::kMatMul: case OpKind::kLinear: case OpKind::kQuantMatMul:
     case OpKind::kAttention: case OpKind::kGDNChunkScan: case OpKind::kMoEDispatch:
     case OpKind::kMoECombine: case OpKind::kEmbedding: case OpKind::kRoPE:
-    case OpKind::kTopK: case OpKind::kOverwriteSlice:
+    case OpKind::kTopK: case OpKind::kArgMax: case OpKind::kOverwriteSlice:
       return true;
     default:
       return is_collective(k);

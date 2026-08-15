@@ -1,7 +1,5 @@
 #include "lse/ops/linear_attention.hpp"
 
-#include <algorithm>
-
 #include "lse/graph/ops.hpp"
 
 namespace lse::ops {
@@ -12,32 +10,19 @@ namespace {
 // the recurrent state overflows to inf, then NaN.
 constexpr float kBetaFloor = 1e-4f;
 
-// Runs the depthwise causal conv over `tail ++ x` and returns only the columns
-// belonging to x, leaving `tail` holding the last kernel-1 inputs for the next
-// call. A null tail is the stateless full-sequence path.
+// Runs the depthwise causal conv over x with `tail` standing in for the zero
+// pad, leaving `tail` holding the last kernel-1 inputs for the next call —
+// no concat of tail ++ x and no slices, which is what keeps the decode-path
+// copy count down. A null or empty tail is the stateless full-sequence path.
 Array conv_stream(const Array& x, const Array& weight, const Array& bias,
                   bool has_bias, Array* tail) {
-  Array input = x;
-  std::int64_t skip = 0;
-  if (tail != nullptr && tail->valid()) {
-    input = graph::concat({*tail, x}, 1);
-    skip = tail->shape().dim(1);
-  }
-
-  Array y = has_bias
-                ? graph::causal_conv1d(input, weight, bias)
-                : graph::causal_conv1d(
-                      input, weight,
-                      Array::zeros(Shape{weight.shape().dim(0)}, x.dtype()));
-
-  if (tail != nullptr) {
-    const std::int64_t kernel = weight.shape().dim(1);
-    const std::int64_t seen = input.shape().dim(1);
-    const std::int64_t keep = std::min(kernel - 1, seen);
-    *tail = keep > 0 ? graph::slice(input, 1, seen - keep, seen) : Array{};
-  }
-  if (skip > 0) y = graph::slice(y, 1, skip, y.shape().dim(1));
-  return y;
+  const Array b = has_bias
+                      ? bias
+                      : Array::zeros(Shape{weight.shape().dim(0)}, x.dtype());
+  if (tail == nullptr || !tail->valid()) return graph::causal_conv1d(x, weight, b);
+  const Array prev = *tail;
+  *tail = graph::conv_tail(prev, x);
+  return graph::causal_conv1d(x, weight, b, prev);
 }
 
 }  // namespace

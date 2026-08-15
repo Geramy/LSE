@@ -66,7 +66,14 @@ class HrxBackend : public Backend<HrxBackend> {
   void* stream_ = nullptr;    // hrx_stream_t
   void* allocator_ = nullptr; // hrx_allocator_t (borrowed)
   bool initialized_ = false;
+  // Dispatches accumulate in the stream's open command buffer and are
+  // submitted every flush_interval_ launches (LSE_FLUSH_INTERVAL; 1 = submit
+  // per launch, 0 = only at sync/transfer boundaries). Counts launches
+  // recorded since the last submit.
+  std::uint32_t flush_interval_ = 0;
+  std::uint32_t unflushed_launches_ = 0;
 
+  Status flush_pending();
   void adopt(DeviceBuffer& buf, std::uint64_t handle, std::size_t bytes);
   void release_buffer(std::uint64_t handle) noexcept;
 };

@@ -72,9 +72,11 @@ namespace lse::graph {
   X(kAttention,     "attention") \
   X(kGDNChunkScan,  "gdn_chunk_scan") \
   X(kCausalConv1d,  "causal_conv1d") \
+  X(kConvTailShift, "conv_tail") \
   X(kMoEDispatch,   "moe_dispatch") \
   X(kMoECombine,    "moe_combine") \
   X(kTopK,          "topk") \
+  X(kArgMax,        "argmax") \
   X(kAllReduce,     "all_reduce") \
   X(kAllGather,     "all_gather") \
   X(kReduceScatter, "reduce_scatter") \
