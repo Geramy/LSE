@@ -1,0 +1,560 @@
+#include "lse/backends/hrx/hip_emitter.hpp"
+
+#include "lse/backends/hrx/device_info.hpp"
+#include "lse/backends/hrx/hip_types.hpp"
+#include "lse/graph/graph.hpp"
+#include "lse/graph/kernel_primitive.hpp"
+#include "lse/graph/ops.hpp"
+#include "lse/math.hpp"
+#include "kernels/lds_linear.hpp"
+#include "kernels/vec_mem.hpp"
+
+#include <algorithm>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace lse::backend {
+
+using namespace lse::graph;
+
+namespace {
+
+std::string_view device_scalar(DType dt) noexcept {
+  switch (dt) {
+    case DType::kF16: return "_Float16";
+    case DType::kBF16: return "__hip_bfloat16";
+    case DType::kI32: return "int";
+    default: return "float";
+  }
+}
+
+std::string typed_ptr(const std::string& buf, DType dt) {
+  return "((" + std::string(device_scalar(dt)) + "*)(" + buf + "))";
+}
+
+std::string load_elem(const std::string& buf, const std::string& index,
+                      DType dt) {
+  const std::string p = typed_ptr(buf, dt) + "[" + index + "]";
+  switch (dt) {
+    case DType::kBF16:
+      return "__bfloat162float(" + p + ")";
+    case DType::kF16:
+      return "(float)(" + p + ")";
+    default:
+      return "(float)(" + p + ")";
+  }
+}
+
+std::string store_elem(const std::string& buf, const std::string& index,
+                       DType dt, const std::string& value) {
+  const std::string slot = typed_ptr(buf, dt) + "[" + index + "] = ";
+  switch (dt) {
+    case DType::kBF16:
+      return slot + "__float2bfloat16(" + value + ");";
+    case DType::kF16:
+      return slot + "(_Float16)(" + value + ");";
+    default:
+      return slot + "(" + std::string(device_scalar(dt)) + ")(" + value + ");";
+  }
+}
+
+std::string broadcast_index(const Shape& src, const Shape& out,
+                            std::string_view flat) {
+  const BroadcastMap m = BroadcastMap::build(src, out);
+  if (m.identity) return std::string(flat);
+  if (m.scalar) return "0";
+  std::string expr = "(";
+  bool first = true;
+  for (std::size_t i = m.gap; i < m.rank; ++i) {
+    const std::size_t si = i - m.gap;
+    if (m.src_stride[si] == 0) continue;
+    if (!first) expr += " + ";
+    first = false;
+    expr += "((" + std::string(flat) + " / " + std::to_string(m.out_stride[i]) +
+            ") % " + std::to_string(m.out_dim[i]) + ") * " +
+            std::to_string(m.src_stride[si]);
+  }
+  if (first) expr += "0";
+  expr += ")";
+  return expr;
+}
+
+bool is_linear_name(std::string_view n) {
+  return n == "linear" || n == "linear.lds" || n == "linear_indexed" ||
+         n == "linear_indexed.lds";
+}
+
+bool is_linked_name(std::string_view n) {
+  return n.find("linked") != std::string_view::npos;
+}
+
+// Records the same C++ GEMV as linear.lds. HIP spelling comes from kir.
+std::string gemv_stage(const std::string& x, const std::string& w,
+                       const std::string& out, const std::string& idx,
+                       std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
+                       std::uint32_t K, std::uint32_t M, DType odt, bool grid,
+                       const DeviceInfo& device,
+                       const kir::TypeTable& types,
+                       const DialectSourceTable& spellings) {
+  kir::KernelBody body(types, spellings, workgroup_lds_bytes(&device));
+  body.set_store([&](std::string_view index, std::string_view value) {
+    return store_elem(out, std::string(index), odt, std::string(value));
+  });
+  const kir::Buffer<kir::f32> xb(&body, &body.types(), x);
+  const kir::Buffer<kir::f32> wb(&body, &body.types(), w);
+  kir::Buffer<kir::f32> ib;
+  const kir::Buffer<kir::f32>* idxp = nullptr;
+  if (!idx.empty()) {
+    ib = kir::Buffer<kir::f32>(&body, &body.types(), idx);
+    idxp = &ib;
+  }
+  std::uint32_t wave = 32;
+  if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
+    if (amd->wavefront_size == 32 || amd->wavefront_size == 64) {
+      wave = amd->wavefront_size;
+    }
+  }
+  hrx_kernels::emit_gemv(body, xb, wb, idxp, keep, slot, N, K, M,
+                         hrx_kernels::device_load_bytes(&device), grid, wave);
+  if (!body.lds().ok()) return {};
+  return "    {\n" + body.str() + "\n    }\n";
+}
+
+std::string elem_loop(std::uint32_t count, const std::string& body, bool grid) {
+  std::ostringstream s;
+  s << "    {\n      const unsigned n = " << count << "u;\n";
+  if (grid) {
+    s << "      const unsigned i = blockIdx.x * 256u + threadIdx.x;\n"
+      << "      if (i < n) {\n"
+      << body << "      }\n    }\n";
+  } else {
+    s << "      for (unsigned i = threadIdx.x; i < n; i += 256u) {\n"
+      << body << "      }\n      __syncthreads();\n    }\n";
+  }
+  return s.str();
+}
+
+// Repeat is host-only in the library. Stage the index map so a GQA GDN
+// does not punch a host hole in the phase.
+std::string repeat_stage(const Node& n, const std::string& in,
+                         const std::string& out, bool grid) {
+  const Shape& src = n.inputs[0]->shape;
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const auto count = static_cast<std::uint32_t>(n.iattrs[1]);
+  if (axis >= src.rank() || count == 0) return {};
+  std::uint32_t inner = 1;
+  std::uint32_t in_axis = 1;
+  for (std::size_t i = 0; i < src.rank(); ++i) {
+    const auto d = static_cast<std::uint32_t>(src.dim(i));
+    if (i > axis) inner *= d;
+    else if (i == axis) in_axis = d;
+  }
+  const auto out_axis = in_axis * count;
+  if (inner == 0 || out_axis == 0) return {};
+  std::ostringstream body;
+  body << "        const unsigned span = " << (out_axis * inner) << "u;\n"
+       << "        const unsigned o = i / span;\n"
+       << "        const unsigned rem = i % span;\n"
+       << "        const unsigned a = rem / " << inner << "u;\n"
+       << "        const unsigned ii = rem % " << inner << "u;\n"
+       << "        const unsigned src_a = a / " << count << "u;\n"
+       << "        const unsigned src = (o * " << in_axis << "u + src_a) * "
+       << inner << "u + ii;\n"
+       << "        " << store_elem(out, "i", n.dtype, load_elem(in, "src", n.inputs[0]->dtype))
+       << "\n";
+  return elem_loop(static_cast<std::uint32_t>(n.element_count()), body.str(),
+                   grid);
+}
+
+const Node* skip_view(const Node* n) noexcept {
+  while (n != nullptr && n->kind == OpKind::kReshape && n->inputs.size() == 1) {
+    n = n->inputs[0].get();
+  }
+  return n;
+}
+
+}  // namespace
+
+void HipEmitter::bind_phase(const FusionGroup& group, EmittedKernel& out) {
+  out.binding_order.clear();
+  out.scratch_bytes = 0;
+  std::unordered_set<const Node*> bound;
+  auto bind = [&](const NodePtr& n) {
+    if (!n || !bound.insert(n.get()).second) return;
+    out.binding_order.push_back(n);
+  };
+  for (const NodePtr& in : group.inputs) bind(in);
+  for (const NodePtr& n : group.nodes) {
+    if (n->kind == OpKind::kReshape) continue;
+    bind(n);
+  }
+}
+
+bool HipEmitter::phase_can_stage(const Node& n) noexcept {
+  if (n.kind == OpKind::kReshape || n.kind == OpKind::kConstant ||
+      n.kind == OpKind::kBuffer || n.kind == OpKind::kCast ||
+      n.kind == OpKind::kBroadcast || n.kind == OpKind::kRepeat) {
+    return true;
+  }
+  if (is_elementwise(n.kind)) return true;
+  if (n.prim == nullptr) return false;
+  const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
+  if (kp == nullptr) return false;
+  const auto name = kp->name();
+  if (is_linked_name(name) || name == "linear.wmma") return false;
+  if (is_linear_name(name)) return true;
+  if (name == "overwrite_slice" || name == "gdn_chunk_scan" ||
+      name == "gdn_chunk_scan.pair") {
+    return true;
+  }
+  return !kp->owns_indexing();
+}
+
+Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
+                                             const DeviceInfo& device) {
+  if (group.nodes.empty()) {
+    return LSE_ERROR(kInvalidArgument, "empty phase group");
+  }
+  bool any_compute = false;
+  for (const NodePtr& n : group.nodes) {
+    if (n->kind != OpKind::kReshape && n->kind != OpKind::kConstant &&
+        n->kind != OpKind::kBuffer) {
+      any_compute = true;
+      break;
+    }
+  }
+  if (!any_compute) {
+    return LSE_ERROR(kUnimplemented, "phase group is views only");
+  }
+  for (const NodePtr& n : group.nodes) {
+    if (!phase_can_stage(*n)) {
+      return LSE_ERROR(kUnimplemented, "phase kernel cannot stage ",
+                       std::string(to_string(n->kind)));
+    }
+  }
+
+  const DialectSourceTable spellings = hip_sources();
+  const kir::TypeTable type_table = hip_types();
+
+  EmittedKernel out;
+  out.pointer_table = false;
+  out.entry_name = "lse_phase_" + std::to_string(group.signature());
+  out.constants.add("count", 4);
+  bind_phase(group, out);
+
+  std::unordered_map<const Node*, std::size_t> binding_of;
+  for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
+    const Node* p = skip_view(out.binding_order[i].get());
+    if (p != nullptr) binding_of.emplace(p, i);
+  }
+
+  auto bname = [&](const Node* n) -> std::string {
+    n = skip_view(n);
+    if (n == nullptr) return {};
+    auto it = binding_of.find(n);
+    if (it == binding_of.end()) return {};
+    return "b" + std::to_string(it->second);
+  };
+
+  std::vector<Shape> storage;
+  auto shapes_for = [&](const NodePtr& n) {
+    storage.clear();
+    for (const NodePtr& in : n->inputs) storage.push_back(in->shape);
+    KernelShapes s;
+    s.inputs = storage;
+    s.output = n->shape;
+    s.attrs = n->attrs;
+    s.iattrs = n->iattrs;
+    s.device = &device;
+    s.types = type_table;
+    s.intrinsics = &spellings;
+    return s;
+  };
+
+  std::unordered_set<const Node*> members;
+  for (const NodePtr& n : group.nodes) members.insert(n.get());
+  bool only_linears = true;
+  bool dependent = false;
+  std::uint32_t max_n = 0;
+  std::uint32_t max_m = 1;
+  std::uint32_t max_elems = 0;
+  std::uint32_t compute = 0;
+  for (const NodePtr& n : group.nodes) {
+    if (n->kind == OpKind::kConstant || n->kind == OpKind::kBuffer ||
+        n->kind == OpKind::kReshape) {
+      continue;
+    }
+    ++compute;
+    const auto elems = static_cast<std::uint32_t>(n->element_count());
+    if (elems > max_elems) max_elems = elems;
+    for (const NodePtr& in : n->inputs) {
+      const Node* p = in.get();
+      while (p && p->kind == OpKind::kReshape && p->inputs.size() == 1) {
+        p = p->inputs[0].get();
+      }
+      if (p && members.count(p) && p->kind != OpKind::kConstant &&
+          p->kind != OpKind::kBuffer && p->kind != OpKind::kReshape) {
+        dependent = true;
+      }
+    }
+    const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
+    const bool lin =
+        kp != nullptr && is_linear_name(kp->name()) && n->inputs.size() >= 2;
+    if (!lin) {
+      only_linears = false;
+      continue;
+    }
+    const Shape& wsh = n->inputs[1]->shape;
+    const auto N = static_cast<std::uint32_t>(
+        wsh.rank() == 3 ? wsh.dim(1) : wsh.dim(0));
+    const auto M = N == 0 ? 1u : elems / N;
+    if (N > max_n) max_n = N;
+    if (M > max_m) max_m = M;
+  }
+  // A grid is legal when no stage reads another stage in this launch.
+  // Dependent stages share one workgroup so __syncthreads is enough.
+  const bool grid_gemv = only_linears && compute > 0 && max_n >= 256;
+  const bool grid_elem = !grid_gemv && !dependent && max_elems >= 512;
+
+  std::ostringstream preamble;
+  std::ostringstream stages;
+  std::uint32_t stage_id = 0;
+
+  for (const NodePtr& n : group.nodes) {
+    if (n->kind == OpKind::kConstant || n->kind == OpKind::kBuffer) continue;
+    if (n->kind == OpKind::kReshape) continue;
+
+    if (n->kind == OpKind::kRepeat) {
+      if (n->inputs.size() != 1) {
+        return LSE_ERROR(kInvalidArgument, "repeat stage missing input");
+      }
+      const std::string in = bname(n->inputs[0].get());
+      const std::string ob = bname(n.get());
+      if (in.empty() || ob.empty()) {
+        return LSE_ERROR(kInternal, "repeat stage is not bound");
+      }
+      const std::string body = repeat_stage(*n, in, ob, grid_elem);
+      if (body.empty()) {
+        return LSE_ERROR(kUnimplemented, "repeat stage has a bad shape");
+      }
+      stages << body;
+      continue;
+    }
+
+    const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
+    const KernelPrimitiveBase* spec = kp;
+    if (kp != nullptr) {
+      KernelShapes sh = shapes_for(n);
+      spec = kp->specialize(sh);
+      if (spec == nullptr) spec = kp;
+      // WMMA owns a grid we cannot share. The scalar linear body is the
+      // same function and fits the one-workgroup walk.
+      if (spec != kp && (spec->name() == "linear.wmma" ||
+                         is_linked_name(spec->name()))) {
+        spec = kp;
+      }
+    }
+
+    if (spec != nullptr && spec->owns_indexing() &&
+        is_linear_name(spec->name())) {
+      if (n->inputs.size() < 2) {
+        return LSE_ERROR(kInvalidArgument, "linear stage missing operands");
+      }
+      const Shape& wsh = n->inputs[1]->shape;
+      const auto N = static_cast<std::uint32_t>(
+          wsh.rank() == 3 ? wsh.dim(1) : wsh.dim(0));
+      const auto K = static_cast<std::uint32_t>(wsh.dim(wsh.rank() - 1));
+      const auto elems = static_cast<std::uint32_t>(n->element_count());
+      if (N == 0 || elems % N != 0) {
+        return LSE_ERROR(kInvalidArgument, "linear stage has a bad shape");
+      }
+      const auto M = elems / N;
+
+      std::string idx;
+      std::uint32_t keep = 0;
+      std::uint32_t slot = 0;
+      if (n->inputs.size() >= 3) {
+        idx = bname(n->inputs[2].get());
+        if (idx.empty()) {
+          return LSE_ERROR(kInternal, "indexed linear missing idx binding");
+        }
+        keep = static_cast<std::uint32_t>(
+            n->inputs[2]->shape.dim(n->inputs[2]->shape.rank() - 1));
+        slot = static_cast<std::uint32_t>(n->iattrs[0]);
+      }
+      const std::string xb = bname(n->inputs[0].get());
+      const std::string wb = bname(n->inputs[1].get());
+      const std::string ob = bname(n.get());
+      if (xb.empty() || wb.empty() || ob.empty()) {
+        return LSE_ERROR(kInternal, "linear stage is not bound");
+      }
+      const std::string body =
+          gemv_stage(xb, wb, ob, idx, keep, slot, N, K, M, n->dtype, grid_gemv,
+                     device, type_table, spellings);
+      if (body.empty()) {
+        return LSE_ERROR(kInternal, "linear stage exceeded LDS");
+      }
+      stages << body;
+      if (!grid_gemv) stages << "    __syncthreads();\n";
+      continue;
+    }
+
+    if (spec != nullptr && spec->owns_indexing()) {
+      KernelShapes sh = shapes_for(n);
+      const std::string ob = bname(n.get());
+      if (ob.empty()) {
+        return LSE_ERROR(kInternal, std::string(spec->name()),
+                         ": output is not bound");
+      }
+      bool stored = false;
+      sh.store = [&](std::string_view index, std::string_view value) {
+        stored = true;
+        return store_elem(ob, std::string(index), n->dtype, std::string(value));
+      };
+      std::string body = spec->emit_kernel(sh);
+      if (body.empty() || !stored) {
+        return LSE_ERROR(kUnimplemented, "phase primitive '",
+                         std::string(spec->name()), "' declined");
+      }
+      for (std::size_t pos = 0;
+           (pos = body.find("return;", pos)) != std::string::npos;) {
+        body.replace(pos, 7, "continue;");
+        pos += 9;
+      }
+      const ThreadPlan tp = spec->plan(sh);
+      const std::uint32_t nthreads = std::max(
+          1u, tp.workgroup_count[0] * tp.workgroup_size[0]);
+      stages << "    {\n";
+      for (std::size_t a = 0; a < n->inputs.size(); ++a) {
+        const std::string b = bname(n->inputs[a].get());
+        if (b.empty()) {
+          return LSE_ERROR(kInternal, std::string(spec->name()),
+                           ": an input is not bound");
+        }
+        stages << "      float* in" << a << " = " << b << ";\n";
+      }
+      stages << "      const unsigned n = " << nthreads << "u;\n"
+             << "      for (unsigned i = threadIdx.x; i < n; i += 256u) {\n"
+             << body << "      }\n      __syncthreads();\n    }\n";
+      continue;
+    }
+
+    if (spec != nullptr && !spec->owns_indexing()) {
+      KernelShapes sh = shapes_for(n);
+      const std::string body = spec->emit_kernel(sh);
+      if (body.empty()) {
+        return LSE_ERROR(kUnimplemented, "phase primitive '",
+                         std::string(spec->name()), "' declined");
+      }
+      // Stage id is part of the symbol. Two slices with the same count
+      // and axis but different begins must not share a body — extents
+      // are literals inside emit_kernel.
+      const std::string fn =
+          std::string(spec->entry_name()) + "_" + std::to_string(stage_id++);
+      preamble << "__device__ float " << fn << "(unsigned int i";
+      for (std::size_t a = 0; a < n->inputs.size(); ++a) {
+        preamble << ", const " << device_scalar(n->inputs[a]->dtype)
+                 << "* __restrict__ in" << a;
+      }
+      preamble << ") {\n" << body << "\n}\n\n";
+
+      const auto count = static_cast<std::uint32_t>(n->element_count());
+      const std::string ob = bname(n.get());
+      if (ob.empty()) {
+        return LSE_ERROR(kInternal, fn, ": output is not bound");
+      }
+      std::ostringstream call;
+      call << "        const float v = " << fn << "(i";
+      for (const NodePtr& in : n->inputs) {
+        const std::string b = bname(in.get());
+        if (b.empty()) {
+          return LSE_ERROR(kInternal, fn, ": an input is not bound");
+        }
+        call << ", (" << device_scalar(in->dtype) << "*)" << b;
+      }
+      call << ");\n        " << store_elem(ob, "i", n->dtype, "v") << "\n";
+      stages << elem_loop(count, call.str(), grid_elem);
+      continue;
+    }
+
+    const auto count = static_cast<std::uint32_t>(n->element_count());
+    std::vector<std::string> args;
+    args.reserve(n->inputs.size());
+    for (const NodePtr& in : n->inputs) {
+      const std::string b = bname(in.get());
+      if (b.empty()) {
+        return LSE_ERROR(kUnimplemented, "phase elementwise missing input");
+      }
+      args.push_back(load_elem(b, broadcast_index(in->shape, n->shape, "i"),
+                               in->dtype));
+    }
+    const std::string ob = bname(n.get());
+    if (ob.empty()) {
+      return LSE_ERROR(kInternal, "phase elementwise output is not bound");
+    }
+    if (n->prim != nullptr) {
+      EmitContext ctx;
+      ctx.inputs = args;
+      ctx.out = "v";
+      ctx.device = &device;
+      ctx.attrs = n->attrs;
+      ctx.iattrs = n->iattrs;
+      ctx.dialect = Dialect::kHip;
+      ctx.sources = &spellings;
+      const std::string body = n->prim->emit_device(ctx);
+      if (body.empty()) {
+        return LSE_ERROR(kUnimplemented, "phase has no source for '",
+                         std::string(n->prim->name()), "'");
+      }
+      std::ostringstream loop;
+      loop << "        float v; " << body << "\n        "
+           << store_elem(ob, "i", n->dtype, "v") << "\n";
+      stages << elem_loop(count, loop.str(), grid_elem);
+      continue;
+    }
+    if (n->kind == OpKind::kCast || n->kind == OpKind::kBroadcast) {
+      std::ostringstream loop;
+      loop << "        "
+           << store_elem(ob, "i", n->dtype, args.empty() ? "0.0f" : args[0])
+           << "\n";
+      stages << elem_loop(count, loop.str(), grid_elem);
+      continue;
+    }
+    return LSE_ERROR(kUnimplemented, "phase kernel cannot stage ",
+                     std::string(to_string(n->kind)));
+  }
+
+  std::ostringstream src;
+  src << "#include <hip/hip_runtime.h>\n"
+      << "#include <hip/hip_bf16.h>\n\n"
+      << HipEmitter::constants_decl(out.constants) << "\n"
+      << preamble.str()
+      << "extern \"C\" __global__ void " << out.entry_name << "(\n";
+  for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
+    src << "    float* __restrict__ b" << i << ",\n";
+  }
+  src << "    LseConstants k) {\n"
+      << "  (void)k;\n"
+      << stages.str() << "}\n";
+  out.source = src.str();
+  out.dims.workgroup_size[0] = 256;
+  if (grid_gemv) {
+    out.dims.workgroup_count[0] = (max_n + 7u) / 8u;
+    out.dims.workgroup_count[1] = max_m == 0 ? 1u : max_m;
+  } else if (grid_elem) {
+    out.dims.workgroup_count[0] = max_elems == 0 ? 1u : (max_elems + 255u) / 256u;
+    out.dims.workgroup_count[1] = 1;
+  } else {
+    out.dims.workgroup_count[0] = 1;
+    out.dims.workgroup_count[1] = 1;
+  }
+  out.lds_bytes = 256 * 4;
+  if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
+    out.dims.subgroup_size = amd->wavefront_size;
+  }
+  return out;
+}
+
+}  // namespace lse::backend

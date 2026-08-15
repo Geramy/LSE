@@ -1,0 +1,971 @@
+#include "lse/graph/interpreter.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+namespace lse::graph::interpreter {
+
+namespace {
+
+std::size_t broadcast_index(const Shape& src, const Shape& out,
+                            std::size_t out_index) noexcept {
+  return BroadcastMap::build(src, out).apply(out_index);
+}
+
+Status ensure_buffer(Node& n, backend::IBackend& backend) {
+  if (n.buffer.valid()) return OkStatus();
+  const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
+  if (bytes == 0) {
+    return LSE_ERROR(kInvalidArgument, "cannot size a buffer for ",
+                     std::string(to_string(n.dtype)), n.shape.to_string());
+  }
+  // Device-local: only kernels are expected to touch it. The host reaches it
+  // through the mirror, and only when a node actually falls back to the host.
+  auto buf = backend.allocate(bytes, backend::MemoryClass::kDevice);
+  if (!buf.ok()) return buf.status();
+  n.buffer = buf.release();
+  return OkStatus();
+}
+
+// Splits a shape into (outer, axis_len, inner) around the reduced axis so a
+// reduction is one flat triple loop regardless of rank.
+struct AxisSplit {
+  std::size_t outer = 1;
+  std::size_t axis_len = 1;
+  std::size_t inner = 1;
+};
+
+AxisSplit split_axis(const Shape& s, std::size_t axis) noexcept {
+  AxisSplit out;
+  for (std::size_t i = 0; i < s.rank(); ++i) {
+    const auto d = static_cast<std::size_t>(s.dim(i));
+    if (i < axis) out.outer *= d;
+    else if (i == axis) out.axis_len = d;
+    else out.inner *= d;
+  }
+  return out;
+}
+
+Status eval_reduction(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const AxisSplit sp = split_axis(src.shape, axis);
+
+  for (std::size_t o = 0; o < sp.outer; ++o) {
+    for (std::size_t i = 0; i < sp.inner; ++i) {
+      const std::size_t base = o * sp.axis_len * sp.inner + i;
+      float acc = (n.kind == OpKind::kMax) ? -std::numeric_limits<float>::infinity()
+                                           : 0.0f;
+      for (std::size_t a = 0; a < sp.axis_len; ++a) {
+        const float v = load_element(src, base + a * sp.inner);
+        if (n.kind == OpKind::kMax) acc = v > acc ? v : acc;
+        else acc += v;
+      }
+      if (n.kind == OpKind::kMean) acc /= static_cast<float>(sp.axis_len);
+      store_element(n, o * sp.inner + i, acc);
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_softmax(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const AxisSplit sp = split_axis(src.shape, axis);
+
+  for (std::size_t o = 0; o < sp.outer; ++o) {
+    for (std::size_t i = 0; i < sp.inner; ++i) {
+      const std::size_t base = o * sp.axis_len * sp.inner + i;
+      float m = -std::numeric_limits<float>::infinity();
+      for (std::size_t a = 0; a < sp.axis_len; ++a) {
+        const float v = load_element(src, base + a * sp.inner);
+        m = v > m ? v : m;
+      }
+      float denom = 0.0f;
+      for (std::size_t a = 0; a < sp.axis_len; ++a) {
+        denom += std::exp(load_element(src, base + a * sp.inner) - m);
+      }
+      for (std::size_t a = 0; a < sp.axis_len; ++a) {
+        const float v = std::exp(load_element(src, base + a * sp.inner) - m) / denom;
+        store_element(n, base + a * sp.inner, v);
+      }
+    }
+  }
+  return OkStatus();
+}
+
+// Rank of e is how many others are strictly larger, then how many equals have
+// a smaller index. Slot s is the unique e whose rank is s, so the output is
+// descending and ties are deterministic.
+Status eval_topk(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const auto k = static_cast<std::size_t>(n.iattrs[1]);
+  const bool write_idx = n.iattrs[2] != 0;
+  const float score_band = n.attrs[0] == 0.0f ? 1.0f : n.attrs[0];
+  const AxisSplit sp = split_axis(src.shape, axis);
+  if (k == 0 || k > sp.axis_len) {
+    return LSE_ERROR(kInvalidArgument, "topk k=", std::to_string(k),
+                     " along axis of ", std::to_string(sp.axis_len));
+  }
+
+  std::vector<float> vals(k);
+  std::vector<float> ids(k);
+  for (std::size_t o = 0; o < sp.outer; ++o) {
+    for (std::size_t i = 0; i < sp.inner; ++i) {
+      const std::size_t in_base = o * sp.axis_len * sp.inner + i;
+      const std::size_t out_base = o * k * sp.inner + i;
+      for (std::size_t slot = 0; slot < k; ++slot) {
+        bool found = false;
+        for (std::size_t e = 0; e < sp.axis_len; ++e) {
+          const float v = load_element(src, in_base + e * sp.inner);
+          std::size_t rank = 0;
+          for (std::size_t j = 0; j < sp.axis_len; ++j) {
+            const float u = load_element(src, in_base + j * sp.inner);
+            if (u > v || (u == v && j < e)) ++rank;
+          }
+          if (rank != slot) continue;
+          vals[slot] = v;
+          ids[slot] = static_cast<float>(e);
+          found = true;
+          break;
+        }
+        if (!found) {
+          return LSE_ERROR(kInternal, "topk found no element for slot ",
+                           std::to_string(slot));
+        }
+      }
+      if (!write_idx && score_band < 1.0f) {
+        const float top = vals[0];
+        float total = 0.0f;
+        for (std::size_t s = 0; s < k; ++s) {
+          if (vals[s] < (1.0f - score_band) * top) vals[s] = 0.0f;
+          total += vals[s];
+        }
+        total += 1e-9f;
+        for (std::size_t s = 0; s < k; ++s) vals[s] /= total;
+      }
+      for (std::size_t slot = 0; slot < k; ++slot) {
+        store_element(n, out_base + slot * sp.inner,
+                      write_idx ? ids[slot] : vals[slot]);
+      }
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_rms_norm(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& w = *n.inputs[1];
+  const auto dim = static_cast<std::size_t>(x.shape.dim(x.shape.rank() - 1));
+  const std::size_t rows = x.element_count() / dim;
+  const float eps = n.attrs[0];
+  const float w_bias = n.iattrs[0] != 0 ? 1.0f : 0.0f;
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    // fp64 accumulation: the reduction is what makes RMSNorm numerically
+    // touchy, and the device kernels accumulate in fp32 for the same reason.
+    double acc = 0.0;
+    for (std::size_t c = 0; c < dim; ++c) {
+      const double v = static_cast<double>(load_element(x, r * dim + c));
+      acc += v * v;
+    }
+    const float scale =
+        1.0f / std::sqrt(static_cast<float>(acc / static_cast<double>(dim)) + eps);
+    for (std::size_t c = 0; c < dim; ++c) {
+      store_element(n, r * dim + c, load_element(x, r * dim + c) * scale *
+                                        (w_bias + load_element(w, c)));
+    }
+  }
+  return OkStatus();
+}
+
+// log1p(exp(x)) with the standard large-x guard: exp overflows past ~88f.
+Status eval_softplus(Node& n) {
+  const Node& src = *n.inputs[0];
+  for (std::size_t i = 0; i < n.element_count(); ++i) {
+    const float v = load_element(src, i);
+    store_element(n, i, v > 20.0f ? v : std::log1p(std::exp(v)));
+  }
+  return OkStatus();
+}
+
+Status eval_l2_norm(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto dim = static_cast<std::size_t>(n.shape.dim(n.shape.rank() - 1));
+  const std::size_t rows = n.element_count() / dim;
+  const float eps = n.attrs[0];
+  for (std::size_t r = 0; r < rows; ++r) {
+    double acc = 0.0;
+    for (std::size_t c = 0; c < dim; ++c) {
+      const double x = static_cast<double>(load_element(src, r * dim + c));
+      acc += x * x;
+    }
+    // eps floors the norm rather than sitting under the sqrt: it is only a
+    // divide-by-zero guard, and must not perturb rows whose norm is already
+    // well above it. Head vectors here have norms near 0.05, where folding eps
+    // into the radicand shifts the result by ~2e-4.
+    const float inv =
+        1.0f / std::max(std::sqrt(static_cast<float>(acc)), eps);
+    for (std::size_t c = 0; c < dim; ++c) {
+      store_element(n, r * dim + c, load_element(src, r * dim + c) * inv);
+    }
+  }
+  return OkStatus();
+}
+
+// x [B,T,C], weight [C,K], bias [C]. Left-padded with zeros so out[t] sees only
+// inputs <= t.
+Status eval_causal_conv1d(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& w = *n.inputs[1];
+  const Node& b = *n.inputs[2];
+  const std::size_t rank = x.shape.rank();
+  const auto channels = static_cast<std::size_t>(x.shape.dim(rank - 1));
+  const auto seq = static_cast<std::size_t>(x.shape.dim(rank - 2));
+  const auto kernel = static_cast<std::size_t>(w.shape.dim(1));
+  const std::size_t batch = x.element_count() / (seq * channels);
+
+  for (std::size_t bi = 0; bi < batch; ++bi) {
+    for (std::size_t t = 0; t < seq; ++t) {
+      for (std::size_t c = 0; c < channels; ++c) {
+        double acc = static_cast<double>(load_element(b, c));
+        for (std::size_t j = 0; j < kernel; ++j) {
+          // weight[c][j] pairs with the input j steps before t; positions
+          // before the start are the zero pad.
+          const std::size_t back = kernel - 1 - j;
+          if (t < back) continue;
+          const std::size_t src = ((bi * seq) + (t - back)) * channels + c;
+          acc += static_cast<double>(load_element(x, src)) *
+                 static_cast<double>(load_element(w, c * kernel + j));
+        }
+        store_element(n, (bi * seq + t) * channels + c, static_cast<float>(acc));
+      }
+    }
+  }
+  return OkStatus();
+}
+
+// S = S*alpha ; S += ((v - S k) * beta) k^T ; o = S q, stepped over time.
+Status eval_gated_delta(Node& n) {
+  const Node& q = *n.inputs[0];
+  const Node& k = *n.inputs[1];
+  const Node& v = *n.inputs[2];
+  const Node& alpha = *n.inputs[3];
+  const Node& beta = *n.inputs[4];
+  const Node& s_in = *n.inputs[5];
+  const bool write_state = n.iattrs[0] != 0;
+
+  const auto batch = static_cast<std::size_t>(q.shape.dim(0));
+  const auto seq = static_cast<std::size_t>(q.shape.dim(1));
+  const auto heads = static_cast<std::size_t>(q.shape.dim(2));
+  const auto dim = static_cast<std::size_t>(q.shape.dim(3));
+
+  std::vector<double> state(batch * heads * dim * dim);
+  for (std::size_t i = 0; i < state.size(); ++i) state[i] = static_cast<double>(load_element(s_in, i));
+
+  std::vector<double> sk(dim);
+  for (std::size_t bi = 0; bi < batch; ++bi) {
+    for (std::size_t t = 0; t < seq; ++t) {
+      for (std::size_t h = 0; h < heads; ++h) {
+        double* S = state.data() + ((bi * heads) + h) * dim * dim;
+        const std::size_t vec = (((bi * seq) + t) * heads + h) * dim;
+        const std::size_t sc = ((bi * seq) + t) * heads + h;
+
+        const double a = static_cast<double>(load_element(alpha, sc));
+        for (std::size_t i = 0; i < dim * dim; ++i) S[i] *= a;
+
+        for (std::size_t i = 0; i < dim; ++i) {
+          double acc = 0.0;
+          for (std::size_t j = 0; j < dim; ++j) {
+            acc += S[i * dim + j] * static_cast<double>(load_element(k, vec + j));
+          }
+          sk[i] = acc;
+        }
+
+        const double bt = static_cast<double>(load_element(beta, sc));
+        for (std::size_t i = 0; i < dim; ++i) {
+          const double delta =
+              (static_cast<double>(load_element(v, vec + i)) - sk[i]) * bt;
+          for (std::size_t j = 0; j < dim; ++j) {
+            S[i * dim + j] += delta * static_cast<double>(load_element(k, vec + j));
+          }
+        }
+
+        for (std::size_t i = 0; i < dim; ++i) {
+          double acc = 0.0;
+          for (std::size_t j = 0; j < dim; ++j) {
+            acc += S[i * dim + j] * static_cast<double>(load_element(q, vec + j));
+          }
+          if (!write_state) {
+            store_element(n, vec + i, static_cast<float>(acc));
+          }
+        }
+      }
+    }
+  }
+
+  if (write_state) {
+    for (std::size_t i = 0; i < state.size(); ++i) {
+      store_element(n, i, static_cast<float>(state[i]));
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_matmul(Node& n) {
+  const Node& a = *n.inputs[0];
+  const Node& b = *n.inputs[1];
+  const auto k = static_cast<std::size_t>(a.shape.dim(a.shape.rank() - 1));
+  const auto cols = static_cast<std::size_t>(b.shape.dim(b.shape.rank() - 1));
+  const std::size_t rows = a.element_count() / k;
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t c = 0; c < cols; ++c) {
+      double acc = 0.0;
+      for (std::size_t i = 0; i < k; ++i) {
+        acc += static_cast<double>(load_element(a, r * k + i)) *
+               static_cast<double>(load_element(b, i * cols + c));
+      }
+      store_element(n, r * cols + c, static_cast<float>(acc));
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_transpose(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto src_strides = src.shape.strides();
+  const auto out_strides = n.shape.strides();
+  const std::size_t rank = n.shape.rank();
+  const std::size_t count = n.element_count();
+
+  for (std::size_t i = 0; i < count; ++i) {
+    std::size_t src_index = 0;
+    for (std::size_t d = 0; d < rank; ++d) {
+      const std::int64_t coord =
+          static_cast<std::int64_t>(i) / out_strides[d] % n.shape.dim(d);
+      src_index += static_cast<std::size_t>(
+          coord * src_strides[static_cast<std::size_t>(n.iattrs[d])]);
+    }
+    store_element(n, i, load_element(src, src_index));
+  }
+  return OkStatus();
+}
+
+Status eval_concat(Node& n) {
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const AxisSplit out_sp = split_axis(n.shape, axis);
+  std::size_t written = 0;
+  for (const NodePtr& part : n.inputs) {
+    const AxisSplit in_sp = split_axis(part->shape, axis);
+    for (std::size_t o = 0; o < in_sp.outer; ++o) {
+      for (std::size_t a = 0; a < in_sp.axis_len; ++a) {
+        for (std::size_t i = 0; i < in_sp.inner; ++i) {
+          const std::size_t src = (o * in_sp.axis_len + a) * in_sp.inner + i;
+          const std::size_t dst = (o * out_sp.axis_len + written + a) * out_sp.inner + i;
+          store_element(n, dst, load_element(*part, src));
+        }
+      }
+    }
+    written += in_sp.axis_len;
+  }
+  return OkStatus();
+}
+
+Status eval_slice(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const auto begin = static_cast<std::size_t>(n.iattrs[1]);
+  const AxisSplit in_sp = split_axis(src.shape, axis);
+  const AxisSplit out_sp = split_axis(n.shape, axis);
+
+  for (std::size_t o = 0; o < out_sp.outer; ++o) {
+    for (std::size_t a = 0; a < out_sp.axis_len; ++a) {
+      for (std::size_t i = 0; i < out_sp.inner; ++i) {
+        const std::size_t s = (o * in_sp.axis_len + begin + a) * in_sp.inner + i;
+        const std::size_t d = (o * out_sp.axis_len + a) * out_sp.inner + i;
+        store_element(n, d, load_element(src, s));
+      }
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_repeat(Node& n) {
+  const Node& src = *n.inputs[0];
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  const auto count = static_cast<std::size_t>(n.iattrs[1]);
+  const AxisSplit in_sp = split_axis(src.shape, axis);
+  const AxisSplit out_sp = split_axis(n.shape, axis);
+
+  for (std::size_t o = 0; o < in_sp.outer; ++o) {
+    for (std::size_t a = 0; a < in_sp.axis_len; ++a) {
+      for (std::size_t r = 0; r < count; ++r) {
+        for (std::size_t i = 0; i < in_sp.inner; ++i) {
+          const std::size_t s = (o * in_sp.axis_len + a) * in_sp.inner + i;
+          const std::size_t d = (o * out_sp.axis_len + a * count + r) * out_sp.inner + i;
+          store_element(n, d, load_element(src, s));
+        }
+      }
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_linear_indexed(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& w = *n.inputs[1];
+  const Node& idx = *n.inputs[2];
+  const auto experts = static_cast<std::size_t>(w.shape.dim(0));
+  const auto out_dim = static_cast<std::size_t>(w.shape.dim(1));
+  const auto in_dim = static_cast<std::size_t>(w.shape.dim(2));
+  const auto keep = static_cast<std::size_t>(idx.shape.dim(idx.shape.rank() - 1));
+  const auto slot = static_cast<std::size_t>(n.iattrs[0]);
+  const std::size_t rows = x.element_count() / in_dim;
+  if (keep == 0 || slot >= keep) {
+    return LSE_ERROR(kInvalidArgument, "linear_indexed slot out of range");
+  }
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    const auto e = static_cast<std::size_t>(load_element(idx, r * keep + slot));
+    if (e >= experts) {
+      return LSE_ERROR(kOutOfRange, "expert ", std::to_string(e),
+                       " is outside ", std::to_string(experts));
+    }
+    for (std::size_t o = 0; o < out_dim; ++o) {
+      double acc = 0.0;
+      const std::size_t wrow = (e * out_dim + o) * in_dim;
+      for (std::size_t i = 0; i < in_dim; ++i) {
+        acc += static_cast<double>(load_element(x, r * in_dim + i)) *
+               static_cast<double>(load_element(w, wrow + i));
+      }
+      store_element(n, r * out_dim + o, static_cast<float>(acc));
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_linear(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& w = *n.inputs[1];
+  const auto in_dim = static_cast<std::size_t>(w.shape.dim(1));
+  const auto out_dim = static_cast<std::size_t>(w.shape.dim(0));
+  const std::size_t rows = x.element_count() / in_dim;
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t o = 0; o < out_dim; ++o) {
+      double acc = 0.0;
+      for (std::size_t i = 0; i < in_dim; ++i) {
+        acc += static_cast<double>(load_element(x, r * in_dim + i)) *
+               static_cast<double>(load_element(w, o * in_dim + i));
+      }
+      store_element(n, r * out_dim + o, static_cast<float>(acc));
+    }
+  }
+  return OkStatus();
+}
+
+// x [.., width] viewed as [N, width]; rows[i] selects a row.
+Status eval_gather_rows(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& rows = *n.inputs[1];
+  const auto width = static_cast<std::size_t>(n.shape.dim(n.shape.rank() - 1));
+  const std::size_t total = x.element_count() / width;
+  const std::size_t count = rows.element_count();
+
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto row = static_cast<std::size_t>(load_element(rows, i));
+    if (row >= total) {
+      return LSE_ERROR(kOutOfRange, "gather row ", std::to_string(row),
+                       " is outside ", std::to_string(total), " rows");
+    }
+    for (std::size_t c = 0; c < width; ++c) {
+      store_element(n, i * width + c, load_element(x, row * width + c));
+    }
+  }
+  return OkStatus();
+}
+
+// Accumulates rather than overwrites: two routed experts may land on the same
+// token, and their contributions must sum.
+Status eval_scatter_add_rows(Node& n) {
+  const Node& base = *n.inputs[0];
+  const Node& rows = *n.inputs[1];
+  const Node& values = *n.inputs[2];
+  const auto width = static_cast<std::size_t>(n.shape.dim(n.shape.rank() - 1));
+  const std::size_t total = n.element_count() / width;
+  const std::size_t count = rows.element_count();
+
+  for (std::size_t i = 0; i < n.element_count(); ++i) {
+    store_element(n, i, load_element(base, i));
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto row = static_cast<std::size_t>(load_element(rows, i));
+    if (row >= total) {
+      return LSE_ERROR(kOutOfRange, "scatter row ", std::to_string(row),
+                       " is outside ", std::to_string(total), " rows");
+    }
+    for (std::size_t c = 0; c < width; ++c) {
+      const std::size_t dst = row * width + c;
+      store_element(n, dst,
+                    load_element(n, dst) + load_element(values, i * width + c));
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_embedding(Node& n) {
+  const Node& table = *n.inputs[0];
+  const Node& ids = *n.inputs[1];
+  const auto dim = static_cast<std::size_t>(table.shape.dim(1));
+  const auto vocab = static_cast<std::size_t>(table.shape.dim(0));
+  const std::size_t count = ids.element_count();
+
+  for (std::size_t t = 0; t < count; ++t) {
+    const auto id = static_cast<std::size_t>(load_element(ids, t));
+    if (id >= vocab) {
+      return LSE_ERROR(kOutOfRange, "token id ", std::to_string(id),
+                       " is outside a vocab of ", std::to_string(vocab));
+    }
+    for (std::size_t d = 0; d < dim; ++d) {
+      store_element(n, t * dim + d, load_element(table, id * dim + d));
+    }
+  }
+  return OkStatus();
+}
+
+// Interleaved-pair rotation: (x0,x1) -> (x0*c - x1*s, x1*c + x0*s).
+Status eval_rope(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& cos = *n.inputs[1];
+  const Node& sin = *n.inputs[2];
+  const auto offset = n.inputs.size() >= 4
+                          ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
+                          : static_cast<std::size_t>(n.iattrs[0]);
+  const std::size_t rank = x.shape.rank();
+  const auto dim = static_cast<std::size_t>(x.shape.dim(rank - 1));
+  const auto seq = static_cast<std::size_t>(x.shape.dim(rank - 2));
+  const std::size_t rows = x.element_count() / dim;
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    const std::size_t t = offset + (r % seq);
+    for (std::size_t d = 0; d + 1 < dim; d += 2) {
+      const float c = load_element(cos, t * dim + d);
+      const float s = load_element(sin, t * dim + d);
+      const float a = load_element(x, r * dim + d);
+      const float b = load_element(x, r * dim + d + 1);
+      store_element(n, r * dim + d, a * c - b * s);
+      store_element(n, r * dim + d + 1, b * c + a * s);
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_overwrite_slice(Node& n) {
+  if (n.inputs.size() != 3) {
+    return LSE_ERROR(kInvalidArgument, "overwrite_slice takes 3 inputs");
+  }
+  const Node& dst = *n.inputs[0];
+  const Node& src = *n.inputs[1];
+  const Node& begin_n = *n.inputs[2];
+  const auto axis = static_cast<std::size_t>(n.iattrs[0]);
+  if (axis >= dst.shape.rank() || axis >= src.shape.rank()) {
+    return LSE_ERROR(kInvalidArgument, "overwrite_slice axis out of rank");
+  }
+  const auto begin = static_cast<std::size_t>(load_element(begin_n, 0));
+  const AxisSplit d = split_axis(dst.shape, axis);
+  const AxisSplit s = split_axis(src.shape, axis);
+  if (s.outer != d.outer || s.inner != d.inner) {
+    return LSE_ERROR(kInvalidArgument, "overwrite_slice shape mismatch");
+  }
+  if (begin + s.axis_len > d.axis_len) {
+    return LSE_ERROR(kOutOfRange, "overwrite_slice window [",
+                     std::to_string(begin), ", ",
+                     std::to_string(begin + s.axis_len), ") exceeds ",
+                     std::to_string(d.axis_len));
+  }
+  const bool aliased =
+      n.buffer.valid() && dst.buffer.valid() &&
+      n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr;
+  if (!aliased) {
+    for (std::size_t i = 0; i < n.element_count(); ++i) {
+      store_element(n, i, load_element(dst, i));
+    }
+  }
+  for (std::size_t o = 0; o < s.outer; ++o) {
+    for (std::size_t a = 0; a < s.axis_len; ++a) {
+      for (std::size_t i = 0; i < s.inner; ++i) {
+        const std::size_t si = (o * s.axis_len + a) * s.inner + i;
+        const std::size_t di = (o * d.axis_len + begin + a) * d.inner + i;
+        store_element(n, di, load_element(src, si));
+      }
+    }
+  }
+  return OkStatus();
+}
+
+Status eval_sdpa(Node& n) {
+  const Node& q = *n.inputs[0];
+  const Node& k = *n.inputs[1];
+  const Node& v = *n.inputs[2];
+
+  const auto batch = static_cast<std::size_t>(q.shape.dim(0));
+  const auto qh = static_cast<std::size_t>(q.shape.dim(1));
+  const auto tq = static_cast<std::size_t>(q.shape.dim(2));
+  const auto dh = static_cast<std::size_t>(q.shape.dim(3));
+  const auto kvh = static_cast<std::size_t>(k.shape.dim(1));
+  const auto ts = static_cast<std::size_t>(k.shape.dim(2));
+  const auto dv = static_cast<std::size_t>(v.shape.dim(3));
+
+  const float scale = n.attrs[0];
+  const auto mask = static_cast<int>(n.iattrs[0]);
+  const auto window = static_cast<std::size_t>(n.iattrs[1]);
+  const auto offset = n.inputs.size() >= 4
+                          ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
+                          : static_cast<std::size_t>(n.iattrs[2]);
+  const std::size_t used = std::min(ts, offset + tq);
+  const std::size_t group = qh / kvh;  // GQA: several q heads share one kv head
+
+  std::vector<float> logits(ts);
+  for (std::size_t b = 0; b < batch; ++b) {
+    for (std::size_t h = 0; h < qh; ++h) {
+      const std::size_t kh = h / group;
+      for (std::size_t i = 0; i < tq; ++i) {
+        const std::size_t qbase = ((b * qh + h) * tq + i) * dh;
+        const std::size_t abs_i = offset + i;
+
+        float m = -std::numeric_limits<float>::infinity();
+        for (std::size_t j = 0; j < used; ++j) {
+          bool allowed = true;
+          if (mask != 0) allowed = j <= abs_i;
+          if (allowed && mask == 2 && window > 0) allowed = (abs_i - j) < window;
+          if (!allowed) {
+            logits[j] = -std::numeric_limits<float>::infinity();
+            continue;
+          }
+          const std::size_t kbase = ((b * kvh + kh) * ts + j) * dh;
+          double acc = 0.0;
+          for (std::size_t d = 0; d < dh; ++d) {
+            acc += static_cast<double>(load_element(q, qbase + d)) *
+                   static_cast<double>(load_element(k, kbase + d));
+          }
+          logits[j] = static_cast<float>(acc) * scale;
+          m = logits[j] > m ? logits[j] : m;
+        }
+
+        double denom = 0.0;
+        for (std::size_t j = 0; j < used; ++j) {
+          if (std::isinf(logits[j]) && logits[j] < 0) {
+            logits[j] = 0.0f;
+            continue;
+          }
+          logits[j] = std::exp(logits[j] - m);
+          denom += static_cast<double>(logits[j]);
+        }
+        // A fully-masked row would divide by zero; the causal mask always keeps
+        // at least the diagonal, so this only guards degenerate windows.
+        if (denom == 0.0) denom = 1.0;
+
+        const std::size_t obase = ((b * qh + h) * tq + i) * dv;
+        for (std::size_t d = 0; d < dv; ++d) {
+          double acc = 0.0;
+          for (std::size_t j = 0; j < used; ++j) {
+            if (logits[j] == 0.0f) continue;
+            acc += static_cast<double>(logits[j]) *
+                   static_cast<double>(load_element(v, ((b * kvh + kh) * ts + j) * dv + d));
+          }
+          store_element(n, obase + d, static_cast<float>(acc / denom));
+        }
+      }
+    }
+  }
+  return OkStatus();
+}
+
+}  // namespace
+
+void* host_bytes(Node& node) {
+  if (node.buffer.ptr != nullptr) {
+    return static_cast<std::byte*>(node.buffer.ptr) + node.buffer.offset;
+  }
+  const std::size_t bytes =
+      dtype_storage_bytes(node.dtype, node.element_count());
+  if (node.host_mirror.size() < bytes) node.host_mirror.resize(bytes);
+  return node.host_mirror.data();
+}
+
+const void* host_bytes(const Node& node) noexcept {
+  if (node.buffer.ptr != nullptr) {
+    return static_cast<const std::byte*>(node.buffer.ptr) + node.buffer.offset;
+  }
+  return node.host_mirror.empty() ? nullptr : node.host_mirror.data();
+}
+
+Status sync_to_device(Node& node, backend::IBackend& backend) {
+  if (node.buffer.ptr != nullptr || !node.host_dirty) return OkStatus();
+  if (!node.buffer.valid()) return OkStatus();
+  const std::size_t bytes =
+      dtype_storage_bytes(node.dtype, node.element_count());
+  if (node.host_mirror.size() < bytes) return OkStatus();
+  LSE_RETURN_IF_ERROR(
+      backend.copy_h2d(node.host_mirror.data(), node.buffer, bytes, 0));
+  node.host_dirty = false;
+  return OkStatus();
+}
+
+Status sync_from_device(Node& node, backend::IBackend& backend) {
+  if (node.buffer.ptr != nullptr || !node.device_dirty) return OkStatus();
+  if (!node.buffer.valid()) return OkStatus();
+  const std::size_t bytes =
+      dtype_storage_bytes(node.dtype, node.element_count());
+  if (node.host_mirror.size() < bytes) node.host_mirror.resize(bytes);
+  LSE_RETURN_IF_ERROR(
+      backend.copy_d2h(node.buffer, node.host_mirror.data(), bytes, 0));
+  node.device_dirty = false;
+  return OkStatus();
+}
+
+float load_element(const Node& node, std::size_t index) noexcept {
+  if (node.kind == OpKind::kConstant && !node.buffer.valid()) {
+    return node.attrs[0];
+  }
+  const void* p = host_bytes(node);
+  if (p == nullptr) return 0.0f;
+  switch (node.dtype) {
+    case DType::kF32: return static_cast<const float*>(p)[index];
+    case DType::kBF16: {
+      bfloat16_t h;
+      h.bits = static_cast<const std::uint16_t*>(p)[index];
+      return h.to_float();
+    }
+    case DType::kF16: {
+      float16_t h;
+      h.bits = static_cast<const std::uint16_t*>(p)[index];
+      return h.to_float();
+    }
+    case DType::kI32:
+      return static_cast<float>(static_cast<const std::int32_t*>(p)[index]);
+    case DType::kI8:
+      return static_cast<float>(static_cast<const std::int8_t*>(p)[index]);
+    case DType::kU8:
+      return static_cast<float>(static_cast<const std::uint8_t*>(p)[index]);
+    default: return 0.0f;
+  }
+}
+
+void store_element(Node& node, std::size_t index, float value) noexcept {
+  void* p = host_bytes(node);
+  if (p == nullptr) return;
+  // The host is now authoritative: the scheduler pushes this before it
+  // dispatches, and any pending pull would copy stale device bytes back over
+  // what was just written. Callers write whole buffers, never a subset of one
+  // the device still owns.
+  node.host_dirty = true;
+  node.device_dirty = false;
+  switch (node.dtype) {
+    case DType::kF32: static_cast<float*>(p)[index] = value; break;
+    case DType::kBF16:
+      static_cast<std::uint16_t*>(p)[index] = bfloat16_t::from_float(value);
+      break;
+    case DType::kF16:
+      static_cast<std::uint16_t*>(p)[index] = float16_t::from_float(value);
+      break;
+    case DType::kI32:
+      static_cast<std::int32_t*>(p)[index] = static_cast<std::int32_t>(value);
+      break;
+    case DType::kI8:
+      static_cast<std::int8_t*>(p)[index] = static_cast<std::int8_t>(value);
+      break;
+    case DType::kU8:
+      static_cast<std::uint8_t*>(p)[index] = static_cast<std::uint8_t>(value);
+      break;
+    default: break;
+  }
+}
+
+Status ensure_output_buffer(Node& node, backend::IBackend& backend) {
+  return ensure_buffer(node, backend);
+}
+
+Status evaluate(const NodePtr& node, backend::IBackend& backend) {
+  Node& n = *node;
+  if (n.materialized) return OkStatus();
+
+  if (n.prim != nullptr) {
+    const int a = n.prim->inplace_input();
+    if (a >= 0 && static_cast<std::size_t>(a) < n.inputs.size() &&
+        n.inputs[static_cast<std::size_t>(a)] &&
+        n.inputs[static_cast<std::size_t>(a)]->buffer.valid() &&
+        !n.buffer.valid()) {
+      n.buffer = n.inputs[static_cast<std::size_t>(a)]->buffer;
+    }
+  }
+
+  LSE_RETURN_IF_ERROR(ensure_buffer(n, backend));
+  // Every read below is a host read, so anything a kernel wrote has to come
+  // back first. No-op unless a device group actually produced the input.
+  for (const NodePtr& in : n.inputs) {
+    LSE_RETURN_IF_ERROR(sync_from_device(*in, backend));
+  }
+  const std::size_t count = n.element_count();
+
+  // Anything with a registered primitive evaluates through it. Built-in
+  // elementwise ops attach one too, so there is a single path.
+  // A primitive without a host body is not automatically fatal: the
+  // interpreter may still have a built-in rule for the op (matmul carries a
+  // device kernel primitive but the host path is the oracle). Only a kCustom
+  // node has nowhere else to go.
+  if (n.prim != nullptr && !n.prim->has_host_impl() && n.kind == OpKind::kCustom) {
+    return LSE_ERROR(kUnimplemented, "primitive '",
+                     std::string(n.prim->name()),
+                     "' is device source only; it needs the JIT backend");
+  }
+  if (n.prim != nullptr && n.prim->has_host_impl()) {
+    std::vector<std::vector<float>> staged(n.inputs.size());
+    std::vector<const float*> ptrs(n.inputs.size());
+    for (std::size_t i = 0; i < n.inputs.size(); ++i) {
+      staged[i].resize(count);
+      const Node& src = *n.inputs[i];
+      for (std::size_t e = 0; e < count; ++e) {
+        staged[i][e] = load_element(src, broadcast_index(src.shape, n.shape, e));
+      }
+      ptrs[i] = staged[i].data();
+    }
+    std::vector<float> result(count);
+    n.prim->eval_cpu(ptrs, result.data(), count, n.attrs);
+    for (std::size_t e = 0; e < count; ++e) store_element(n, e, result[e]);
+    n.materialized = true;
+    return OkStatus();
+  }
+
+  switch (n.kind) {
+    case OpKind::kConstant:
+      for (std::size_t i = 0; i < count; ++i) store_element(n, i, n.attrs[0]);
+      break;
+
+    case OpKind::kSum: case OpKind::kMax: case OpKind::kMean:
+      LSE_RETURN_IF_ERROR(eval_reduction(n));
+      break;
+
+    case OpKind::kSoftmax:
+      LSE_RETURN_IF_ERROR(eval_softmax(n));
+      break;
+
+    case OpKind::kRMS:
+      LSE_RETURN_IF_ERROR(eval_rms_norm(n));
+      break;
+
+    case OpKind::kMatMul:
+      LSE_RETURN_IF_ERROR(eval_matmul(n));
+      break;
+
+    case OpKind::kSoftplus:
+      LSE_RETURN_IF_ERROR(eval_softplus(n));
+      break;
+
+    case OpKind::kL2Norm:
+      LSE_RETURN_IF_ERROR(eval_l2_norm(n));
+      break;
+
+    case OpKind::kCausalConv1d:
+      LSE_RETURN_IF_ERROR(eval_causal_conv1d(n));
+      break;
+
+    case OpKind::kGDNChunkScan:
+      LSE_RETURN_IF_ERROR(eval_gated_delta(n));
+      break;
+
+    case OpKind::kLinear:
+      LSE_RETURN_IF_ERROR(eval_linear(n));
+      break;
+
+    case OpKind::kMoEDispatch:
+      LSE_RETURN_IF_ERROR(eval_linear_indexed(n));
+      break;
+
+    case OpKind::kGather:
+      LSE_RETURN_IF_ERROR(eval_gather_rows(n));
+      break;
+
+    case OpKind::kScatter:
+      LSE_RETURN_IF_ERROR(eval_scatter_add_rows(n));
+      break;
+
+    case OpKind::kOverwriteSlice:
+      LSE_RETURN_IF_ERROR(eval_overwrite_slice(n));
+      break;
+
+    case OpKind::kEmbedding:
+      LSE_RETURN_IF_ERROR(eval_embedding(n));
+      break;
+
+    case OpKind::kTranspose:
+      LSE_RETURN_IF_ERROR(eval_transpose(n));
+      break;
+
+    case OpKind::kConcat:
+      LSE_RETURN_IF_ERROR(eval_concat(n));
+      break;
+
+    case OpKind::kSlice:
+      LSE_RETURN_IF_ERROR(eval_slice(n));
+      break;
+
+    case OpKind::kRepeat:
+      LSE_RETURN_IF_ERROR(eval_repeat(n));
+      break;
+
+    case OpKind::kRoPE:
+      LSE_RETURN_IF_ERROR(eval_rope(n));
+      break;
+
+    case OpKind::kAttention:
+      LSE_RETURN_IF_ERROR(eval_sdpa(n));
+      break;
+
+    case OpKind::kTopK:
+      LSE_RETURN_IF_ERROR(eval_topk(n));
+      break;
+
+    default:
+      if (n.kind == OpKind::kCast || n.kind == OpKind::kReshape) {
+        const Node& src = *n.inputs[0];
+        for (std::size_t i = 0; i < count; ++i) {
+          store_element(n, i,
+                        load_element(src, broadcast_index(src.shape, n.shape, i)));
+        }
+        break;
+      }
+      return LSE_ERROR(kUnimplemented, "cpu interpreter has no rule for ",
+                       std::string(to_string(n.kind)));
+  }
+
+  n.materialized = true;
+  return OkStatus();
+}
+
+Result<float> read_scalar(const Node& node) {
+  if (node.element_count() == 0) {
+    return LSE_ERROR(kOutOfRange, "item() on an empty Array");
+  }
+  return load_element(node, 0);
+}
+
+Status read_raw(const Node& node, void* dst, std::size_t bytes) {
+  if (!node.buffer.valid()) return LSE_ERROR(kInternal, "node has no buffer");
+  const std::size_t have = dtype_storage_bytes(node.dtype, node.element_count());
+  if (bytes > have) {
+    return LSE_ERROR(kOutOfRange, "to_host asked for ", std::to_string(bytes),
+                     " bytes, tensor holds ", std::to_string(have));
+  }
+  const void* src = host_bytes(node);
+  if (src == nullptr) return LSE_ERROR(kInternal, "node has no host bytes");
+  std::memcpy(dst, src, bytes);
+  return OkStatus();
+}
+
+}  // namespace lse::graph::interpreter

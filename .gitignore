@@ -1,0 +1,15 @@
+build/
+reference/
+.cache/
+compile_commands.json
+*.safetensors
+*.o
+*.so
+target/
+
+# Generated design docs — not source of truth, not committed.
+PLAN.md
+README.md
+WORK.md
+.venv/
+tests/data/

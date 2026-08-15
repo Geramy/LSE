@@ -1,0 +1,17 @@
+[package]
+name = "fastokens-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "fastokens_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+fastokens = { path = "../../reference/fastokens" }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "unwind"

@@ -1,0 +1,7 @@
+# Host is C++26. compile_commands.json lives in the CMake build dir.
+# clangd-21 does not parse P2996; drop -freflection so it takes the
+# non-reflection branches. g++-16 still compiles those TUs with the flag.
+CompileFlags:
+  Add: [-std=c++26]
+  Remove: [-freflection]
+  CompilationDatabase: build

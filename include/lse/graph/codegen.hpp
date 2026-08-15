@@ -1,0 +1,97 @@
+// Device-agnostic kernel codegen contract.
+//
+// The graph layer knows that a fusion group becomes source and then a code
+// object; it does not know which language or which toolchain. A backend that
+// can generate kernels supplies both halves, and one that cannot supplies
+// neither — see backend::IBackend::emitter / ::compiler.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "lse/backend/backend.hpp"
+#include "lse/core/status.hpp"
+#include "lse/graph/dialect_source.hpp"
+
+namespace lse::graph {
+
+class Node;
+using NodePtr = std::shared_ptr<Node>;
+struct FusionGroup;
+
+// A float as a source literal. std::to_string is %.6f, which turns 1e-7f into
+// "0.000000"; streaming without showpoint turns 1.0f into the invalid "1f".
+std::string float_literal(float v);
+
+// Layout of the dispatch constants block. HRX separates buffer bindings from a
+// flat push-constant block; the emitter builds this and bakes the matching
+// signature into the generated source, so the two cannot drift.
+struct ConstantsLayout {
+  struct Field {
+    std::string name;
+    std::uint16_t offset;
+    std::uint8_t size;
+  };
+
+  std::vector<Field> fields;
+  std::uint32_t total_bytes = 0;
+
+  std::uint16_t add(std::string name, std::uint8_t size);
+};
+
+struct EmittedKernel {
+  std::string source;
+  std::string entry_name;
+  ConstantsLayout constants;
+  std::vector<NodePtr> binding_order;
+  backend::LaunchDims dims;
+  std::uint32_t lds_bytes = 0;
+  // Workspace for values the phase produces and consumes itself. Not a
+  // launch argument per tensor: one buffer, offsets baked into the source.
+  std::size_t scratch_bytes = 0;
+  // Kernel takes `const float* const* buf` and binding_order[i] is buf[i].
+  bool pointer_table = false;
+};
+
+class IKernelEmitter {
+ public:
+  virtual ~IKernelEmitter() = default;
+
+  virtual Result<EmittedKernel> emit(const FusionGroup& group,
+                                     const backend::DeviceInfo& device) const = 0;
+
+  // JIT identity for this group on this device. Must change when generated
+  // source would change without FusionGroup::signature() changing (a
+  // specialized primitive). Arch is mixed in by the cache, not here.
+  [[nodiscard]] virtual std::uint64_t cache_key(
+      const FusionGroup& group, const backend::DeviceInfo& device) const;
+
+  // Dialect of EmittedKernel::source, and of the source a primitive must
+  // supply to land in it.
+  [[nodiscard]] virtual Dialect dialect() const noexcept = 0;
+
+  // Declarations every kernel this emitter produces may rely on: the target's
+  // runtime header, the dispatch-constants struct. Kernel primitives that own
+  // a whole translation unit are prefixed with it.
+  [[nodiscard]] virtual std::string_view prelude() const noexcept = 0;
+
+  // How this backend spells each built-in primitive. Primitives carry no
+  // device text of their own unless they are written against an intrinsic.
+  [[nodiscard]] virtual DialectSourceTable sources() const noexcept = 0;
+};
+
+class IKernelCompiler {
+ public:
+  virtual ~IKernelCompiler() = default;
+
+  virtual Result<std::vector<std::byte>> compile(std::string_view source,
+                                                 std::string_view arch) const = 0;
+
+  [[nodiscard]] virtual bool available() const = 0;
+};
+
+}  // namespace lse::graph
