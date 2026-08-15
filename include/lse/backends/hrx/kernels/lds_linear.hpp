@@ -1,5 +1,6 @@
 #pragma once
 
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 
@@ -9,6 +10,16 @@ namespace lse::backend::hrx_kernels {
 // onto the launch; `persist` grid-strides tiles by `persist_wgs` so every
 // resident block works. Otherwise the same body walks every tile in one
 // workgroup. `persist_wgs` is a literal — HIP gridDim is not reliable here.
+void emit_gemv(graph::env::Emit& e,
+               const graph::env::In<graph::kir::f32, graph::env::Emit>& x,
+               const graph::env::In<graph::kir::f32, graph::env::Emit>& w,
+               const graph::env::In<graph::kir::f32, graph::env::Emit>* idx,
+               std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
+               std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
+               bool grid, std::uint32_t wave, bool persist = false,
+               std::uint32_t persist_wgs = 1);
+
+// Recorder-signature shim for callers that still hold raw kir buffers.
 void emit_gemv(graph::kir::KernelBody& k,
                const graph::kir::Buffer<graph::kir::f32>& x,
                const graph::kir::Buffer<graph::kir::f32>& w,

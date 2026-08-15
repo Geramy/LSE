@@ -2,9 +2,33 @@
 
 #include <string>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
+
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
+
+template <class E>
+struct SliceArgs {
+  env::In<kir::f32, E> x;
+  // Ret-style kernel: the element value is returned, not stored; the slot
+  // exists to satisfy the binding contract.
+  env::Out<kir::f32, E> out;
+};
+
+template <class E>
+auto slice_element(E& e, SliceArgs<E>& a, std::uint32_t begin,
+                   std::uint32_t in_axis, std::uint32_t out_axis,
+                   std::uint32_t inner) {
+  auto i = e.thread_id();
+  auto span = e.u32(out_axis * inner);
+  auto o = i / span;
+  auto rem = e.let(i % span);
+  auto ax = rem / inner;
+  auto ii = rem % inner;
+  return a.x[(o * in_axis + begin + ax) * inner + ii];
+}
 
 // Device copy of a slice. Stays on the device so a last-token take or a conv
 // tail is a D2D launch, not a host bounce. The general (outer, axis, inner)
@@ -40,16 +64,10 @@ struct SliceKernel final : KernelPrimitive<SliceKernel> {
     if (inner == 0 || out_axis == 0) return {};
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto i = k.thread_id();
-    const auto span = k.constant<kir::u32>(out_axis * inner);
-    const auto o = k.let<kir::u32>("o", i / span);
-    const auto rem = k.let<kir::u32>("rem", i % span);
-    const auto a = k.let<kir::u32>("a", rem / inner);
-    const auto ii = k.let<kir::u32>("ii", rem % inner);
-    const auto src = k.let<kir::u32>(
-        "src", (o * in_axis + begin + a) * inner + ii);
-    k.ret(x[src].read());
+    SliceArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    k.ret(slice_element(e, a, begin, in_axis, out_axis, inner));
     return k.str();
   }
 

@@ -11,7 +11,7 @@
 
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
-#include "kernels/linked.hpp"
+#include "lse/backends/hrx/kernels/linked.hpp"
 
 namespace lse::backend {
 
@@ -227,7 +227,11 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
   if (hrx_kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
     self = hrx_kernels::linked_kernel_for(group, dummy);
-  } else {
+  }
+  // A matched-but-declined linked pipeline must not erase the specialize
+  // probe: emit() falls back to the specialized primitive, so the key must
+  // name the same kernel or replays serve mismatched dims.
+  if (self == nullptr) {
     const graph::DialectSourceTable spellings = hip_sources();
     const kir::TypeTable type_table = hip_types();
     std::vector<Shape> storage;
@@ -458,21 +462,30 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   }
 
   const auto linked = hrx_kernels::linked_bindings(group);
+  // Active only when the linked pipeline supplies a kernel. A matched-but-
+  // declined pipeline (linked_kernel_for -> nullptr) must not clobber the
+  // specialize() choice above: that turned the decode lm_head GEMV back into
+  // the per-element scaffold on every replayed token.
+  bool linked_active = false;
   if (linked.ok) {
     KernelShapes probe;
-    self_indexed = hrx_kernels::linked_kernel_for(group, probe);
-    for (const NodePtr& n : group.nodes) {
-      if (n.get() == linked.sink) anchor = n;
+    if (const KernelPrimitiveBase* lk =
+            hrx_kernels::linked_kernel_for(group, probe)) {
+      linked_active = true;
+      self_indexed = lk;
+      for (const NodePtr& n : group.nodes) {
+        if (n.get() == linked.sink) anchor = n;
+      }
+      si_storage.clear();
+      for (const Node* in : linked.inputs) si_storage.push_back(in->shape);
+      si_shapes.inputs = si_storage;
+      si_shapes.output = linked.sink != nullptr ? linked.sink->shape : Shape{};
+      si_shapes.attrs = linked.attrs;
+      si_shapes.iattrs = linked.iattrs;
+      si_shapes.device = &device;
+      si_shapes.types = type_table;
+      si_shapes.intrinsics = &spellings;
     }
-    si_storage.clear();
-    for (const Node* in : linked.inputs) si_storage.push_back(in->shape);
-    si_shapes.inputs = si_storage;
-    si_shapes.output = linked.sink != nullptr ? linked.sink->shape : Shape{};
-    si_shapes.attrs = linked.attrs;
-    si_shapes.iattrs = linked.iattrs;
-    si_shapes.device = &device;
-    si_shapes.types = type_table;
-    si_shapes.intrinsics = &spellings;
   }
 
   EmittedKernel out;
@@ -487,7 +500,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   // A self-indexing primitive names its operands in0..inN in its own order, so
   // they are bound first and an epilogue's extra inputs cannot shift them.
   if (self_indexed != nullptr) {
-    if (linked.ok) {
+    if (linked_active) {
       for (const Node* want : linked.inputs) {
         NodePtr found;
         for (const NodePtr& n : group.nodes) {
@@ -714,7 +727,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       const bool is_out = output_set.count(b.get()) != 0;
       // Linked scratch (the SwiGLU hidden) lives in the group and is written
       // by the staged kernel, so it cannot be a const binding.
-      const bool scratch = linked.ok && !is_out && group_members.count(b.get());
+      const bool scratch =
+          linked_active && !is_out && group_members.count(b.get());
       const bool aliased_in = inplace_src != nullptr && b.get() == inplace_src;
       const bool writable = is_out || scratch || aliased_in;
       body << "    " << (writable ? "" : "const ")

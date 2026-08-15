@@ -182,6 +182,14 @@ Result<std::vector<std::byte>> compile_comgr(std::string_view source,
   LSE_RETURN_IF_ERROR(check(
       amd_comgr_action_info_set_logging(backend_action.handle, true),
       "amd_comgr_action_info_set_logging(backend)"));
+  // The codegen action does not inherit the compile action's options; without
+  // an explicit -O3 the backend runs at its default and every kernel ships
+  // unscheduled ISA (measured 13 GB/s vs 227 GB/s on the same GEMV source).
+  const char* backend_opts[] = {"-O3"};
+  LSE_RETURN_IF_ERROR(check(
+      amd_comgr_action_info_set_option_list(backend_action.handle, backend_opts,
+                                            1),
+      "amd_comgr_action_info_set_option_list(backend)"));
 
   DataSetGuard relocatable;
   LSE_RETURN_IF_ERROR(check(amd_comgr_create_data_set(&relocatable.handle),

@@ -19,14 +19,16 @@
 // Operands are f16: that is what the instruction multiplies. Against f32
 // weights a linear's error moves from ~1e-6 to ~1e-3. Default is on when
 // the live device has WMMA; LSE_WMMA=0 keeps the f32 scalar oracle.
-#include "kernels/wmma.hpp"
+#include "lse/backends/hrx/kernels/wmma.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
-#include "kernels/vec_mem.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {
@@ -80,6 +82,15 @@ bool device_supported(const KernelShapes& s) {
   return family == ArchFamily::kRdna3 || family == ArchFamily::kRdna35;
 }
 
+template <class E>
+struct WmmaLinearArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> w;
+  // Unused directly: owns_indexing stores go through the emitter hook, but the
+  // binding contract still names the output slot.
+  env::Out<kir::f32, E> out;
+};
+
 struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
   static constexpr std::string_view kName = "linear.wmma";
   static constexpr std::string_view kEntry = "lse_linear_wmma";
@@ -106,68 +117,67 @@ struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
-    const auto x = k.input<kir::f32>(0);
-    const auto w = k.input<kir::f32>(1);
+    WmmaLinearArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
 
-    const auto wave = k.let<kir::u32>("wave", k.thread_id() / 32u);
-    k.ret_if(wave >= tiles);
+    const auto wave = e.let(e.thread_id() / 32u);
+    (void)e.ret_if(wave >= tiles);
 
-    const auto lane = k.let<kir::u32>("lane", k.thread_id() % 32u);
-    const auto l16 = k.let<kir::u32>("l16", lane % 16u);
-    const auto half = k.let<kir::u32>("half", lane / 16u);
-    const auto m0 = k.let<kir::u32>("m0", (wave / tiles_n) * kTile);
-    const auto n0 = k.let<kir::u32>("n0", (wave % tiles_n) * kTile);
+    const auto lane = e.let(e.thread_id() % 32u);
+    const auto l16 = e.let(lane % 16u);
+    const auto half = e.let(lane / 16u);
+    const auto m0 = e.let((wave / tiles_n) * kTile);
+    const auto n0 = e.let((wave % tiles_n) * kTile);
 
     // Lane L supplies row L of x and row L of w. Both are contiguous in k, so
     // the fragment load is the checkpoint's own layout.
-    const auto arow = k.let<kir::u32>("arow", m0 + l16);
-    const auto bcol = k.let<kir::u32>("bcol", n0 + l16);
+    const auto arow = e.let(m0 + l16);
+    const auto bcol = e.let(n0 + l16);
 
-    const auto acc = k.local<kir::f32, 8>("acc");
-    k.unroll("e", 8, [&](kir::Val<kir::u32> e) { acc[e] = 0.0f; });
+    const auto acc = e.local<kir::f32, 8>();
+    for (auto z : e.unroll(8)) acc[z] = 0.0f;
 
     const auto load_bytes = device_load_bytes(s.device);
-    k.loop("k0", k.constant<kir::u32>(0), k.constant<kir::u32>(K), kTile,
-           [&](kir::Val<kir::u32> k0) {
-             const auto af = k.local<lse::f16, 16>("af");
-             const auto bf = k.local<lse::f16, 16>("bf");
-             const auto zero = cast<lse::f16>(k.lit(0.0f));
-             k.unroll("z", kTile, [&](kir::Val<kir::u32> z) {
-               af[z] = zero;
-               bf[z] = zero;
-             });
-             const auto step =
-                 kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
-             const auto chunks = static_cast<std::uint32_t>(kTile) / step;
-             k.unroll("c", chunks, [&](kir::Val<kir::u32> c) {
-               const auto kk = k.let<kir::u32>("kk", k0 + c * step);
-               const auto kend = k.let<kir::u32>("kend", kk + step);
-               k.when(arow < M && kend <= K, [&] {
-                 const auto xv = math::load(x, arow * K + kk, load_bytes);
-                 k.unroll("e", step, [&](kir::Val<kir::u32> e) {
-                   af[c * step + e] = cast<lse::f16>(xv[e]);
-                 });
-               });
-               k.when(bcol < N && kend <= K, [&] {
-                 const auto wv = math::load(w, bcol * K + kk, load_bytes);
-                 k.unroll("e", step, [&](kir::Val<kir::u32> e) {
-                   bf[c * step + e] = cast<lse::f16>(wv[e]);
-                 });
-               });
-             });
+    for (auto k0 : e.range(0u, K, kTile)) {
+      const auto af = e.local<lse::f16, 16>();
+      const auto bf = e.local<lse::f16, 16>();
+      const auto zero = cast<lse::f16>(e.f32(0.0f));
+      for (auto z : e.unroll(kTile)) {
+        af[z] = zero;
+        bf[z] = zero;
+      }
+      const auto step =
+          kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
+      const auto chunks = static_cast<std::uint32_t>(kTile) / step;
+      for (auto c : e.unroll(chunks)) {
+        const auto kk = e.let(k0 + c * step);
+        const auto kend = e.let(kk + step);
+        if (auto ga = e.when(arow < M && kend <= K)) {
+          const auto xv = e.load(a.x, arow * K + kk, load_bytes);
+          for (auto v : e.unroll(step)) {
+            af[c * step + v] = cast<lse::f16>(xv[v]);
+          }
+        }
+        if (auto gb = e.when(bcol < N && kend <= K)) {
+          const auto wv = e.load(a.w, bcol * K + kk, load_bytes);
+          for (auto v : e.unroll(step)) {
+            bf[c * step + v] = cast<lse::f16>(wv[v]);
+          }
+        }
+      }
 
-             acc = lse::math::wmma_f32_16x16x16(af.value(), bf.value(),
-                                                acc.value());
-           });
+      acc = lse::math::wmma_f32_16x16x16(af.value(), bf.value(), acc.value());
+    }
 
-    const auto col = k.let<kir::u32>("col", n0 + l16);
-    k.ret_if(col >= N);
-    k.unroll("e", 8, [&](kir::Val<kir::u32> e) {
-      const auto row = k.let<kir::u32>("row", m0 + e * 2u + half);
+    const auto col = e.let(n0 + l16);
+    (void)e.ret_if(col >= N);
+    for (auto z : e.unroll(8)) {
+      const auto row = e.let(m0 + z * 2u + half);
       // Storing through the hook, not into `out`: this is where any fused
       // silu/mul/add runs, on the accumulator still in register.
-      k.when(row < M, [&] { k.store(row * N + col, acc[e].read()); });
-    });
+      if (auto gr = e.when(row < M)) e.store(row * N + col, acc[z].read());
+    }
 
     return k.str();
   }

@@ -203,8 +203,8 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group) {
     }
   }
   if (std::getenv("LSE_TRACE_DISPATCH") != nullptr) {
-    std::fprintf(stderr, "dispatch %s count=%u wg=%u x %u |", 
-                 emitted->entry_name.c_str(), count,
+    std::fprintf(stderr, "dispatch %s phase=%d count=%u wg=%u x %u |",
+                 emitted->entry_name.c_str(), (int)group.is_phase, count,
                  emitted->dims.workgroup_count[0], emitted->dims.workgroup_size[0]);
     for (const NodePtr& n : emitted->binding_order) {
       std::fprintf(stderr, " %s%s", std::string(to_string(n->kind)).c_str(),

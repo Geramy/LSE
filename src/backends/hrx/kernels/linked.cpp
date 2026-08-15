@@ -4,12 +4,14 @@
 // SwiGLU is the one that shows up every block: two linears from the same
 // x, silu(g)*u, then a down linear. Decode is one workgroup per row;
 // hidden lives in LDS so the down GEMV never hits global for it.
-#include "kernels/linked.hpp"
-#include "kernels/gdn.hpp"
+#include "lse/backends/hrx/kernels/linked.hpp"
+#include "lse/backends/hrx/kernels/gdn.hpp"
 
 #include <string>
 
-#include "kernels/vec_mem.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {
@@ -141,13 +143,55 @@ RmsLinearParts match_rms_linear(const FusionGroup& group) {
 
 constexpr std::uint32_t kBlock = 256;
 
-void emit_row_dot(kir::KernelBody& k, const kir::Buffer<kir::f32>& a,
-                  const kir::Buffer<kir::f32>& b,
-                  const kir::Val<kir::u32>& a0,
-                  const kir::Val<kir::u32>& b0,
-                  const kir::LValue<kir::f32>& acc, std::uint32_t kdim,
-                  std::uint32_t load_bytes) {
-  emit_dot_f32(k, a, b, a0, b0, acc, kdim, load_bytes);
+// Both kernels store through the emitter hook; `out` exists only because
+// bind() requires the one output slot.
+template <class E>
+struct SwigluArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> wg;
+  env::In<kir::f32, E> wu;
+  env::In<kir::f32, E> wd;
+  env::InOut<kir::f32, E> hid;
+  env::Out<kir::f32, E> out;
+};
+
+template <class E>
+struct SwigluIndexedArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> wg;
+  env::In<kir::f32, E> wu;
+  env::In<kir::f32, E> wd;
+  env::In<kir::f32, E> idx;
+  env::InOut<kir::f32, E> hid;
+  env::Out<kir::f32, E> out;
+};
+
+// The dot walk stays on the shared kir-level helper, so the raw buffers
+// come out of the bound args.
+template <class A>
+void swiglu_stages(kir::KernelBody& k, env::Emit& e, A& a,
+                   const kir::Val<kir::u32>& lid,
+                   const kir::Val<kir::u32>& row,
+                   const kir::Val<kir::u32>& e_up,
+                   const kir::Val<kir::u32>& e_down, std::uint32_t K,
+                   std::uint32_t N, std::uint32_t D,
+                   std::uint32_t load_bytes) {
+  for (auto n : e.range(lid, e.u32(N), kBlock)) {
+    auto g = e.var(0.0f);
+    auto u = e.var(0.0f);
+    emit_dot_f32(k, a.x.b, a.wg.b, row * K, (e_up + n) * K, g, K, load_bytes);
+    emit_dot_f32(k, a.x.b, a.wu.b, row * K, (e_up + n) * K, u, K, load_bytes);
+    const auto gate = g.read() / (1.0f + math::exp(0.0f - g.read()));
+    a.hid[row * N + n] = gate * u.read();
+  }
+  e.barrier();
+
+  for (auto d : e.range(lid, e.u32(D), kBlock)) {
+    auto acc = e.var(0.0f);
+    emit_dot_f32(k, a.hid.b, a.wd.b, row * N, (e_down + d) * N, acc, N,
+                 load_bytes);
+    e.store(row * D + d, acc.read());
+  }
 }
 
 struct SwigluKernel final : KernelPrimitive<SwigluKernel> {

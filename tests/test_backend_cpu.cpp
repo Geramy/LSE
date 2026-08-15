@@ -1,6 +1,6 @@
 // Exercises the Backend<Derived> CRTP contract through the CPU reference
 // backend, and the registry that selects backends by name.
-#include "../src/backends/cpu/cpu_backend.hpp"
+#include "lse/backends/cpu/cpu_backend.hpp"
 
 #include <numeric>
 #include <vector>

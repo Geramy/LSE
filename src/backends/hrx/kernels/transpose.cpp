@@ -2,9 +2,34 @@
 
 #include <string>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
+
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
+
+template <class E>
+struct TransposeArgs {
+  env::In<kir::f32, E> x;
+  // Ret-style kernel: the element value is returned, not stored; the slot
+  // exists to satisfy the binding contract.
+  env::Out<kir::f32, E> out;
+};
+
+template <class E>
+auto transpose_element(E& e, TransposeArgs<E>& a, std::size_t rank,
+                       const std::uint32_t (&out_stride)[4],
+                       const std::uint32_t (&out_dim)[4],
+                       const std::uint32_t (&src_stride)[4]) {
+  auto i = e.thread_id();
+  auto src = e.u32(0);
+  for (std::size_t d = 0; d < rank; ++d) {
+    auto coord = e.let((i / out_stride[d]) % out_dim[d]);
+    src = src + coord * src_stride[d];
+  }
+  return a.x[src];
+}
 
 // Output axis d reads source axis iattrs[d]. Rank > 4 has no slot in iattrs
 // and declines, so the host reference keeps covering those.
@@ -26,22 +51,22 @@ struct TransposeKernel final : KernelPrimitive<TransposeKernel> {
 
     const auto in_st = in.strides();
     const auto out_st = out.strides();
-
-    kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto i = k.thread_id();
-    auto src = k.var<kir::u32>("src", k.constant<kir::u32>(0));
+    std::uint32_t out_stride[4] = {};
+    std::uint32_t out_dim[4] = {};
+    std::uint32_t src_stride[4] = {};
     for (std::size_t d = 0; d < out.rank(); ++d) {
       const auto perm = static_cast<std::size_t>(s.iattrs[d]);
       if (perm >= in.rank()) return {};
-      const auto coord = k.let<kir::u32>(
-          "c" + std::to_string(d),
-          (i / static_cast<std::uint32_t>(out_st[d])) %
-              static_cast<std::uint32_t>(out.dim(d)));
-      src = src.read() +
-            coord * static_cast<std::uint32_t>(in_st[perm]);
+      out_stride[d] = static_cast<std::uint32_t>(out_st[d]);
+      out_dim[d] = static_cast<std::uint32_t>(out.dim(d));
+      src_stride[d] = static_cast<std::uint32_t>(in_st[perm]);
     }
-    k.ret(x[src.read()].read());
+
+    kir::KernelBody k(s.types, *s.intrinsics);
+    TransposeArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    k.ret(transpose_element(e, a, out.rank(), out_stride, out_dim, src_stride));
     return k.str();
   }
 

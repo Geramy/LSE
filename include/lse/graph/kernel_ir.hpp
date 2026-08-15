@@ -622,9 +622,10 @@ inline bool Lds::reserve(std::uint32_t bytes) {
 template <typename T>
 Tile<T> Lds::array(std::string_view name, std::uint32_t count) {
   if (body_ == nullptr || !reserve(count * pack_elem_bytes<T>())) return {};
-  static std::uint32_t uniq;
+  // Uniqued per body, not per process: the generated text must be identical
+  // for the same group on every run or the disk cache can never hit.
   const std::string ident =
-      std::string(name) + "_" + std::to_string(uniq++);
+      std::string(name) + "_" + std::to_string(body_->temp_++);
   const std::string_view storage = body_->intrinsics_->find("shared");
   body_->statement(std::string(storage) + " " +
                    std::string(body_->types_->scalar(scalar_of<T>::value)) +

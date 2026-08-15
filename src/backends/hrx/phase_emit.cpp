@@ -6,8 +6,8 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/math.hpp"
-#include "kernels/lds_linear.hpp"
-#include "kernels/vec_mem.hpp"
+#include "lse/backends/hrx/kernels/lds_linear.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 
 #include <algorithm>
 #include <sstream>

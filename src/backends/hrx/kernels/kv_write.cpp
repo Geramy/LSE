@@ -1,3 +1,5 @@
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 
 #include <string>
@@ -5,6 +7,14 @@
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
+
+template <class E>
+struct OverwriteSliceArgs {
+  env::In<kir::f32, E> dst;  // inplace cache slot; written via the store hook
+  env::In<kir::f32, E> src;
+  env::In<kir::f32, E> begin;
+  env::Out<kir::f32, E> out;
+};
 
 // Writes src [.., T, inner] into dst [.., Cap, inner] at a runtime begin.
 // Threads cover src only; dest bytes the window does not touch stay put.
@@ -44,21 +54,20 @@ struct OverwriteSliceKernel final : KernelPrimitive<OverwriteSliceKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
-    const auto in = k.input<kir::f32>(1);
-    const auto begin = k.input<kir::f32>(2);
-    const auto i = k.thread_id();
-    k.ret_if(i >= src_n);
+    OverwriteSliceArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    (void)e.ret_if(i >= src_n);
 
-    const auto span = k.constant<kir::u32>(src_axis * inner);
-    const auto o = k.let<kir::u32>("o", i / span);
-    const auto rem = k.let<kir::u32>("rem", i % span);
-    const auto a = k.let<kir::u32>("a", rem / inner);
-    const auto ii = k.let<kir::u32>("ii", rem % inner);
-    const auto pos = k.let<kir::u32>(
-        "pos", kir::cast<kir::u32>(begin[k.constant<kir::u32>(0)].read()));
-    const auto dest = k.let<kir::u32>(
-        "dest", (o * dst_axis + pos + a) * inner + ii);
-    k.store(dest, in[i].read());
+    const auto span = e.u32(src_axis * inner);
+    const auto o = e.let(i / span);
+    const auto rem = e.let(i % span);
+    const auto ax = e.let(rem / inner);
+    const auto ii = e.let(rem % inner);
+    const auto pos = e.let(kir::cast<kir::u32>(a.begin[0u]));
+    const auto dest = e.let((o * dst_axis + pos + ax) * inner + ii);
+    e.store(dest, a.src[i]);
     return k.str();
   }
 

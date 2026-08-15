@@ -3,9 +3,9 @@
 
 #include <string>
 
-#include "kernels/lds_linear.hpp"
-#include "kernels/vec_mem.hpp"
-#include "kernels/wmma.hpp"
+#include "lse/backends/hrx/kernels/lds_linear.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/backends/hrx/kernels/wmma.hpp"
 
 namespace lse::backend::hrx_kernels {
 
@@ -95,10 +95,13 @@ struct LinearKernel final : KernelPrimitive<LinearKernel> {
   // verified; everywhere else this scalar loop stands.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
     // W is [N, K], x is [.., K]: both rows are contiguous in K, which is
-    // the WMMA A/B layout. Decode M=1 pads the M tile; that is still one
-    // wave per 16 output columns and a fat grid, not a scalar GEMV.
-    if (const KernelPrimitiveBase* wmma = wmma_linear_for(s)) return wmma;
+    // the WMMA A/B layout. M below one tile goes to the wave-per-column
+    // GEMV first: the padded 16x16 path masks 15/16 rows and its per-lane
+    // K-strided weight loads measured ~9 GB/s on the M=1 vocab head, vs a
+    // coalesced stream from the GEMV. lds_linear_for gates itself on m<16,
+    // so WMMA keeps every shape with full tiles.
     if (const KernelPrimitiveBase* lds = lds_linear_for(s)) return lds;
+    if (const KernelPrimitiveBase* wmma = wmma_linear_for(s)) return wmma;
     return this;
   }
 

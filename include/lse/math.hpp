@@ -9,10 +9,21 @@
 // so those stay written down.
 #pragma once
 
+#include <cmath>
+
 #include "lse/core/elem.hpp"
 #include "lse/graph/kernel_ir.hpp"
 
 namespace lse::math {
+
+// Host overloads of the same spellings: a kernel body instantiated with
+// env::Cpu calls these and executes directly instead of recording.
+inline float exp(float x) { return std::exp(x); }
+inline float sqrt(float x) { return std::sqrt(x); }
+inline float rsqrt(float x) { return 1.0f / std::sqrt(x); }
+inline float fma(float a, float b, float c) { return std::fma(a, b, c); }
+inline float max(float a, float b) { return a > b ? a : b; }
+inline float min(float a, float b) { return a < b ? a : b; }
 
 // Expression type of this library. The recorder lives in graph::kir; authors
 // include this header and never name that namespace.

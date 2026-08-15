@@ -11,6 +11,8 @@
 // cheaper than the host round trip it replaces.
 #include <string>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
@@ -30,20 +32,28 @@ bool usable(const KernelShapes& s) {
 
 // Sum of squares over the row this thread's element belongs to. Extents are
 // literals: shapes are already part of the JIT cache key.
-kir::LValue<kir::f32> sum_of_squares(kir::KernelBody& k,
-                                     const kir::Buffer<kir::f32>& x,
+kir::LValue<kir::f32> sum_of_squares(env::Emit& e,
+                                     const env::In<kir::f32, env::Emit>& x,
                                      const kir::Val<kir::u32>& row,
                                      std::uint32_t d) {
-  const auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-  k.loop("t", k.constant<kir::u32>(0), k.constant<kir::u32>(d), 1,
-         [&](kir::Val<kir::u32> t) {
-           const auto v = k.let<kir::f32>("v", x[row + t].read());
-           acc = math::fma(v, v, acc.read());
-         });
+  auto acc = e.var(0.0f);
+  for (auto t : e.range(d)) {
+    const auto v = e.let(x[row + t]);
+    acc = math::fma(v, v, acc.read());
+  }
   return acc;
 }
 
 }  // namespace
+
+// These kernels are not self-indexing: they hand their element back through
+// `ret` and the emitter stores it, so `out` is bound but never written here.
+template <class E>
+struct RmsNormArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> g;
+  env::Out<kir::f32, E> out;
+};
 
 // scale = rsqrt(mean(x^2) + eps); out = x * scale * (bias + w[col]).
 // The host reference accumulates in fp64 and this in fp32; over 1024 terms
@@ -63,18 +73,18 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto g = k.input<kir::f32>(1);
-    const auto row = k.let<kir::u32>("row", (k.thread_id() / d) * d);
-    const auto col = k.let<kir::u32>("col", k.thread_id() % d);
-    const auto acc = sum_of_squares(k, x, row, d);
-    const auto scale = k.let<kir::f32>(
-        "scale", math::rsqrt(acc.read() / static_cast<float>(d) + s.attrs[0]));
+    RmsNormArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto row = e.let((e.thread_id() / d) * d);
+    const auto col = e.let(e.thread_id() % d);
+    const auto acc = sum_of_squares(e, a.x, row, d);
+    const auto scale =
+        e.let(math::rsqrt(acc.read() / static_cast<float>(d) + s.attrs[0]));
     // iattrs[0] selects the zero-centered form, where the stored weight is an
     // offset from 1 rather than the scale itself.
-    const auto w = s.iattrs[0] != 0 ? k.lit(1.0f) + g[col].read()
-                                    : g[col].read();
-    k.ret(x[k.thread_id()].read() * scale * w);
+    const auto w = s.iattrs[0] != 0 ? e.f32(1.0f) + a.g[col] : a.g[col];
+    k.ret(a.x[e.thread_id()] * scale * w);
     return k.str();
   }
 
@@ -98,6 +108,12 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
 };
 LSE_REGISTER_PRIMITIVE(RmsNormKernel);
 
+template <class E>
+struct L2NormArgs {
+  env::In<kir::f32, E> x;
+  env::Out<kir::f32, E> out;
+};
+
 // out = x / max(||x||, eps). eps floors the norm, it does not sit under the
 // sqrt — see the note in the host implementation.
 struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
@@ -115,13 +131,14 @@ struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto row = k.let<kir::u32>("row", (k.thread_id() / d) * d);
-    const auto acc = sum_of_squares(k, x, row, d);
-    const auto inv = k.let<kir::f32>(
-        "inv", k.lit(1.0f) / math::max(math::sqrt(acc.read()),
-                                       k.lit(s.attrs[0])));
-    k.ret(x[k.thread_id()].read() * inv);
+    L2NormArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto row = e.let((e.thread_id() / d) * d);
+    const auto acc = sum_of_squares(e, a.x, row, d);
+    const auto inv = e.let(
+        e.f32(1.0f) / math::max(math::sqrt(acc.read()), e.f32(s.attrs[0])));
+    k.ret(a.x[e.thread_id()] * inv);
     return k.str();
   }
 
@@ -138,6 +155,12 @@ struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
   }
 };
 LSE_REGISTER_PRIMITIVE(L2NormKernel);
+
+template <class E>
+struct SoftmaxArgs {
+  env::In<kir::f32, E> x;
+  env::Out<kir::f32, E> out;
+};
 
 // Max-shifted softmax over the last axis. Any other axis declines, and the
 // group falls back to the host rather than emitting the wrong reduction.
@@ -159,22 +182,25 @@ struct SoftmaxKernel final : KernelPrimitive<SoftmaxKernel> {
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto x = k.input<kir::f32>(0);
-    const auto row = k.let<kir::u32>("row", (k.thread_id() / d) * d);
+    SoftmaxArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto row = e.let((e.thread_id() / d) * d);
 
-    const auto m = k.var<kir::f32>("m", math::neg_inf());
-    k.loop("t", k.constant<kir::u32>(0), k.constant<kir::u32>(d), 1,
-           [&](kir::Val<kir::u32> t) {
-             m = math::max(m.read(), x[row + t].read());
-           });
+    // env vars lift only float literals; seed, then overwrite with the
+    // recorded -inf before any read.
+    auto m = e.var(0.0f);
+    m = math::neg_inf();
+    for (auto t : e.range(d)) {
+      m = math::max(m.read(), a.x[row + t]);
+    }
 
-    const auto denom = k.var<kir::f32>("denom", k.lit(0.0f));
-    k.loop("t", k.constant<kir::u32>(0), k.constant<kir::u32>(d), 1,
-           [&](kir::Val<kir::u32> t) {
-             denom = denom.read() + math::exp(x[row + t].read() - m.read());
-           });
+    auto denom = e.var(0.0f);
+    for (auto t : e.range(d)) {
+      denom = denom.read() + math::exp(a.x[row + t] - m.read());
+    }
 
-    k.ret(math::exp(x[k.thread_id()].read() - m.read()) / denom.read());
+    k.ret(math::exp(a.x[e.thread_id()] - m.read()) / denom.read());
     return k.str();
   }
 

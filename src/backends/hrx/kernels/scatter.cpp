@@ -2,9 +2,26 @@
 
 #include <string>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
+
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
+
+namespace {
+
+template <class E>
+struct ScatterAddArgs {
+  env::In<kir::f32, E> base;
+  env::In<kir::f32, E> rows;
+  env::In<kir::f32, E> values;
+  // Per-element kernel: the value leaves through k.ret, never this slot, but
+  // bind requires the output declared.
+  env::Out<kir::f32, E> out;
+};
+
+}  // namespace
 
 // out = base; out[row[s]] += values[s]. Two experts can land on one token, so
 // this accumulates. The scatter list is short (tokens routed to one expert),
@@ -27,21 +44,20 @@ struct ScatterAddKernel final : KernelPrimitive<ScatterAddKernel> {
     if (width == 0) return {};
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto base = k.input<kir::f32>(0);
-    const auto rows = k.input<kir::f32>(1);
-    const auto values = k.input<kir::f32>(2);
-    const auto i = k.thread_id();
-    const auto dst_row = k.let<kir::u32>("dr", i / width);
-    const auto col = k.let<kir::u32>("col", i % width);
-    auto v = k.var<kir::f32>("v", base[i].read());
+    ScatterAddArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    const auto dst_row = e.let(i / width);
+    const auto col = e.let(i % width);
+    // env::Emit::var only takes a float literal; the accumulator starts from
+    // a buffer read, so it stays on the recorder directly.
+    auto v = k.var<kir::f32>("v", a.base[i]);
     for (std::uint32_t sidx = 0; sidx < count; ++sidx) {
-      const auto src_row = k.let<kir::u32>(
-          "sr" + std::to_string(sidx),
-          cast<kir::u32>(rows[k.constant<kir::u32>(sidx)].read()));
-      k.when(src_row == dst_row, [&] {
-        v = v.read() +
-            values[k.constant<kir::u32>(sidx) * width + col].read();
-      });
+      const auto src_row = e.let(cast<kir::u32>(a.rows[sidx]));
+      if (auto g = e.when(src_row == dst_row)) {
+        v = v.read() + a.values[sidx * width + col];
+      }
     }
     k.ret(v.read());
     return k.str();

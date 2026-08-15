@@ -1,10 +1,10 @@
-#include "hrx_backend.hpp"
+#include "lse/backends/hrx/hrx_backend.hpp"
 
 #include <cstring>
 #include <memory>
 #include <vector>
 
-#include "arch_database.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
 
 extern "C" {
 #include "hrx_runtime.h"

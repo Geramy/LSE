@@ -2,9 +2,48 @@
 
 #include <string>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
+
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
+
+// Concat takes 2-4 inputs; every possible slot is declared and the body only
+// touches the first `parts` of them.
+template <class E>
+struct ConcatArgs {
+  env::In<kir::f32, E> in0;
+  env::In<kir::f32, E> in1;
+  env::In<kir::f32, E> in2;
+  env::In<kir::f32, E> in3;
+  // Ret-style kernel: the element value is returned, not stored; the slot
+  // exists to satisfy the binding contract.
+  env::Out<kir::f32, E> out;
+};
+
+template <class E>
+auto concat_element(E& e, ConcatArgs<E>& a, std::size_t parts,
+                    const std::uint32_t (&lens)[4], std::uint32_t out_axis,
+                    std::uint32_t inner) {
+  const env::In<kir::f32, E>* src[4] = {&a.in0, &a.in1, &a.in2, &a.in3};
+  auto i = e.thread_id();
+  auto span = e.u32(out_axis * inner);
+  auto o = e.let(i / span);
+  auto rem = e.let(i % span);
+  auto ax = e.let(rem / inner);
+  auto ii = e.let(rem % inner);
+  auto v = e.var(0.0f);
+  std::uint32_t off = 0;
+  for (std::size_t p = 0; p < parts; ++p) {
+    auto idx = (o * lens[p] + (ax - off)) * inner + ii;
+    if (auto owns = e.when(ax >= off && ax < off + lens[p])) {
+      v = (*src[p])[idx];
+    }
+    off += lens[p];
+  }
+  return v;
+}
 
 // Pack along one axis. Split points are literals; the thread picks which
 // input owns its output coordinate and copies that element.
@@ -39,26 +78,12 @@ struct ConcatKernel final : KernelPrimitive<ConcatKernel> {
     }
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto i = k.thread_id();
-    const auto span = k.constant<kir::u32>(out_axis * inner);
-    const auto o = k.let<kir::u32>("o", i / span);
-    const auto rem = k.let<kir::u32>("rem", i % span);
-    const auto a = k.let<kir::u32>("a", rem / inner);
-    const auto ii = k.let<kir::u32>("ii", rem % inner);
-
-    const auto v = k.var<kir::f32>("v", k.lit(0.0f));
-    std::uint32_t off = 0;
-    for (std::size_t p = 0; p < s.inputs.size(); ++p) {
-      const auto src = k.input<kir::f32>(p);
-      const auto lo = k.constant<kir::u32>(off);
-      const auto hi = k.constant<kir::u32>(off + lens[p]);
-      const auto local = k.let<kir::u32>("c" + std::to_string(p), a - lo);
-      const auto idx = k.let<kir::u32>(
-          "idx" + std::to_string(p), (o * lens[p] + local) * inner + ii);
-      k.when(a >= lo && a < hi, [&] { v = src[idx].read(); });
-      off += lens[p];
-    }
-    k.ret(v.read());
+    ConcatArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const kir::Val<kir::f32> v =
+        concat_element(e, a, s.inputs.size(), lens, out_axis, inner);
+    k.ret(v);
     return k.str();
   }
 

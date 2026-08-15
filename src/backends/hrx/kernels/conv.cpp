@@ -1,3 +1,5 @@
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
@@ -7,6 +9,14 @@ namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
+
+template <class E>
+struct CausalConv1dArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> w;
+  env::In<kir::f32, E> bias;
+  env::Out<kir::f32, E> out;
+};
 
 // Depthwise causal conv: out[b,t,c] = bias[c] + sum_j w[c,j] * x[b,t-(K-1-j),c]
 // with zeros before t=0. K is a literal; lemonseed uses a small kernel.
@@ -29,24 +39,22 @@ struct CausalConv1dKernel final : KernelPrimitive<CausalConv1dKernel> {
     if (channels == 0 || seq == 0 || kernel == 0) return {};
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto in = k.input<kir::f32>(0);
-    const auto w = k.input<kir::f32>(1);
-    const auto b = k.input<kir::f32>(2);
-    const auto i = k.thread_id();
-    const auto c = k.let<kir::u32>("ch", i % channels);
-    const auto t = k.let<kir::u32>("t", (i / channels) % seq);
-    const auto bi = k.let<kir::u32>("bi", i / (channels * seq));
-    auto acc = k.var<kir::f32>("acc", b[c].read());
+    CausalConv1dArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    const auto c = e.let(i % channels);
+    const auto t = e.let((i / channels) % seq);
+    const auto bi = e.let(i / (channels * seq));
+    auto acc = e.var(0.0f);
+    acc = a.bias[c];
     for (std::uint32_t j = 0; j < kernel; ++j) {
       const auto back = kernel - 1 - j;
-      const auto src_t = k.let<kir::u32>("st" + std::to_string(j), t - back);
-      const auto src = k.let<kir::u32>(
-          "sx" + std::to_string(j), (bi * seq + src_t) * channels + c);
-      k.when(t >= back, [&] {
-        acc = math::fma(in[src].read(),
-                        w[c * kernel + k.constant<kir::u32>(j)].read(),
-                        acc.read());
-      });
+      const auto src_t = e.let(t - back);
+      const auto src = e.let((bi * seq + src_t) * channels + c);
+      if (auto in_range = e.when(t >= back)) {
+        acc = math::fma(a.x[src], a.w[c * kernel + j], acc);
+      }
     }
     k.ret(acc.read());
     return k.str();

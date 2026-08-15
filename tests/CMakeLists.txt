@@ -14,6 +14,7 @@ endfunction()
 
 lse_add_test(test_dtype)
 lse_add_test(test_reflect)
+lse_add_test(test_kernel_env lse_graph)
 lse_add_test(test_quant)
 lse_add_test(test_shape)
 lse_add_test(test_model lse_model)

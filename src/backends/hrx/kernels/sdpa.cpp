@@ -1,3 +1,5 @@
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
@@ -7,6 +9,15 @@ namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
+
+template <class E>
+struct SdpaArgs {
+  env::In<kir::f32, E> q;
+  env::In<kir::f32, E> k;
+  env::In<kir::f32, E> v;
+  env::In<kir::f32, E> off;  // optional 4th input: live cache offset
+  env::Out<kir::f32, E> out;
+};
 
 // One thread per output [B, Hq, Tq, Dv]. Recomputes the key dots for softmax;
 // S is small on the generate path (prefill tokens or cached length).
@@ -46,80 +57,71 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     (void)bsz;
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto qin = k.input<kir::f32>(0);
-    const auto kin = k.input<kir::f32>(1);
-    const auto vin = k.input<kir::f32>(2);
-    const auto i = k.thread_id();
-    const auto d = k.let<kir::u32>("d", i % dv);
-    const auto qi = k.let<kir::u32>("qi", (i / dv) % tq);
-    const auto h = k.let<kir::u32>("h", (i / (dv * tq)) % qh);
-    const auto b = k.let<kir::u32>("b", i / (dv * tq * qh));
-    const auto kh = k.let<kir::u32>("kh", h / group);
-    kir::Val<kir::u32> offset = k.constant<kir::u32>(baked_off);
+    SdpaArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    const auto d = e.let(i % dv);
+    const auto qi = e.let((i / dv) % tq);
+    const auto h = e.let((i / (dv * tq)) % qh);
+    const auto b = e.let(i / (dv * tq * qh));
+    const auto kh = e.let(h / group);
+    kir::Val<kir::u32> offset = e.u32(baked_off);
     if (live_off) {
-      const auto offb = k.input<kir::f32>(3);
-      offset = k.let<kir::u32>(
-          "off", kir::cast<kir::u32>(offb[k.constant<kir::u32>(0)].read()));
+      offset = e.let(kir::cast<kir::u32>(a.off[0u]));
     }
-    const auto abs_i = k.let<kir::u32>("ai", offset + qi);
-    const auto used = k.let<kir::u32>("used", offset + tq);
-    const auto hi = k.let<kir::u32>(
-        "hi", select(used < k.constant<kir::u32>(ts), used,
-                     k.constant<kir::u32>(ts)));
+    const auto abs_i = e.let(offset + qi);
+    const auto used = e.let(offset + tq);
+    const auto hi = e.let(select(used < e.u32(ts), used, e.u32(ts)));
 
+    // env::var only takes a float literal init; neg_inf() is a recorded call.
     const auto m = k.var<kir::f32>("m", math::neg_inf());
-    k.loop("j0", k.constant<kir::u32>(0), live_off ? hi : k.constant<kir::u32>(ts), 1,
-           [&](kir::Val<kir::u32> j) {
-             auto score = k.var<kir::f32>("sc0", k.lit(0.0f));
-             k.loop("dd0", k.constant<kir::u32>(0), k.constant<kir::u32>(dh), 1,
-                    [&](kir::Val<kir::u32> dd) {
-                      const auto qb = ((b * qh + h) * tq + qi) * dh + dd;
-                      const auto kb = ((b * kvh + kh) * ts + j) * dh + dd;
-                      score = math::fma(qin[qb].read(), kin[kb].read(),
-                                        score.read());
-                    });
-             score = score.read() * scale;
-             auto take = [&] {
-               m = math::max(m.read(), score.read());
-             };
-             if (mask == 0) {
-               take();
-             } else if (mask == 1) {
-               k.when(j <= abs_i, take);
-             } else {
-               k.when(j <= abs_i && (abs_i - j) < window, take);
-             }
-           });
+    for (auto j : e.range(live_off ? hi : e.u32(ts))) {
+      auto score = e.var(0.0f);
+      for (auto dd : e.range(dh)) {
+        const auto qb = ((b * qh + h) * tq + qi) * dh + dd;
+        const auto kb = ((b * kvh + kh) * ts + j) * dh + dd;
+        score = math::fma(a.q[qb], a.k[kb], score.read());
+      }
+      score = score.read() * scale;
+      auto take = [&] {
+        m = math::max(m.read(), score.read());
+      };
+      if (mask == 0) {
+        take();
+      } else if (mask == 1) {
+        if (auto g = e.when(j <= abs_i)) take();
+      } else {
+        if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
+      }
+    }
 
-    auto denom = k.var<kir::f32>("den", k.lit(0.0f));
-    auto acc = k.var<kir::f32>("acc", k.lit(0.0f));
-    k.loop("j1", k.constant<kir::u32>(0), live_off ? hi : k.constant<kir::u32>(ts), 1,
-           [&](kir::Val<kir::u32> j) {
-             auto score = k.var<kir::f32>("sc1", k.lit(0.0f));
-             k.loop("dd1", k.constant<kir::u32>(0), k.constant<kir::u32>(dh), 1,
-                    [&](kir::Val<kir::u32> dd) {
-                      const auto qb = ((b * qh + h) * tq + qi) * dh + dd;
-                      const auto kb = ((b * kvh + kh) * ts + j) * dh + dd;
-                      score = math::fma(qin[qb].read(), kin[kb].read(),
-                                        score.read());
-                    });
-             score = score.read() * scale;
-             auto w = k.var<kir::f32>("w", k.lit(0.0f));
-             auto apply = [&] {
-               w = math::exp(score.read() - m.read());
-             };
-             if (mask == 0) {
-               apply();
-             } else if (mask == 1) {
-               k.when(j <= abs_i, apply);
-             } else {
-               k.when(j <= abs_i && (abs_i - j) < window, apply);
-             }
-             denom = denom.read() + w.read();
-             const auto vb = ((b * kvh + kh) * ts + j) * dv + d;
-             acc = math::fma(w.read(), vin[vb].read(), acc.read());
-           });
-    k.ret(acc.read() / select(denom.read() == 0.0f, k.lit(1.0f), denom.read()));
+    auto denom = e.var(0.0f);
+    auto acc = e.var(0.0f);
+    for (auto j : e.range(live_off ? hi : e.u32(ts))) {
+      auto score = e.var(0.0f);
+      for (auto dd : e.range(dh)) {
+        const auto qb = ((b * qh + h) * tq + qi) * dh + dd;
+        const auto kb = ((b * kvh + kh) * ts + j) * dh + dd;
+        score = math::fma(a.q[qb], a.k[kb], score.read());
+      }
+      score = score.read() * scale;
+      auto w = e.var(0.0f);
+      auto apply = [&] {
+        w = math::exp(score.read() - m.read());
+      };
+      if (mask == 0) {
+        apply();
+      } else if (mask == 1) {
+        if (auto g = e.when(j <= abs_i)) apply();
+      } else {
+        if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
+      }
+      denom = denom.read() + w.read();
+      const auto vb = ((b * kvh + kh) * ts + j) * dv + d;
+      acc = math::fma(w.read(), a.v[vb], acc.read());
+    }
+    k.ret(acc.read() / select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
     return k.str();
   }
 

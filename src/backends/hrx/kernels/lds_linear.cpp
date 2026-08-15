@@ -3,11 +3,11 @@
 // W is [N, K] (or [E, N, K]). One thread per column walks a whole row, so
 // neighbouring threads are K floats apart. One wave per column, lanes on
 // consecutive K, is a coalesced row read; the wave xor-reduces in registers.
-#include "kernels/lds_linear.hpp"
+#include "lse/backends/hrx/kernels/lds_linear.hpp"
 
 #include <string>
 
-#include "kernels/vec_mem.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/math.hpp"
 

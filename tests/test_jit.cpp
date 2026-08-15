@@ -11,7 +11,7 @@
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
 #include "lse/core/debug.hpp"
-#include "arch_database.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/comgr_compiler.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hip_emitter.hpp"
@@ -780,7 +780,7 @@ LSE_TEST(live_arch_picks_the_widest_load) {
 
 // Decode-shaped (M=1): still WMMA. One wave owns a 16-wide N tile;
 // padding the M side is cheaper than a scalar column walk.
-LSE_TEST(decode_linear_uses_wmma_row_tiles) {
+LSE_TEST(decode_linear_uses_coalesced_gemv_not_wmma) {
   ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{64, 32}, DType::kF32, 1.0f);
@@ -788,11 +788,16 @@ LSE_TEST(decode_linear_uses_wmma_row_tiles) {
   auto e = emit_last_for(y);
   LSE_EXPECT(e.ok());
   if (!e.ok()) return;
-  LSE_EXPECT(e->source.find("__builtin_amdgcn_wmma_f32_16x16x16_f16_w32") !=
+  // M below one tile takes the wave-per-column GEMV: the padded WMMA tile
+  // masks 15/16 rows and its K-strided weight loads measured ~9 GB/s on the
+  // M=1 vocab head. The GEMV reduces across the wave, so shfl is the marker.
+  LSE_EXPECT(e->source.find("__builtin_amdgcn_wmma_f32_16x16x16_f16_w32") ==
              std::string::npos);
+  LSE_EXPECT(e->source.find("__shfl_xor") != std::string::npos);
   LSE_EXPECT(e->dims.workgroup_size[0] == 256u);
-  // 64/16 = 4 column tiles, 8 waves to a group → one workgroup.
-  LSE_EXPECT(e->dims.workgroup_count[0] == 1u);
+  // 8 waves to a group, one wave per output column → 64/8 workgroups.
+  LSE_EXPECT(e->dims.workgroup_count[0] == 8u);
+  LSE_EXPECT(e->dims.workgroup_count[1] == 1u);
   if (!kCompiler.available()) return;
   auto code = kCompiler.compile(e->source, "gfx1151");
   if (!code.ok()) {

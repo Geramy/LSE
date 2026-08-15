@@ -2,8 +2,8 @@
 
 #include <string>
 
-#include "kernels/lds_linear.hpp"
-#include "kernels/vec_mem.hpp"
+#include "lse/backends/hrx/kernels/lds_linear.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {

@@ -1,3 +1,5 @@
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 
 #include <string>
@@ -5,6 +7,15 @@
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
+
+template <class E>
+struct RopeArgs {
+  env::In<kir::f32, E> x;
+  env::In<kir::f32, E> cos;
+  env::In<kir::f32, E> sin;
+  env::In<kir::f32, E> off;  // optional: present only on 4-input nodes
+  env::Out<kir::f32, E> out;
+};
 
 // Interleaved pairs: (x0,x1) -> (x0 c - x1 s, x1 c + x0 s). cos/sin are
 // [max_T, D]; position is offset + (row % seq).
@@ -29,27 +40,25 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
     if (dim < 2 || seq == 0) return {};
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    const auto in = k.input<kir::f32>(0);
-    const auto cos = k.input<kir::f32>(1);
-    const auto sin = k.input<kir::f32>(2);
-    const auto i = k.thread_id();
-    const auto d = k.let<kir::u32>("d", i % dim);
-    const auto r = k.let<kir::u32>("r", i / dim);
-    kir::Val<kir::u32> offset = k.constant<kir::u32>(baked_off);
+    RopeArgs<env::Emit> a;
+    env::bind(k, a);
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    const auto d = e.let(i % dim);
+    const auto r = e.let(i / dim);
+    kir::Val<kir::u32> offset = e.u32(baked_off);
     if (live_off) {
-      const auto offb = k.input<kir::f32>(3);
-      offset = k.let<kir::u32>(
-          "off", kir::cast<kir::u32>(offb[k.constant<kir::u32>(0)].read()));
+      offset = e.let(kir::cast<kir::u32>(a.off[0u]));
     }
-    const auto t = k.let<kir::u32>("t", offset + (r % seq));
-    const auto pair = k.let<kir::u32>("pair", (d / 2u) * 2u);
-    const auto base = k.let<kir::u32>("base", r * dim + pair);
-    const auto ang = k.let<kir::u32>("ang", t * dim + pair);
-    const auto a = k.let<kir::f32>("a", in[base].read());
-    const auto b = k.let<kir::f32>("b", in[base + 1u].read());
-    const auto c = k.let<kir::f32>("c", cos[ang].read());
-    const auto s0 = k.let<kir::f32>("s0", sin[ang].read());
-    k.ret(select((d % 2u) == 0u, a * c - b * s0, b * c + a * s0));
+    const auto t = e.let(offset + (r % seq));
+    const auto pair = e.let((d / 2u) * 2u);
+    const auto base = e.let(r * dim + pair);
+    const auto ang = e.let(t * dim + pair);
+    const auto x0 = e.let(a.x[base]);
+    const auto x1 = e.let(a.x[base + 1u]);
+    const auto c = e.let(a.cos[ang]);
+    const auto s0 = e.let(a.sin[ang]);
+    k.ret(select((d % 2u) == 0u, x0 * c - x1 * s0, x1 * c + x0 * s0));
     return k.str();
   }
 

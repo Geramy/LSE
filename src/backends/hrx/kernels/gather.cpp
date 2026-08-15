@@ -2,11 +2,23 @@
 
 #include <string>
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
+
 namespace lse::backend::hrx_kernels {
 
 using namespace lse::graph;
 
 namespace {
+
+template <class E>
+struct RowGatherArgs {
+  env::In<kir::f32, E> src;
+  env::In<kir::f32, E> rows;
+  // Per-element kernel: the value leaves through k.ret, never this slot, but
+  // bind requires the output declared.
+  env::Out<kir::f32, E> out;
+};
 
 // out[s, c] = src[row[s], c]. rows are f32 indices, matching the rest of the
 // graph. Width is the last axis of the output.
@@ -20,13 +32,14 @@ std::string emit_row_gather(const KernelShapes& s) {
   if (width == 0) return {};
 
   kir::KernelBody k(s.types, *s.intrinsics);
-  const auto src = k.input<kir::f32>(0);
-  const auto rows = k.input<kir::f32>(1);
-  const auto i = k.thread_id();
-  const auto slot = k.let<kir::u32>("s", i / width);
-  const auto col = k.let<kir::u32>("col", i % width);
-  const auto row = k.let<kir::u32>("row", cast<kir::u32>(rows[slot].read()));
-  k.ret(src[row * width + col].read());
+  RowGatherArgs<env::Emit> a;
+  env::bind(k, a);
+  env::Emit e{&k};
+  const auto i = e.thread_id();
+  const auto slot = i / width;
+  const auto col = i % width;
+  const auto row = cast<kir::u32>(a.rows[slot]);
+  k.ret(a.src[row * width + col]);
   return k.str();
 }
 

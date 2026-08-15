@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/linked.hpp"
+#include "lse/backends/hrx/kernels/linked.hpp"
 
 namespace lse::backend::hrx_kernels {
 

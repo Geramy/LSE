@@ -164,8 +164,15 @@ void purge_kernel_artifacts() {
       std::error_code ec;
       fs::remove_all(n, ec);
     };
-    wipe(default_cache_dir());
+    // The dump dir is debug output; clearing it keeps build/hip in step with
+    // this process's emission. The .co cache is NOT wiped: entries carry an
+    // arch + source-hash check on read, so stale ones self-invalidate, and
+    // wiping here forced every process to recompile every kernel.
     wipe(hip_dump_directory());
+    if (const char* env = std::getenv("LSE_JIT_PURGE");
+        env != nullptr && env[0] == '1') {
+      wipe(default_cache_dir());
+    }
   });
 }
 
@@ -201,8 +208,13 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
 JitCache::~JitCache() = default;
 
 std::uint64_t JitCache::slot_key(std::uint64_t signature) const noexcept {
+  // Bump when the compiler invocation changes (options, action pipeline):
+  // source_hash cannot tell objects built by an older pipeline apart, so the
+  // key must. Rev 2: backend codegen action gained -O3.
+  constexpr std::uint64_t kCompileRevision = 2;
   // Arch in the key so a device change cannot reuse another target's object.
-  return mix(signature, fnv(backend_.device_info().arch));
+  return mix(mix(signature, kCompileRevision),
+             fnv(backend_.device_info().arch));
 }
 
 const backend::KernelHandle* JitCache::try_get(

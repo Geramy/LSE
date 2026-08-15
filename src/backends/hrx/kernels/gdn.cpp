@@ -1,5 +1,7 @@
-#include "kernels/gdn.hpp"
+#include "lse/backends/hrx/kernels/gdn.hpp"
 
+#include "lse/graph/kernel_args.hpp"
+#include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 #include "lse/backends/hrx/device_info.hpp"
@@ -26,6 +28,21 @@ std::uint32_t wave_of(const DeviceInfo* device) {
 
 enum class GdnWrite : std::uint8_t { kOut, kState, kBoth };
 
+template <class E>
+struct GdnArgs {
+  env::In<kir::f32, E> q;
+  env::In<kir::f32, E> k;
+  env::In<kir::f32, E> v;
+  env::In<kir::f32, E> alpha;
+  env::In<kir::f32, E> beta;
+  env::In<kir::f32, E> s;
+  // Input slot 6, written by the .pair variant to carry final state.
+  env::InOut<kir::f32, E> sout;
+  // Never indexed: this kernel owns indexing and stores through the emitter's
+  // epilogue hook, but the binding contract wants exactly one Out.
+  env::Out<kir::f32, E> out;
+};
+
 // One wave owns one row of S. Each lane holds D/wave (or 1) scalars — never
 // a D-wide ext_vector, which is what spilled 64 floats to scratch.
 // kBoth scans time once: write o[t] every step and S at the end.
@@ -48,98 +65,91 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
 
   kir::KernelBody k(s.types, *s.intrinsics);
   k.set_store(s.store);
-  const auto qin = k.input<kir::f32>(0);
-  const auto kin = k.input<kir::f32>(1);
-  const auto vin = k.input<kir::f32>(2);
-  const auto alpha = k.input<kir::f32>(3);
-  const auto beta = k.input<kir::f32>(4);
-  const auto sin = k.input<kir::f32>(5);
-  const auto i = k.thread_id();
-  const auto lane = k.let<kir::u32>("lane", i % wave);
-  const auto wid = k.let<kir::u32>("wid", i / wave);
-  k.ret_if(wid >= rows);
+  GdnArgs<env::Emit> a;
+  env::bind(k, a);
+  env::Emit e{&k};
 
-  const auto row = k.let<kir::u32>("row", wid % D);
-  const auto h = k.let<kir::u32>("h", (wid / D) % heads);
+  const auto i = e.thread_id();
+  const auto lane = e.let(i % wave);
+  const auto wid = e.let(i / wave);
+  (void)e.ret_if(wid >= rows);
+
+  const auto row = e.let(wid % D);
+  const auto h = e.let((wid / D) % heads);
   kir::Val<kir::u32> b, t_out;
   if (write_state) {
-    b = k.let<kir::u32>("b", wid / (D * heads));
-    t_out = k.let<kir::u32>("to", k.constant<kir::u32>(seq - 1));
+    b = e.let(wid / (D * heads));
+    t_out = e.let(e.u32(seq - 1));
   } else {
-    t_out = k.let<kir::u32>("to", (wid / (D * heads)) % seq);
-    b = k.let<kir::u32>("b", wid / (D * heads * seq));
+    t_out = e.let((wid / (D * heads)) % seq);
+    b = e.let(wid / (D * heads * seq));
   }
-  kir::Buffer<kir::f32> sout;
-  if (mode == GdnWrite::kBoth) sout = k.input<kir::f32>(6);
 
   k.statement("float s[" + std::to_string(tile) + "];");
   kir::Tile<kir::f32> srow(&k, &k.types(), "s", tile);
 
-  k.unroll("e0", tile, [&](kir::Val<kir::u32> e) {
-    const auto j = k.let<kir::u32>("j0", lane + e * wave);
-    const auto idx =
-        ((b * heads + h) * D + row) * D + j;
-    srow[e] = kir::select(j < D, sin[idx].read(), k.lit(0.0f));
-  });
+  for (auto ei : e.unroll(tile)) {
+    const auto j = e.let(lane + ei * wave);
+    const auto idx = ((b * heads + h) * D + row) * D + j;
+    srow[ei] = kir::select(j < D, a.s[idx], e.f32(0.0f));
+  }
 
-  auto reduce = [&](std::string_view name, kir::Val<kir::f32> v) {
-    auto acc = k.var<kir::f32>(name, v);
+  auto reduce = [&](kir::Val<kir::f32> acc) {
     for (std::uint32_t m = 1; m < wave; m <<= 1) {
-      acc = acc.read() + math::shfl_xor(acc.read(), k.constant<kir::u32>(m));
+      acc = e.let(acc + math::shfl_xor(acc, e.u32(m)));
     }
-    return acc.read();
+    return acc;
   };
 
-  auto result = k.var<kir::f32>("oacc", k.lit(0.0f));
-  k.loop("t", k.constant<kir::u32>(0), k.constant<kir::u32>(seq), 1,
-         [&](kir::Val<kir::u32> t) {
-           const auto sc = (b * seq + t) * heads + h;
-           const auto vec = sc * D;
-           const auto a = k.let<kir::f32>("al", alpha[sc].read());
-           auto skp = k.var<kir::f32>("skp", k.lit(0.0f));
-           k.unroll("e1", tile, [&](kir::Val<kir::u32> e) {
-             const auto j = lane + e * wave;
-             srow[e] = srow[e].read() * a;
-             k.when(j < D, [&] {
-               skp = math::fma(srow[e].read(), kin[vec + j].read(), skp.read());
-             });
-           });
-           const auto sk = reduce("skr", skp.read());
-           const auto bt = k.let<kir::f32>("bt", beta[sc].read());
-           const auto delta = k.let<kir::f32>(
-               "del", (vin[vec + row].read() - sk) * bt);
-           auto accp = k.var<kir::f32>("acp", k.lit(0.0f));
-           k.unroll("e2", tile, [&](kir::Val<kir::u32> e) {
-             const auto j = lane + e * wave;
-             k.when(j < D, [&] {
-               srow[e] = math::fma(delta, kin[vec + j].read(), srow[e].read());
-               accp = math::fma(srow[e].read(), qin[vec + j].read(),
-                                accp.read());
-             });
-           });
-           const auto acc = reduce("acr", accp.read());
-           if (mode == GdnWrite::kBoth) {
-             k.when(lane == 0, [&] {
-               k.store(((b * seq + t) * heads + h) * D + row, acc);
-             });
-           } else {
-             k.when(t == t_out, [&] { result = acc; });
-           }
-         });
+  auto result = e.var(0.0f);
+  for (auto t : e.range(seq)) {
+    const auto sc = (b * seq + t) * heads + h;
+    const auto vec = sc * D;
+    const auto al = e.let(a.alpha[sc]);
+    auto skp = e.var(0.0f);
+    for (auto ei : e.unroll(tile)) {
+      const auto j = lane + ei * wave;
+      srow[ei] = srow[ei].read() * al;
+      if (auto in = e.when(j < D)) {
+        skp = math::fma(srow[ei].read(), a.k[vec + j], skp);
+      }
+    }
+    const auto sk = reduce(skp);
+    const auto bt = e.let(a.beta[sc]);
+    const auto delta = e.let((a.v[vec + row] - sk) * bt);
+    auto accp = e.var(0.0f);
+    for (auto ei : e.unroll(tile)) {
+      const auto j = lane + ei * wave;
+      if (auto in = e.when(j < D)) {
+        srow[ei] = math::fma(delta, a.k[vec + j], srow[ei].read());
+        accp = math::fma(srow[ei].read(), a.q[vec + j], accp);
+      }
+    }
+    const auto acc = reduce(accp);
+    if (mode == GdnWrite::kBoth) {
+      if (auto in = e.when(lane == 0)) {
+        e.store(((b * seq + t) * heads + h) * D + row, acc);
+      }
+    } else {
+      if (auto in = e.when(t == t_out)) {
+        result = acc;
+      }
+    }
+  }
 
   if (write_state) {
-    k.unroll("ew", tile, [&](kir::Val<kir::u32> e) {
-      const auto j = k.let<kir::u32>("jw", lane + e * wave);
-      k.when(j < D, [&] {
+    for (auto ei : e.unroll(tile)) {
+      const auto j = e.let(lane + ei * wave);
+      if (auto in = e.when(j < D)) {
         const auto idx = ((b * heads + h) * D + row) * D + j;
-        if (mode == GdnWrite::kBoth) sout[idx] = srow[e].read();
-        else k.store(idx, srow[e].read());
-      });
-    });
+        if (mode == GdnWrite::kBoth) a.sout[idx] = srow[ei].read();
+        else e.store(idx, srow[ei].read());
+      }
+    }
   } else {
-    k.when(lane == 0, [&] {
-      k.store(((b * seq + t_out) * heads + h) * D + row, result.read());
-    });
+    if (auto in = e.when(lane == 0)) {
+      e.store(((b * seq + t_out) * heads + h) * D + row, result);
+    }
   }
   return k.str();
 }
