@@ -59,7 +59,7 @@ struct ArgMaxPartialKernel final : KernelPrimitive<ArgMaxPartialKernel> {
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     ArgMaxPartialArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
     const auto lid = e.let(math::local_id());
@@ -168,7 +168,7 @@ struct ArgMaxFinalKernel final : KernelPrimitive<ArgMaxFinalKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     ArgMaxFinalArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto base = e.let(e.thread_id() * (2 * nchunks));
     auto bv = e.var(0.0f);

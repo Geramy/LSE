@@ -9,6 +9,7 @@
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
+#include "lse/graph/stream_plan.hpp"
 #include "lse/graph/workgroup.hpp"
 
 using namespace lse;
@@ -1023,6 +1024,135 @@ LSE_TEST(gdn_phase_kernel_matches_the_delta_rule) {
   LSE_EXPECT_EQ(sv.size(), static_cast<std::size_t>(D * D));
   for (float e : ov) LSE_EXPECT_NEAR(e, 8.0, 1e-4);
   for (float e : sv) LSE_EXPECT_NEAR(e, 0.5, 1e-4);
+}
+
+// --- stream placement -------------------------------------------------------
+// The policy runs on every backend; whether a device can cash it is a separate
+// question its StreamCapabilities answers. These drive it directly so the
+// placement rules are checked on a machine with one queue, or none.
+namespace {
+
+// A group that writes `out` and reads `ins`, with buffers standing in for the
+// allocations the planner actually compares.
+FusionGroup placed(std::uint64_t out_handle, std::size_t out_bytes,
+                   std::initializer_list<std::uint64_t> ins) {
+  FusionGroup g;
+  auto make = [](std::uint64_t handle, std::size_t bytes) {
+    auto n = std::make_shared<Node>();
+    n->kind = OpKind::kMul;
+    n->dtype = DType::kF32;
+    n->shape = Shape({static_cast<std::int64_t>(bytes / 4)});
+    n->buffer.handle = handle;
+    n->buffer.size_bytes = bytes;
+    return n;
+  };
+  NodePtr out = make(out_handle, out_bytes);
+  for (std::uint64_t h : ins) out->inputs.push_back(make(h, out_bytes));
+  g.nodes.push_back(out);
+  g.outputs.push_back(out);
+  g.inputs = out->inputs;
+  return g;
+}
+
+backend::StreamCapabilities four_streams() {
+  backend::StreamCapabilities c;
+  c.stream_count = 4;
+  c.concurrent_streams = 4;
+  c.needs_explicit_events = true;
+  return c;
+}
+
+backend::DeviceInfo wide_device() {
+  backend::DeviceInfo d;
+  d.compute_units = 64;
+  d.max_threads_per_workgroup = 1024;
+  return d;
+}
+
+}  // namespace
+
+LSE_TEST(a_dependency_chain_stays_on_one_stream) {
+  // b reads a's output, c reads b's: nothing may overlap, so nothing moves and
+  // no event is spent.
+  std::vector<FusionGroup> gs{placed(10, 256, {}), placed(11, 256, {10}),
+                              placed(12, 256, {11})};
+  const StreamPlan p = plan_streams(gs, four_streams(), wide_device());
+  LSE_EXPECT_EQ(p.stream[0], 0u);
+  LSE_EXPECT_EQ(p.stream[1], 0u);
+  LSE_EXPECT_EQ(p.stream[2], 0u);
+  LSE_EXPECT_EQ(p.waits_total, 0u);
+  LSE_EXPECT_EQ(p.chain, 3u);
+}
+
+LSE_TEST(independent_consumers_of_one_value_fork_onto_their_own_streams) {
+  // b and c both read a and write different buffers. b continues a's stream;
+  // c has to move, and pays exactly one event to be ordered after a.
+  std::vector<FusionGroup> gs{placed(10, 256, {}), placed(11, 256, {10}),
+                              placed(12, 256, {10})};
+  const StreamPlan p = plan_streams(gs, four_streams(), wide_device());
+  LSE_EXPECT_EQ(p.stream[0], 0u);
+  LSE_EXPECT_EQ(p.stream[1], 0u);
+  LSE_EXPECT(p.stream[2] != p.stream[1]);
+  LSE_EXPECT_EQ(p.waits_total, 1u);
+  LSE_EXPECT_EQ(p.waits[2].size(), 1u);
+  LSE_EXPECT_EQ(p.waits[2][0], 0u);
+  LSE_EXPECT_EQ(p.record_after[0], 1);
+  LSE_EXPECT_EQ(p.chain, 2u);
+}
+
+LSE_TEST(a_reused_buffer_is_a_dependency_even_with_no_value_between_them) {
+  // c writes the buffer a wrote and b read. No node connects them; the slot
+  // allocator put them on one allocation, and a write-after-read is real.
+  std::vector<FusionGroup> gs{placed(10, 256, {}), placed(11, 256, {10}),
+                              placed(10, 256, {})};
+  const StreamPlan p = plan_streams(gs, four_streams(), wide_device());
+  LSE_EXPECT(!p.waits[2].empty() || p.stream[2] == p.stream[1]);
+  LSE_EXPECT(p.chain >= 2u);
+}
+
+LSE_TEST(a_group_that_fills_the_device_is_not_worth_an_event) {
+  // Same fork, but each consumer alone saturates the machine: moving one buys
+  // no overlap, so the cost model keeps it ordered and spends nothing.
+  const std::size_t big = 64u * 1024u * 4u;  // 64K work items > 64 CU x 1024
+  std::vector<FusionGroup> gs{placed(10, big, {}), placed(11, big, {10}),
+                              placed(12, big, {10})};
+  const StreamPlan p = plan_streams(gs, four_streams(), wide_device());
+  LSE_EXPECT_EQ(p.streams_used, 1u);
+  LSE_EXPECT_EQ(p.waits_total, 0u);
+}
+
+LSE_TEST(a_single_stream_device_gets_the_order_it_already_had) {
+  std::vector<FusionGroup> gs{placed(10, 256, {}), placed(11, 256, {10}),
+                              placed(12, 256, {10})};
+  backend::StreamCapabilities one;  // stream_count 1, concurrent 1
+  const StreamPlan p = plan_streams(gs, one, wide_device());
+  for (std::uint32_t s : p.stream) LSE_EXPECT_EQ(s, 0u);
+  LSE_EXPECT_EQ(p.waits_total, 0u);
+  LSE_EXPECT_EQ(p.chain, 3u);
+}
+
+LSE_TEST(a_backend_whose_other_streams_cost_more_per_launch_keeps_the_order) {
+  // Same fork as the spreading test, on a device with four concurrent streams
+  // — but reaching any of them but the first costs extra per dispatch, so the
+  // overlap can never pay for itself and nothing moves. The seam is intact and
+  // the cost model, not a switch, is what declines.
+  std::vector<FusionGroup> gs{placed(10, 256, {}), placed(11, 256, {10}),
+                              placed(12, 256, {10})};
+  backend::StreamCapabilities caps = four_streams();
+  caps.uniform_launch_cost = false;
+  const StreamPlan p = plan_streams(gs, caps, wide_device());
+  for (std::uint32_t s : p.stream) LSE_EXPECT_EQ(s, 0u);
+  LSE_EXPECT_EQ(p.waits_total, 0u);
+  LSE_EXPECT_EQ(p.streams_used, 1u);
+}
+
+LSE_TEST(a_group_whose_buffers_are_unknown_is_ordered_after_everything) {
+  // Nothing is known about the third group's bytes, so it may not be placed
+  // beside anything: it waits for the tail of every stream in flight.
+  std::vector<FusionGroup> gs{placed(10, 256, {}), placed(11, 256, {10}),
+                              placed(12, 256, {10}), placed(0, 256, {})};
+  const StreamPlan p = plan_streams(gs, four_streams(), wide_device());
+  LSE_EXPECT(!p.waits[3].empty());
 }
 
 LSE_TEST_MAIN()

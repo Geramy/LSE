@@ -45,7 +45,7 @@ struct ScatterAddKernel final : KernelPrimitive<ScatterAddKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     ScatterAddArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto i = e.thread_id();
     const auto dst_row = e.let(i / width);

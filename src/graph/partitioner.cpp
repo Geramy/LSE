@@ -65,6 +65,133 @@ void topo_visit(const NodePtr& n, std::unordered_set<const Node*>& seen,
   order.push_back(n);
 }
 
+// A run of siblings shares one launch, so every one of their outputs is live
+// at once and plan_slots cannot recycle between them.
+//
+// This used to be four because the LDS budget made it four: every stage staged
+// its own copy of the shared activation row and the compiler summed them, so
+// `run * 4 * K` had to fit a quarter of the workgroup budget. The kernel IR's
+// `lds_fold` pass now merges those copies — every sibling in a run shares
+// `inputs[0]` and K by construction, so the fill is provably the same fill —
+// and the budget term stopped scaling with the run (see the check below).
+//
+// What binds instead is the composition rule in the run loop below: a run
+// whose members do not all have a self-indexing form at this shape is refused
+// by the emitter, and the WHOLE group then falls back to the per-element
+// scaffold. Six is the ceiling this model can present — the MoE block has two
+// shared-expert and four routed wide linears off one normed activation — and
+// eight and ten measure identically because the candidates run out.
+//
+// Median of 5 at `-n 32`, idle box (rocm-smi VRAM 8%), groups per decode token
+// in brackets: run 4 gives 99.5 tok/s [395], run 6 gives 100.5 tok/s [375].
+constexpr std::size_t kMaxSiblingRun = 6;
+
+// Rows the linear covers. One is the decode shape, where every wide-linear
+// kind is a wave-per-column GEMV.
+std::int64_t linear_rows(const Node& n) noexcept {
+  if (n.inputs.size() < 2) return 0;
+  const Shape& w = n.inputs[1]->shape;
+  const std::int64_t cols =
+      w.rank() == 3 ? w.dim(1) : (w.rank() >= 2 ? w.dim(0) : 0);
+  const auto elems = static_cast<std::int64_t>(n.shape.elem_count());
+  return cols > 0 && elems % cols == 0 ? elems / cols : 0;
+}
+
+// Length of the activation row a wide linear reads. Every sibling in a run
+// shares inputs[0], so this is one number for the whole run.
+std::int64_t activation_k(const Node& n) noexcept {
+  if (n.inputs.empty()) return 0;
+  const Shape& x = n.inputs[0]->shape;
+  return x.rank() == 0 ? 0 : x.dim(x.rank() - 1);
+}
+
+// Make independent wide linears that share an activation adjacent, so the
+// scheduler's join_wide_linear can put them in one launch and the emitter's
+// sibling path can emit one body per output.
+//
+// join_wide_linear only ever looks at the group it just emitted, and the DFS
+// post-order separates the pairs that would join: `x, gate, silu, up, mul`
+// puts silu between the MoE gate and up. Pulling the later one forward is the
+// whole pass.
+//
+// Legality is one condition: every input of the node being moved must already
+// be behind the cut. Post-order puts a node's inputs before it, so if all of
+// its *direct* inputs are behind the cut then its whole transitive cone is,
+// and the order stays topological.
+void group_sibling_linears(std::vector<NodePtr>& order,
+                           const WorkgroupDevice& dev) {
+  std::unordered_set<const Node*> in_order;
+  std::unordered_set<const Node*> emitted;
+  in_order.reserve(order.size() * 2);
+  emitted.reserve(order.size() * 2);
+  for (const NodePtr& n : order) in_order.insert(n.get());
+
+  std::vector<std::size_t> take;
+  std::vector<const Node*> run;
+  for (std::size_t p = 0; p < order.size(); ++p) {
+    emitted.insert(order[p].get());
+    if (!is_wide_linear(*order[p]) || order[p]->inputs.empty()) continue;
+
+    const Node* x = order[p]->inputs[0].get();
+    const std::int64_t k = activation_k(*order[p]);
+    if (k <= 0) continue;
+
+    // The run stages the shared activation row in workgroup scratch (the grid
+    // arm of emit_gemv in lds_linear.cpp). It stages it ONCE for the whole run
+    // — the stages are one IR body and `lds_fold` merges the identical
+    // allocations — so what has to fit is one row, not one per stage. Hold it
+    // to a quarter of the workgroup budget so four of these GEMV workgroups
+    // still fit on a CU; past that the launch saved costs more occupancy than
+    // it buys.
+    const auto staged = static_cast<std::uint32_t>(k) * 4u;
+    if (staged != 0 && staged > dev.lds_bytes / 4u) continue;
+    const std::size_t cap = kMaxSiblingRun;
+
+    run.assign(1, order[p].get());
+    take.clear();
+    for (std::size_t j = p + 1;
+         j < order.size() && run.size() + take.size() < cap; ++j) {
+      const Node& c = *order[j];
+      if (!is_wide_linear(c) || c.inputs.empty()) continue;
+      if (c.inputs[0].get() != x || activation_k(c) != k) continue;
+      // Mixing kinds in one run is legal only where every kind has a
+      // self-indexing form. `linear` gains a matrix-core form at M >= 16;
+      // `linear_indexed` has only the wave-per-column GEMV, which needs a
+      // decode-shaped M. Put them in one group at M >= 16 and the emitter
+      // refuses the sibling path — the stages no longer cover the group — and
+      // drops the whole group to the per-element scaffold, which took the two
+      // shared-expert linears off the matrix core and moved the logits by
+      // 1.6e-2 (measured, T=16 and T=32, fused vs unfused). At one row every
+      // wide-linear kind is a GEMV and the mix costs nothing.
+      if (c.kind != order[p]->kind && linear_rows(*order[p]) != 1) continue;
+      bool ok = true;
+      for (const NodePtr& in : c.inputs) {
+        if (in_order.count(in.get()) && !emitted.count(in.get())) ok = false;
+        // A sibling that reads another member of the run is not independent of
+        // it: they cannot share a launch, so moving it buys nothing.
+        for (const Node* m : run) {
+          if (in.get() == m) ok = false;
+        }
+        for (std::size_t t : take) {
+          if (in.get() == order[t].get()) ok = false;
+        }
+        if (!ok) break;
+      }
+      if (ok) take.push_back(j);
+    }
+    // Rotating in increasing source order leaves the later indices where they
+    // are: everything between the destination and the source shifts right by
+    // one, and nothing past the source moves.
+    for (std::size_t t : take) {
+      ++p;
+      std::rotate(order.begin() + static_cast<std::ptrdiff_t>(p),
+                  order.begin() + static_cast<std::ptrdiff_t>(t),
+                  order.begin() + static_cast<std::ptrdiff_t>(t) + 1);
+      emitted.insert(order[p].get());
+    }
+  }
+}
+
 }  // namespace
 
 bool Partitioner::can_fuse(const Node& producer, const Node& consumer) noexcept {
@@ -143,12 +270,14 @@ std::vector<Workgroup> Partitioner::phases(std::span<const NodePtr> roots) {
 
 std::vector<Workgroup> Partitioner::phases(
     std::span<const NodePtr> roots, const backend::DeviceInfo* device) {
+  const WorkgroupDevice dev = WorkgroupDevice::from(device);
+
   std::vector<NodePtr> order;
   std::unordered_set<const Node*> seen;
   for (const NodePtr& r : roots) topo_visit(r, seen, order);
+  group_sibling_linears(order, dev);
 
   std::vector<Workgroup> out;
-  const WorkgroupDevice dev = WorkgroupDevice::from(device);
   for (const NodePtr& n : order) {
     if (!out.empty() && out.back().try_add(n)) continue;
     if (std::getenv("LSE_DEBUG_PHASES") != nullptr && !out.empty()) {

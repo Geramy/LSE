@@ -52,9 +52,66 @@ target_include_directories(lse_core SYSTEM PUBLIC
 lse_apply_common_flags(lse_core)
 
 # ---------------------------------------------------------------------------
+# ir — the kernel IR: types, values, ops, structured regions, the affine index
+# vocabulary, the optimization passes and the lowering to source. Sits below
+# the backends, which record into it, and below lse_graph, which is a *tensor*
+# level IR and a different thing.
+# ---------------------------------------------------------------------------
+add_library(lse_ir
+  src/ir/body.cpp
+  src/ir/index.cpp
+  src/ir/lower.cpp
+  src/ir/recorder.cpp
+  src/ir/spell.cpp
+  src/ir/verify.cpp
+  src/ir/pass/cse.cpp
+  src/ir/pass/dce.cpp
+  src/ir/pass/lds_fold.cpp
+  src/ir/pass/pipeline.cpp
+)
+add_library(lse::ir ALIAS lse_ir)
+target_link_libraries(lse_ir PUBLIC lse_core)
+lse_apply_common_flags(lse_ir)
+
+# ---------------------------------------------------------------------------
 # backends — each is an independent module under src/backends/<name>/.
 # ---------------------------------------------------------------------------
 add_subdirectory(src/backends)
+
+# ---------------------------------------------------------------------------
+# dist — transports and collectives. Deliberately below lse_graph: a backend
+# registers its device codec engine here, so this must not depend on lse_graph
+# (which link-depends on the backends).
+# ---------------------------------------------------------------------------
+add_library(lse_dist
+  src/dist/transport.cpp
+  src/dist/loopback.cpp
+  src/dist/codec.cpp
+  src/dist/collective.cpp
+)
+add_library(lse::dist ALIAS lse_dist)
+target_link_libraries(lse_dist PUBLIC lse_core lse_ir lse_backend_registry)
+# Transports self-register from a TU with no referenced symbols.
+target_link_options(lse_dist INTERFACE
+  "LINKER:--whole-archive,$<TARGET_FILE:lse_dist>,--no-whole-archive")
+lse_apply_common_flags(lse_dist)
+
+# ---------------------------------------------------------------------------
+# probe — device qualification: what a pool member measurably does, and the
+# cost model that reads it. Below lse_graph for the same reason dist is: a
+# backend registers its device probe here, so this must not depend on lse_graph.
+# ---------------------------------------------------------------------------
+add_library(lse_probe
+  src/probe/profile.cpp
+  src/probe/device_probe.cpp
+  src/probe/link_probe.cpp
+  src/probe/cost_model.cpp
+  src/probe/profile_store.cpp
+  src/probe/pool.cpp
+)
+add_library(lse::probe ALIAS lse_probe)
+target_link_libraries(lse_probe PUBLIC lse_core lse_ir lse_dist lse_backend_registry)
+lse_apply_common_flags(lse_probe)
 
 add_library(lse_graph
   src/graph/graph.cpp
@@ -67,13 +124,13 @@ add_library(lse_graph
   src/graph/primitive_library.cpp
   src/graph/fallback.cpp
   src/graph/codegen.cpp
-  src/graph/kernel_ir.cpp
   src/graph/jit_cache.cpp
   src/graph/interpreter.cpp
   src/graph/scheduler.cpp
+  src/graph/stream_plan.cpp
 )
 add_library(lse::graph ALIAS lse_graph)
-target_link_libraries(lse_graph PUBLIC lse_core lse_backend_registry)
+target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry)
 
 if(LSE_ENABLE_CPU)
   target_link_libraries(lse_graph PUBLIC lse_backend_cpu)

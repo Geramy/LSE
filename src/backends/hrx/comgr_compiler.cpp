@@ -98,6 +98,31 @@ std::string rocm_root(const std::string& include_dir) {
   return pos == std::string::npos ? include_dir : include_dir.substr(0, pos);
 }
 
+// Options for the source -> bitcode action. Shared with identity() so the JIT
+// cache key cannot drift from what was actually passed to the frontend.
+std::vector<std::string> frontend_options() {
+  std::vector<std::string> opts = {"-O3", "-x", "hip"};
+  const std::string include_dir = rocm_include_dir();
+  if (!include_dir.empty()) {
+    opts.push_back("-isystem");
+    opts.push_back(include_dir);
+    opts.push_back("--rocm-path=" + rocm_root(include_dir));
+  }
+  const std::string resource_dir = clang_resource_dir();
+  if (!resource_dir.empty()) {
+    opts.push_back("-isystem");
+    opts.push_back(resource_dir);
+  }
+  return opts;
+}
+
+// The codegen action does not inherit the compile action's options; without an
+// explicit -O3 the backend runs at its default and every kernel ships
+// unscheduled ISA (measured 13 GB/s vs 227 GB/s on the same GEMV source).
+// Not constexpr: amd_comgr_action_info_set_option_list takes `const char**`,
+// so const elements would not convert.
+const char* kBackendOptions[] = {"-O3"};
+
 Result<std::vector<std::byte>> compile_comgr(std::string_view source,
                                              std::string_view arch) {
   const std::string target = "amdgcn-amd-amdhsa--" + std::string(arch);
@@ -137,18 +162,7 @@ Result<std::vector<std::byte>> compile_comgr(std::string_view source,
       "amd_comgr_action_info_set_logging"));
 
   // Kept alive for the duration of the option list.
-  std::vector<std::string> owned = {"-O3", "-x", "hip"};
-  const std::string include_dir = rocm_include_dir();
-  if (!include_dir.empty()) {
-    owned.push_back("-isystem");
-    owned.push_back(include_dir);
-    owned.push_back("--rocm-path=" + rocm_root(include_dir));
-  }
-  const std::string resource_dir = clang_resource_dir();
-  if (!resource_dir.empty()) {
-    owned.push_back("-isystem");
-    owned.push_back(resource_dir);
-  }
+  const std::vector<std::string> owned = frontend_options();
   std::vector<const char*> options;
   options.reserve(owned.size());
   for (const std::string& o : owned) options.push_back(o.c_str());
@@ -182,13 +196,9 @@ Result<std::vector<std::byte>> compile_comgr(std::string_view source,
   LSE_RETURN_IF_ERROR(check(
       amd_comgr_action_info_set_logging(backend_action.handle, true),
       "amd_comgr_action_info_set_logging(backend)"));
-  // The codegen action does not inherit the compile action's options; without
-  // an explicit -O3 the backend runs at its default and every kernel ships
-  // unscheduled ISA (measured 13 GB/s vs 227 GB/s on the same GEMV source).
-  const char* backend_opts[] = {"-O3"};
   LSE_RETURN_IF_ERROR(check(
-      amd_comgr_action_info_set_option_list(backend_action.handle, backend_opts,
-                                            1),
+      amd_comgr_action_info_set_option_list(
+          backend_action.handle, kBackendOptions, std::size(kBackendOptions)),
       "amd_comgr_action_info_set_option_list(backend)"));
 
   DataSetGuard relocatable;
@@ -255,6 +265,28 @@ bool ComgrCompiler::available() const {
   return true;
 #else
   return false;
+#endif
+}
+
+std::string ComgrCompiler::identity() const {
+#if LSE_HAVE_COMGR
+  std::size_t major = 0;
+  std::size_t minor = 0;
+  amd_comgr_get_version(&major, &minor);
+  // The option lists come from the same place the actions read them, so a
+  // flag edit reaches the cache key without anyone remembering to do anything.
+  // What this does NOT see is an in-place ROCm patch that leaves the comgr
+  // version and the install paths untouched; purge the cache for those.
+  std::string id = "comgr." + std::to_string(major) + "." + std::to_string(minor);
+  for (const std::string& opt : frontend_options()) id += ' ' + opt;
+  id += " |";
+  for (const char* opt : kBackendOptions) {
+    id += ' ';
+    id += opt;
+  }
+  return id;
+#else
+  return "no-compiler";
 #endif
 }
 

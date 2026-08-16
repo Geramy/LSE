@@ -27,7 +27,10 @@ constexpr std::array<Spelling, 12> kTypes{{
     {Scalar::kU64, "unsigned long long"},
     {Scalar::kI64, "long long"},
     {Scalar::kF16, "_Float16"},
-    {Scalar::kBF16, "__hip_bfloat16"},
+    // __bf16, not __hip_bfloat16: the latter is a class and clang refuses it as
+    // an ext_vector_type element ("invalid vector element type"), which every
+    // packed weight load needs.
+    {Scalar::kBF16, "__bf16"},
     {Scalar::kF32, "float"},
     {Scalar::kBool, "bool"},
 }};

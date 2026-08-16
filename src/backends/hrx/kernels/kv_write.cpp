@@ -55,7 +55,7 @@ struct OverwriteSliceKernel final : KernelPrimitive<OverwriteSliceKernel> {
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
     OverwriteSliceArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto i = e.thread_id();
     (void)e.ret_if(i >= src_n);

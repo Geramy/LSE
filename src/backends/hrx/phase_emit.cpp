@@ -22,10 +22,12 @@ using namespace lse::graph;
 
 namespace {
 
+// Must agree with hip_types.cpp and hip_emitter.cpp: __bf16, the compiler's
+// own type, which casts to and from float directly.
 std::string_view device_scalar(DType dt) noexcept {
   switch (dt) {
     case DType::kF16: return "_Float16";
-    case DType::kBF16: return "__hip_bfloat16";
+    case DType::kBF16: return "__bf16";
     case DType::kI32: return "int";
     default: return "float";
   }
@@ -37,28 +39,13 @@ std::string typed_ptr(const std::string& buf, DType dt) {
 
 std::string load_elem(const std::string& buf, const std::string& index,
                       DType dt) {
-  const std::string p = typed_ptr(buf, dt) + "[" + index + "]";
-  switch (dt) {
-    case DType::kBF16:
-      return "__bfloat162float(" + p + ")";
-    case DType::kF16:
-      return "(float)(" + p + ")";
-    default:
-      return "(float)(" + p + ")";
-  }
+  return "(float)(" + typed_ptr(buf, dt) + "[" + index + "])";
 }
 
 std::string store_elem(const std::string& buf, const std::string& index,
                        DType dt, const std::string& value) {
-  const std::string slot = typed_ptr(buf, dt) + "[" + index + "] = ";
-  switch (dt) {
-    case DType::kBF16:
-      return slot + "__float2bfloat16(" + value + ");";
-    case DType::kF16:
-      return slot + "(_Float16)(" + value + ");";
-    default:
-      return slot + "(" + std::string(device_scalar(dt)) + ")(" + value + ");";
-  }
+  return typed_ptr(buf, dt) + "[" + index + "] = (" +
+         std::string(device_scalar(dt)) + ")(" + value + ");";
 }
 
 std::string broadcast_index(const Shape& src, const Shape& out,
@@ -91,38 +78,110 @@ bool is_linked_name(std::string_view n) {
   return n.find("linked") != std::string_view::npos;
 }
 
+// The primitive the phase actually stages. WMMA owns a grid we cannot share
+// and a linked pipeline owns the whole kernel; the scalar body is the same
+// function and fits the staged walk.
+const KernelPrimitiveBase* phase_spec(const KernelPrimitiveBase* kp,
+                                      const KernelShapes& sh) {
+  if (kp == nullptr) return nullptr;
+  const KernelPrimitiveBase* spec = kp->specialize(sh);
+  if (spec == nullptr) return kp;
+  if (spec != kp &&
+      (spec->name() == "linear.wmma" || is_linked_name(spec->name()))) {
+    return kp;
+  }
+  return spec;
+}
+
+struct GemvShape {
+  bool ok = false;
+  std::uint32_t n = 0;
+  std::uint32_t k = 0;
+  std::uint32_t m = 0;
+};
+
+GemvShape gemv_shape_of(const Node& node) noexcept {
+  GemvShape g;
+  if (node.inputs.size() < 2) return g;
+  const Shape& x = node.inputs[0]->shape;
+  const Shape& w = node.inputs[1]->shape;
+  if (x.rank() == 0 || w.rank() < 2) return g;
+  const auto n = static_cast<std::uint32_t>(
+      w.rank() == 3 ? w.dim(1) : w.dim(0));
+  const auto k = static_cast<std::uint32_t>(w.dim(w.rank() - 1));
+  const auto elems = static_cast<std::uint32_t>(node.element_count());
+  if (n == 0 || k == 0 || elems == 0 || elems % n != 0) return g;
+  if (static_cast<std::uint32_t>(x.dim(x.rank() - 1)) != k) return g;
+  g.n = n;
+  g.k = k;
+  g.m = elems / n;
+  g.ok = true;
+  return g;
+}
+
+// One thread per output column walks a whole K-row, so an N=8 K=1024 GEMV
+// runs on 8 lanes that are 4KB apart — 12 us for eight dot products. emit_gemv
+// gives each column a wave with the lanes on consecutive K: same arithmetic,
+// 32x the threads, one coalesced stream. Worth it only while the columns
+// cannot fill the group on their own. Plain linear only: an indexed one needs
+// the expert slot validated, which is the specialization's job.
+bool wave_gemv_beats_lanes(const Node& node, const GemvShape& g) noexcept {
+  return g.ok && node.inputs.size() == 2 && g.m <= 4 && g.n * g.m <= 256 &&
+         g.k >= 128;
+}
+
+// Independent work items the stage can spend. A primitive that owns its
+// indexing sizes its own grid (a decode gdn_chunk_scan wants 16384 threads
+// for a 512-element output), so its plan is the only honest answer.
+std::uint32_t stage_threads(const Node& node, const KernelShapes& sh,
+                            const KernelPrimitiveBase* spec) {
+  if (spec != nullptr && spec->owns_indexing() &&
+      !is_linear_name(spec->name())) {
+    const ThreadPlan tp = spec->plan(sh);
+    const std::uint32_t t = tp.workgroup_count[0] * tp.workgroup_size[0];
+    if (t != 0) return t;
+  }
+  const auto elems = static_cast<std::uint32_t>(node.element_count());
+  return elems == 0 ? 1u : elems;
+}
+
 // Records the same C++ GEMV as linear.lds. HIP spelling comes from kir.
+// Phase bindings are all declared float*, so every access casts to the node's
+// real storage type first — `wdt` is what makes a bf16 weight read as bf16
+// rather than reinterpret two of them as one float.
 std::string gemv_stage(const std::string& x, const std::string& w,
                        const std::string& out, const std::string& idx,
                        std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
-                       std::uint32_t K, std::uint32_t M, DType odt, bool grid,
-                       bool persist, std::uint32_t persist_wgs,
+                       std::uint32_t K, std::uint32_t M, DType odt, DType wdt,
+                       bool grid, bool persist, std::uint32_t persist_wgs,
                        const DeviceInfo& device,
                        const kir::TypeTable& types,
                        const DialectSourceTable& spellings) {
-  kir::KernelBody body(types, spellings, workgroup_lds_bytes(&device));
-  body.set_store([&](std::string_view index, std::string_view value) {
-    return store_elem(out, std::string(index), odt, std::string(value));
-  });
-  const kir::Buffer<kir::f32> xb(&body, &body.types(), x);
-  const kir::Buffer<kir::f32> wb(&body, &body.types(), w);
-  kir::Buffer<kir::f32> ib;
-  const kir::Buffer<kir::f32>* idxp = nullptr;
-  if (!idx.empty()) {
-    ib = kir::Buffer<kir::f32>(&body, &body.types(), idx);
-    idxp = &ib;
-  }
-  std::uint32_t wave = 32;
-  if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
-    if (amd->wavefront_size == 32 || amd->wavefront_size == 64) {
-      wave = amd->wavefront_size;
+  return hrx_kernels::with_elem(wdt, [&]<class W>() -> std::string {
+    kir::KernelBody body(types, spellings, workgroup_lds_bytes(&device));
+    body.set_store([&](std::string_view index, std::string_view value) {
+      return store_elem(out, std::string(index), odt, std::string(value));
+    });
+    const kir::Buffer<kir::f32> xb(&body, &body.types(), x);
+    const kir::Buffer<W> wb(&body, &body.types(), typed_ptr(w, wdt));
+    kir::Buffer<kir::f32> ib;
+    const kir::Buffer<kir::f32>* idxp = nullptr;
+    if (!idx.empty()) {
+      ib = kir::Buffer<kir::f32>(&body, &body.types(), idx);
+      idxp = &ib;
     }
-  }
-  hrx_kernels::emit_gemv(body, xb, wb, idxp, keep, slot, N, K, M,
-                         hrx_kernels::device_load_bytes(&device), grid, wave,
-                         persist, persist_wgs);
-  if (!body.lds().ok()) return {};
-  return "    {\n" + body.str() + "\n    }\n";
+    std::uint32_t wave = 32;
+    if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
+      if (amd->wavefront_size == 32 || amd->wavefront_size == 64) {
+        wave = amd->wavefront_size;
+      }
+    }
+    hrx_kernels::emit_gemv<W>(body, xb, wb, idxp, keep, slot, N, K, M,
+                              hrx_kernels::device_load_bytes(&device), grid,
+                              wave, persist, persist_wgs);
+    if (!body.lds().ok()) return {};
+    return "    {\n" + body.str() + "\n    }\n";
+  });
 }
 
 std::string elem_loop(std::uint32_t count, const std::string& body, bool grid,
@@ -272,6 +331,36 @@ bool HipEmitter::phase_can_stage(const Node& n) noexcept {
   return !kp->owns_indexing();
 }
 
+std::uint32_t HipEmitter::phase_stage_threads(const Node& n,
+                                              const DeviceInfo& device) {
+  if (n.kind == OpKind::kReshape || n.kind == OpKind::kConstant ||
+      n.kind == OpKind::kBuffer) {
+    return 0;
+  }
+  const DialectSourceTable spellings = hip_sources();
+  const kir::TypeTable type_table = hip_types();
+  std::vector<Shape> storage;
+  std::vector<DType> dtypes;
+  storage.reserve(n.inputs.size());
+  dtypes.reserve(n.inputs.size());
+  for (const NodePtr& in : n.inputs) {
+    storage.push_back(in->shape);
+    dtypes.push_back(in->dtype);
+  }
+  KernelShapes sh;
+  sh.inputs = storage;
+  sh.input_dtypes = dtypes;
+  sh.output = n.shape;
+  sh.output_dtype = n.dtype;
+  sh.attrs = n.attrs;
+  sh.iattrs = n.iattrs;
+  sh.device = &device;
+  sh.types = type_table;
+  sh.intrinsics = &spellings;
+  const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
+  return stage_threads(n, sh, phase_spec(kp, sh));
+}
+
 Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
                                              const DeviceInfo& device) {
   if (group.nodes.empty()) {
@@ -319,12 +408,19 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   };
 
   std::vector<Shape> storage;
+  std::vector<DType> dtypes;
   auto shapes_for = [&](const NodePtr& n) {
     storage.clear();
-    for (const NodePtr& in : n->inputs) storage.push_back(in->shape);
+    dtypes.clear();
+    for (const NodePtr& in : n->inputs) {
+      storage.push_back(in->shape);
+      dtypes.push_back(in->dtype);
+    }
     KernelShapes s;
     s.inputs = storage;
+    s.input_dtypes = dtypes;
     s.output = n->shape;
+    s.output_dtype = n->dtype;
     s.attrs = n->attrs;
     s.iattrs = n->iattrs;
     s.device = &device;
@@ -339,7 +435,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   bool dependent = false;
   std::uint32_t max_n = 0;
   std::uint32_t max_m = 1;
-  std::uint32_t max_elems = 0;
+  std::uint32_t max_threads = 0;
   std::uint32_t compute = 0;
   for (const NodePtr& n : group.nodes) {
     if (n->kind == OpKind::kConstant || n->kind == OpKind::kBuffer ||
@@ -348,7 +444,12 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     }
     ++compute;
     const auto elems = static_cast<std::uint32_t>(n->element_count());
-    if (elems > max_elems) max_elems = elems;
+    {
+      KernelShapes sh = shapes_for(n);
+      const auto* kpn = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
+      const std::uint32_t want = stage_threads(*n, sh, phase_spec(kpn, sh));
+      if (want > max_threads) max_threads = want;
+    }
     for (const NodePtr& in : n->inputs) {
       const Node* p = in.get();
       while (p && p->kind == OpKind::kReshape && p->inputs.size() == 1) {
@@ -380,13 +481,16 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   const bool grid_gemv =
       !persist && only_linears && compute > 0 && max_n >= 256;
   const bool grid_elem =
-      !persist && !grid_gemv && !dependent && max_elems >= 512;
+      !persist && !grid_gemv && !dependent && max_threads >= 512;
+  // Every stage of a grid launch walks the same flat thread space, so the
+  // stride is one literal for the whole kernel.
+  const std::uint32_t grid_wgs =
+      max_threads == 0 ? 1u : (max_threads + 255u) / 256u;
   std::uint32_t persist_wgs = 1;
   if (persist) {
     const std::uint32_t tiles = max_n == 0 ? 1u : (max_n + 7u) / 8u;
     const std::uint32_t gemv_wgs = tiles * (max_m == 0 ? 1u : max_m);
-    const std::uint32_t elem_wgs =
-        max_elems == 0 ? 1u : (max_elems + 255u) / 256u;
+    const std::uint32_t elem_wgs = grid_wgs;
     const std::uint32_t work = gemv_wgs > elem_wgs ? gemv_wgs : elem_wgs;
     const std::uint32_t cap =
         device.compute_units == 0 ? 1u : device.compute_units;
@@ -493,30 +597,24 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     const KernelPrimitiveBase* spec = kp;
     if (kp != nullptr) {
       KernelShapes sh = shapes_for(n);
-      spec = kp->specialize(sh);
-      if (spec == nullptr) spec = kp;
-      // WMMA owns a grid we cannot share. The scalar linear body is the
-      // same function and fits the one-workgroup walk.
-      if (spec != kp && (spec->name() == "linear.wmma" ||
-                         is_linked_name(spec->name()))) {
-        spec = kp;
-      }
+      spec = phase_spec(kp, sh);
     }
 
-    if (spec != nullptr && spec->owns_indexing() &&
-        is_linear_name(spec->name())) {
+    const bool spec_gemv = spec != nullptr && spec->owns_indexing() &&
+                           is_linear_name(spec->name());
+    const GemvShape gsh =
+        kp != nullptr && is_linear_name(kp->name()) ? gemv_shape_of(*n)
+                                                    : GemvShape{};
+    if (spec_gemv || wave_gemv_beats_lanes(*n, gsh)) {
       if (n->inputs.size() < 2) {
         return LSE_ERROR(kInvalidArgument, "linear stage missing operands");
       }
-      const Shape& wsh = n->inputs[1]->shape;
-      const auto N = static_cast<std::uint32_t>(
-          wsh.rank() == 3 ? wsh.dim(1) : wsh.dim(0));
-      const auto K = static_cast<std::uint32_t>(wsh.dim(wsh.rank() - 1));
-      const auto elems = static_cast<std::uint32_t>(n->element_count());
-      if (N == 0 || elems % N != 0) {
+      if (!gsh.ok) {
         return LSE_ERROR(kInvalidArgument, "linear stage has a bad shape");
       }
-      const auto M = elems / N;
+      const std::uint32_t N = gsh.n;
+      const std::uint32_t K = gsh.k;
+      const std::uint32_t M = gsh.m;
 
       std::string idx;
       std::uint32_t keep = 0;
@@ -537,11 +635,16 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
         return LSE_ERROR(kInternal, "linear stage is not bound");
       }
       const std::string body =
-          gemv_stage(xb, wb, ob, idx, keep, slot, N, K, M, n->dtype, grid_gemv,
-                     persist, persist_wgs, device, type_table, spellings);
+          gemv_stage(xb, wb, ob, idx, keep, slot, N, K, M, n->dtype,
+                     n->inputs[1]->dtype, grid_gemv, persist, persist_wgs,
+                     device, type_table, spellings);
       if (body.empty()) {
         return LSE_ERROR(kInternal, "linear stage exceeded LDS");
       }
+      // The workgroup walk covers the whole GEMV by itself. In a grid launch
+      // sized for some other stage, every workgroup would redo it and race on
+      // the same addresses, so only one runs it.
+      if (grid_elem) stages << "    if (blockIdx.x == 0u)\n";
       stages << body;
       record_write();
       continue;
@@ -569,9 +672,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
         body.replace(pos, 7, "continue;");
         pos += 9;
       }
-      const ThreadPlan tp = spec->plan(sh);
-      const std::uint32_t nthreads = std::max(
-          1u, tp.workgroup_count[0] * tp.workgroup_size[0]);
+      const std::uint32_t nthreads = stage_threads(*n, sh, spec);
       stages << "    {\n";
       for (std::size_t a = 0; a < n->inputs.size(); ++a) {
         const std::string b = bname(n->inputs[a].get());
@@ -587,6 +688,13 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
                << "u * 256u;\n"
                << "      for (unsigned i = blockIdx.x * 256u + threadIdx.x; "
                   "i < n; i += stride) {\n"
+               << body << "      }\n    }\n";
+      } else if (grid_elem) {
+        // Loop form, not `if (i < n)`: the body spells an early-out as
+        // `continue`, which needs a loop to continue out of.
+        stages << "      for (unsigned i = blockIdx.x * 256u + threadIdx.x; "
+                  "i < n; i += "
+               << (grid_wgs * 256u) << "u) {\n"
                << body << "      }\n    }\n";
       } else {
         stages << "      for (unsigned i = threadIdx.x; i < n; i += 256u) {\n"
@@ -723,7 +831,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     out.dims.workgroup_count[1] = max_m == 0 ? 1u : max_m;
     out.lds_bytes = 256 * 4;
   } else if (grid_elem) {
-    out.dims.workgroup_count[0] = max_elems == 0 ? 1u : (max_elems + 255u) / 256u;
+    out.dims.workgroup_count[0] = grid_wgs;
     out.dims.workgroup_count[1] = 1;
     out.lds_bytes = 256 * 4;
   } else {

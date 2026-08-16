@@ -28,6 +28,7 @@
 #include <string_view>
 
 #include "lse/backend/backend.hpp"
+#include "lse/core/dtype.hpp"
 #include "lse/core/shape.hpp"
 #include "lse/core/status.hpp"
 #include "lse/graph/kernel_ir.hpp"
@@ -39,6 +40,13 @@ namespace lse::graph {
 struct KernelShapes {
   std::span<const Shape> inputs;
   Shape output;
+  // Storage dtype of each input buffer, parallel to `inputs`, and of the
+  // output. `env::bind` refuses a slot whose declared element type disagrees,
+  // which is the only thing standing between a stale `env::In<kir::f32>` over
+  // a bf16 buffer and a kernel that reinterprets memory without a diagnostic.
+  // Empty means the caller did not describe them and no check is possible.
+  std::span<const DType> input_dtypes;
+  DType output_dtype = DType::kF32;
   std::array<float, 4> attrs{};
   std::array<std::int32_t, 4> iattrs{};
   const backend::DeviceInfo* device = nullptr;

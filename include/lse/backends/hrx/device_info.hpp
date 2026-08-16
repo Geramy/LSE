@@ -111,7 +111,11 @@ struct AmdDeviceInfo {
   // (LSE_WAVEFRONT picks; default 32).
   std::uint8_t wavefront_size = 0;
   MatrixCore matrix_core = MatrixCore::kNone;
+  // ALU bf16, which is not the same question as whether the *matrix core* has
+  // a bf16 operand form: CDNA1 has MFMA and no bf16 at all, and the two could
+  // diverge again. A kernel choosing a matrix instruction asks the second one.
   bool has_bf16_arith = false;
+  bool matrix_core_bf16 = false;
   bool has_dot4_i8 = false;
   std::uint8_t max_load_bytes = 0;
   std::uint8_t max_store_bytes = 0;

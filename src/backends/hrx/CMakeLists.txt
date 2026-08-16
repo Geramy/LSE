@@ -31,10 +31,12 @@ add_library(lse_backend_hrx
   kernels/wmma_linear.cpp
   kernels/lds_linear.cpp
   kernels/linked.cpp
+  kernels/dist_codec.cpp
+  kernels/probe.cpp
 )
 add_library(lse::backend_hrx ALIAS lse_backend_hrx)
 
-target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph)
+target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_dist lse_probe)
 target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_HRX_INCLUDE_DIR})
 target_include_directories(lse_backend_hrx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

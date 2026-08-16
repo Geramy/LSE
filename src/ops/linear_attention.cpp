@@ -79,7 +79,12 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // alpha = exp(-softplus(exp(A_log)) * softplus(a + dt_bias)) — the decay
   // applied to the recurrent state each step.
   Array a = graph::linear(x, w.in_proj_a);
-  Array decay = graph::softplus(graph::exp(w.a_log));
+  // Widened once, at the weight boundary: the decay multiplies the recurrent
+  // state on every step, so its error compounds without bound, and the
+  // delta-rule solve this feeds NaNs outright in bf16. `a + dt_bias` is a
+  // binary op and already promotes to f32; the exp chain would not.
+  Array decay =
+      graph::softplus(graph::exp(graph::cast(w.a_log, DType::kF32)));
   Array alpha =
       graph::exp(graph::neg(decay * graph::softplus(a + w.dt_bias)));
   Array beta = graph::clamp(graph::sigmoid(graph::linear(x, w.in_proj_b)),

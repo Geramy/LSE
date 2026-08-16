@@ -145,42 +145,40 @@ constexpr std::uint32_t kBlock = 256;
 
 // Both kernels store through the emitter hook; `out` exists only because
 // bind() requires the one output slot.
-template <class E>
+template <class E, class W = kir::f32>
 struct SwigluArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> wg;
-  env::In<kir::f32, E> wu;
-  env::In<kir::f32, E> wd;
+  env::In<W, E> wg;
+  env::In<W, E> wu;
+  env::In<W, E> wd;
   env::InOut<kir::f32, E> hid;
   env::Out<kir::f32, E> out;
 };
 
-template <class E>
+template <class E, class W = kir::f32>
 struct SwigluIndexedArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> wg;
-  env::In<kir::f32, E> wu;
-  env::In<kir::f32, E> wd;
+  env::In<W, E> wg;
+  env::In<W, E> wu;
+  env::In<W, E> wd;
   env::In<kir::f32, E> idx;
   env::InOut<kir::f32, E> hid;
   env::Out<kir::f32, E> out;
 };
 
-// The dot walk stays on the shared kir-level helper, so the raw buffers
-// come out of the bound args.
-template <class A>
-void swiglu_stages(kir::KernelBody& k, env::Emit& e, A& a,
-                   const kir::Val<kir::u32>& lid,
+template <class W, class A>
+void swiglu_stages(env::Emit& e, A& a, const kir::Val<kir::u32>& lid,
                    const kir::Val<kir::u32>& row,
                    const kir::Val<kir::u32>& e_up,
                    const kir::Val<kir::u32>& e_down, std::uint32_t K,
                    std::uint32_t N, std::uint32_t D,
                    std::uint32_t load_bytes) {
+  const env::In<kir::f32, env::Emit> hid_in{a.hid.b, a.hid.tt};
   for (auto n : e.range(lid, e.u32(N), kBlock)) {
     auto g = e.var(0.0f);
     auto u = e.var(0.0f);
-    emit_dot_f32(k, a.x.b, a.wg.b, row * K, (e_up + n) * K, g, K, load_bytes);
-    emit_dot_f32(k, a.x.b, a.wu.b, row * K, (e_up + n) * K, u, K, load_bytes);
+    emit_dot<W>(e, a.x, a.wg, row * K, (e_up + n) * K, g, K, load_bytes);
+    emit_dot<W>(e, a.x, a.wu, row * K, (e_up + n) * K, u, K, load_bytes);
     const auto gate = g.read() / (1.0f + math::exp(0.0f - g.read()));
     a.hid[row * N + n] = gate * u.read();
   }
@@ -188,8 +186,7 @@ void swiglu_stages(kir::KernelBody& k, env::Emit& e, A& a,
 
   for (auto d : e.range(lid, e.u32(D), kBlock)) {
     auto acc = e.var(0.0f);
-    emit_dot_f32(k, a.hid.b, a.wd.b, row * N, (e_down + d) * N, acc, N,
-                 load_bytes);
+    emit_dot<W>(e, hid_in, a.wd, row * N, (e_down + d) * N, acc, N, load_bytes);
     e.store(row * D + d, acc.read());
   }
 }
@@ -204,7 +201,7 @@ struct SwigluKernel final : KernelPrimitive<SwigluKernel> {
 
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() < 5 || !s.store || s.types.scalar == nullptr ||
-        s.intrinsics == nullptr) {
+        s.intrinsics == nullptr || s.input_dtypes.size() < 5) {
       return {};
     }
     const auto K = static_cast<std::uint32_t>(
@@ -228,26 +225,30 @@ struct SwigluKernel final : KernelPrimitive<SwigluKernel> {
     const auto M = static_cast<std::uint32_t>(s.output.elem_count() / D);
     if (M == 0) return {};
 
-    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
-    k.set_store(s.store);
-    env::Emit e{&k};
-    const auto load_bytes = device_load_bytes(s.device);
-    const auto lid = e.let(math::local_id());
-    const auto row = e.let(math::workgroup_id_y());
+    // All three expert matrices come from one checkpoint, so one W serves.
+    return with_elem(s.input_dtypes[1], [&]<class W>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+      k.set_store(s.store);
+      env::Emit e{&k};
+      const auto load_bytes = device_load_bytes(s.device);
+      const auto lid = e.let(math::local_id());
+      const auto row = e.let(math::workgroup_id_y());
 
-    if (indexed) {
-      SwigluIndexedArgs<env::Emit> a;
-      env::bind(k, a);
-      const auto expert = e.let(kir::cast<kir::u32>(a.idx[row * keep + slot]));
-      swiglu_stages(k, e, a, lid, row, e.let(expert * N), e.let(expert * D), K,
-                    N, D, load_bytes);
-    } else {
-      SwigluArgs<env::Emit> a;
-      env::bind(k, a);
-      swiglu_stages(k, e, a, lid, row, e.u32(0), e.u32(0), K, N, D,
-                    load_bytes);
-    }
-    return k.str();
+      if (indexed) {
+        SwigluIndexedArgs<env::Emit, W> a;
+        if (!env::bind(k, a, s)) return {};
+        const auto expert =
+            e.let(kir::cast<kir::u32>(a.idx[row * keep + slot]));
+        swiglu_stages<W>(e, a, lid, row, e.let(expert * N), e.let(expert * D),
+                         K, N, D, load_bytes);
+      } else {
+        SwigluArgs<env::Emit, W> a;
+        if (!env::bind(k, a, s)) return {};
+        swiglu_stages<W>(e, a, lid, row, e.u32(0), e.u32(0), K, N, D,
+                         load_bytes);
+      }
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -275,11 +276,11 @@ struct SwigluKernel final : KernelPrimitive<SwigluKernel> {
   }
 };
 
-template <class E>
+template <class E, class W = kir::f32>
 struct RmsLinearArgs {
   env::In<kir::f32, E> x;
   env::In<kir::f32, E> rw;
-  env::In<kir::f32, E> w;
+  env::In<W, E> w;
   env::Out<kir::f32, E> out;
 };
 
@@ -293,7 +294,7 @@ struct RmsLinearKernel final : KernelPrimitive<RmsLinearKernel> {
 
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() < 3 || !s.store || s.types.scalar == nullptr ||
-        s.intrinsics == nullptr) {
+        s.intrinsics == nullptr || s.input_dtypes.size() < 3) {
       return {};
     }
     const auto K = static_cast<std::uint32_t>(
@@ -304,10 +305,11 @@ struct RmsLinearKernel final : KernelPrimitive<RmsLinearKernel> {
     const bool zc = s.iattrs[0] != 0;
     const auto load_bytes = device_load_bytes(s.device);
 
+    return with_elem(s.input_dtypes[2], [&]<class W>() -> std::string {
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    RmsLinearArgs<env::Emit> a;
-    env::bind(k, a);
+    RmsLinearArgs<env::Emit, W> a;
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto lid = e.let(math::local_id());
     const auto row = e.let(math::workgroup_id_y());
@@ -342,24 +344,26 @@ struct RmsLinearKernel final : KernelPrimitive<RmsLinearKernel> {
     }
     e.barrier();
 
-    const auto vn = kir::pack_n(load_bytes, 4);
+    constexpr std::uint32_t we = kir::pack_elem_bytes<W>();
+    const auto vn = row_pack(K, load_bytes, we);
     const auto aligned = (K / vn) * vn;
     for (auto n : e.range(lid, e.u32(N), kBlock)) {
       auto acc = e.var(0.0f);
       for (auto t : e.range(0u, aligned, vn)) {
-        const auto wv = e.load(a.w, n * K + t, load_bytes);
+        const auto wv = e.load(a.w, n * K + t, vn * we);
         for (auto j : e.unroll(vn)) {
-          acc = math::fma(xs[t + j], wv[j], acc);
+          acc = math::fma(xs[t + j], math::widen(wv[j]), acc);
         }
       }
       if (aligned < K) {
         for (auto t : e.range(aligned, K)) {
-          acc = math::fma(xs[t], a.w[n * K + t], acc);
+          acc = math::fma(xs[t], math::widen(a.w[n * K + t]), acc);
         }
       }
       e.store(row * N + n, acc.read());
     }
     return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {

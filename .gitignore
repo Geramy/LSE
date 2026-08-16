@@ -10,6 +10,7 @@ target/
 # Generated design docs — not source of truth, not committed.
 PLAN.md
 WORK.md
+PLAN_FINAL_ENGINE.md
 .venv/
 tests/data/
 

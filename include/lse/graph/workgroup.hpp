@@ -35,6 +35,10 @@ struct WorkgroupDevice {
 // the phase Workgroup (attention, embedding, top-k included).
 [[nodiscard]] bool workgroup_shareable(const Node& n) noexcept;
 
+// A GEMV wide enough to want a grid of its own rather than a slot in a staged
+// body. Matches the cut the scheduler makes when it groups sibling linears.
+[[nodiscard]] bool is_wide_linear(const Node& n) noexcept;
+
 enum class WorkgroupPhase : std::uint8_t {
   kUnknown,
   kDecode,   // few rows (M < 16): one hardware workgroup can own the token

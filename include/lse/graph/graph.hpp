@@ -260,7 +260,8 @@ class Scheduler {
   [[nodiscard]] FallbackChain& fallback_chain() const noexcept;
 
  private:
-  Status try_dispatch_group(const FusionGroup& group);
+  Status try_dispatch_group(const FusionGroup& group,
+                            backend::Stream stream);
 
  public:
 
@@ -290,6 +291,14 @@ class Scheduler {
     std::uint32_t slots_reused = 0;
     std::uint32_t slots_allocated = 0;
     std::vector<std::string> host_group_reasons;
+    // Execution streams the step's groups were spread across, how many
+    // cross-stream waits that cost, and the longest chain of dependent groups
+    // in it. The chain is the floor: no number of streams can make a step
+    // shorter than its own dependencies, so `chain` against `device_groups` is
+    // the spread that was actually available, not the one that was hoped for.
+    std::uint32_t streams_used = 1;
+    std::uint32_t stream_waits = 0;
+    std::uint32_t stream_chain = 0;
     // Compute time that overlapped an in-flight collective.
     std::uint64_t overlap_ns = 0;
     std::uint64_t partition_ns = 0;

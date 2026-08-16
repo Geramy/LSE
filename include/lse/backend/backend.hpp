@@ -84,6 +84,122 @@ struct DispatchArgs {
   std::uint32_t flags = 0;
 };
 
+// An ordered timeline of dispatches. Work issued on one stream executes in
+// issue order. Work on two different streams may execute concurrently, and any
+// ordering between them has to be *stated* — record_event on the producer,
+// wait_event on the consumer. There is no implicit cross-stream ordering, and
+// the seam deliberately offers no "sync everything" shortcut for expressing a
+// dependency: a global barrier is not a dependency, it is the absence of one.
+struct Stream {
+  std::uint32_t index = 0;
+
+  friend bool operator==(Stream, Stream) noexcept = default;
+};
+
+// Every backend has at least this one, and a backend that has only this one
+// satisfies the whole seam without writing a line (see Backend<Derived>).
+inline constexpr Stream kDefaultStream{0};
+
+// A point on a stream's timeline: everything that stream had been given at the
+// moment it was recorded. Opaque past these two fields — the backend decides
+// what `timeline` counts.
+struct StreamEvent {
+  Stream stream{};
+  std::uint64_t timeline = 0;
+
+  [[nodiscard]] bool valid() const noexcept { return timeline != 0; }
+};
+
+// Which part of a dispatch's work this launch covers, as a half-open range of
+// work items. `count == 0` means the whole dispatch, which is every launch
+// today: a kernel still declares a grid, and a grid cannot be cut.
+//
+// It is here now so that when a kernel declares N work items at a granularity
+// instead, splitting one op across two streams — and later across two devices
+// — is a different WorkRange on the same call, not a new signature.
+struct WorkRange {
+  std::uint64_t begin = 0;
+  std::uint64_t count = 0;
+
+  [[nodiscard]] bool whole() const noexcept { return begin == 0 && count == 0; }
+};
+
+// Where a launch goes. One struct rather than trailing parameters so that
+// adding the work range above did not change launch()'s arity, and adding
+// placement (which device) later will not either.
+struct DispatchTarget {
+  Stream stream{};
+  WorkRange work{};
+};
+
+// What this device's execution streams can actually do — declared by the
+// backend, read by the scheduler, never inferred from the backend's name.
+//
+// The scheduler asks two questions of it: may I put these two groups on
+// different streams at all, and is it worth an event to do so. Everything a
+// caller needs to answer them is here; nothing that only one vendor could
+// interpret is.
+struct StreamCapabilities {
+  // Streams the backend will hand out. Indices [0, stream_count) are valid.
+  std::uint32_t stream_count = 1;
+  // How many of those the device can genuinely run at the same time. 1 means
+  // extra streams are legal but buy nothing, and a scheduler that reads this
+  // will keep everything ordered rather than pay for events it cannot cash.
+  std::uint32_t concurrent_streams = 1;
+  // Ordering between two streams needs record_event/wait_event. False when the
+  // backend already keeps every stream mutually ordered, which makes the
+  // events no-ops rather than a special case at the call site.
+  bool needs_explicit_events = false;
+  // A launch may cover a strict subrange of its work items. False until a
+  // kernel declares work items rather than a grid; while it is false a launch
+  // whose WorkRange is not whole() is refused instead of silently widened.
+  bool splittable_work = false;
+  // A launch costs the same whatever stream it goes to. False when the
+  // backend's cheap submission path can only address one queue, so every other
+  // stream pays extra per dispatch to reach a queue of its own. While it is
+  // false, moving a group is a loss even when it genuinely overlaps — the
+  // overlap has to beat a per-kernel tax the group did not owe before — so the
+  // cost model refuses to spread and the seam is exercised without being paid
+  // for. It flips when the backend can batch onto more than one queue, and
+  // nothing else about the seam changes when it does.
+  bool uniform_launch_cost = true;
+
+  [[nodiscard]] bool concurrent() const noexcept {
+    return concurrent_streams > 1 && stream_count > 1;
+  }
+
+  // Whether any group could end up on a stream other than the one it is
+  // already ordered on. False makes the whole placement pass dead work — the
+  // answer is the order the caller already had — so the planner may skip it
+  // rather than compute a plan it is forbidden to act on.
+  [[nodiscard]] bool may_spread() const noexcept {
+    return concurrent() && uniform_launch_cost;
+  }
+
+  // The cost model, in the only currency the caller has at placement time.
+  // Moving independent work to another stream costs one event and buys the
+  // chance to run beside something, so it is worth it only for work that does
+  // not already fill the machine: `device_width` is the work-item count that
+  // saturates it. A group at or above that leaves nothing to overlap with and
+  // stays on the stream it is already on, however independent it is.
+  //
+  // Deliberately not priced in nanoseconds. A group's device time is not known
+  // until there is a roofline model to predict it, and a made-up estimate
+  // would make this look like a decision it is not.
+  [[nodiscard]] bool worth_moving(std::uint64_t work_items,
+                                  std::uint64_t device_width) const noexcept {
+    return may_spread() && work_items > 0 && work_items < device_width;
+  }
+};
+
+// One stream, everything ordered. What a device with no concurrency has, and
+// what a backend that implements none of the stream *_impl surface reports.
+[[nodiscard]] inline const StreamCapabilities&
+ordered_single_stream() noexcept {
+  static const StreamCapabilities caps{};
+  return caps;
+}
+
 // What any device has. Nothing here is specific to a vendor or an ISA: every
 // field is either an identity a cache key needs or a limit every backend can
 // answer. Vendor detail lives in `extension`.
@@ -175,11 +291,71 @@ class Backend {
   }
 
   Status launch(const KernelHandle& kernel, const LaunchDims& dims,
-                const DispatchArgs& args) {
-    return derived().launch_impl(kernel, dims, args);
+                const DispatchArgs& args, const DispatchTarget& target = {}) {
+    if constexpr (requires {
+                    derived().launch_impl(kernel, dims, args, target);
+                  }) {
+      return derived().launch_impl(kernel, dims, args, target);
+    } else {
+      // A backend with one ordered stream: the target names the only stream
+      // there is, and a partial work range has no way to be honoured.
+      if (!target.work.whole()) {
+        return LSE_ERROR(kUnimplemented, "backend '", std::string(Derived::kName),
+                         "' cannot split a dispatch's work range");
+      }
+      return derived().launch_impl(kernel, dims, args);
+    }
   }
 
   Status synchronize() { return derived().synchronize_impl(); }
+
+  // --- execution streams -----------------------------------------------
+  // A backend that implements none of the *_impl below still satisfies the
+  // whole seam: it gets one stream, everything ordered, and events that are
+  // already true the moment they are recorded. Nothing here assumes a GPU.
+
+  [[nodiscard]] const StreamCapabilities& stream_capabilities() const noexcept {
+    if constexpr (requires { derived().stream_capabilities_impl(); }) {
+      return derived().stream_capabilities_impl();
+    } else {
+      return ordered_single_stream();
+    }
+  }
+
+  // Names everything issued on `stream` so far, so another stream can be made
+  // to wait for exactly that and no more.
+  Result<StreamEvent> record_event(Stream stream) {
+    if constexpr (requires { derived().record_event_impl(stream); }) {
+      return derived().record_event_impl(stream);
+    } else {
+      // Nothing can be issued out of order, so every point is already past.
+      return StreamEvent{stream, 1};
+    }
+  }
+
+  // Orders `stream` after `event`. Does not block the host, and never becomes
+  // a device-wide barrier: only the waiting stream is held.
+  Status wait_event(Stream stream, const StreamEvent& event) {
+    if constexpr (requires { derived().wait_event_impl(stream, event); }) {
+      return derived().wait_event_impl(stream, event);
+    } else {
+      (void)stream;
+      (void)event;
+      return OkStatus();
+    }
+  }
+
+  // Distinct name rather than an overload of synchronize(): a backend that
+  // wants only the device-wide one must not have to restate this to keep it
+  // visible.
+  Status synchronize_stream(Stream stream) {
+    if constexpr (requires { derived().synchronize_stream_impl(stream); }) {
+      return derived().synchronize_stream_impl(stream);
+    } else {
+      (void)stream;
+      return derived().synchronize_impl();
+    }
+  }
 
   Result<void*> device_pointer(const DeviceBuffer& buf) const {
     if constexpr (requires { derived().device_pointer_impl(buf); }) {
@@ -247,8 +423,31 @@ class IBackend {
   virtual Result<KernelHandle> load_executable(
       std::string_view name, std::span<const std::byte> code_object) = 0;
   virtual Status launch(const KernelHandle& kernel, const LaunchDims& dims,
-                        const DispatchArgs& args) = 0;
+                        const DispatchArgs& args,
+                        const DispatchTarget& target) = 0;
+  // Whole dispatch, default stream — what a caller that has no opinion wants.
+  Status launch(const KernelHandle& kernel, const LaunchDims& dims,
+                const DispatchArgs& args) {
+    return launch(kernel, dims, args, DispatchTarget{});
+  }
   virtual Status synchronize() = 0;
+
+  // What this device's streams can do, and how to order two of them. A caller
+  // reads the capabilities and decides; it never asks which backend this is.
+  //
+  // The defaults are a backend with one stream on which everything is already
+  // ordered — every point on its timeline is behind anything issued later, so
+  // an event is satisfied the moment it is recorded. A backend with real
+  // streams overrides all four; one without overrides none.
+  virtual const StreamCapabilities& stream_capabilities() const noexcept {
+    return ordered_single_stream();
+  }
+  virtual Result<StreamEvent> record_event(Stream stream) {
+    return StreamEvent{stream, 1};
+  }
+  virtual Status wait_event(Stream, const StreamEvent&) { return OkStatus(); }
+  virtual Status synchronize_stream(Stream) { return synchronize(); }
+
   virtual std::string_view name() const noexcept = 0;
   // nullptr when the backend has no codegen of its own.
   virtual const graph::IKernelEmitter* emitter() const noexcept = 0;
@@ -292,10 +491,23 @@ class BackendAdapter final : public IBackend {
     return impl_.load_executable(n, code);
   }
   Status launch(const KernelHandle& k, const LaunchDims& d,
-                const DispatchArgs& a) override {
-    return impl_.launch(k, d, a);
+                const DispatchArgs& a, const DispatchTarget& t) override {
+    return impl_.launch(k, d, a, t);
   }
+  using IBackend::launch;
   Status synchronize() override { return impl_.synchronize(); }
+  const StreamCapabilities& stream_capabilities() const noexcept override {
+    return impl_.stream_capabilities();
+  }
+  Result<StreamEvent> record_event(Stream s) override {
+    return impl_.record_event(s);
+  }
+  Status wait_event(Stream s, const StreamEvent& e) override {
+    return impl_.wait_event(s, e);
+  }
+  Status synchronize_stream(Stream s) override {
+    return impl_.synchronize_stream(s);
+  }
   std::string_view name() const noexcept override { return Derived::kName; }
   const graph::IKernelEmitter* emitter() const noexcept override {
     return impl_.emitter();

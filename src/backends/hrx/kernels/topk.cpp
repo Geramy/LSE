@@ -120,7 +120,7 @@ struct TopKKernel final : KernelPrimitive<TopKKernel> {
 
     kir::KernelBody body(s.types, *s.intrinsics);
     TopKArgs<env::Emit> a;
-    env::bind(body, a);
+    if (!env::bind(body, a, s)) return {};
     env::Emit e{&body};
     const auto i = e.thread_id();
     const auto row = e.let((i / k) * n);

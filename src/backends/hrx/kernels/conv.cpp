@@ -1,3 +1,4 @@
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -10,11 +11,13 @@ namespace lse::backend::hrx_kernels {
 using namespace lse::graph;
 namespace math = lse::math;
 
-template <class E>
+// `W` is the filter's storage element; the weight and the bias come from the
+// same checkpoint, so one parameter covers both. A mismatch makes bind refuse.
+template <class E, class W = kir::f32>
 struct CausalConv1dArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> w;
-  env::In<kir::f32, E> bias;
+  env::In<W, E> w;
+  env::In<W, E> bias;
   env::In<kir::f32, E> tail;  // optional 4th input: previous K-1 columns
   env::Out<kir::f32, E> out;
 };
@@ -32,7 +35,7 @@ struct CausalConv1dKernel final : KernelPrimitive<CausalConv1dKernel> {
   std::string emit_kernel(const KernelShapes& s) const override {
     if ((s.inputs.size() != 3 && s.inputs.size() != 4) ||
         s.types.scalar == nullptr || s.intrinsics == nullptr ||
-        s.inputs[0].rank() < 2) {
+        s.inputs[0].rank() < 2 || s.input_dtypes.size() < 3) {
       return {};
     }
     const Shape& x = s.inputs[0];
@@ -49,33 +52,36 @@ struct CausalConv1dKernel final : KernelPrimitive<CausalConv1dKernel> {
       }
     }
 
-    kir::KernelBody k(s.types, *s.intrinsics);
-    CausalConv1dArgs<env::Emit> a;
-    env::bind(k, a);
-    env::Emit e{&k};
-    const auto i = e.thread_id();
-    const auto c = e.let(i % channels);
-    const auto t = e.let((i / channels) % seq);
-    const auto bi = e.let(i / (channels * seq));
-    auto acc = e.var(0.0f);
-    acc = a.bias[c];
-    for (std::uint32_t j = 0; j < kernel; ++j) {
-      const auto back = kernel - 1 - j;
-      const auto src_t = e.let(t - back);
-      const auto src = e.let((bi * seq + src_t) * channels + c);
-      if (auto in_range = e.when(t >= back)) {
-        acc = math::fma(a.x[src], a.w[c * kernel + j], acc);
-      }
-      if (has_tail && back > 0) {
-        // t < back <= K-1 puts t+j inside the K-1 tail columns.
-        const auto tsrc = e.let((bi * (kernel - 1) + t + j) * channels + c);
-        if (auto in_tail = e.when(t < back)) {
-          acc = math::fma(a.tail[tsrc], a.w[c * kernel + j], acc);
+    return with_elem(s.input_dtypes[1], [&]<class W>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics);
+      CausalConv1dArgs<env::Emit, W> a;
+      if (!env::bind(k, a, s)) return {};
+      env::Emit e{&k};
+      const auto i = e.thread_id();
+      const auto c = e.let(i % channels);
+      const auto t = e.let((i / channels) % seq);
+      const auto bi = e.let(i / (channels * seq));
+      auto acc = e.var(0.0f);
+      acc = math::widen(a.bias[c]);
+      for (std::uint32_t j = 0; j < kernel; ++j) {
+        const auto back = kernel - 1 - j;
+        const auto src_t = e.let(t - back);
+        const auto src = e.let((bi * seq + src_t) * channels + c);
+        const auto tap = e.let(math::widen(a.w[c * kernel + j]));
+        if (auto in_range = e.when(t >= back)) {
+          acc = math::fma(a.x[src], tap, acc);
+        }
+        if (has_tail && back > 0) {
+          // t < back <= K-1 puts t+j inside the K-1 tail columns.
+          const auto tsrc = e.let((bi * (kernel - 1) + t + j) * channels + c);
+          if (auto in_tail = e.when(t < back)) {
+            acc = math::fma(a.tail[tsrc], tap, acc);
+          }
         }
       }
-    }
-    e.ret(acc.read());
-    return k.str();
+      e.ret(acc.read());
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -133,7 +139,7 @@ struct ConvTailShiftKernel final : KernelPrimitive<ConvTailShiftKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     ConvTailArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto i = e.thread_id();
     const auto c = e.let(i % channels);

@@ -1,5 +1,6 @@
 #include "lse/graph/graph.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -15,6 +17,7 @@
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/graph/program.hpp"
+#include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/backends/hrx/hip_emitter.hpp"
 
@@ -23,9 +26,19 @@ namespace lse::graph {
 struct Scheduler::Impl {
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
-  backend::DeviceBuffer grid_bar;
+  // One per stream: a persistent-grid kernel spins on this counter across its
+  // whole grid, so two of them running at once must not share one.
+  std::vector<backend::DeviceBuffer> grid_bar;
 
   Program program;
+  StreamPlan plan;
+  std::vector<backend::StreamEvent> events;
+  // Streams still holding work from an earlier step. A plan covers one step,
+  // so without this the first group a step puts on a stream would be ordered
+  // against nothing at all — the previous step's work on every *other* stream
+  // is invisible to it. Cleared whenever the device is known idle.
+  std::vector<std::uint8_t> outstanding;
+  std::vector<backend::StreamEvent> entry_events;
 
   Status ensure_jit(backend::IBackend& backend) {
     if (jit != nullptr) return OkStatus();
@@ -66,7 +79,8 @@ std::string Scheduler::device_gap(const Node& node,
   return {};
 }
 
-Status Scheduler::try_dispatch_group(const FusionGroup& group) {
+Status Scheduler::try_dispatch_group(const FusionGroup& group,
+                                     backend::Stream stream) {
   const IKernelEmitter* emitter = backend_.emitter();
   if (emitter == nullptr) {
     return LSE_ERROR(kUnimplemented, "backend '", std::string(backend_.name()),
@@ -179,17 +193,19 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group) {
   }
 
   if (emitted->persist_grid) {
-    if (!impl_->grid_bar.valid()) {
+    if (impl_->grid_bar.size() <= stream.index) {
+      impl_->grid_bar.resize(stream.index + 1);
+    }
+    backend::DeviceBuffer& bar_buf = impl_->grid_bar[stream.index];
+    if (!bar_buf.valid()) {
       auto bar = backend_.allocate(sizeof(std::uint32_t),
                                    backend::MemoryClass::kDevice);
       if (!bar.ok()) return bar.status();
-      impl_->grid_bar = bar.release();
+      bar_buf = bar.release();
       const std::uint32_t zero = 0;
-      LSE_RETURN_IF_ERROR(backend_.copy_h2d(&zero, impl_->grid_bar,
-                                            sizeof(zero), 0));
+      LSE_RETURN_IF_ERROR(backend_.copy_h2d(&zero, bar_buf, sizeof(zero), 0));
     }
-    bindings.push_back(
-        backend::BufferRef{&impl_->grid_bar, 0, impl_->grid_bar.size_bytes});
+    bindings.push_back(backend::BufferRef{&bar_buf, 0, bar_buf.size_bytes});
   }
 
   backend::DispatchArgs args;
@@ -213,7 +229,8 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group) {
     std::fprintf(stderr, "\n");
   }
   const auto t_launch = std::chrono::steady_clock::now();
-  LSE_RETURN_IF_ERROR(backend_.launch(launched, emitted->dims, args));
+  LSE_RETURN_IF_ERROR(backend_.launch(launched, emitted->dims, args,
+                                      backend::DispatchTarget{stream, {}}));
   trace_.launch_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - t_launch)
@@ -305,16 +322,6 @@ void alias_ready_reshapes(const FusionGroup& group) {
   }
 }
 
-bool views_only(const FusionGroup& group) noexcept {
-  for (const NodePtr& n : group.nodes) {
-    if (n->kind != OpKind::kReshape && n->kind != OpKind::kConstant &&
-        n->kind != OpKind::kBuffer) {
-      return false;
-    }
-  }
-  return !group.nodes.empty();
-}
-
 bool is_gdn_node(const Node& n) noexcept {
   return n.kind == OpKind::kGDNChunkScan;
 }
@@ -340,6 +347,9 @@ void accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
   acc.nodes_evaluated += step.nodes_evaluated;
   acc.intercepted += step.intercepted;
   acc.collectives_issued += step.collectives_issued;
+  acc.streams_used = std::max(acc.streams_used, step.streams_used);
+  acc.stream_waits += step.stream_waits;
+  acc.stream_chain += step.stream_chain;
   acc.partition_ns += step.partition_ns;
   acc.emit_ns += step.emit_ns;
   acc.launch_ns += step.launch_ns;
@@ -413,6 +423,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       staged.is_phase = true;
       staged.launches = 1;
       staged.anchor_class = FusionClass::kBarrier;
+      bool staged_grid = false;
       auto flush_staged = [&] {
         if (staged.nodes.empty()) return;
         auto chunks = Partitioner::phase_chunks(staged, 480);
@@ -421,6 +432,21 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         staged.is_phase = true;
         staged.launches = 1;
         staged.anchor_class = FusionClass::kBarrier;
+      };
+      // Mirrors the emitter's `dependent` test: a chunk whose stages never
+      // read each other needs no barrier, which is what lets it keep a grid.
+      auto reads_staged = [&](const NodePtr& n) {
+        for (const NodePtr& in : n->inputs) {
+          const Node* p = in.get();
+          while (p != nullptr && p->kind == OpKind::kReshape &&
+                 p->inputs.size() == 1) {
+            p = p->inputs[0].get();
+          }
+          for (const NodePtr& m : staged.nodes) {
+            if (m.get() == p) return true;
+          }
+        }
+        return false;
       };
       auto linear_n = [](const Node& n) -> std::int64_t {
         if (n.inputs.size() < 2) return 0;
@@ -506,6 +532,22 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
           phase_groups.push_back(std::move(one));
           continue;
         }
+        // A stage with thousands of independent items must not share the
+        // one-workgroup fallback with the dependent chain around it: the
+        // launch boundary is the barrier a grid-wide stage needs, and it
+        // costs ~2 us against tens of microseconds of idle CUs. 2048 is
+        // eight workgroups — below that the grid is not worth the split.
+        constexpr std::uint32_t kGridStage = 2048;
+        const bool fat = backend::HipEmitter::phase_stage_threads(
+                             *n, backend_.device_info()) >= kGridStage;
+        const bool grid_chunk = staged_grid && !staged.nodes.empty();
+        // A grid chunk keeps growing while its stages stay independent, so
+        // sibling wide stages cost one launch, not one each.
+        if (fat ? (!grid_chunk || reads_staged(n))
+                : (grid_chunk && reads_staged(n))) {
+          flush_staged();
+        }
+        if (staged.nodes.empty()) staged_grid = fat;
         staged.nodes.push_back(n);
       }
       flush_staged();
@@ -525,9 +567,47 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       replayed ? rec.groups() : phase_groups;
   if (mode_ == Mode::kDeviceFirst && backend_.emitter() != nullptr &&
       !staged_groups.empty()) {
+      // Placement for the whole step, decided before any of it is issued.
+      impl_->plan = plan_streams(staged_groups, backend_.stream_capabilities(),
+                                 backend_.device_info());
+      impl_->events.assign(staged_groups.size(), backend::StreamEvent{});
+      trace_.streams_used = impl_->plan.streams_used;
+      trace_.stream_waits = impl_->plan.waits_total;
+      trace_.stream_chain = impl_->plan.chain;
+
+      // The step inherits whatever earlier steps left running. Snapshot each
+      // such stream *before* issuing anything, so a group that later joins a
+      // different stream waits for the previous step and not for this one's
+      // work as well — and snapshot only the streams this plan can actually
+      // race with, which in a single-stream step is none of them.
+      const std::uint32_t stream_count =
+          backend_.stream_capabilities().stream_count;
+      if (impl_->outstanding.size() != stream_count) {
+        impl_->outstanding.assign(stream_count, 0);
+      }
+      impl_->entry_events.assign(stream_count, backend::StreamEvent{});
+      std::vector<std::uint8_t> plans_on(stream_count, 0);
+      for (std::uint32_t i = 0; i < impl_->plan.stream.size(); ++i) {
+        if (impl_->plan.stream[i] < stream_count) {
+          plans_on[impl_->plan.stream[i]] = 1;
+        }
+      }
+      for (std::uint32_t s = 0; s < stream_count; ++s) {
+        if (impl_->outstanding[s] == 0) continue;
+        bool raced = false;
+        for (std::uint32_t t = 0; t < stream_count && !raced; ++t) {
+          raced = t != s && plans_on[t] != 0;
+        }
+        if (!raced) continue;
+        auto ev = backend_.record_event(backend::Stream{s});
+        if (ev.ok()) impl_->entry_events[s] = ev.release();
+      }
+      std::vector<std::uint8_t> entered(stream_count, 0);
+
       bool launched_phase = true;
       std::size_t done = 0;
       for (const FusionGroup& g : staged_groups) {
+        const std::uint32_t gi = static_cast<std::uint32_t>(done);
         if (views_only(g)) {
           alias_ready_reshapes(g);
           ++trace_.views_aliased;
@@ -536,7 +616,29 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
           ++done;
           continue;
         }
-        Status st = try_dispatch_group(g);
+        const backend::Stream on{impl_->plan.stream[gi]};
+        Status st = OkStatus();
+        if (on.index < stream_count && entered[on.index] == 0) {
+          entered[on.index] = 1;
+          for (std::uint32_t s = 0; s < stream_count && st.ok(); ++s) {
+            if (s == on.index) continue;
+            st = backend_.wait_event(on, impl_->entry_events[s]);
+          }
+        }
+        for (std::uint32_t j : impl_->plan.waits[gi]) {
+          if (!st.ok()) break;
+          st = backend_.wait_event(on, impl_->events[j]);
+          if (!st.ok()) break;
+        }
+        if (st.ok()) st = try_dispatch_group(g, on);
+        if (st.ok() && impl_->plan.record_after[gi] != 0) {
+          auto ev = backend_.record_event(on);
+          if (ev.ok()) {
+            impl_->events[gi] = ev.release();
+          } else {
+            st = ev.status();
+          }
+        }
         if (!st.ok()) {
           if (std::getenv("LSE_DEBUG_PHASES") != nullptr) {
             std::fprintf(stderr, "phase dispatch failed: %s\n",
@@ -546,6 +648,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
           break;
         }
         alias_ready_reshapes(g);
+        if (on.index < stream_count) impl_->outstanding[on.index] = 1;
         ++trace_.device_groups;
         ++trace_.kernels_launched;
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
@@ -563,6 +666,9 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         if (pull_host) {
           const auto t_sync = std::chrono::steady_clock::now();
           LSE_RETURN_IF_ERROR(backend_.synchronize());
+          // The device is idle: nothing is left for a later step to be
+          // ordered against, so the next one starts with no entry barriers.
+          std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
           trace_.sync_ns += static_cast<std::uint64_t>(
               std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - t_sync)
@@ -610,7 +716,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
         continue;
       }
-      Status dispatched = try_dispatch_group(g);
+      Status dispatched = try_dispatch_group(g, backend::kDefaultStream);
       if (dispatched.ok()) {
         ++trace_.device_groups;
         ++trace_.kernels_launched;
@@ -633,6 +739,13 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
               .count());
       launched = false;
     }
+
+    // Host-only mode reaches here without passing the device-first arm above,
+    // so nothing had counted this group. Leaving it uncounted printed
+    // `groups device=0 host=0` beside a five-figure launch count, which reads
+    // like broken instrumentation and hid a run that was executing the whole
+    // model on the host interpreter. Every group is now in exactly one bucket.
+    if (mode_ != Mode::kDeviceFirst) ++trace_.host_groups;
 
     for (const NodePtr& n : g.nodes) {
       // Routing first: an intercepting handler may claim a node the backend
@@ -718,13 +831,28 @@ struct DefaultScheduler {
     // backend builds fine and then fails to come up when the HSA runtime on the
     // loader path is too old. Treating that as fatal would turn preferring the
     // GPU into a hard stop on any machine without one.
+    std::string declined;
     for (const std::string& name : backend::default_backend_order()) {
       auto be = backend::create_backend(name);
       if (!be.ok()) continue;
       auto candidate = be.release();
-      if (!candidate->init(ordinal).ok()) continue;
+      if (const Status init = candidate->init(ordinal); !init.ok()) {
+        if (declined.empty()) declined = name + ": " + init.to_string();
+        continue;
+      }
       backend = std::move(candidate);
       scheduler = std::make_unique<Scheduler>(*backend);
+      // Falling back to a backend with no code generator runs the whole model
+      // through the host interpreter. That is a two-order-of-magnitude cliff
+      // and it used to be silent: the `--stats` line reported zero device
+      // groups next to a five-figure launch count and read like broken
+      // instrumentation. Say it once, where it happens.
+      if (backend->emitter() == nullptr && !declined.empty()) {
+        std::fprintf(stderr,
+                     "lse: no code-generating backend came up (%s); running on "
+                     "'%s' through the host interpreter\n",
+                     declined.c_str(), std::string(backend->name()).c_str());
+      }
       return;
     }
   }

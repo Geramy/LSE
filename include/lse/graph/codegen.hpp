@@ -16,6 +16,7 @@
 #include "lse/backend/backend.hpp"
 #include "lse/core/status.hpp"
 #include "lse/graph/dialect_source.hpp"
+#include "lse/ir/spell.hpp"
 
 namespace lse::graph {
 
@@ -23,9 +24,8 @@ class Node;
 using NodePtr = std::shared_ptr<Node>;
 struct FusionGroup;
 
-// A float as a source literal. std::to_string is %.6f, which turns 1e-7f into
-// "0.000000"; streaming without showpoint turns 1.0f into the invalid "1f".
-std::string float_literal(float v);
+// Spelled by the IR, which is where a literal's text belongs.
+using ir::float_literal;
 
 // Layout of the dispatch constants block. HRX separates buffer bindings from a
 // flat push-constant block; the emitter builds this and bakes the matching
@@ -94,6 +94,14 @@ class IKernelCompiler {
                                                  std::string_view arch) const = 0;
 
   [[nodiscard]] virtual bool available() const = 0;
+
+  // Everything that changes the bytes this compiler produces from identical
+  // source: its version, its option list, its action pipeline. It goes in the
+  // JIT cache key, so an upgraded toolchain or an edited flag invalidates
+  // stale objects on its own. The alternative is a hand-maintained revision
+  // constant, which is one forgotten increment away from serving an object
+  // built by a different compiler.
+  [[nodiscard]] virtual std::string identity() const = 0;
 };
 
 }  // namespace lse::graph

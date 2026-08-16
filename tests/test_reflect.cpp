@@ -12,8 +12,9 @@
 LSE_TEST(reflection_counts_match_declared_enums) {
   LSE_EXPECT_EQ(lse::reflected_enum_count<lse::StatusCode>(),
                 lse::enum_count(lse::StatusCode{}));
+  // Found by ADL: Dialect belongs to the kernel IR, which the graph names.
   LSE_EXPECT_EQ(lse::reflected_enum_count<lse::graph::Dialect>(),
-                lse::graph::enum_count(lse::graph::Dialect{}));
+                enum_count(lse::graph::Dialect{}));
   LSE_EXPECT_EQ(lse::reflected_enum_count<lse::graph::OpKind>(),
                 lse::graph::enum_count(lse::graph::OpKind{}));
   LSE_EXPECT_EQ(lse::reflected_enum_count<lse::graph::kir::Scalar>(), 12u);

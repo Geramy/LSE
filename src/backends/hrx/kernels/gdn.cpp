@@ -66,7 +66,7 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
   kir::KernelBody k(s.types, *s.intrinsics);
   k.set_store(s.store);
   GdnArgs<env::Emit> a;
-  env::bind(k, a);
+  if (!env::bind(k, a, s)) return {};
   env::Emit e{&k};
 
   const auto i = e.thread_id();

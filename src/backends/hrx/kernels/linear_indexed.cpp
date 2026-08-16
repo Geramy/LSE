@@ -15,10 +15,10 @@ namespace math = lse::math;
 
 // The value leaves through the wrapper's per-element return; the Out member
 // only names the slot the binding contract requires.
-template <class E>
+template <class E, class W = kir::f32>
 struct LinearIndexedArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> w;
+  env::In<W, E> w;
   env::In<kir::f32, E> idx;
   env::Out<kir::f32, E> out;
 };
@@ -39,7 +39,7 @@ struct LinearIndexedKernel final : KernelPrimitive<LinearIndexedKernel> {
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() != 3 || s.types.scalar == nullptr ||
         s.intrinsics == nullptr || s.inputs[1].rank() != 3 ||
-        s.inputs[2].rank() == 0) {
+        s.inputs[2].rank() == 0 || s.input_dtypes.size() < 3) {
       return {};
     }
     const auto kdim = static_cast<std::uint32_t>(
@@ -50,20 +50,22 @@ struct LinearIndexedKernel final : KernelPrimitive<LinearIndexedKernel> {
     const auto slot = static_cast<std::uint32_t>(s.iattrs[0]);
     if (kdim == 0 || nout == 0 || keep == 0 || slot >= keep) return {};
 
-    kir::KernelBody k(s.types, *s.intrinsics);
-    LinearIndexedArgs<env::Emit> args;
-    env::bind(k, args);
-    env::Emit e{&k};
-    const auto row = e.let(e.thread_id() / nout);
-    const auto col = e.let(e.thread_id() % nout);
-    const auto expert =
-        e.let(kir::cast<kir::u32>(args.idx[row * keep + e.u32(slot)]));
-    auto acc = e.var(0.0f);
-    const auto base = e.let((expert * nout + col) * kdim);
-    emit_dot_f32(e, args.x, args.w, row * kdim, base, acc, kdim,
-                 device_load_bytes(s.device));
-    e.ret(acc.read());
-    return k.str();
+    return with_elem(s.input_dtypes[1], [&]<class W>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics);
+      LinearIndexedArgs<env::Emit, W> args;
+      if (!env::bind(k, args, s)) return {};
+      env::Emit e{&k};
+      const auto row = e.let(e.thread_id() / nout);
+      const auto col = e.let(e.thread_id() % nout);
+      const auto expert =
+          e.let(kir::cast<kir::u32>(args.idx[row * keep + e.u32(slot)]));
+      auto acc = e.var(0.0f);
+      const auto base = e.let((expert * nout + col) * kdim);
+      emit_dot<W>(e, args.x, args.w, row * kdim, base, acc, kdim,
+                  device_load_bytes(s.device));
+      e.ret(acc.read());
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {

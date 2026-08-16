@@ -41,7 +41,7 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     RopeArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto i = e.thread_id();
     const auto d = e.let(i % dim);

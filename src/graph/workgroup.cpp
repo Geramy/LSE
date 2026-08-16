@@ -345,8 +345,6 @@ std::int64_t linear_n(const Node& n) noexcept {
   return 0;
 }
 
-bool is_wide_linear(const Node& n) noexcept { return linear_n(n) >= 128; }
-
 const Node* skip_reshape(const Node* n) noexcept {
   while (n && n->kind == OpKind::kReshape && n->inputs.size() == 1) {
     n = n->inputs[0].get();
@@ -378,6 +376,8 @@ bool reads_large_in_cut(const WorkgroupCut& cut, const Node& n) noexcept {
 }
 
 }  // namespace
+
+bool is_wide_linear(const Node& n) noexcept { return linear_n(n) >= 128; }
 
 std::vector<WorkgroupCut> Workgroup::cuts() const {
   std::vector<WorkgroupCut> out;

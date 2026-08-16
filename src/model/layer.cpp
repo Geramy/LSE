@@ -4,8 +4,8 @@
 #include <algorithm>
 #include <vector>
 
-// store_element: a checkpoint tensor is host data and Array has no host-write
-// path, so the widened copy is filled element by element.
+// host_bytes / sync_to_device: a checkpoint tensor is host data and Array has
+// no host-write path, so the buffer is filled behind the graph.
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/ops/norm.hpp"
@@ -21,6 +21,26 @@ Result<Array> WeightBinder::require(std::string_view name) {
   return LSE_ERROR(kNotFound, "checkpoint has no tensor '", std::string(name),
                    "'");
 }
+
+namespace {
+
+// The dtype a checkpoint tensor is held in on the device. Float formats keep
+// the format they were stored in — widening them in memory is a pure bandwidth
+// tax on every token, and converting in register costs nothing. Integer and
+// block-quantized storage has no device kernel that reads it directly yet, so
+// it still widens here.
+DType device_storage(DType checkpoint) noexcept {
+  switch (checkpoint) {
+    case DType::kF32:
+    case DType::kF16:
+    case DType::kBF16:
+      return checkpoint;
+    default:
+      return DType::kF32;
+  }
+}
+
+}  // namespace
 
 Result<Array> WeightBinder::optional(std::string_view name) {
   const TensorView* v = weights_->find(name);
@@ -38,12 +58,19 @@ Result<Array> WeightBinder::optional(std::string_view name) {
   }
   backend::IBackend& be = sched->backend();
 
-  Array a = Array::zeros(v->shape, DType::kF32);
+  const DType dt = device_storage(v->dtype);
+  Array a = Array::zeros(v->shape, dt);
   graph::Node& n = *a.node();
   LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be));
-  LSE_RETURN_IF_ERROR(v->read_f32(
-      static_cast<float*>(graph::interpreter::host_bytes(n)),
-      n.element_count()));
+  if (dt == v->dtype) {
+    LSE_RETURN_IF_ERROR(
+        v->read_native(graph::interpreter::host_bytes(n),
+                       dtype_storage_bytes(dt, n.element_count())));
+  } else {
+    LSE_RETURN_IF_ERROR(v->read_f32(
+        static_cast<float*>(graph::interpreter::host_bytes(n)),
+        n.element_count()));
+  }
   // The mirror now holds the only copy; it is the authority until it is pushed.
   n.host_dirty = true;
   n.device_dirty = false;

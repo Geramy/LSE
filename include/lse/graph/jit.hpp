@@ -60,6 +60,9 @@ class JitCache {
 
   backend::IBackend& backend_;
   const IKernelCompiler& compiler_;
+  // Hash of compiler_.identity(), taken once: slot_key runs per group per
+  // token and identity() builds strings.
+  std::uint64_t compiler_id_;
   std::string cache_dir_;
   Stats stats_;
   struct Impl;

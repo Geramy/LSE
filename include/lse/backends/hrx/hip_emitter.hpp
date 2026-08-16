@@ -23,6 +23,13 @@ class HipEmitter final : public graph::IKernelEmitter {
   static Result<graph::EmittedKernel> emit_phase(
       const graph::FusionGroup& group, const DeviceInfo& device);
   static bool phase_can_stage(const graph::Node& n) noexcept;
+
+  // Independent work items the node could spend if it owned the launch. The
+  // phase splitter breaks a chain here: a stage wanting thousands of them
+  // cannot share the one-workgroup fallback its dependent neighbours need.
+  static std::uint32_t phase_stage_threads(const graph::Node& n,
+                                           const DeviceInfo& device);
+
   static void bind_phase(const graph::FusionGroup& group,
                          graph::EmittedKernel& out);
 

@@ -2,8 +2,10 @@
 
 #include <string>
 
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
+#include "lse/math.hpp"
 
 namespace lse::backend::hrx_kernels {
 
@@ -11,9 +13,9 @@ using namespace lse::graph;
 
 namespace {
 
-template <class E>
+template <class E, class S = kir::f32>
 struct RowGatherArgs {
-  env::In<kir::f32, E> src;
+  env::In<S, E> src;
   env::In<kir::f32, E> rows;
   // Per-element kernel: the value leaves through k.ret, never this slot, but
   // bind requires the output declared.
@@ -21,26 +23,30 @@ struct RowGatherArgs {
 };
 
 // out[s, c] = src[row[s], c]. rows are f32 indices, matching the rest of the
-// graph. Width is the last axis of the output.
+// graph. Width is the last axis of the output. The table is read in whatever
+// format it is stored in and widens in register.
 std::string emit_row_gather(const KernelShapes& s) {
   if (s.inputs.size() != 2 || s.types.scalar == nullptr ||
-      s.intrinsics == nullptr || s.output.rank() == 0) {
+      s.intrinsics == nullptr || s.output.rank() == 0 ||
+      s.input_dtypes.size() < 2) {
     return {};
   }
   const auto width =
       static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 1));
   if (width == 0) return {};
 
-  kir::KernelBody k(s.types, *s.intrinsics);
-  RowGatherArgs<env::Emit> a;
-  env::bind(k, a);
-  env::Emit e{&k};
-  const auto i = e.thread_id();
-  const auto slot = i / width;
-  const auto col = i % width;
-  const auto row = cast<kir::u32>(a.rows[slot]);
-  e.ret(a.src[row * width + col]);
-  return k.str();
+  return with_elem(s.input_dtypes[0], [&]<class S>() -> std::string {
+    kir::KernelBody k(s.types, *s.intrinsics);
+    RowGatherArgs<env::Emit, S> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    const auto slot = i / width;
+    const auto col = i % width;
+    const auto row = cast<kir::u32>(a.rows[slot]);
+    e.ret(lse::math::widen(a.src[row * width + col]));
+    return k.str();
+  });
 }
 
 ThreadPlan plan_by_elems(const KernelShapes& s) {

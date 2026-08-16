@@ -65,7 +65,7 @@ struct SliceKernel final : KernelPrimitive<SliceKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     SliceArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     e.ret(slice_element(e, a, begin, in_axis, out_axis, inner));
     return k.str();

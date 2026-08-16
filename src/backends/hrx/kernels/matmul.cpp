@@ -16,10 +16,10 @@ namespace math = lse::math;
 
 // The value leaves through the wrapper's per-element return; the Out member
 // only names the slot the binding contract requires.
-template <class E>
+template <class E, class Y = kir::f32>
 struct MatMulArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> y;
+  env::In<Y, E> y;
   env::Out<kir::f32, E> out;
 };
 
@@ -42,7 +42,7 @@ struct MatMulKernel final : KernelPrimitive<MatMulKernel> {
   // the compiler size the loop.
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() != 2 || s.types.scalar == nullptr ||
-        s.intrinsics == nullptr) {
+        s.intrinsics == nullptr || s.input_dtypes.size() < 2) {
       return {};
     }
     const Shape& a = s.inputs[0];
@@ -50,20 +50,23 @@ struct MatMulKernel final : KernelPrimitive<MatMulKernel> {
     const auto kdim = static_cast<std::uint32_t>(a.dim(a.rank() - 1));
     const auto cols = static_cast<std::uint32_t>(b.dim(b.rank() - 1));
 
-    kir::KernelBody k(s.types, *s.intrinsics);
-    MatMulArgs<env::Emit> args;
-    env::bind(k, args);
-    env::Emit e{&k};
-    const auto row = e.let(e.thread_id() / cols);
-    const auto col = e.let(e.thread_id() % cols);
-    auto acc = e.var(0.0f);
-    // B is [K, cols] in the usual matmul, so the inner walk on y is strided
-    // and cannot be a wide load. x is contiguous in k.
-    for (auto t : e.range(kdim)) {
-      acc = math::fma(args.x[row * kdim + t], args.y[t * cols + col], acc);
-    }
-    e.ret(acc.read());
-    return k.str();
+    return with_elem(s.input_dtypes[1], [&]<class Y>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics);
+      MatMulArgs<env::Emit, Y> args;
+      if (!env::bind(k, args, s)) return {};
+      env::Emit e{&k};
+      const auto row = e.let(e.thread_id() / cols);
+      const auto col = e.let(e.thread_id() % cols);
+      auto acc = e.var(0.0f);
+      // B is [K, cols] in the usual matmul, so the inner walk on y is strided
+      // and cannot be a wide load. x is contiguous in k.
+      for (auto t : e.range(kdim)) {
+        acc = math::fma(args.x[row * kdim + t],
+                        math::widen(args.y[t * cols + col]), acc);
+      }
+      e.ret(acc.read());
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -91,10 +94,10 @@ struct MatMulKernel final : KernelPrimitive<MatMulKernel> {
 
 LSE_REGISTER_PRIMITIVE(MatMulKernel);
 
-template <class E>
+template <class E, class W = kir::f32>
 struct LinearArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> w;
+  env::In<W, E> w;
   env::Out<kir::f32, E> out;
 };
 
@@ -124,24 +127,26 @@ struct LinearKernel final : KernelPrimitive<LinearKernel> {
 
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() != 2 || s.types.scalar == nullptr ||
-        s.intrinsics == nullptr) {
+        s.intrinsics == nullptr || s.input_dtypes.size() < 2) {
       return {};
     }
     const auto kdim = static_cast<std::uint32_t>(
         s.inputs[0].dim(s.inputs[0].rank() - 1));
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
 
-    kir::KernelBody k(s.types, *s.intrinsics);
-    LinearArgs<env::Emit> args;
-    env::bind(k, args);
-    env::Emit e{&k};
-    const auto row = e.let(e.thread_id() / n);
-    const auto col = e.let(e.thread_id() % n);
-    auto acc = e.var(0.0f);
-    emit_dot_f32(e, args.x, args.w, row * kdim, col * kdim, acc, kdim,
-                 device_load_bytes(s.device));
-    e.ret(acc.read());
-    return k.str();
+    return with_elem(s.input_dtypes[1], [&]<class W>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics);
+      LinearArgs<env::Emit, W> args;
+      if (!env::bind(k, args, s)) return {};
+      env::Emit e{&k};
+      const auto row = e.let(e.thread_id() / n);
+      const auto col = e.let(e.thread_id() % n);
+      auto acc = e.var(0.0f);
+      emit_dot<W>(e, args.x, args.w, row * kdim, col * kdim, acc, kdim,
+                  device_load_bytes(s.device));
+      e.ret(acc.read());
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {

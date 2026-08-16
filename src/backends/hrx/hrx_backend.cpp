@@ -1,5 +1,8 @@
 #include "lse/backends/hrx/hrx_backend.hpp"
 
+#include <dlfcn.h>
+
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -60,6 +63,163 @@ template <typename T>
   return std::string(buffer);
 }
 
+// The agent's own answer to "how many queues may exist on you at once"
+// (HSA_AGENT_INFO_QUEUES_MAX; 128 on gfx1151). hrx has no property for it, so
+// it is read from the copy of libhsa-runtime64 that hrx has *already* loaded —
+// dlopen by soname returns that same handle, never a second runtime. The three
+// entry points below have been ABI-stable since HSA 1.0 and are declared here
+// rather than by including <hsa/hsa.h>, which is not a build input of this
+// backend. Returns 0 when the runtime is not reachable, which is not an error:
+// the caller then bounds the stream count by the compute units alone.
+std::uint32_t agent_queue_maximum(std::uint8_t ordinal) noexcept {
+  struct HsaAgent {
+    std::uint64_t handle;
+  };
+  using HsaStatus = int;
+  constexpr HsaStatus kSuccess = 0;
+  constexpr int kInfoQueuesMax = 12;
+  constexpr int kInfoDevice = 17;
+  constexpr int kDeviceTypeGpu = 1;
+
+  void* lib = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
+  if (lib == nullptr) return 0;
+
+  using IterateFn = HsaStatus (*)(HsaStatus (*)(HsaAgent, void*), void*);
+  using GetInfoFn = HsaStatus (*)(HsaAgent, int, void*);
+  auto iterate = reinterpret_cast<IterateFn>(dlsym(lib, "hsa_iterate_agents"));
+  auto get_info = reinterpret_cast<GetInfoFn>(dlsym(lib, "hsa_agent_get_info"));
+  if (iterate == nullptr || get_info == nullptr) {
+    dlclose(lib);
+    return 0;
+  }
+
+  struct Visit {
+    GetInfoFn get_info;
+    std::uint8_t want;
+    std::uint8_t seen;
+    std::uint32_t queues;
+  } visit{get_info, ordinal, 0, 0};
+
+  iterate(
+      [](HsaAgent agent, void* data) -> HsaStatus {
+        auto* v = static_cast<Visit*>(data);
+        int type = 0;
+        if (v->get_info(agent, kInfoDevice, &type) != kSuccess) return kSuccess;
+        if (type != kDeviceTypeGpu) return kSuccess;
+        if (v->seen++ != v->want) return kSuccess;
+        std::uint32_t queues = 0;
+        if (v->get_info(agent, kInfoQueuesMax, &queues) == kSuccess) {
+          v->queues = queues;
+        }
+        return kSuccess;
+      },
+      &visit);
+
+  dlclose(lib);
+  return visit.queues;
+}
+
+// How many logical queues this device's submission path can address, asked of
+// the device rather than read off a header.
+//
+// The AMDGPU HAL resolves a queue affinity by ANDing the request with the
+// queues the logical device actually created and taking the first set bit
+// (queue_affinity.c); a bit past the end normalizes to empty and the call
+// fails. So walking the bits with a barrier that signals a scratch timeline
+// asks exactly the question that matters — "does a submission carrying this
+// bit reach a queue" — and the answer is the count of bits that do. Each such
+// queue is its own AQL ring (one hsa_queue_create per host queue).
+//
+// Cheap: N empty barriers once, at init. Returns 1 if the probe cannot run,
+// which is the answer that costs nothing to be wrong about.
+#if LSE_HRX_LINKED
+std::uint32_t probe_queue_count(hrx_device_t device) noexcept {
+  hrx_semaphore_t semaphore = nullptr;
+  if (!hrx_status_is_ok(hrx_semaphore_create(device, 0, &semaphore))) return 1;
+
+  std::uint64_t value = 0;
+  std::uint32_t count = 0;
+  // 64 is the width of the affinity mask; the loop stops at the first bit the
+  // device refuses, so this is bounded by the queue count in practice.
+  for (std::uint32_t bit = 0; bit < 64; ++bit) {
+    std::uint64_t next = value + 1;
+    hrx_semaphore_list_t signals = {};
+    signals.semaphores = &semaphore;
+    signals.values = &next;
+    signals.count = 1;
+    const hrx_status_t status = hrx_queue_barrier(
+        device, static_cast<hrx_queue_affinity_t>(1) << bit,
+        /*wait_semaphores=*/nullptr, &signals);
+    if (!hrx_status_is_ok(status)) {
+      hrx_status_ignore(status);
+      break;
+    }
+    value = next;
+    ++count;
+  }
+  if (value > 0) {
+    hrx_status_ignore(hrx_semaphore_wait(semaphore, value, UINT64_MAX));
+  }
+  hrx_semaphore_release(semaphore);
+  return count != 0 ? count : 1u;
+}
+#endif
+
+// How many execution streams this device is worth handing out.
+//
+// One per addressable hardware queue, and no more. A stream past that shares a
+// ring with another, so it cannot overlap with it — it would only cost the
+// events the scheduler spends to spread onto it. `queues` is what the probe
+// found; the agent's queue maximum and the compute units still bound it,
+// because a queue with no CU to run on is a submission that returns nothing.
+StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
+                                              std::uint32_t queues) noexcept {
+  StreamCapabilities caps;
+  const std::uint32_t agent_max = agent_queue_maximum(info.ordinal);
+  std::uint32_t n = queues != 0 ? queues : 1u;
+  if (agent_max != 0) n = std::min(n, agent_max);
+  if (info.compute_units != 0) {
+    n = std::min(n, static_cast<std::uint32_t>(info.compute_units));
+  }
+  caps.stream_count = std::max(n, 1u);
+  // Every stream this backend hands out has its own AQL ring, so every one of
+  // them can run at the same time as the others. That is the probe's answer,
+  // not a promise from the header, and rocprofv3 agrees: spreading a decode
+  // step across two rings produced 1.73 ms of genuinely concurrent kernel time
+  // per token on two distinct Queue_Ids, where the single-ring path produced
+  // 0.000 ms.
+  caps.concurrent_streams = caps.stream_count;
+  caps.needs_explicit_events = true;
+  // ...and it still does not pay, which is a different question and belongs to
+  // the cost model rather than to the capability.
+  //
+  // Only one stream can use the batched path: hrx_stream_dispatch accumulates
+  // into a command buffer whose packets the hardware walks with the barrier bit
+  // already set, but hrx submits it with IREE_HAL_QUEUE_AFFINITY_ANY and cannot
+  // name a queue. Every other stream must go through hrx_queue_dispatch, one
+  // submission and one completion-signal round trip per kernel. Measured on
+  // gfx1151, -n 32, median of 5: 93.7 tok/s batched vs 79.8 tok/s when the same
+  // single-stream step goes through the queue path — 3.06 us per dispatch
+  // against a 7.3 us median kernel.
+  //
+  // Overlap cannot win that back here, because the memory system was already
+  // the limit: the largest decode kernel reads 508 MB in 2.1 ms, which is
+  // 242 GB/s on a part whose roof is about that. Kernels run beside each other
+  // therefore take longer by about what the concurrency saves — per token,
+  // 598 kernels summing 8.51 ms ordered against 10.33 ms spread, for 1.735 ms
+  // of concurrency won and 8.51 vs 8.62 ms of device busy time. End to end, a
+  // balanced 297/295 split cost 93.7 -> 80.9 tok/s.
+  //
+  // So the seam is real and the planner is right to decline. This flips the day
+  // a stream can carry a queue affinity into the batched path — a libhrx
+  // change, not an LSE one — and nothing above this line moves when it does.
+  caps.uniform_launch_cost = false;
+  // A dispatch is a grid, and a grid cannot be cut. Flips when a kernel
+  // declares work items instead; nothing else about the seam changes.
+  caps.splittable_work = false;
+  return caps;
+}
+
 }  // namespace
 
 bool HrxBackend::available() noexcept {
@@ -94,11 +254,6 @@ Status HrxBackend::init_impl(int device_ordinal) {
   LSE_RETURN_IF_ERROR(
       from_hrx(hrx_gpu_device_get(device_ordinal, &device), "hrx_gpu_device_get"));
   device_ = device;
-
-  hrx_stream_t stream = nullptr;
-  LSE_RETURN_IF_ERROR(
-      from_hrx(hrx_stream_create(device, 0, &stream), "hrx_stream_create"));
-  stream_ = stream;
 
   // Borrowed reference, valid for the device's lifetime — do not release.
   allocator_ = hrx_device_allocator(device);
@@ -146,19 +301,53 @@ Status HrxBackend::init_impl(int device_ordinal) {
     }
   }
 
+  queue_count_ = probe_queue_count(device);
+  stream_caps_ = derive_stream_capabilities(info_, queue_count_);
+  streams_.assign(stream_caps_.stream_count, nullptr);
+  unflushed_launches_.assign(stream_caps_.stream_count, 0);
+  stream_affinity_.resize(stream_caps_.stream_count);
+  for (std::uint32_t i = 0; i < stream_caps_.stream_count; ++i) {
+    stream_affinity_[i] = static_cast<std::uint64_t>(1) << (i % queue_count_);
+  }
+  // Stream 0 exists from the start: every path that does not name a stream
+  // uses it, including the stream-ordered allocator.
+  LSE_RETURN_IF_ERROR(stream_at(0).status());
+
   initialized_ = true;
   return OkStatus();
 #endif
 }
 
+Result<void*> HrxBackend::stream_at(std::uint32_t index) {
+#if !LSE_HRX_LINKED
+  (void)index;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (index >= streams_.size()) {
+    return LSE_ERROR(kOutOfRange, "stream ", std::to_string(index),
+                     " past the ", std::to_string(streams_.size()),
+                     " this device offers");
+  }
+  if (streams_[index] != nullptr) return streams_[index];
+  hrx_stream_t stream = nullptr;
+  LSE_RETURN_IF_ERROR(
+      from_hrx(hrx_stream_create(static_cast<hrx_device_t>(device_), 0, &stream),
+               "hrx_stream_create"));
+  streams_[index] = stream;
+  return streams_[index];
+#endif
+}
+
 #if LSE_HRX_LINKED
-Status HrxBackend::flush_pending() {
-  unflushed_launches_ = 0;
-  return from_hrx(hrx_stream_flush(static_cast<hrx_stream_t>(stream_)),
+Status HrxBackend::flush_stream(std::uint32_t index) {
+  if (index >= streams_.size() || streams_[index] == nullptr) return OkStatus();
+  unflushed_launches_[index] = 0;
+  return from_hrx(hrx_stream_flush(static_cast<hrx_stream_t>(streams_[index])),
                   "hrx_stream_flush");
 }
+
 #else
-Status HrxBackend::flush_pending() {
+Status HrxBackend::flush_stream(std::uint32_t) {
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 }
 #endif
@@ -189,10 +378,13 @@ void HrxBackend::release_buffer(std::uint64_t handle) noexcept {
 
 void HrxBackend::shutdown_impl() noexcept {
 #if LSE_HRX_LINKED
-  if (stream_ != nullptr) {
-    hrx_stream_release(static_cast<hrx_stream_t>(stream_));
-    stream_ = nullptr;
+  for (void*& s : streams_) {
+    if (s == nullptr) continue;
+    hrx_stream_release(static_cast<hrx_stream_t>(s));
+    s = nullptr;
   }
+  streams_.clear();
+  unflushed_launches_.clear();
   if (device_ != nullptr) {
     hrx_device_release(static_cast<hrx_device_t>(device_));
     device_ = nullptr;
@@ -227,11 +419,18 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
     // hipMallocAsync: ordered against work already on this stream.
     // hrx_buffer_allocate flushes the stream internally (libhrx buffer.c), so
     // an allocation mid-batch submits the open command buffer for us.
+    //
+    // The other streams are deliberately not flushed. A one-shot command
+    // buffer inserts every buffer it dispatches against into its own resource
+    // set at *record* time, so memory another stream still references cannot
+    // be handed back to the pool here, flushed or not.
+    auto stream = stream_at(0);
+    if (!stream.ok()) return stream.status();
     LSE_RETURN_IF_ERROR(from_hrx(
-        hrx_buffer_allocate(static_cast<hrx_stream_t>(stream_), bytes,
+        hrx_buffer_allocate(static_cast<hrx_stream_t>(*stream), bytes,
                             HRX_MEMORY_TYPE_DEVICE_LOCAL, usage, &buffer),
         "hrx_buffer_allocate"));
-    unflushed_launches_ = 0;
+    unflushed_launches_[0] = 0;
   } else {
     // Staging has to stay mapped; the stream-ordered path is device-local.
     hrx_buffer_params_t params = {};
@@ -301,10 +500,13 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   if (dst_offset + bytes > dst.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_h2d writes past the end of the buffer");
   }
-  // hrx_synchronous_* is a separate device submission with no ordering
-  // against the stream's unflushed command buffer; submit pending dispatches
-  // first or the transfer races them.
-  LSE_RETURN_IF_ERROR(flush_pending());
+  // hrx_synchronous_* is a separate device submission carrying no semaphore
+  // dependency on any stream, and a HAL queue does not order entries by
+  // submission — only by semaphore edges. Flushing is therefore not enough:
+  // the streams have to be *waited* for, or the transfer races whatever they
+  // still hold on this buffer. With one stream that race was invisible; with
+  // two it is not, and it is the same race either way.
+  LSE_RETURN_IF_ERROR(synchronize_impl());
   return from_hrx(hrx_synchronous_h2d(static_cast<hrx_device_t>(device_), src,
                                       reinterpret_cast<hrx_buffer_t>(dst.handle),
                                       dst.offset + dst_offset, bytes),
@@ -324,9 +526,9 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   if (src_offset + bytes > src.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_d2h reads past the end of the buffer");
   }
-  // Same ordering hazard as copy_h2d: unflushed dispatches must be submitted
-  // before the transfer reads their results.
-  LSE_RETURN_IF_ERROR(flush_pending());
+  // Same hazard as copy_h2d: the transfer is not ordered against any stream
+  // by anything but this wait.
+  LSE_RETURN_IF_ERROR(synchronize_impl());
   return from_hrx(hrx_synchronous_d2h(static_cast<hrx_device_t>(device_),
                                       reinterpret_cast<hrx_buffer_t>(src.handle),
                                       src.offset + src_offset, dst, bytes),
@@ -397,12 +599,23 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
 }
 
 Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
-                               const DispatchArgs& args) {
+                               const DispatchArgs& args,
+                               const DispatchTarget& target) {
 #if !LSE_HRX_LINKED
-  (void)kernel; (void)dims; (void)args;
+  (void)kernel; (void)dims; (void)args; (void)target;
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
   if (!kernel.valid()) return LSE_ERROR(kInvalidArgument, "invalid kernel handle");
+  if (!target.work.whole()) {
+    // A dispatch is still a grid here, and a grid has no subrange. When a
+    // kernel declares work items the range lands in the dispatch config and
+    // this refusal goes away; nothing else on this path changes.
+    return LSE_ERROR(kUnimplemented,
+                     "hrx dispatch covers a whole grid; work ranges arrive "
+                     "with work-item kernels");
+  }
+  auto stream = stream_at(target.stream.index);
+  if (!stream.ok()) return stream.status();
 
   hrx_dispatch_config_t config = {};
   for (int i = 0; i < 3; ++i) {
@@ -424,26 +637,195 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
     bindings.push_back(out);
   }
 
-  LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_stream_dispatch(static_cast<hrx_stream_t>(stream_),
-                          reinterpret_cast<hrx_executable_t>(kernel.executable),
-                          kernel.export_ordinal, &config,
-                          args.constants.empty() ? nullptr : args.constants.data(),
-                          args.constants.size(),
-                          bindings.empty() ? nullptr : bindings.data(),
-                          bindings.size(), args.flags),
-      "hrx_stream_dispatch"));
-  // Dispatches accumulate in the stream's open command buffer: hrx already
-  // records a dispatch->dispatch barrier per launch, so batching preserves
-  // execution order while paying one queue_execute + semaphore hop per batch
-  // instead of per kernel. The periodic flush keeps the GPU fed while the
-  // host records the rest of the token's launches. Do not reach for
-  // hrx_stream_begin_capture/hrx_graph_exec_update to go further: both are
-  // UNIMPLEMENTED stubs in libhrx (graph.c) as of this writing.
-  if (flush_interval_ != 0 && ++unflushed_launches_ >= flush_interval_) {
-    return flush_pending();
+  const std::uint32_t index = target.stream.index;
+  auto* s = static_cast<hrx_stream_t>(*stream);
+
+  // Two submission shapes, and which one a stream gets is a property of the
+  // runtime rather than a policy:
+  //
+  //   - a command buffer batches many dispatches behind one submission and one
+  //     semaphore hop, and the hardware walks its packets with the barrier bit
+  //     already set — no host round trip between kernels. But hrx submits it
+  //     with IREE_HAL_QUEUE_AFFINITY_ANY, which this HAL resolves by
+  //     first-set-bit to ring 0, so it cannot name a queue. Exactly one stream
+  //     can use it, and that stream is 0.
+  //   - hrx_queue_dispatch names a queue, which is what puts a second stream on
+  //     a second AQL ring, but it submits one dispatch at a time and pays a
+  //     completion-signal round trip per kernel (measured ~3 us on gfx1151).
+  //
+  // So the chain, which is most of the work, keeps the cheap path, and only
+  // the groups the planner deliberately moves off it pay for the ring change.
+  if (index == 0) {
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_dispatch(s,
+                            reinterpret_cast<hrx_executable_t>(kernel.executable),
+                            kernel.export_ordinal, &config,
+                            args.constants.empty() ? nullptr : args.constants.data(),
+                            args.constants.size(),
+                            bindings.empty() ? nullptr : bindings.data(),
+                            bindings.size(), args.flags),
+        "hrx_stream_dispatch"));
+    // The periodic flush keeps the GPU fed while the host records the rest of
+    // the token's launches. Do not reach for hrx_stream_begin_capture or
+    // hrx_graph_exec_update to go further: both are UNIMPLEMENTED stubs in
+    // libhrx (graph.c) as of this writing.
+    if (flush_interval_ != 0 &&
+        ++unflushed_launches_[index] >= flush_interval_) {
+      return flush_stream(index);
+    }
+    return OkStatus();
   }
+
+  // Order inside the stream is the timeline: wait on the position this stream
+  // is at, signal the next. That is the same guarantee the command buffer's
+  // dispatch->dispatch barrier gives, spelled with a semaphore instead, and it
+  // is required rather than implied — this HAL states outright that queue
+  // entries are not ordered by submission (host_queue_waits.c).
+  hrx_timeline_point_t self = {};
+  LSE_RETURN_IF_ERROR(from_hrx(hrx_stream_get_timeline_position(s, &self),
+                               "hrx_stream_get_timeline_position"));
+  std::uint64_t next = 0;
+  LSE_RETURN_IF_ERROR(from_hrx(hrx_stream_advance_timeline(s, &next),
+                               "hrx_stream_advance_timeline"));
+
+  hrx_semaphore_list_t waits = {};
+  waits.semaphores = &self.semaphore;
+  waits.values = &self.value;
+  waits.count = self.value > 0 ? 1 : 0;
+  hrx_semaphore_list_t signals = {};
+  signals.semaphores = &self.semaphore;
+  signals.values = &next;
+  signals.count = 1;
+
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_queue_dispatch(static_cast<hrx_device_t>(device_),
+                         stream_affinity_[index], &waits, &signals,
+                         reinterpret_cast<hrx_executable_t>(kernel.executable),
+                         kernel.export_ordinal, &config,
+                         args.constants.empty() ? nullptr : args.constants.data(),
+                         args.constants.size(),
+                         bindings.empty() ? nullptr : bindings.data(),
+                         bindings.size(), args.flags),
+      "hrx_queue_dispatch"));
+  unflushed_launches_[index] = 0;
   return OkStatus();
+#endif
+}
+
+Result<StreamEvent> HrxBackend::record_event_impl(Stream stream) {
+#if !LSE_HRX_LINKED
+  (void)stream;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (stream.index >= streams_.size()) {
+    return LSE_ERROR(kOutOfRange, "stream ", std::to_string(stream.index),
+                     " past the ", std::to_string(streams_.size()),
+                     " this device offers");
+  }
+  // A stream nobody has used has nothing to wait for. The invalid event says
+  // exactly that, and wait_event treats it as satisfied.
+  if (streams_[stream.index] == nullptr) return StreamEvent{stream, 0};
+
+  // The timeline only advances on submit, so the batch has to go now — this
+  // is the one place batching yields, and it yields because a consumer is
+  // about to depend on the result.
+  LSE_RETURN_IF_ERROR(flush_stream(stream.index));
+
+  hrx_timeline_point_t point = {};
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_get_timeline_position(
+          static_cast<hrx_stream_t>(streams_[stream.index]), &point),
+      "hrx_stream_get_timeline_position"));
+  return StreamEvent{stream, point.value};
+#endif
+}
+
+Status HrxBackend::wait_event_impl(Stream stream, const StreamEvent& event) {
+#if !LSE_HRX_LINKED
+  (void)stream; (void)event;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (!event.valid()) return OkStatus();
+  // Work on one stream is already ordered against itself.
+  if (event.stream == stream) return OkStatus();
+  if (event.stream.index >= streams_.size() ||
+      streams_[event.stream.index] == nullptr) {
+    return LSE_ERROR(kInvalidArgument, "event names a stream that has no work");
+  }
+  auto waiter = stream_at(stream.index);
+  if (!waiter.ok()) return waiter.status();
+  auto* waiting = static_cast<hrx_stream_t>(*waiter);
+
+  hrx_semaphore_t produced = nullptr;
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_get_semaphore(
+          static_cast<hrx_stream_t>(streams_[event.stream.index]), &produced),
+      "hrx_stream_get_semaphore"));
+
+  // Everything already recorded here has to be submitted before the barrier
+  // that follows it, or the barrier would be ordered ahead of it.
+  LSE_RETURN_IF_ERROR(flush_stream(stream.index));
+
+  hrx_timeline_point_t self = {};
+  LSE_RETURN_IF_ERROR(
+      from_hrx(hrx_stream_get_timeline_position(waiting, &self),
+               "hrx_stream_get_timeline_position"));
+
+  std::uint64_t next = 0;
+  LSE_RETURN_IF_ERROR(from_hrx(hrx_stream_advance_timeline(waiting, &next),
+                               "hrx_stream_advance_timeline"));
+
+  // The barrier waits on the producer AND on this stream's own current
+  // position before signalling the position everything after it will wait on.
+  //
+  // hrx_stream_wait_on() would be the obvious call and is wrong here: it omits
+  // the second wait, so on a stream with work still in flight the barrier can
+  // signal position+1 while position itself is unreached. A timeline that
+  // jumps ahead of its own work releases every later wait early — including
+  // the one inside hrx_stream_synchronize — and the stream silently stops
+  // being ordered against itself.
+  hrx_semaphore_t wait_semaphores[2] = {produced, self.semaphore};
+  std::uint64_t wait_values[2] = {event.timeline, self.value};
+  hrx_semaphore_list_t waits = {};
+  waits.semaphores = wait_semaphores;
+  waits.values = wait_values;
+  waits.count = self.value > 0 ? 2 : 1;
+
+  hrx_semaphore_t signal_semaphore = self.semaphore;
+  std::uint64_t signal_value = next;
+  hrx_semaphore_list_t signals = {};
+  signals.semaphores = &signal_semaphore;
+  signals.values = &signal_value;
+  signals.count = 1;
+
+  // On the waiting stream's own queue: a barrier submitted anywhere else would
+  // order that queue instead of this one.
+  LSE_RETURN_IF_ERROR(
+      from_hrx(hrx_queue_barrier(static_cast<hrx_device_t>(device_),
+                                 stream_affinity_[stream.index], &waits,
+                                 &signals),
+               "hrx_queue_barrier"));
+  unflushed_launches_[stream.index] = 0;
+  return OkStatus();
+#endif
+}
+
+Status HrxBackend::synchronize_stream_impl(Stream stream) {
+#if !LSE_HRX_LINKED
+  (void)stream;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
+  if (stream.index >= streams_.size()) {
+    return LSE_ERROR(kOutOfRange, "stream ", std::to_string(stream.index),
+                     " past the ", std::to_string(streams_.size()),
+                     " this device offers");
+  }
+  if (streams_[stream.index] == nullptr) return OkStatus();
+  unflushed_launches_[stream.index] = 0;
+  return from_hrx(
+      hrx_stream_synchronize(static_cast<hrx_stream_t>(streams_[stream.index])),
+      "hrx_stream_synchronize");
 #endif
 }
 
@@ -468,11 +850,14 @@ Status HrxBackend::synchronize_impl() {
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
   if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
-  // hrx_stream_synchronize flushes the open command buffer itself before
-  // waiting (libhrx stream.c), so no explicit flush_pending() here.
-  unflushed_launches_ = 0;
-  return from_hrx(hrx_stream_synchronize(static_cast<hrx_stream_t>(stream_)),
-                  "hrx_stream_synchronize");
+  // Every stream, because "the device is idle" is the only thing a caller can
+  // mean by synchronize() with no stream named. hrx_stream_synchronize flushes
+  // the open command buffer itself before waiting (libhrx stream.c), and a
+  // stream that was never used is skipped inside synchronize_impl(Stream).
+  for (std::uint32_t i = 0; i < streams_.size(); ++i) {
+    LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{i}));
+  }
+  return OkStatus();
 #endif
 }
 

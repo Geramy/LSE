@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "lse/graph/graph.hpp"
 #include "lse/graph/interpreter.hpp"
@@ -40,6 +41,41 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
   return a;
 }
 
+// Tokens per prefill pass. Extents are baked into the generated HIP, so one
+// pass over the whole prompt makes every distinct prompt length its own JIT
+// cold start; a ladder caps the shapes the engine can ever see.
+//
+// Off by default, and it must stay off until the engine is width-invariant:
+// Shapes are baked into the generated source as literals, so an unsplit
+// prefill makes every distinct prompt length its own set of kernels: ~50
+// compiles and ~18 s the first time each length is seen, forever. Feeding
+// prefill through a fixed ladder bounds that to 8 shape sets total.
+constexpr std::size_t kPrefillChunk = 128;
+
+std::size_t prefill_chunk() { return kPrefillChunk; }
+
+// Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
+// two below it}, so the whole engine only ever compiles that many prefill
+// shapes. 0 is one pass, whatever the length.
+//
+// Ascending, which puts the ragged remainder first: the last pass is then the
+// widest one, and it is the pass whose final row feeds the LM head. That keeps
+// the logits row on the same linear kernel a single pass would have used,
+// which is the closest a split can get to the unsplit answer.
+std::vector<std::size_t> prefill_plan(std::size_t n, std::size_t chunk) {
+  if (chunk == 0) return {n};
+  std::vector<std::size_t> plan;
+  std::size_t rest = n % chunk;
+  for (std::size_t step = 1; rest != 0; step <<= 1) {
+    if ((rest & step) != 0) {
+      plan.push_back(step);
+      rest -= step;
+    }
+  }
+  plan.insert(plan.end(), n / chunk, chunk);
+  return plan;
+}
+
 void snapshot_trace(GenerationStats* stats, std::vector<std::string>* reasons) {
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) return;
@@ -51,6 +87,11 @@ void snapshot_trace(GenerationStats* stats, std::vector<std::string>* reasons) {
   stats->phase_ideal_launches = t.phase_ideal_launches;
   stats->views_aliased = t.views_aliased;
   stats->host_fallbacks = t.host_fallbacks;
+  stats->streams_used = t.streams_used;
+  stats->stream_waits = t.stream_waits;
+  stats->stream_chain = t.stream_chain;
+  stats->streams_available =
+      sched->backend().stream_capabilities().stream_count;
   stats->partition_ns = t.partition_ns;
   stats->emit_ns = t.emit_ns;
   stats->launch_ns = t.launch_ns;
@@ -172,8 +213,19 @@ Result<std::vector<float>> Generator::step(
     return out;
   }
 
-  LSE_ASSIGN_OR(Array ids, token_array(tokens));
-  LSE_ASSIGN_OR(Array hidden, model_.hidden(ids, &session.states(), nullptr));
+  // Every pass carries the block state forward exactly as decode does, so the
+  // split is invisible to the model: the KV write cursor, the RoPE angles and
+  // the attention masks all read the shared device position slot, which counts
+  // absolute tokens, not tokens within a pass.
+  Array hidden;
+  std::size_t at = 0;
+  for (std::size_t take : prefill_plan(tokens.size(), prefill_chunk())) {
+    const auto first = tokens.begin() + static_cast<std::ptrdiff_t>(at);
+    LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(
+                                 first, first + static_cast<std::ptrdiff_t>(take))));
+    LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr));
+    at += take;
+  }
   LSE_ASSIGN_OR(Array last, last_hidden(hidden));
   LSE_ASSIGN_OR(Array logits, model_.lm_head(last));
 

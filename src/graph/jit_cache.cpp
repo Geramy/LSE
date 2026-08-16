@@ -200,6 +200,7 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
                    std::string cache_dir)
     : backend_(backend),
       compiler_(compiler),
+      compiler_id_(fnv(compiler.identity())),
       cache_dir_(std::move(cache_dir)),
       impl_(std::make_unique<Impl>()) {
   purge_kernel_artifacts();
@@ -208,12 +209,13 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
 JitCache::~JitCache() = default;
 
 std::uint64_t JitCache::slot_key(std::uint64_t signature) const noexcept {
-  // Bump when the compiler invocation changes (options, action pipeline):
-  // source_hash cannot tell objects built by an older pipeline apart, so the
-  // key must. Rev 2: backend codegen action gained -O3.
-  constexpr std::uint64_t kCompileRevision = 2;
+  // A cached object is only valid for the toolchain that built it, and
+  // source_hash cannot tell two toolchains apart. The compiler reports its own
+  // identity (version + option lists) rather than a human bumping a revision
+  // constant here, which was one forgotten increment away from serving an
+  // object built by a different pipeline.
   // Arch in the key so a device change cannot reuse another target's object.
-  return mix(mix(signature, kCompileRevision),
+  return mix(mix(signature, compiler_id_),
              fnv(backend_.device_info().arch));
 }
 

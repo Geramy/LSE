@@ -11,6 +11,7 @@
 // cheaper than the host round trip it replaces.
 #include <string>
 
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -48,10 +49,10 @@ kir::LValue<kir::f32> sum_of_squares(env::Emit& e,
 
 // These kernels are not self-indexing: they hand their element back through
 // `ret` and the emitter stores it, so `out` is bound but never written here.
-template <class E>
+template <class E, class G = kir::f32>
 struct RmsNormArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> g;
+  env::In<G, E> g;
   env::Out<kir::f32, E> out;
 };
 
@@ -69,23 +70,26 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!usable(s)) return {};
+    if (!usable(s) || s.input_dtypes.size() < 2) return {};
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
 
-    kir::KernelBody k(s.types, *s.intrinsics);
-    RmsNormArgs<env::Emit> a;
-    env::bind(k, a);
-    env::Emit e{&k};
-    const auto row = e.let((e.thread_id() / d) * d);
-    const auto col = e.let(e.thread_id() % d);
-    const auto acc = sum_of_squares(e, a.x, row, d);
-    const auto scale =
-        e.let(math::rsqrt(acc.read() / static_cast<float>(d) + s.attrs[0]));
-    // iattrs[0] selects the zero-centered form, where the stored weight is an
-    // offset from 1 rather than the scale itself.
-    const auto w = s.iattrs[0] != 0 ? e.f32(1.0f) + a.g[col] : a.g[col];
-    e.ret(a.x[e.thread_id()] * scale * w);
-    return k.str();
+    return with_elem(s.input_dtypes[1], [&]<class G>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics);
+      RmsNormArgs<env::Emit, G> a;
+      if (!env::bind(k, a, s)) return {};
+      env::Emit e{&k};
+      const auto row = e.let((e.thread_id() / d) * d);
+      const auto col = e.let(e.thread_id() % d);
+      const auto acc = sum_of_squares(e, a.x, row, d);
+      const auto scale =
+          e.let(math::rsqrt(acc.read() / static_cast<float>(d) + s.attrs[0]));
+      // iattrs[0] selects the zero-centered form, where the stored weight is an
+      // offset from 1 rather than the scale itself.
+      const auto gain = math::widen(a.g[col]);
+      const auto w = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+      e.ret(a.x[e.thread_id()] * scale * w);
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -132,7 +136,7 @@ struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     L2NormArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto row = e.let((e.thread_id() / d) * d);
     const auto acc = sum_of_squares(e, a.x, row, d);
@@ -183,7 +187,7 @@ struct SoftmaxKernel final : KernelPrimitive<SoftmaxKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     SoftmaxArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto row = e.let((e.thread_id() / d) * d);
 

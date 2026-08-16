@@ -5,9 +5,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -27,7 +30,48 @@ DType dtype_from_safetensors(std::string_view s) noexcept {
   return DType::kCount;
 }
 
+// Widening the checkpoint is ~1.4 billion scalar converts and 5.8 GB of stores
+// for a 2.9 GB bf16 file — single-threaded that was most of process start. The
+// work is memory-bound, so threads past a handful buy nothing; small tensors
+// run inline rather than pay for a spawn.
+template <typename Fn>
+void parallel_chunks(std::size_t count, Fn&& fn) {
+  constexpr std::size_t kMinPerThread = 1u << 20;
+  unsigned threads = std::thread::hardware_concurrency();
+  if (threads == 0) threads = 1;
+  threads = std::min(threads, 16u);
+  const std::size_t affordable = count / kMinPerThread;
+  if (affordable < threads) {
+    threads = static_cast<unsigned>(affordable);
+  }
+  if (threads <= 1) {
+    fn(std::size_t{0}, count);
+    return;
+  }
+  const std::size_t chunk = (count + threads - 1) / threads;
+  std::vector<std::thread> pool;
+  pool.reserve(threads - 1);
+  for (unsigned t = 1; t < threads; ++t) {
+    const std::size_t lo = t * chunk;
+    if (lo >= count) break;
+    const std::size_t hi = std::min(count, lo + chunk);
+    pool.emplace_back([&fn, lo, hi] { fn(lo, hi); });
+  }
+  fn(std::size_t{0}, std::min(count, chunk));
+  for (std::thread& t : pool) t.join();
+}
+
 }  // namespace
+
+Status TensorView::read_native(void* dst, std::size_t bytes) const {
+  if (bytes > data.size()) {
+    return LSE_ERROR(kOutOfRange, "read_native asked for ",
+                     std::to_string(bytes), " of ",
+                     std::to_string(data.size()), " bytes in '", name, "'");
+  }
+  std::memcpy(dst, data.data(), bytes);
+  return OkStatus();
+}
 
 Status TensorView::read_f32(float* dst, std::size_t count) const {
   if (count > element_count()) {
@@ -42,20 +86,24 @@ Status TensorView::read_f32(float* dst, std::size_t count) const {
       return OkStatus();
     case DType::kBF16: {
       const auto* src = static_cast<const std::uint16_t*>(p);
-      for (std::size_t i = 0; i < count; ++i) {
-        bfloat16_t h;
-        h.bits = src[i];
-        dst[i] = h.to_float();
-      }
+      parallel_chunks(count, [dst, src](std::size_t lo, std::size_t hi) {
+        for (std::size_t i = lo; i < hi; ++i) {
+          bfloat16_t h;
+          h.bits = src[i];
+          dst[i] = h.to_float();
+        }
+      });
       return OkStatus();
     }
     case DType::kF16: {
       const auto* src = static_cast<const std::uint16_t*>(p);
-      for (std::size_t i = 0; i < count; ++i) {
-        float16_t h;
-        h.bits = src[i];
-        dst[i] = h.to_float();
-      }
+      parallel_chunks(count, [dst, src](std::size_t lo, std::size_t hi) {
+        for (std::size_t i = lo; i < hi; ++i) {
+          float16_t h;
+          h.bits = src[i];
+          dst[i] = h.to_float();
+        }
+      });
       return OkStatus();
     }
     case DType::kI32: {

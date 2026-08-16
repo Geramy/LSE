@@ -1,32 +1,33 @@
-// `linear` on the RDNA matrix cores.
+// `linear` on the matrix core.
 //
-// One wave owns one 16x16 output tile and walks K in steps of 16, accumulating
-// in the v_wmma_f32_16x16x16_f16 fragment. The operand layout the instruction
-// wants is the layout the checkpoints already have: lane L supplies row L of x
-// and row L of w, both contiguous in k, which is exactly x[row*K+k] and
-// w[col*K+k].
+// One wave owns one output tile and walks K in the step its table row names,
+// accumulating in the accumulator fragment that row describes. Nothing below
+// spells a fragment width, a K step, a lane index or an instruction: those all
+// come from `MatrixCoreRow`, so a new operand format — f16, bf16, int8, int4,
+// a future fp8 or a different device generation — is a row in `lse::math`'s
+// table and nothing here changes.
 //
-// The per-lane fragment mapping was measured on gfx1151 rather than taken from
-// documentation, because it is not guessable and the two RDNA generations
-// disagree. With a_frag[e] = a[16*lane+e] and b_frag[e] = b[16*lane+e]:
+// The measured layouts the gfx1151 rows carry were established on the device
+// rather than taken from documentation, because they are not guessable and the
+// generations disagree. A row whose layout has not been measured is still a
+// real row — name, widths, capability, shape — but it is not emittable, so the
+// gate below declines it and the group falls back visibly. That is what keeps
+// an unverified gfx12 or CDNA layout from becoming a silent wrong answer.
 //
-//     D[2*e + lane/16][lane%16] == c_frag[e]        256/256 slots, max err 5e-07
-//
-// gfx12 (RDNA4) is a different builtin name *and* a different operand width
-// (v8f16, so k splits across the half-waves), so this kernel declines there
-// rather than emit a layout nothing has run.
-//
-// Operands are f16: that is what the instruction multiplies. Against f32
-// weights a linear's error moves from ~1e-6 to ~1e-3. Default is on when
-// the live device has WMMA; LSE_WMMA=0 keeps the f32 scalar oracle.
+// The operand element follows the weight's storage: a bf16 checkpoint feeds the
+// bf16 form of the instruction directly, which is both the arithmetic it was
+// trained in and the one that keeps f32's exponent range. f32 weights have no
+// matching operand form and keep the f16 one. Default is on when the live
+// device has the row's capability; LSE_WMMA=0 keeps the f32 scalar oracle,
+// which is what the lemonseed differential in test_reference compares against.
 #include "lse/backends/hrx/kernels/wmma.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
@@ -38,10 +39,29 @@ namespace math = lse::math;
 
 namespace {
 
-constexpr std::int64_t kTile = 16;
+// The output tile one wave owns. Blocking is the author's choice, so it is
+// named here — once — and everything else about the instruction comes from the
+// row this shape selects.
+constexpr int kTileM = 16;
+constexpr int kTileN = 16;
+constexpr int kTileK = 16;
+
+// The generations whose layouts have been measured here, and therefore the
+// ones a body may be emitted for. Bringing gfx1201 or gfx942 up is measuring
+// its rows and adding its target to this pack — the body itself already reads
+// everything it needs from the row.
+template <math::MatrixTarget... Live, class F>
+[[nodiscard]] std::string for_live_target(math::MatrixTarget t, F&& fn) {
+  std::string out;
+  const auto one = [&]<math::MatrixTarget L>() {
+    if (t == L) out = fn.template operator()<L>();
+  };
+  (one.template operator()<Live>(), ...);
+  return out;
+}
 
 // LSE_WMMA=0 forces the scalar loop. Anything else, including unset, follows
-// the device: gfx11 wave32 with matrix cores uses WMMA.
+// the device.
 bool wmma_forced_off() {
   const char* v = std::getenv("LSE_WMMA");
   return v != nullptr && std::strcmp(v, "0") == 0;
@@ -50,7 +70,9 @@ bool wmma_forced_off() {
 struct LinearDims {
   std::int64_t m = 0;
   std::int64_t n = 0;
-  std::int64_t k = 0;
+  // Row length in *buffer* elements. Equal to K for an unpacked operand; K/4
+  // for int8 riding four to an i32.
+  std::int64_t kb = 0;
   bool valid = false;
 };
 
@@ -60,9 +82,9 @@ LinearDims dims_of(const KernelShapes& s) {
   const Shape& x = s.inputs[0];
   const Shape& w = s.inputs[1];
   if (x.rank() == 0 || w.rank() != 2) return d;
-  d.k = x.dim(x.rank() - 1);
+  d.kb = x.dim(x.rank() - 1);
   d.n = w.dim(0);
-  if (d.k <= 0 || d.n <= 0 || w.dim(1) != d.k) return d;
+  if (d.kb <= 0 || d.n <= 0 || w.dim(1) != d.kb) return d;
   const std::int64_t elems = static_cast<std::int64_t>(s.output.elem_count());
   if (elems <= 0 || elems % d.n != 0) return d;
   d.m = elems / d.n;
@@ -70,28 +92,72 @@ LinearDims dims_of(const KernelShapes& s) {
   return d;
 }
 
-// The measured layout is the gfx11 wave32 form. Anything else keeps the scalar
-// kernel: a matmul that is subtly wrong is worse than one that is merely slow.
-bool device_supported(const KernelShapes& s) {
-  if (s.device == nullptr) return false;
-  const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*s.device);
-  if (amd == nullptr) return false;
-  if (amd->matrix_core != MatrixCore::kWMMA) return false;
-  if (amd->wavefront_size != 32) return false;
-  const ArchFamily family = arch_family(s.device->arch);
-  return family == ArchFamily::kRdna3 || family == ArchFamily::kRdna35;
+// The row this invocation would use, or null. One place the table is consulted
+// at runtime — the gate, the thread plan and the body all come through here,
+// keyed identically, so they cannot pick different rows.
+//
+// Four separate reasons to decline, all of them loud: the device speaks no
+// matrix family, the storage format has no operand form, the row exists but
+// its layout has never been measured on hardware, or the row is measured but
+// this device lacks the capability. None of them converts an operand to fit an
+// instruction the device does have.
+const math::MatrixCoreRow* row_for(const KernelShapes& s) {
+  if (s.device == nullptr || s.intrinsics == nullptr) return nullptr;
+  if (s.input_dtypes.size() < 2) return nullptr;
+  const std::optional<math::MatrixTarget> target = matrix_target(*s.device);
+  if (!target.has_value()) return nullptr;
+
+  struct Key {
+    bool named = false;
+    math::MatrixElem acc{};
+    math::MatrixElem operand{};
+  };
+  const Key key = with_matrix_operand<Key>(
+      s.input_dtypes[1],
+      []<class, class, math::MatrixElem A, math::MatrixElem T>() {
+        return Key{true, A, T};
+      });
+  if (!key.named) return nullptr;
+
+  const std::uint32_t caps = device_matrix_caps(*s.device);
+  for (const math::MatrixCoreRow& r : math::matrix_core_table()) {
+    if (r.target != *target || r.acc != key.acc || r.operand != key.operand) {
+      continue;
+    }
+    if (r.m != kTileM || r.n != kTileN || r.k_step != kTileK) continue;
+    if (!r.emittable()) continue;
+    if (!math::has_cap(caps, r.cap)) continue;
+    if (s.intrinsics->find(r.key).empty()) continue;
+    return &r;
+  }
+  return nullptr;
 }
 
-template <class E>
-struct WmmaLinearArgs {
-  env::In<kir::f32, E> x;
-  env::In<kir::f32, E> w;
+template <class E, class X = kir::f32, class W = kir::f32>
+struct MatrixLinearArgs {
+  env::In<X, E> x;
+  env::In<W, E> w;
   // Unused directly: owns_indexing stores go through the emitter hook, but the
   // binding contract still names the output slot.
   env::Out<kir::f32, E> out;
 };
 
-struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
+// The one thing this kernel adds to the shared tile: where a finished
+// accumulator slot goes. Through the emitter's hook, not into `out`, because
+// that is where a fused silu/mul/add runs — on the value still in register.
+template <math::MatrixTarget G, math::MatrixElem A, math::MatrixElem T>
+struct LinearTile
+    : MatrixTile<LinearTile<G, A, T>, G, A, T, kTileM, kTileN, kTileK> {
+  std::uint32_t cols = 0;
+
+  void emit_element(env::Emit& e, const kir::Val<kir::u32>& row,
+                    const kir::Val<kir::u32>& col,
+                    const kir::Val<kir::f32>& v) const {
+    e.store(row * cols + col, v);
+  }
+};
+
+struct MatrixLinearKernel final : KernelPrimitive<MatrixLinearKernel> {
   static constexpr std::string_view kName = "linear.wmma";
   static constexpr std::string_view kEntry = "lse_linear_wmma";
   static constexpr std::string_view kSource = {};
@@ -99,87 +165,41 @@ struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
   std::size_t arity() const noexcept override { return 2; }
   bool owns_indexing() const noexcept override { return true; }
 
-  // The kernel, in C++. Nothing below names a HIP type or a builtin: types come
-  // from s.types and the matrix instruction from s.intrinsics, so retargeting
-  // this is two table entries rather than an edit here.
   std::string emit_kernel(const KernelShapes& s) const override {
     const LinearDims d = dims_of(s);
-    if (!d.valid || s.types.scalar == nullptr || s.intrinsics == nullptr ||
-        !s.store) {
+    const math::MatrixCoreRow* row = row_for(s);
+    if (!d.valid || row == nullptr || s.types.scalar == nullptr ||
+        s.intrinsics == nullptr || !s.store) {
       return {};
     }
+    return for_live_target<math::MatrixTarget::kRdna3>(
+        row->target, [&]<math::MatrixTarget G>() -> std::string {
+          return with_matrix_operand<std::string>(
+              s.input_dtypes[1],
+              [&]<class X, class W, math::MatrixElem A, math::MatrixElem T>()
+                  -> std::string { return emit_body<G, X, W, A, T>(s, d); });
+        });
+  }
 
+  // The kernel, in C++. Nothing here names a HIP type, a builtin or a width:
+  // types come from s.types, the instruction from s.intrinsics, and every
+  // shape from the row.
+  template <math::MatrixTarget G, class X, class W, math::MatrixElem A,
+            math::MatrixElem T>
+  std::string emit_body(const KernelShapes& s, const LinearDims& d) const {
     const auto M = static_cast<std::uint32_t>(d.m);
     const auto N = static_cast<std::uint32_t>(d.n);
-    const auto K = static_cast<std::uint32_t>(d.k);
-    constexpr auto kT = static_cast<std::uint32_t>(kTile);
-    const std::uint32_t tiles_n = (N + kT - 1u) / kT;
-    const std::uint32_t tiles = ((M + kT - 1u) / kT) * tiles_n;
+    const auto KB = static_cast<std::uint32_t>(d.kb);
 
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
-    WmmaLinearArgs<env::Emit> a;
-    env::bind(k, a);
+    MatrixLinearArgs<env::Emit, X, W> a;
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
-    const auto wave = e.let(e.thread_id() / 32u);
-    (void)e.ret_if(wave >= tiles);
-
-    const auto lane = e.let(e.thread_id() % 32u);
-    const auto l16 = e.let(lane % 16u);
-    const auto half = e.let(lane / 16u);
-    const auto m0 = e.let((wave / tiles_n) * kTile);
-    const auto n0 = e.let((wave % tiles_n) * kTile);
-
-    // Lane L supplies row L of x and row L of w. Both are contiguous in k, so
-    // the fragment load is the checkpoint's own layout.
-    const auto arow = e.let(m0 + l16);
-    const auto bcol = e.let(n0 + l16);
-
-    const auto acc = e.local<kir::f32, 8>();
-    for (auto z : e.unroll(8)) acc[z] = 0.0f;
-
-    const auto load_bytes = device_load_bytes(s.device);
-    for (auto k0 : e.range(0u, K, kTile)) {
-      const auto af = e.local<lse::f16, 16>();
-      const auto bf = e.local<lse::f16, 16>();
-      const auto zero = cast<lse::f16>(e.f32(0.0f));
-      for (auto z : e.unroll(kTile)) {
-        af[z] = zero;
-        bf[z] = zero;
-      }
-      const auto step =
-          kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
-      const auto chunks = static_cast<std::uint32_t>(kTile) / step;
-      for (auto c : e.unroll(chunks)) {
-        const auto kk = e.let(k0 + c * step);
-        const auto kend = e.let(kk + step);
-        if (auto ga = e.when(arow < M && kend <= K)) {
-          const auto xv = e.load(a.x, arow * K + kk, load_bytes);
-          for (auto v : e.unroll(step)) {
-            af[c * step + v] = cast<lse::f16>(xv[v]);
-          }
-        }
-        if (auto gb = e.when(bcol < N && kend <= K)) {
-          const auto wv = e.load(a.w, bcol * K + kk, load_bytes);
-          for (auto v : e.unroll(step)) {
-            bf[c * step + v] = cast<lse::f16>(wv[v]);
-          }
-        }
-      }
-
-      acc = lse::math::wmma_f32_16x16x16(af.value(), bf.value(), acc.value());
-    }
-
-    const auto col = e.let(n0 + l16);
-    (void)e.ret_if(col >= N);
-    for (auto z : e.unroll(8)) {
-      const auto row = e.let(m0 + z * 2u + half);
-      // Storing through the hook, not into `out`: this is where any fused
-      // silu/mul/add runs, on the accumulator still in register.
-      if (auto gr = e.when(row < M)) e.store(row * N + col, acc[z].read());
-    }
-
+    LinearTile<G, A, T> tile;
+    tile.cols = N;
+    tile.run(e, a.x, a.w, M, N, KB, device_load_bytes(s.device));
     return k.str();
   }
 
@@ -195,18 +215,23 @@ struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
     return in.empty() ? DType::kF32 : in[0];
   }
 
-  // A tile is a wave, not an output element, so the launch is sized in waves.
+  // A tile is a wave, not an output element, so the launch is sized in waves —
+  // in the row's own tile and the row's own wave, which is how a wave64 MFMA
+  // row would launch correctly without a second plan.
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
+    const math::MatrixCoreRow* row = row_for(s);
+    if (row == nullptr) return tp;  // never selected; nothing to size
     const LinearDims d = dims_of(s);
-    const std::int64_t tiles_n = (d.n + kTile - 1) / kTile;
-    const std::int64_t tiles = ((d.m + kTile - 1) / kTile) * tiles_n;
+    const auto lanes = static_cast<std::uint32_t>(row->wave);
+    const std::int64_t tiles_n = (d.n + row->n - 1) / row->n;
+    const std::int64_t tiles = ((d.m + row->m - 1) / row->m) * tiles_n;
 
     const std::uint32_t cap =
         s.device != nullptr && s.device->max_threads_per_workgroup >= 256
             ? 256u : 64u;
-    const std::uint32_t waves = cap / 32u;
-    tp.workgroup_size[0] = waves * 32u;
+    const std::uint32_t waves = cap / lanes;
+    tp.workgroup_size[0] = waves * lanes;
     tp.workgroup_count[0] = static_cast<std::uint32_t>(
         (tiles + waves - 1) / waves);
     return tp;
@@ -216,11 +241,16 @@ struct WmmaLinearKernel final : KernelPrimitive<WmmaLinearKernel> {
 }  // namespace
 
 const KernelPrimitiveBase* wmma_linear_for(const KernelShapes& s) {
-  static const WmmaLinearKernel kKernel;
+  static const MatrixLinearKernel kKernel;
   if (wmma_forced_off()) return nullptr;
-  if (!device_supported(s)) return nullptr;
+  const math::MatrixCoreRow* row = row_for(s);
+  if (row == nullptr) return nullptr;
   const LinearDims d = dims_of(s);
-  if (!d.valid || d.k < kTile || d.n < kTile) return nullptr;
+  if (!d.valid) return nullptr;
+  // One tile is the smallest unit the instruction can do. A K that is not a
+  // whole number of steps is fine — the fill guards zero the tail — but a K
+  // below one step would be all tail.
+  if (d.kb < row->k_step / row->pack || d.n < row->n) return nullptr;
   return &kKernel;
 }
 

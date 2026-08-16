@@ -42,6 +42,24 @@ struct GenerationStats {
   std::uint32_t phase_ideal_launches = 0;
   std::uint32_t views_aliased = 0;
   std::uint32_t host_fallbacks = 0;
+  // Execution streams: how many the device offers, how many the scheduler put
+  // work on, what the cross-stream ordering cost, and the length of the
+  // longest dependency chain against the groups it was drawn from.
+  std::uint32_t streams_available = 1;
+  std::uint32_t streams_used = 1;
+  std::uint32_t stream_waits = 0;
+  std::uint32_t stream_chain = 0;
+
+  // Share of dispatched groups that did not have to wait for the one before
+  // them. 0 when every group is on the critical path — which is the honest
+  // answer when a step is a straight line, and the number to watch when the
+  // partitioner starts producing wider steps.
+  [[nodiscard]] double spread() const noexcept {
+    if (device_groups == 0 || stream_chain == 0) return 0.0;
+    if (stream_chain >= device_groups) return 0.0;
+    return 1.0 - static_cast<double>(stream_chain) /
+                     static_cast<double>(device_groups);
+  }
   std::uint64_t partition_ns = 0;
   std::uint64_t emit_ns = 0;
   std::uint64_t launch_ns = 0;

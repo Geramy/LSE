@@ -11,6 +11,8 @@
 
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/ir/lower.hpp"
+#include "lse/ir/pass/pass.hpp"
 #include "lse/backends/hrx/kernels/linked.hpp"
 
 namespace lse::backend {
@@ -30,7 +32,42 @@ void mix_name(std::uint64_t& h, std::string_view name) {
 struct IndexedStage {
   NodePtr node;
   const KernelPrimitiveBase* prim = nullptr;
+  ThreadPlan plan;
 };
+
+// Identity of the `__device__` helper the per-element scaffold emits for a
+// kernel primitive.
+//
+// `entry_name()` is a constant per primitive — every `linear` is
+// "lse_linear" — while `emit_kernel` bakes the extents, the operand dtypes
+// and `iattrs[0]` (the expert slot of `linear_indexed`) in as literals. Two
+// nodes of the same primitive are therefore the same function only when all
+// of those agree; deduplicating on the name alone let a sibling with N=128
+// call a body specialized for N=1024 and read past the end of its weight,
+// and let the slot-1 expert run the slot-0 body.
+std::string device_fn_name(const KernelPrimitiveBase& kp, const Node& n) {
+  std::uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](std::uint64_t v) {
+    h ^= v;
+    h *= 1099511628211ull;
+  };
+  auto mix_shape = [&](const Shape& s, DType dt) {
+    mix(s.rank());
+    for (std::size_t i = 0; i < s.rank(); ++i) {
+      mix(static_cast<std::uint64_t>(s.dim(i)));
+    }
+    mix(static_cast<std::uint64_t>(dt));
+  };
+  for (const NodePtr& in : n.inputs) mix_shape(in->shape, in->dtype);
+  mix_shape(n.shape, n.dtype);
+  for (std::int32_t v : n.iattrs) mix(static_cast<std::uint64_t>(v));
+  for (float f : n.attrs) {
+    std::uint32_t bits = 0;
+    __builtin_memcpy(&bits, &f, sizeof(bits));
+    mix(bits);
+  }
+  return std::string(kp.entry_name()) + "_" + std::to_string(h);
+}
 
 std::vector<IndexedStage> indexed_stages(const FusionGroup& group,
                                          const DeviceInfo& device) {
@@ -38,15 +75,23 @@ std::vector<IndexedStage> indexed_stages(const FusionGroup& group,
   const kir::TypeTable type_table = hip_types();
   std::vector<IndexedStage> out;
   std::vector<Shape> storage;
+  std::vector<DType> dtypes;
   for (const NodePtr& n : group.nodes) {
     const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
     if (kp == nullptr) continue;
     storage.clear();
+    dtypes.clear();
     storage.reserve(n->inputs.size());
-    for (const NodePtr& in : n->inputs) storage.push_back(in->shape);
+    dtypes.reserve(n->inputs.size());
+    for (const NodePtr& in : n->inputs) {
+      storage.push_back(in->shape);
+      dtypes.push_back(in->dtype);
+    }
     KernelShapes probe;
     probe.inputs = storage;
+    probe.input_dtypes = dtypes;
     probe.output = n->shape;
+    probe.output_dtype = n->dtype;
     probe.attrs = n->attrs;
     probe.iattrs = n->iattrs;
     probe.device = &device;
@@ -54,7 +99,7 @@ std::vector<IndexedStage> indexed_stages(const FusionGroup& group,
     probe.intrinsics = &spellings;
     const KernelPrimitiveBase* chosen = kp->specialize(probe);
     if (chosen == nullptr || !chosen->owns_indexing()) continue;
-    out.push_back(IndexedStage{n, chosen});
+    out.push_back(IndexedStage{n, chosen, chosen->plan(probe)});
   }
   return out;
 }
@@ -66,19 +111,39 @@ bool sibling_stages(const FusionGroup& group,
   std::unordered_set<const Node*> outputs;
   for (const IndexedStage& s : stages) stage_set.insert(s.node.get());
   for (const NodePtr& o : group.outputs) outputs.insert(o.get());
+  // The stages must cover the group. The emit loop walks `stages`, so a member
+  // that did not specialize to a self-indexing form would get no body, no
+  // binding and no store — yet the scheduler marks every group.nodes member
+  // materialized and device-dirty, so the next group reads a buffer nothing
+  // ever wrote. Refusing costs one launch; guessing costs an argmax.
+  for (const NodePtr& n : group.nodes) {
+    if (!stage_set.count(n.get())) return false;
+  }
   for (const IndexedStage& s : stages) {
     if (!outputs.count(s.node.get())) return false;
     for (const NodePtr& in : s.node->inputs) {
       if (stage_set.count(in.get())) return false;
     }
+    // Concatenated bodies share one workgroup shape, and a stage bakes its own
+    // block size in as a literal — the GEMV strides its LDS staging loop by it.
+    // Widening the block under such a body walks the extra threads off the end
+    // of the scratch it reserved, so a disagreement is not composable.
+    for (int d = 0; d < 3; ++d) {
+      if (s.plan.workgroup_size[d] != stages.front().plan.workgroup_size[d]) {
+        return false;
+      }
+    }
   }
   return true;
 }
 
+// Must agree with hip_types.cpp: bf16 is the compiler's own __bf16, which
+// converts to and from float with a plain cast. Spelling it __hip_bfloat16
+// here and __bf16 there is a comgr compile error, not a wrong answer.
 std::string_view device_scalar(DType dt) noexcept {
   switch (dt) {
     case DType::kF16: return "_Float16";
-    case DType::kBF16: return "__hip_bfloat16";
+    case DType::kBF16: return "__bf16";
     case DType::kI32: return "int";
     case DType::kI8: return "signed char";
     case DType::kU8: return "unsigned char";
@@ -89,19 +154,8 @@ std::string_view device_scalar(DType dt) noexcept {
 // Loads always widen to float and stores narrow back, so the generated body is
 // written once in float regardless of storage dtype.
 std::string load_expr(std::string_view buffer, std::string_view index, DType dt) {
-  std::string out;
-  switch (dt) {
-    case DType::kBF16:
-      out = "__bfloat162float(" + std::string(buffer) + "[" + std::string(index) + "])";
-      break;
-    case DType::kF16:
-      out = "(float)" + std::string(buffer) + "[" + std::string(index) + "]";
-      break;
-    default:
-      out = "(float)" + std::string(buffer) + "[" + std::string(index) + "]";
-      break;
-  }
-  return out;
+  (void)dt;
+  return "(float)" + std::string(buffer) + "[" + std::string(index) + "]";
 }
 
 std::string store_stmt(std::string_view buffer, std::string_view index, DType dt,
@@ -109,19 +163,11 @@ std::string store_stmt(std::string_view buffer, std::string_view index, DType dt
   std::string out(buffer);
   out += "[";
   out += index;
-  out += "] = ";
-  switch (dt) {
-    case DType::kBF16:
-      out += "__float2bfloat16(" + std::string(value) + ")";
-      break;
-    case DType::kF16:
-      out += "(_Float16)(" + std::string(value) + ")";
-      break;
-    default:
-      out += "(" + std::string(device_scalar(dt)) + ")(" + std::string(value) + ")";
-      break;
-  }
-  out += ";";
+  out += "] = (";
+  out += device_scalar(dt);
+  out += ")(";
+  out += value;
+  out += ");";
   return out;
 }
 
@@ -235,14 +281,21 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
     const graph::DialectSourceTable spellings = hip_sources();
     const kir::TypeTable type_table = hip_types();
     std::vector<Shape> storage;
+    std::vector<DType> dtypes;
     for (const NodePtr& n : group.nodes) {
       const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
       if (kp == nullptr) continue;
       storage.clear();
-      for (const NodePtr& in : n->inputs) storage.push_back(in->shape);
+      dtypes.clear();
+      for (const NodePtr& in : n->inputs) {
+        storage.push_back(in->shape);
+        dtypes.push_back(in->dtype);
+      }
       KernelShapes probe;
       probe.inputs = storage;
+      probe.input_dtypes = dtypes;
       probe.output = n->shape;
+      probe.output_dtype = n->dtype;
       probe.attrs = n->attrs;
       probe.iattrs = n->iattrs;
       probe.device = &device;
@@ -310,16 +363,25 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
                      " is a transport operation, not generated source");
   }
 
-  // The span points into `storage`, which the caller must keep alive.
+  // The spans point into `storage` and `dtypes`, which the caller must keep
+  // alive.
   const graph::DialectSourceTable spellings = sources();
   const kir::TypeTable type_table = hip_types();
-  auto shapes_for = [&](const NodePtr& n, std::vector<Shape>& storage) {
+  auto shapes_for = [&](const NodePtr& n, std::vector<Shape>& storage,
+                        std::vector<DType>& dtypes) {
     storage.clear();
+    dtypes.clear();
     storage.reserve(n->inputs.size());
-    for (const NodePtr& in : n->inputs) storage.push_back(in->shape);
+    dtypes.reserve(n->inputs.size());
+    for (const NodePtr& in : n->inputs) {
+      storage.push_back(in->shape);
+      dtypes.push_back(in->dtype);
+    }
     KernelShapes s;
     s.inputs = storage;
+    s.input_dtypes = dtypes;
     s.output = n->shape;
+    s.output_dtype = n->dtype;
     s.attrs = n->attrs;
     s.iattrs = n->iattrs;
     s.device = &device;
@@ -375,12 +437,25 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     body << "    LseConstants k) {\n"
          << "  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n";
 
+    // One IR body for the whole run, not N texts concatenated. That is the
+    // whole reason the middle end exists: every stage stages the SAME
+    // activation row into its own `__shared__` array, and no pass can see that
+    // while the stages are strings. Spliced into one body they are ordinary
+    // sibling ops, and `lds_fold` folds the copies.
+    //
+    // Each stage records against the run's real binding names (`b3`, not
+    // `in1`), so two stages reading one buffer name the same IR value, and
+    // against a name prefix, so their generated locals cannot collide once the
+    // per-stage braces are gone.
+    ir::Body merged(type_table, spellings);
     ThreadPlan unified;
     unified.workgroup_size[0] = 1;
     unified.workgroup_count[0] = 1;
-    for (const IndexedStage& st : stages) {
+    for (std::size_t si = 0; si < stages.size(); ++si) {
+      const IndexedStage& st = stages[si];
       std::vector<Shape> storage;
-      KernelShapes shapes = shapes_for(st.node, storage);
+      std::vector<DType> dtypes;
+      KernelShapes shapes = shapes_for(st.node, storage, dtypes);
       const auto out_it = binding_of.find(st.node.get());
       if (out_it == binding_of.end()) {
         return LSE_ERROR(kInternal, "sibling stage has no output binding");
@@ -391,25 +466,43 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
                                           std::string_view value) {
         return store_stmt(out_buf, index, out_dt, value) + "\n";
       };
-      const std::string stage_body = st.prim->emit_kernel(shapes);
-      if (stage_body.empty()) {
-        return LSE_ERROR(kUnimplemented, "primitive '",
-                         std::string(st.prim->name()),
-                         "' declined to emit for this invocation");
-      }
-      body << "  {\n";
-      for (std::size_t a = 0; a < st.node->inputs.size(); ++a) {
-        auto iit = binding_of.find(st.node->inputs[a].get());
+
+      std::vector<std::string> input_names;
+      input_names.reserve(st.node->inputs.size());
+      for (const NodePtr& in : st.node->inputs) {
+        const auto iit = binding_of.find(in.get());
         if (iit == binding_of.end()) {
           return LSE_ERROR(kInternal, std::string(st.prim->name()),
                            ": an input is not bound in this group");
         }
-        body << "    const " << device_scalar(st.node->inputs[a]->dtype)
-             << "* in" << a << " = b" << iit->second << ";\n";
+        input_names.push_back("b" + std::to_string(iit->second));
       }
-      body << stage_body << "\n  }\n";
+      const std::string prefix = "s" + std::to_string(si) + "_";
 
-      const ThreadPlan tp = st.prim->plan(shapes);
+      std::string stage_text;
+      {
+        const ir::RecordOptions opts{input_names, {}, prefix};
+        const ir::KernelBody::Recording rec(opts);
+        ir::KernelBody::Capture cap;
+        stage_text = st.prim->emit_kernel(shapes);
+        if (stage_text.empty() || !cap.has()) {
+          return LSE_ERROR(kUnimplemented, "primitive '",
+                           std::string(st.prim->name()),
+                           "' declined to emit for this invocation");
+        }
+        // Sibling bodies share one thread index, so an early return in one
+        // retires threads the next still needs — silently, as unwritten
+        // output. A stage that wants to opt out of work must predicate, not
+        // return. Asked of the IR now, not of the text.
+        if (cap.body().contains(ir::OpKind::kReturn)) {
+          return LSE_ERROR(kInternal, "primitive '",
+                           std::string(st.prim->name()),
+                           "' returns early and cannot be a fused sibling");
+        }
+        merged.splice(cap.body(), merged.entry());
+      }
+
+      const ThreadPlan& tp = st.plan;
       for (int d = 0; d < 3; ++d) {
         if (tp.workgroup_size[d] > unified.workgroup_size[d]) {
           unified.workgroup_size[d] = tp.workgroup_size[d];
@@ -420,7 +513,14 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       }
       if (tp.lds_bytes > unified.lds_bytes) unified.lds_bytes = tp.lds_bytes;
     }
-    body << "}\n";
+
+    std::vector<ir::PassStat> pass_stats;
+    if (const Status s = ir::default_pipeline().run(merged, &pass_stats);
+        !s.ok()) {
+      return LSE_ERROR(kInternal, "fused sibling body: ", s.message());
+    }
+    ir::record_pass_totals(pass_stats);
+    body << ir::lower(merged) << "\n}\n";
     out.source = body.str();
     for (int d = 0; d < 3; ++d) {
       out.dims.workgroup_size[d] = unified.workgroup_size[d];
@@ -445,11 +545,12 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   const KernelPrimitiveBase* self_indexed = nullptr;
   NodePtr anchor;
   std::vector<Shape> si_storage;
+  std::vector<DType> si_dtypes;
   KernelShapes si_shapes;
   for (const NodePtr& n : group.nodes) {
     const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
     if (kp == nullptr) continue;
-    KernelShapes probe = shapes_for(n, si_storage);
+    KernelShapes probe = shapes_for(n, si_storage, si_dtypes);
     const KernelPrimitiveBase* chosen = kp->specialize(probe);
     if (chosen == nullptr || !chosen->owns_indexing()) continue;
     // The hook stores one value at one index, so a group producing two live
@@ -477,9 +578,16 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
         if (n.get() == linked.sink) anchor = n;
       }
       si_storage.clear();
-      for (const Node* in : linked.inputs) si_storage.push_back(in->shape);
+      si_dtypes.clear();
+      for (const Node* in : linked.inputs) {
+        si_storage.push_back(in->shape);
+        si_dtypes.push_back(in->dtype);
+      }
       si_shapes.inputs = si_storage;
+      si_shapes.input_dtypes = si_dtypes;
       si_shapes.output = linked.sink != nullptr ? linked.sink->shape : Shape{};
+      si_shapes.output_dtype =
+          linked.sink != nullptr ? linked.sink->dtype : DType::kF32;
       si_shapes.attrs = linked.attrs;
       si_shapes.iattrs = linked.iattrs;
       si_shapes.device = &device;
@@ -583,12 +691,14 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       // A self-indexing primitive is the whole kernel body, not a helper the
       // loop calls, so it gets no device function.
       if (kp->owns_indexing()) continue;
-      if (!seen_preambles.emplace(std::string(kp->entry_name())).second) continue;
+      const std::string fn = device_fn_name(*kp, *n);
+      if (!seen_preambles.emplace(fn).second) continue;
 
       std::vector<Shape> in_shapes;
-      const KernelShapes shapes = shapes_for(n, in_shapes);
+      std::vector<DType> in_dtypes;
+      const KernelShapes shapes = shapes_for(n, in_shapes, in_dtypes);
 
-      preamble << "__device__ float " << kp->entry_name()
+      preamble << "__device__ float " << fn
                << "(unsigned int i";
       for (std::size_t a = 0; a < n->inputs.size(); ++a) {
         preamble << ", const " << device_scalar(n->inputs[a]->dtype)
@@ -764,6 +874,13 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   }
 
   const Shape& out_shape = group.nodes.back()->shape;
+  // The launch covers the widest thing in the group — choose_dims takes the
+  // largest output, the walk below indexes against the last node — so every
+  // narrower member has to be guarded against the same bound.
+  std::size_t launch_elems = out_shape.elem_count();
+  for (const NodePtr& o : group.outputs) {
+    launch_elems = std::max(launch_elems, o->element_count());
+  }
 
   std::ostringstream src;
   src << "#include <hip/hip_runtime.h>\n"
@@ -807,7 +924,17 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
     if (const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim)) {
       const std::string var = "t" + std::to_string(temp++);
-      src << "  const float " << var << " = " << kp->entry_name() << "(i";
+      // The helper turns the flat thread id into a row and a column of *its*
+      // output, so calling it past its own extent walks the activation off the
+      // end and faults the device — guarding only the store is not enough.
+      // A member narrower than the launch contributes nothing at those threads:
+      // can_fuse keeps a kernel primitive's consumers the same width, so the
+      // value is either stored under the same guard or never read.
+      const std::size_t elems = n->element_count();
+      const bool guarded = elems < launch_elems;
+      src << "  const float " << var << " = ";
+      if (guarded) src << "i < " << elems << "u ? ";
+      src << device_fn_name(*kp, *n) << "(i";
       for (const NodePtr& in : n->inputs) {
         auto it = binding_of.find(in.get());
         if (it == binding_of.end()) {
@@ -816,7 +943,9 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
         }
         src << ", b" << it->second;
       }
-      src << ");\n";
+      src << ")";
+      if (guarded) src << " : 0.0f";
+      src << ";\n";
       value_of[n.get()] = var;
       continue;
     }
@@ -879,7 +1008,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     // to be guarded: writing it at every i walks off the end of its buffer and
     // faults the device. Its extent is a literal — shapes are in the cache key.
     const std::size_t elems = n->element_count();
-    const bool needs_guard = elems < out_shape.elem_count();
+    const bool needs_guard = elems < launch_elems;
     if (needs_guard) src << "  if (i < " << elems << "u) ";
     else src << "  ";
     src << store_stmt("b" + std::to_string(i), "i", n->dtype, it->second)

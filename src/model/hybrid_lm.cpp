@@ -251,6 +251,15 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   std::vector<graph::NodePtr> roots;
   roots.push_back(y.node());
+  // A traced block output is only read after the whole stack has run, and the
+  // slot planner recycles any buffer whose in-graph consumers are done. Held
+  // Array handles are not consumers, so without this every trace entry aliases
+  // one slot and reads back the last block's activations.
+  if (trace != nullptr) {
+    for (const Array& t : *trace) {
+      if (t.valid() && t.node()) roots.push_back(t.node());
+    }
+  }
   if (states != nullptr) {
     auto add = [&](const Array& a) {
       if (a.valid() && a.node() && !a.node()->materialized) {

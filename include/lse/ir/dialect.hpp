@@ -16,7 +16,7 @@
 #include <span>
 #include <string_view>
 
-namespace lse::graph {
+namespace lse::ir {
 
 // The source language a kernel is written in. A primitive declares which of
 // these it can emit; an emitter declares the one it consumes. Nothing in the
@@ -73,4 +73,4 @@ struct DialectExpr {
   return {};
 }
 
-}  // namespace lse::graph
+}  // namespace lse::ir

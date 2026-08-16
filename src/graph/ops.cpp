@@ -248,7 +248,11 @@ Array embedding(const Array& table, const Array& ids) {
   Shape out;
   for (std::size_t i = 0; i < ids.shape().rank(); ++i) out.push_back(ids.shape().dim(i));
   out.push_back(table.shape().dim(1));
-  auto n = make(OpKind::kEmbedding, out, table.dtype(),
+  // Not the table's dtype: this is where the residual stream begins, and a
+  // narrow embedding table would make the whole stream narrow for the rest of
+  // the network. Storage format is the table's business; the value it yields
+  // is an activation.
+  auto n = make(OpKind::kEmbedding, out, promote(table.dtype(), DType::kF32),
                 {table.node(), ids.node()});
   n->prim = find_primitive("embedding");
   return Array(n);
@@ -261,7 +265,10 @@ Array gather_rows(const Array& x, const Array& rows) {
                     ? static_cast<std::int64_t>(rows.shape().elem_count())
                     : 0);
   out.push_back(width);
-  auto n = make(OpKind::kGather, out, x.dtype(), {x.node(), rows.node()});
+  // Same rule as embedding: gathering rows out of a stored table produces
+  // activations, so the result does not inherit the table's storage width.
+  auto n = make(OpKind::kGather, out, promote(x.dtype(), DType::kF32),
+                {x.node(), rows.node()});
   n->prim = find_primitive("gather");
   return Array(n);
 }

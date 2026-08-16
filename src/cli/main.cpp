@@ -5,13 +5,16 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "lse/backend/backend.hpp"
 #include "lse/core/debug.hpp"
 #include "lse/graph/jit.hpp"
+#include "lse/ir/pass/pass.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
@@ -207,10 +210,16 @@ int main(int argc, char** argv) {
   auto weights = model::SafeTensors::open(paths->weights);
   if (!weights.ok()) return fail(weights.status(), "opening the weights");
 
-  auto tok = tokenizer::Tokenizer::for_model_dir(
-      paths->weights.substr(0, paths->weights.find_last_of('/')),
-      opt.tokenizer_repo);
-  if (!tok.ok()) return fail(tok.status(), "loading the tokenizer");
+  // Building the tokenizer is a 248k-entry automaton and binding the weights
+  // streams the whole checkpoint; neither needs the other, so the smaller
+  // hides behind the larger. jthread so an early return below still joins.
+  const std::string tok_dir =
+      paths->weights.substr(0, paths->weights.find_last_of('/'));
+  std::optional<Result<tokenizer::Tokenizer>> tok_slot;
+  std::jthread tok_load([&] {
+    tok_slot.emplace(
+        tokenizer::Tokenizer::for_model_dir(tok_dir, opt.tokenizer_repo));
+  });
 
   auto arch = model::detect_architecture(*cfg, *weights);
   if (opt.arch.empty() && !arch.ok()) {
@@ -228,6 +237,10 @@ int main(int argc, char** argv) {
   model::WeightBinder binder(*weights);
   const Status loaded = lm->load(binder);
   if (!loaded.ok()) return fail(loaded, "binding the weights");
+
+  tok_load.join();
+  if (!tok_slot->ok()) return fail(tok_slot->status(), "loading the tokenizer");
+  Result<tokenizer::Tokenizer>& tok = *tok_slot;
 
   auto prompt = tok->encode(opt.prompt);
   if (!prompt.ok()) return fail(prompt.status(), "encoding the prompt");
@@ -265,6 +278,8 @@ int main(int argc, char** argv) {
                  "%.2f tok/s\n"
                  "launches %u | phases %u (ideal %u launch%s) | groups "
                  "device=%u host=%u views=%u fallbacks=%u\n"
+                 "streams %u of %u | cross-stream waits %u | chain %u of %u "
+                 "groups (%.0f%% spread)\n"
                  "sched partition=%.3f s emit=%.3f s launch=%.3f s sync=%.3f s\n"
                  "jit mem=%llu disk=%llu compile=%llu (%.3f s)\n",
                  s.prompt_tokens, static_cast<double>(s.prefill_ns) / 1e9,
@@ -273,6 +288,8 @@ int main(int argc, char** argv) {
                  s.phase_ideal_launches == 1 ? "" : "es",
                  s.device_groups, s.host_groups, s.views_aliased,
                  s.host_fallbacks,
+                 s.streams_used, s.streams_available, s.stream_waits,
+                 s.stream_chain, s.device_groups, s.spread() * 100.0,
                  static_cast<double>(s.partition_ns) / 1e9,
                  static_cast<double>(s.emit_ns) / 1e9,
                  static_cast<double>(s.launch_ns) / 1e9,
@@ -281,6 +298,18 @@ int main(int argc, char** argv) {
                  static_cast<unsigned long long>(s.jit_disk_hits),
                  static_cast<unsigned long long>(s.jit_compiles),
                  static_cast<double>(s.jit_compile_ns) / 1e9);
+    // What the kernel IR's middle end actually did, per pass. A pass that
+    // reports zero here fired on nothing in this model and is dead weight.
+    const std::vector<lse::ir::PassStat> passes = lse::ir::pass_totals();
+    if (!passes.empty()) {
+      std::fprintf(stderr, "ir passes");
+      for (const lse::ir::PassStat& ps : passes) {
+        std::fprintf(stderr, " %.*s=%llu", static_cast<int>(ps.name.size()),
+                     ps.name.data(),
+                     static_cast<unsigned long long>(ps.fired));
+      }
+      std::fputc('\n', stderr);
+    }
     std::unordered_map<std::string, unsigned> reasons;
     for (const std::string& r : gen.host_group_reasons()) ++reasons[r];
     unsigned shown = 0;

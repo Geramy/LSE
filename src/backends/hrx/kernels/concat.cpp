@@ -79,7 +79,7 @@ struct ConcatKernel final : KernelPrimitive<ConcatKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     ConcatArgs<env::Emit> a;
-    env::bind(k, a);
+    if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const kir::Val<kir::f32> v =
         concat_element(e, a, s.inputs.size(), lens, out_axis, inner);

@@ -26,6 +26,10 @@ struct TensorView {
 
   // Widens to f32 regardless of stored dtype.
   Status read_f32(float* dst, std::size_t count) const;
+
+  // The stored bytes, unchanged. Half the copy and none of the widening loop
+  // when the device holds the tensor in the format the checkpoint used.
+  Status read_native(void* dst, std::size_t bytes) const;
 };
 
 class SafeTensors {

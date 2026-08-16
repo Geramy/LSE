@@ -98,15 +98,22 @@ ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave) {
 }
 
 using F32In = env::In<kir::f32, env::Emit>;
+template <class W>
+using WIn = env::In<W, env::Emit>;
 
-void emit_tile(env::Emit& e, const F32In& x, const F32In& w,
+// `xs` is the activation row already staged in workgroup scratch; null means
+// read it from global, which is what a non-grid launch still does.
+template <class W>
+void emit_tile(env::Emit& e, const F32In& x, const kir::Tile<kir::f32>* xs,
+               const WIn<W>& w,
                const kir::Val<kir::u32>& w_base, const kir::Val<kir::u32>& tile,
                const kir::Val<kir::u32>& row, const kir::Val<kir::u32>& wave_id,
                const kir::Val<kir::u32>& lane, std::uint32_t N, std::uint32_t K,
                std::uint32_t wave, std::uint32_t load_bytes) {
   const auto waves = kBlock / wave;
   const auto col = e.let(tile * waves + wave_id);
-  const auto step = kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
+  constexpr std::uint32_t we = kir::pack_elem_bytes<W>();
+  const auto step = row_pack(K, load_bytes, we);
   const auto span = wave * step;
   const auto aligned = (K / span) * span;
 
@@ -114,15 +121,21 @@ void emit_tile(env::Emit& e, const F32In& x, const F32In& w,
   if (auto in_cols = e.when(col < N)) {
     for (auto k0 : e.range(0u, aligned, span)) {
       const auto kk = e.let(k0 + lane * step);
-      const auto xv = e.load(x, row * K + kk, load_bytes);
-      const auto wv = e.load(w, (w_base + col) * K + kk, load_bytes);
+      // The weight load must stay the only global load in this loop: adding a
+      // second one splits the load clause and costs a full DRAM round trip
+      // (measured 41 -> 68 us). The activation comes from LDS for that reason.
+      const auto wv = e.load(w, (w_base + col) * K + kk, step * we);
       for (auto elem : e.unroll(step)) {
-        acc = math::fma(xv[elem], wv[elem], acc.read());
+        const auto xe = xs != nullptr ? (*xs)[kk + elem].read()
+                                      : x[row * K + kk + elem];
+        acc = math::fma(xe, math::widen(wv[elem]), acc.read());
       }
     }
     if (aligned < K) {
       for (auto kt : e.range(e.u32(aligned) + lane, e.u32(K), wave)) {
-        acc = math::fma(x[row * K + kt], w[(w_base + col) * K + kt],
+        const auto xe =
+            xs != nullptr ? (*xs)[kt].read() : x[row * K + kt];
+        acc = math::fma(xe, math::widen(w[(w_base + col) * K + kt]),
                         acc.read());
       }
     }
@@ -148,7 +161,8 @@ kir::Val<kir::u32> gemv_w_base(env::Emit& e, const F32In* idx,
 
 }  // namespace
 
-void emit_gemv(env::Emit& e, const F32In& x, const F32In& w, const F32In* idx,
+template <class W>
+void emit_gemv(env::Emit& e, const F32In& x, const WIn<W>& w, const F32In* idx,
                std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
                std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
                bool grid, std::uint32_t wave, bool persist,
@@ -162,7 +176,7 @@ void emit_gemv(env::Emit& e, const F32In& x, const F32In& w, const F32In* idx,
 
   auto run = [&](const kir::Val<kir::u32>& tile, const kir::Val<kir::u32>& row) {
     const auto w_base = gemv_w_base(e, idx, keep, slot, row, N);
-    emit_tile(e, x, w, w_base, tile, row, wave_id, lane, N, K, wave,
+    emit_tile(e, x, nullptr, w, w_base, tile, row, wave_id, lane, N, K, wave,
               load_bytes);
   };
 
@@ -176,10 +190,26 @@ void emit_gemv(env::Emit& e, const F32In& x, const F32In& w, const F32In* idx,
     return;
   }
   if (grid) {
+    // One workgroup owns one row of x and every column in its tile. Left in
+    // global, that row is re-read by every wave inside the K loop, and those
+    // loads hold the same outstanding-request capacity the weight stream needs
+    // — measured 66.2 -> 41.3 us (134 -> 216 GB/s) at N=2176 K=1024. Only a
+    // grid launch has a workgroup-constant row, so only it stages.
+    kir::Tile<kir::f32> xs;
+    const bool stage = e.lds_fits<kir::f32>(K);
+    if (stage) xs = e.lds<kir::f32>(K);
     const auto tile = e.let(math::workgroup_id_x());
     const auto row = e.let(math::workgroup_id_y());
     if (auto in_grid = e.when(tile < ntiles && row < M)) {
-      run(tile, row);
+      if (stage) {
+        for (auto t : e.range(lid, e.u32(K), kBlock)) {
+          xs[t] = x[row * K + t];
+        }
+        e.barrier();
+      }
+      const auto w_base = gemv_w_base(e, idx, keep, slot, row, N);
+      emit_tile(e, x, stage ? &xs : nullptr, w, w_base, tile, row, wave_id,
+                lane, N, K, wave, load_bytes);
     }
     return;
   }
@@ -190,33 +220,50 @@ void emit_gemv(env::Emit& e, const F32In& x, const F32In& w, const F32In* idx,
   }
 }
 
+template <class W>
 void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
-               const kir::Buffer<kir::f32>& w, const kir::Buffer<kir::f32>* idx,
+               const kir::Buffer<W>& w, const kir::Buffer<kir::f32>* idx,
                std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
                std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
                bool grid, std::uint32_t wave, bool persist,
                std::uint32_t persist_wgs) {
   env::Emit e{&k};
   const F32In xi{x, &k.types()};
-  const F32In wi{w, &k.types()};
+  const WIn<W> wi{w, &k.types()};
   F32In ii;
   const F32In* idxp = nullptr;
   if (idx != nullptr) {
     ii = F32In{*idx, &k.types()};
     idxp = &ii;
   }
-  emit_gemv(e, xi, wi, idxp, keep, slot, N, K, M, load_bytes, grid, wave,
-            persist, persist_wgs);
+  emit_gemv<W>(e, xi, wi, idxp, keep, slot, N, K, M, load_bytes, grid, wave,
+               persist, persist_wgs);
 }
+
+#define LSE_GEMV_INSTANTIATE(W_)                                               \
+  template void emit_gemv<W_>(                                                 \
+      env::Emit&, const F32In&, const WIn<W_>&, const F32In*, std::uint32_t,   \
+      std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,              \
+      std::uint32_t, bool, std::uint32_t, bool, std::uint32_t);                \
+  template void emit_gemv<W_>(                                                 \
+      kir::KernelBody&, const kir::Buffer<kir::f32>&, const kir::Buffer<W_>&,  \
+      const kir::Buffer<kir::f32>*, std::uint32_t, std::uint32_t,              \
+      std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool,        \
+      std::uint32_t, bool, std::uint32_t);
+LSE_GEMV_INSTANTIATE(kir::f32)
+LSE_GEMV_INSTANTIATE(lse::bf16)
+LSE_GEMV_INSTANTIATE(lse::f16)
+#undef LSE_GEMV_INSTANTIATE
 
 namespace {
 
 // The output leaves through the emitter's store hook; the Out member only
-// names the slot the binding contract requires.
-template <class E>
+// names the slot the binding contract requires. `W` is the weight's storage
+// element, so one body serves every checkpoint format.
+template <class E, class W = kir::f32>
 struct LinearLdsArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> w;
+  env::In<W, E> w;
   env::Out<kir::f32, E> out;
 };
 
@@ -231,20 +278,22 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   std::string emit_kernel(const KernelShapes& s) const override {
     const LinearDims d = dims_of_linear(s);
     if (!lds_shape_ok(d) || !device_fits(s) || s.types.scalar == nullptr ||
-        !s.store) {
+        !s.store || s.input_dtypes.size() < 2) {
       return {};
     }
-    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
-    k.set_store(s.store);
-    LinearLdsArgs<env::Emit> a;
-    env::bind(k, a);
-    env::Emit e{&k};
-    emit_gemv(e, a.x, a.w, nullptr, 0, 0, static_cast<std::uint32_t>(d.n),
-              static_cast<std::uint32_t>(d.k),
-              static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
-              true, wave_of(s.device));
-    if (!k.lds().ok()) return {};
-    return k.str();
+    return with_elem(s.input_dtypes[1], [&]<class W>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+      k.set_store(s.store);
+      LinearLdsArgs<env::Emit, W> a;
+      if (!env::bind(k, a, s)) return {};
+      env::Emit e{&k};
+      emit_gemv<W>(e, a.x, a.w, nullptr, 0, 0, static_cast<std::uint32_t>(d.n),
+                   static_cast<std::uint32_t>(d.k),
+                   static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
+                   true, wave_of(s.device));
+      if (!k.lds().ok()) return {};
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -262,10 +311,10 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   }
 };
 
-template <class E>
+template <class E, class W = kir::f32>
 struct LinearIndexedLdsArgs {
   env::In<kir::f32, E> x;
-  env::In<kir::f32, E> w;
+  env::In<W, E> w;
   env::In<kir::f32, E> idx;
   env::Out<kir::f32, E> out;
 };
@@ -281,7 +330,8 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
   std::string emit_kernel(const KernelShapes& s) const override {
     const LinearDims d = dims_of_indexed(s);
     if (!lds_shape_ok(d) || !device_fits(s) || s.types.scalar == nullptr ||
-        !s.store || s.inputs.size() != 3 || s.inputs[2].rank() == 0) {
+        !s.store || s.inputs.size() != 3 || s.inputs[2].rank() == 0 ||
+        s.input_dtypes.size() < 3) {
       return {};
     }
     const auto keep = static_cast<std::uint32_t>(
@@ -289,17 +339,20 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
     const auto slot = static_cast<std::uint32_t>(s.iattrs[0]);
     if (keep == 0 || slot >= keep) return {};
 
-    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
-    k.set_store(s.store);
-    LinearIndexedLdsArgs<env::Emit> a;
-    env::bind(k, a);
-    env::Emit e{&k};
-    emit_gemv(e, a.x, a.w, &a.idx, keep, slot, static_cast<std::uint32_t>(d.n),
-              static_cast<std::uint32_t>(d.k),
-              static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
-              true, wave_of(s.device));
-    if (!k.lds().ok()) return {};
-    return k.str();
+    return with_elem(s.input_dtypes[1], [&]<class W>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+      k.set_store(s.store);
+      LinearIndexedLdsArgs<env::Emit, W> a;
+      if (!env::bind(k, a, s)) return {};
+      env::Emit e{&k};
+      emit_gemv<W>(e, a.x, a.w, &a.idx, keep, slot,
+                   static_cast<std::uint32_t>(d.n),
+                   static_cast<std::uint32_t>(d.k),
+                   static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
+                   true, wave_of(s.device));
+      if (!k.lds().ok()) return {};
+      return k.str();
+    });
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {

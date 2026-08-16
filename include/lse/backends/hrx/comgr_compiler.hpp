@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -18,6 +19,9 @@ class ComgrCompiler final : public graph::IKernelCompiler {
                                          std::string_view arch) const override;
 
   [[nodiscard]] bool available() const override;
+
+  // comgr's own version plus the exact option lists both actions run with.
+  [[nodiscard]] std::string identity() const override;
 };
 
 }  // namespace lse::backend

@@ -33,6 +33,7 @@
 #include "lse/core/status.hpp"
 #include "lse/graph/codegen.hpp"
 #include "lse/graph/dialect_source.hpp"
+#include "lse/ir/spell.hpp"
 
 namespace lse::graph {
 
@@ -112,9 +113,7 @@ class Primitive {
 };
 
 // Substitutes $0, $1, ... in a source template with the caller's expressions.
-std::string substitute(std::string_view tmpl, std::span<const std::string> args);
-std::string substitute(std::string_view tmpl, std::span<const std::string> args,
-                       std::span<const float> attrs);
+using ir::substitute;
 
 // CRTP base for the common case. Derived supplies kName and apply(). Device
 // source comes from the emitting backend's table by default; a primitive
