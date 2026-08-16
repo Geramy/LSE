@@ -55,32 +55,29 @@ cmake -S . -B build -GNinja -DLSE_HRX_ROOT=/path/to/hrx-install
 - Optimization passes: common subexpression elimination, dead code elimination,
   and LDS folding — which collapses the identical shared-memory stagings of
   fused siblings into one.
-- Sibling fusion, retained and replayed programs, and batched command buffers,
-  so a decode token issues far fewer dispatches than it has nodes.
+- Sibling fusion, retained and replayed programs, and batched command buffers.
 - JIT cache keyed on group signature, target architecture, and the compiler's
-  own reported identity, so a toolchain change invalidates stale objects without
-  anyone maintaining a revision constant.
+  own reported identity, so a toolchain change invalidates stale objects.
 
 **Kernels**
 
 - Authored as ordinary C++ against a reflection-based surface — one body is
   either executed on the host or recorded into device source, with argument
-  binding derived from struct layout rather than written out by hand.
+  binding derived from struct layout.
 - Matrix-core descriptor table covering WMMA and MFMA across RDNA3/3.5, RDNA4
   and CDNA3, keyed by target, accumulator, operand and shape. Adding an operand
-  family is a table row, not a kernel edit.
+  family is a table row.
 - Weights are held and moved in the checkpoint's own format; conversion happens
-  inside the kernel at the register boundary, never laterally. bf16 native, with
-  Q8/Q6/Q4 block codecs.
+  inside the kernel at the register boundary. bf16 native, with Q8/Q6/Q4 block
+  codecs.
 
 **Measurement and distribution**
 
 - Device qualification probe: measured DRAM bandwidth, dispatch cost, and
   matrix-core throughput per operand family, plus per-ordered-pair link latency
-  and bandwidth fitted separately. Every number carries its provenance, and an
-  unmeasured path stays unknown rather than being guessed.
+  and bandwidth fitted separately. Every number carries its provenance.
 - Cost model answering throughput at a given queue depth, with split proportions
-  for uneven pools — not a single latency threshold.
+  for uneven pools.
 - QuickReduce two-shot compressed all-reduce; execution-stream seam; loopback
   transport exercising 2/4/8 ranks on one box.
 - CPU reference backend for numerics checking against every device kernel.
@@ -99,9 +96,8 @@ cmake -S . -B build -GNinja -DLSE_HRX_ROOT=/path/to/hrx-install
   placement chosen from the measured cost model rather than configuration.
 - **Paged KV cache** with runtime batch extents, replacing contiguous
   per-session state.
-- **Continuous batching** across sessions — the largest remaining throughput
-  lever, and the thing that makes distribution pay by hiding link latency behind
-  queue depth.
+- **Continuous batching** across sessions, which hides link latency behind queue
+  depth.
 - **Device-resident collectives** over a real peer path.
 - **Tracing seam** exporting Perfetto traces, with a rocprofiler adapter, so
   engine spans and kernel traces share one timeline and one clock.
