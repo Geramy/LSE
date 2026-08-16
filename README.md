@@ -87,8 +87,9 @@ cmake -S . -B build -GNinja -DLSE_HRX_ROOT=/path/to/hrx-install
 - Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
   Mixture-of-Depths, chunked prefill, and device-side argmax.
 
-**Measured** — 102.4 tok/s median decode on one gfx1151 APU (Strix Halo,
-227–233 GB/s), 16 test suites green, zero warnings under the full warning set.
+**Measured** — LemonSeed-1.5b-coder-v1 (bf16) at 102.4 tok/s median decode on
+one gfx1151 APU (Strix Halo, 227–233 GB/s), 16 test suites green, zero warnings
+under the full warning set.
 
 ## Upcoming
 
