@@ -5,8 +5,6 @@ A modular C++ training and inference engine for the
 (Gated DeltaNet + gated GQA + sparse MoE with Mixture-of-Depths), running on the
 [HRX](https://github.com/ROCm/hrx-system) native runtime.
 
-See **[PLAN.md](PLAN.md)** for the full design and milestones.
-
 ## Design in one paragraph
 
 Ops are lazy: they record into a DAG and execute only when a host-visible read
@@ -45,17 +43,83 @@ cmake -S . -B build -GNinja -DLSE_HRX_ROOT=/path/to/hrx-install
 | `LSE_WERROR` | OFF | Warnings as errors |
 | `LSE_ASAN` | OFF | AddressSanitizer + UBSan |
 
-## Layout
+## Current
 
-```
-include/lse/     public headers — core, quant, backend, graph, model,
-                 tokenizer, runtime, train, dist, server
-src/backends/    one directory per backend (hrx, cpu), self-registering
-third_party/     fastokens FFI crate + vendored single-header deps
-reference/       upstream repos, read-only (gitignored)
-tests/           dependency-free harness
-```
+**Compiler**
 
-## Status
+- Tracing JIT: lazy tensor DAG, fusion-group partitioning, HIP emission,
+  `amd_comgr` compilation, disk cache, native-ABI dispatch with no HIP runtime.
+- Kernel IR with regions and typed SSA values, a verifier run after every pass,
+  and an iteration space whose dimensions carry their kind (parallel, reduction,
+  sequential).
+- Optimization passes: common subexpression elimination, dead code elimination,
+  and LDS folding — which collapses the identical shared-memory stagings of
+  fused siblings into one.
+- Sibling fusion, retained and replayed programs, and batched command buffers,
+  so a decode token issues far fewer dispatches than it has nodes.
+- JIT cache keyed on group signature, target architecture, and the compiler's
+  own reported identity, so a toolchain change invalidates stale objects without
+  anyone maintaining a revision constant.
 
-Phase 0: foundation builds, 4 test suites green. See PLAN.md §11 for milestones.
+**Kernels**
+
+- Authored as ordinary C++ against a reflection-based surface — one body is
+  either executed on the host or recorded into device source, with argument
+  binding derived from struct layout rather than written out by hand.
+- Matrix-core descriptor table covering WMMA and MFMA across RDNA3/3.5, RDNA4
+  and CDNA3, keyed by target, accumulator, operand and shape. Adding an operand
+  family is a table row, not a kernel edit.
+- Weights are held and moved in the checkpoint's own format; conversion happens
+  inside the kernel at the register boundary, never laterally. bf16 native, with
+  Q8/Q6/Q4 block codecs.
+
+**Measurement and distribution**
+
+- Device qualification probe: measured DRAM bandwidth, dispatch cost, and
+  matrix-core throughput per operand family, plus per-ordered-pair link latency
+  and bandwidth fitted separately. Every number carries its provenance, and an
+  unmeasured path stays unknown rather than being guessed.
+- Cost model answering throughput at a given queue depth, with split proportions
+  for uneven pools — not a single latency threshold.
+- QuickReduce two-shot compressed all-reduce; execution-stream seam; loopback
+  transport exercising 2/4/8 ranks on one box.
+- CPU reference backend for numerics checking against every device kernel.
+
+**Model**
+
+- Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
+  Mixture-of-Depths, chunked prefill, and device-side argmax.
+
+**Measured** — 102.4 tok/s median decode on one gfx1151 APU (Strix Halo,
+227–233 GB/s), 16 test suites green, zero warnings under the full warning set.
+
+## Upcoming
+
+- **Multi-device** — device enumeration, buffer residency, and per-group
+  placement chosen from the measured cost model rather than configuration.
+- **Paged KV cache** with runtime batch extents, replacing contiguous
+  per-session state.
+- **Continuous batching** across sessions — the largest remaining throughput
+  lever, and the thing that makes distribution pay by hiding link latency behind
+  queue depth.
+- **Device-resident collectives** over a real peer path.
+- **Tracing seam** exporting Perfetto traces, with a rocprofiler adapter, so
+  engine spans and kernel traces share one timeline and one clock.
+- **Iteration-space windows** — fusion and sharding as one mechanism, where the
+  level of parallelism (data, expert, pipeline, tensor) is which dimension gets
+  split, derived from dimension kind, queue depth and measured link cost.
+- **Heterogeneous pools** — a device without fp8 matrix cores runs the fp16
+  route for the same operation and stays a full pool member, taking a smaller
+  share proportional to its measured throughput.
+- **Communication layer** — one asynchronous client/server API over TCP and
+  RDMA, with the transport hidden from callers.
+- **Multi-machine** — a control plane that ships IR rather than code objects, so
+  each peer compiles for its own architecture.
+- **Runtime-adaptive optimization** — variant tournaments judged on measured
+  time, with what was learned persisted so the next process starts tuned.
+
+## License
+
+Non-commercial use is free for everyone; commercial use requires a separate
+license, with exceptions for the organizations listed in Exhibit A. See
+**[LICENSE.md](LICENSE.md)**.
