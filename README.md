@@ -3,7 +3,8 @@
 A modular C++ training and inference engine for the
 [lemonseed](https://github.com/Geramy/lemonseed) hybrid LLM architecture
 (Gated DeltaNet + gated GQA + sparse MoE with Mixture-of-Depths), running on the
-[HRX](https://github.com/ROCm/hrx-system) native runtime.
+[HRX](https://github.com/ROCm/hrx-system) native runtime. Weights:
+[lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base).
 
 ## Design in one paragraph
 
@@ -87,9 +88,9 @@ cmake -S . -B build -GNinja -DLSE_HRX_ROOT=/path/to/hrx-install
 - Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
   Mixture-of-Depths, chunked prefill, and device-side argmax.
 
-**Measured** — LemonSeed-1.5b-coder-v1 (bf16) at 102.4 tok/s median decode on
-one gfx1151 APU (Strix Halo, 227–233 GB/s), 16 test suites green, zero warnings
-under the full warning set.
+**Measured** — [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base)
+(bf16) at 102.3 tok/s median decode on one gfx1151 APU (Strix Halo,
+227–233 GB/s), 17 test suites green, zero warnings under the full warning set.
 
 ## Upcoming
 
