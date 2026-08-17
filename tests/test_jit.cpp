@@ -84,6 +84,18 @@ Result<EmittedKernel> emit_for(Array& root) {
   return kEmitter.emit(groups.front(), gfx1151());
 }
 
+// The group that anchors on `kind`, not the first one: a root whose operands
+// are themselves computed contributes a group per operand, and those come
+// first in topological order.
+Result<EmittedKernel> emit_anchor(Array& root, OpKind kind) {
+  const NodePtr roots[] = {root.node()};
+  auto groups = Partitioner::partition(roots);
+  for (const FusionGroup& g : groups) {
+    if (g.anchor == kind) return kEmitter.emit(g, gfx1151());
+  }
+  return LSE_ERROR(kNotFound, "no group anchored on ", to_string(kind));
+}
+
 }  // namespace
 
 LSE_REGISTER_PRIMITIVE(JitSwish);
@@ -131,6 +143,42 @@ LSE_TEST(emitter_produces_a_complete_translation_unit) {
   LSE_EXPECT(e->source.find(e->entry_name) != std::string::npos);
   LSE_EXPECT(e->source.find("if (i >= k.count) return;") != std::string::npos);
   LSE_EXPECT(e->entry_name.rfind("lse_fused_", 0) == 0);
+}
+
+// The row stride has to reach the activation load on both sides of the LDS
+// budget. quant_linear stages the activation row in scratch when it fits and
+// reads it from global when it does not; the global form had no `row * K`
+// term, so a multi-row launch computed every row from row 0. This asks the
+// emitter directly, so it holds on a machine with no device: gfx1151 reports
+// 64 KiB, K * 4 B decides, and the shape below sits one group past the line.
+// N, the lane count and the group count are all distinct from K, so the K
+// stride can only have come from indexing the activation by its row.
+LSE_TEST(quant_linear_indexes_the_activation_by_its_row) {
+  constexpr int kBits = 8;
+  constexpr std::int64_t kGroup = 64;
+  constexpr std::int64_t kN = 16;
+  const std::int64_t lds_floats = gfx1151().lds_bytes_per_workgroup / 4;
+
+  for (const std::int64_t k :
+       {std::int64_t{640}, (lds_floats / kGroup + 1) * kGroup}) {
+    const std::int64_t lanes = k * kBits / 32;
+    const std::int64_t groups = k / kGroup;
+    Array x = Array::zeros(Shape{5, k}, DType::kF32);
+    Array packed = Array::zeros(Shape{kN, lanes}, DType::kU32);
+    Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
+    Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
+
+    Array y = quant_linear(x, packed, scales, biases, kBits, kGroup);
+    auto e = emit_anchor(y, OpKind::kQuantMatMul);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) {
+      std::printf("       K=%lld: %s\n", static_cast<long long>(k),
+                  e.status().to_string().c_str());
+      continue;
+    }
+    const std::string stride = "* " + std::to_string(k) + "u";
+    LSE_EXPECT(e->source.find(stride) != std::string::npos);
+  }
 }
 
 LSE_TEST(phase_emits_syncthreads_only_on_cross_lane_deps) {
