@@ -1,6 +1,7 @@
 #include "lse/graph/graph.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -13,8 +14,6 @@
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/workgroup.hpp"
 #include "lse/quant/group_affine.hpp"
-
-#include <cstring>
 
 using namespace lse;
 using namespace lse::graph;
@@ -1570,78 +1569,266 @@ Array packed_host_array(const std::vector<std::uint32_t>& lanes, Shape shape) {
 }  // namespace
 
 // The whole point of the op: a weight that stays packed all the way to the
-// register produces the same numbers as one dequantized ahead of time.
-LSE_TEST(quant_linear_matches_a_dequantized_linear) {
-  for (int bits : {4, 6, 8}) {
+// register produces the same numbers as the contraction against the weights it
+// encodes. The reference is computed here in double rather than with
+// graph::linear, whose kernel narrows to f16 operands above a tile and would
+// then be the less precise side of the comparison.
+//
+// Every bit width MLX emits, at one row (decode) and at more rows than a tile
+// (prefill): 3, 5 and 6 bits are the ones whose codes straddle two lanes.
+LSE_TEST(quant_linear_matches_the_weights_it_encodes) {
+  for (int bits : {2, 3, 4, 5, 6, 8}) {
+    for (std::int64_t rows : {std::int64_t{1}, std::int64_t{20}}) {
+      auto spec = quant::GroupAffine::make(bits, 64);
+      LSE_EXPECT(spec.ok());
+      if (!spec.ok()) continue;
+      const quant::GroupAffine q = *spec;
+
+      constexpr std::int64_t kN = 32, kK = 128;
+      const auto lanes_per_row = q.packed_words(kK);
+      const auto groups_per_row = q.group_count(kK);
+
+      std::vector<float> x(static_cast<std::size_t>(rows * kK));
+      for (std::size_t i = 0; i < x.size(); ++i) {
+        x[i] = 0.1f * std::sin(0.7f * static_cast<float>(i));
+      }
+
+      std::vector<std::uint32_t> packed(
+          static_cast<std::size_t>(kN) * lanes_per_row);
+      std::vector<float> scales(static_cast<std::size_t>(kN) * groups_per_row);
+      std::vector<float> biases(scales.size());
+      std::vector<float> dequantized(static_cast<std::size_t>(kN * kK));
+
+      for (std::int64_t r = 0; r < kN; ++r) {
+        std::vector<float> row(static_cast<std::size_t>(kK));
+        for (std::int64_t c = 0; c < kK; ++c) {
+          row[static_cast<std::size_t>(c)] =
+              0.05f * std::cos(0.13f * static_cast<float>(r * kK + c));
+        }
+        const auto ro = static_cast<std::size_t>(r);
+        std::vector<bfloat16_t> s(groups_per_row), b(groups_per_row);
+        q.quantize_row<bfloat16_t>(row.data(), static_cast<std::size_t>(kK),
+                                   packed.data() + ro * lanes_per_row, s.data(),
+                                   b.data());
+        q.dequantize_row<bfloat16_t>(
+            packed.data() + ro * lanes_per_row, s.data(), b.data(),
+            static_cast<std::size_t>(kK),
+            dequantized.data() + ro * static_cast<std::size_t>(kK));
+        for (std::size_t g = 0; g < groups_per_row; ++g) {
+          scales[ro * groups_per_row + g] = s[g].to_float();
+          biases[ro * groups_per_row + g] = b[g].to_float();
+        }
+      }
+
+      Array xa = host_array(x, Shape{rows, kK});
+      Array pa = packed_host_array(
+          packed, Shape{kN, static_cast<std::int64_t>(lanes_per_row)});
+      Array sa = typed_host_array(
+          scales, Shape{kN, static_cast<std::int64_t>(groups_per_row)},
+          DType::kBF16);
+      Array ba = typed_host_array(
+          biases, Shape{kN, static_cast<std::int64_t>(groups_per_row)},
+          DType::kBF16);
+      // The plane reached the graph at its own width; nothing widened it.
+      LSE_EXPECT(pa.dtype() == DType::kU32);
+
+      Array got = quant_linear(xa, pa, sa, ba, bits, 64);
+      LSE_EXPECT(got.node()->kind == OpKind::kQuantMatMul);
+      LSE_EXPECT(got.node()->inputs.size() == 4);
+
+      const std::vector<float> g = drain(got);
+      LSE_EXPECT(g.size() == static_cast<std::size_t>(rows * kN));
+      for (std::int64_t r = 0; r < rows; ++r) {
+        for (std::int64_t o = 0; o < kN; ++o) {
+          double want = 0.0;
+          for (std::int64_t c = 0; c < kK; ++c) {
+            want += static_cast<double>(x[static_cast<std::size_t>(r * kK + c)]) *
+                    static_cast<double>(
+                        dequantized[static_cast<std::size_t>(o * kK + c)]);
+          }
+          LSE_EXPECT_NEAR(g[static_cast<std::size_t>(r * kN + o)], want,
+                          1e-5 + 1e-5 * std::fabs(want));
+        }
+      }
+    }
+  }
+}
+
+// The gather half of the same op. A tied head reads this table as a matrix and
+// as rows, so both readers have to agree with the codes on disk.
+LSE_TEST(quant_embedding_gathers_the_rows_it_encodes) {
+  for (int bits : {2, 3, 4, 5, 6, 8}) {
     auto spec = quant::GroupAffine::make(bits, 64);
     LSE_EXPECT(spec.ok());
     if (!spec.ok()) continue;
     const quant::GroupAffine q = *spec;
 
-    constexpr std::int64_t kN = 32, kK = 128;
-    const auto lanes_per_row = q.packed_words(kK);
-    const auto groups_per_row = q.group_count(kK);
-
-    std::vector<float> x(kK);
-    for (std::int64_t i = 0; i < kK; ++i) {
-      x[static_cast<std::size_t>(i)] =
-          0.1f * std::sin(0.7f * static_cast<float>(i));
-    }
+    constexpr std::int64_t kVocab = 9, kDim = 128;
+    const auto lanes_per_row = q.packed_words(kDim);
+    const auto groups_per_row = q.group_count(kDim);
 
     std::vector<std::uint32_t> packed(
-        static_cast<std::size_t>(kN) * lanes_per_row);
-    std::vector<float> scales(static_cast<std::size_t>(kN) * groups_per_row);
+        static_cast<std::size_t>(kVocab) * lanes_per_row);
+    std::vector<float> scales(static_cast<std::size_t>(kVocab) * groups_per_row);
     std::vector<float> biases(scales.size());
-    std::vector<float> dequantized(static_cast<std::size_t>(kN * kK));
+    std::vector<float> table(static_cast<std::size_t>(kVocab * kDim));
 
-    for (std::int64_t r = 0; r < kN; ++r) {
-      std::vector<float> row(static_cast<std::size_t>(kK));
-      for (std::int64_t c = 0; c < kK; ++c) {
+    for (std::int64_t r = 0; r < kVocab; ++r) {
+      std::vector<float> row(static_cast<std::size_t>(kDim));
+      for (std::int64_t c = 0; c < kDim; ++c) {
         row[static_cast<std::size_t>(c)] =
-            0.05f * std::cos(0.13f * static_cast<float>(r * kK + c));
+            0.05f * std::cos(0.31f * static_cast<float>(r * kDim + c));
       }
       const auto ro = static_cast<std::size_t>(r);
       std::vector<bfloat16_t> s(groups_per_row), b(groups_per_row);
-      q.quantize_row<bfloat16_t>(row.data(), static_cast<std::size_t>(kK),
+      q.quantize_row<bfloat16_t>(row.data(), static_cast<std::size_t>(kDim),
                                  packed.data() + ro * lanes_per_row, s.data(),
                                  b.data());
-      q.dequantize_row<bfloat16_t>(
-          packed.data() + ro * lanes_per_row, s.data(), b.data(),
-          static_cast<std::size_t>(kK),
-          dequantized.data() + ro * static_cast<std::size_t>(kK));
+      q.dequantize_row<bfloat16_t>(packed.data() + ro * lanes_per_row, s.data(),
+                                   b.data(), static_cast<std::size_t>(kDim),
+                                   table.data() + ro * static_cast<std::size_t>(kDim));
       for (std::size_t g = 0; g < groups_per_row; ++g) {
         scales[ro * groups_per_row + g] = s[g].to_float();
         biases[ro * groups_per_row + g] = b[g].to_float();
       }
     }
 
-    Array xa = host_array(x, Shape{1, kK});
     Array pa = packed_host_array(
-        packed, Shape{kN, static_cast<std::int64_t>(lanes_per_row)});
+        packed, Shape{kVocab, static_cast<std::int64_t>(lanes_per_row)});
     Array sa = typed_host_array(
-        scales, Shape{kN, static_cast<std::int64_t>(groups_per_row)},
+        scales, Shape{kVocab, static_cast<std::int64_t>(groups_per_row)},
         DType::kBF16);
     Array ba = typed_host_array(
-        biases, Shape{kN, static_cast<std::int64_t>(groups_per_row)},
+        biases, Shape{kVocab, static_cast<std::int64_t>(groups_per_row)},
         DType::kBF16);
-    // The plane reached the graph at its own width; nothing widened it.
-    LSE_EXPECT(pa.dtype() == DType::kU32);
 
-    Array wa = host_array(dequantized, Shape{kN, kK});
-    Array want = linear(xa, wa);
-    Array got = quant_linear(xa, pa, sa, ba, bits, 64);
-    LSE_EXPECT(got.node()->kind == OpKind::kQuantMatMul);
+    const std::vector<float> want_ids{8.0f, 0.0f, 5.0f, 3.0f};
+    Array ids = host_array(want_ids, Shape{1, 4});
+
+    // The table carries its own planes, so the model kernel asks for an
+    // embedding and the storage format picks the op.
+    auto planes = std::make_shared<QuantPlanes>();
+    planes->scales = sa.node();
+    planes->biases = ba.node();
+    planes->bits = bits;
+    planes->group_size = 64;
+    planes->in_features = kDim;
+    pa.node()->quant = planes;
+
+    LSE_EXPECT(weight_shape(pa) == (Shape{kVocab, kDim}));
+    Array got = embedding(pa, ids);
+    LSE_EXPECT(got.node()->kind == OpKind::kQuantEmbedding);
     LSE_EXPECT(got.node()->inputs.size() == 4);
+    LSE_EXPECT(got.shape() == (Shape{1, 4, kDim}));
 
-    const std::vector<float> w = drain(want);
     const std::vector<float> g = drain(got);
-    LSE_EXPECT(w.size() == static_cast<std::size_t>(kN));
-    LSE_EXPECT(g.size() == w.size());
-    for (std::size_t i = 0; i < w.size(); ++i) {
-      LSE_EXPECT_NEAR(g[i], w[i],
-                      1e-4 + 1e-4 * std::fabs(static_cast<double>(w[i])));
+    LSE_EXPECT(g.size() == want_ids.size() * static_cast<std::size_t>(kDim));
+    for (std::size_t t = 0; t < want_ids.size(); ++t) {
+      const auto row = static_cast<std::size_t>(want_ids[t]);
+      for (std::int64_t c = 0; c < kDim; ++c) {
+        LSE_EXPECT_NEAR(g[t * static_cast<std::size_t>(kDim) +
+                          static_cast<std::size_t>(c)],
+                        table[row * static_cast<std::size_t>(kDim) +
+                              static_cast<std::size_t>(c)],
+                        1e-6);
+      }
     }
   }
+}
+
+// A group-affine row whose scale plane does not cover it exactly is the one
+// shape error that produces plausible numbers rather than a crash: `i /
+// group_size` walks off the end of the row's own scales and into the next
+// row's, and on the last row past the plane entirely. The device kernels
+// already decline these; so must the host arm, or a shape the loader would
+// reject reaches it as a fallback and answers with someone else's scales.
+LSE_TEST(a_scale_plane_that_does_not_cover_the_row_is_refused) {
+  constexpr int kBits = 4, kGroup = 64;
+
+  // 12 lanes of 4-bit codes is 96 weights: one whole group of 64 and half of
+  // another. Truncating division makes 96/64 == 1, so a one-group plane looks
+  // right to any check that does not multiply back.
+  {
+    std::vector<std::uint32_t> packed(4 * 12, 0x11111111u);
+    std::vector<float> sc(4, 1.0f), bi(4, 0.0f);
+    Array pa = packed_host_array(packed, Shape{4, 12});
+    Array sa = typed_host_array(sc, Shape{4, 1}, DType::kBF16);
+    Array ba = typed_host_array(bi, Shape{4, 1}, DType::kBF16);
+    Array x = host_array(std::vector<float>(96, 1.0f), Shape{1, 96});
+    Array y = quant_linear(x, pa, sa, ba, kBits, kGroup);
+    LSE_EXPECT(!y.eval().ok());
+  }
+
+  // The gather half: 32 lanes is 256 weights needing four groups, and two are
+  // offered. Groups 2 and 3 would resolve into the next vocabulary row.
+  {
+    std::vector<std::uint32_t> packed(4 * 32, 0x11111111u);
+    std::vector<float> sc{1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<float> bi(8, 0.0f);
+    Array pa = packed_host_array(packed, Shape{4, 32});
+    Array sa = typed_host_array(sc, Shape{4, 2}, DType::kBF16);
+    Array ba = typed_host_array(bi, Shape{4, 2}, DType::kBF16);
+    Array ids = host_array({0.0f}, Shape{1});
+    Array e = quant_embedding(pa, sa, ba, ids, kBits, kGroup);
+    LSE_EXPECT(!e.eval().ok());
+  }
+
+  // An activation row wider than the weight is the same error one operand
+  // over, and the worst of the three: the row count is derived from the
+  // plane's width while the output was sized from x's leading axes, so a
+  // 512-wide row against a 256-wide weight writes two rows into a one-row
+  // output.
+  {
+    std::vector<std::uint32_t> packed(4 * 32, 0x11111111u);
+    std::vector<float> sc(4 * 4, 1.0f), bi(4 * 4, 0.0f);
+    Array pa = packed_host_array(packed, Shape{4, 32});
+    Array sa = typed_host_array(sc, Shape{4, 4}, DType::kBF16);
+    Array ba = typed_host_array(bi, Shape{4, 4}, DType::kBF16);
+    for (std::int64_t width : {std::int64_t{512}, std::int64_t{128}}) {
+      Array x = host_array(
+          std::vector<float>(static_cast<std::size_t>(width), 1.0f),
+          Shape{1, width});
+      Array y = quant_linear(x, pa, sa, ba, kBits, kGroup);
+      LSE_EXPECT(!y.eval().ok());
+    }
+  }
+
+  // A biases plane that disagrees with the scales plane is the same class of
+  // error one axis over.
+  {
+    std::vector<std::uint32_t> packed(4 * 16, 0x11111111u);
+    std::vector<float> sc(4 * 2, 1.0f), bi(4, 0.0f);
+    Array pa = packed_host_array(packed, Shape{4, 16});
+    Array sa = typed_host_array(sc, Shape{4, 2}, DType::kBF16);
+    Array ba = typed_host_array(bi, Shape{4, 1}, DType::kBF16);
+    Array x = host_array(std::vector<float>(128, 1.0f), Shape{1, 128});
+    Array y = quant_linear(x, pa, sa, ba, kBits, kGroup);
+    LSE_EXPECT(!y.eval().ok());
+  }
+}
+
+// linear() and embedding() route on the weight, not on a flag the caller sets,
+// which is what lets every lse::ops weight struct stay a plain Array.
+LSE_TEST(a_group_affine_weight_picks_its_own_contraction) {
+  Array x = host_array(std::vector<float>(64, 0.5f), Shape{1, 64});
+  Array plain = host_array(std::vector<float>(64 * 8, 0.25f), Shape{8, 64});
+  LSE_EXPECT(linear(x, plain).node()->kind == OpKind::kLinear);
+  LSE_EXPECT(weight_shape(plain) == (Shape{8, 64}));
+
+  Array packed = packed_host_array(std::vector<std::uint32_t>(8 * 8, 0u),
+                                   Shape{8, 8});
+  Array sa = typed_host_array(std::vector<float>(8, 1.0f), Shape{8, 1},
+                              DType::kBF16);
+  auto planes = std::make_shared<QuantPlanes>();
+  planes->scales = sa.node();
+  planes->biases = sa.node();
+  planes->bits = 4;
+  planes->group_size = 64;
+  planes->in_features = 64;
+  packed.node()->quant = planes;
+
+  LSE_EXPECT(weight_shape(packed) == (Shape{8, 64}));
+  LSE_EXPECT(linear(x, packed).node()->kind == OpKind::kQuantMatMul);
 }
 
 LSE_TEST_MAIN()

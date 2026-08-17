@@ -30,12 +30,20 @@ struct HybridLMSpec {
   std::string lm_head_name;
   bool zero_centered_norm = true;
 
-  // Checkpoint tensors that are deliberately not part of the decoder stack —
-  // Qwen3.5 ships a vision tower and a multi-token-prediction head in the same
-  // file. Everything else must be claimed by some layer: an unclaimed tensor is
-  // a builder that misread the checkpoint, and it fails load rather than
-  // quietly producing a model with pieces missing.
-  std::vector<std::string> ignored_prefixes;
+  // Checkpoint tensors this architecture deliberately does not read — Qwen3.5
+  // ships a vision tower in the same file. Everything else must be claimed by
+  // some layer: an unclaimed tensor is a builder that misread the checkpoint,
+  // and it fails load rather than quietly producing a model with pieces
+  // missing.
+  //
+  // A refusal is reported at load with its count, its size and its reason. Not
+  // reading part of a checkpoint is a limitation of the build, and a silent
+  // skip is exactly how a half-loaded model comes to look like a working one.
+  struct Refusal {
+    std::string prefix;
+    std::string reason;
+  };
+  std::vector<Refusal> refused;
 
   // Recurrent state for the linear-attention layers, [B, heads, dim, dim].
   // Zero derives it from the Config the way lemonseed's mixer does, where the

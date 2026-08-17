@@ -229,7 +229,19 @@ Array repeat(const Array& x, int count, int axis) {
   return Array(n);
 }
 
+Shape weight_shape(const Array& w) {
+  if (!w.valid()) return Shape{};
+  const NodePtr& n = w.node();
+  if (!n->quant) return n->shape;
+  return Shape{n->shape.dim(0), n->quant->in_features};
+}
+
 Array linear(const Array& x, const Array& w) {
+  if (w.valid() && w.node()->quant) {
+    const QuantPlanes& q = *w.node()->quant;
+    return quant_linear(x, w, Array(q.scales), Array(q.biases), q.bits,
+                        q.group_size);
+  }
   const Shape& sx = x.shape();
   Shape out;
   for (std::size_t i = 0; i + 1 < sx.rank(); ++i) out.push_back(sx.dim(i));
@@ -261,7 +273,29 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   return Array(n);
 }
 
+Array quant_embedding(const Array& packed, const Array& scales,
+                      const Array& biases, const Array& ids, int bits,
+                      int group_size) {
+  Shape out;
+  for (std::size_t i = 0; i < ids.shape().rank(); ++i) {
+    out.push_back(ids.shape().dim(i));
+  }
+  out.push_back(packed.shape().dim(1) * 32 / bits);
+  auto n = make(OpKind::kQuantEmbedding, out, DType::kF32,
+                {packed.node(), scales.node(), biases.node(), ids.node()});
+  n->iattrs[0] = bits;
+  n->iattrs[1] = group_size;
+  n->prim = find_primitive("quant_embedding");
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+
 Array embedding(const Array& table, const Array& ids) {
+  if (table.valid() && table.node()->quant) {
+    const QuantPlanes& q = *table.node()->quant;
+    return quant_embedding(table, Array(q.scales), Array(q.biases), ids, q.bits,
+                           q.group_size);
+  }
   Shape out;
   for (std::size_t i = 0; i < ids.shape().rank(); ++i) out.push_back(ids.shape().dim(i));
   out.push_back(table.shape().dim(1));

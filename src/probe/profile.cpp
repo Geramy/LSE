@@ -89,7 +89,9 @@ math::MatrixElem operand_of_storage(DType storage) noexcept {
     case DType::kQ4: return math::MatrixElem::kI4;
     // f32 has no operand form on any target in the table; the f16 one is the
     // single narrowing the engine permits, and it is the row an f32 weight has
-    // always taken. Q8/Q6 dequantize to the accumulate type inside the kernel.
+    // always taken. Q8/Q6 dequantize to the accumulate type inside the kernel,
+    // and so does a group-affine packed plane (kU32) — its codes reach the
+    // accumulator as floats, never as a matrix-core operand.
     default: return math::MatrixElem::kF16;
   }
 }

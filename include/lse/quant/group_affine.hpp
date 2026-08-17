@@ -90,9 +90,16 @@ struct GroupAffine {
   [[nodiscard]] Status check_row(std::size_t k) const;
 
   // MLX's own shape identity — w.shape(-1) * 32 / bits == scales.shape(-1) *
-  // group_size — run backwards. This is the answer that needs no config at
-  // all, so a checkpoint whose per-tensor block is in a spelling LSE does not
-  // recognise still cannot decode at the wrong width.
+  // group_size — run backwards.
+  //
+  // The identity pins only the RATIO bits/group_size, so this answers with the
+  // width implied by the group size it is given and cannot check that group
+  // size. A wrong `bits` at the right group size is caught. A (bits,
+  // group_size) pair that is wrong in the same proportion — reading a 4-bit
+  // group-32 plane as 2-bit group-64, say — satisfies every check and decodes
+  // the row at twice its width. So the group_size half of a per-tensor
+  // override is load-bearing and unverifiable; only `bits` has a second
+  // opinion.
   static Result<int> bits_from_shapes(std::int64_t packed_last,
                                       std::int64_t scales_last,
                                       int group_size);

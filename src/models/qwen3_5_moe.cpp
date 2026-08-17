@@ -1,9 +1,18 @@
 // Qwen3.5 MoE: the shared Qwen3.5 mixers with a routed feed-forward.
 //
-// Read off Qwen/Qwen3.5-35B-A3B and transcribed from
-// transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py. The routing shape is
-// 256 experts, top-8, expert width 512 — lemonseed's 8-experts-top-2 does not
-// generalise, so nothing here is inherited from it.
+// Tensor names and shapes are read from the indexes of
+// mlx-community/Qwen3.5-35B-A3B-8bit and
+// lmstudio-community/Qwen3.6-35B-A3B-MLX-6bit (config model_type qwen3_5_moe;
+// the 3.6 release is the same architecture). The routing shape is 256 experts,
+// top-8, expert width 512 — lemonseed's 8-experts-top-2 does not generalise, so
+// nothing here is inherited from it.
+//
+// NOT VALIDATED BY A LOAD. Neither checkpoint can be opened by this engine:
+// both are split across six or eight shards and SafeTensors reads one file with
+// no index, and both quantize the expert stack as rank-3 group-affine planes,
+// for which there is no indexed contraction. This file is therefore correct
+// about names and shapes and unproven about everything else; the two blockers
+// are named where they bite rather than papered over.
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -35,30 +44,21 @@ class Qwen35MoE final : public IFeedForward {
     LSE_RETURN_IF_ERROR(qwen3_5::expect_shape(router_, p + ".gate.weight",
                                               Shape{experts, hidden}));
 
-    // gate_up_proj is one [E, 2*inter, hidden] tensor whose per-expert output
-    // rows are gate then up, which HF splits with chunk(2, -1) on every token.
-    // Splitting it into the two [E, out, in] matrices ops::routed_experts wants
-    // costs one pass over the tensor here instead of a slice per forward. The
-    // staging buffer is the size of the fused tensor, so this peaks at roughly
-    // 1.5x its footprint per layer.
-    const std::string gu = p + ".experts.gate_up_proj";
-    std::vector<std::int64_t> gate_rows;
-    std::vector<std::int64_t> up_rows;
-    gate_rows.reserve(static_cast<std::size_t>(experts * inter));
-    up_rows.reserve(static_cast<std::size_t>(experts * inter));
-    for (std::int64_t e = 0; e < experts; ++e) {
-      for (std::int64_t i = 0; i < inter; ++i) {
-        gate_rows.push_back(e * 2 * inter + i);
-        up_rows.push_back(e * 2 * inter + inter + i);
-      }
-    }
-    LSE_ASSIGN_OR(stacked_.gate,
-                  b.require_rows(gu, gate_rows, Shape{experts, inter, hidden}));
-    LSE_ASSIGN_OR(stacked_.up,
-                  b.require_rows(gu, up_rows, Shape{experts, inter, hidden}));
-    LSE_ASSIGN_OR(stacked_.down, b.require(p + ".experts.down_proj"));
+    // MLX's SwitchGLU keeps the three expert matrices apart and stacks each as
+    // [E, out, in] — already the layout ops::routed_experts wants, so unlike
+    // HF's fused gate_up_proj nothing is de-interleaved here.
+    const std::string sw = p + ".switch_mlp";
+    LSE_ASSIGN_OR(stacked_.gate, b.require(sw + ".gate_proj.weight"));
+    LSE_RETURN_IF_ERROR(qwen3_5::expect_shape(stacked_.gate,
+                                              sw + ".gate_proj.weight",
+                                              Shape{experts, inter, hidden}));
+    LSE_ASSIGN_OR(stacked_.up, b.require(sw + ".up_proj.weight"));
+    LSE_RETURN_IF_ERROR(qwen3_5::expect_shape(stacked_.up,
+                                              sw + ".up_proj.weight",
+                                              Shape{experts, inter, hidden}));
+    LSE_ASSIGN_OR(stacked_.down, b.require(sw + ".down_proj.weight"));
     LSE_RETURN_IF_ERROR(qwen3_5::expect_shape(stacked_.down,
-                                              p + ".experts.down_proj",
+                                              sw + ".down_proj.weight",
                                               Shape{experts, hidden, inter}));
 
     const std::string sp = p + ".shared_expert";
@@ -119,7 +119,7 @@ bool looks_like_qwen3_5_moe(const Config& config, const SafeTensors& weights) {
   (void)config;
   return weights.find(qwen3_5::kGdnMarker) != nullptr &&
          weights.find(qwen3_5::kMoeMarker) != nullptr &&
-         weights.find("model.language_model.layers.0.mlp.gate.weight") != nullptr;
+         weights.find("language_model.model.layers.0.mlp.gate.weight") != nullptr;
 }
 
 std::unique_ptr<HybridLM> make_qwen3_5_moe(const Config& config) {
@@ -130,7 +130,7 @@ std::unique_ptr<HybridLM> make_qwen3_5_moe(const Config& config) {
                                                       : qwen3_5::make_gdn();
         return std::make_unique<HybridBlock>(
             std::move(mixer), std::make_unique<Qwen35MoE>(),
-            /*zero_centered_norm=*/true, /*mod=*/nullptr, qwen3_5::block_spec());
+            /*zero_centered_norm=*/false, /*mod=*/nullptr, qwen3_5::block_spec());
       });
 }
 

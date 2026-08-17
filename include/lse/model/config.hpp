@@ -15,6 +15,7 @@
 
 #include "lse/core/dtype.hpp"
 #include "lse/core/status.hpp"
+#include "lse/quant/group_affine.hpp"
 
 namespace lse::model {
 
@@ -70,6 +71,12 @@ struct Config {
   // False means the checkpoint carries a separate lm_head.
   bool tie_word_embeddings = true;
 
+  // Group geometry per quantized tensor, read from the checkpoint's own
+  // `quantization` block including its per-module overrides. Empty for an
+  // unquantized checkpoint, and a lookup on an empty map fails naming the
+  // tensor rather than assuming a width.
+  quant::GroupAffineMap quantization;
+
   // Training-side
   std::int32_t train_seq_len = 128;
   float rms_eps = 1e-6f;
@@ -81,9 +88,17 @@ struct Config {
   // and advances a write position; the tensor never grows.
   std::int32_t kv_length = 0;
 
+  // Engine allocation, not a checkpoint fact. Attention reserves
+  // [B, kv_heads, capacity, head_dim] once and never grows it, so a model that
+  // trained at 262144 would reserve gigabytes per layer before the first token
+  // arrives. The default covers a working session and kv_length is how a caller
+  // asks for the model's full context.
+  static constexpr std::int32_t kDefaultKvCapacity = 4096;
+
   [[nodiscard]] std::int32_t kv_capacity() const noexcept {
     if (kv_length > 0) return kv_length;
-    return train_seq_len * 2 > 2048 ? train_seq_len * 2 : 2048;
+    const std::int32_t want = train_seq_len * 2 > 2048 ? train_seq_len * 2 : 2048;
+    return want < kDefaultKvCapacity ? want : kDefaultKvCapacity;
   }
 
   [[nodiscard]] bool is_attention_layer(std::int32_t layer_idx) const noexcept {

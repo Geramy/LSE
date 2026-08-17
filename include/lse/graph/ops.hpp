@@ -47,8 +47,14 @@ Array repeat(const Array& x, int n, int axis);
 
 Array matmul(const Array& a, const Array& b);
 // x[..., in] @ w[out, in]^T. Weights are stored [out, in], so this avoids
-// transposing them on every call.
+// transposing them on every call. A weight carrying QuantPlanes routes to
+// quant_linear instead, so a model kernel says `linear` once and the
+// checkpoint decides which contraction runs.
 Array linear(const Array& x, const Array& w);
+// Logical [out, in] of a weight in whichever format it is stored. The packed
+// plane of a group-affine weight counts lanes on its last axis, not weights,
+// so a shape check against the config has to ask for this rather than shape().
+[[nodiscard]] Shape weight_shape(const Array& w);
 // x[..., K] @ W[idx, :, :]^T with W stacked [E, N, K]. `slot` picks a column
 // of `idx` [..., k], so MoE runs the k winners without slicing weights.
 Array linear_indexed(const Array& x, const Array& w, const Array& idx,
@@ -60,6 +66,13 @@ Array linear_indexed(const Array& x, const Array& w, const Array& idx,
 // than a dequantize pass feeding `linear`.
 Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                    const Array& biases, int bits, int group_size);
+// Row gather out of a group-affine table, dequantized in register. A tied LM
+// head makes this unavoidable: the same 4-bit table is read as a matrix by
+// lm_head and as rows by embed, and widening it for the gather would widen it
+// for both.
+Array quant_embedding(const Array& packed, const Array& scales,
+                      const Array& biases, const Array& ids, int bits,
+                      int group_size);
 Array embedding(const Array& table, const Array& ids);
 
 // Row gather/scatter over the last-axis-major layout every op here assumes.

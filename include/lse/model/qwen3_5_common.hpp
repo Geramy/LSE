@@ -17,21 +17,27 @@
 
 namespace lse::model::qwen3_5 {
 
-// Qwen3.5 is a multimodal wrapper, so the decoder sits under `language_model`
-// and the vision tower and MTP head share the file. Both released dense repos
-// and the MoE repo use exactly these names.
-inline constexpr std::string_view kBlockPrefix = "model.language_model.layers";
-inline constexpr std::string_view kLayer0 = "model.language_model.layers.0.";
+// Qwen3.5 is a multimodal wrapper: the decoder is `language_model.model.*` and
+// the vision tower is `vision_tower.*` in the same file. Read from the tensor
+// indexes of mlx-community/Qwen3.5-0.8B-4bit,
+// mlx-community/Qwen3.5-35B-A3B-8bit and
+// lmstudio-community/Qwen3.6-35B-A3B-MLX-6bit, all of which agree.
+inline constexpr std::string_view kBlockPrefix = "language_model.model.layers";
 
 // The linear-attention projection every Qwen3.5 layer 0 carries, dense or MoE.
 // Layer 0 is always a linear_attention layer: full_attention_interval is 4 and
 // the rule is (i + 1) % interval, so the first full-attention layer is 3.
 inline constexpr std::string_view kGdnMarker =
-    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+    "language_model.model.layers.0.linear_attn.in_proj_qkv.weight";
 
-// The tensor that separates the two: only the MoE stacks routed experts.
+// The tensor that separates the two: only the MoE stacks routed experts, and
+// MLX names the stack switch_mlp rather than experts.
 inline constexpr std::string_view kMoeMarker =
-    "model.language_model.layers.0.mlp.experts.gate_up_proj";
+    "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight";
+
+// The vision tower. Text-only decode does not read it, and hybrid_lm reports
+// what that cost rather than skipping it quietly.
+inline constexpr std::string_view kVisionPrefix = "vision_tower.";
 
 std::unique_ptr<IMixer> make_attention();
 std::unique_ptr<IMixer> make_gdn();

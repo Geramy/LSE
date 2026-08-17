@@ -1,5 +1,7 @@
 #include "lse/model/hybrid_lm.hpp"
 
+#include <cstdio>
+
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/ops/norm.hpp"
@@ -12,18 +14,34 @@ namespace {
 // a second architecture arrives, and nothing checked for one. This is that
 // check: it runs on every load, and it names the tensors rather than just their
 // count so the report says which part of the checkpoint went unread.
+//
+// A tensor under a declared refusal prefix is not an error, but it is not
+// silent either: each prefix that actually matched something is reported with
+// what it cost and why it was refused.
 Status audit_unclaimed(const WeightBinder& binder,
-                       const std::vector<std::string>& ignored) {
+                       const std::vector<HybridLMSpec::Refusal>& refused) {
   std::vector<std::string> missed;
+  std::vector<std::size_t> counts(refused.size(), 0);
+  std::vector<std::size_t> bytes(refused.size(), 0);
   for (const std::string& name : binder.unclaimed()) {
     bool covered = false;
-    for (const std::string& prefix : ignored) {
-      if (name.rfind(prefix, 0) == 0) {
-        covered = true;
-        break;
+    for (std::size_t i = 0; i < refused.size(); ++i) {
+      if (name.rfind(refused[i].prefix, 0) != 0) continue;
+      ++counts[i];
+      if (const TensorView* v = binder.weights().find(name)) {
+        bytes[i] += v->data.size();
       }
+      covered = true;
+      break;
     }
     if (!covered) missed.push_back(name);
+  }
+  for (std::size_t i = 0; i < refused.size(); ++i) {
+    if (counts[i] == 0) continue;
+    std::fprintf(stderr, "lse: refused %zu tensor(s) under '%s' (%.1f MiB): %s\n",
+                 counts[i], refused[i].prefix.c_str(),
+                 static_cast<double>(bytes[i]) / (1024.0 * 1024.0),
+                 refused[i].reason.c_str());
   }
   if (missed.empty()) return OkStatus();
 
@@ -65,7 +83,7 @@ Status HybridLM::load(WeightBinder& binder) {
     LSE_RETURN_IF_ERROR(block->load(binder, prefix, ctx));
     blocks_.push_back(std::move(block));
   }
-  return audit_unclaimed(binder, spec_.ignored_prefixes);
+  return audit_unclaimed(binder, spec_.refused);
 }
 
 Result<Array> HybridLM::embed(const Array& tokens) const {

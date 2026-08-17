@@ -22,7 +22,6 @@ namespace math = lse::math;
 namespace {
 
 constexpr std::uint32_t kBlock = 256;
-constexpr std::int64_t kMaxRows = 16;
 // Codes decoded per lane iteration. Past this the straight-line block stops
 // paying for itself in registers.
 constexpr std::uint32_t kMaxUnrolledCodes = 32;
@@ -86,9 +85,13 @@ bool device_fits(const KernelShapes& s) {
   return device_extension<AmdDeviceInfo>(*s.device) != nullptr;
 }
 
-bool shape_ok(const QuantDims& d) {
-  return d.valid && d.m > 0 && d.m < kMaxRows && d.n >= 16 && d.k >= 16;
-}
+// No row cap, unlike linear.lds: that one hands shapes above a tile to WMMA,
+// and a packed plane has no matrix-core operand form to hand off to. Declining
+// here would put the contraction on the host, so the wave-per-column schedule
+// covers every row count — one workgroup row per token, which is a GEMV per
+// token during prefill. A tiled form that shares a decoded chunk across
+// several tokens is the improvement; correctness does not wait for it.
+bool shape_ok(const QuantDims& d) { return d.valid; }
 
 // Chunks a lane decodes per iteration. Consecutive weight rows start at
 // multiples of `lanes`, so the run has to divide that too or some row's block
@@ -132,6 +135,7 @@ void emit_chunk(env::Emit& e, const QuantLinearArgs<S>& a,
                 const kir::Tile<kir::f32>* xs, const quant::GroupAffine& spec,
                 const kir::Val<kir::u32>& row_base,
                 const kir::Val<kir::u32>& scale_base,
+                const kir::Val<kir::u32>& x_base,
                 const kir::Val<kir::u32>& chunk,
                 const kir::LValue<kir::f32>& acc,
                 std::uint32_t chunks_per_group) {
@@ -145,7 +149,7 @@ void emit_chunk(env::Emit& e, const QuantLinearArgs<S>& a,
       e, a.packed, spec, e.let(row_base + chunk * words), scale, bias,
       [&](int c, const kir::Val<kir::f32>& w) {
         const auto idx = e.let(k_base + static_cast<std::uint32_t>(c));
-        const auto xe = xs != nullptr ? (*xs)[idx].read() : a.x[idx];
+        const auto xe = xs != nullptr ? (*xs)[idx].read() : a.x[x_base + idx];
         acc = math::fma(xe, w, acc.read());
       });
 }
@@ -196,17 +200,19 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     if (auto in_cols = e.when(col < n)) {
       const auto row_base = e.let(col * lanes);
       const auto scale_base = e.let(col * groups);
+      const auto x_base = e.let(stage ? e.u32(0) : row * k);
       for (auto c0 : e.range(0u, aligned, span)) {
         const auto chunk0 = e.let(c0 + lane * cpl);
         for (std::uint32_t u = 0; u < cpl; ++u) {
           emit_chunk<S>(e, a, stage ? &xs : nullptr, d.spec, row_base,
-                        scale_base, e.let(chunk0 + u), acc, chunks_per_group);
+                        scale_base, x_base, e.let(chunk0 + u), acc,
+                        chunks_per_group);
         }
       }
       if (aligned < nchunks) {
         for (auto chunk : e.range(e.u32(aligned) + lane, e.u32(nchunks), wave)) {
           emit_chunk<S>(e, a, stage ? &xs : nullptr, d.spec, row_base,
-                        scale_base, chunk, acc, chunks_per_group);
+                        scale_base, x_base, chunk, acc, chunks_per_group);
         }
       }
     }

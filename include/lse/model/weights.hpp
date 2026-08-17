@@ -43,6 +43,11 @@ class SafeTensors {
 
   static Result<SafeTensors> open(const std::string& path);
 
+  // A checkpoint split across shards, named by a safetensors index file. Every
+  // shard the index references is mapped and the tensors are merged into one
+  // namespace, so a caller cannot tell a sharded model from a single-file one.
+  static Result<SafeTensors> open_sharded(const std::string& index_path);
+
   [[nodiscard]] const TensorView* find(std::string_view name) const;
   [[nodiscard]] const std::map<std::string, TensorView>& tensors() const noexcept {
     return tensors_;
@@ -51,9 +56,19 @@ class SafeTensors {
   [[nodiscard]] const std::string& path() const noexcept { return path_; }
 
  private:
+  // Each shard stays mapped for the lifetime of the reader; TensorView::data
+  // points into these, so they must not be unmapped while views are alive.
+  struct Mapping {
+    void* ptr = nullptr;
+    std::size_t size = 0;
+  };
+
+  // Maps one safetensors file and merges its tensors into this reader.
+  Status map_file(const std::string& path);
+  void unmap_all() noexcept;
+
   std::string path_;
-  void* mapping_ = nullptr;
-  std::size_t mapping_size_ = 0;
+  std::vector<Mapping> mappings_;
   std::map<std::string, TensorView> tensors_;
 };
 

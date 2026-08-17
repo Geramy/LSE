@@ -64,6 +64,7 @@ namespace lse::graph {
   X(kOverwriteSlice,"overwrite_slice") \
   X(kRepeat,        "repeat") \
   X(kEmbedding,     "embedding") \
+  X(kQuantEmbedding,"quant_embedding") \
   X(kMatMul,        "matmul") \
   X(kLinear,        "linear") \
   X(kQuantMatMul,   "quant_matmul") \
@@ -95,6 +96,24 @@ LSE_DECLARE_ENUM(OpKind, std::uint16_t, LSE_OPKIND_LIST)
 class Node;
 using NodePtr = std::shared_ptr<Node>;
 
+// A group-affine weight is three tensors, but every op that consumes a weight
+// takes one Array. The packed plane carries the other two and its geometry
+// here, so linear() and embedding() can dispatch on the storage format without
+// every weight struct in lse::ops growing two more fields.
+//
+// Trace-time metadata only. The op builders read it and pass all three planes
+// as ordinary inputs, so the partitioner, the emitter and the scheduler never
+// see it and the packed plane stays a leaf buffer to all of them.
+struct QuantPlanes {
+  NodePtr scales;
+  NodePtr biases;
+  std::int32_t bits = 0;
+  std::int32_t group_size = 0;
+  // Weights per row. The packed plane's own last axis counts lanes, so this is
+  // the only place the logical width survives.
+  std::int64_t in_features = 0;
+};
+
 class Node {
  public:
   OpKind kind = OpKind::kBuffer;
@@ -112,6 +131,9 @@ class Node {
 
   backend::DeviceBuffer buffer;
   bool materialized = false;
+
+  // Non-null only on the packed plane of a group-affine weight.
+  std::shared_ptr<const QuantPlanes> quant;
 
   // Host copy of `buffer`, for nodes the host has to read or write. Device
   // memory has no host address, so this is the only way the interpreter can

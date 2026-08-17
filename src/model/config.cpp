@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -86,6 +87,37 @@ Result<Config> from_hf_json(const nlohmann::json& root) {
   }
   c.rope_dim = rotary;
 
+  // mRoPE splits the rotary channels across three position axes so an image
+  // patch can carry a row and a column alongside its time index. Every axis of
+  // a text-only prompt holds the same position, so the three sections collapse
+  // onto one and plain RoPE is exactly equivalent — but only while they cover
+  // the rotary half exactly, which is the part worth checking rather than
+  // assuming.
+  if (rope.contains("mrope_section") && rope["mrope_section"].is_array()) {
+    const auto sections = rope["mrope_section"].get<std::vector<std::int32_t>>();
+    std::int32_t covered = 0;
+    for (std::int32_t s : sections) covered += s;
+    if (covered * 2 != c.rope_dim) {
+      return LSE_ERROR(kUnimplemented, "mrope_section covers ",
+                       std::to_string(covered), " rotary pairs but rope_dim ",
+                       std::to_string(c.rope_dim), " has ",
+                       std::to_string(c.rope_dim / 2),
+                       "; text-only decode is only equivalent to plain RoPE "
+                       "when the sections tile the rotary half");
+    }
+  }
+
+  // The stack builds one mixer per layer from full_attention_interval. A
+  // checkpoint that also names layers whose mixer is replaced by a plain MLP
+  // would come out with the wrong layer at every named index.
+  if (t.contains("mlp_only_layers") && t["mlp_only_layers"].is_array() &&
+      !t["mlp_only_layers"].empty()) {
+    return LSE_ERROR(kUnimplemented, "mlp_only_layers names ",
+                     std::to_string(t["mlp_only_layers"].size()),
+                     " layer(s) with no mixer; the block factory builds a "
+                     "mixer for every layer");
+  }
+
   // Qwen has no sliding window; every full-attention layer sees the whole
   // prefix, which is what a zero window selects in GatedAttention::load.
   c.sliding_window = 0;
@@ -151,11 +183,20 @@ Result<Config> Config::from_json_string(const std::string& text) {
     return LSE_ERROR(kInvalidArgument, "model config is not valid JSON: ", e.what());
   }
 
+  // Read before the dispatch: the quantization block sits at the top level in
+  // both spellings, and everything the two paths disagree about is shape
+  // rather than storage.
+  LSE_ASSIGN_OR(quant::GroupAffineMap quantization,
+                quant::GroupAffineMap::from_config_json(text));
+
   if (j.contains("text_config") && j["text_config"].is_object()) {
-    return from_hf_json(j);
+    LSE_ASSIGN_OR(Config hf, from_hf_json(j));
+    hf.quantization = std::move(quantization);
+    return hf;
   }
 
   Config c;
+  c.quantization = std::move(quantization);
   read(j, "vocab_size", c.vocab_size);
   read(j, "hidden_size", c.hidden_size);
   read(j, "num_layers", c.num_layers);

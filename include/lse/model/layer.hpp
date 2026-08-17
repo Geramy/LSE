@@ -8,6 +8,7 @@
 // implementation covers both.
 #pragma once
 
+#include <array>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/weights.hpp"
+#include "lse/quant/group_affine.hpp"
 
 namespace lse::model {
 
@@ -49,7 +51,16 @@ struct LayerContext {
 // claimed — the most likely silent failure when adding a second architecture.
 class WeightBinder {
  public:
-  explicit WeightBinder(const SafeTensors& weights) : weights_(&weights) {}
+  // `quantization` says which tensors are group-affine and at what geometry.
+  // A quantized tensor is a triple — `<name>`, `<name minus .weight>.scales`,
+  // `.biases` — and the binder claims all three together, returning the packed
+  // plane with the other two attached, so a caller still asks for one name and
+  // hands the result to graph::linear unchanged. Null means the checkpoint
+  // declared no quantization: a tensor that nonetheless has the side planes
+  // then fails naming itself rather than being read at a guessed width.
+  explicit WeightBinder(const SafeTensors& weights,
+                        const quant::GroupAffineMap* quantization = nullptr)
+      : weights_(&weights), quantization_(quantization) {}
 
   Result<Array> require(std::string_view name);
   Result<Array> optional(std::string_view name);
@@ -63,15 +74,39 @@ class WeightBinder {
   // and transposes that would express the same permutation in the graph are
   // paid on every forward. Both uses today are Qwen3.5's — de-interleaving the
   // attention gate out of q_proj, and splitting a fused gate_up expert.
+  //
+  // On a group-affine tensor a row is an output feature, and its scale and
+  // bias rows carry the same index, so all three planes take the permutation
+  // and `shape` still names the logical [out, in].
   Result<Array> require_rows(std::string_view name,
                              const std::vector<std::int64_t>& order,
                              Shape shape);
 
+  // The same tensor under a different shape of the same elements. MLX writes a
+  // depthwise conv weight as [channels, kernel, 1]; the graph wants
+  // [channels, kernel]. Nothing moves — only the reported shape differs.
+  Result<Array> require_as(std::string_view name, Shape shape);
+
+  [[nodiscard]] const SafeTensors& weights() const noexcept { return *weights_; }
   [[nodiscard]] std::vector<std::string> unclaimed() const;
   [[nodiscard]] std::size_t claimed_count() const noexcept { return claimed_.size(); }
 
  private:
+  // The `.scales` / `.biases` planes beside `name`, or nulls when the
+  // checkpoint stored it in full precision. Errors when exactly one is there.
+  Result<std::array<const TensorView*, 2>> quant_planes(
+      std::string_view name) const;
+
+  // All three planes, claimed together. `order` and `logical` come from
+  // require_rows and are empty otherwise.
+  Result<Array> bind_quantized(std::string_view name, const TensorView& packed,
+                               const TensorView& scales,
+                               const TensorView& biases,
+                               const std::vector<std::int64_t>* order,
+                               Shape logical);
+
   const SafeTensors* weights_;
+  const quant::GroupAffineMap* quantization_ = nullptr;
   std::vector<std::string> claimed_;
 };
 

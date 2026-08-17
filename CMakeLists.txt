@@ -234,6 +234,17 @@ if(TARGET lse_tokenizer)
   target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer
                                     lse_probe lse_backends)
   lse_apply_common_flags(lse)
+
+  if(EXISTS "$ENV{LSE_SCRATCH}/layerdump.cpp")
+    add_executable(layerdump "$ENV{LSE_SCRATCH}/layerdump.cpp")
+    target_link_libraries(layerdump PRIVATE lse_runtime lse_model lse_tokenizer
+                                            lse_probe lse_backends)
+    lse_apply_common_flags(layerdump)
+    add_executable(qlindiff "$ENV{LSE_SCRATCH}/qlindiff.cpp")
+    target_link_libraries(qlindiff PRIVATE lse_runtime lse_model lse_tokenizer
+                                           lse_probe lse_backends)
+    lse_apply_common_flags(qlindiff)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

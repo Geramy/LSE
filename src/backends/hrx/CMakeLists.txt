@@ -31,6 +31,7 @@ add_library(lse_backend_hrx
   kernels/wmma_linear.cpp
   kernels/lds_linear.cpp
   kernels/quant_linear.cpp
+  kernels/quant_embedding.cpp
   kernels/linked.cpp
   kernels/dist_codec.cpp
   kernels/probe.cpp

@@ -4,14 +4,16 @@
 // other model kernels; this file only says which tensor plays which role and
 // which parameters Qwen picked.
 //
-// Transcribed from transformers/models/qwen3_5/modeling_qwen3_5.py and checked
-// against the tensor shapes in Qwen/Qwen3.5-0.8B, Qwen/Qwen3.5-4B and
-// Qwen/Qwen3.5-35B-A3B. It is not a plain transformer: every layer whose index
-// is not 3 mod 4 is a Gated DeltaNet, the same skeleton lemonseed uses. The
-// pieces that differ from lemonseed and are easily got wrong:
+// Checked against the tensors of mlx-community/Qwen3.5-0.8B-4bit. It is not a
+// plain transformer: every layer whose index is not 3 mod 4 is a Gated
+// DeltaNet, the same skeleton lemonseed uses. The pieces that differ from
+// lemonseed and are easily got wrong:
 //   - the GDN decay rate is exp(A_log), with no softplus around it
 //   - the GDN output gate and the post-conv activation are SiLU, not sigmoid
-//   - the GDN head norm is plain RMSNorm; every other norm is zero-centered
+//   - every norm is plain RMSNorm, weight * x. lemonseed's are zero-centered,
+//     (1 + weight) * x. The checkpoint says which: these weights average 1.0,
+//     and a zero-centered norm stores the deviation from 1, so they would
+//     average 0.
 //   - attention has no separate gate weight: q_proj is twice as wide and each
 //     head's second head_dim is its gate
 //   - RoPE is HF rotate_half over a quarter of a 256-wide head
@@ -59,14 +61,6 @@ std::int64_t rope_source(std::int64_t d, std::int64_t rope_dim) {
   if (d >= rope_dim) return d;
   const std::int64_t j = d / 2;
   return d % 2 == 0 ? j : j + rope_dim / 2;
-}
-
-// Rows of a [.., kernel] conv weight, unchanged: Qwen stores conv1d.weight as
-// [channels, 1, kernel] and graph::causal_conv1d wants [channels, kernel].
-std::vector<std::int64_t> identity_rows(std::int64_t n) {
-  std::vector<std::int64_t> order(static_cast<std::size_t>(n));
-  for (std::int64_t i = 0; i < n; ++i) order[static_cast<std::size_t>(i)] = i;
-  return order;
 }
 
 class Qwen35Attention final : public IMixer {
@@ -138,7 +132,7 @@ class Qwen35Attention final : public IMixer {
     spec_.mask = graph::MaskKind::kCausal;
     spec_.window = 0;
     spec_.norm_eps = c.rms_eps;
-    spec_.zero_centered_norm = true;
+    spec_.zero_centered_norm = false;
     spec_.kv_length = c.kv_capacity();
     LSE_ASSIGN_OR(rope_, shared_rope(c));
     return OkStatus();
@@ -197,11 +191,12 @@ class Qwen35GatedDeltaNet final : public IMixer {
     LSE_RETURN_IF_ERROR(
         expect_shape(w_.in_proj_b, p + ".in_proj_b.weight", Shape{vh, hidden}));
 
-    // [conv_dim, 1, kernel] in the checkpoint, [conv_dim, kernel] in the graph.
+    // MLX writes a depthwise conv weight as [channels, kernel, in/groups] and
+    // this conv is fully depthwise, so the trailing axis is 1 and the elements
+    // are already in the [conv_dim, kernel] order graph::causal_conv1d wants.
     const auto kernel = static_cast<std::int64_t>(c.gdn_conv_kernel);
-    LSE_ASSIGN_OR(w_.conv_w,
-                  b.require_rows(p + ".conv1d.weight", identity_rows(conv_dim),
-                                 Shape{conv_dim, kernel}));
+    LSE_ASSIGN_OR(w_.conv_w, b.require_as(p + ".conv1d.weight",
+                                          Shape{conv_dim, kernel}));
 
     LSE_ASSIGN_OR(w_.a_log, b.require(p + ".A_log"));
     LSE_RETURN_IF_ERROR(expect_shape(w_.a_log, p + ".A_log", Shape{vh}));
@@ -224,8 +219,6 @@ class Qwen35GatedDeltaNet final : public IMixer {
     spec_.query_scale = 1.0f / std::sqrt(static_cast<float>(c.gdn_head_dim));
     spec_.layout = ops::ProjLayout::kFusedQKV;
     spec_.norm_eps = c.rms_eps;
-    // Qwen3_5RMSNormGated is weight * x, not (1 + weight) * x. The rest of the
-    // model's norms are zero-centered; this one is not.
     spec_.zero_centered_norm = false;
     return OkStatus();
   }
@@ -270,15 +263,18 @@ HybridBlockSpec block_spec() {
 
 HybridLMSpec lm_spec(const Config& config) {
   HybridLMSpec spec;
-  spec.embed_name = "model.language_model.embed_tokens.weight";
-  spec.final_norm_name = "model.language_model.norm.weight";
+  spec.embed_name = "language_model.model.embed_tokens.weight";
+  spec.final_norm_name = "language_model.model.norm.weight";
   spec.block_prefix = std::string(kBlockPrefix);
-  spec.lm_head_name = config.tie_word_embeddings ? "" : "lm_head.weight";
-  spec.zero_centered_norm = true;
-  // The image tower and the speculative-decoding head are in the same file and
-  // are not part of text generation. Naming them here is what makes every
-  // other unclaimed tensor a load error.
-  spec.ignored_prefixes = {"model.visual.", "mtp."};
+  spec.lm_head_name =
+      config.tie_word_embeddings ? "" : "language_model.lm_head.weight";
+  spec.zero_centered_norm = false;
+  // Text-only. Naming the tower here is what makes every *other* unclaimed
+  // tensor a load error, and hybrid_lm prints what this one cost.
+  spec.refused.push_back(
+      {std::string(kVisionPrefix),
+       "this build decodes text only; the Qwen3.5 vision tower is not "
+       "implemented, so image and video tokens cannot be encoded"});
   spec.gdn_state_heads = config.gdn_v_heads;
   spec.gdn_state_dim = config.gdn_head_dim;
   spec.gdn_conv_width =
@@ -287,9 +283,13 @@ HybridLMSpec lm_spec(const Config& config) {
 }
 
 Status expect_shape(const Array& a, std::string_view name, Shape want) {
-  if (a.shape() == want) return OkStatus();
+  // The logical shape, not the stored one: a group-affine weight's plane counts
+  // packed lanes on its last axis, and comparing that against the config would
+  // reject every quantized checkpoint.
+  const Shape have = graph::weight_shape(a);
+  if (have == want) return OkStatus();
   return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' is ",
-                   a.shape().to_string(), " but the config implies ",
+                   have.to_string(), " but the config implies ",
                    want.to_string());
 }
 

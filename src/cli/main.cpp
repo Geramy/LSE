@@ -310,7 +310,9 @@ int main(int argc, char** argv) {
   if (!cfg.ok()) return fail(cfg.status(), "reading the config");
   if (opt.kv_len > 0) cfg->kv_length = opt.kv_len;
 
-  auto weights = model::SafeTensors::open(paths->weights);
+  auto weights = paths->weights.ends_with(".index.json")
+                     ? model::SafeTensors::open_sharded(paths->weights)
+                     : model::SafeTensors::open(paths->weights);
   if (!weights.ok()) return fail(weights.status(), "opening the weights");
 
   auto arch = model::detect_architecture(*cfg, *weights);
@@ -342,7 +344,7 @@ int main(int argc, char** argv) {
   if (!built.ok()) return fail(built.status(), "building the model");
   std::unique_ptr<model::HybridLM> lm = built.release();
 
-  model::WeightBinder binder(*weights);
+  model::WeightBinder binder(*weights, &cfg->quantization);
   const Status loaded = lm->load(binder);
   if (!loaded.ok()) return fail(loaded, "binding the weights");
 

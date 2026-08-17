@@ -2,6 +2,7 @@
 // cases run everywhere.
 #include "lse/model/config.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -16,6 +17,7 @@
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/ops/rope.hpp"
+#include "lse/quant/group_affine.hpp"
 
 using namespace lse;
 using namespace lse::model;
@@ -220,18 +222,21 @@ const std::vector<std::string>& lemonseed_names() {
   return v;
 }
 
+// Names taken from the tensor index of mlx-community/Qwen3.5-0.8B-4bit.
 const std::vector<std::string>& qwen_dense_names() {
   static const std::vector<std::string> v{
-      "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-      "model.language_model.layers.0.mlp.gate_proj.weight"};
+      "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+      "language_model.model.layers.0.mlp.gate_proj.weight"};
   return v;
 }
 
+// ...and of mlx-community/Qwen3.5-35B-A3B-8bit, whose routed experts are three
+// separate switch_mlp stacks rather than HF's fused gate_up_proj.
 const std::vector<std::string>& qwen_moe_names() {
   static const std::vector<std::string> v{
-      "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-      "model.language_model.layers.0.mlp.experts.gate_up_proj",
-      "model.language_model.layers.0.mlp.gate.weight"};
+      "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+      "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight",
+      "language_model.model.layers.0.mlp.gate.weight"};
   return v;
 }
 
@@ -489,6 +494,34 @@ LSE_TEST(hf_config_is_read_with_hf_field_names) {
   LSE_EXPECT_EQ(c->num_experts, 0);
 }
 
+LSE_TEST(the_quantization_block_travels_with_the_config) {
+  // An MLX checkpoint carries its group geometry beside the shape fields, and
+  // the loader needs both from the same read. The block is top level in both
+  // spellings, so it is not inside text_config.
+  const std::string quantized =
+      R"({"quantization": {"group_size": 64, "bits": 4, "mode": "affine",
+                           "language_model.model.layers.0.mlp.gate": {"bits": 8}}, )" +
+      hf_config().substr(1);
+  auto c = Config::from_json_string(quantized);
+  LSE_EXPECT(c.ok());
+  if (!c.ok()) return;
+  LSE_EXPECT(c->quantization.has_global());
+  LSE_EXPECT_EQ(c->quantization.global().bits, 4);
+  LSE_EXPECT_EQ(c->quantization.override_count(), std::size_t(1));
+  auto router =
+      c->quantization.resolve("language_model.model.layers.0.mlp.gate.weight");
+  LSE_EXPECT(router.ok());
+  if (router.ok()) LSE_EXPECT_EQ(router->bits, 8);
+
+  // An unquantized checkpoint carries no block, and nothing is invented for it.
+  auto plain = Config::from_json_string(hf_config());
+  LSE_EXPECT(plain.ok());
+  if (plain.ok()) {
+    LSE_EXPECT(!plain->quantization.has_global());
+    LSE_EXPECT(!plain->quantization.resolve("any.tensor.weight").ok());
+  }
+}
+
 LSE_TEST(hf_moe_config_carries_the_routing_shape) {
   auto c = Config::from_json_string(hf_config(
       R"(, "num_experts": 256, "num_experts_per_tok": 8,
@@ -666,13 +699,15 @@ std::vector<NamedShape> qwen_checkpoint(const Config& c) {
   const std::int64_t conv_dim = 2 * kh * ghd + vh * ghd;
 
   std::vector<NamedShape> t;
-  t.push_back({"model.language_model.embed_tokens.weight", {c.vocab_size, h}});
-  t.push_back({"model.language_model.norm.weight", {h}});
-  if (!c.tie_word_embeddings) t.push_back({"lm_head.weight", {c.vocab_size, h}});
+  t.push_back({"language_model.model.embed_tokens.weight", {c.vocab_size, h}});
+  t.push_back({"language_model.model.norm.weight", {h}});
+  if (!c.tie_word_embeddings) {
+    t.push_back({"language_model.lm_head.weight", {c.vocab_size, h}});
+  }
 
   for (std::int32_t i = 0; i < c.num_layers; ++i) {
     const std::string p =
-        "model.language_model.layers." + std::to_string(i) + ".";
+        "language_model.model.layers." + std::to_string(i) + ".";
     t.push_back({p + "input_layernorm.weight", {h}});
     t.push_back({p + "post_attention_layernorm.weight", {h}});
 
@@ -690,7 +725,7 @@ std::vector<NamedShape> qwen_checkpoint(const Config& c) {
       t.push_back({g + "in_proj_z.weight", {vh * ghd, h}});
       t.push_back({g + "in_proj_a.weight", {vh, h}});
       t.push_back({g + "in_proj_b.weight", {vh, h}});
-      t.push_back({g + "conv1d.weight", {conv_dim, 1, c.gdn_conv_kernel}});
+      t.push_back({g + "conv1d.weight", {conv_dim, c.gdn_conv_kernel, 1}});
       t.push_back({g + "A_log", {vh}});
       t.push_back({g + "dt_bias", {vh}});
       t.push_back({g + "norm.weight", {ghd}});
@@ -702,8 +737,9 @@ std::vector<NamedShape> qwen_checkpoint(const Config& c) {
       const std::int64_t e = c.num_experts, in = c.expert_intermediate;
       const std::int64_t si = c.shared_expert_intermediate;
       t.push_back({m + "gate.weight", {e, h}});
-      t.push_back({m + "experts.gate_up_proj", {e, 2 * in, h}});
-      t.push_back({m + "experts.down_proj", {e, h, in}});
+      t.push_back({m + "switch_mlp.gate_proj.weight", {e, in, h}});
+      t.push_back({m + "switch_mlp.up_proj.weight", {e, in, h}});
+      t.push_back({m + "switch_mlp.down_proj.weight", {e, h, in}});
       t.push_back({m + "shared_expert.gate_proj.weight", {si, h}});
       t.push_back({m + "shared_expert.up_proj.weight", {si, h}});
       t.push_back({m + "shared_expert.down_proj.weight", {h, si}});
@@ -741,7 +777,7 @@ LSE_TEST(qwen_dense_load_claims_every_tensor_in_the_checkpoint) {
   // is exactly why the audit has to.
   std::vector<NamedShape> extra = full;
   extra.push_back(
-      {"model.language_model.layers.0.linear_attn.in_proj_g.weight", {8, 32}});
+      {"language_model.model.layers.0.linear_attn.in_proj_g.weight", {8, 32}});
   const Status stray = load_fixture("q35_extra", c, extra);
   LSE_EXPECT(!stray.ok());
   if (!stray.ok()) {
@@ -751,7 +787,7 @@ LSE_TEST(qwen_dense_load_claims_every_tensor_in_the_checkpoint) {
   // One tensor a layer needs and the file lacks.
   std::vector<NamedShape> absent;
   for (const NamedShape& t : full) {
-    if (t.name != "model.language_model.layers.1.mlp.up_proj.weight") {
+    if (t.name != "language_model.model.layers.1.mlp.up_proj.weight") {
       absent.push_back(t);
     }
   }
@@ -774,7 +810,7 @@ LSE_TEST(qwen_moe_load_claims_every_tensor_in_the_checkpoint) {
   LSE_EXPECT_OK(load_fixture("q35moe_exact", c, full));
 
   std::vector<NamedShape> extra = full;
-  extra.push_back({"model.language_model.layers.2.mlp.experts.bias", {4, 16}});
+  extra.push_back({"language_model.model.layers.2.mlp.experts.bias", {4, 16}});
   const Status stray = load_fixture("q35moe_extra", c, extra);
   LSE_EXPECT(!stray.ok());
   if (!stray.ok()) {
@@ -785,24 +821,219 @@ LSE_TEST(qwen_moe_load_claims_every_tensor_in_the_checkpoint) {
   // silently fall back to the embedding table.
   std::vector<NamedShape> headless;
   for (const NamedShape& t : full) {
-    if (t.name != "lm_head.weight") headless.push_back(t);
+    if (t.name != "language_model.lm_head.weight") headless.push_back(t);
   }
   const Status no_head = load_fixture("q35moe_headless", c, headless);
   LSE_EXPECT(!no_head.ok());
 }
 
-LSE_TEST(qwen_ignores_only_the_vision_tower_and_the_mtp_head) {
-  // Two prefixes are declared not-part-of-the-decoder. They have to actually be
-  // skipped, and the declaration must not widen into "ignore what we missed".
+LSE_TEST(qwen_refuses_the_vision_tower_and_nothing_else) {
+  // One prefix is declared not-part-of-the-decoder, and it is the one the
+  // checkpoint actually uses: `vision_tower.`, not HF's `model.visual.`. It has
+  // to actually be skipped, and the declaration must not widen into "ignore
+  // what we missed".
   const Config c = tiny_qwen_config(/*moe=*/false);
   std::vector<NamedShape> t = qwen_checkpoint(c);
-  t.push_back({"model.visual.blocks.0.attn.qkv.weight", {8, 8}});
-  t.push_back({"mtp.fc.weight", {8, 8}});
-  LSE_EXPECT_OK(load_fixture("q35_ignored", c, t));
+  t.push_back({"vision_tower.blocks.0.attn.qkv.weight", {8, 8}});
+  t.push_back({"vision_tower.merger.linear_fc2.weight", {8, 8}});
+  LSE_EXPECT_OK(load_fixture("q35_refused", c, t));
 
-  // A near-miss on an ignored prefix is still an unread tensor.
-  t.push_back({"model.visual_extra.weight", {4}});
+  // A near-miss on the refused prefix is still an unread tensor.
+  t.push_back({"vision_towerx.weight", {4}});
   LSE_EXPECT(!load_fixture("q35_nearmiss", c, t).ok());
+}
+
+namespace {
+
+// A checkpoint in MLX's shape: every rank-2 `.weight` becomes a packed U32
+// plane plus BF16 `.scales` and `.biases`, and everything else stays F32. That
+// is the layout of every Qwen3.5 release, so a load that only works on an
+// unquantized fixture has not been tested against anything real.
+struct QuantFixture {
+  std::string path;
+  std::string config_json;
+};
+
+bool is_quantized_weight(const NamedShape& t) {
+  return t.dims.size() == 2 && t.name.size() > 7 &&
+         t.name.compare(t.name.size() - 7, 7, ".weight") == 0;
+}
+
+QuantFixture write_quantized_fixture(const std::string& stem,
+                                     const std::vector<NamedShape>& tensors,
+                                     int bits, int group_size,
+                                     bool drop_biases_of_first) {
+  auto spec = quant::GroupAffine::make(bits, group_size);
+  std::string header = "{";
+  std::size_t offset = 0;
+  bool dropped = false;
+
+  auto entry = [&](const std::string& name, const char* dtype,
+                   const std::vector<std::int64_t>& dims,
+                   std::size_t elem_bytes) {
+    std::size_t count = 1;
+    std::string d;
+    for (std::int64_t v : dims) {
+      if (!d.empty()) d += ",";
+      d += std::to_string(v);
+      count *= static_cast<std::size_t>(v);
+    }
+    if (header.size() > 1) header += ",";
+    header += "\"" + name + "\":{\"dtype\":\"" + dtype + "\",\"shape\":[" + d +
+              "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + count * elem_bytes) + "]}";
+    offset += count * elem_bytes;
+  };
+
+  for (const NamedShape& t : tensors) {
+    if (!is_quantized_weight(t)) {
+      entry(t.name, "F32", t.dims, 4);
+      continue;
+    }
+    const std::int64_t rows = t.dims[0], k = t.dims[1];
+    const auto lanes = static_cast<std::int64_t>(
+        spec.ok() ? spec->packed_words(static_cast<std::size_t>(k)) : 0);
+    const auto groups = static_cast<std::int64_t>(
+        spec.ok() ? spec->group_count(static_cast<std::size_t>(k)) : 0);
+    const std::string base = t.name.substr(0, t.name.size() - 7);
+    entry(t.name, "U32", {rows, lanes}, 4);
+    entry(base + ".scales", "BF16", {rows, groups}, 2);
+    if (drop_biases_of_first && !dropped) {
+      dropped = true;
+    } else {
+      entry(base + ".biases", "BF16", {rows, groups}, 2);
+    }
+  }
+  header += "}";
+  while (header.size() % 8 != 0) header += " ";
+
+  const std::string path =
+      (std::filesystem::temp_directory_path() / (stem + ".safetensors")).string();
+  std::ofstream out(path, std::ios::binary);
+  const std::uint64_t n = header.size();
+  out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  // Byte-patterned rather than zeroed: an all-zero scale plane would make every
+  // dequantized weight zero and hide a wiring error behind a finite result.
+  std::vector<std::uint8_t> data(offset);
+  for (std::size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<std::uint8_t>((i * 37u + 11u) % 61u);
+  }
+  out.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(offset));
+
+  QuantFixture f;
+  f.path = path;
+  f.config_json = "{\"quantization\":{\"group_size\":" +
+                  std::to_string(group_size) + ",\"bits\":" +
+                  std::to_string(bits) + ",\"mode\":\"affine\"}}";
+  return f;
+}
+
+// Every last axis a Qwen3.5 weight contracts over has to be a whole number of
+// groups, which the 32-wide toy config does not manage for the GDN output
+// projection until the value heads are as wide as one group.
+Config tiny_quantized_qwen_config() {
+  Config c = tiny_qwen_config(/*moe=*/false);
+  c.gdn_head_dim = 16;
+  return c;
+}
+
+}  // namespace
+
+LSE_TEST(a_quantized_qwen_checkpoint_binds_all_three_planes) {
+  const Config base = tiny_quantized_qwen_config();
+  const std::vector<NamedShape> t = qwen_checkpoint(base);
+  const QuantFixture f =
+      write_quantized_fixture("q35_quant", t, 4, 32, /*drop=*/false);
+
+  auto cfg = Config::from_json_string(f.config_json);
+  LSE_EXPECT(cfg.ok());
+  if (!cfg.ok()) return;
+  Config c = base;
+  c.quantization = cfg->quantization;
+  LSE_EXPECT(c.quantization.has_global());
+
+  auto st = SafeTensors::open(f.path);
+  LSE_EXPECT(st.ok());
+  if (!st.ok()) return;
+  auto model = build_model(c, *st);
+  LSE_EXPECT(model.ok());
+  if (!model.ok()) return;
+
+  WeightBinder binder(*st, &c.quantization);
+  LSE_EXPECT_OK((*model)->load(binder));
+  // Three planes per quantized weight, all claimed: the audit inside load()
+  // fails on anything left over, so reaching here is the proof.
+  LSE_EXPECT_EQ(binder.claimed_count(), st->tensors().size());
+
+  const std::int64_t T = 3;
+  graph::Array tokens = graph::Array::zeros(Shape{1, T}, DType::kF32);
+  LSE_EXPECT_OK(tokens.eval());
+  for (std::int64_t i = 0; i < T; ++i) {
+    graph::interpreter::store_element(*tokens.node(), (std::size_t)i,
+                                      (float)(i + 1));
+  }
+  auto hid = (*model)->hidden(tokens, nullptr, nullptr);
+  LSE_EXPECT(hid.ok());
+  if (!hid.ok()) return;
+  std::vector<float> v((std::size_t)(T * c.hidden_size));
+  LSE_EXPECT_OK(hid->to_host(v.data(), v.size() * sizeof(float)));
+  bool finite = true;
+  for (float x : v) finite = finite && std::isfinite(x);
+  LSE_EXPECT(finite);
+
+  // The tied head reads the same packed table the embedding gathered from.
+  auto logits = (*model)->lm_head(*hid);
+  LSE_EXPECT(logits.ok());
+  if (logits.ok()) LSE_EXPECT_EQ(logits->shape().dim(2), c.vocab_size);
+}
+
+LSE_TEST(a_quantized_weight_without_its_geometry_is_an_error) {
+  const Config base = tiny_quantized_qwen_config();
+  const std::vector<NamedShape> t = qwen_checkpoint(base);
+
+  // No quantization block in the config: the group size is not derivable from
+  // the shapes, so guessing one is the failure mode this refuses.
+  {
+    const QuantFixture f =
+        write_quantized_fixture("q35_noquant", t, 4, 32, /*drop=*/false);
+    auto st = SafeTensors::open(f.path);
+    LSE_EXPECT(st.ok());
+    if (!st.ok()) return;
+    auto model = build_model(base, *st);
+    LSE_EXPECT(model.ok());
+    if (!model.ok()) return;
+    WeightBinder binder(*st);
+    const Status s = (*model)->load(binder);
+    LSE_EXPECT(!s.ok());
+    if (!s.ok()) {
+      LSE_EXPECT(s.message().find("no quantization block") != std::string::npos);
+    }
+  }
+
+  // Half a triple: a scale plane with no bias plane.
+  {
+    const QuantFixture f =
+        write_quantized_fixture("q35_halftriple", t, 4, 32, /*drop=*/true);
+    auto cfg = Config::from_json_string(f.config_json);
+    LSE_EXPECT(cfg.ok());
+    if (!cfg.ok()) return;
+    Config c = base;
+    c.quantization = cfg->quantization;
+    auto st = SafeTensors::open(f.path);
+    LSE_EXPECT(st.ok());
+    if (!st.ok()) return;
+    auto model = build_model(c, *st);
+    LSE_EXPECT(model.ok());
+    if (!model.ok()) return;
+    WeightBinder binder(*st, &c.quantization);
+    const Status s = (*model)->load(binder);
+    LSE_EXPECT(!s.ok());
+    if (!s.ok()) {
+      LSE_EXPECT(s.message().find(".biases") != std::string::npos);
+    }
+  }
 }
 
 LSE_TEST(a_tiny_qwen_of_each_kind_runs_a_forward_pass) {

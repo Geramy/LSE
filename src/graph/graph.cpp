@@ -57,7 +57,8 @@ bool is_barrier(OpKind k) noexcept {
     case OpKind::kCausalConv1d:
     case OpKind::kMatMul: case OpKind::kLinear: case OpKind::kQuantMatMul:
     case OpKind::kAttention: case OpKind::kGDNChunkScan: case OpKind::kMoEDispatch:
-    case OpKind::kMoECombine: case OpKind::kEmbedding: case OpKind::kRoPE:
+    case OpKind::kMoECombine: case OpKind::kEmbedding:
+    case OpKind::kQuantEmbedding: case OpKind::kRoPE:
     case OpKind::kTopK: case OpKind::kArgMax: case OpKind::kOverwriteSlice:
       return true;
     default:

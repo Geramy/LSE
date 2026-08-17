@@ -559,6 +559,42 @@ Status eval_linear(Node& n) {
   return OkStatus();
 }
 
+// The three planes and the bit width have to describe one and the same row,
+// because the loops below turn `i / group_size` into a scale index without
+// bounds-checking it. A row that is not a whole number of groups reads the
+// *next* row's scales for its tail, and the last row reads past the plane
+// entirely — plausible numbers, no complaint. These are the two conditions the
+// device kernels' dims_of() already require, so enforcing them here only makes
+// the host arm accept exactly what the device one does.
+Status check_quant_planes(const quant::GroupAffine& spec, const char* op,
+                          const Shape& packed, const Shape& scales,
+                          const Shape& biases, std::size_t in_dim) {
+  if (packed.rank() != 2 || scales != biases || scales.rank() != 2 ||
+      scales.dim(0) != packed.dim(0)) {
+    return LSE_ERROR(kInvalidArgument, op, " has a ", packed.to_string(),
+                     " plane with scales ", scales.to_string(), " and biases ",
+                     biases.to_string(),
+                     "; the three must be matrices agreeing on the row axis");
+  }
+  const auto lanes = static_cast<std::size_t>(packed.dim(1));
+  const auto groups = static_cast<std::size_t>(scales.dim(1));
+  if (lanes * 32 != in_dim * static_cast<std::size_t>(spec.bits)) {
+    return LSE_ERROR(kInvalidArgument, op, " packed plane of ",
+                     std::to_string(lanes), " lanes does not hold a whole "
+                     "number of ", std::to_string(spec.bits), "-bit codes");
+  }
+  const std::size_t covered =
+      groups * static_cast<std::size_t>(spec.group_size);
+  if (covered != in_dim) {
+    return LSE_ERROR(kInvalidArgument, op, " scale plane has ",
+                     std::to_string(groups), " groups of ",
+                     std::to_string(spec.group_size), ", covering ",
+                     std::to_string(covered), " of the row's ",
+                     std::to_string(in_dim), " weights");
+  }
+  return OkStatus();
+}
+
 // The reference the emitted quant_linear kernel is diffed against. A U32 lane
 // holds several codes, so the packed plane is read at its own width rather
 // than through load_element, which speaks in floats.
@@ -574,12 +610,21 @@ Status eval_quant_matmul(Node& n) {
   const auto lanes = static_cast<std::size_t>(packed.shape.dim(1));
   const auto groups = static_cast<std::size_t>(scales.shape.dim(1));
   const std::size_t in_dim = lanes * 32 / static_cast<std::size_t>(spec.bits);
-  if (groups != spec.group_count(in_dim)) {
-    return LSE_ERROR(kInvalidArgument, "quant_linear scale plane has ",
-                     std::to_string(groups), " groups, ",
-                     std::to_string(in_dim), " weights at group size ",
-                     std::to_string(spec.group_size), " need ",
-                     std::to_string(spec.group_count(in_dim)));
+  LSE_RETURN_IF_ERROR(check_quant_planes(spec, "quant_linear", packed.shape,
+                                         scales.shape, biases.shape, in_dim));
+  // The row count below comes from the plane's width, but the output was sized
+  // from x's leading axes. Let them disagree and a wider x writes more rows
+  // than the output holds — a heap overflow, not a wrong number. The device
+  // kernel contracts over x's own last axis and declines the mismatch; match
+  // it rather than reinterpreting x's shape.
+  const auto x_width =
+      x.shape.rank() == 0
+          ? 0
+          : static_cast<std::size_t>(x.shape.dim(x.shape.rank() - 1));
+  if (x_width != in_dim) {
+    return LSE_ERROR(kInvalidArgument, "quant_linear contracts a row of ",
+                     std::to_string(x_width), " against a weight of ",
+                     std::to_string(in_dim), " per output");
   }
   const auto* w = static_cast<const std::uint32_t*>(host_bytes(packed));
   if (w == nullptr) {
@@ -671,6 +716,48 @@ Status eval_embedding(Node& n) {
     }
     for (std::size_t d = 0; d < dim; ++d) {
       store_element(n, t * dim + d, load_element(table, id * dim + d));
+    }
+  }
+  return OkStatus();
+}
+
+// The same gather against a group-affine table. Like eval_quant_matmul it
+// reads the packed plane at its own width, because load_element speaks floats
+// and a U32 lane holds several codes.
+Status eval_quant_embedding(Node& n) {
+  const Node& packed = *n.inputs[0];
+  const Node& scales = *n.inputs[1];
+  const Node& biases = *n.inputs[2];
+  const Node& ids = *n.inputs[3];
+  LSE_ASSIGN_OR(const quant::GroupAffine spec,
+                quant::GroupAffine::make(n.iattrs[0], n.iattrs[1]));
+
+  const auto vocab = static_cast<std::size_t>(packed.shape.dim(0));
+  const auto lanes = static_cast<std::size_t>(packed.shape.dim(1));
+  const auto groups = static_cast<std::size_t>(scales.shape.dim(1));
+  const std::size_t dim = lanes * 32 / static_cast<std::size_t>(spec.bits);
+  LSE_RETURN_IF_ERROR(check_quant_planes(spec, "quant_embedding", packed.shape,
+                                         scales.shape, biases.shape, dim));
+  const auto* w = static_cast<const std::uint32_t*>(host_bytes(packed));
+  if (w == nullptr) {
+    return LSE_ERROR(kInternal,
+                     "quant_embedding has no host copy of its packed table");
+  }
+  const std::size_t count = ids.element_count();
+
+  for (std::size_t t = 0; t < count; ++t) {
+    const auto id = static_cast<std::size_t>(load_element(ids, t));
+    if (id >= vocab) {
+      return LSE_ERROR(kOutOfRange, "token id ", std::to_string(id),
+                       " is outside a vocab of ", std::to_string(vocab));
+    }
+    const std::uint32_t* row = w + id * lanes;
+    for (std::size_t d = 0; d < dim; ++d) {
+      const std::size_t g = d / static_cast<std::size_t>(spec.group_size);
+      store_element(n, t * dim + d,
+                    static_cast<float>(spec.code_at(row, d)) *
+                            load_element(scales, id * groups + g) +
+                        load_element(biases, id * groups + g));
     }
   }
   return OkStatus();
@@ -1055,6 +1142,10 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
 
     case OpKind::kEmbedding:
       LSE_RETURN_IF_ERROR(eval_embedding(n));
+      break;
+
+    case OpKind::kQuantEmbedding:
+      LSE_RETURN_IF_ERROR(eval_quant_embedding(n));
       break;
 
     case OpKind::kTranspose:

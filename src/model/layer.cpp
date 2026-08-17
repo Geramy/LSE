@@ -43,45 +43,129 @@ DType device_storage(DType checkpoint) noexcept {
   }
 }
 
-}  // namespace
-
-Result<Array> WeightBinder::optional(std::string_view name) {
-  const TensorView* v = weights_->find(name);
-  if (v == nullptr) return LSE_ERROR(kNotFound, std::string(name));
-
-  // A weight is data, not a computation. Going through eval() would dispatch a
-  // fill kernel across every element and then overwrite the result one element
-  // at a time — for the tied head that is a quarter of a billion pointless
-  // writes on each side, and it dominated model load. Allocate the buffer and
-  // read the tensor straight into it instead.
+// Uploads one checkpoint tensor and reports it as `shape`. `order`, when
+// non-null, selects and reorders rows — a row being one span of the tensor's
+// last axis.
+//
+// A weight is data, not a computation. Going through eval() would dispatch a
+// fill kernel across every element and then overwrite the result one element
+// at a time — for the tied head that is a quarter of a billion pointless
+// writes on each side, and it dominated model load. Allocate the buffer and
+// read the tensor straight into it instead.
+Result<Array> upload(const TensorView& v, Shape shape,
+                     const std::vector<std::int64_t>* order) {
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
-    return LSE_ERROR(kInternal, "no usable backend to load '",
-                     std::string(name), "' into");
+    return LSE_ERROR(kInternal, "no usable backend to load '", v.name,
+                     "' into");
   }
   backend::IBackend& be = sched->backend();
 
-  const DType dt = device_storage(v->dtype);
-  Array a = Array::zeros(v->shape, dt);
+  const DType dt = device_storage(v.dtype);
+  Array a = Array::zeros(shape, dt);
   graph::Node& n = *a.node();
   LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be));
-  if (dt == v->dtype) {
-    LSE_RETURN_IF_ERROR(
-        v->read_native(graph::interpreter::host_bytes(n),
-                       dtype_storage_bytes(dt, n.element_count())));
+  const bool native = dt == v.dtype;
+
+  if (order == nullptr) {
+    if (native) {
+      LSE_RETURN_IF_ERROR(
+          v.read_native(graph::interpreter::host_bytes(n),
+                        dtype_storage_bytes(dt, n.element_count())));
+    } else {
+      LSE_RETURN_IF_ERROR(v.read_f32(
+          static_cast<float*>(graph::interpreter::host_bytes(n)),
+          n.element_count()));
+    }
   } else {
-    LSE_RETURN_IF_ERROR(v->read_f32(
-        static_cast<float*>(graph::interpreter::host_bytes(n)),
-        n.element_count()));
+    // Staged whole rather than read row by row: TensorView reads the mapping,
+    // and one sequential pass over it beats `order->size()` scattered ones.
+    const std::size_t rank = v.shape.rank();
+    const auto width =
+        static_cast<std::size_t>(rank >= 2 ? v.shape.dim(rank - 1) : 1);
+    const std::size_t elem = dtype_storage_bytes(dt, 1);
+    std::vector<std::byte> staged(dtype_storage_bytes(dt, v.element_count()));
+    if (native) {
+      LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
+    } else {
+      LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
+                                     v.element_count()));
+    }
+    auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
+    const std::size_t row_bytes = width * elem;
+    for (std::size_t i = 0; i < order->size(); ++i) {
+      std::memcpy(
+          dst + i * row_bytes,
+          staged.data() + static_cast<std::size_t>((*order)[i]) * row_bytes,
+          row_bytes);
+    }
   }
+
   // The mirror now holds the only copy; it is the authority until it is pushed.
   n.host_dirty = true;
   n.device_dirty = false;
   n.materialized = true;
   LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
-
-  claimed_.emplace_back(name);
   return a;
+}
+
+std::int64_t last_dim(const Shape& s) {
+  return s.rank() == 0 ? 0 : s.dim(s.rank() - 1);
+}
+
+Status check_rows(std::string_view name, const Shape& shape,
+                  const std::vector<std::int64_t>& order) {
+  const auto width = static_cast<std::size_t>(
+      shape.rank() >= 2 ? shape.dim(shape.rank() - 1) : 1);
+  const std::size_t rows = width > 0 ? shape.elem_count() / width : 0;
+  if (width == 0) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                     "' has no rows to take");
+  }
+  for (std::int64_t r : order) {
+    if (r < 0 || static_cast<std::size_t>(r) >= rows) {
+      return LSE_ERROR(kOutOfRange, "row ", std::to_string(r), " of '",
+                       std::string(name), "' is outside its ",
+                       std::to_string(rows), " rows");
+    }
+  }
+  return OkStatus();
+}
+
+}  // namespace
+
+Result<std::array<const TensorView*, 2>> WeightBinder::quant_planes(
+    std::string_view name) const {
+  constexpr std::string_view kWeight = ".weight";
+  std::array<const TensorView*, 2> planes{nullptr, nullptr};
+  if (name.size() <= kWeight.size() ||
+      name.substr(name.size() - kWeight.size()) != kWeight) {
+    return planes;
+  }
+  const std::string base(name.substr(0, name.size() - kWeight.size()));
+  planes[0] = weights_->find(base + ".scales");
+  planes[1] = weights_->find(base + ".biases");
+  if ((planes[0] == nullptr) != (planes[1] == nullptr)) {
+    const bool have_scales = planes[0] != nullptr;
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' has a '",
+                     have_scales ? ".scales" : ".biases", "' plane but no '",
+                     have_scales ? ".biases" : ".scales",
+                     "'; a group-affine weight needs both");
+  }
+  return planes;
+}
+
+Result<Array> WeightBinder::optional(std::string_view name) {
+  const TensorView* v = weights_->find(name);
+  if (v == nullptr) return LSE_ERROR(kNotFound, std::string(name));
+
+  LSE_ASSIGN_OR(const auto planes, quant_planes(name));
+  if (planes[0] == nullptr) {
+    LSE_ASSIGN_OR(Array a, upload(*v, v->shape, nullptr));
+    claimed_.emplace_back(name);
+    return a;
+  }
+  return bind_quantized(name, *v, *planes[0], *planes[1], nullptr, Shape{});
 }
 
 Result<Array> WeightBinder::require_rows(std::string_view name,
@@ -92,6 +176,11 @@ Result<Array> WeightBinder::require_rows(std::string_view name,
     return LSE_ERROR(kNotFound, "checkpoint has no tensor '", std::string(name),
                      "'");
   }
+  LSE_ASSIGN_OR(const auto planes, quant_planes(name));
+  if (planes[0] != nullptr) {
+    return bind_quantized(name, *v, *planes[0], *planes[1], &order, shape);
+  }
+
   const std::size_t rank = v->shape.rank();
   const auto width =
       static_cast<std::size_t>(rank >= 2 ? v->shape.dim(rank - 1) : 1);
@@ -103,51 +192,103 @@ Result<Array> WeightBinder::require_rows(std::string_view name,
                      " of them cannot fill the requested ",
                      std::to_string(shape.elem_count()), " elements");
   }
-  for (std::int64_t r : order) {
-    if (r < 0 || static_cast<std::size_t>(r) >= rows) {
-      return LSE_ERROR(kOutOfRange, "row ", std::to_string(r), " of '",
-                       std::string(name), "' is outside its ",
-                       std::to_string(rows), " rows");
+  LSE_RETURN_IF_ERROR(check_rows(name, v->shape, order));
+  LSE_ASSIGN_OR(Array a, upload(*v, shape, &order));
+  claimed_.emplace_back(name);
+  return a;
+}
+
+Result<Array> WeightBinder::require_as(std::string_view name, Shape shape) {
+  const TensorView* v = weights_->find(name);
+  if (v == nullptr) {
+    return LSE_ERROR(kNotFound, "checkpoint has no tensor '", std::string(name),
+                     "'");
+  }
+  if (v->element_count() != shape.elem_count()) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' is ",
+                     v->shape.to_string(), ", which is not ",
+                     shape.to_string(), " read differently");
+  }
+  LSE_ASSIGN_OR(Array a, upload(*v, shape, nullptr));
+  claimed_.emplace_back(name);
+  return a;
+}
+
+Result<Array> WeightBinder::bind_quantized(
+    std::string_view name, const TensorView& packed, const TensorView& scales,
+    const TensorView& biases, const std::vector<std::int64_t>* order,
+    Shape logical) {
+  if (quantization_ == nullptr) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                     "' is stored with .scales/.biases planes but the config "
+                     "declared no quantization block, so its group size is "
+                     "unknown");
+  }
+  if (packed.dtype != DType::kU32) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                     "' has .scales/.biases planes but is stored as ",
+                     to_string(packed.dtype),
+                     "; a group-affine plane is packed into u32 lanes");
+  }
+  if (scales.dtype != biases.dtype) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                     "' stores its scales as ", to_string(scales.dtype),
+                     " and its biases as ", to_string(biases.dtype));
+  }
+  if (packed.shape.rank() != 2) {
+    return LSE_ERROR(kUnimplemented, "'", std::string(name), "' is ",
+                     packed.shape.to_string(),
+                     "; group-affine weights are read as [out, in] matrices, "
+                     "and a stack of them needs an indexed group-affine "
+                     "contraction that this engine does not have");
+  }
+  if (scales.shape != biases.shape || scales.shape.rank() != 2 ||
+      scales.shape.dim(0) != packed.shape.dim(0)) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' is ",
+                     packed.shape.to_string(), " with scales ",
+                     scales.shape.to_string(), " and biases ",
+                     biases.shape.to_string(),
+                     "; the three planes must agree on the output axis");
+  }
+
+  LSE_ASSIGN_OR(const quant::GroupAffine spec,
+                quantization_->resolve_checked(name, last_dim(packed.shape),
+                                               last_dim(scales.shape)));
+  const std::int64_t in_features =
+      last_dim(packed.shape) * 32 / spec.bits;
+
+  Shape packed_shape = packed.shape;
+  Shape group_shape = scales.shape;
+  if (order != nullptr) {
+    LSE_RETURN_IF_ERROR(check_rows(name, packed.shape, *order));
+    const auto rows = static_cast<std::int64_t>(order->size());
+    if (logical.elem_count() != static_cast<std::size_t>(rows * in_features)) {
+      return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' has ",
+                       std::to_string(packed.shape.dim(0)), " rows of ",
+                       std::to_string(in_features), " weights; taking ",
+                       std::to_string(order->size()),
+                       " of them cannot fill the requested ",
+                       std::to_string(logical.elem_count()), " elements");
     }
+    packed_shape = Shape{rows, last_dim(packed.shape)};
+    group_shape = Shape{rows, last_dim(scales.shape)};
   }
 
-  graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) {
-    return LSE_ERROR(kInternal, "no usable backend to load '",
-                     std::string(name), "' into");
-  }
-  backend::IBackend& be = sched->backend();
+  LSE_ASSIGN_OR(Array a, upload(packed, packed_shape, order));
+  LSE_ASSIGN_OR(Array s, upload(scales, group_shape, order));
+  LSE_ASSIGN_OR(Array b, upload(biases, group_shape, order));
 
-  const DType dt = device_storage(v->dtype);
-  Array a = Array::zeros(shape, dt);
-  graph::Node& n = *a.node();
-  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be));
-
-  // Staged whole rather than read row by row: TensorView reads the mapping,
-  // and one sequential pass over it beats `order.size()` scattered ones.
-  const bool native = dt == v->dtype;
-  const std::size_t elem = dtype_storage_bytes(dt, 1);
-  std::vector<std::byte> staged(dtype_storage_bytes(dt, v->element_count()));
-  if (native) {
-    LSE_RETURN_IF_ERROR(v->read_native(staged.data(), staged.size()));
-  } else {
-    LSE_RETURN_IF_ERROR(v->read_f32(reinterpret_cast<float*>(staged.data()),
-                                    v->element_count()));
-  }
-  auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
-  const std::size_t row_bytes = width * elem;
-  for (std::size_t i = 0; i < order.size(); ++i) {
-    std::memcpy(dst + i * row_bytes,
-                staged.data() + static_cast<std::size_t>(order[i]) * row_bytes,
-                row_bytes);
-  }
-
-  n.host_dirty = true;
-  n.device_dirty = false;
-  n.materialized = true;
-  LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
+  auto planes = std::make_shared<graph::QuantPlanes>();
+  planes->scales = s.node();
+  planes->biases = b.node();
+  planes->bits = spec.bits;
+  planes->group_size = spec.group_size;
+  planes->in_features = in_features;
+  a.node()->quant = std::move(planes);
 
   claimed_.emplace_back(name);
+  claimed_.emplace_back(scales.name);
+  claimed_.emplace_back(biases.name);
   return a;
 }
 

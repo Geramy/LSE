@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -130,33 +132,34 @@ Status TensorView::read_f32(float* dst, std::size_t count) const {
   }
 }
 
-SafeTensors::~SafeTensors() {
-  if (mapping_ != nullptr) ::munmap(mapping_, mapping_size_);
+void SafeTensors::unmap_all() noexcept {
+  for (const Mapping& m : mappings_) {
+    if (m.ptr != nullptr) ::munmap(m.ptr, m.size);
+  }
+  mappings_.clear();
 }
+
+SafeTensors::~SafeTensors() { unmap_all(); }
 
 SafeTensors::SafeTensors(SafeTensors&& other) noexcept
     : path_(std::move(other.path_)),
-      mapping_(other.mapping_),
-      mapping_size_(other.mapping_size_),
+      mappings_(std::move(other.mappings_)),
       tensors_(std::move(other.tensors_)) {
-  other.mapping_ = nullptr;
-  other.mapping_size_ = 0;
+  other.mappings_.clear();
 }
 
 SafeTensors& SafeTensors::operator=(SafeTensors&& other) noexcept {
   if (this != &other) {
-    if (mapping_ != nullptr) ::munmap(mapping_, mapping_size_);
+    unmap_all();
     path_ = std::move(other.path_);
-    mapping_ = other.mapping_;
-    mapping_size_ = other.mapping_size_;
+    mappings_ = std::move(other.mappings_);
     tensors_ = std::move(other.tensors_);
-    other.mapping_ = nullptr;
-    other.mapping_size_ = 0;
+    other.mappings_.clear();
   }
   return *this;
 }
 
-Result<SafeTensors> SafeTensors::open(const std::string& path) {
+Status SafeTensors::map_file(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return LSE_ERROR(kIoError, "cannot open '", path, "'");
 
@@ -183,10 +186,7 @@ Result<SafeTensors> SafeTensors::open(const std::string& path) {
     return LSE_ERROR(kIoError, "safetensors header length is out of range");
   }
 
-  SafeTensors out;
-  out.path_ = path;
-  out.mapping_ = map;
-  out.mapping_size_ = file_size;
+  mappings_.push_back(Mapping{map, file_size});
 
   const std::byte* payload = base + 8 + header_len;
   const std::size_t payload_size = file_size - 8 - header_len;
@@ -227,9 +227,68 @@ Result<SafeTensors> SafeTensors::open(const std::string& path) {
                        std::to_string(expected));
     }
     v.data = std::span<const std::byte>(payload + begin, end - begin);
-    out.tensors_.emplace(name, std::move(v));
+    // A name repeated across shards would silently shadow; the index is
+    // supposed to make that impossible, so treat it as a corrupt checkpoint.
+    if (!tensors_.emplace(name, std::move(v)).second) {
+      return LSE_ERROR(kIoError, "tensor '", name, "' appears in more than one shard");
+    }
   }
 
+  return OkStatus();
+}
+
+Result<SafeTensors> SafeTensors::open(const std::string& path) {
+  SafeTensors out;
+  out.path_ = path;
+  LSE_RETURN_IF_ERROR(out.map_file(path));
+  return out;
+}
+
+Result<SafeTensors> SafeTensors::open_sharded(const std::string& index_path) {
+  std::ifstream in(index_path);
+  if (!in) return LSE_ERROR(kIoError, "cannot open '", index_path, "'");
+  nlohmann::json index;
+  try {
+    in >> index;
+  } catch (const std::exception& e) {
+    return LSE_ERROR(kIoError, "'", index_path, "' is not valid JSON: ", e.what());
+  }
+  if (!index.contains("weight_map") || !index["weight_map"].is_object()) {
+    return LSE_ERROR(kIoError, "'", index_path, "' has no weight_map");
+  }
+
+  // Ordered so the tensor namespace does not depend on hash iteration order,
+  // and so an error names the same shard on every run.
+  std::set<std::string> shards;
+  for (const auto& [tensor, file] : index["weight_map"].items()) {
+    (void)tensor;
+    shards.insert(file.get<std::string>());
+  }
+  if (shards.empty()) return LSE_ERROR(kIoError, "'", index_path, "' names no shards");
+
+  const fs::path dir = fs::path(index_path).parent_path();
+
+  // A repo directory can exist with the download unfinished, so check the whole
+  // set before mapping any of it rather than failing halfway through.
+  for (const std::string& shard : shards) {
+    if (!fs::exists(dir / shard)) {
+      return LSE_ERROR(kIoError, "shard '", shard, "' named by '", index_path,
+                       "' is missing; the checkpoint is incomplete");
+    }
+  }
+
+  SafeTensors out;
+  out.path_ = index_path;
+  for (const std::string& shard : shards) {
+    LSE_RETURN_IF_ERROR(out.map_file((dir / shard).string()));
+  }
+
+  const std::size_t named = index["weight_map"].size();
+  if (out.tensors_.size() != named) {
+    return LSE_ERROR(kIoError, "'", index_path, "' names ", std::to_string(named),
+                     " tensors but the shards hold ",
+                     std::to_string(out.tensors_.size()));
+  }
   return out;
 }
 
@@ -290,14 +349,23 @@ std::string hf_cache_root() {
 
 namespace {
 
-// A directory holding one .safetensors plus its sidecar .json.
+// A directory holding either one .safetensors or a set of shards named by a
+// safetensors index, plus a config json.
 Result<ModelPaths> from_directory(const fs::path& dir) {
   std::error_code ec;
   fs::path weights;
-  for (const auto& entry : fs::directory_iterator(dir, ec)) {
-    if (entry.path().extension() == ".safetensors") {
-      weights = entry.path();
-      break;
+  // The index wins: picking the first shard off the directory iterator gives a
+  // partial tensor set, and the failure surfaces far away as an architecture
+  // that nothing recognizes.
+  if (const fs::path index = dir / "model.safetensors.index.json";
+      fs::exists(index, ec)) {
+    weights = index;
+  } else {
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+      if (entry.path().extension() == ".safetensors") {
+        weights = entry.path();
+        break;
+      }
     }
   }
   if (weights.empty()) {
@@ -306,9 +374,11 @@ Result<ModelPaths> from_directory(const fs::path& dir) {
 
   ModelPaths out;
   out.weights = weights.string();
-  fs::path sidecar = weights;
-  sidecar.replace_extension(".json");
-  if (fs::exists(sidecar, ec)) {
+  // A shard index is already a .json, so the sidecar rule would name the index
+  // as its own config and every field would silently take its default.
+  fs::path sidecar = out.weights.ends_with(".index.json") ? fs::path{} : weights;
+  if (!sidecar.empty()) sidecar.replace_extension(".json");
+  if (!sidecar.empty() && fs::exists(sidecar, ec)) {
     out.config = sidecar.string();
   } else if (fs::exists(dir / "config.json", ec)) {
     out.config = (dir / "config.json").string();
