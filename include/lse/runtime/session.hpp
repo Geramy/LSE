@@ -1,14 +1,20 @@
 // A conversation's live state, owned separately from whoever is decoding it.
 //
-// A session is the unit that holds cache: per-layer MixerState (a KV pair
-// allocated at the engine length on attention layers, a fixed recurrent
-// matrix on GDN layers), the token history the repetition penalty reads, and
-// the absolute position. Keeping it out of the generator is what lets a
-// server interleave conversations and resume one without replaying its prompt.
+// A session is the unit that holds cache: per-layer MixerState (a paged K/V
+// block pool plus this sequence's block lists on attention layers, a fixed
+// recurrent matrix on GDN layers), the token history the repetition penalty
+// reads, and the absolute position. Keeping it out of the generator is what lets
+// a server interleave conversations and resume one without replaying its prompt.
 //
-// Not batched. Every session decodes on its own; there is no shared step, no
-// paged KV, no cross-sequence scheduler. See SessionStore's note on what that
-// would take.
+// The KV is paged: a sequence holds a list of kv::kBlockSize-token blocks in a
+// pool sized to the rung above what it uses, not a contiguous span at the engine
+// capacity. Sequence length and the batch row count are dispatch values the
+// kernels read, so one code object serves every length and every batch up to a
+// bucket.
+//
+// Still not batched, and that is the remaining half: sessions decode one at a
+// time. What is missing is the driver — admitting and preempting sequences
+// between steps and running one ragged attention over them — not the cache.
 #pragma once
 
 #include <cstdint>
@@ -19,6 +25,7 @@
 #include <vector>
 
 #include "lse/core/status.hpp"
+#include "lse/kv/block.hpp"
 #include "lse/model/hybrid_lm.hpp"
 
 namespace lse::runtime {
@@ -42,9 +49,14 @@ class Session {
   // Drops the cache but keeps the id, so the next turn is a fresh prefill.
   void clear();
 
-  // What the cache currently costs. Attention layers sit at the engine KV
-  // length; GDN layers stay flat.
+  // What the cache currently costs: the block pools actually allocated plus the
+  // GDN state and its conv tails. Attention pools sit at a rung above the blocks
+  // in use, not at the engine capacity.
   [[nodiscard]] std::size_t cache_bytes() const noexcept;
+
+  // Blocks this session holds, summed over layers. The unit a budget and a
+  // preemption decision are counted in; see kv::BlockPolicy.
+  [[nodiscard]] std::size_t kv_blocks() const noexcept;
 
  private:
   std::string id_;
@@ -57,9 +69,10 @@ class Session {
 // budget. A server holds one of these; a single-shot CLI run does not need it.
 //
 // Deliberately not a batching scheduler: sessions here are independent and are
-// decoded one at a time. Continuous batching in the vLLM sense would replace
-// the per-session contiguous KV tensors with a paged pool, admit and preempt
-// sequences between steps, and run one ragged attention over all of them.
+// decoded one at a time. The paged pool and the runtime batch extent are landed
+// (see kv/ and model::batch_bucket); what continuous batching still needs is the
+// policy layer on top — admitting and preempting sequences between steps with
+// kv::BlockPolicy, and stepping the admitted set together.
 class SessionStore {
  public:
   SessionStore(std::size_t layers, std::size_t budget_bytes)

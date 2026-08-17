@@ -20,6 +20,12 @@ class CpuBackend : public Backend<CpuBackend> {
 
   Status init_impl(int device_ordinal);
   void shutdown_impl() noexcept;
+
+  // The host is one device and it is always there, so this neither binds
+  // anything nor can fail. What it does report is how little a host knows
+  // about itself in the terms a device report asks for.
+  static Result<std::vector<DeviceDescriptor>> enumerate_devices();
+
   const DeviceInfo& device_info_impl() const noexcept { return info_; }
 
   Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls);

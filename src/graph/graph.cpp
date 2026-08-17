@@ -60,6 +60,7 @@ bool is_barrier(OpKind k) noexcept {
     case OpKind::kMoECombine: case OpKind::kEmbedding:
     case OpKind::kQuantEmbedding: case OpKind::kRoPE:
     case OpKind::kTopK: case OpKind::kArgMax: case OpKind::kOverwriteSlice:
+    case OpKind::kKvPageWrite:
       return true;
     default:
       return is_collective(k);

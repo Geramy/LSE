@@ -22,6 +22,30 @@ namespace lse::model {
 
 using graph::Array;
 
+// Padded batch buckets.
+//
+// graph::FusionGroup::signature() mixes every dimension of every node, and the
+// batch axis is dim(0) of essentially every activation — so a free batch axis
+// multiplies the shape set the JIT has to compile by the number of distinct
+// batch sizes, and a miss is not a slow path: the group lands on the host
+// interpreter at roughly 0.5 tok/s against 100. Rows in a pass are therefore
+// padded up to a rung, and the rung — never the true row count — is what reaches
+// the graph.
+//
+// Powers of two, matching the prefill chunk ladder, and chosen so a family
+// change happens *at* a rung rather than inside one: MatmulKernel::specialize()
+// leaves the LDS GEMV path at m >= 16, so 16 is a rung and the choice is a
+// function of the bucket, which is in the key, rather than of the true batch,
+// which is not.
+//
+// The ladder stops at 32. A batch that fits no bucket is an error naming the
+// size, not a silent widening: padding 33 rows to 64 would double the work of
+// every row in the pass, and the caller that assembled 33 rows is the one that
+// knows how to split them.
+inline constexpr std::int32_t kBatchRungs[] = {1, 2, 4, 8, 16, 32};
+
+Result<std::int32_t> batch_bucket(std::int32_t rows);
+
 struct HybridLMSpec {
   std::string embed_name = "embed.weight";
   std::string final_norm_name = "final_norm.weight";
@@ -75,8 +99,14 @@ class HybridLM {
   // prefill; otherwise it must hold one entry per layer and is updated in
   // place. `trace`, when non-null, is filled with each block's output — that is
   // what lets a mismatch be localized to a layer instead of just to the logits.
+  //
+  // `rows` is how many of tokens' leading rows carry a real sequence. The batch
+  // axis is padded up to a bucket so the bucket — never the true row count — is
+  // what the JIT keys on; the rows past `rows` run the same kernels on their own
+  // pad blocks and their output is discarded. 0 means every row is real.
   Result<Array> hidden(const Array& tokens, std::vector<MixerState>* states,
-                       Array* aux_loss, std::vector<Array>* trace = nullptr);
+                       Array* aux_loss, std::vector<Array>* trace = nullptr,
+                       std::int32_t rows = 0);
 
   // [.., D] -> [.., vocab]. Applied to only the positions a caller needs: at
   // long context the full [B,T,vocab] tensor does not fit.
@@ -103,7 +133,7 @@ class HybridLM {
     graph::Program program;
     Array tokens;
     Array hidden;
-    Array pos;
+    Array meta;
     const void* states = nullptr;
     std::int64_t seq = -1;
     std::vector<graph::Node*> kv_leaves;

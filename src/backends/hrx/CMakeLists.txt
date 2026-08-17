@@ -12,6 +12,7 @@ add_library(lse_backend_hrx
   phase_emit.cpp
   hip_sources.cpp
   comgr_compiler.cpp
+  trace.cpp
   kernels/matmul.cpp
   kernels/reduction.cpp
   kernels/slice.cpp
@@ -38,7 +39,7 @@ add_library(lse_backend_hrx
 )
 add_library(lse::backend_hrx ALIAS lse_backend_hrx)
 
-target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_dist lse_probe)
+target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_dist lse_probe lse_trace)
 target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_HRX_INCLUDE_DIR})
 target_include_directories(lse_backend_hrx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

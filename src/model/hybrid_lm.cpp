@@ -1,6 +1,8 @@
 #include "lse/model/hybrid_lm.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <span>
 
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
@@ -61,6 +63,20 @@ Status audit_unclaimed(const WeightBinder& binder,
 
 }  // namespace
 
+Result<std::int32_t> batch_bucket(std::int32_t rows) {
+  if (rows <= 0) {
+    return LSE_ERROR(kInvalidArgument, "a pass needs at least one row, got ",
+                     std::to_string(rows));
+  }
+  for (std::int32_t rung : kBatchRungs) {
+    if (rows <= rung) return rung;
+  }
+  return LSE_ERROR(kOutOfRange, "batch of ", std::to_string(rows),
+                   " fits no bucket; the ladder tops out at ",
+                   std::to_string(kBatchRungs[std::size(kBatchRungs) - 1]),
+                   " rows, so split the batch");
+}
+
 Status HybridLM::load(WeightBinder& binder) {
   LSE_ASSIGN_OR(embed_weight_, binder.require(spec_.embed_name));
   LSE_ASSIGN_OR(final_norm_weight_, binder.require(spec_.final_norm_name));
@@ -118,18 +134,25 @@ void add_carry(std::vector<graph::Program::Carry>& c, const graph::NodePtr& in,
   c.push_back({in, out.node()});
 }
 
-Status poke_scalar(Array& slot, float value) {
-  if (!slot.valid()) return LSE_ERROR(kInvalidArgument, "scalar poke on empty Array");
+Status poke_values(Array& slot, std::span<const float> values) {
+  if (!slot.valid()) return LSE_ERROR(kInvalidArgument, "poke on empty Array");
   graph::Node& dst = *slot.node();
+  if (dst.element_count() < values.size()) {
+    return LSE_ERROR(kInvalidArgument, "poke of ",
+                     std::to_string(values.size()), " into a slot of ",
+                     std::to_string(dst.element_count()));
+  }
   graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for scalar poke");
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for a poke");
   if (!dst.buffer.valid()) {
     LSE_RETURN_IF_ERROR(
         graph::interpreter::ensure_output_buffer(dst, sched->backend()));
   }
   const std::size_t bytes = dtype_storage_bytes(dst.dtype, dst.element_count());
   if (dst.host_mirror.size() < bytes) dst.host_mirror.resize(bytes);
-  graph::interpreter::store_element(dst, 0, value);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    graph::interpreter::store_element(dst, i, values[i]);
+  }
   dst.host_dirty = true;
   dst.device_dirty = false;
   dst.materialized = true;
@@ -169,7 +192,7 @@ Status poke_tokens(Array& slot, const Array& incoming) {
 
 Result<Array> HybridLM::hidden(const Array& tokens,
                                std::vector<MixerState>* states, Array* aux_loss,
-                               std::vector<Array>* trace) {
+                               std::vector<Array>* trace, std::int32_t rows) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -227,6 +250,52 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       if (s.position > kv_pos) kv_pos = s.position;
     }
   }
+  // The step descriptor the paged kernels read: where this pass's first query
+  // sits, how much KV is live behind it, and how many of the padded batch rows
+  // are real. All three are dispatch values, not shapes — which is what lets one
+  // code object serve every position, every length and every batch up to the
+  // bucket.
+  const std::int32_t kv_len = kv_pos + static_cast<std::int32_t>(t_now);
+  // Checked here rather than only where the pool is sized: the decode fast path
+  // replays a held program and never re-enters the attention layer, so a session
+  // running past the engine length would write past the last slot its block table
+  // has instead of being refused.
+  if (states != nullptr && kv_len > config_.kv_capacity()) {
+    return LSE_ERROR(kOutOfRange, "this pass would reach KV position ",
+                     std::to_string(kv_len), ", past the engine length ",
+                     std::to_string(config_.kv_capacity()));
+  }
+  const auto bucket = static_cast<std::int32_t>(
+      tokens.valid() ? tokens.shape().dim(0) : 1);
+  // The batch axis reaching the graph must already be a rung: it is what the JIT
+  // keys on, so an off-ladder width is a shape set nobody budgeted for.
+  LSE_ASSIGN_OR(const std::int32_t rung, batch_bucket(bucket));
+  if (rung != bucket) {
+    return LSE_ERROR(kInvalidArgument, "a pass of ", std::to_string(bucket),
+                     " rows is not a batch bucket; pad it to ",
+                     std::to_string(rung));
+  }
+  const std::int32_t live_rows = rows > 0 ? rows : bucket;
+  if (live_rows > bucket) {
+    return LSE_ERROR(kInvalidArgument, "asked for ", std::to_string(live_rows),
+                     " live rows in a pass of ", std::to_string(bucket));
+  }
+  const float meta[3] = {static_cast<float>(kv_pos), static_cast<float>(kv_len),
+                         static_cast<float>(live_rows)};
+
+  // Blocks first, on both paths: the retained decode program is not re-recorded,
+  // yet it crosses a block boundary every kv::kBlockSize tokens and needs the
+  // next block in the table before it runs. A pool that has to move to a bigger
+  // rung cannot be absorbed by a replay — the buffer changes identity — so that
+  // answer forces the rebuild below.
+  bool pool_moved = false;
+  if (states != nullptr) {
+    for (MixerState& st : *states) {
+      if (!st.paged.valid()) continue;
+      LSE_ASSIGN_OR(const bool moved, ops::extend_paged(st.paged, kv_len));
+      pool_moved = pool_moved || moved;
+    }
+  }
 
   auto kv_leaves_match = [&]() -> bool {
     if (states == nullptr) return cache_.kv_leaves.empty();
@@ -246,8 +315,9 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   };
 
   const bool can_reuse =
-      aux_loss == nullptr && trace == nullptr && cache_.hidden.valid() &&
-      cache_.tokens.valid() && tokens.valid() && cache_.pos.valid() &&
+      aux_loss == nullptr && trace == nullptr && !pool_moved &&
+      cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
+      cache_.meta.valid() &&
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
       cache_.states == states && !cache_.program.empty() &&
       !cache_.program.groups().empty() && kv_leaves_match();
@@ -255,8 +325,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     cache_.program.reset_compute();
     cache_.program.fold_carries();
     LSE_RETURN_IF_ERROR(poke_tokens(cache_.tokens, tokens));
-    LSE_RETURN_IF_ERROR(
-        poke_scalar(cache_.pos, static_cast<float>(kv_pos)));
+    LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
     if (graph::Scheduler* sched = graph::default_scheduler()) {
       LSE_RETURN_IF_ERROR(
           sched->eval(cache_.program.roots(), false, &cache_.program));
@@ -271,20 +340,20 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     return cache_.hidden;
   }
 
-  if (!cache_.pos.valid()) {
+  if (!cache_.meta.valid()) {
     graph::Scheduler* sched = graph::default_scheduler();
     if (sched == nullptr) {
-      return LSE_ERROR(kInternal, "no backend for the KV position slot");
+      return LSE_ERROR(kInternal, "no backend for the KV step descriptor");
     }
-    const std::size_t bytes = dtype_storage_bytes(DType::kF32, 1);
+    const std::size_t bytes = dtype_storage_bytes(DType::kF32, 3);
     auto buf = sched->backend().allocate(bytes, backend::MemoryClass::kDevice);
     if (!buf.ok()) return buf.status();
-    cache_.pos = Array::from_buffer(buf.release(), Shape{1}, DType::kF32);
+    cache_.meta = Array::from_buffer(buf.release(), Shape{3}, DType::kF32);
   }
-  LSE_RETURN_IF_ERROR(poke_scalar(cache_.pos, static_cast<float>(kv_pos)));
+  LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
   if (states != nullptr) {
     for (MixerState& s : *states) {
-      if (!s.kv_pos.valid()) s.kv_pos = cache_.pos;
+      if (!s.kv_meta.valid()) s.kv_meta = cache_.meta;
     }
   }
 
@@ -371,8 +440,17 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       add_carry(carries, before[i].ck, (*states)[i].gdn_conv_k);
       add_carry(carries, before[i].cv, (*states)[i].gdn_conv_v);
       add_carry(carries, before[i].cqkv, (*states)[i].gdn_conv_qkv);
-      add_carry(carries, before[i].keys, (*states)[i].key_cache);
-      add_carry(carries, before[i].values, (*states)[i].value_cache);
+      // Only the growing-concat path, where key_cache IS the concat node and has
+      // to become the next step's input. A paged pool is a leaf the write aliases
+      // in place, so there is nothing to carry — and carrying it is actively
+      // wrong: Program::fold_carries swaps the two nodes' buffers, so a pool that
+      // moved to a bigger rung would be handed back the smaller buffer it grew
+      // out of. Five consecutive 128-token prefill passes replay the same
+      // program, which is how that lands on a real prompt.
+      if (!(*states)[i].paged.valid()) {
+        add_carry(carries, before[i].keys, (*states)[i].key_cache);
+        add_carry(carries, before[i].values, (*states)[i].value_cache);
+      }
     }
     cache_.program.set_carries(std::move(carries));
   }

@@ -277,4 +277,83 @@ Result<std::vector<LinkProfile>> probe_links(dist::ITransport& transport,
   return out;
 }
 
+Result<std::vector<LinkProfile>> probe_local_links(
+    std::span<const LocalMember> members, const LinkProbeConfig& cfg) {
+  const std::size_t n = members.size();
+  if (n == 0) return LSE_ERROR(kInvalidArgument, "an empty pool has no links");
+
+  std::vector<LinkProfile> out(n * n);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      LinkProfile& l = out[i * n + j];
+      l.src = members[i].id;
+      l.dst = members[j].id;
+      if (i == j) {
+        // Not a transfer at all. Zero is the measurement, not a placeholder.
+        l.path = PathKind::kSameDevice;
+        l.latency_ns = Measured::measured(0.0);
+        continue;
+      }
+      if (members[i].backend == nullptr || members[j].backend == nullptr) {
+        l.path = PathKind::kUnknown;
+        continue;
+      }
+    }
+  }
+  if (n == 1 || cfg.sizes.empty()) return out;
+
+  const std::size_t widest =
+      *std::max_element(cfg.sizes.begin(), cfg.sizes.end());
+  std::vector<std::byte> host(widest, std::byte{0x5A});
+
+  for (std::size_t i = 0; i < n; ++i) {
+    if (members[i].backend == nullptr) continue;
+    backend::IBackend& src_be = *members[i].backend;
+    auto src = src_be.allocate(widest, backend::MemoryClass::kDevice);
+    if (!src.ok()) return src.status();
+    backend::DeviceBuffer src_buf = src.release();
+
+    for (std::size_t j = 0; j < n; ++j) {
+      if (i == j || members[j].backend == nullptr) continue;
+      backend::IBackend& dst_be = *members[j].backend;
+      auto dst = dst_be.allocate(widest, backend::MemoryClass::kDevice);
+      if (!dst.ok()) {
+        src_be.deallocate(src_buf);
+        return dst.status();
+      }
+      backend::DeviceBuffer dst_buf = dst.release();
+
+      LinkProfile& l = out[i * n + j];
+      l.path = PathKind::kHostStaged;
+      Status failed;
+      for (const std::size_t bytes : cfg.sizes) {
+        const int reps = reps_for(bytes, cfg.byte_budget);
+        // The minimum, not the mean, for the same reason the transport probe
+        // takes it: every source of noise here only ever adds time, so the
+        // fastest of the repeats is the one closest to what the move costs.
+        double best = 0.0;
+        for (int r = 0; r < reps && failed.ok(); ++r) {
+          const auto t0 = Clock::now();
+          failed = src_be.copy_d2h(src_buf, host.data(), bytes, 0);
+          if (failed.ok()) {
+            failed = dst_be.copy_h2d(host.data(), dst_buf, bytes, 0);
+          }
+          const double one = ns_since(t0);
+          if (best == 0.0 || one < best) best = one;
+        }
+        if (!failed.ok()) break;
+        if (best > 0.0) l.points.push_back(TransferPoint{bytes, best});
+      }
+      dst_be.deallocate(dst_buf);
+      if (!failed.ok()) {
+        src_be.deallocate(src_buf);
+        return failed;
+      }
+      fit_link(l);
+    }
+    src_be.deallocate(src_buf);
+  }
+  return out;
+}
+
 }  // namespace lse::probe

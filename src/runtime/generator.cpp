@@ -45,11 +45,14 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 // pass over the whole prompt makes every distinct prompt length its own JIT
 // cold start; a ladder caps the shapes the engine can ever see.
 //
-// Off by default, and it must stay off until the engine is width-invariant:
-// Shapes are baked into the generated source as literals, so an unsplit
-// prefill makes every distinct prompt length its own set of kernels: ~50
-// compiles and ~18 s the first time each length is seen, forever. Feeding
-// prefill through a fixed ladder bounds that to 8 shape sets total.
+// Measured on this box: a fresh cache pays ~35-48 compiles at ~54 ms for each
+// new pass width, and the ladder below makes the reachable widths exactly
+// {1,2,4,8,16,32,64,128} — so the whole engine costs ~290 compiles once and a
+// novel prompt length costs zero. Without it every length is its own set.
+//
+// The row axis is bucketed the same way (model::kBatchRungs) and for the same
+// reason, and the two share the ladder: a decode pass of B sequences and a
+// prefill pass of B tokens present the same row count to every GEMM.
 constexpr std::size_t kPrefillChunk = 128;
 
 std::size_t prefill_chunk() { return kPrefillChunk; }

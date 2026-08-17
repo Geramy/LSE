@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <numeric>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -242,6 +243,163 @@ LSE_TEST(registry_finds_the_cpu_backend) {
   LSE_EXPECT((*be)->name() == "cpu");
   LSE_EXPECT_OK((*be)->init(0));
   (*be)->shutdown();
+}
+
+LSE_TEST(enumeration_describes_devices_without_binding_one) {
+  // Through the registry, and with no CpuBackend in scope: asking what devices
+  // exist must not require one to have been initialised, which is the whole
+  // reason this is a free function.
+  auto found = enumerate_devices("cpu");
+  LSE_EXPECT_OK(found.status());
+  if (!found.ok()) return;
+  LSE_EXPECT_EQ(found->size(), 1u);
+  const DeviceDescriptor& d = found->front();
+  LSE_EXPECT(d.backend == "cpu");
+  LSE_EXPECT_EQ(d.ordinal, 0);
+  LSE_EXPECT(d.id() == "cpu:0");
+  LSE_EXPECT(d.product.known());
+  LSE_EXPECT(d.arch.known());
+  LSE_EXPECT(d.arch.value == "host");
+  // The host answers this one itself.
+  LSE_EXPECT(d.compute_units.known());
+  LSE_EXPECT(d.compute_units.source == FactSource::kQueried);
+  LSE_EXPECT(d.compute_units.value >= 1u);
+  // A one-device backend still has a peer row, and its own entry is the only
+  // reach that needs no query.
+  LSE_EXPECT_EQ(d.peers.size(), 1u);
+  LSE_EXPECT(d.peers[0] == PeerAccess::kSelf);
+}
+
+LSE_TEST(a_property_nothing_answers_stays_unknown) {
+  auto found = enumerate_devices("cpu");
+  LSE_EXPECT_OK(found.status());
+  if (!found.ok()) return;
+  const DeviceDescriptor& d = found->front();
+
+  // This backend asks the host for no memory figure. Unknown is then the only
+  // honest answer: zero would read as a full device and the machine's RAM
+  // would read as a device budget nothing has agreed to.
+  LSE_EXPECT(!d.total_memory.known());
+  LSE_EXPECT(d.total_memory.source == FactSource::kUnknown);
+  LSE_EXPECT_EQ(d.total_memory.value, 0u);
+  LSE_EXPECT(!d.free_memory.known());
+  LSE_EXPECT_EQ(d.free_memory.value, 0u);
+  // A host has no wavefront and no LDS at all, which is a different fact from
+  // not knowing — and neither of them is a number.
+  LSE_EXPECT(d.wavefront_size.source == FactSource::kInapplicable);
+  LSE_EXPECT(!d.wavefront_size.known());
+  LSE_EXPECT(d.lds_bytes_per_workgroup.source == FactSource::kInapplicable);
+  // A hole the reader can name, not one it has to infer from a zero.
+  LSE_EXPECT(!d.declined.empty());
+
+  const std::string text = d.describe();
+  LSE_EXPECT(text.find("unknown") != std::string::npos);
+  LSE_EXPECT(text.find("n/a") != std::string::npos);
+  // The old report printed "0 MiB" for exactly this device.
+  LSE_EXPECT(text.find("0 MiB") == std::string::npos);
+}
+
+LSE_TEST(a_backend_with_no_enumerator_refuses_rather_than_answering_zero) {
+  auto found = enumerate_devices("does-not-exist");
+  LSE_EXPECT(!found.ok());
+  LSE_EXPECT(found.status().code() == StatusCode::kNotFound);
+}
+
+LSE_TEST(a_buffer_says_which_device_holds_it) {
+  CpuBackend be;
+  // Nothing is bound yet, so nothing can be claimed.
+  LSE_EXPECT(!be.device_index().bound());
+  LSE_EXPECT_OK(be.init(0));
+  const DeviceIndex mine = be.device_index();
+  LSE_EXPECT(mine.bound());
+
+  auto buf = be.allocate(64, MemoryClass::kDevice);
+  LSE_EXPECT(buf.ok());
+  LSE_EXPECT(buf->residency == mine);
+
+  // A view is the same bytes on the same device.
+  DeviceBuffer view = *buf;
+  view.offset += 16;
+  view.size_bytes -= 16;
+  LSE_EXPECT(view.residency == mine);
+
+  be.deallocate(*buf);
+  // Released: no device holds these bytes any more, and a stale token would
+  // resolve to whoever was bound next.
+  LSE_EXPECT(!buf->residency.bound());
+  be.shutdown();
+  LSE_EXPECT(!be.device_index().bound());
+}
+
+LSE_TEST(two_instances_are_two_devices_even_on_one_ordinal) {
+  CpuBackend a;
+  CpuBackend b;
+  LSE_EXPECT_OK(a.init(0));
+  LSE_EXPECT_OK(b.init(0));
+  // Same board, two owners. The buffer a allocated is released by a and the
+  // executable a loaded runs on a, so the tokens must differ.
+  LSE_EXPECT(a.device_index() != b.device_index());
+
+  auto mine = a.allocate(64, MemoryClass::kDevice);
+  LSE_EXPECT(mine.ok());
+  LSE_EXPECT(mine->residency == a.device_index());
+  LSE_EXPECT(!(mine->residency == b.device_index()));
+  a.deallocate(*mine);
+  a.shutdown();
+  b.shutdown();
+}
+
+LSE_TEST(a_launch_addressed_elsewhere_is_refused) {
+  CpuBackend a;
+  CpuBackend b;
+  LSE_EXPECT_OK(a.init(0));
+  LSE_EXPECT_OK(b.init(0));
+
+  KernelHandle kernel;
+  kernel.executable = 1;
+  LaunchDims dims;
+  DispatchArgs args;
+
+  // Addressed at b, handed to a. A kernel handle is loaded on one device and
+  // its bindings are on one device: landing on the wrong one would run and
+  // return numbers nothing flags.
+  DispatchTarget elsewhere;
+  elsewhere.device = b.device_index();
+  const Status refused = a.launch(kernel, dims, args, elsewhere);
+  LSE_EXPECT(!refused.ok());
+  LSE_EXPECT(refused.code() == StatusCode::kInvalidArgument);
+  LSE_EXPECT(refused.message().find("reached the backend") != std::string::npos);
+
+  // Unaddressed still means "whatever device this is", which is every call
+  // site that holds one device.
+  const Status unaddressed = a.launch(kernel, dims, args, DispatchTarget{});
+  LSE_EXPECT(unaddressed.code() != StatusCode::kInvalidArgument ||
+             unaddressed.message().find("reached the backend") ==
+                 std::string::npos);
+  a.shutdown();
+  b.shutdown();
+}
+
+LSE_TEST(a_set_of_one_refuses_another_devices_bytes) {
+  auto a = create_backend("cpu");
+  auto b = create_backend("cpu");
+  LSE_EXPECT(a.ok() && b.ok());
+  LSE_EXPECT_OK((*a)->init(0));
+  LSE_EXPECT_OK((*b)->init(0));
+  SingleDevice set(**a);
+
+  LSE_EXPECT_EQ(set.size(), std::size_t{1});
+  LSE_EXPECT_EQ(set.primary(), std::size_t{0});
+  LSE_EXPECT_EQ(set.member_of((*a)->device_index()), std::size_t{0});
+  LSE_EXPECT_EQ(set.member_of((*b)->device_index()), std::size_t{1});
+  LSE_EXPECT(set.residency(0) == (*a)->device_index());
+
+  // Unclaimed bytes are nobody's, so there is nothing to violate.
+  LSE_EXPECT_OK(set.may_read(kNoDevice, 0));
+  LSE_EXPECT_OK(set.may_read((*a)->device_index(), 0));
+  LSE_EXPECT(!set.may_read((*b)->device_index(), 0).ok());
+  (*a)->shutdown();
+  (*b)->shutdown();
 }
 
 LSE_TEST(registry_reports_unknown_backends) {

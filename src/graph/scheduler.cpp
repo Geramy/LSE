@@ -39,24 +39,33 @@ struct Scheduler::Impl {
   std::vector<std::uint8_t> outstanding;
   std::vector<backend::StreamEvent> entry_events;
 
-  Status ensure_jit(backend::IBackend& backend) {
+  Status ensure_jit(backend::IDeviceSet& devices, std::size_t member) {
     if (jit != nullptr) return OkStatus();
-    const IKernelCompiler* compiler = backend.compiler();
-    if (compiler == nullptr) {
-      return LSE_ERROR(kUnimplemented, "backend '",
-                       std::string(backend.name()),
+    // Asked of the member about to be dispatched to, because a set may hold a
+    // device with codegen beside one without: the refusal has to name the
+    // device that declined, not the set.
+    const backend::IBackend& be = devices.device(member);
+    if (be.compiler() == nullptr) {
+      return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
                        "' has no kernel compiler");
     }
-    jit = std::make_unique<JitCache>(backend, *compiler);
+    jit = std::make_unique<JitCache>(devices);
     return OkStatus();
   }
 };
 
-Scheduler::Scheduler(backend::IBackend& backend)
-    : backend_(backend), impl_(std::make_unique<Impl>()) {
+Scheduler::Scheduler(backend::IDeviceSet& devices)
+    : devices_(devices), impl_(std::make_unique<Impl>()) {
   // Without codegen there is no code-object path, so device-first is
   // meaningless.
-  if (backend_.emitter() == nullptr) mode_ = Mode::kHostOnly;
+  if (backend().emitter() == nullptr) mode_ = Mode::kHostOnly;
+}
+
+Scheduler::Scheduler(backend::IBackend& backend)
+    : own_set_(std::make_unique<backend::SingleDevice>(backend)),
+      devices_(*own_set_),
+      impl_(std::make_unique<Impl>()) {
+  if (backend.emitter() == nullptr) mode_ = Mode::kHostOnly;
 }
 
 Scheduler::~Scheduler() = default;
@@ -78,30 +87,72 @@ std::string Scheduler::device_gap(const Node& node,
   return {};
 }
 
+std::size_t Scheduler::member_for(const FusionGroup& group) const noexcept {
+  if (devices_.size() == 1) return devices_.primary();
+  // The first input that names a device decides. Operands cannot be read from
+  // anywhere else until something moves them, so this is forced rather than
+  // chosen — what a Planner decides is whether moving them is worth it, and it
+  // decides that before the group reaches here.
+  for (const NodePtr& n : group.inputs) {
+    if (!n) continue;
+    const std::size_t m = devices_.member_of(n->buffer.residency);
+    if (m < devices_.size()) return m;
+  }
+  return devices_.primary();
+}
+
+void Scheduler::release(backend::DeviceBuffer& buf) const noexcept {
+  // Through whoever allocated it. Freeing a member's allocation on another
+  // member's allocator is the mirror of a wrong-device launch, and residency is
+  // what makes the owner recoverable from the buffer instead of from wherever
+  // the caller happened to be standing.
+  const std::size_t owner = devices_.member_of(buf.residency);
+  devices_.device(owner < devices_.size() ? owner : devices_.primary())
+      .deallocate(buf);
+}
+
+Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
+                                  std::size_t member) const {
+  const backend::DeviceIndex mine = devices_.residency(member);
+  for (const backend::BufferRef& b : bindings) {
+    if (b.buffer == nullptr) continue;
+    const backend::DeviceIndex held = b.buffer->residency;
+    // The common case is an inline compare that never leaves this loop; the set
+    // is only asked about a residency that is not already the target's, which
+    // on one device is never.
+    if (!held.bound() || held == mine) continue;
+    LSE_RETURN_IF_ERROR(devices_.may_read(held, member));
+  }
+  return OkStatus();
+}
+
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
-                                     backend::Stream stream) {
-  const IKernelEmitter* emitter = backend_.emitter();
+                                     backend::Stream stream,
+                                     std::size_t member) {
+  backend::IBackend& be = devices_.device(member);
+  const IKernelEmitter* emitter = be.emitter();
   if (emitter == nullptr) {
-    return LSE_ERROR(kUnimplemented, "backend '", std::string(backend_.name()),
+    return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
                      "' has no kernel emitter");
   }
-  LSE_RETURN_IF_ERROR(impl_->ensure_jit(backend_));
+  LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member));
 
   const std::uint64_t ident =
-      emitter->cache_key(group, backend_.device_info());
+      emitter->cache_key(group, be.device_info());
 
   const auto t_emit = std::chrono::steady_clock::now();
-  auto emitted = emitter->emit(group, backend_.device_info());
+  auto emitted = emitter->emit(group, be.device_info());
   if (!emitted.ok()) return emitted.status();
   dump_hip_source(*emitted, ident);
 
   // Compile only when this kernel is not already loaded for this device.
   // Disk miss / source change / arch change still go through get_or_compile.
   backend::KernelHandle launched;
-  if (const backend::KernelHandle* cached = impl_->jit->try_get(ident)) {
+  if (const backend::KernelHandle* cached =
+          impl_->jit->try_get(member, ident)) {
     launched = *cached;
   } else {
-    auto kernel = impl_->jit->get_or_compile(ident, *emitted);
+    auto kernel = impl_->jit->get_or_compile(member, ident, *emitted);
     if (!kernel.ok()) return kernel.status();
     launched = kernel.release();
   }
@@ -141,7 +192,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // nothing — so the value has to be written whenever we allocate here.
     const bool fresh = !n->buffer.valid();
     if (fresh) {
-      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend_));
+      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, be));
     }
     if (fresh && n->kind == OpKind::kConstant) {
       for (std::size_t e = 0; e < n->element_count(); ++e) {
@@ -151,7 +202,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     }
     // Weights and any host-computed input have to reach device memory before
     // the kernel reads them.
-    LSE_RETURN_IF_ERROR(interpreter::sync_to_device(*n, backend_));
+    LSE_RETURN_IF_ERROR(interpreter::sync_to_device(*n, be));
     bindings.push_back(backend::BufferRef{&n->buffer, 0, n->buffer.size_bytes});
   }
 
@@ -175,15 +226,15 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   if (emitted->pointer_table) {
     std::vector<void*> ptrs(bindings.size(), nullptr);
     for (std::size_t i = 0; i < bindings.size(); ++i) {
-      auto p = backend_.device_pointer(*bindings[i].buffer);
+      auto p = be.device_pointer(*bindings[i].buffer);
       if (!p.ok()) return p.status();
       ptrs[i] = *p;
     }
-    auto tab = backend_.allocate(ptrs.size() * sizeof(void*),
+    auto tab = be.allocate(ptrs.size() * sizeof(void*),
                                  backend::MemoryClass::kDevice);
     if (!tab.ok()) return tab.status();
     table_buf = tab.release();
-    LSE_RETURN_IF_ERROR(backend_.copy_h2d(ptrs.data(), table_buf,
+    LSE_RETURN_IF_ERROR(be.copy_h2d(ptrs.data(), table_buf,
                                            ptrs.size() * sizeof(void*), 0));
     table_bindings.push_back(
         backend::BufferRef{&table_buf, 0, table_buf.size_bytes});
@@ -197,12 +248,12 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     }
     backend::DeviceBuffer& bar_buf = impl_->grid_bar[stream.index];
     if (!bar_buf.valid()) {
-      auto bar = backend_.allocate(sizeof(std::uint32_t),
+      auto bar = be.allocate(sizeof(std::uint32_t),
                                    backend::MemoryClass::kDevice);
       if (!bar.ok()) return bar.status();
       bar_buf = bar.release();
       const std::uint32_t zero = 0;
-      LSE_RETURN_IF_ERROR(backend_.copy_h2d(&zero, bar_buf, sizeof(zero), 0));
+      LSE_RETURN_IF_ERROR(be.copy_h2d(&zero, bar_buf, sizeof(zero), 0));
     }
     bindings.push_back(backend::BufferRef{&bar_buf, 0, bar_buf.size_bytes});
   }
@@ -227,9 +278,15 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     }
     std::fprintf(stderr, "\n");
   }
+  // `bindings`, not args.bindings: with a pointer table the dispatch binds one
+  // buffer of device addresses and the operands it points at are exactly the
+  // ones a wrong-device launch would read.
+  LSE_RETURN_IF_ERROR(check_residency(bindings, member));
+
   const auto t_launch = std::chrono::steady_clock::now();
-  LSE_RETURN_IF_ERROR(backend_.launch(launched, emitted->dims, args,
-                                      backend::DispatchTarget{stream, {}}));
+  LSE_RETURN_IF_ERROR(be.launch(
+      launched, emitted->dims, args,
+      backend::DispatchTarget{stream, devices_.residency(member), {}}));
   trace_.launch_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - t_launch)
@@ -369,7 +426,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
                       Program* plan) {
   Program& rec = plan != nullptr ? *plan : impl_->program;
   trace_ = Trace{};
-  for (auto& t : impl_->phase_tables) backend_.deallocate(t);
+  for (auto& t : impl_->phase_tables) release(t);
   impl_->phase_tables.clear();
 
   const auto t_part = std::chrono::steady_clock::now();
@@ -377,7 +434,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
 
   std::vector<FusionGroup> phase_groups;
   bool replayed = false;
-  if (mode_ == Mode::kDeviceFirst && backend_.emitter() != nullptr &&
+  if (mode_ == Mode::kDeviceFirst && backend().emitter() != nullptr &&
       rec.holds(roots) && !rec.groups().empty()) {
     bool ready = !roots.empty();
     for (const NodePtr& r : roots) {
@@ -389,7 +446,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     if (ready) {
       if (pull_host) {
         for (const NodePtr& r : roots) {
-          if (r) LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend_));
+          if (r) LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend()));
         }
       }
       accumulate(acc_, trace_);
@@ -404,7 +461,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
 
   auto planned = replayed
                      ? std::vector<Workgroup>{}
-                     : Partitioner::phases(roots, &backend_.device_info());
+                     : Partitioner::phases(roots, &backend().device_info());
   if (!replayed) {
     trace_.phase_groups = static_cast<std::uint32_t>(planned.size());
     for (const Workgroup& wg : planned) {
@@ -412,11 +469,11 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     }
   }
 
-  if (mode_ == Mode::kDeviceFirst && backend_.emitter() != nullptr &&
+  if (mode_ == Mode::kDeviceFirst && backend().emitter() != nullptr &&
       !replayed) {
     // Null when this emitter has no staged phase body: every node then takes
     // the same one-group path a node it refuses to stage already takes.
-    const IPhaseStaging* staging = backend_.emitter()->staging();
+    const IPhaseStaging* staging = backend().emitter()->staging();
     for (Workgroup& wg : planned) {
       FusionGroup g = Partitioner::phase_group(wg, roots);
       if (g.nodes.empty()) continue;
@@ -548,7 +605,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         // eight workgroups — below that the grid is not worth the split.
         constexpr std::uint32_t kGridStage = 2048;
         const bool fat =
-            staging->stage_threads(*n, backend_.device_info()) >= kGridStage;
+            staging->stage_threads(*n, backend().device_info()) >= kGridStage;
         const bool grid_chunk = staged_grid && !staged.nodes.empty();
         // Mirrors the emitter's `lane_chunk`: every stage per-lane over one
         // element count, every read of the chunk at the index the reading
@@ -591,7 +648,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       }
       flush_staged();
       wg.plan_slots(roots);
-      if (wg.bind_slots(backend_).ok()) {
+      if (wg.bind_slots(backend()).ok()) {
         trace_.slots_reused += wg.reused_slots();
         trace_.slots_allocated += wg.slot_count();
       }
@@ -604,11 +661,11 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   // was most of the host-side churn of a decode token.
   const std::vector<FusionGroup>& staged_groups =
       replayed ? rec.groups() : phase_groups;
-  if (mode_ == Mode::kDeviceFirst && backend_.emitter() != nullptr &&
+  if (mode_ == Mode::kDeviceFirst && backend().emitter() != nullptr &&
       !staged_groups.empty()) {
       // Placement for the whole step, decided before any of it is issued.
-      impl_->plan = plan_streams(staged_groups, backend_.stream_capabilities(),
-                                 backend_.device_info());
+      impl_->plan = plan_streams(staged_groups, backend().stream_capabilities(),
+                                 backend().device_info());
       impl_->events.assign(staged_groups.size(), backend::StreamEvent{});
       trace_.streams_used = impl_->plan.streams_used;
       trace_.stream_waits = impl_->plan.waits_total;
@@ -620,7 +677,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       // work as well — and snapshot only the streams this plan can actually
       // race with, which in a single-stream step is none of them.
       const std::uint32_t stream_count =
-          backend_.stream_capabilities().stream_count;
+          backend().stream_capabilities().stream_count;
       if (impl_->outstanding.size() != stream_count) {
         impl_->outstanding.assign(stream_count, 0);
       }
@@ -638,7 +695,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
           raced = t != s && plans_on[t] != 0;
         }
         if (!raced) continue;
-        auto ev = backend_.record_event(backend::Stream{s});
+        auto ev = backend().record_event(backend::Stream{s});
         if (ev.ok()) impl_->entry_events[s] = ev.release();
       }
       std::vector<std::uint8_t> entered(stream_count, 0);
@@ -661,17 +718,17 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
           entered[on.index] = 1;
           for (std::uint32_t s = 0; s < stream_count && st.ok(); ++s) {
             if (s == on.index) continue;
-            st = backend_.wait_event(on, impl_->entry_events[s]);
+            st = backend().wait_event(on, impl_->entry_events[s]);
           }
         }
         for (std::uint32_t j : impl_->plan.waits[gi]) {
           if (!st.ok()) break;
-          st = backend_.wait_event(on, impl_->events[j]);
+          st = backend().wait_event(on, impl_->events[j]);
           if (!st.ok()) break;
         }
-        if (st.ok()) st = try_dispatch_group(g, on);
+        if (st.ok()) st = try_dispatch_group(g, on, member_for(g));
         if (st.ok() && impl_->plan.record_after[gi] != 0) {
-          auto ev = backend_.record_event(on);
+          auto ev = backend().record_event(on);
           if (ev.ok()) {
             impl_->events[gi] = ev.release();
           } else {
@@ -704,7 +761,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         }
         if (pull_host) {
           const auto t_sync = std::chrono::steady_clock::now();
-          LSE_RETURN_IF_ERROR(backend_.synchronize());
+          LSE_RETURN_IF_ERROR(backend().synchronize());
           // The device is idle: nothing is left for a later step to be
           // ordered against, so the next one starts with no entry barriers.
           std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
@@ -714,11 +771,11 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
                   .count());
           for (const NodePtr& r : roots) {
             if (r) {
-              LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend_));
+              LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend()));
             }
           }
         }
-        for (auto& t : impl_->phase_tables) backend_.deallocate(t);
+        for (auto& t : impl_->phase_tables) release(t);
         impl_->phase_tables.clear();
         accumulate(acc_, trace_);
         return OkStatus();
@@ -733,7 +790,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   }
 
   std::vector<FusionGroup> groups =
-      Partitioner::partition(roots, &backend_.device_info());
+      Partitioner::partition(roots, &backend().device_info());
   trace_.partition_ns = static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - t_part)
@@ -755,7 +812,8 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
         continue;
       }
-      Status dispatched = try_dispatch_group(g, backend::kDefaultStream);
+      Status dispatched =
+          try_dispatch_group(g, backend::kDefaultStream, member_for(g));
       if (dispatched.ok()) {
         ++trace_.device_groups;
         ++trace_.kernels_launched;
@@ -771,7 +829,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
 
     if (launched) {
       const auto t_sync = std::chrono::steady_clock::now();
-      LSE_RETURN_IF_ERROR(backend_.synchronize());
+      LSE_RETURN_IF_ERROR(backend().synchronize());
       trace_.sync_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - t_sync)
@@ -791,9 +849,9 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       // could have run, which is how per-op device placement is switched at
       // runtime.
       if (const FallbackHandler* router =
-              fallback_chain().resolve_intercept(*n, backend_)) {
-        LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend_));
-        LSE_RETURN_IF_ERROR(router->execute(*n, backend_));
+              fallback_chain().resolve_intercept(*n, backend())) {
+        LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
+        LSE_RETURN_IF_ERROR(router->execute(*n, backend()));
         if (!n->materialized) {
           return LSE_ERROR(kInternal, "handler '", std::string(router->name()),
                            "' returned OK without materializing the node");
@@ -804,21 +862,21 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         continue;
       }
 
-      const std::string gap = device_gap(*n, backend_);
+      const std::string gap = device_gap(*n, backend());
       if (gap.empty()) {
-        LSE_RETURN_IF_ERROR(interpreter::evaluate(n, backend_));
+        LSE_RETURN_IF_ERROR(interpreter::evaluate(n, backend()));
         ++trace_.nodes_evaluated;
         continue;
       }
 
-      const FallbackHandler* handler = fallback_chain().resolve(*n, backend_);
+      const FallbackHandler* handler = fallback_chain().resolve(*n, backend());
       if (handler == nullptr) {
         return LSE_ERROR(kUnimplemented, "node '", std::string(to_string(n->kind)),
-                         "' cannot run on ", std::string(backend_.name()),
+                         "' cannot run on ", std::string(backend().name()),
                          " (", gap, ") and no fallback handler accepted it");
       }
-      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend_));
-      LSE_RETURN_IF_ERROR(handler->execute(*n, backend_));
+      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
+      LSE_RETURN_IF_ERROR(handler->execute(*n, backend()));
       if (!n->materialized) {
         return LSE_ERROR(kInternal, "fallback handler '",
                          std::string(handler->name()),
@@ -836,7 +894,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
 
   if (launched) {
     const auto t_sync = std::chrono::steady_clock::now();
-    LSE_RETURN_IF_ERROR(backend_.synchronize());
+    LSE_RETURN_IF_ERROR(backend().synchronize());
     trace_.sync_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - t_sync)
@@ -846,7 +904,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   // the device so the next kernel can read them without a round trip.
   if (pull_host) {
     for (const NodePtr& root : roots) {
-      LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*root, backend_));
+      LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*root, backend()));
     }
   }
   rec.retain(roots, std::move(planned), ran, order);
@@ -856,11 +914,31 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
 
 namespace {
 
+// Zero-initialized before any dynamic initialization runs, so the layer that
+// owns device lifetimes can register during its own static init and be seen
+// here whenever the first scheduler is asked for.
+DeviceSetFactory g_device_set_factory = nullptr;
+
 struct DefaultScheduler {
   std::unique_ptr<backend::IBackend> backend;
   std::unique_ptr<Scheduler> scheduler;
 
   DefaultScheduler() {
+    // The set, when the layer that owns one is linked. It has already applied
+    // whatever the run asked for; nothing is decided here.
+    if (g_device_set_factory != nullptr) {
+      if (backend::IDeviceSet* set = g_device_set_factory();
+          set != nullptr && set->size() > 0) {
+        scheduler = std::make_unique<Scheduler>(*set);
+      }
+      // Registered and empty means nothing came up. Falling through to the loop
+      // below would bind a second instance of the device it just failed on.
+      return;
+    }
+
+    // No such layer in this binary — a test, or a tool that only needs one
+    // device. Bind one the same way, which is the set of size one.
+    //
     // LSE_DEVICE picks the ordinal; on a mixed box the discrete card and the
     // integrated one are different devices with different memory models.
     int ordinal = 0;
@@ -870,34 +948,23 @@ struct DefaultScheduler {
     // backend builds fine and then fails to come up when the HSA runtime on the
     // loader path is too old. Treating that as fatal would turn preferring the
     // GPU into a hard stop on any machine without one.
-    std::string declined;
     for (const std::string& name : backend::default_backend_order()) {
       auto be = backend::create_backend(name);
       if (!be.ok()) continue;
       auto candidate = be.release();
-      if (const Status init = candidate->init(ordinal); !init.ok()) {
-        if (declined.empty()) declined = name + ": " + init.to_string();
-        continue;
-      }
+      if (const Status init = candidate->init(ordinal); !init.ok()) continue;
       backend = std::move(candidate);
       scheduler = std::make_unique<Scheduler>(*backend);
-      // Falling back to a backend with no code generator runs the whole model
-      // through the host interpreter. That is a two-order-of-magnitude cliff
-      // and it used to be silent: the `--stats` line reported zero device
-      // groups next to a five-figure launch count and read like broken
-      // instrumentation. Say it once, where it happens.
-      if (backend->emitter() == nullptr && !declined.empty()) {
-        std::fprintf(stderr,
-                     "lse: no code-generating backend came up (%s); running on "
-                     "'%s' through the host interpreter\n",
-                     declined.c_str(), std::string(backend->name()).c_str());
-      }
       return;
     }
   }
 };
 
 }  // namespace
+
+void register_device_set_factory(DeviceSetFactory factory) {
+  if (g_device_set_factory == nullptr) g_device_set_factory = factory;
+}
 
 Scheduler* default_scheduler() {
   static DefaultScheduler d;

@@ -3,9 +3,12 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "lse/backends/hrx/arch_database.hpp"
@@ -63,60 +66,227 @@ template <typename T>
   return std::string(buffer);
 }
 
-// One attribute of the `ordinal`-th GPU agent, read from the copy of
-// libhsa-runtime64 that hrx has *already* loaded — dlopen by soname returns
-// that same handle, never a second runtime. The three entry points below have
-// been ABI-stable since HSA 1.0 and are declared here rather than by including
-// <hsa/hsa.h>, which is not a build input of this backend. hsa_agent_get_info
-// writes exactly the attribute's own width, so `out` must be that wide and
-// there is no size to pass.
+// The GPU agents of the copy of libhsa-runtime64 that hrx has *already* loaded
+// — dlopen by soname with RTLD_NOLOAD returns that same handle, never a second
+// runtime, and a null handle means no device has been brought up yet rather
+// than that the machine has none. The entry points below have been ABI-stable
+// since HSA 1.0 (the hsa_amd_* pool calls since ROCm 2.x) and are declared here
+// rather than by including <hsa/hsa.h>, which is not a build input of this
+// backend. hsa_agent_get_info writes exactly the attribute's own width, so a
+// caller's buffer must be at least that wide and there is no size to pass.
 //
-// False when the runtime is not reachable or the agent will not answer. Each
-// caller has its own answer for not knowing; neither invents one.
-bool agent_attribute(std::uint8_t ordinal, int attribute, void* out) noexcept {
-  struct HsaAgent {
-    std::uint64_t handle;
-  };
-  using HsaStatus = int;
-  constexpr HsaStatus kSuccess = 0;
-  constexpr int kInfoDevice = 17;
-  constexpr int kDeviceTypeGpu = 1;
+// Every query here can fail, and each caller has its own answer for not
+// knowing; none of them invents one.
+using HsaStatus = int;
+constexpr HsaStatus kHsaSuccess = 0;
+constexpr int kInfoDevice = 17;
+constexpr int kDeviceTypeGpu = 1;
 
-  void* lib = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
-  if (lib == nullptr) return false;
+struct HsaAgent {
+  std::uint64_t handle = 0;
+};
 
-  using IterateFn = HsaStatus (*)(HsaStatus (*)(HsaAgent, void*), void*);
-  using GetInfoFn = HsaStatus (*)(HsaAgent, int, void*);
-  auto iterate = reinterpret_cast<IterateFn>(dlsym(lib, "hsa_iterate_agents"));
-  auto get_info = reinterpret_cast<GetInfoFn>(dlsym(lib, "hsa_agent_get_info"));
-  if (iterate == nullptr || get_info == nullptr) {
-    dlclose(lib);
-    return false;
+// A global memory pool of one agent. Peer reach is a question about a pool, not
+// about a device: an agent either may address another agent's coarse-grained
+// global pool or may not.
+struct HsaPool {
+  std::uint64_t handle = 0;
+};
+
+class HsaRuntime {
+ public:
+  HsaRuntime() noexcept {
+    lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (lib_ == nullptr) return;
+    iterate_ = reinterpret_cast<IterateFn>(dlsym(lib_, "hsa_iterate_agents"));
+    get_info_ = reinterpret_cast<GetInfoFn>(dlsym(lib_, "hsa_agent_get_info"));
+    iterate_pools_ = reinterpret_cast<IteratePoolsFn>(
+        dlsym(lib_, "hsa_amd_agent_iterate_memory_pools"));
+    pool_info_ = reinterpret_cast<PoolInfoFn>(
+        dlsym(lib_, "hsa_amd_memory_pool_get_info"));
+    agent_pool_info_ = reinterpret_cast<AgentPoolInfoFn>(
+        dlsym(lib_, "hsa_amd_agent_memory_pool_get_info"));
+  }
+  ~HsaRuntime() {
+    if (lib_ != nullptr) dlclose(lib_);
+  }
+  HsaRuntime(const HsaRuntime&) = delete;
+  HsaRuntime& operator=(const HsaRuntime&) = delete;
+
+  [[nodiscard]] bool reachable() const noexcept {
+    return iterate_ != nullptr && get_info_ != nullptr;
   }
 
-  struct Visit {
-    GetInfoFn get_info;
-    std::uint8_t want;
-    std::uint8_t seen;
-    int attribute;
-    void* out;
-    bool filled;
-  } visit{get_info, ordinal, 0, attribute, out, false};
+  [[nodiscard]] bool attribute(HsaAgent agent, int attr, void* out) const noexcept {
+    return reachable() && get_info_(agent, attr, out) == kHsaSuccess;
+  }
 
-  iterate(
-      [](HsaAgent agent, void* data) -> HsaStatus {
-        auto* v = static_cast<Visit*>(data);
-        int type = 0;
-        if (v->get_info(agent, kInfoDevice, &type) != kSuccess) return kSuccess;
-        if (type != kDeviceTypeGpu) return kSuccess;
-        if (v->seen++ != v->want) return kSuccess;
-        v->filled = v->get_info(agent, v->attribute, v->out) == kSuccess;
-        return kSuccess;
-      },
-      &visit);
+  // GPU agents only, in hsa_iterate_agents order. The CPU and any accelerator
+  // that is not a GPU (this box also enumerates an NPU) are skipped, so the
+  // index is a GPU index — which is what an hrx ordinal is meant to be too.
+  [[nodiscard]] std::vector<HsaAgent> gpu_agents() const noexcept {
+    std::vector<HsaAgent> agents;
+    if (!reachable()) return agents;
+    struct Visit {
+      const HsaRuntime* self;
+      std::vector<HsaAgent>* out;
+    } visit{this, &agents};
+    iterate_(
+        [](HsaAgent agent, void* data) -> HsaStatus {
+          auto* v = static_cast<Visit*>(data);
+          int type = 0;
+          if (!v->self->attribute(agent, kInfoDevice, &type)) return kHsaSuccess;
+          if (type == kDeviceTypeGpu) v->out->push_back(agent);
+          return kHsaSuccess;
+        },
+        &visit);
+    return agents;
+  }
 
-  dlclose(lib);
-  return visit.filled;
+  // This agent's coarse-grained global pool — the one device-local allocations
+  // come from, and the one a peer would have to reach. Null handle when the
+  // agent publishes none.
+  [[nodiscard]] HsaPool coarse_global_pool(HsaAgent agent) const noexcept {
+    constexpr int kPoolInfoSegment = 0;
+    constexpr int kPoolInfoGlobalFlags = 1;
+    constexpr std::uint32_t kSegmentGlobal = 0;
+    constexpr std::uint32_t kGlobalFlagCoarseGrained = 4;
+    if (iterate_pools_ == nullptr || pool_info_ == nullptr) return {};
+    struct Visit {
+      const HsaRuntime* self;
+      HsaPool found;
+    } visit{this, {}};
+    iterate_pools_(
+        agent,
+        [](HsaPool pool, void* data) -> HsaStatus {
+          auto* v = static_cast<Visit*>(data);
+          if (v->found.handle != 0) return kHsaSuccess;
+          std::uint32_t segment = 0;
+          std::uint32_t flags = 0;
+          if (v->self->pool_info_(pool, kPoolInfoSegment, &segment) != kHsaSuccess ||
+              v->self->pool_info_(pool, kPoolInfoGlobalFlags, &flags) != kHsaSuccess) {
+            return kHsaSuccess;
+          }
+          if (segment == kSegmentGlobal &&
+              (flags & kGlobalFlagCoarseGrained) != 0) {
+            v->found = pool;
+          }
+          return kHsaSuccess;
+        },
+        &visit);
+    return visit.found;
+  }
+
+  // Whether `agent` may address `pool`, as the runtime that owns both answers
+  // it (HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS). This is a real topology query:
+  // ROCr resolves it through the KFD's peer table, unlike
+  // hrx_device_can_access_peer, which compares the two devices' *types* and
+  // therefore answers "yes" for any two GPUs whether a path exists or not.
+  [[nodiscard]] PeerAccess pool_access(HsaAgent agent, HsaPool pool) const noexcept {
+    constexpr int kAgentPoolInfoAccess = 0;
+    if (agent_pool_info_ == nullptr || pool.handle == 0) {
+      return PeerAccess::kUnknown;
+    }
+    int access = -1;
+    if (agent_pool_info_(agent, pool, kAgentPoolInfoAccess, &access) !=
+        kHsaSuccess) {
+      return PeerAccess::kUnknown;
+    }
+    switch (access) {
+      case 0: return PeerAccess::kNo;         // NEVER_ALLOWED
+      case 1: return PeerAccess::kYes;        // ALLOWED_BY_DEFAULT
+      case 2: return PeerAccess::kOnRequest;  // DISALLOWED_BY_DEFAULT
+      default: return PeerAccess::kUnknown;
+    }
+  }
+
+ private:
+  using IterateFn = HsaStatus (*)(HsaStatus (*)(HsaAgent, void*), void*);
+  using GetInfoFn = HsaStatus (*)(HsaAgent, int, void*);
+  using IteratePoolsFn = HsaStatus (*)(HsaAgent,
+                                       HsaStatus (*)(HsaPool, void*), void*);
+  using PoolInfoFn = HsaStatus (*)(HsaPool, int, void*);
+  using AgentPoolInfoFn = HsaStatus (*)(HsaAgent, HsaPool, int, void*);
+
+  void* lib_ = nullptr;
+  IterateFn iterate_ = nullptr;
+  GetInfoFn get_info_ = nullptr;
+  IteratePoolsFn iterate_pools_ = nullptr;
+  PoolInfoFn pool_info_ = nullptr;
+  AgentPoolInfoFn agent_pool_info_ = nullptr;
+};
+
+// One attribute of the `ordinal`-th GPU agent. False when the runtime is not
+// reachable, the index is past the agents it lists, or the agent will not
+// answer.
+bool agent_attribute(std::uint8_t ordinal, int attribute, void* out) noexcept {
+  const HsaRuntime hsa;
+  const std::vector<HsaAgent> agents = hsa.gpu_agents();
+  if (ordinal >= agents.size()) return false;
+  return hsa.attribute(agents[ordinal], attribute, out);
+}
+
+// A string attribute. hsa_agent_get_info writes the attribute's whole declared
+// width, so the buffer is the widest string attribute read here (64) rather
+// than the length of what comes back; empty when the agent will not answer.
+[[maybe_unused]] std::string agent_string(const HsaRuntime& hsa, HsaAgent agent,
+                                         int attribute) {
+  char buffer[64] = {};
+  if (!hsa.attribute(agent, attribute, buffer)) return {};
+  buffer[sizeof(buffer) - 1] = '\0';
+  return std::string(buffer);
+}
+
+// The KFD node id an hrx device name carries. IREE's AMDGPU driver builds the
+// name as "<product> (Node <HSA_AGENT_INFO_NODE>)" (drivers/amdgpu/driver.c:188)
+// and that node is the one exact identity both hrx and the HSA runtime can see:
+// it pins an hrx ordinal to an agent even among boards of the same part, where
+// matching the architecture cannot. -1 when the name carries none.
+[[maybe_unused]] int node_in_name(std::string_view name) noexcept {
+  constexpr std::string_view kOpen = "(Node ";
+  const std::size_t open = name.rfind(kOpen);
+  if (open == std::string_view::npos) return -1;
+  const std::size_t start = open + kOpen.size();
+  const std::size_t close = name.find(')', start);
+  if (close == std::string_view::npos) return -1;
+  int node = -1;
+  const auto [ptr, ec] = std::from_chars(name.data() + start,
+                                         name.data() + close, node);
+  if (ec != std::errc{} || ptr != name.data() + close) return -1;
+  return node;
+}
+
+// How well the `index`-th GPU agent can be shown to be the device hrx calls
+// ordinal `index`.
+//
+// The two are independent numbering schemes over the same GPUs: hrx skips
+// IREE's pseudo-device (one logical device standing for all of them) and
+// renumbers what is left, while hsa_iterate_agents has its own order. Nothing
+// in hrx_runtime.h publishes a bus id or a uuid to join them on, so the join is
+// the node in the name, with the architecture as a weaker fallback — and an
+// agent fact is only attributed to an ordinal when one of them holds.
+enum class AgentMatch : std::uint8_t {
+  kNo,        // not the same device, or nothing could be compared
+  kArchOnly,  // same architecture, which identical boards also share
+  kNode,      // same KFD node: this is that device
+};
+
+[[maybe_unused]] AgentMatch match_agent(const HsaRuntime& hsa, HsaAgent agent,
+                                        std::string_view hrx_name,
+                                        std::string_view hrx_arch) {
+  constexpr int kInfoName = 0;
+  constexpr int kInfoNode = 16;
+  // For a GPU agent HSA's own name is the ISA name ("gfx1151"), which is what
+  // hrx reports as the architecture.
+  if (hrx_arch.empty() || agent_string(hsa, agent, kInfoName) != hrx_arch) {
+    return AgentMatch::kNo;
+  }
+  const int named_node = node_in_name(hrx_name);
+  if (named_node < 0) return AgentMatch::kArchOnly;
+  std::uint32_t node = 0;
+  if (!hsa.attribute(agent, kInfoNode, &node)) return AgentMatch::kArchOnly;
+  return static_cast<int>(node) == named_node ? AgentMatch::kNode
+                                             : AgentMatch::kNo;
 }
 
 // The agent's own answer to "how many queues may exist on you at once"
@@ -258,6 +428,52 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
   return caps;
 }
 
+#if LSE_HRX_LINKED
+// Brings the GPU accelerator up once for the whole process, and leaves it up.
+//
+// It cannot belong to a backend instance. hrx_gpu_initialize is global, is not
+// refcounted, and returns ALREADY_EXISTS on a second call — which is why two
+// HrxBackend objects could not both init before this existed — while
+// hrx_gpu_shutdown is global too and tears every device down for every holder
+// with no owner check. Measured on this box: after one instance's shutdown ran
+// the global teardown, a surviving instance still answered property and
+// free-memory queries with plausible numbers and then failed inside the
+// allocator ("shared proactor pool must be initialized"), which is the worst
+// failure shape available — late, partial, and downstream of the report.
+//
+// ALREADY_EXISTS therefore counts as up, and taking it down is deliberately
+// left to process exit: hrx_gpu_shutdown is one-way, hsa_init fails
+// RESOURCE_EXHAUSTED on the way back up, so an early teardown would buy a tidy
+// exit at the price of a process that can never bind a device again — which is
+// exactly what enumerating devices before binding one would otherwise cause.
+Status accelerator_up() {
+  struct Owner {
+    bool up = false;
+    ~Owner() {
+      if (up) hrx_status_ignore(hrx_gpu_shutdown());
+    }
+  };
+  // Constructed on the first bring-up, i.e. before any backend finishes
+  // initialising, so its destructor is registered first and therefore runs
+  // last — after every instance has released its streams, buffers and device.
+  static Owner owner;
+  static std::mutex mu;
+  const std::lock_guard lock(mu);
+  if (owner.up) return OkStatus();
+  const hrx_status_t status = hrx_gpu_initialize(0);
+  if (hrx_status_is_ok(status)) {
+    owner.up = true;
+    return OkStatus();
+  }
+  if (hrx_status_code(status) == HRX_STATUS_ALREADY_EXISTS) {
+    hrx_status_ignore(status);
+    owner.up = true;
+    return OkStatus();
+  }
+  return from_hrx(status, "hrx_gpu_initialize");
+}
+#endif
+
 }  // namespace
 
 bool HrxBackend::available() noexcept {
@@ -270,6 +486,223 @@ bool HrxBackend::available() noexcept {
 
 HrxBackend::~HrxBackend() { shutdown_impl(); }
 
+Result<std::vector<DeviceDescriptor>> HrxBackend::enumerate_devices() {
+#if !LSE_HRX_LINKED
+  return LSE_ERROR(kUnimplemented,
+                   "this build was configured with HRX headers but libhrx was "
+                   "not linked; build hrx-system and reconfigure with "
+                   "-DLSE_HRX_ROOT=<install prefix>");
+#else
+  LSE_RETURN_IF_ERROR(accelerator_up());
+
+  int count = 0;
+  LSE_RETURN_IF_ERROR(
+      from_hrx(hrx_gpu_device_count(&count), "hrx_gpu_device_count"));
+
+  // HSA attribute ids, from hsa.h / hsa_ext_amd.h. Declared here for the same
+  // reason the entry points are: those headers are not a build input.
+  constexpr int kInfoWavefrontSize = 6;
+  constexpr int kInfoWorkgroupMaxSize = 8;
+  constexpr int kInfoComputeUnitCount = 0xA002;
+  constexpr int kInfoBdfId = 0xA006;
+  constexpr int kInfoDomain = 0xA00F;
+  constexpr int kInfoUuid = 0xA011;
+  constexpr int kInfoMemoryAvail = 0xA015;
+
+  const HsaRuntime hsa;
+  const std::vector<HsaAgent> agents = hsa.gpu_agents();
+  std::vector<HsaPool> pools(agents.size());
+  for (std::size_t i = 0; i < agents.size(); ++i) {
+    pools[i] = hsa.coarse_global_pool(agents[i]);
+  }
+
+  std::vector<DeviceDescriptor> out;
+  out.reserve(static_cast<std::size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    hrx_device_t device = nullptr;
+    LSE_RETURN_IF_ERROR(
+        from_hrx(hrx_gpu_device_get(i, &device), "hrx_gpu_device_get"));
+
+    DeviceDescriptor d;
+    d.backend = std::string(kName);
+    d.ordinal = i;
+    const auto decline = [&d](std::string_view text) {
+      if (!d.declined.empty()) d.declined += "; ";
+      d.declined += text;
+    };
+
+    const std::string name = query_string_property(device, HRX_DEVICE_PROPERTY_NAME);
+    if (!name.empty()) d.product = DeviceFact<std::string>::queried(name);
+    const std::string arch =
+        query_string_property(device, HRX_DEVICE_PROPERTY_ARCHITECTURE);
+    if (!arch.empty()) d.arch = DeviceFact<std::string>::queried(arch);
+
+    std::uint64_t total = 0;
+    if (query_property(device, HRX_DEVICE_PROPERTY_TOTAL_MEMORY, &total).ok() &&
+        total != 0) {
+      d.total_memory =
+          DeviceFact<std::size_t>::queried(static_cast<std::size_t>(total));
+    }
+    std::uint32_t queues = 0;
+    if (query_property(device, HRX_DEVICE_PROPERTY_QUEUE_COUNT, &queues).ok() &&
+        queues != 0) {
+      d.queue_count = DeviceFact<std::uint32_t>::queried(queues);
+    }
+    // hrx answers these two with a literal 0 ("not available from local-task
+    // driver"), which is an absent answer and not a device with no CUs.
+    std::uint32_t cus = 0;
+    if (query_property(device, HRX_DEVICE_PROPERTY_COMPUTE_UNITS, &cus).ok() &&
+        cus != 0) {
+      d.compute_units = DeviceFact<std::uint32_t>::queried(cus);
+    }
+    std::uint32_t threads = 0;
+    if (query_property(device, HRX_DEVICE_PROPERTY_MAX_WORKGROUP_SIZE, &threads)
+            .ok() &&
+        threads != 0) {
+      d.max_threads_per_workgroup = DeviceFact<std::uint32_t>::queried(threads);
+    }
+
+    // Free memory: the HAL first, so that the day it publishes an availability
+    // observation that is the figure used. The AMDGPU HAL populates its
+    // observation from the device spec and so answers UNAVAILABLE today.
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    const hrx_status_t mem =
+        hrx_device_memory_info(device, &free_bytes, &total_bytes);
+    if (hrx_status_is_ok(mem)) {
+      d.free_memory = DeviceFact<std::size_t>::queried(free_bytes);
+    } else {
+      hrx_status_ignore(mem);
+    }
+
+    // One row per device of this backend, kUnknown until something answers.
+    // The diagonal falls back to the one fact about reach that needs no query.
+    const std::size_t index = static_cast<std::size_t>(i);
+    d.peers.assign(static_cast<std::size_t>(count), PeerAccess::kUnknown);
+    d.peers[index] = PeerAccess::kSelf;
+
+    const AgentMatch matched = index < agents.size()
+                                   ? match_agent(hsa, agents[index], name, arch)
+                                   : AgentMatch::kNo;
+    if (matched == AgentMatch::kNo) {
+      decline("this device could not be matched to one of the " +
+              std::to_string(agents.size()) +
+              " GPU agent(s) the HSA runtime lists, so its uuid, pci path, "
+              "free memory, occupancy limits and peer reach are unknown here "
+              "rather than read off whichever agent shares its index");
+    } else if (matched == AgentMatch::kArchOnly) {
+      decline("this device's name carries no KFD node, so its HSA agent was "
+              "matched on architecture alone: two boards of the same part "
+              "could be permuted between hrx ordinals and agent order");
+    }
+
+    if (matched != AgentMatch::kNo) {
+      const HsaAgent agent = agents[index];
+
+      if (!d.free_memory.known()) {
+        std::uint64_t available = 0;
+        if (hsa.attribute(agent, kInfoMemoryAvail, &available)) {
+          d.free_memory = DeviceFact<std::size_t>::queried(
+              static_cast<std::size_t>(available));
+        } else {
+          decline("neither this device's HAL nor its agent publishes an "
+                  "available-memory figure");
+        }
+      }
+      if (!d.compute_units.known() &&
+          hsa.attribute(agent, kInfoComputeUnitCount, &cus) && cus != 0) {
+        d.compute_units = DeviceFact<std::uint32_t>::queried(cus);
+      }
+      if (!d.max_threads_per_workgroup.known() &&
+          hsa.attribute(agent, kInfoWorkgroupMaxSize, &threads) &&
+          threads != 0) {
+        d.max_threads_per_workgroup = DeviceFact<std::uint32_t>::queried(threads);
+      }
+      std::uint32_t wavefront = 0;
+      if (hsa.attribute(agent, kInfoWavefrontSize, &wavefront) &&
+          wavefront != 0) {
+        d.wavefront_size = DeviceFact<std::uint32_t>::queried(wavefront);
+      }
+
+      // "GPU-XX" is what ROCr returns for an agent with no uuid, documented as
+      // such in hsa_ext_amd.h. Printing it would be printing a placeholder as
+      // an identity.
+      const std::string uuid = agent_string(hsa, agent, kInfoUuid);
+      if (!uuid.empty() && !uuid.ends_with("-XX")) {
+        d.uuid = DeviceFact<std::string>::queried(uuid);
+      } else {
+        decline("this agent publishes no uuid (ROCr's \"" +
+                (uuid.empty() ? std::string("(no answer)") : uuid) +
+                "\" placeholder), and hrx exposes no device uuid of its own "
+                "even though IREE reads one to build the device path");
+      }
+
+      std::uint32_t bdf = 0;
+      std::uint32_t domain = 0;
+      if (hsa.attribute(agent, kInfoBdfId, &bdf) && bdf != 0 &&
+          hsa.attribute(agent, kInfoDomain, &domain)) {
+        // BDFID packs bus:device.function; the domain is a separate attribute
+        // and the two together are the whole physical location.
+        char path[32] = {};
+        std::snprintf(path, sizeof(path), "%04x:%02x:%02x.%u", domain,
+                      (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7);
+        d.pci_path = DeviceFact<std::string>::queried(std::string(path));
+      } else {
+        decline("this agent publishes no pci location");
+      }
+
+      for (int j = 0; j < count; ++j) {
+        const std::size_t peer = static_cast<std::size_t>(j);
+        const PeerAccess reach = peer < pools.size()
+                                     ? hsa.pool_access(agent, pools[peer])
+                                     : PeerAccess::kUnknown;
+        if (reach != PeerAccess::kUnknown) d.peers[peer] = reach;
+      }
+      if (std::find(d.peers.begin(), d.peers.end(), PeerAccess::kUnknown) !=
+          d.peers.end()) {
+        decline("peer reach is read from the HSA agents' pool access, because "
+                "hrx_device_can_access_peer compares the two devices' types "
+                "instead of querying a path and would answer yes for any two "
+                "GPUs; it is unknown for a peer whose agent or pool this could "
+                "not reach");
+      }
+    }
+
+    // The tables fill what no runtime here answers. They are declared, not
+    // measured, and say so: an ISA row is fixed by the architecture, a board
+    // row is a spec sheet.
+    const FamilyIsa* isa = family_isa(arch_family(arch));
+    const BoardFallback* board = board_fallback(arch);
+    if (!d.compute_units.known() && board != nullptr) {
+      d.compute_units = DeviceFact<std::uint32_t>::declared(board->compute_units);
+    }
+    if (!d.max_threads_per_workgroup.known() && isa != nullptr) {
+      d.max_threads_per_workgroup =
+          DeviceFact<std::uint32_t>::declared(isa->max_threads_per_workgroup);
+    }
+    if (!d.wavefront_size.known() && isa != nullptr) {
+      d.wavefront_size = DeviceFact<std::uint32_t>::declared(isa->wavefront_size);
+    }
+    // hrx declares HRX_DEVICE_PROPERTY_MAX_SHARED_MEMORY and implements no case
+    // for it, and HSA publishes no per-workgroup LDS attribute, so the ISA row
+    // is the only source there is.
+    if (isa != nullptr) {
+      d.lds_bytes_per_workgroup =
+          DeviceFact<std::uint32_t>::declared(isa->lds_bytes_per_workgroup);
+    }
+    // Nothing queryable states whether host and device share one physical pool,
+    // and the difference is a behavioural branch, so it comes from the board
+    // row or it is unknown.
+    if (board != nullptr) {
+      d.unified_memory = DeviceFact<bool>::declared(board->unified_memory);
+    }
+
+    out.push_back(std::move(d));
+  }
+  return out;
+#endif
+}
+
 Status HrxBackend::init_impl(int device_ordinal) {
 #if !LSE_HRX_LINKED
   (void)device_ordinal;
@@ -278,7 +711,7 @@ Status HrxBackend::init_impl(int device_ordinal) {
                    "not linked; build hrx-system and reconfigure with "
                    "-DLSE_HRX_ROOT=<install prefix>");
 #else
-  LSE_RETURN_IF_ERROR(from_hrx(hrx_gpu_initialize(0), "hrx_gpu_initialize"));
+  LSE_RETURN_IF_ERROR(accelerator_up());
 
   int count = 0;
   LSE_RETURN_IF_ERROR(from_hrx(hrx_gpu_device_count(&count), "hrx_gpu_device_count"));
@@ -291,6 +724,12 @@ Status HrxBackend::init_impl(int device_ordinal) {
   hrx_device_t device = nullptr;
   LSE_RETURN_IF_ERROR(
       from_hrx(hrx_gpu_device_get(device_ordinal, &device), "hrx_gpu_device_get"));
+  // device_get hands back a borrowed pointer into hrx's static device array and
+  // does not retain, while shutdown_impl releases — so the reference this
+  // instance is about to drop has to be taken here. Without it N instances on
+  // one ordinal are N decrements against a device none of them retained, and
+  // the only thing hiding that today is that streams and buffers retain it too.
+  hrx_device_retain(device);
   device_ = device;
 
   // Borrowed reference, valid for the device's lifetime — do not release.
@@ -428,10 +867,9 @@ void HrxBackend::shutdown_impl() noexcept {
     device_ = nullptr;
   }
   allocator_ = nullptr;
-  if (initialized_) {
-    hrx_status_ignore(hrx_gpu_shutdown());
-    initialized_ = false;
-  }
+  // The accelerator is not this instance's to shut down: it is process-scoped
+  // and every other instance is still using it (see accelerator_up).
+  initialized_ = false;
 #endif
 }
 

@@ -64,8 +64,19 @@ lse_add_test(test_probe lse_probe lse_dist)
 if(TARGET lse_backend_hrx)
   target_link_libraries(test_probe PRIVATE lse_graph)
 endif()
+# The live device set is qualified by the same probe, so it is exercised here
+# rather than in a suite of its own: place owns the lifetime, probe measures it.
+target_link_libraries(test_probe PRIVATE lse_place)
 target_link_libraries(test_probe PRIVATE lse_backends)
 target_link_libraries(test_probe PRIVATE Threads::Threads)
+
+# The trace module: the writer, the collector and the pftrace bytes need no
+# device, and the suite asserts on the encoded bytes rather than on a viewer.
+# lse_backends is linked so the same seam can be exercised against a live
+# backend's real dispatches where there is one; those cases skip on a bare
+# machine.
+lse_add_test(test_trace lse_trace)
+target_link_libraries(test_trace PRIVATE lse_graph lse_backends Threads::Threads)
 
 # The GPU backend needs the 7.13 HSA runtime on the loader path; without it the
 # tests still pass on the CPU backend, just without exercising a device.

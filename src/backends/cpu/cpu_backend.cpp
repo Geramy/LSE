@@ -39,6 +39,33 @@ Status CpuBackend::init_impl(int device_ordinal) {
 
 void CpuBackend::shutdown_impl() noexcept { initialized_ = false; }
 
+Result<std::vector<DeviceDescriptor>> CpuBackend::enumerate_devices() {
+  DeviceDescriptor d;
+  d.backend = std::string(kName);
+  d.ordinal = 0;
+  // The backend's own label for the host, not a part number read off it: a
+  // report that printed the host's model string here would be describing the
+  // machine rather than the device this backend drives.
+  d.product = DeviceFact<std::string>::declared("host cpu");
+  d.arch = DeviceFact<std::string>::declared("host");
+  const unsigned hw = std::thread::hardware_concurrency();
+  if (hw != 0) d.compute_units = DeviceFact<std::uint32_t>::queried(hw);
+  // One host thread per workgroup is what the reference kernels execute.
+  d.max_threads_per_workgroup = DeviceFact<std::uint32_t>::declared(1);
+  d.wavefront_size = DeviceFact<std::uint32_t>::inapplicable();
+  d.lds_bytes_per_workgroup = DeviceFact<std::uint32_t>::inapplicable();
+  d.queue_count = DeviceFact<std::uint32_t>::inapplicable();
+  d.unified_memory = DeviceFact<bool>::declared(true);
+  d.peers = {PeerAccess::kSelf};
+  d.declined =
+      "this backend answers no memory query, so total and free stay unknown "
+      "rather than being taken from the machine's RAM: its allocations come "
+      "from the host heap, whose capacity it does not ask for";
+  std::vector<DeviceDescriptor> out;
+  out.push_back(std::move(d));
+  return out;
+}
+
 Result<DeviceBuffer> CpuBackend::allocate_impl(std::size_t bytes,
                                               MemoryClass cls) {
   // Host and device are the same memory here, so the class changes nothing.

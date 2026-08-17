@@ -341,8 +341,8 @@ bool node_can_stage(const Node& n) noexcept {
   const auto name = kp->name();
   if (is_linked_name(name) || name == "linear.wmma") return false;
   if (is_linear_name(name)) return true;
-  if (name == "overwrite_slice" || name == "gdn_chunk_scan" ||
-      name == "gdn_chunk_scan.pair") {
+  if (name == "overwrite_slice" || name == "kv_page_write" ||
+      name == "gdn_chunk_scan" || name == "gdn_chunk_scan.pair") {
     return true;
   }
   return !kp->owns_indexing();

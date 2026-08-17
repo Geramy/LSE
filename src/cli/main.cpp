@@ -20,6 +20,7 @@
 #include "lse/model/config.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
+#include "lse/place/devices.hpp"
 #include "lse/probe/pool.hpp"
 #include "lse/probe/profile_store.hpp"
 #include "lse/runtime/generator.hpp"
@@ -37,8 +38,11 @@ struct Options {
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   // Empty means detect from the checkpoint.
   std::string arch;
+  // Empty means $LSE_POOL, and empty again means one device.
+  std::string pool;
   bool show_stats = false;
   bool list_devices = false;
+  bool list_cache = false;
   bool debug = false;
   std::int32_t kv_len = 0;
 };
@@ -47,8 +51,10 @@ void usage() {
   std::puts(
       "usage: lse [options] [prompt]\n"
       "\n"
-      "  -m, --model PATH       checkpoint directory or HF repo id\n"
-      "                         (default: $LSE_MODEL, else the HF cache)\n"
+      "  -m, --model NAME       checkpoint directory, .safetensors, or an HF\n"
+      "                         repo id such as mlx-community/Qwen3.5-4B-4bit;\n"
+      "                         a bare model name resolves when it is unique\n"
+      "                         (default: $LSE_MODEL)\n"
       "  -n, --max-tokens N     tokens to generate (default 256)\n"
       "  -t, --temperature F    0 or less is greedy (default 0.8)\n"
       "      --top-k N          keep the N most likely tokens (default off)\n"
@@ -59,11 +65,18 @@ void usage() {
       "                         model directory has none (default Qwen/Qwen3.6-27B)\n"
       "      --arch NAME        force a model kernel instead of detecting one\n"
       "      --list-models      print the registered model kernels and exit\n"
+      "      --list-cache       list the models in the HF cache and whether\n"
+      "                         this build can load each one, and exit\n"
       "      --kv-len N         allocate the KV cache for N tokens and keep\n"
       "                         that shape (default: max(2*train_seq, 2048))\n"
       "      --stats            print timings when done\n"
       "      --debug            print the HIP dump path and file count\n"
-      "      --devices          list available backends and exit\n"
+      "      --devices          report every device this build can see, with\n"
+      "                         its identity and what it will not answer\n"
+      "      --pool LIST         devices this run may use, backend-qualified\n"
+      "                         and best first: hrx:0,cpu:0 (default $LSE_POOL,\n"
+      "                         else one device -- the first backend that comes\n"
+      "                         up, at $LSE_DEVICE's ordinal)\n"
       "  -h, --help             this message");
 }
 
@@ -88,6 +101,10 @@ bool parse(int argc, char** argv, Options* opt) {
       std::exit(0);
     } else if (a == "--devices") {
       opt->list_devices = true;
+    } else if (a == "--list-cache") {
+      opt->list_cache = true;
+    } else if (a == "--pool") {
+      if (!take_value(argc, argv, i, "--pool", &opt->pool)) return false;
     } else if (a == "--stats") {
       opt->show_stats = true;
     } else if (a == "--debug") {
@@ -142,38 +159,139 @@ bool parse(int argc, char** argv, Options* opt) {
   return true;
 }
 
+// "iB" throughout so a byte count is never read as a parameter count: the
+// SCALE column's B means billion and this column's B would mean bytes.
+std::string human_bytes(std::uintmax_t n) {
+  const char* unit[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+  double v = static_cast<double>(n);
+  int u = 0;
+  while (v >= 1024.0 && u < 4) {
+    v /= 1024.0;
+    ++u;
+  }
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), v < 10.0 && u > 0 ? "%.1f%s" : "%.0f%s", v,
+                unit[u]);
+  return buf;
+}
+
+std::string human_scale(std::size_t params) {
+  if (params == 0) return "-";
+  char buf[32];
+  if (params >= 1000000000ull) {
+    std::snprintf(buf, sizeof(buf), "%.1fB",
+                  static_cast<double>(params) / 1e9);
+  } else {
+    std::snprintf(buf, sizeof(buf), "%.0fM", static_cast<double>(params) / 1e6);
+  }
+  return buf;
+}
+
+// One line per model, and the reason on a continuation line whenever the
+// verdict is anything but yes — the same shape list_devices uses for a backend
+// it cannot bring up.
+int list_cache() {
+  auto models = model::list_cached_models();
+  if (!models.ok()) {
+    std::fprintf(stderr, "lse: %s\n", models.status().to_string().c_str());
+    return 1;
+  }
+  std::printf("cache %s\n", model::hf_cache_root().c_str());
+  if (models->empty()) {
+    std::puts("no models in the cache");
+    return 0;
+  }
+
+  std::size_t repo_w = 4;
+  std::size_t arch_w = 4;
+  std::size_t quant_w = 5;
+  for (const model::CacheModel& m : *models) {
+    repo_w = std::max(repo_w, m.repo_id.size());
+    arch_w = std::max(arch_w, m.architecture.size());
+    quant_w = std::max(quant_w, m.quantization.size());
+  }
+
+  std::printf("\n%-*s  %-*s  %5s  %-*s  %-4s  %6s  %s\n",
+              static_cast<int>(repo_w), "REPO", static_cast<int>(arch_w),
+              "ARCH", "SCALE", static_cast<int>(quant_w), "QUANT", "MM",
+              "ONDISK", "LOAD");
+  for (const model::CacheModel& m : *models) {
+    std::string load(model::to_string(m.loadable));
+    if (!m.engine_arch.empty()) load += " (" + m.engine_arch + ")";
+    std::printf("%-*s  %-*s  %5s  %-*s  %-4s  %6s  %s\n",
+                static_cast<int>(repo_w), m.repo_id.c_str(),
+                static_cast<int>(arch_w),
+                m.architecture.empty() ? "-" : m.architecture.c_str(),
+                human_scale(m.parameters).c_str(), static_cast<int>(quant_w),
+                m.quantization.empty() ? "-" : m.quantization.c_str(),
+                m.multimodal_known ? (m.multimodal ? "yes" : "no") : "-",
+                human_bytes(m.bytes).c_str(), load.c_str());
+    if (!m.reason.empty()) std::printf("    %s\n", m.reason.c_str());
+  }
+  // The tower is in every one of these checkpoints and none of it is read, so
+  // saying "multimodal" without saying that would overstate what a load gets.
+  std::puts("\nMM marks a checkpoint carrying a vision tower; this build decodes text only.");
+  return 0;
+}
+
+// One block per DEVICE, not per backend: on a machine with several GPUs the
+// old shape printed one line for the whole hrx backend and the properties of
+// whichever device it happened to bind.
+//
+// Nothing here binds a device. Enumeration reads identities, so a report costs
+// no stream, no allocation and no queue probe, and the ordinal a run would
+// select is not privileged over the others.
 int list_devices() {
   const auto names = backend::available_backends();
   if (names.empty()) {
     std::puts("no backends were compiled into this build");
     return 1;
   }
+  std::size_t devices = 0;
   for (std::string_view name : names) {
-    auto b = backend::create_backend(name);
-    if (!b.ok()) {
+    auto found = backend::enumerate_devices(name);
+    if (!found.ok()) {
       std::printf("%-6s unavailable: %s\n", std::string(name).c_str(),
-                  b.status().to_string().c_str());
-      continue;
-    }
-    int ordinal = 0;
-    if (const char* env = std::getenv("LSE_DEVICE")) ordinal = std::atoi(env);
-    const Status init = (*b)->init(ordinal);
-    if (!init.ok()) {
-      std::printf("%-6s unavailable: %s\n", std::string(name).c_str(),
-                  init.to_string().c_str());
+                  found.status().to_string().c_str());
 #ifdef LSE_HSA_RUNTIME_DIR
       // The loader captured LD_LIBRARY_PATH before main ran, so this cannot be
       // fixed from here — say what to set rather than fail silently.
-      if (init.to_string().find("hsa_") != std::string::npos) {
+      if (found.status().to_string().find("hsa_") != std::string::npos) {
         std::printf("       the distro HSA runtime is too old; run with\n"
                     "         LD_LIBRARY_PATH=%s\n", LSE_HSA_RUNTIME_DIR);
       }
 #endif
       continue;
     }
-    std::printf("%-6s %s", std::string(name).c_str(),
-                (*b)->device_info().describe().c_str());
+    if (found->empty()) {
+      std::printf("%-6s no devices attached\n", std::string(name).c_str());
+      continue;
+    }
+    for (const backend::DeviceDescriptor& d : *found) {
+      std::printf("%-6s %s", d.id().c_str(), d.describe().c_str());
+      ++devices;
+    }
   }
+  if (devices == 0) return 1;
+  // What a run would pick, in the order it would try — the report names
+  // devices because a human is reading it, and this is the one line that says
+  // which of them the engine would choose. Placement upstream reads
+  // capabilities, never these names.
+  std::string order;
+  for (const std::string& candidate : backend::default_backend_order()) {
+    if (!order.empty()) order += ", ";
+    order += candidate;
+  }
+  int selected = 0;
+  if (const char* env = std::getenv("LSE_DEVICE")) selected = std::atoi(env);
+  std::printf(
+      "\n%zu device%s. A run binds ordinal %d of the first backend that comes "
+      "up, trying %s (LSE_BACKEND and LSE_DEVICE override); --pool or "
+      "$LSE_POOL names a set instead, best first, e.g. --pool hrx:0,cpu:0.\n"
+      "Values are the device's own answers unless marked (declared), which "
+      "means an architecture table answered; a property nothing here can "
+      "answer reads unknown, and n/a means the device has no such property.\n",
+      devices, devices == 1 ? "" : "s", selected, order.c_str());
   return 0;
 }
 
@@ -204,6 +322,13 @@ StoreEntry stat_entry(const std::string& path) {
 
 struct Qualification {
   probe::PoolProfile pool;
+  // Whether the device set opened at all. Distinct from `status`: a device
+  // that merely could not be MEASURED is a pool with unknown numbers and a
+  // run that proceeds, while a device that was asked for and never came up is
+  // the end of the run — and saying so here rather than letting the weights
+  // fail two seconds later is the difference between naming the device and
+  // reporting that a tensor had nowhere to go.
+  bool devices_up = false;
   // Non-ok when nothing could be qualified at all. A device that merely could
   // not be measured is not a failure: it comes back with kUnknown numbers.
   Status status;
@@ -217,16 +342,38 @@ struct Qualification {
 // memory has to mean "what could hold a shard", not "what the model left over",
 // and the probe's own transfers must not be timed against the checkpoint
 // streaming to the same device.
-Qualification qualify_startup_pool() {
+Qualification qualify_startup_pool(const Options& opt) {
   Qualification q;
 
-  // Untimed on purpose: this brings the backend up, which the engine pays for
+  // Untimed on purpose: this brings the devices up, which the engine pays for
   // either way — building the model was the first caller before this one. The
   // clock below measures qualification, not device init, or a warm start would
   // report a couple of hundred milliseconds it did not add.
-  graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) {
-    q.status = LSE_ERROR(kDeviceError, "no backend came up to qualify");
+  if (const Status opened = place::open_default_devices(opt.pool);
+      !opened.ok()) {
+    q.status = opened;
+    return q;
+  }
+  place::Devices* devices = place::default_devices();
+  if (devices == nullptr || devices->size() == 0) {
+    q.status = LSE_ERROR(kDeviceError, "no device came up to qualify");
+    return q;
+  }
+  q.devices_up = true;
+  // Falling back to a backend with no code generator runs the whole model
+  // through the host interpreter. That is a two-order-of-magnitude cliff and it
+  // used to be silent: the `--stats` line reported zero device groups next to a
+  // five-figure launch count and read like broken instrumentation.
+  backend::IBackend& first = devices->device(devices->primary());
+  if (first.emitter() == nullptr && !devices->declined().empty()) {
+    std::fprintf(stderr,
+                 "lse: no code-generating backend came up (%s); running on "
+                 "'%s' through the host interpreter\n",
+                 std::string(devices->declined()).c_str(),
+                 std::string(first.name()).c_str());
+  }
+  if (graph::default_scheduler() == nullptr) {
+    q.status = LSE_ERROR(kDeviceError, "no scheduler could be built");
     return q;
   }
 
@@ -238,19 +385,13 @@ Qualification qualify_startup_pool() {
     return std::move(out);
   };
 
-  backend::IBackend& device = sched->backend();
-  probe::PoolMember member;
-  member.id.backend = std::string(device.name());
-  member.id.ordinal = static_cast<int>(device.device_info().ordinal);
-  member.backend = &device;
-  const probe::PoolMember members[] = {member};
-
   // Whether this start read a profile or paid for one is not the same question
   // as whether a file was there: a truncated, foreign or unreadable entry is
   // present and still re-measured, and a store that cannot be written back is
   // re-measured on every start. Only a measurement rewrites the entry, so the
   // entry is its own witness — and it stays one however qualify_pool decides
   // what it will serve.
+  const std::vector<probe::PoolMember> members = devices->pool_members();
   std::string entry;
   if (auto fingerprint = probe::pool_fingerprint(members, nullptr);
       fingerprint.ok()) {
@@ -258,13 +399,13 @@ Qualification qualify_startup_pool() {
   }
   const StoreEntry before = stat_entry(entry);
 
-  auto pool = probe::qualify_pool(members, nullptr);
+  const Status qualified = devices->qualify();
   q.from_cache = before.present && stat_entry(entry) == before;
-  if (!pool.ok()) {
-    q.status = pool.status();
+  if (!qualified.ok()) {
+    q.status = qualified;
     return finish(std::move(q));
   }
-  q.pool = pool.release();
+  q.pool = devices->profile();
   return finish(std::move(q));
 }
 
@@ -287,6 +428,7 @@ int main(int argc, char** argv) {
   Options opt;
   if (!parse(argc, argv, &opt)) return 2;
   if (opt.list_devices) return list_devices();
+  if (opt.list_cache) return list_cache();
   if (opt.debug) {
     lse::set_debug(true);
     const std::string dir = lse::graph::hip_dump_directory();
@@ -324,7 +466,8 @@ int main(int argc, char** argv) {
                                 : opt.arch.c_str(),
                cfg->num_layers, cfg->hidden_size);
 
-  const Qualification qual = qualify_startup_pool();
+  const Qualification qual = qualify_startup_pool(opt);
+  if (!qual.devices_up) return fail(qual.status, "opening the device set");
 
   // Building the tokenizer is a 248k-entry automaton and binding the weights
   // streams the whole checkpoint; neither needs the other, so the smaller

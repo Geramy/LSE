@@ -7,10 +7,12 @@
 // no entry for this (arch, signature), or the generated source changed.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "lse/backend/backend.hpp"
 #include "lse/core/status.hpp"
@@ -34,18 +36,32 @@ void purge_kernel_artifacts();
 
 class JitCache {
  public:
+  // One cache for the whole set. Not one per device: two members of the same
+  // arch and geometry emit the same source and compile to the same object, so a
+  // cache per device would pay ~350 ms per kernel per device for bytes it
+  // already had. What IS per device is the loaded handle — an executable is
+  // loaded on one device and running it on another is a wrong-device dispatch
+  // that no runtime here reports — so the object is shared and the handle is not.
+  explicit JitCache(backend::IDeviceSet& devices,
+                    std::string cache_dir = default_cache_dir());
+  // One device, for a caller that holds a backend rather than a set. The
+  // compiler is taken from the backend either way; the parameter is here
+  // because a caller may hold a compiler the backend does not publish.
   JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
            std::string cache_dir = default_cache_dir());
   ~JitCache();
 
-  // `signature` is the emitter's cache identity (group + specialization).
-  // Arch is taken from the live device and mixed in here.
-  Result<backend::KernelHandle> get_or_compile(std::uint64_t signature,
+  // `signature` is the emitter's cache identity (group + specialization);
+  // `member` is which device of the set will run it. The device's arch and the
+  // geometry the source was emitted against are mixed in here.
+  Result<backend::KernelHandle> get_or_compile(std::size_t member,
+                                               std::uint64_t signature,
                                                const EmittedKernel& emitted);
 
-  // Live handle if this process already loaded the kernel for the current
-  // device. Does not compile, emit, or read disk. Counts as a memory hit.
-  const backend::KernelHandle* try_get(std::uint64_t signature) noexcept;
+  // Live handle if this process already loaded the kernel ON THIS MEMBER. Does
+  // not compile, emit, or read disk. Counts as a memory hit.
+  const backend::KernelHandle* try_get(std::size_t member,
+                                       std::uint64_t signature) noexcept;
 
   struct Stats {
     std::uint64_t memory_hits = 0;
@@ -56,13 +72,22 @@ class JitCache {
   [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
  private:
-  [[nodiscard]] std::uint64_t slot_key(std::uint64_t signature) const noexcept;
+  // Everything that decides what SOURCE this device would be given, which is
+  // what an object on disk is only valid for.
+  [[nodiscard]] std::uint64_t slot_key(std::size_t member,
+                                       std::uint64_t signature) const noexcept;
+  [[nodiscard]] const IKernelCompiler* compiler_for(
+      std::size_t member) const noexcept;
 
-  backend::IBackend& backend_;
-  const IKernelCompiler& compiler_;
-  // Hash of compiler_.identity(), taken once: slot_key runs per group per
-  // token and identity() builds strings.
-  std::uint64_t compiler_id_;
+  // Only when the single-device constructor was used: the set that backend is,
+  // and the compiler the caller named for it. Declared before devices_ so the
+  // reference is bound to something already built.
+  std::unique_ptr<backend::SingleDevice> own_set_;
+  backend::IDeviceSet& devices_;
+  const IKernelCompiler* named_compiler_ = nullptr;
+  // Hash of each member's compiler identity, taken once: slot_key runs per
+  // group per token and identity() builds strings.
+  std::vector<std::uint64_t> compiler_id_;
   std::string cache_dir_;
   Stats stats_;
   struct Impl;

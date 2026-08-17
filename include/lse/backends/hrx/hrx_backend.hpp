@@ -31,6 +31,14 @@ class HrxBackend : public Backend<HrxBackend> {
   void shutdown_impl() noexcept;
   const DeviceInfo& device_info_impl() const noexcept { return info_; }
 
+  // Every GPU this runtime can drive, described without binding one. Static
+  // because the answer cannot depend on a device already being bound, and
+  // cheap for the same reason: it reads identities and asks the accelerator
+  // for nothing else — no queue probe, no stream, no allocation. Bringing the
+  // accelerator up is unavoidable (hrx_gpu_device_count is UNAVAILABLE before
+  // it) and is idempotent, so enumerating first does not stop a later bind.
+  static Result<std::vector<DeviceDescriptor>> enumerate_devices();
+
   Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls);
   void deallocate_impl(DeviceBuffer& buf) noexcept;
   Result<std::size_t> sample_free_memory_impl() const;

@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "lse/core/enum_names.hpp"
 #include "lse/core/status.hpp"
 
 namespace lse::graph {
@@ -39,6 +40,38 @@ enum class MemoryClass : std::uint8_t {
   kStaging,
 };
 
+// Which device holds bytes, and which device a launch is for.
+//
+// Not an ordinal and not a backend name: it identifies the bound backend
+// INSTANCE. Two instances driving the same board are two values here, because
+// a buffer one of them allocated is released by that one and an executable one
+// of them loaded runs on that one — the identity a dispatch turns on is the
+// instance, not the part number. Resolving one back to an "hrx:0" is the
+// device set's job one layer up; nothing at this level can name a device,
+// which is the point.
+//
+// Zero is "no device": what a default-constructed buffer carries, what a
+// released one goes back to, and what an IBackend that stamps nothing reports.
+struct DeviceIndex {
+  std::uint16_t value = 0;
+
+  [[nodiscard]] bool bound() const noexcept { return value != 0; }
+  friend bool operator==(DeviceIndex, DeviceIndex) noexcept = default;
+  friend auto operator<=>(DeviceIndex, DeviceIndex) noexcept = default;
+};
+
+inline constexpr DeviceIndex kNoDevice{};
+
+// The next index no device in this process has held. Called by Backend<Derived>
+// when init() binds a device; nothing picks its own.
+//
+// Indices are never recycled: a stale one must resolve to nothing rather than
+// to whoever was bound next. Past 65535 binds in one process it stops handing
+// them out and returns kNoDevice, so the failure is unstamped buffers — which
+// read as "no device holds these" and are refused a cross-device check — and
+// never two live devices sharing a token.
+[[nodiscard]] DeviceIndex next_device_index() noexcept;
+
 struct DeviceBuffer {
   // Host address of the allocation base, or null when the allocation is
   // device-local. A view keeps the same pointer and names its window with
@@ -47,12 +80,26 @@ struct DeviceBuffer {
   std::size_t size_bytes = 0;
   std::uint64_t handle = 0;     // opaque, backend-private
   std::size_t offset = 0;       // bytes from the start of the allocation
+  // Which device holds these bytes. Stamped by the backend that allocated
+  // them, carried unchanged by a view, cleared when the allocation is
+  // released. Without it a launch on the wrong device is accepted by every
+  // runtime here, runs, and returns plausible numbers — the whole point is
+  // that a kernel's right to read a buffer becomes a question that can be
+  // asked.
+  DeviceIndex residency{};
   // When set, the allocation is released when the last copy dies. Views
   // share it so a reshape cannot free a buffer the residual still holds.
   std::shared_ptr<void> storage;
 
   [[nodiscard]] bool valid() const noexcept { return ptr != nullptr || handle != 0; }
 };
+
+// Four words of addressing, then residency in the padding its own alignment
+// leaves, then the shared_ptr's two. Pinned because this struct is a member of
+// every graph Node and every workgroup slot: a field here is paid for per
+// tensor, so adding one has to be a deliberate act.
+static_assert(sizeof(DeviceBuffer) == 40 + sizeof(std::shared_ptr<void>),
+              "DeviceBuffer grew — justify the field, then update this assert");
 
 // A loaded code object plus which of its exports to dispatch. Selection is by
 // ordinal, not by symbol lookup, so no runtime carries a module table here.
@@ -263,11 +310,24 @@ struct WorkRange {
 
 // Where a launch goes. One struct rather than trailing parameters so that
 // adding the work range above did not change launch()'s arity, and adding
-// placement (which device) later will not either.
+// placement (which device) later did not either.
 struct DispatchTarget {
   Stream stream{};
+  // Which device this launch is for. kNoDevice means "whichever device the
+  // backend being called drives" — every call site that has one device in
+  // view. When it is set and names a different device than the callee drives,
+  // the launch is refused: the kernel handle was loaded on one device and the
+  // bindings' bytes sit on one device, so landing on the wrong one computes
+  // garbage without erroring anywhere.
+  //
+  // Sits between `stream` and `work` rather than after them because the
+  // padding after a 4-byte Stream was being spent on nothing.
+  DeviceIndex device{};
   WorkRange work{};
 };
+
+static_assert(sizeof(DispatchTarget) == 24,
+              "DispatchTarget grew past the padding it was fitted into");
 
 // What this device's execution streams can actually do — declared by the
 // backend, read by the scheduler, never inferred from the backend's name.
@@ -412,10 +472,22 @@ template <typename Derived>
 class Backend {
  public:
   Status init(int device_ordinal = 0) {
-    return derived().init_impl(device_ordinal);
+    LSE_RETURN_IF_ERROR(derived().init_impl(device_ordinal));
+    // Claimed only after the bind succeeded, so a refused ordinal leaves this
+    // instance stamping nothing rather than owning a token for a device it
+    // never got.
+    device_ = next_device_index();
+    return OkStatus();
   }
 
-  void shutdown() noexcept { derived().shutdown_impl(); }
+  void shutdown() noexcept {
+    derived().shutdown_impl();
+    device_ = kNoDevice;
+  }
+
+  // The token this instance stamps on the buffers it allocates. kNoDevice
+  // before init() and after shutdown().
+  [[nodiscard]] DeviceIndex device_index() const noexcept { return device_; }
 
   [[nodiscard]] const DeviceInfo& device_info() const noexcept {
     return derived().device_info_impl();
@@ -427,10 +499,18 @@ class Backend {
 
   Result<DeviceBuffer> allocate(std::size_t bytes,
                                 MemoryClass cls = MemoryClass::kDevice) {
-    return derived().allocate_impl(bytes, cls);
+    // The one funnel every allocation goes through, which is why residency is
+    // stamped here rather than in each backend's allocate_impl: a backend
+    // author cannot forget to do it.
+    auto buf = derived().allocate_impl(bytes, cls);
+    if (buf.ok()) buf->residency = device_;
+    return buf;
   }
 
-  void deallocate(DeviceBuffer& buf) noexcept { derived().deallocate_impl(buf); }
+  void deallocate(DeviceBuffer& buf) noexcept {
+    derived().deallocate_impl(buf);
+    buf.residency = kNoDevice;
+  }
 
   // Bytes free on this device at the instant of the call.
   //
@@ -504,6 +584,16 @@ class Backend {
 
   Status launch(const KernelHandle& kernel, const LaunchDims& dims,
                 const DispatchArgs& args, const DispatchTarget& target = {}) {
+    // The one invariant this layer can settle alone: a launch addressed to
+    // another device must not run here. Whether the bindings' bytes are
+    // reachable is a question about two devices and belongs to whoever holds
+    // the set — a backend can only see its own.
+    if (target.device.bound() && target.device != device_) {
+      return LSE_ERROR(kInvalidArgument, "launch is for device ",
+                       std::to_string(target.device.value),
+                       " but reached the backend driving device ",
+                       std::to_string(device_.value));
+    }
     if constexpr (requires {
                     derived().launch_impl(kernel, dims, args, target);
                   }) {
@@ -617,6 +707,8 @@ class Backend {
   const Derived& derived() const noexcept {
     return static_cast<const Derived&>(*this);
   }
+
+  DeviceIndex device_{};
 };
 
 class IBackend {
@@ -625,6 +717,12 @@ class IBackend {
   virtual Status init(int device_ordinal) = 0;
   virtual void shutdown() noexcept = 0;
   virtual const DeviceInfo& device_info() const noexcept = 0;
+  // The token this instance stamps on the buffers it allocates, or kNoDevice
+  // for an implementation that stamps none. An unstamped buffer says "no device
+  // claims these bytes", which is exactly what a residency check should read
+  // from an implementation that does not track one — so the default is honest
+  // rather than merely permissive.
+  virtual DeviceIndex device_index() const noexcept { return kNoDevice; }
   virtual Result<DeviceBuffer> allocate(std::size_t bytes,
                                         MemoryClass cls) = 0;
   virtual void deallocate(DeviceBuffer& buf) noexcept = 0;
@@ -708,6 +806,9 @@ class BackendAdapter final : public IBackend {
   const DeviceInfo& device_info() const noexcept override {
     return impl_.device_info();
   }
+  DeviceIndex device_index() const noexcept override {
+    return impl_.device_index();
+  }
   Result<DeviceBuffer> allocate(std::size_t b, MemoryClass c) override {
     return impl_.allocate(b, c);
   }
@@ -768,12 +869,187 @@ class BackendAdapter final : public IBackend {
   Derived impl_;
 };
 
+// --- the device set --------------------------------------------------------
+// What one process holds, as everything above a backend sees it. A scheduler
+// binds one of these instead of a single backend, so the difference between one
+// device and eight is how many members the set has and not which code path ran.
+//
+// A seam rather than a class because the layer that owns device lifetimes sits
+// ABOVE the layer that dispatches on them: lse::place builds the set, lse::graph
+// holds it, and graph must not depend on place to do so.
+//
+// Every method here is an index into the set. Nothing above the seam may name a
+// device, so nothing here hands out a name.
+class IDeviceSet {
+ public:
+  virtual ~IDeviceSet() = default;
+
+  [[nodiscard]] virtual std::size_t size() const noexcept = 0;
+  // The backend driving member `i`, which callers only ever ask for i < size().
+  [[nodiscard]] virtual IBackend& device(std::size_t i) const = 0;
+  // Where work goes when nothing has placed it. Always < size().
+  [[nodiscard]] virtual std::size_t primary() const noexcept = 0;
+  // Which member stamps this residency, or size() when no member does — the
+  // answer for an unbound residency and for a device this set does not hold,
+  // told apart by DeviceIndex::bound().
+  [[nodiscard]] virtual std::size_t member_of(DeviceIndex d) const noexcept = 0;
+  // Whether a kernel running on member `target` may read bytes with this
+  // residency. Only the set can answer: it holds the members' identities and
+  // whatever was measured or queried about the paths between them, and a
+  // backend cannot see past its own device.
+  //
+  // An unbound residency is readable — nothing claims those bytes, so there is
+  // nothing to violate. A residency this set cannot resolve is NOT: an
+  // unanswerable question about two devices refuses rather than passes, because
+  // the alternative is a kernel reading another device's memory and returning
+  // numbers that look right.
+  [[nodiscard]] virtual Status may_read(DeviceIndex held,
+                                        std::size_t target) const = 0;
+
+  // The residency member `i`'s buffers carry. Hoisted out of a binding loop by
+  // callers, which is why it is worth having beside device().
+  [[nodiscard]] DeviceIndex residency(std::size_t i) const {
+    return device(i).device_index();
+  }
+};
+
+// The set one backend is: itself, alone. What everything holding a single
+// device uses to speak the set vocabulary, so the one-device case is the same
+// code with size() == 1 rather than a second path beside it.
+class SingleDevice final : public IDeviceSet {
+ public:
+  explicit SingleDevice(IBackend& backend) noexcept : backend_(&backend) {}
+
+  std::size_t size() const noexcept override { return 1; }
+  IBackend& device(std::size_t) const override { return *backend_; }
+  std::size_t primary() const noexcept override { return 0; }
+  std::size_t member_of(DeviceIndex d) const noexcept override {
+    return d.bound() && d == backend_->device_index() ? std::size_t{0}
+                                                      : std::size_t{1};
+  }
+  Status may_read(DeviceIndex held, std::size_t) const override {
+    if (!held.bound() || held == backend_->device_index()) return OkStatus();
+    return LSE_ERROR(kInvalidArgument, "bytes resident on device ",
+                     std::to_string(held.value),
+                     " cannot be read by work on device ",
+                     std::to_string(backend_->device_index().value),
+                     ": this set holds one device and it is not that one");
+  }
+
+ private:
+  IBackend* backend_;
+};
+
+// --- device enumeration ----------------------------------------------------
+// Asking what devices exist is a different question from binding one, and the
+// answer must be available before any device is bound: an instance method
+// would mean initialising a device to find out how many exist. So enumeration
+// is a free function over the registry, and what it returns is a description,
+// not a device — nothing here can allocate, launch or be dispatched to.
+
+// Where a described fact came from. An enumerator reports what it was told and
+// nothing else: a property nothing reachable can answer stays kUnknown and
+// carries no number to be mistaken for one, because at the point a placement
+// reads it a plausible substitute is indistinguishable from a real answer.
+// The same discipline as probe::Provenance, restated here because this header
+// sits below probe in the build and must not depend on it.
+#define LSE_FACT_SOURCE_LIST(X)                                             \
+  X(kUnknown, "unknown")      /* nothing reachable here answers it */       \
+  X(kInapplicable, "n/a")     /* the device has no such property at all */  \
+  X(kDeclared, "declared")    /* a table answers for this part number */    \
+  X(kQueried, "queried")      /* the device's own runtime answered */
+
+LSE_DECLARE_ENUM(FactSource, std::uint8_t, LSE_FACT_SOURCE_LIST)
+
+template <typename T>
+struct DeviceFact {
+  // Meaningless unless known(). Default-constructed rather than left
+  // uninitialized so a reader that ignores the source gets a zero it can spot,
+  // not whatever was on the stack.
+  T value{};
+  FactSource source = FactSource::kUnknown;
+
+  [[nodiscard]] bool known() const noexcept {
+    return source == FactSource::kQueried || source == FactSource::kDeclared;
+  }
+
+  static DeviceFact queried(T v) { return {std::move(v), FactSource::kQueried}; }
+  static DeviceFact declared(T v) {
+    return {std::move(v), FactSource::kDeclared};
+  }
+  static DeviceFact inapplicable() { return {T{}, FactSource::kInapplicable}; }
+};
+
+// Whether one device can reach another's memory. Four answers rather than a
+// bool: "not yet enabled" is a different fact from "never", and "nothing here
+// can tell" is a third — a peer path that is assumed rather than queried is
+// how a cost model comes to believe in a link that does not exist.
+#define LSE_PEER_ACCESS_LIST(X)                                              \
+  X(kUnknown, "unknown")         /* no reachable query answers this pair */  \
+  X(kSelf, "self")               /* the same device */                       \
+  X(kNo, "no")                   /* the runtime says never */                \
+  X(kOnRequest, "on request")    /* reachable once access is granted */      \
+  X(kYes, "yes")                 /* reachable as it stands */
+
+LSE_DECLARE_ENUM(PeerAccess, std::uint8_t, LSE_PEER_ACCESS_LIST)
+
+// One device a backend can drive, described without binding it.
+//
+// `backend` + `ordinal` is the device's whole identity to the engine and the
+// only part of this a placement may consume: the rest is for a human reading a
+// report. A product name is not an address — two boards of the same part share
+// it, and an ordinal is not stable across a topology change either, which is
+// what `uuid` and `pci_path` are here to say when the runtime can.
+struct DeviceDescriptor {
+  std::string backend;               // registry name, "hrx"
+  int ordinal = 0;                   // index within that backend
+
+  DeviceFact<std::string> product;   // "Radeon 8060S Graphics"
+  DeviceFact<std::string> arch;      // "gfx1151"
+  DeviceFact<std::string> uuid;      // stable across reboots when present
+  DeviceFact<std::string> pci_path;  // "0000:bd:00.0"
+
+  DeviceFact<std::size_t> total_memory;  // bytes
+  // Bytes free, sampled while enumerating. A sample and not an identity: it
+  // moves with every allocation on the device, this process's or another
+  // process's, so a reader may act on it but must not memoize it.
+  DeviceFact<std::size_t> free_memory;
+  DeviceFact<std::uint32_t> compute_units;
+  DeviceFact<std::uint32_t> max_threads_per_workgroup;
+  DeviceFact<std::uint32_t> wavefront_size;
+  DeviceFact<std::uint32_t> lds_bytes_per_workgroup;
+  DeviceFact<std::uint32_t> queue_count;  // hardware queues, not streams
+  DeviceFact<bool> unified_memory;
+
+  // Reach to every device of this same backend, indexed by their ordinal, so
+  // peers[ordinal] is this device's answer about itself. Empty when the
+  // backend has no peer query at all, which is not the same as a row of
+  // kUnknown: that row means the query exists and did not answer.
+  std::vector<PeerAccess> peers;
+
+  // What was asked and not answered, in the runtime's own terms, joined by
+  // "; ". Empty when everything above is known. A hole a reader can name is
+  // worth more than one it has to infer from a zero.
+  std::string declined;
+
+  // "hrx:0" — the form probe::parse_device_id round-trips.
+  [[nodiscard]] std::string id() const;
+  [[nodiscard]] std::string describe() const;
+};
+
+// Every device this backend can drive, in ordinal order. Empty is a valid
+// answer and not an error: a backend can be present with no device attached.
+// A backend with no enumerator of its own refuses.
+using DeviceEnumerator = Result<std::vector<DeviceDescriptor>> (*)();
+
 // Backends self-register from their own TU: linking one in is all that makes
 // it selectable by name.
 using BackendFactory = std::unique_ptr<IBackend> (*)();
 
-void register_backend(std::string_view name, BackendFactory factory);
+void register_backend(std::string_view name, BackendFactory factory,
+                      DeviceEnumerator enumerator = nullptr);
 Result<std::unique_ptr<IBackend>> create_backend(std::string_view name);
+Result<std::vector<DeviceDescriptor>> enumerate_devices(std::string_view name);
 std::vector<std::string> available_backends();
 
 Result<std::unique_ptr<IBackend>> create_default_backend();
@@ -784,10 +1060,23 @@ Result<std::unique_ptr<IBackend>> create_default_backend();
 std::vector<std::string> default_backend_order();
 
 struct BackendRegistrar {
-  BackendRegistrar(std::string_view name, BackendFactory factory) {
-    register_backend(name, factory);
+  BackendRegistrar(std::string_view name, BackendFactory factory,
+                   DeviceEnumerator enumerator) {
+    register_backend(name, factory, enumerator);
   }
 };
+
+// The enumerator a backend supplies, or null. Detected from the type rather
+// than named in the macro, so a backend gains enumeration by writing one
+// static function and nothing else.
+template <typename Derived>
+[[nodiscard]] constexpr DeviceEnumerator device_enumerator_for() noexcept {
+  if constexpr (requires { DeviceEnumerator{&Derived::enumerate_devices}; }) {
+    return &Derived::enumerate_devices;
+  } else {
+    return nullptr;
+  }
+}
 
 // No token pasting: Type may be a qualified name. One registration per TU.
 #define LSE_REGISTER_BACKEND(name, Type)                                  \
@@ -795,7 +1084,8 @@ struct BackendRegistrar {
   const ::lse::backend::BackendRegistrar _lse_backend_registrar{          \
       name, []() -> std::unique_ptr<::lse::backend::IBackend> {           \
         return std::make_unique<::lse::backend::BackendAdapter<Type>>();  \
-      }};                                                                 \
+      },                                                                  \
+      ::lse::backend::device_enumerator_for<Type>()};                     \
   }  // namespace
 
 }  // namespace lse::backend

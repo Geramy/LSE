@@ -27,6 +27,9 @@
 #include "lse/probe/link_probe.hpp"
 #include "lse/probe/pool.hpp"
 #include "lse/probe/profile.hpp"
+#include "lse/place/devices.hpp"
+#include "lse/place/placement.hpp"
+#include "lse/place/residency.hpp"
 #include "lse/probe/profile_store.hpp"
 
 using namespace lse;
@@ -1413,6 +1416,396 @@ LSE_TEST(the_device_probe_measures_the_roofline_and_the_matrix_rows) {
   LSE_EXPECT(token.known());
   std::printf("       a 1.425 GB weight stream costs %.2f ms here\n",
               token.ns / 1e6);
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration: what a pool is built out of
+// ---------------------------------------------------------------------------
+
+LSE_TEST(an_enumerated_device_id_round_trips_into_a_pool_member) {
+  std::size_t seen = 0;
+  for (const std::string& name : backend::available_backends()) {
+    auto found = backend::enumerate_devices(name);
+    if (!found.ok()) {
+      std::printf("       %s does not enumerate here: %s\n", name.c_str(),
+                  found.status().to_string().c_str());
+      continue;
+    }
+    for (const backend::DeviceDescriptor& d : *found) {
+      // The descriptor's id is the engine's whole address for that device, and
+      // it is the pool's too: a member is built by parsing it, never by
+      // carrying the product name along.
+      auto id = parse_device_id(d.id());
+      LSE_EXPECT_OK(id.status());
+      if (!id.ok()) continue;
+      LSE_EXPECT(id->backend == d.backend);
+      LSE_EXPECT_EQ(id->ordinal, d.ordinal);
+      LSE_EXPECT(id->str() == d.id());
+
+      PoolMember member;
+      member.id = *id;
+      LSE_EXPECT(member.id.str() == d.id());
+      ++seen;
+      std::printf("       %s: %s\n", d.id().c_str(),
+                  d.product.known() ? d.product.value.c_str() : "unknown");
+    }
+  }
+  // The cpu backend is in every build this suite runs in, so an empty walk is
+  // a broken registry rather than a bare machine.
+  LSE_EXPECT(seen >= 1);
+}
+
+LSE_TEST(enumerating_and_a_refused_ordinal_both_leave_the_process_bindable) {
+  // The enumerate-then-bind loop, which is what a device set is built by. Two
+  // hazards live here and both were real: enumeration has to bring the
+  // accelerator up to count devices at all, and a bind that fails its range
+  // check used to leave the accelerator up with nothing recorded as owning it,
+  // after which every later bind in the process failed ALREADY_EXISTS.
+  auto found = backend::enumerate_devices("hrx");
+  if (!found.ok()) {
+    std::printf("       skipped: hrx does not enumerate here (%s)\n",
+                found.status().to_string().c_str());
+    return;
+  }
+  const int count = static_cast<int>(found->size());
+  auto created = backend::create_backend("hrx");
+  LSE_EXPECT(created.ok());
+  if (!created.ok()) return;
+  std::unique_ptr<backend::IBackend> be = created.release();
+
+  const Status refused = be->init(count + 7);
+  LSE_EXPECT(!refused.ok());
+  LSE_EXPECT(refused.code() == StatusCode::kInvalidArgument);
+
+  // Same object, right after the refusal.
+  LSE_EXPECT_OK(be->init(0));
+  LSE_EXPECT(be->device_info().arch == (*found)[0].arch.value);
+  auto buf = be->allocate(4096, backend::MemoryClass::kDevice);
+  LSE_EXPECT_OK(buf.status());
+  if (buf.ok()) {
+    backend::DeviceBuffer owned = buf.release();
+    be->deallocate(owned);
+  }
+}
+
+LSE_TEST(two_backends_for_one_device_coexist_in_one_process) {
+  // The first acceptance item for a device *set*: a pool member holds its own
+  // backend, so N members in one process is N live backend objects. Before the
+  // accelerator's lifecycle was lifted out of the instance, the second init in
+  // a process failed outright (hrx_gpu_initialize returns ALREADY_EXISTS) and
+  // the first destructor took the accelerator down under everyone else.
+  //
+  // Only one ordinal exists on this box, so this binds it twice: that shares
+  // the device and its allocator, which is the weaker of the two cases but the
+  // one that catches process-wide lifecycle damage. Two *different* ordinals
+  // await a multi-GPU box.
+  auto first = backend::create_backend("hrx");
+  if (!first.ok()) {
+    std::printf("       skipped: no hrx backend in this build\n");
+    return;
+  }
+  std::unique_ptr<backend::IBackend> a = first.release();
+  if (const Status up = a->init(0); !up.ok()) {
+    std::printf("       skipped: no hrx device here (%s)\n",
+                up.to_string().c_str());
+    return;
+  }
+
+  auto second = backend::create_backend("hrx");
+  LSE_EXPECT(second.ok());
+  if (!second.ok()) return;
+  std::unique_ptr<backend::IBackend> b = second.release();
+  LSE_EXPECT_OK(b->init(0));
+
+  LSE_EXPECT(a->device_info().arch == b->device_info().arch);
+  LSE_EXPECT(a->stream_capabilities().stream_count ==
+             b->stream_capabilities().stream_count);
+
+  // Each instance compiles and dispatches its own kernels, on its own streams,
+  // through its own emitter — the probe is the shortest path to a real
+  // dispatch, and it ends in a readback so a wrong answer is a failure.
+  auto profile_a = probe_device(*a);
+  LSE_EXPECT_OK(profile_a.status());
+  auto profile_b = probe_device(*b);
+  LSE_EXPECT_OK(profile_b.status());
+  if (profile_a.ok() && profile_b.ok()) {
+    LSE_EXPECT(profile_a->dram_bytes_per_s.known());
+    LSE_EXPECT(profile_b->dram_bytes_per_s.known());
+    std::printf("       two instances, one device: %.0f and %.0f GB/s streamed\n",
+                profile_a->dram_bytes_per_s.value / 1e9,
+                profile_b->dram_bytes_per_s.value / 1e9);
+  }
+
+  // Destroying one must leave the other with a working device, not one whose
+  // queries still answer and whose allocator has stopped.
+  b.reset();
+  const auto free_after = a->sample_free_memory();
+  LSE_EXPECT(free_after.ok());
+  auto buf = a->allocate(1u << 20, backend::MemoryClass::kDevice);
+  LSE_EXPECT_OK(buf.status());
+  if (buf.ok()) {
+    backend::DeviceBuffer owned = buf.release();
+    std::vector<std::uint32_t> host(8, 0x5eedu);
+    LSE_EXPECT_OK(a->copy_h2d(host.data(), owned, host.size() * 4, 0));
+    std::vector<std::uint32_t> back(8, 0);
+    LSE_EXPECT_OK(a->copy_d2h(owned, back.data(), back.size() * 4, 0));
+    LSE_EXPECT_EQ(back[7], 0x5eedu);
+    a->deallocate(owned);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// place: the live device set
+// ---------------------------------------------------------------------------
+
+LSE_TEST(a_selector_is_backend_qualified_or_it_is_refused) {
+  auto empty = place::parse_selector("");
+  LSE_EXPECT(empty.ok());
+  LSE_EXPECT(empty->empty());
+
+  auto one = place::parse_selector("cpu:0");
+  LSE_EXPECT(one.ok());
+  LSE_EXPECT_EQ(one->size(), std::size_t{1});
+  LSE_EXPECT((*one)[0] == dev("cpu", 0));
+
+  auto two = place::parse_selector(" hrx:0 , cpu:0 ");
+  LSE_EXPECT(two.ok());
+  LSE_EXPECT_EQ(two->size(), std::size_t{2});
+  LSE_EXPECT((*two)[0] == dev("hrx", 0));
+  LSE_EXPECT((*two)[1] == dev("cpu", 0));
+
+  // A bare ordinal is not an address: PLAN.md's rule, enforced by the parser
+  // that probe::parse_device_id already implements.
+  LSE_EXPECT(!place::parse_selector("0").ok());
+  // The same device twice is not two load locations.
+  LSE_EXPECT(!place::parse_selector("cpu:0,cpu:0").ok());
+}
+
+LSE_TEST(a_set_owns_its_devices_and_routes_a_release_to_the_owner) {
+  auto opened = place::Devices::open("cpu:0");
+  LSE_EXPECT_OK(opened.status());
+  if (!opened.ok()) return;
+  std::unique_ptr<place::Devices> set = opened.release();
+
+  LSE_EXPECT_EQ(set->size(), std::size_t{1});
+  LSE_EXPECT(set->members()[0].id == dev("cpu", 0));
+  LSE_EXPECT(set->members()[0].index.bound());
+  LSE_EXPECT(set->find(dev("cpu", 0)) != nullptr);
+  LSE_EXPECT(set->find(dev("cpu", 7)) == nullptr);
+
+  auto buf = set->allocate(0, 4096);
+  LSE_EXPECT_OK(buf.status());
+  if (!buf.ok()) return;
+  backend::DeviceBuffer owned = buf.release();
+  LSE_EXPECT(owned.residency == set->members()[0].index);
+  LSE_EXPECT_EQ(set->member_of(owned.residency), std::size_t{0});
+  LSE_EXPECT_OK(set->deallocate(owned));
+  LSE_EXPECT(!owned.residency.bound());
+
+  // A buffer some other set's device holds cannot be released here: guessing an
+  // owner would free an allocation under whoever actually holds it.
+  backend::DeviceBuffer foreign;
+  foreign.handle = 1;
+  foreign.size_bytes = 16;
+  foreign.residency = backend::DeviceIndex{0xfffe};
+  const Status refused = set->deallocate(foreign);
+  LSE_EXPECT(!refused.ok());
+  LSE_EXPECT(refused.code() == StatusCode::kInvalidArgument);
+
+  LSE_EXPECT(!set->allocate(3, 16).ok());
+}
+
+LSE_TEST(a_named_device_that_will_not_come_up_is_an_error_not_an_omission) {
+  // A set that quietly lost a member would place work by a plan nobody agreed
+  // to, so the refusal has to name the device and carry the runtime's reason.
+  auto missing = place::Devices::open("cpu:9");
+  LSE_EXPECT(!missing.ok());
+  LSE_EXPECT(missing.status().message().find("cpu:9") != std::string::npos);
+
+  auto nonsense = place::Devices::open("nope:0");
+  LSE_EXPECT(!nonsense.ok());
+  LSE_EXPECT(nonsense.status().code() == StatusCode::kNotFound);
+}
+
+LSE_TEST(a_two_member_local_pool_qualifies_with_no_transport) {
+  // Two devices in one box is not a degenerate distributed pool: there is no
+  // rank to pair off with and no fabric to send over, so the process that
+  // drives both ends measures them. On this machine the second member is the
+  // cpu backend, which is a real IBackend with a real (host) memory of its own.
+  if (device_backend() == nullptr) {
+    std::printf("       skipped: no hrx device here\n");
+    return;
+  }
+  LSE_EXPECT(host_backend() != nullptr);
+  if (host_backend() == nullptr) return;
+
+  auto opened = place::Devices::open("hrx:0,cpu:0");
+  LSE_EXPECT_OK(opened.status());
+  if (!opened.ok()) return;
+  std::unique_ptr<place::Devices> set = opened.release();
+  LSE_EXPECT_EQ(set->size(), std::size_t{2});
+  LSE_EXPECT_EQ(set->primary(), std::size_t{0});
+  LSE_EXPECT(set->members()[0].id == dev("hrx", 0));
+  LSE_EXPECT(set->members()[1].id == dev("cpu", 0));
+  // Two members, two distinct residencies. Sharing one would make every
+  // downstream question about which device holds what unanswerable.
+  LSE_EXPECT(!(set->members()[0].index == set->members()[1].index));
+
+  PoolOptions options;
+  options.profile_dir = (scratch_dir() / "local-pool").string();
+  LSE_EXPECT_OK(set->qualify(options));
+
+  const PoolProfile& pool = set->profile();
+  LSE_EXPECT_EQ(pool.devices.size(), std::size_t{2});
+  LSE_EXPECT_EQ(pool.links.size(), std::size_t{4});
+  LSE_EXPECT(pool.devices[0].dram_bytes_per_s.known());
+  LSE_EXPECT(pool.devices[1].dram_bytes_per_s.known());
+
+  // Both directions are measured, separately: a link can be faster one way.
+  const LinkProfile* out = pool.link(dev("hrx", 0), dev("cpu", 0));
+  const LinkProfile* back = pool.link(dev("cpu", 0), dev("hrx", 0));
+  LSE_EXPECT(out != nullptr && back != nullptr);
+  if (out == nullptr || back == nullptr) return;
+  // The only move this seam can make today is out to host and in again, so
+  // that is what was timed and that is what it claims to be. A peer path would
+  // be a different measurement and a different PathKind.
+  LSE_EXPECT(out->path == PathKind::kHostStaged);
+  LSE_EXPECT(back->path == PathKind::kHostStaged);
+  LSE_EXPECT(out->bandwidth_bytes_per_s.provenance == Provenance::kMeasured);
+  LSE_EXPECT(out->bandwidth_bytes_per_s.value > 0.0);
+  std::printf("       hrx:0->cpu:0 %.2f GB/s, cpu:0->hrx:0 %.2f GB/s\n",
+              out->bandwidth_bytes_per_s.value / 1e9,
+              back->bandwidth_bytes_per_s.value / 1e9);
+
+  std::error_code ec;
+  fs::remove_all(scratch_dir(), ec);
+}
+
+LSE_TEST(reach_is_queried_or_measured_and_otherwise_unknown) {
+  // The mappings, on their own, because they are what decides whether a kernel
+  // is allowed to load from another device's memory.
+  LSE_EXPECT(place::reach_of(backend::PeerAccess::kSelf) == place::Reach::kSame);
+  LSE_EXPECT(place::reach_of(backend::PeerAccess::kYes) == place::Reach::kPeer);
+  LSE_EXPECT(place::reach_of(backend::PeerAccess::kOnRequest) ==
+             place::Reach::kPeer);
+  LSE_EXPECT(place::reach_of(backend::PeerAccess::kNo) == place::Reach::kNo);
+  LSE_EXPECT(place::reach_of(backend::PeerAccess::kUnknown) ==
+             place::Reach::kUnknown);
+
+  LSE_EXPECT(place::reach_of(PathKind::kPeerDirect) == place::Reach::kPeer);
+  LSE_EXPECT(place::reach_of(PathKind::kHostStaged) == place::Reach::kStaged);
+  // A NIC that DMAs out of device memory still does not let a shader load from
+  // another machine.
+  LSE_EXPECT(place::reach_of(PathKind::kRdmaDirect) == place::Reach::kStaged);
+  LSE_EXPECT(place::reach_of(PathKind::kUnknown) == place::Reach::kUnknown);
+
+  LSE_EXPECT(place::readable(place::Reach::kSame));
+  LSE_EXPECT(place::readable(place::Reach::kPeer));
+  LSE_EXPECT(place::readable(place::Reach::kUnclaimed));
+  // The two that must never pass: a staged path is a copy, not a read, and an
+  // unanswerable question about two devices is not a yes.
+  LSE_EXPECT(!place::readable(place::Reach::kStaged));
+  LSE_EXPECT(!place::readable(place::Reach::kUnknown));
+  LSE_EXPECT(!place::readable(place::Reach::kNo));
+}
+
+LSE_TEST(a_kernel_may_not_read_a_staged_members_bytes) {
+  if (device_backend() == nullptr) {
+    std::printf("       skipped: no hrx device here\n");
+    return;
+  }
+  auto opened = place::Devices::open("hrx:0,cpu:0");
+  LSE_EXPECT_OK(opened.status());
+  if (!opened.ok()) return;
+  std::unique_ptr<place::Devices> set = opened.release();
+
+  const backend::DeviceIndex gpu = set->members()[0].index;
+  const backend::DeviceIndex host = set->members()[1].index;
+
+  LSE_EXPECT(set->reach(gpu, 0) == place::Reach::kSame);
+  LSE_EXPECT(set->reach(backend::kNoDevice, 0) == place::Reach::kUnclaimed);
+  LSE_EXPECT_OK(set->may_read(gpu, 0));
+  LSE_EXPECT_OK(set->may_read(backend::kNoDevice, 0));
+
+  // Before anything measured the pair, nothing here says the read is legal —
+  // and an unanswerable question refuses.
+  LSE_EXPECT(set->reach(host, 0) == place::Reach::kUnknown);
+  const Status before = set->may_read(host, 0);
+  LSE_EXPECT(!before.ok());
+  LSE_EXPECT(before.message().find("cpu:0") != std::string::npos);
+
+  PoolOptions options;
+  options.profile_dir = (scratch_dir() / "reach-pool").string();
+  LSE_EXPECT_OK(set->qualify(options));
+
+  // Measured, and what was measured is a copy through host. Still not a read:
+  // the bytes have to be moved first.
+  LSE_EXPECT(set->reach(host, 0) == place::Reach::kStaged);
+  const Status after = set->may_read(host, 0);
+  LSE_EXPECT(!after.ok());
+  LSE_EXPECT(after.message().find("moved first") != std::string::npos);
+
+  std::error_code ec;
+  fs::remove_all(scratch_dir(), ec);
+}
+
+LSE_TEST(a_planner_on_one_device_never_moves_anything) {
+  auto opened = place::Devices::open("cpu:0");
+  LSE_EXPECT_OK(opened.status());
+  if (!opened.ok()) return;
+  std::unique_ptr<place::Devices> set = opened.release();
+
+  PoolProfile pool;
+  pool.devices.push_back(
+      fake_device(dev("cpu", 0), 2.0e9, 1000.0, 1.0e12, math::MatrixElem::kF16));
+  pool.links.resize(1);
+  pool.links[0].src = dev("cpu", 0);
+  pool.links[0].dst = dev("cpu", 0);
+  pool.links[0].path = PathKind::kSameDevice;
+  pool.links[0].latency_ns = Measured::measured(0.0);
+
+  const place::Planner planner(*set, pool);
+  const Work work = matmul_work(4096, 4096, 4096, DType::kF16);
+  auto placed = planner.place(work, 0, place::Transfer{1u << 20, 1u << 20});
+  LSE_EXPECT_OK(placed.status());
+  if (!placed.ok()) return;
+  LSE_EXPECT_EQ(placed->member, std::size_t{0});
+  LSE_EXPECT(!placed->relocates);
+  LSE_EXPECT(placed->reason.find("one device") != std::string_view::npos);
+}
+
+LSE_TEST(a_planner_splits_a_two_member_set_by_measured_rate) {
+  // The heterogeneous case, on injected profiles so it runs on a bare machine:
+  // one member is four times the other's rate, and an equal split would idle
+  // the fast one.
+  auto opened = place::Devices::open("cpu:0");
+  LSE_EXPECT_OK(opened.status());
+  if (!opened.ok()) return;
+  std::unique_ptr<place::Devices> set = opened.release();
+
+  // A one-member set can still be asked to divide; the answer is the whole
+  // work on the one member, which is the boundary case the solver must not
+  // special-case away.
+  PoolProfile pool;
+  pool.devices.push_back(fake_device(dev("cpu", 0), 2.0e11, 500.0, 4.0e13,
+                                     math::MatrixElem::kF16));
+  pool.devices[0].free_memory = Measured::measured(8.0e9);
+  pool.links.resize(1);
+  pool.links[0].src = dev("cpu", 0);
+  pool.links[0].dst = dev("cpu", 0);
+  pool.links[0].path = PathKind::kSameDevice;
+  pool.links[0].latency_ns = Measured::measured(0.0);
+
+  const place::Planner planner(*set, pool);
+  Work work = matmul_work(2048, 2048, 2048, DType::kF16);
+  work.bytes_resident = 1u << 20;
+  auto divided = planner.divide(work, 0);
+  LSE_EXPECT_OK(divided.status());
+  if (!divided.ok()) return;
+  LSE_EXPECT(divided->fit == Fit::kFits);
+  LSE_EXPECT_EQ(divided->portions.size(), std::size_t{1});
+  LSE_EXPECT_EQ(divided->portions[0].member, std::size_t{0});
+  LSE_EXPECT_NEAR(divided->portions[0].fraction, 1.0, 1e-9);
 }
 
 LSE_TEST_MAIN()

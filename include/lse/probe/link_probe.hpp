@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "lse/backend/backend.hpp"
 #include "lse/core/status.hpp"
 #include "lse/dist/transport.hpp"
 #include "lse/probe/profile.hpp"
@@ -58,5 +59,28 @@ struct LinkMember {
 [[nodiscard]] Result<std::vector<LinkProfile>> probe_links(
     dist::ITransport& transport, std::span<const LinkMember> members,
     const LinkProbeConfig& cfg = {});
+
+// One process, several devices, no transport between them.
+//
+// The case two GPUs in one box actually are, and the one probe_links cannot
+// serve: there is no rank to pair off with and no fabric to send over, so the
+// measurement has to be made by the process that drives both ends.
+//
+// What it times is the move the engine can actually make TODAY: out of the
+// source device's memory to host, and from there into the destination's. That
+// is why the path is kHostStaged and not kPeerDirect — no peer copy exists at
+// this seam yet, and reporting one would put a link in the cost model that
+// nothing can use. When a device-to-device path lands, this measures that
+// instead and the path it reports changes with it.
+//
+// A member with no backend cannot be driven from here, so its pairs stay
+// kUnknown rather than being credited with the mechanism that was not tried.
+struct LocalMember {
+  DeviceId id;
+  backend::IBackend* backend = nullptr;
+};
+
+[[nodiscard]] Result<std::vector<LinkProfile>> probe_local_links(
+    std::span<const LocalMember> members, const LinkProbeConfig& cfg = {});
 
 }  // namespace lse::probe

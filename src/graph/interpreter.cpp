@@ -790,6 +790,75 @@ Status eval_rope(Node& n) {
   return OkStatus();
 }
 
+// Writes src [rows, kvh, T, width] into the pool dst [blocks, kvh, block_size,
+// width] at absolute position meta[0], following the block table. Aliases the
+// pool and touches only the positions it covers, exactly as overwrite_slice
+// does for a contiguous cache.
+Status eval_kv_page_write(Node& n) {
+  if (n.inputs.size() != 4) {
+    return LSE_ERROR(kInvalidArgument, "kv_page_write takes 4 inputs");
+  }
+  const Node& dst = *n.inputs[0];
+  const Node& src = *n.inputs[1];
+  const Node& meta = *n.inputs[2];
+  const Node& table = *n.inputs[3];
+  if (dst.shape.rank() != 4 || src.shape.rank() != 4) {
+    return LSE_ERROR(kInvalidArgument,
+                     "kv_page_write needs rank-4 pool and source");
+  }
+  const auto bs = static_cast<std::size_t>(dst.shape.dim(2));
+  const auto kvh = static_cast<std::size_t>(dst.shape.dim(1));
+  const auto width = static_cast<std::size_t>(dst.shape.dim(3));
+  const auto pool_blocks = static_cast<std::size_t>(dst.shape.dim(0));
+  const auto batch = static_cast<std::size_t>(src.shape.dim(0));
+  const auto t = static_cast<std::size_t>(src.shape.dim(2));
+  if (bs == 0 || kvh == 0 || width == 0 ||
+      static_cast<std::size_t>(src.shape.dim(1)) != kvh ||
+      static_cast<std::size_t>(src.shape.dim(3)) != width) {
+    return LSE_ERROR(kInvalidArgument, "kv_page_write geometry mismatch");
+  }
+  const auto stride =
+      static_cast<std::size_t>(table.shape.dim(table.shape.rank() - 1));
+  const auto pos = static_cast<std::size_t>(load_element(meta, 0));
+  const auto rows = static_cast<std::size_t>(load_element(meta, 2));
+
+  const bool aliased =
+      n.buffer.valid() && dst.buffer.valid() &&
+      n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr;
+  if (!aliased) {
+    for (std::size_t i = 0; i < n.element_count(); ++i) {
+      store_element(n, i, load_element(dst, i));
+    }
+  }
+  for (std::size_t r = 0; r < batch && r < rows; ++r) {
+    for (std::size_t j = 0; j < t; ++j) {
+      const std::size_t abs = pos + j;
+      const std::size_t slot = abs / bs;
+      if (slot >= stride) {
+        return LSE_ERROR(kOutOfRange, "kv_page_write position ",
+                         std::to_string(abs), " needs table slot ",
+                         std::to_string(slot), " of ", std::to_string(stride));
+      }
+      const auto blk =
+          static_cast<std::size_t>(load_element(table, r * stride + slot));
+      if (blk >= pool_blocks) {
+        return LSE_ERROR(kOutOfRange, "kv_page_write block ",
+                         std::to_string(blk), " is outside a pool of ",
+                         std::to_string(pool_blocks));
+      }
+      for (std::size_t h = 0; h < kvh; ++h) {
+        const std::size_t di =
+            ((blk * kvh + h) * bs + (abs % bs)) * width;
+        const std::size_t si = ((r * kvh + h) * t + j) * width;
+        for (std::size_t w = 0; w < width; ++w) {
+          store_element(n, di + w, load_element(src, si + w));
+        }
+      }
+    }
+  }
+  return OkStatus();
+}
+
 Status eval_overwrite_slice(Node& n) {
   if (n.inputs.size() != 3) {
     return LSE_ERROR(kInvalidArgument, "overwrite_slice takes 3 inputs");
@@ -849,14 +918,45 @@ Status eval_sdpa(Node& n) {
   const float scale = n.attrs[0];
   const auto mask = static_cast<int>(n.iattrs[0]);
   const auto window = static_cast<std::size_t>(n.iattrs[1]);
+  // Paged: inputs[1]/[2] are pools of blocks and inputs[4] says which block
+  // holds each position. The scan order over j is unchanged, so a paged read
+  // and a contiguous read of the same logical KV agree bit for bit.
+  const bool paged = n.inputs.size() == 5;
+  const Node* table = paged ? n.inputs[4].get() : nullptr;
+  const std::size_t stride =
+      paged ? static_cast<std::size_t>(table->shape.dim(table->shape.rank() - 1))
+            : 0;
   const auto offset = n.inputs.size() >= 4
                           ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
                           : static_cast<std::size_t>(n.iattrs[2]);
-  const std::size_t used = std::min(ts, offset + tq);
+  const std::size_t used =
+      paged ? static_cast<std::size_t>(load_element(*n.inputs[3], 1))
+            : std::min(ts, offset + tq);
+  const std::size_t rows =
+      paged ? static_cast<std::size_t>(load_element(*n.inputs[3], 2)) : batch;
   const std::size_t group = qh / kvh;  // GQA: several q heads share one kv head
 
-  std::vector<float> logits(ts);
+  // Element offset of key/value j of (b, kh). Paged form walks the block table;
+  // ts is the block size there, not the sequence length.
+  const auto kv_base = [&](std::size_t b, std::size_t kh, std::size_t j,
+                           std::size_t width) -> std::size_t {
+    if (!paged) return ((b * kvh + kh) * ts + j) * width;
+    const auto blk = static_cast<std::size_t>(
+        load_element(*table, b * stride + j / ts));
+    return ((blk * kvh + kh) * ts + (j % ts)) * width;
+  };
+
+  std::vector<float> logits(used);
   for (std::size_t b = 0; b < batch; ++b) {
+    // Rows past the real count are batch padding: they run the same code path
+    // on real blocks and their output is zero, so nothing downstream can tell
+    // how many rows shared the pass.
+    if (b >= rows) {
+      for (std::size_t e = 0; e < qh * tq * dv; ++e) {
+        store_element(n, ((b * qh) * tq) * dv + e, 0.0f);
+      }
+      continue;
+    }
     for (std::size_t h = 0; h < qh; ++h) {
       const std::size_t kh = h / group;
       for (std::size_t i = 0; i < tq; ++i) {
@@ -872,7 +972,7 @@ Status eval_sdpa(Node& n) {
             logits[j] = -std::numeric_limits<float>::infinity();
             continue;
           }
-          const std::size_t kbase = ((b * kvh + kh) * ts + j) * dh;
+          const std::size_t kbase = kv_base(b, kh, j, dh);
           double acc = 0.0;
           for (std::size_t d = 0; d < dh; ++d) {
             acc += static_cast<double>(load_element(q, qbase + d)) *
@@ -901,7 +1001,7 @@ Status eval_sdpa(Node& n) {
           for (std::size_t j = 0; j < used; ++j) {
             if (logits[j] == 0.0f) continue;
             acc += static_cast<double>(logits[j]) *
-                   static_cast<double>(load_element(v, ((b * kvh + kh) * ts + j) * dv + d));
+                   static_cast<double>(load_element(v, kv_base(b, kh, j, dv) + d));
           }
           store_element(n, obase + d, static_cast<float>(acc / denom));
         }
@@ -1170,6 +1270,10 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
 
     case OpKind::kAttention:
       LSE_RETURN_IF_ERROR(eval_sdpa(n));
+      break;
+
+    case OpKind::kKvPageWrite:
+      LSE_RETURN_IF_ERROR(eval_kv_page_write(n));
       break;
 
     case OpKind::kTopK:

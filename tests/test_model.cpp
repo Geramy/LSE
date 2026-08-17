@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -115,6 +116,439 @@ LSE_TEST(resolve_reports_missing_models_clearly) {
   LSE_EXPECT(!r.ok());
   LSE_EXPECT(r.status().code() == StatusCode::kNotFound);
 }
+
+namespace {
+
+// Every cache test rewrites the variables that decide where the cache is, so
+// each one is restored before the next test reads them.
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_ = true;
+      old_ = old;
+    }
+    if (value == nullptr) {
+      ::unsetenv(name);
+    } else {
+      ::setenv(name, value, 1);
+    }
+  }
+  ~ScopedEnv() {
+    if (had_) {
+      ::setenv(name_.c_str(), old_.c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_ = false;
+};
+
+// A hub cache tree under a temp directory, with HF_HUB_CACHE pointed at it so
+// resolve_model and list_cached_models look here and not at the real cache.
+class FakeHub {
+ public:
+  explicit FakeHub(const std::string& tag)
+      : root_(std::filesystem::temp_directory_path() / ("lse_hub_" + tag)) {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+    std::filesystem::create_directories(root_, ec);
+    pin_ = std::make_unique<ScopedEnv>("HF_HUB_CACHE", root_.string().c_str());
+    legacy_ = std::make_unique<ScopedEnv>("HUGGINGFACE_HUB_CACHE", nullptr);
+  }
+  ~FakeHub() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+  FakeHub(const FakeHub&) = delete;
+  FakeHub& operator=(const FakeHub&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& root() const { return root_; }
+
+  // The snapshot directory for a repo id, created. Doubles the separator the
+  // way the hub does.
+  std::filesystem::path snapshot(const std::string& repo_id,
+                                 const std::string& sha = "cafe0001") {
+    std::string dir = "models--";
+    for (char c : repo_id) {
+      if (c == '/') {
+        dir += "--";
+      } else {
+        dir += c;
+      }
+    }
+    const std::filesystem::path p = root_ / dir / "snapshots" / sha;
+    std::error_code ec;
+    std::filesystem::create_directories(p, ec);
+    return p;
+  }
+
+ private:
+  std::filesystem::path root_;
+  std::unique_ptr<ScopedEnv> pin_;
+  std::unique_ptr<ScopedEnv> legacy_;
+};
+
+void write_text(const std::filesystem::path& p, const std::string& text) {
+  std::ofstream out(p, std::ios::binary);
+  out << text;
+}
+
+// A config the native (lemonseed) path accepts, so a cache test exercises
+// discovery rather than config validation.
+std::string minimal_config() {
+  return Config{}.to_json();
+}
+
+// A valid one-tensor safetensors file at an arbitrary path.
+void write_safetensors_at(const std::filesystem::path& p,
+                          const std::vector<std::string>& names) {
+  std::string header = "{";
+  std::size_t offset = 0;
+  for (const std::string& name : names) {
+    if (header.size() > 1) header += ",";
+    header += "\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[2,2]," +
+              "\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + 16) + "]}";
+    offset += 16;
+  }
+  header += "}";
+  while (header.size() % 8 != 0) header += " ";
+
+  std::ofstream out(p, std::ios::binary);
+  const std::uint64_t n = header.size();
+  out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  const std::vector<float> data(offset / 4, 0.5f);
+  out.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(offset));
+}
+
+const CacheModel* find_repo(const std::vector<CacheModel>& models,
+                            std::string_view repo_id) {
+  for (const CacheModel& m : models) {
+    if (m.repo_id == repo_id) return &m;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+// The order huggingface_hub uses. Getting this wrong sends the engine looking
+// somewhere the Python library never would, so each rung is pinned.
+LSE_TEST(the_cache_root_follows_the_huggingface_precedence) {
+  const std::string base =
+      (std::filesystem::temp_directory_path() / "lse_hf_env").string();
+
+  {  // HF_HUB_CACHE outranks every other variable.
+    const ScopedEnv a("HF_HUB_CACHE", (base + "/direct").c_str());
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", (base + "/legacy").c_str());
+    const ScopedEnv c("HF_HOME", (base + "/home").c_str());
+    const ScopedEnv d("XDG_CACHE_HOME", (base + "/xdg").c_str());
+    LSE_EXPECT(hf_cache_root() == base + "/direct");
+  }
+  {  // The legacy alias is still honoured, one rung down.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", (base + "/legacy").c_str());
+    const ScopedEnv c("HF_HOME", (base + "/home").c_str());
+    LSE_EXPECT(hf_cache_root() == base + "/legacy");
+  }
+  {  // Then $HF_HOME/hub.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", nullptr);
+    const ScopedEnv c("HF_HOME", (base + "/home").c_str());
+    const ScopedEnv d("XDG_CACHE_HOME", (base + "/xdg").c_str());
+    LSE_EXPECT(hf_cache_root() == base + "/home/hub");
+  }
+  {  // XDG_CACHE_HOME feeds HF_HOME's default only, and is not a fallback for
+     // either cache variable.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", nullptr);
+    const ScopedEnv c("HF_HOME", nullptr);
+    const ScopedEnv d("XDG_CACHE_HOME", (base + "/xdg").c_str());
+    LSE_EXPECT(hf_cache_root() == base + "/xdg/huggingface/hub");
+  }
+  {  // The documented default.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", nullptr);
+    const ScopedEnv c("HF_HOME", nullptr);
+    const ScopedEnv d("XDG_CACHE_HOME", nullptr);
+    const ScopedEnv e("HOME", base.c_str());
+    LSE_EXPECT(hf_cache_root() == base + "/.cache/huggingface/hub");
+  }
+  {  // TRANSFORMERS_CACHE is absent from huggingface_hub and must not be read.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", nullptr);
+    const ScopedEnv c("HF_HOME", nullptr);
+    const ScopedEnv d("XDG_CACHE_HOME", nullptr);
+    const ScopedEnv e("HOME", base.c_str());
+    const ScopedEnv f("TRANSFORMERS_CACHE", (base + "/transformers").c_str());
+    LSE_EXPECT(hf_cache_root().find("transformers") == std::string::npos);
+  }
+  {  // An empty value cannot name a directory, so it reads as unset.
+    const ScopedEnv a("HF_HUB_CACHE", "");
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", nullptr);
+    const ScopedEnv c("HF_HOME", (base + "/home").c_str());
+    LSE_EXPECT(hf_cache_root() == base + "/home/hub");
+  }
+}
+
+// The Python library expanduser+expandvars the value it reads; without this a
+// '~' becomes a literal directory name.
+LSE_TEST(a_cache_path_expands_a_tilde_and_a_variable) {
+  const ScopedEnv home("HOME", "/tmp/lse-fake-home");
+  const ScopedEnv legacy("HUGGINGFACE_HUB_CACHE", nullptr);
+  {
+    const ScopedEnv c("HF_HUB_CACHE", "~/hub");
+    LSE_EXPECT(hf_cache_root() == "/tmp/lse-fake-home/hub");
+  }
+  {
+    const ScopedEnv c("HF_HUB_CACHE", "$HOME/hub");
+    LSE_EXPECT(hf_cache_root() == "/tmp/lse-fake-home/hub");
+  }
+  {
+    const ScopedEnv c("HF_HUB_CACHE", "${HOME}/hub");
+    LSE_EXPECT(hf_cache_root() == "/tmp/lse-fake-home/hub");
+  }
+  {  // An undefined variable is left as written, as expandvars leaves it.
+    const ScopedEnv c("HF_HUB_CACHE", "/tmp/$LSE_NO_SUCH_VAR_HERE/hub");
+    LSE_EXPECT(hf_cache_root() == "/tmp/$LSE_NO_SUCH_VAR_HERE/hub");
+  }
+}
+
+// The cache doubles the separator: models--<org>--<name>. A single dash meant
+// naming a model by its repo id never resolved.
+LSE_TEST(a_repo_id_resolves_to_its_snapshot) {
+  FakeHub hub("resolve");
+  const std::filesystem::path snap = hub.snapshot("mlx-community/Tiny-4bit");
+  write_text(snap / "config.json", minimal_config());
+  write_safetensors_at(snap / "model.safetensors", {"w"});
+
+  auto r = resolve_model("mlx-community/Tiny-4bit");
+  LSE_EXPECT_OK(r.status());
+  LSE_EXPECT(r->weights == (snap / "model.safetensors").string());
+  LSE_EXPECT(r->config == (snap / "config.json").string());
+}
+
+LSE_TEST(a_bare_model_name_resolves_only_when_it_is_unique) {
+  FakeHub hub("bare");
+  const std::filesystem::path a = hub.snapshot("mlx-community/Solo-4bit");
+  write_text(a / "config.json", minimal_config());
+  write_safetensors_at(a / "model.safetensors", {"w"});
+
+  auto solo = resolve_model("Solo-4bit");
+  LSE_EXPECT_OK(solo.status());
+  LSE_EXPECT(solo->weights == (a / "model.safetensors").string());
+
+  // A second organization's build of the same name makes the bare name
+  // ambiguous, and picking one silently would load the wrong checkpoint.
+  const std::filesystem::path b = hub.snapshot("other-org/Solo-4bit");
+  write_text(b / "config.json", minimal_config());
+  write_safetensors_at(b / "model.safetensors", {"w"});
+
+  auto both = resolve_model("Solo-4bit");
+  LSE_EXPECT(!both.ok());
+  LSE_EXPECT(both.status().code() == StatusCode::kInvalidArgument);
+  const std::string msg = both.status().to_string();
+  LSE_EXPECT(msg.find("mlx-community/Solo-4bit") != std::string::npos);
+  LSE_EXPECT(msg.find("other-org/Solo-4bit") != std::string::npos);
+
+  // The full repo id still resolves either of them.
+  auto exact = resolve_model("other-org/Solo-4bit");
+  LSE_EXPECT_OK(exact.status());
+  LSE_EXPECT(exact->weights == (b / "model.safetensors").string());
+}
+
+LSE_TEST(an_absent_name_names_what_was_tried) {
+  FakeHub hub("absent");
+  const std::filesystem::path a = hub.snapshot("mlx-community/Present-4bit");
+  write_text(a / "config.json", minimal_config());
+  write_safetensors_at(a / "model.safetensors", {"w"});
+
+  auto r = resolve_model("nobody/Missing-8bit");
+  LSE_EXPECT(!r.ok());
+  LSE_EXPECT(r.status().code() == StatusCode::kNotFound);
+  const std::string msg = r.status().to_string();
+  // What was looked for, where, and what was there instead.
+  LSE_EXPECT(msg.find("models--nobody--Missing-8bit") != std::string::npos);
+  LSE_EXPECT(msg.find(hub.root().string()) != std::string::npos);
+  LSE_EXPECT(msg.find("tried: mlx-community/Present-4bit") != std::string::npos);
+}
+
+// The two stubs in the real cache would otherwise look like models: a repo
+// directory exists whether or not the download finished.
+LSE_TEST(an_incomplete_repo_is_never_offered_as_loadable) {
+  FakeHub hub("incomplete");
+
+  // Nothing but a tokenizer, which is what an interrupted download leaves.
+  const std::filesystem::path bare = hub.snapshot("org/Interrupted");
+  write_text(bare / "tokenizer.json", "{}");
+
+  // A repo with no snapshots directory at all.
+  std::error_code ec;
+  std::filesystem::create_directories(
+      hub.root() / "models--org--NoSnapshot" / "refs", ec);
+
+  // A valid index naming two shards, one of which never arrived. This is the
+  // case a config.json check alone would pass.
+  const std::filesystem::path partial = hub.snapshot("org/HalfSharded");
+  write_text(partial / "config.json", minimal_config());
+  write_text(partial / "model.safetensors.index.json",
+             R"({"weight_map":{"a":"model-00001-of-00002.safetensors",)"
+             R"("b":"model-00002-of-00002.safetensors"}})");
+  write_safetensors_at(partial / "model-00001-of-00002.safetensors", {"a"});
+
+  auto models = list_cached_models();
+  LSE_EXPECT_OK(models.status());
+
+  for (const char* repo : {"org/Interrupted", "org/NoSnapshot",
+                           "org/HalfSharded"}) {
+    const CacheModel* m = find_repo(*models, repo);
+    LSE_EXPECT(m != nullptr);
+    if (m == nullptr) continue;
+    LSE_EXPECT(m->loadable == Loadable::kIncomplete);
+    LSE_EXPECT(!m->reason.empty());
+  }
+
+  // The missing shard has to be named, not merely counted.
+  const CacheModel* half = find_repo(*models, "org/HalfSharded");
+  LSE_EXPECT(half != nullptr);
+  if (half != nullptr) {
+    LSE_EXPECT(half->reason.find("model-00002-of-00002.safetensors") !=
+               std::string::npos);
+  }
+
+  // And opening one still fails rather than half-loading.
+  LSE_EXPECT(!SafeTensors::open_sharded(
+                  (partial / "model.safetensors.index.json").string())
+                  .ok());
+}
+
+// Two downloaded revisions and no refs/main: the name does not identify one, so
+// neither resolution nor the listing may pick for the user.
+LSE_TEST(several_revisions_with_no_ref_are_ambiguous_not_incomplete) {
+  FakeHub hub("revisions");
+  for (const char* sha : {"aaaa1111", "bbbb2222"}) {
+    const std::filesystem::path snap = hub.snapshot("org/TwoRevs", sha);
+    write_text(snap / "config.json", minimal_config());
+    write_safetensors_at(snap / "model.safetensors", {"w"});
+  }
+
+  auto r = resolve_model("org/TwoRevs");
+  LSE_EXPECT(!r.ok());
+  LSE_EXPECT(r.status().code() == StatusCode::kInvalidArgument);
+  LSE_EXPECT(r.status().to_string().find("aaaa1111") != std::string::npos);
+  LSE_EXPECT(r.status().to_string().find("bbbb2222") != std::string::npos);
+
+  auto models = list_cached_models();
+  LSE_EXPECT_OK(models.status());
+  const CacheModel* m = find_repo(*models, "org/TwoRevs");
+  LSE_EXPECT(m != nullptr);
+  if (m == nullptr) return;
+  // Unknown, not incomplete: both downloads finished.
+  LSE_EXPECT(m->loadable == Loadable::kUnknown);
+
+  // refs/main settles it, and then the repo resolves.
+  std::error_code ec;
+  std::filesystem::create_directories(
+      hub.root() / "models--org--TwoRevs" / "refs", ec);
+  write_text(hub.root() / "models--org--TwoRevs" / "refs" / "main", "bbbb2222");
+  auto pinned = resolve_model("org/TwoRevs");
+  LSE_EXPECT_OK(pinned.status());
+  LSE_EXPECT(pinned->weights.find("bbbb2222") != std::string::npos);
+}
+
+LSE_TEST(a_gguf_repo_is_reported_unloadable_not_incomplete) {
+  FakeHub hub("gguf");
+  const std::filesystem::path snap = hub.snapshot("org/Gguf-Only");
+  write_text(snap / "config.json", minimal_config());
+  write_text(snap / "model.gguf", "GGUF not really");
+
+  auto models = list_cached_models();
+  LSE_EXPECT_OK(models.status());
+  const CacheModel* m = find_repo(*models, "org/Gguf-Only");
+  LSE_EXPECT(m != nullptr);
+  if (m == nullptr) return;
+  LSE_EXPECT(m->loadable == Loadable::kNo);
+  LSE_EXPECT(m->reason.find("GGUF") != std::string::npos);
+}
+
+// The verdict comes from the engine's own detection, so a checkpoint no
+// architecture claims is reported as unloadable naming what was tried — never
+// guessed at from the repo's name.
+LSE_TEST(an_unrecognized_checkpoint_lists_as_unloadable_naming_what_was_tried) {
+  FakeHub hub("stranger");
+  const std::filesystem::path snap = hub.snapshot("org/Stranger");
+  write_text(snap / "config.json", minimal_config());
+  write_safetensors_at(snap / "model.safetensors", {"encoder.layer.0.weight"});
+
+  auto models = list_cached_models();
+  LSE_EXPECT_OK(models.status());
+  const CacheModel* m = find_repo(*models, "org/Stranger");
+  LSE_EXPECT(m != nullptr);
+  if (m == nullptr) return;
+  LSE_EXPECT(m->loadable == Loadable::kNo);
+  LSE_EXPECT(m->reason.find("tried:") != std::string::npos);
+  LSE_EXPECT(m->engine_arch.empty());
+}
+
+// Resolution and listing must read the same variables hf_cache_root does, or
+// the engine looks in one place and reports on another.
+LSE_TEST(discovery_follows_the_cache_variables_end_to_end) {
+  const std::filesystem::path base =
+      std::filesystem::temp_directory_path() / "lse_hub_endtoend";
+  std::error_code ec;
+  std::filesystem::remove_all(base, ec);
+  const std::filesystem::path snap =
+      base / "hub" / "models--org--ViaHfHome" / "snapshots" / "d00d";
+  std::filesystem::create_directories(snap, ec);
+  write_text(snap / "config.json", minimal_config());
+  write_safetensors_at(snap / "model.safetensors", {"w"});
+
+  {  // Reached through $HF_HOME/hub, with no cache variable set.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE", nullptr);
+    const ScopedEnv c("HF_HOME", base.string().c_str());
+    auto r = resolve_model("org/ViaHfHome");
+    LSE_EXPECT_OK(r.status());
+    auto models = list_cached_models();
+    LSE_EXPECT_OK(models.status());
+    LSE_EXPECT(find_repo(*models, "org/ViaHfHome") != nullptr);
+  }
+  {  // The legacy variable points somewhere else entirely, and wins over
+     // HF_HOME.
+    const ScopedEnv a("HF_HUB_CACHE", nullptr);
+    const ScopedEnv b("HUGGINGFACE_HUB_CACHE",
+                      (base / "elsewhere").string().c_str());
+    const ScopedEnv c("HF_HOME", base.string().c_str());
+    LSE_EXPECT(!resolve_model("org/ViaHfHome").ok());
+  }
+  std::filesystem::remove_all(base, ec);
+}
+
+// A listing is sorted and complete: a repo missing from it cannot be chosen.
+LSE_TEST(the_listing_reports_every_repo_in_the_cache) {
+  FakeHub hub("listing");
+  for (const char* repo : {"z-org/Last", "a-org/First", "m-org/Middle"}) {
+    const std::filesystem::path snap = hub.snapshot(repo);
+    write_text(snap / "config.json", minimal_config());
+    write_safetensors_at(snap / "model.safetensors", {"w"});
+  }
+  auto models = list_cached_models();
+  LSE_EXPECT_OK(models.status());
+  LSE_EXPECT_EQ(models->size(), 3u);
+  LSE_EXPECT((*models)[0].repo_id == "a-org/First");
+  LSE_EXPECT((*models)[1].repo_id == "m-org/Middle");
+  LSE_EXPECT((*models)[2].repo_id == "z-org/Last");
+  for (const CacheModel& m : *models) LSE_EXPECT(m.bytes > 0);
+}
+
 
 LSE_TEST(loads_the_real_b1_5_checkpoint) {
   if (!have_model()) {
@@ -941,6 +1375,122 @@ Config tiny_quantized_qwen_config() {
 
 }  // namespace
 
+// A packed plane holds several weights per u32 lane, so summing stored elements
+// reports an 0.8B checkpoint as 0.2B. The scale column has to expand them.
+LSE_TEST(parameter_scale_expands_packed_planes) {
+  constexpr std::int64_t kOut = 8;
+  constexpr std::int64_t kIn = 64;
+  const QuantFixture fx = write_quantized_fixture(
+      "scale_expand", {{"m.weight", {kOut, kIn}}}, 4, 32, /*drop=*/false);
+
+  auto st = SafeTensors::open(fx.path);
+  LSE_EXPECT_OK(st.status());
+  auto quant = quant::GroupAffineMap::from_config_json(fx.config_json);
+  LSE_EXPECT_OK(quant.status());
+
+  // Logical: exactly the weights the matrix holds. Stored: a quarter of the
+  // lanes plus the scale and bias planes, which are not parameters at all.
+  LSE_EXPECT_EQ(st->logical_parameters(&*quant),
+                static_cast<std::size_t>(kOut * kIn));
+  LSE_EXPECT(st->total_parameters() < static_cast<std::size_t>(kOut * kIn));
+}
+
+namespace {
+
+// A safetensors file with per-tensor dtypes, which write_shaped_fixture (all
+// F32) and write_quantized_fixture (2-D weights only) cannot express: a stacked
+// expert plane is 3-D and u32.
+struct RawTensor {
+  std::string name;
+  std::string dtype;
+  std::vector<std::int64_t> dims;
+  int elem_bytes;
+};
+
+void write_raw_safetensors(const std::filesystem::path& path,
+                           const std::vector<RawTensor>& tensors) {
+  std::string header = "{";
+  std::size_t offset = 0;
+  for (const RawTensor& t : tensors) {
+    std::size_t count = 1;
+    std::string dims;
+    for (std::int64_t d : t.dims) {
+      if (!dims.empty()) dims += ",";
+      dims += std::to_string(d);
+      count *= static_cast<std::size_t>(d);
+    }
+    if (header.size() > 1) header += ",";
+    const std::size_t bytes = count * static_cast<std::size_t>(t.elem_bytes);
+    header += "\"" + t.name + "\":{\"dtype\":\"" + t.dtype + "\",\"shape\":[" +
+              dims + "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + bytes) + "]}";
+    offset += bytes;
+  }
+  header += "}";
+  while (header.size() % 8 != 0) header += " ";
+
+  std::ofstream out(path, std::ios::binary);
+  const std::uint64_t n = header.size();
+  out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  std::vector<std::uint8_t> data(offset);
+  for (std::size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<std::uint8_t>((i * 31u + 7u) % 59u);
+  }
+  out.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(offset));
+}
+
+}  // namespace
+
+// The MoE checkpoints in the real cache detect fine and then fail to bind: a
+// stacked 3-D group-affine expert tensor has no kernel. Reporting one of them as
+// loadable is the worst output this listing can produce, so the verdict is
+// pinned to the same precondition the binder enforces.
+LSE_TEST(a_stacked_expert_checkpoint_is_reported_unloadable_not_loadable) {
+  constexpr int kBits = 8;
+  constexpr int kGroup = 32;
+  const Config c = tiny_qwen_config(/*moe=*/true);
+
+  // Every tensor F32, except the two stacked expert planes that contract over
+  // hidden_size, which are written the way MLX writes them: a u32 packed plane
+  // with bf16 scales and biases beside it.
+  std::vector<RawTensor> raw;
+  for (const NamedShape& t : qwen_checkpoint(c)) {
+    const bool stacked =
+        t.name.find("switch_mlp.gate_proj.weight") != std::string::npos ||
+        t.name.find("switch_mlp.up_proj.weight") != std::string::npos;
+    if (!stacked) {
+      raw.push_back({t.name, "F32", t.dims, 4});
+      continue;
+    }
+    const std::int64_t k = t.dims.back();
+    const std::string base = t.name.substr(0, t.name.size() - 7);
+    raw.push_back({t.name, "U32", {t.dims[0], t.dims[1], k * kBits / 32}, 4});
+    raw.push_back({base + ".scales", "BF16", {t.dims[0], t.dims[1], k / kGroup}, 2});
+    raw.push_back({base + ".biases", "BF16", {t.dims[0], t.dims[1], k / kGroup}, 2});
+  }
+
+  FakeHub hub("stacked");
+  const std::filesystem::path snap = hub.snapshot("org/Stacked-8bit");
+  write_raw_safetensors(snap / "model.safetensors", raw);
+  // The config declares the geometry, so the refusal is about rank and not
+  // about a missing quantization block.
+  std::string cfg = c.to_json();
+  cfg.insert(1, "\"quantization\":{\"group_size\":" + std::to_string(kGroup) +
+                    ",\"bits\":" + std::to_string(kBits) +
+                    ",\"mode\":\"affine\"},");
+  write_text(snap / "config.json", cfg);
+
+  const CacheModel m = inspect_model_dir(snap.string(), "org/Stacked-8bit");
+  // Detection succeeds — which is exactly why the verdict cannot stop there.
+  LSE_EXPECT(m.engine_arch == "qwen3.5-moe");
+  LSE_EXPECT(m.loadable == Loadable::kNo);
+  LSE_EXPECT(m.reason.find("switch_mlp") != std::string::npos);
+  LSE_EXPECT(m.reason.find("indexed group-affine contraction") !=
+             std::string::npos);
+}
+
 LSE_TEST(a_quantized_qwen_checkpoint_binds_all_three_planes) {
   const Config base = tiny_quantized_qwen_config();
   const std::vector<NamedShape> t = qwen_checkpoint(base);
@@ -1105,6 +1655,96 @@ LSE_TEST(no_qwen_predicate_claims_a_lemonseed_shaped_checkpoint) {
     if (name != "blocks.0.mod.router.weight") real.push_back(name);
   }
   LSE_EXPECT(detect("lemonseed_real_no_mod", real).empty());
+}
+
+// What paging actually moves, measured per model rather than derived: the pools
+// a session holds after a short prompt against what one contiguous span at the
+// engine KV length would have reserved.
+//
+// LSE_TEST_KV_MODELS overrides the list (colon-separated repo ids or paths).
+// The default skips checkpoints large enough to make the suite slow; point the
+// variable at one to measure it.
+LSE_TEST(a_paged_session_reserves_a_rung_not_the_capacity) {
+  std::vector<std::string> want{model_dir()};
+  if (const char* env = std::getenv("LSE_TEST_KV_MODELS")) {
+    want.clear();
+    std::string all(env);
+    for (std::size_t at = 0; at <= all.size();) {
+      const std::size_t sep = all.find(':', at);
+      const std::string one = all.substr(at, sep == std::string::npos
+                                                ? std::string::npos
+                                                : sep - at);
+      if (!one.empty()) want.push_back(one);
+      if (sep == std::string::npos) break;
+      at = sep + 1;
+    }
+  } else {
+    want.push_back("mlx-community/Qwen3.5-0.8B-4bit");
+    want.push_back("mlx-community/Qwen3.5-4B-4bit");
+  }
+
+  std::size_t measured = 0;
+  for (const std::string& name : want) {
+    if (name.empty()) continue;
+    auto paths = resolve_model(name);
+    if (!paths.ok()) continue;
+    auto ckpt = paths->weights.ends_with(".index.json")
+                    ? SafeTensors::open_sharded(paths->weights)
+                    : SafeTensors::open(paths->weights);
+    auto cfg = Config::from_json_file(paths->config);
+    if (!ckpt.ok() || !cfg.ok()) continue;
+    auto lm = build_model(*cfg, *ckpt);
+    if (!lm.ok()) continue;
+    WeightBinder binder(*ckpt, &cfg->quantization);
+    if (!(*lm)->load(binder).ok()) continue;
+
+    std::vector<MixerState> states = (*lm)->make_states();
+    graph::Array tokens = graph::Array::zeros(Shape{1, 5}, DType::kF32);
+    graph::Scheduler* sched = graph::default_scheduler();
+    if (sched == nullptr) return;
+    graph::Node& tn = *tokens.node();
+    if (!graph::interpreter::ensure_output_buffer(tn, sched->backend()).ok()) {
+      continue;
+    }
+    for (std::size_t i = 0; i < 5; ++i) {
+      graph::interpreter::store_element(tn, i, static_cast<float>(3 + i));
+    }
+    tn.materialized = true;
+    if (!graph::interpreter::sync_to_device(tn, sched->backend()).ok()) continue;
+    auto h = (*lm)->hidden(tokens, &states, nullptr);
+    LSE_EXPECT_OK(h.status());
+    if (!h.ok()) continue;
+
+    std::size_t paged = 0;
+    std::size_t contiguous = 0;
+    std::size_t blocks = 0;
+    std::size_t layers = 0;
+    for (const MixerState& st : states) {
+      if (!st.paged.valid()) continue;
+      ++layers;
+      paged += st.paged.pool_bytes();
+      blocks += static_cast<std::size_t>(st.paged.tables[0].size());
+      const Shape& p = st.key_cache.shape();
+      contiguous += static_cast<std::size_t>(p.dim(1) * p.dim(3)) *
+                    sizeof(float) * 2 *
+                    static_cast<std::size_t>(cfg->kv_capacity());
+    }
+    LSE_EXPECT(layers > 0u);
+    if (layers == 0u) continue;
+    std::printf(
+        "       %-42s %2zu attn layer(s), %2zu block(s) held: "
+        "%8.3f MiB paged vs %8.3f MiB contiguous (%.1fx)\n",
+        name.c_str(), layers, blocks,
+        static_cast<double>(paged) / 1048576.0,
+        static_cast<double>(contiguous) / 1048576.0,
+        static_cast<double>(contiguous) / static_cast<double>(paged));
+    // One block per attention layer covers 5 tokens, and the pool is at the
+    // smallest rung.
+    LSE_EXPECT_EQ(blocks, layers);
+    LSE_EXPECT(paged * 8 <= contiguous);
+    ++measured;
+  }
+  std::printf("       measured %zu checkpoint(s)\n", measured);
 }
 
 LSE_TEST_MAIN()

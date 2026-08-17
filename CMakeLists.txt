@@ -141,6 +141,26 @@ add_library(lse::probe ALIAS lse_probe)
 target_link_libraries(lse_probe PUBLIC lse_core lse_ir lse_dist lse_backend_registry)
 lse_apply_common_flags(lse_probe)
 
+# ---------------------------------------------------------------------------
+# trace — what the work costs, continuously, and the Perfetto export of it.
+# Distinct from probe on purpose: probe measures the hardware ONCE at admission,
+# trace measures the WORK as it happens. Below lse_graph for the same reason
+# probe and dist are — a backend registers its tracer here — and deliberately
+# not linked against lse_graph, because lse_backend_hrx links both and an edge
+# back would be the cycle the comment on lse_graph warns about.
+# ---------------------------------------------------------------------------
+add_library(lse_trace
+  src/trace/record.cpp
+  src/trace/collector.cpp
+  src/trace/tracer.cpp
+  src/trace/export.cpp
+)
+add_library(lse::trace ALIAS lse_trace)
+# A tracer self-registers from its backend's TU, which is already whole-archived
+# by that backend, so this needs no whole-archive of its own.
+target_link_libraries(lse_trace PUBLIC lse_core lse_backend_registry)
+lse_apply_common_flags(lse_trace)
+
 add_library(lse_graph
   src/graph/graph.cpp
   src/graph/ops.cpp
@@ -182,6 +202,20 @@ if(TARGET fastokens_ffi)
   lse_apply_common_flags(lse_tokenizer)
 endif()
 
+# ---------------------------------------------------------------------------
+# kv — the paged attention pool: block geometry, a refcounted free list and the
+# admit/preempt/swap policy. Core only: no device, no graph, no session, so the
+# allocation policy is testable with nothing attached.
+# ---------------------------------------------------------------------------
+add_library(lse_kv
+  src/kv/allocator.cpp
+  src/kv/block.cpp
+  src/kv/policy.cpp
+)
+add_library(lse::kv ALIAS lse_kv)
+target_link_libraries(lse_kv PUBLIC lse_core)
+lse_apply_common_flags(lse_kv)
+
 add_library(lse_ops
   src/ops/activation.cpp
   src/ops/attention.cpp
@@ -191,7 +225,7 @@ add_library(lse_ops
   src/ops/rope.cpp
 )
 add_library(lse::ops ALIAS lse_ops)
-target_link_libraries(lse_ops PUBLIC lse_core lse_graph)
+target_link_libraries(lse_ops PUBLIC lse_core lse_graph lse_kv)
 lse_apply_common_flags(lse_ops)
 
 add_library(lse_runtime
@@ -223,6 +257,27 @@ lse_apply_common_flags(lse_model)
 target_link_libraries(lse_runtime PUBLIC lse_core lse_graph lse_model)
 
 # ---------------------------------------------------------------------------
+# place — the device SET: which devices this process holds, which of them holds
+# which bytes, and where work runs. Deliberately the TOP layer: it depends on
+# probe (to measure a pool) and on graph (to hand the set to a scheduler), and
+# nothing depends on it. That direction is what keeps graph free of it — graph
+# holds the backend::IDeviceSet seam and this implements it.
+# ---------------------------------------------------------------------------
+add_library(lse_place
+  src/place/residency.cpp
+  src/place/devices.cpp
+  src/place/placement.cpp
+)
+add_library(lse::place ALIAS lse_place)
+target_link_libraries(lse_place PUBLIC lse_core lse_probe lse_graph
+                                       lse_backend_registry)
+# The set registers itself as graph's device-set factory from a TU with no
+# referenced symbols, the same way transports and backends register.
+target_link_options(lse_place INTERFACE
+  "LINKER:--whole-archive,$<TARGET_FILE:lse_place>,--no-whole-archive")
+lse_apply_common_flags(lse_place)
+
+# ---------------------------------------------------------------------------
 # cli — needs a tokenizer, so it is built only when the Rust shim is available.
 # ---------------------------------------------------------------------------
 if(TARGET lse_tokenizer)
@@ -232,7 +287,7 @@ if(TARGET lse_tokenizer)
       LSE_HSA_RUNTIME_DIR="${LSE_ROCM_RUNTIME_DIR}")
   endif()
   target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer
-                                    lse_probe lse_backends)
+                                    lse_place lse_probe lse_backends)
   lse_apply_common_flags(lse)
 endif()
 

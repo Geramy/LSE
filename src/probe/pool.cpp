@@ -47,19 +47,33 @@ std::string local_identity(const PoolMember& member) {
   return s;
 }
 
-Result<std::size_t> self_index(std::span<const PoolMember> members,
-                               dist::ITransport* transport) {
+// Which members this process drives.
+//
+// With a transport there is exactly one — the member whose rank is ours, the
+// rest belonging to other ranks. Without one, every member that carries a
+// backend is ours: several devices in one process is not a degenerate
+// distributed pool, it is the ordinary multi-GPU box, and requiring a transport
+// to describe it would mean standing up a network to measure a PCIe slot.
+Result<std::vector<std::size_t>> local_indices(
+    std::span<const PoolMember> members, dist::ITransport* transport) {
+  std::vector<std::size_t> out;
   if (transport == nullptr) {
-    if (members.size() != 1) {
-      return LSE_ERROR(kInvalidArgument,
-                       "a pool of more than one member needs a transport to "
-                       "measure the links between them");
+    for (std::size_t i = 0; i < members.size(); ++i) {
+      if (members[i].backend != nullptr) out.push_back(i);
     }
-    return std::size_t{0};
+    if (out.empty()) {
+      return LSE_ERROR(kInvalidArgument,
+                       "no member of this pool carries a backend, so nothing "
+                       "here can measure any of them");
+    }
+    return out;
   }
   const dist::Rank me = transport->rank();
   for (std::size_t i = 0; i < members.size(); ++i) {
-    if (members[i].rank == me) return i;
+    if (members[i].rank == me) {
+      out.push_back(i);
+      return out;
+    }
   }
   return LSE_ERROR(kOutOfRange, "transport rank ", std::to_string(me),
                    " names no pool member");
@@ -107,10 +121,23 @@ DeviceProfile bare_profile(const PoolMember& member) {
 Result<std::string> pool_fingerprint(std::span<const PoolMember> members,
                                      dist::ITransport* transport) {
   LSE_RETURN_IF_ERROR(validate(members));
-  LSE_ASSIGN_OR(const std::size_t self, self_index(members, transport));
+  LSE_ASSIGN_OR(const std::vector<std::size_t> locals,
+                local_indices(members, transport));
+  const std::size_t self = locals.front();
 
   const std::string mine = hex64(hash_bytes(local_identity(members[self])));
   std::vector<std::string> per_rank(members.size(), mine);
+  // Every member this process drives contributes its own identity, so two local
+  // devices cannot fingerprint as one. A pool of one is unchanged: `mine` is
+  // already its identity and the loop rewrites it with the same value.
+  if (transport == nullptr) {
+    for (const std::size_t i : locals) {
+      const auto r = static_cast<std::size_t>(members[i].rank);
+      if (r < per_rank.size()) {
+        per_rank[r] = hex64(hash_bytes(local_identity(members[i])));
+      }
+    }
+  }
   if (transport != nullptr && transport->world_size() > 1) {
     LSE_ASSIGN_OR(per_rank,
                   wire::all_gather_strings(*transport, mine, kTagFingerprint));
@@ -142,7 +169,9 @@ Result<PoolProfile> qualify_pool(std::span<const PoolMember> members,
                                  dist::ITransport* transport,
                                  const PoolOptions& options) {
   LSE_RETURN_IF_ERROR(validate(members));
-  LSE_ASSIGN_OR(const std::size_t self, self_index(members, transport));
+  LSE_ASSIGN_OR(const std::vector<std::size_t> locals,
+                local_indices(members, transport));
+  const std::size_t self = locals.front();
   LSE_ASSIGN_OR(const std::string fingerprint,
                 pool_fingerprint(members, transport));
 
@@ -170,23 +199,11 @@ Result<PoolProfile> qualify_pool(std::span<const PoolMember> members,
       // unknown until a rank that can reach it probes again, which is the same
       // refusal an unmeasured device already gets.
       for (DeviceProfile& d : pool.devices) d.free_memory = Measured::unknown();
-      if (members[self].backend != nullptr) {
-        pool.devices[self].free_memory =
-            sample_free_memory(*members[self].backend);
+      for (const std::size_t i : locals) {
+        if (members[i].backend == nullptr) continue;
+        pool.devices[i].free_memory = sample_free_memory(*members[i].backend);
       }
       return pool;
-    }
-  }
-
-  DeviceProfile local = bare_profile(members[self]);
-  if (members[self].backend != nullptr) {
-    auto probed = probe_device(*members[self].backend);
-    if (probed.ok()) {
-      local = probed.release();
-      // The pool addresses this member by the name the caller gave it, which
-      // may differ from the backend's own ordinal when a rank drives one of
-      // several devices.
-      local.id = members[self].id;
     }
   }
 
@@ -196,7 +213,19 @@ Result<PoolProfile> qualify_pool(std::span<const PoolMember> members,
   for (std::size_t i = 0; i < members.size(); ++i) {
     pool.devices[i] = bare_profile(members[i]);
   }
-  pool.devices[self] = local;
+  // Every device this process drives is measured here. A member some other rank
+  // owns stays bare until that rank sends its profile over.
+  for (const std::size_t i : locals) {
+    if (members[i].backend == nullptr) continue;
+    auto probed = probe_device(*members[i].backend);
+    if (!probed.ok()) continue;
+    pool.devices[i] = probed.release();
+    // The pool addresses this member by the name the caller gave it, which may
+    // differ from the backend's own ordinal when a rank drives one of several
+    // devices.
+    pool.devices[i].id = members[i].id;
+  }
+  const DeviceProfile& local = pool.devices[self];
 
   if (transport != nullptr && transport->world_size() > 1) {
     LSE_ASSIGN_OR(
@@ -214,15 +243,16 @@ Result<PoolProfile> qualify_pool(std::span<const PoolMember> members,
     }
   }
 
-  const std::vector<LinkMember> lm = link_members(members);
   if (transport != nullptr) {
+    const std::vector<LinkMember> lm = link_members(members);
     LSE_ASSIGN_OR(pool.links, probe_links(*transport, lm, options.links));
   } else {
-    pool.links.resize(1);
-    pool.links[0].src = members[0].id;
-    pool.links[0].dst = members[0].id;
-    pool.links[0].path = PathKind::kSameDevice;
-    pool.links[0].latency_ns = Measured::measured(0.0);
+    std::vector<LocalMember> lm;
+    lm.reserve(members.size());
+    for (const PoolMember& m : members) {
+      lm.push_back(LocalMember{m.id, m.backend});
+    }
+    LSE_ASSIGN_OR(pool.links, probe_local_links(lm, options.links));
   }
 
   // Best effort: a pool that measured fine but cannot write its cache is still

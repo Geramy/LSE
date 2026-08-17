@@ -146,14 +146,15 @@ class Qwen35Attention final : public IMixer {
     ops::AttentionCache cache;
     cache.keys = state->key_cache;
     cache.values = state->value_cache;
-    cache.pos = state->kv_pos;
+    cache.table = state->paged.table;
+    cache.meta = state->kv_meta;
+    cache.paged = &state->paged;
     cache.capacity = spec_.kv_length;
     cache.used = state->position;
     LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_, spec_, rope_,
                                                 state->position, &cache));
     state->key_cache = cache.keys;
     state->value_cache = cache.values;
-    if (cache.pos.valid()) state->kv_pos = cache.pos;
     return y;
   }
 

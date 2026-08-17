@@ -303,7 +303,9 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     graph::EmittedKernel emitted;
     emitted.source = source;
     emitted.entry_name = std::string(entry);
-    return cache_.get_or_compile(hash_bytes(entry), emitted);
+    // Member 0: this probe holds one backend, so its cache is the set that
+    // backend is.
+    return cache_.get_or_compile(0, hash_bytes(entry), emitted);
   }
 
   // --- roofline ----------------------------------------------------------

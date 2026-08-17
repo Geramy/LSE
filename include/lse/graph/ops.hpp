@@ -146,6 +146,25 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
            MaskKind mask, int window, const Array& offset);
 
+// Paged form. `k`/`v` are pools [blocks, Hkv, block_size, Dh] rather than one
+// contiguous span per sequence, and `table` [rows, stride] says which block
+// holds each of a row's positions. `meta` is the per-step descriptor, f32 [3]:
+// {first query position, live KV length, real rows}.
+//
+// The live length is a dispatch value, not a shape: one code object serves
+// every sequence length. `rows` likewise — the batch axis is padded to a bucket
+// and the rows past `meta[2]` return zero, so a pass is the same kernel however
+// many sequences are in it.
+Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
+                 MaskKind mask, int window, const Array& meta,
+                 const Array& table, int block_size);
+
+// Writes `src` [rows, Hkv, T, Dh] into the pool `dst` [blocks, Hkv,
+// block_size, Dh] at absolute position meta[0], following `table`. Returns the
+// pool: the write aliases it and touches only the positions it covers.
+Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
+                    const Array& table, int block_size);
+
 // Records a node for a registered primitive. Returns an invalid Array if the
 // name is unknown or the arity/shapes do not match.
 Result<Array> custom(std::string_view primitive, const std::vector<Array>& inputs,

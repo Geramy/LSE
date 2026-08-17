@@ -18,6 +18,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/weights.hpp"
+#include "lse/ops/attention.hpp"
 #include "lse/quant/group_affine.hpp"
 
 namespace lse::model {
@@ -25,15 +26,24 @@ namespace lse::model {
 using graph::Array;
 
 // Per-sequence mixer state: GDN keeps a fixed recurrent state, attention keeps
-// a KV pair allocated at the engine length. Null on a prefill with no cache.
+// a paged K/V pool plus the block lists that index it. Null on a prefill with no
+// cache.
+//
+// GDN carries by value replacement and is never indexed by position, so it needs
+// no block table: in paged terms it is a one-block-per-sequence pool.
 struct MixerState {
   Array gdn_state;
   // The GDN conv tails travel with it; see ops::GatedDeltaNetState.
   Array gdn_conv_q, gdn_conv_k, gdn_conv_v, gdn_conv_qkv;
+  // The paged pools and their block lists. `key_cache`/`value_cache` mirror
+  // paged.keys/values so the program's carry pairs and the cache-leaf check keep
+  // working on plain Arrays.
+  ops::PagedKvLayer paged;
   Array key_cache;
   Array value_cache;
-  // Shared 1-element write cursor the decode program pokes each step.
-  Array kv_pos;
+  // Shared per-step descriptor the decode program pokes: f32 [3] =
+  // {first query position, live KV length, real rows}.
+  Array kv_meta;
   std::int32_t position = 0;
 
   [[nodiscard]] bool empty() const noexcept {

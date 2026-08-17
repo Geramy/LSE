@@ -62,6 +62,7 @@ namespace lse::graph {
   X(kGather,        "gather") \
   X(kScatter,       "scatter") \
   X(kOverwriteSlice,"overwrite_slice") \
+  X(kKvPageWrite,   "kv_page_write") \
   X(kRepeat,        "repeat") \
   X(kEmbedding,     "embedding") \
   X(kQuantEmbedding,"quant_embedding") \
@@ -254,6 +255,13 @@ class Program;
 
 class Scheduler {
  public:
+  // The devices this scheduler may run on. One member or eight is a difference
+  // in size(), not in code path: everything below places a group on a member
+  // and dispatches to it, and with one member the placement is the member.
+  explicit Scheduler(backend::IDeviceSet& devices);
+  // One device, for a caller that holds a backend rather than a set — a probe
+  // measuring its own hardware, a tracer, a test. It is the same thing: the set
+  // that backend is.
   explicit Scheduler(backend::IBackend& backend);
   ~Scheduler();
 
@@ -280,8 +288,18 @@ class Scheduler {
   [[nodiscard]] FallbackChain& fallback_chain() const noexcept;
 
  private:
-  Status try_dispatch_group(const FusionGroup& group,
-                            backend::Stream stream);
+  Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
+                            std::size_t member);
+  // Which member of the set runs this group: the one already holding its
+  // operands. Not a cost decision — a group whose inputs are resident on one
+  // device has nowhere else to run until something moves them, and moving them
+  // is what a Planner decides. With one member this is that member.
+  [[nodiscard]] std::size_t member_for(const FusionGroup& group) const noexcept;
+  // Refuses when a binding's bytes are held by a device the target cannot read.
+  Status check_residency(std::span<const backend::BufferRef> bindings,
+                         std::size_t member) const;
+  // Releases through the member that allocated it, which the buffer names.
+  void release(backend::DeviceBuffer& buf) const noexcept;
 
  public:
 
@@ -339,12 +357,21 @@ class Scheduler {
   [[nodiscard]] const Trace& accumulated_trace() const noexcept { return acc_; }
   void reset_accumulated_trace() noexcept { acc_ = {}; }
 
-  // The backend this scheduler runs on, for callers that need to place data
-  // themselves — bulk-loading weights, rather than computing them.
-  [[nodiscard]] backend::IBackend& backend() const noexcept { return backend_; }
+  // Where data goes when the caller has no opinion about which device holds it
+  // — bulk-loading weights, rather than computing them. The set's primary,
+  // which is the whole answer while nothing above states a residency.
+  [[nodiscard]] backend::IBackend& backend() const noexcept {
+    return devices_.device(devices_.primary());
+  }
+  [[nodiscard]] backend::IDeviceSet& devices() const noexcept {
+    return devices_;
+  }
 
  private:
-  backend::IBackend& backend_;
+  // Declared before devices_ so it is built before the reference to it is
+  // bound: the single-backend constructor makes the set it hands itself.
+  std::unique_ptr<backend::SingleDevice> own_set_;
+  backend::IDeviceSet& devices_;
   Mode mode_ = Mode::kDeviceFirst;
   FallbackChain* fallbacks_ = nullptr;
   Trace trace_;
@@ -352,6 +379,16 @@ class Scheduler {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// The device set default_scheduler() binds.
+//
+// A function pointer rather than a call into the layer that owns device
+// lifetimes: that layer (lse::place) sits ABOVE this one and registers itself
+// here at static-initialization time, so a binary that links it gets the whole
+// set and one that does not gets the single-device fallback below. Registering
+// twice keeps the first.
+using DeviceSetFactory = backend::IDeviceSet* (*)();
+void register_device_set_factory(DeviceSetFactory factory);
 
 // null when no backend could be created or initialized.
 Scheduler* default_scheduler();

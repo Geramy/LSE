@@ -193,51 +193,110 @@ struct JitCache::Impl {
     std::uint64_t source_hash = 0;
     std::string arch;
   };
-  std::unordered_map<std::uint64_t, Slot> memory;
+  // One map per member. A KernelHandle is an executable loaded on ONE device;
+  // handing member B the handle member A loaded is a wrong-device dispatch that
+  // no runtime here reports, and two same-arch devices would otherwise share
+  // the entry because the disk key is deliberately the same for them.
+  std::vector<std::unordered_map<std::uint64_t, Slot>> memory;
 };
+
+JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
+    : devices_(devices),
+      cache_dir_(std::move(cache_dir)),
+      impl_(std::make_unique<Impl>()) {
+  impl_->memory.resize(devices_.size());
+  compiler_id_.resize(devices_.size(), 0);
+  for (std::size_t i = 0; i < devices_.size(); ++i) {
+    const IKernelCompiler* cc = devices_.device(i).compiler();
+    compiler_id_[i] = cc != nullptr ? fnv(cc->identity()) : 0;
+  }
+  purge_kernel_artifacts();
+}
 
 JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
                    std::string cache_dir)
-    : backend_(backend),
-      compiler_(compiler),
-      compiler_id_(fnv(compiler.identity())),
+    : own_set_(std::make_unique<backend::SingleDevice>(backend)),
+      devices_(*own_set_),
+      named_compiler_(&compiler),
       cache_dir_(std::move(cache_dir)),
       impl_(std::make_unique<Impl>()) {
+  compiler_id_.push_back(fnv(compiler.identity()));
+  impl_->memory.resize(1);
   purge_kernel_artifacts();
 }
 
 JitCache::~JitCache() = default;
 
-std::uint64_t JitCache::slot_key(std::uint64_t signature) const noexcept {
+const IKernelCompiler* JitCache::compiler_for(
+    std::size_t member) const noexcept {
+  if (named_compiler_ != nullptr) return named_compiler_;
+  return devices_.device(member).compiler();
+}
+
+std::uint64_t JitCache::slot_key(std::size_t member,
+                                 std::uint64_t signature) const noexcept {
   // A cached object is only valid for the toolchain that built it, and
   // source_hash cannot tell two toolchains apart. The compiler reports its own
   // identity (version + option lists) rather than a human bumping a revision
   // constant here, which was one forgotten increment away from serving an
   // object built by a different pipeline.
   // Arch in the key so a device change cannot reuse another target's object.
-  return mix(mix(signature, compiler_id_),
-             fnv(backend_.device_info().arch));
+  const backend::DeviceInfo& info = devices_.device(member).device_info();
+  std::uint64_t h = mix(mix(signature, compiler_id_[member]), fnv(info.arch));
+  // Arch is NOT enough between two devices of the same ISA. The emitter chooses
+  // workgroup dimensions, an LDS budget and a persistent-grid decision from the
+  // CU count, the LDS pool and the workgroup ceiling, so two gfx1151 parts with
+  // different geometry are handed different source under one arch string. Left
+  // out, they collide on one key: the source-hash guard then forces a recompile
+  // per alternation AND each device deletes the other's object as dead — a
+  // ~350 ms stall per kernel per switch, on a key that looked like a hit.
+  //
+  // Deliberately NOT the device's identity. Two members with the same geometry
+  // emit byte-identical source and must share the object; keying on which
+  // device asked would compile it once per device for nothing.
+  h = mix(h, static_cast<std::uint64_t>(info.compute_units));
+  h = mix(h, static_cast<std::uint64_t>(info.lds_bytes_per_workgroup));
+  h = mix(h, static_cast<std::uint64_t>(info.max_threads_per_workgroup));
+  h = mix(h, static_cast<std::uint64_t>(info.wavefront_size));
+  h = mix(h, static_cast<std::uint64_t>(info.cus_per_lds_pool));
+  return h;
 }
 
-const backend::KernelHandle* JitCache::try_get(
-    std::uint64_t signature) noexcept {
-  const auto it = impl_->memory.find(slot_key(signature));
-  if (it == impl_->memory.end()) return nullptr;
-  if (it->second.arch != backend_.device_info().arch) return nullptr;
+const backend::KernelHandle* JitCache::try_get(std::size_t member,
+                                               std::uint64_t signature) noexcept {
+  if (member >= impl_->memory.size()) return nullptr;
+  auto& slots = impl_->memory[member];
+  const auto it = slots.find(slot_key(member, signature));
+  if (it == slots.end()) return nullptr;
+  if (it->second.arch != devices_.device(member).device_info().arch) {
+    return nullptr;
+  }
   ++stats_.memory_hits;
   return &it->second.handle;
 }
 
 Result<backend::KernelHandle> JitCache::get_or_compile(
-    std::uint64_t signature, const EmittedKernel& emitted) {
-  const std::string arch(backend_.device_info().arch);
-  const std::uint64_t key = slot_key(signature);
+    std::size_t member, std::uint64_t signature, const EmittedKernel& emitted) {
+  if (member >= impl_->memory.size()) {
+    return LSE_ERROR(kOutOfRange, "device set has ",
+                     std::to_string(impl_->memory.size()),
+                     " members; there is no member ", std::to_string(member));
+  }
+  backend::IBackend& be = devices_.device(member);
+  const IKernelCompiler* compiler = compiler_for(member);
+  if (compiler == nullptr) {
+    return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
+                     "' has no kernel compiler");
+  }
+  auto& slots = impl_->memory[member];
+  const std::string arch(be.device_info().arch);
+  const std::uint64_t key = slot_key(member, signature);
   const std::uint64_t src_hash =
       emitted.source.empty() ? 0 : fnv(emitted.source);
 
   dump_hip_source(emitted, key);
 
-  if (const auto it = impl_->memory.find(key); it != impl_->memory.end()) {
+  if (const auto it = slots.find(key); it != slots.end()) {
     const Impl::Slot& slot = it->second;
     if (slot.arch == arch &&
         (src_hash == 0 || src_hash == slot.source_hash)) {
@@ -276,7 +335,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
                        "no cached kernel for this device and no source to compile");
     }
     const auto begin = std::chrono::steady_clock::now();
-    auto compiled = compiler_.compile(emitted.source, arch);
+    auto compiled = compiler->compile(emitted.source, arch);
     if (!compiled.ok()) return compiled.status();
     code = compiled.release();
     stats_.compile_ns += static_cast<std::uint64_t>(
@@ -304,14 +363,14 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     write_meta(meta_path, DiskMeta{arch, src_hash, emitted.entry_name});
   }
 
-  auto handle = backend_.load_executable(
+  auto handle = be.load_executable(
       emitted.entry_name.empty() && meta_ok ? meta.entry : emitted.entry_name,
       code);
   if (!handle.ok()) return handle.status();
   backend::KernelHandle kernel = handle.release();
   const std::uint64_t stored_hash =
       src_hash != 0 ? src_hash : (meta_ok ? meta.source_hash : 0);
-  impl_->memory[key] = Impl::Slot{kernel, stored_hash, arch};
+  slots[key] = Impl::Slot{kernel, stored_hash, arch};
   return kernel;
 }
 

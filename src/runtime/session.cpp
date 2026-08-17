@@ -23,8 +23,27 @@ std::size_t Session::cache_bytes() const noexcept {
   std::size_t total = 0;
   for (const model::MixerState& s : states_) {
     total += array_bytes(s.gdn_state);
-    total += array_bytes(s.key_cache);
-    total += array_bytes(s.value_cache);
+    // The conv tails are live device tensors too. Leaving them out under-reported
+    // the cache by 0.26-5.6 MiB per session depending on the model, which is the
+    // accounting a block budget would have inherited.
+    total += array_bytes(s.gdn_conv_q);
+    total += array_bytes(s.gdn_conv_k);
+    total += array_bytes(s.gdn_conv_v);
+    total += array_bytes(s.gdn_conv_qkv);
+    // Paged: what the pools actually hold, which is a rung above the blocks in
+    // use, not the engine capacity. This is the number paging moves.
+    total += s.paged.pool_bytes();
+    total += array_bytes(s.paged.table);
+  }
+  return total;
+}
+
+std::size_t Session::kv_blocks() const noexcept {
+  std::size_t total = 0;
+  for (const model::MixerState& s : states_) {
+    for (const kv::BlockTable& t : s.paged.tables) {
+      total += static_cast<std::size_t>(t.size());
+    }
   }
   return total;
 }

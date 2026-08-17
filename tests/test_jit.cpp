@@ -1005,6 +1005,74 @@ struct CacheStubBackend final : backend::IBackend {
   const IKernelCompiler* compiler() const noexcept override { return nullptr; }
 };
 
+// One member of a device set: its own geometry, its own executables. The
+// executable id is per instance so a test can tell which device a handle was
+// loaded on, which is the thing a shared cache must never get wrong.
+struct SetStubBackend final : backend::IBackend {
+  backend::DeviceInfo info;
+  const IKernelCompiler* cc = nullptr;
+  std::uint64_t exec_id = 1;
+
+  SetStubBackend(std::uint64_t id, const IKernelCompiler* compiler)
+      : cc(compiler), exec_id(id) {
+    info.arch = "gfx1151";
+    info.name = "stub";
+    info.compute_units = 40;
+    info.lds_bytes_per_workgroup = 65536;
+    info.max_threads_per_workgroup = 1024;
+    info.wavefront_size = 32;
+  }
+  Status init(int) override { return OkStatus(); }
+  void shutdown() noexcept override {}
+  const backend::DeviceInfo& device_info() const noexcept override {
+    return info;
+  }
+  Result<backend::DeviceBuffer> allocate(std::size_t,
+                                         backend::MemoryClass) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  void deallocate(backend::DeviceBuffer&) noexcept override {}
+  Status copy_h2d(const void*, backend::DeviceBuffer&, std::size_t,
+                  std::size_t) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status copy_d2h(const backend::DeviceBuffer&, void*, std::size_t,
+                  std::size_t) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Result<backend::KernelHandle> load_executable(
+      std::string_view name, std::span<const std::byte>) override {
+    backend::KernelHandle h;
+    h.executable = exec_id;
+    h.name = std::string(name);
+    return h;
+  }
+  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
+                const backend::DispatchArgs&,
+                const backend::DispatchTarget&) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status synchronize() override { return OkStatus(); }
+  std::string_view name() const noexcept override { return "stub"; }
+  const IKernelEmitter* emitter() const noexcept override { return nullptr; }
+  const IKernelCompiler* compiler() const noexcept override { return cc; }
+};
+
+struct StubSet final : backend::IDeviceSet {
+  std::vector<backend::IBackend*> members;
+  std::size_t size() const noexcept override { return members.size(); }
+  backend::IBackend& device(std::size_t i) const override {
+    return *members[i];
+  }
+  std::size_t primary() const noexcept override { return 0; }
+  std::size_t member_of(backend::DeviceIndex) const noexcept override {
+    return members.size();
+  }
+  Status may_read(backend::DeviceIndex, std::size_t) const override {
+    return OkStatus();
+  }
+};
+
 struct CountingCompiler final : IKernelCompiler {
   mutable int n = 0;
   Result<std::vector<std::byte>> compile(std::string_view,
@@ -1033,18 +1101,18 @@ LSE_TEST(jit_compiles_only_on_miss_source_change_or_device_change) {
 
   {
     JitCache cache(be, cc, dir.string());
-    auto a = cache.get_or_compile(sig, ek);
+    auto a = cache.get_or_compile(0, sig, ek);
     LSE_EXPECT(a.ok());
     LSE_EXPECT_EQ(cc.n, 1);
-    auto b = cache.get_or_compile(sig, ek);
+    auto b = cache.get_or_compile(0, sig, ek);
     LSE_EXPECT(b.ok());
     LSE_EXPECT_EQ(cc.n, 1);
     LSE_EXPECT(cache.stats().memory_hits >= 1u);
-    LSE_EXPECT(cache.try_get(sig) != nullptr);
+    LSE_EXPECT(cache.try_get(0, sig) != nullptr);
   }
   {
     JitCache cache(be, cc, dir.string());
-    auto c = cache.get_or_compile(sig, ek);
+    auto c = cache.get_or_compile(0, sig, ek);
     LSE_EXPECT(c.ok());
     LSE_EXPECT_EQ(cc.n, 1);
     LSE_EXPECT(cache.stats().disk_hits >= 1u);
@@ -1052,7 +1120,7 @@ LSE_TEST(jit_compiles_only_on_miss_source_change_or_device_change) {
   {
     JitCache cache(be, cc, dir.string());
     ek.source = "kernel v2 { }";
-    auto d = cache.get_or_compile(sig, ek);
+    auto d = cache.get_or_compile(0, sig, ek);
     LSE_EXPECT(d.ok());
     LSE_EXPECT_EQ(cc.n, 2);
   }
@@ -1060,10 +1128,105 @@ LSE_TEST(jit_compiles_only_on_miss_source_change_or_device_change) {
     ek.source = "kernel v2 { }";
     be.info.arch = "gfx1201";
     JitCache cache(be, cc, dir.string());
-    auto e = cache.get_or_compile(sig, ek);
+    auto e = cache.get_or_compile(0, sig, ek);
     LSE_EXPECT(e.ok());
     LSE_EXPECT_EQ(cc.n, 3);
   }
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+LSE_TEST(one_cache_serves_two_devices_without_mixing_their_executables) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+                       ("lse-jit-set-" + std::to_string(::getpid()));
+  std::error_code pre;
+  fs::remove_all(dir, pre);
+  fs::create_directories(dir);
+
+  CountingCompiler cc;
+  SetStubBackend a(0xAA, &cc);
+  SetStubBackend b(0xBB, &cc);
+  StubSet set;
+  set.members = {&a, &b};
+
+  EmittedKernel ek;
+  ek.source = "kernel same { }";
+  ek.entry_name = "k";
+  const std::uint64_t sig = 7;
+
+  JitCache cache(set, dir.string());
+
+  auto first = cache.get_or_compile(0, sig, ek);
+  LSE_EXPECT_OK(first.status());
+  LSE_EXPECT_EQ(cc.n, 1);
+  LSE_EXPECT_EQ(first->executable, std::uint64_t{0xAA});
+
+  // Same arch, same geometry: the source is byte-identical, so the OBJECT is
+  // shared and compiling it twice would be ~350 ms spent on bytes already on
+  // disk. What is not shared is the loaded executable.
+  auto second = cache.get_or_compile(1, sig, ek);
+  LSE_EXPECT_OK(second.status());
+  LSE_EXPECT_EQ(cc.n, 1);
+  LSE_EXPECT_EQ(second->executable, std::uint64_t{0xBB});
+  LSE_EXPECT(cache.stats().disk_hits >= 1u);
+
+  // A live handle belongs to the device it was loaded on. Serving member 1 the
+  // handle member 0 loaded is a wrong-device dispatch no runtime reports.
+  const backend::KernelHandle* on_a = cache.try_get(0, sig);
+  const backend::KernelHandle* on_b = cache.try_get(1, sig);
+  LSE_EXPECT(on_a != nullptr && on_b != nullptr);
+  if (on_a != nullptr && on_b != nullptr) {
+    LSE_EXPECT_EQ(on_a->executable, std::uint64_t{0xAA});
+    LSE_EXPECT_EQ(on_b->executable, std::uint64_t{0xBB});
+  }
+  LSE_EXPECT(cache.try_get(2, sig) == nullptr);
+  LSE_EXPECT(!cache.get_or_compile(2, sig, ek).ok());
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+LSE_TEST(two_same_arch_devices_with_different_geometry_do_not_collide) {
+  // Arch is not enough between two parts of one ISA: the emitter picks
+  // workgroup dimensions and an LDS budget from the CU count and the LDS pool,
+  // so the same signature is handed different source on each. Sharing a key
+  // made the source-hash guard force a recompile per alternation AND each
+  // device delete the other's object as dead.
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+                       ("lse-jit-geom-" + std::to_string(::getpid()));
+  std::error_code pre;
+  fs::remove_all(dir, pre);
+  fs::create_directories(dir);
+
+  CountingCompiler cc;
+  SetStubBackend wide(0xAA, &cc);
+  SetStubBackend narrow(0xBB, &cc);
+  narrow.info.compute_units = 20;   // same gfx1151 string, half the CUs
+  StubSet set;
+  set.members = {&wide, &narrow};
+
+  EmittedKernel wide_src;
+  wide_src.source = "kernel tuned_for_40_cu { }";
+  wide_src.entry_name = "k";
+  EmittedKernel narrow_src;
+  narrow_src.source = "kernel tuned_for_20_cu { }";
+  narrow_src.entry_name = "k";
+  const std::uint64_t sig = 11;
+
+  JitCache cache(set, dir.string());
+  LSE_EXPECT_OK(cache.get_or_compile(0, sig, wide_src).status());
+  LSE_EXPECT_EQ(cc.n, 1);
+  LSE_EXPECT_OK(cache.get_or_compile(1, sig, narrow_src).status());
+  LSE_EXPECT_EQ(cc.n, 2);
+
+  // And back again: two live entries, not one that keeps being rebuilt.
+  LSE_EXPECT_OK(cache.get_or_compile(0, sig, wide_src).status());
+  LSE_EXPECT_EQ(cc.n, 2);
+  LSE_EXPECT_OK(cache.get_or_compile(1, sig, narrow_src).status());
+  LSE_EXPECT_EQ(cc.n, 2);
 
   std::error_code ec;
   fs::remove_all(dir, ec);
@@ -1085,7 +1248,7 @@ LSE_TEST(debug_writes_generated_hip_for_review) {
   ek.source = "extern \"C\" __global__ void lemonseed() {}";
   ek.entry_name = "lemonseed";
   JitCache jit(be, cc, cache.string());
-  LSE_EXPECT(jit.get_or_compile(1, ek).ok());
+  LSE_EXPECT(jit.get_or_compile(0, 1, ek).ok());
 
   const fs::path hip = dump / "lemonseed.hip";
   LSE_EXPECT(fs::exists(hip));

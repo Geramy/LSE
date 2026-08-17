@@ -2068,4 +2068,50 @@ LSE_TEST(a_group_affine_weight_picks_its_own_contraction) {
   LSE_EXPECT(linear(x, packed).node()->kind == OpKind::kQuantMatMul);
 }
 
+LSE_TEST(a_scheduler_holds_a_device_set_and_stamps_what_it_evaluates) {
+  Scheduler* sched = default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+
+  // The set is the scheduler's device vocabulary now. One member is the whole
+  // set on this box; what matters is that it IS a set and that the primary is
+  // the backend everything used to reach directly.
+  backend::IDeviceSet& set = sched->devices();
+  LSE_EXPECT(set.size() >= 1);
+  LSE_EXPECT(set.primary() < set.size());
+  LSE_EXPECT(&set.device(set.primary()) == &sched->backend());
+
+  Array a = host_array({1.0f, 2.0f, 3.0f, 4.0f}, Shape{4});
+  Array b = host_array({10.0f, 20.0f, 30.0f, 40.0f}, Shape{4});
+  Array c = add(a, b);
+  LSE_EXPECT_OK(c.materialize());
+
+  // Every buffer the evaluation allocated names the device that allocated it,
+  // which is what makes "may this kernel read these bytes" answerable at all.
+  const backend::DeviceIndex primary = set.residency(set.primary());
+  LSE_EXPECT(c.node()->buffer.valid());
+  if (primary.bound()) {
+    LSE_EXPECT(c.node()->buffer.residency == primary);
+    LSE_EXPECT_EQ(set.member_of(c.node()->buffer.residency), set.primary());
+  }
+  LSE_EXPECT_OK(set.may_read(c.node()->buffer.residency, set.primary()));
+
+  const std::vector<float> out = drain(c);
+  LSE_EXPECT_EQ(out.size(), std::size_t{4});
+  LSE_EXPECT_NEAR(out[0], 11.0f, 1e-6);
+  LSE_EXPECT_NEAR(out[3], 44.0f, 1e-6);
+}
+
+LSE_TEST(a_scheduler_over_a_bare_backend_is_the_set_that_backend_is) {
+  auto be = backend::create_backend("cpu");
+  LSE_EXPECT(be.ok());
+  if (!be.ok()) return;
+  LSE_EXPECT_OK((*be)->init(0));
+
+  Scheduler sched(**be);
+  LSE_EXPECT_EQ(sched.devices().size(), std::size_t{1});
+  LSE_EXPECT(&sched.backend() == be->get());
+  LSE_EXPECT(sched.devices().residency(0) == (*be)->device_index());
+}
+
 LSE_TEST_MAIN()

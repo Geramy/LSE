@@ -11,9 +11,12 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "lse/graph/graph.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/kv/allocator.hpp"
+#include "lse/kv/block.hpp"
 #include "lse/ops/rope.hpp"
 
 namespace lse::ops {
@@ -42,8 +45,8 @@ struct GatedAttentionSpec {
   std::int32_t window = 0;
   float norm_eps = 1e-6f;
   bool zero_centered_norm = true;
-  // Tokens the KV tensors are allocated for. 0 keeps the old growing-concat
-  // path, used only by tests that build a cache by hand.
+  // Tokens a sequence may reach. 0 keeps the growing-concat path, used only by
+  // tests that build a cache by hand.
   std::int32_t kv_length = 0;
 };
 
@@ -53,21 +56,76 @@ struct GatedAttentionWeights {
   Array q_norm, k_norm;
 };
 
-// Keys and values for the positions already seen, [B, kv_heads, T, head_dim].
-// When `capacity` > 0 the tensors are allocated at that T once and new columns
-// overwrite at `used`; otherwise decode concats and T grows every step.
+// The paged state of one attention layer: two block pools plus the block lists
+// that say which of their blocks hold which positions.
+//
+// `keys`/`values` are [blocks, kv_heads, kv::kBlockSize, head_dim]. A sequence
+// does not own a contiguous span of them — `tables[r]` is row r's ordered block
+// list, `alloc` hands blocks out and refcounts them, and the kernels read the
+// device image in `table` to turn a position into (block, slot).
+//
+// Lives in model::MixerState, one per attention layer per sequence set. Every
+// attention layer covers the same positions, so the tables agree layer to layer
+// even though the pools do not.
+struct PagedKvLayer {
+  Array keys;
+  Array values;
+  // [rows, stride] block ids as f32; `stride` is fixed at the engine capacity
+  // in blocks so it is a literal in the generated address arithmetic and never
+  // varies with how many blocks a sequence currently holds.
+  Array table;
+  kv::BlockAllocator alloc;
+  std::vector<kv::BlockTable> tables;
+  // `table` has not been re-uploaded since `tables` last changed.
+  bool table_dirty = true;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return keys.valid() && values.valid() && table.valid();
+  }
+  [[nodiscard]] std::int32_t stride() const noexcept {
+    return table.valid()
+               ? static_cast<std::int32_t>(table.shape().dim(table.shape().rank() - 1))
+               : 0;
+  }
+  // Bytes of device pool actually allocated. This is the number paging exists
+  // to move: a contiguous cache reserves capacity for every sequence whether it
+  // reaches it or not.
+  [[nodiscard]] std::size_t pool_bytes() const noexcept;
+};
+
+// What an attention call needs to reach its cache. `keys`/`values`/`table` are
+// copies of the layer's Arrays (the graph replaces them with the nodes that
+// write them, which the caller stores back); the paging bookkeeping is borrowed
+// so there is one allocator per layer, not one per call.
+//
+// With `capacity` == 0 and no `paged` this is the old growing-concat path, kept
+// for tests that build a cache by hand.
 struct AttentionCache {
   Array keys;
   Array values;
-  Array pos;
+  Array table;
+  // Per-step descriptor, f32 [3] = {first query position, live KV length, real
+  // rows}. One slot for the whole model; see model::HybridLM.
+  Array meta;
+  PagedKvLayer* paged = nullptr;
   std::int64_t capacity = 0;
   std::int32_t used = 0;
-
-  [[nodiscard]] std::int64_t length() const noexcept {
-    if (capacity > 0) return used;
-    return keys.valid() ? keys.shape().dim(2) : 0;
-  }
 };
+
+// Tops the block lists up to cover `tokens` positions on every row and
+// re-uploads the device table if it changed. Returns false when the pool has to
+// move to a bigger rung, which a retained program cannot absorb: the pool
+// buffer changes identity, so the caller must rebuild the graph.
+//
+// Separate from gated_attention because the decode fast path replays a held
+// program and never re-records the layer, yet still crosses a block boundary
+// every kv::kBlockSize tokens.
+Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens);
+
+// The pool rung `tokens` positions on `rows` rows needs, in blocks.
+[[nodiscard]] std::int32_t paged_pool_blocks(std::int32_t tokens,
+                                             std::int32_t rows,
+                                             std::int32_t capacity) noexcept;
 
 // `rope` may rotate fewer channels than head_dim; apply_rope passes the rest
 // through, which is what a partial_rotary_factor < 1 needs.
