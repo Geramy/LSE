@@ -10,14 +10,16 @@
 // low-latency dispatch path that is the whole reason to be on HRX.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "lse/backend/backend.hpp"
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/comgr_compiler.hpp"
-#include "lse/backends/hrx/hip_emitter.hpp"
+#include "lse/backends/hrx/hipc/comgr_compiler.hpp"
+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
 
 namespace lse::backend {
 
@@ -72,9 +74,8 @@ class HrxBackend : public Backend<HrxBackend> {
   Status wait_event_impl(Stream stream, const StreamEvent& event);
   Status synchronize_stream_impl(Stream stream);
 
-  const graph::IKernelEmitter* emitter_impl() const noexcept { return &emitter_; }
-  const graph::IKernelCompiler* compiler_impl() const noexcept {
-    return &compiler_;
+  std::span<const graph::KernelToolchain> toolchains_impl() const noexcept {
+    return toolchains_;
   }
 
   // True when this build actually linked libhrx. When false the backend
@@ -88,6 +89,12 @@ class HrxBackend : public Backend<HrxBackend> {
   AmdDeviceInfo amd_{};
   HipEmitter emitter_;
   ComgrCompiler compiler_;
+  // Declared, not derived: a second dialect is one more entry, and the first
+  // entry is what a caller with no dialect opinion gets. Points into this
+  // object, which is why the backend is constructed in place and never moved —
+  // the same reason DeviceInfo::extension can point at amd_.
+  std::array<graph::KernelToolchain, 1> toolchains_{
+      graph::KernelToolchain{graph::Dialect::kHip, &emitter_, &compiler_}};
   void* device_ = nullptr;    // hrx_device_t
   void* allocator_ = nullptr; // hrx_allocator_t (borrowed)
   bool initialized_ = false;

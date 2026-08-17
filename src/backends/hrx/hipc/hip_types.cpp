@@ -1,7 +1,7 @@
 // The type half of what a backend must supply. Ordered by Scalar so the entry
 // for a type is found by indexing, and so adding an element type without a HIP
 // spelling fails to compile rather than falling through to a default.
-#include "lse/backends/hrx/hip_types.hpp"
+#include "lse/backends/hrx/hipc/hip_types.hpp"
 #include "lse/core/reflect.hpp"
 
 #include <array>

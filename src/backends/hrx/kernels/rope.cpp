@@ -1,6 +1,7 @@
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/kv/block.hpp"
 
 #include <string>
 
@@ -38,6 +39,20 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
     const auto baked_off = static_cast<std::uint32_t>(s.iattrs[0]);
     const bool live_off = s.inputs.size() >= 4;
     if (dim < 2 || seq == 0) return {};
+    // Rows per batch entry: [B, H, T, D] flattens to B*H*T rows of D, so a
+    // thread's batch entry is its row over H*T.
+    const auto batch = static_cast<std::uint32_t>(x.dim(0));
+    const auto rows_total = static_cast<std::uint32_t>(x.elem_count()) / dim;
+    if (batch == 0 || rows_total % batch != 0) return {};
+    const auto rows_per_batch = rows_total / batch;
+    // A batched pass hands RoPE the step descriptor, not a lone offset: rows
+    // sit at different absolute positions, and one shared angle would rotate
+    // every row but one to somebody else's position. A 1-element input is the
+    // single-sequence form and stays exactly that.
+    const bool ragged =
+        live_off && s.inputs[3].elem_count() >=
+                        static_cast<std::size_t>(kv::step_meta_elems(
+                            static_cast<std::int32_t>(batch)));
 
     kir::KernelBody k(s.types, *s.intrinsics);
     RopeArgs<env::Emit> a;
@@ -47,7 +62,12 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
     const auto d = e.let(i % dim);
     const auto r = e.let(i / dim);
     kir::Val<kir::u32> offset = e.u32(baked_off);
-    if (live_off) {
+    if (ragged) {
+      const auto b = e.let(r / rows_per_batch);
+      offset = e.let(kir::cast<kir::u32>(
+          a.off[e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
+                b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow))]));
+    } else if (live_off) {
       offset = e.let(kir::cast<kir::u32>(a.off[0u]));
     }
     const auto t = e.let(offset + (r % seq));

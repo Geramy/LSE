@@ -6,7 +6,7 @@
 #include <string_view>
 #include <unordered_map>
 
-#include "lse/backends/hrx/hip_sources.hpp"
+#include "lse/backends/hrx/hipc/hip_sources.hpp"
 #include "lse/graph/codegen.hpp"
 
 namespace lse::graph {

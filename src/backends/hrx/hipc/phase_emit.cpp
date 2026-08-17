@@ -1,7 +1,7 @@
-#include "lse/backends/hrx/hip_emitter.hpp"
+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
 
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/hip_types.hpp"
+#include "lse/backends/hrx/hipc/hip_types.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"

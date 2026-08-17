@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -446,28 +447,39 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
 // RESOURCE_EXHAUSTED on the way back up, so an early teardown would buy a tidy
 // exit at the price of a process that can never bind a device again — which is
 // exactly what enumerating devices before binding one would otherwise cause.
-Status accelerator_up() {
-  struct Owner {
-    bool up = false;
-    ~Owner() {
-      if (up) hrx_status_ignore(hrx_gpu_shutdown());
+std::atomic<bool> g_accelerator_up{false};
+
+// Registered during this translation unit's dynamic initialization — before
+// main, and so before any object that can own a backend exists. Exit handlers
+// run in reverse registration order, which is what puts the global teardown
+// AFTER the last HrxBackend has released its streams and device.
+//
+// Registering it lazily on first bring-up does NOT achieve that, however early
+// the bring-up is: the first one happens from inside whatever owns the backends
+// (place::Devices, a Scheduler, a test fixture), whose own handler is therefore
+// registered first and runs last — leaving hrx_gpu_shutdown to run while those
+// backends are still holding streams and a device reference.
+[[maybe_unused]] const bool kTeardownRegistered = [] {
+  std::atexit([] {
+    if (g_accelerator_up.load(std::memory_order_acquire)) {
+      hrx_status_ignore(hrx_gpu_shutdown());
     }
-  };
-  // Constructed on the first bring-up, i.e. before any backend finishes
-  // initialising, so its destructor is registered first and therefore runs
-  // last — after every instance has released its streams, buffers and device.
-  static Owner owner;
+  });
+  return true;
+}();
+
+Status accelerator_up() {
   static std::mutex mu;
   const std::lock_guard lock(mu);
-  if (owner.up) return OkStatus();
+  if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
   const hrx_status_t status = hrx_gpu_initialize(0);
   if (hrx_status_is_ok(status)) {
-    owner.up = true;
+    g_accelerator_up.store(true, std::memory_order_release);
     return OkStatus();
   }
   if (hrx_status_code(status) == HRX_STATUS_ALREADY_EXISTS) {
     hrx_status_ignore(status);
-    owner.up = true;
+    g_accelerator_up.store(true, std::memory_order_release);
     return OkStatus();
   }
   return from_hrx(status, "hrx_gpu_initialize");

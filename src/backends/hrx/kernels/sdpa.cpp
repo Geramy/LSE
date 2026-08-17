@@ -1,6 +1,7 @@
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/kv/block.hpp"
 #include "lse/math.hpp"
 
 #include <string>
@@ -38,7 +39,8 @@ struct SdpaArgs {
   env::In<kir::f32, E> k;
   env::In<kir::f32, E> v;
   // Optional 4th input. Contiguous form: [1], the live cache offset. Paged
-  // form: [3] = {first query position, live KV length, real rows}.
+  // form: the step descriptor, kv::step_meta_elems(rows) floats — see
+  // kv/block.hpp.
   env::In<kir::f32, E> meta;
   // Optional 5th input, paged form only: [rows, stride] block ids.
   env::In<kir::f32, E> table;
@@ -95,11 +97,19 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     const auto baked_off = static_cast<std::uint32_t>(s.iattrs[2]);
     const bool live_off = s.inputs.size() >= 4;
     const bool paged = s.inputs.size() == 5;
-    (void)bsz;
 
     std::uint32_t stride = 0;
     if (paged) {
       if (s.inputs[4].rank() < 2) return {};
+      // The descriptor carries a pair per row of this pass. A narrower one is a
+      // caller that built it for a different batch, which would silently read
+      // another row's position, so it is a mismatch rather than a shape to
+      // adapt to.
+      if (s.inputs[3].elem_count() <
+          static_cast<std::size_t>(
+              kv::step_meta_elems(static_cast<std::int32_t>(bsz)))) {
+        return {};
+      }
       stride = static_cast<std::uint32_t>(s.inputs[4].dim(s.inputs[4].rank() - 1));
       const auto want = static_cast<std::uint32_t>(s.iattrs[3]);
       // The pool's own third dimension is the authority on the block size; a
@@ -122,12 +132,28 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     const auto h = e.let((i / (dv * tq)) % qh);
     const auto b = e.let(i / (dv * tq * qh));
     const auto kh = e.let(h / group);
+    const auto qb0 = e.let(((b * qh + h) * tq + qi) * dh);
+
+    // Where this row's queries sit and how much KV is behind them.
+    //
+    // Paged: the row's own pair out of the step descriptor. A batch is a set of
+    // sequences at different absolute positions, so one shared offset would put
+    // the causal mask and the softmax bound of every row but one somewhere
+    // else. Both values are ordinary loads reaching only guards.
+    //
+    // Contiguous: one offset for the pass, which is all a single sequence has.
     kir::Val<kir::u32> offset = e.u32(baked_off);
-    if (live_off) {
+    kir::Val<kir::u32> row_len = e.u32(0);
+    if (paged) {
+      const auto mb =
+          e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
+                b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
+      offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
+      row_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    } else if (live_off) {
       offset = e.let(kir::cast<kir::u32>(a.meta[0u]));
     }
     const auto abs_i = e.let(offset + qi);
-    const auto qb0 = e.let(((b * qh + h) * tq + qi) * dh);
 
     if (!paged) {
       const auto used = e.let(offset + tq);
@@ -186,36 +212,44 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     const auto rows = e.runtime_extent("rows", dispatch_u32(k, s.types, 3, 2));
     if (auto pad = e.when(b >= rows)) e.ret(e.f32(0.0f));
 
-    // The live KV length. One code object serves every sequence length: this is
-    // the softmax trip count and nothing else, and an outermost trip count is
-    // exactly where ExtentBinding::kRuntime is legal.
+    // The longest live KV in the pass. One code object serves every sequence
+    // length: this is the block loop's trip count and nothing else, and an
+    // outermost trip count is exactly where ExtentBinding::kRuntime is legal.
+    // Raggedness rides underneath it in `row_len`, which is a guard.
     const auto kv_len = e.runtime_extent("kv_len", dispatch_u32(k, s.types, 3, 1));
     const auto nblk = e.let((kv_len + e.u32(ts - 1)) / e.u32(ts));
+    // Blocks this row actually holds. A row shorter than the longest one spends
+    // the remaining iterations on one compare — it loads no table entry and
+    // touches no key — so its accumulator sees the same terms in the same order
+    // it would have seen decoding alone.
+    const auto row_blk = e.let((row_len + e.u32(ts - 1)) / e.u32(ts));
     const auto tb = e.let(b * stride);
 
     const auto m = e.var(math::neg_inf());
     for (auto bi : e.range(nblk)) {
-      // One table read per block, not per key: the whole reason a block is 16
-      // positions wide is that this load amortizes over them.
-      const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
-      const auto kb0 = e.let(((blk * kvh + kh) * ts) * dh);
-      const auto j0 = e.let(bi * e.u32(ts));
-      for (auto jj : e.range(ts)) {
-        const auto j = e.let(j0 + jj);
-        if (auto live = e.when(j < kv_len)) {
-          auto score = e.var(0.0f);
-          for (auto dd : e.range(dh)) {
-            score = math::fma(a.q[qb0 + dd], a.k[kb0 + jj * dh + dd],
-                              score.read());
-          }
-          score = score.read() * scale;
-          auto take = [&] { m = math::max(m.read(), score.read()); };
-          if (mask == 0) {
-            take();
-          } else if (mask == 1) {
-            if (auto g = e.when(j <= abs_i)) take();
-          } else {
-            if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
+      if (auto mine = e.when(bi < row_blk)) {
+        // One table read per block, not per key: the whole reason a block is 16
+        // positions wide is that this load amortizes over them.
+        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
+        const auto kb0 = e.let(((blk * kvh + kh) * ts) * dh);
+        const auto j0 = e.let(bi * e.u32(ts));
+        for (auto jj : e.range(ts)) {
+          const auto j = e.let(j0 + jj);
+          if (auto live = e.when(j < row_len)) {
+            auto score = e.var(0.0f);
+            for (auto dd : e.range(dh)) {
+              score = math::fma(a.q[qb0 + dd], a.k[kb0 + jj * dh + dd],
+                                score.read());
+            }
+            score = score.read() * scale;
+            auto take = [&] { m = math::max(m.read(), score.read()); };
+            if (mask == 0) {
+              take();
+            } else if (mask == 1) {
+              if (auto g = e.when(j <= abs_i)) take();
+            } else {
+              if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
+            }
           }
         }
       }
@@ -224,33 +258,38 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     auto denom = e.var(0.0f);
     auto acc = e.var(0.0f);
     for (auto bi : e.range(nblk)) {
-      const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
-      const auto kb0 = e.let(((blk * kvh + kh) * ts) * dh);
-      const auto vb0 = e.let(((blk * kvh + kh) * ts) * dv + d);
-      const auto j0 = e.let(bi * e.u32(ts));
-      for (auto jj : e.range(ts)) {
-        const auto j = e.let(j0 + jj);
-        if (auto live = e.when(j < kv_len)) {
-          auto score = e.var(0.0f);
-          for (auto dd : e.range(dh)) {
-            score = math::fma(a.q[qb0 + dd], a.k[kb0 + jj * dh + dd],
-                              score.read());
+      if (auto mine = e.when(bi < row_blk)) {
+        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
+        const auto kb0 = e.let(((blk * kvh + kh) * ts) * dh);
+        const auto vb0 = e.let(((blk * kvh + kh) * ts) * dv + d);
+        const auto j0 = e.let(bi * e.u32(ts));
+        for (auto jj : e.range(ts)) {
+          const auto j = e.let(j0 + jj);
+          if (auto live = e.when(j < row_len)) {
+            auto score = e.var(0.0f);
+            for (auto dd : e.range(dh)) {
+              score = math::fma(a.q[qb0 + dd], a.k[kb0 + jj * dh + dd],
+                                score.read());
+            }
+            score = score.read() * scale;
+            auto w = e.var(0.0f);
+            auto apply = [&] { w = math::exp(score.read() - m.read()); };
+            if (mask == 0) {
+              apply();
+            } else if (mask == 1) {
+              if (auto g = e.when(j <= abs_i)) apply();
+            } else {
+              if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
+            }
+            denom = denom.read() + w.read();
+            acc = math::fma(w.read(), a.v[vb0 + jj * dv], acc.read());
           }
-          score = score.read() * scale;
-          auto w = e.var(0.0f);
-          auto apply = [&] { w = math::exp(score.read() - m.read()); };
-          if (mask == 0) {
-            apply();
-          } else if (mask == 1) {
-            if (auto g = e.when(j <= abs_i)) apply();
-          } else {
-            if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
-          }
-          denom = denom.read() + w.read();
-          acc = math::fma(w.read(), a.v[vb0 + jj * dv], acc.read());
         }
       }
     }
+    // A row holding no sequence has row_len 0, so it accumulated nothing and
+    // this is the zero it must answer. No separate pad case, and therefore no
+    // pad case that can drift out of step with the live one.
     e.ret(acc.read() / select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
     return k.str();
   }
@@ -286,8 +325,8 @@ struct KvPageWriteArgs {
 };
 
 // Writes src [rows, Hkv, T, W] into the pool dst [blocks, Hkv, block_size, W]
-// at absolute position meta[0], following the block table. Threads cover src
-// only; pool bytes outside the positions written stay put.
+// at each row's own absolute position, following that row's block table.
+// Threads cover src only; pool bytes outside the positions written stay put.
 //
 // The paged counterpart of overwrite_slice: there the destination offset was
 // `pos` with coefficient 1 against a baked capacity stride; here the capacity
@@ -325,6 +364,11 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
     if (!is_pow2(bs)) return {};
     const auto src_n = static_cast<std::uint32_t>(src.elem_count());
     if (src_n == 0) return {};
+    if (s.inputs[2].elem_count() <
+        static_cast<std::size_t>(
+            kv::step_meta_elems(static_cast<std::int32_t>(src.dim(0))))) {
+      return {};
+    }
 
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
@@ -343,8 +387,17 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
     // cannot be reached by a row that is not in the batch.
     const auto rows = e.runtime_extent("rows", dispatch_u32(k, s.types, 2, 2));
     (void)e.ret_if(r >= rows);
+    const auto mb =
+        e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
+              r * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
+    // A row holding no sequence has zero live length. It must not write: the
+    // blocks its table row names belong to whoever held the slot last.
+    (void)e.ret_if(kir::cast<kir::u32>(a.meta[mb + 1u]) == e.u32(0));
 
-    const auto pos = e.let(kir::cast<kir::u32>(a.meta[0u]));
+    // Per row, like the attention read: rows of one pass sit at different
+    // absolute positions, and a shared one would have every row but one
+    // overwrite somebody else's slot.
+    const auto pos = e.let(kir::cast<kir::u32>(a.meta[mb]));
     const auto abs = e.let(pos + tt);
     const auto blk =
         e.let(kir::cast<kir::u32>(a.table[r * stride + abs / bs]));

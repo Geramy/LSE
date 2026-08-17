@@ -6,7 +6,7 @@
 //
 // `$0`, `$1` are input values (already widened to float). `$a0`..`$a3` are the
 // node's float attrs, spliced as literals by the emitter.
-#include "lse/backends/hrx/hip_sources.hpp"
+#include "lse/backends/hrx/hipc/hip_sources.hpp"
 
 #include <array>
 

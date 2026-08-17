@@ -10,6 +10,8 @@
 // what makes it a useful differential-testing oracle for the JIT.
 #pragma once
 
+#include <span>
+
 #include "lse/backend/backend.hpp"
 
 namespace lse::backend {
@@ -42,9 +44,10 @@ class CpuBackend : public Backend<CpuBackend> {
                      const DispatchArgs& args);
   Status synchronize_impl();
 
-  // No codegen: CPU fusion groups run through the interpreter.
-  const graph::IKernelEmitter* emitter_impl() const noexcept { return nullptr; }
-  const graph::IKernelCompiler* compiler_impl() const noexcept { return nullptr; }
+  // No codegen in any dialect: CPU fusion groups run through the interpreter.
+  std::span<const graph::KernelToolchain> toolchains_impl() const noexcept {
+    return {};
+  }
 
  private:
   DeviceInfo info_;

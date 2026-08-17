@@ -25,11 +25,11 @@
 #include <string>
 #include <vector>
 
-#include "lse/backends/hrx/comgr_compiler.hpp"
+#include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/hip_emitter.hpp"
-#include "lse/backends/hrx/hip_sources.hpp"
-#include "lse/backends/hrx/hip_types.hpp"
+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
+#include "lse/backends/hrx/hipc/hip_sources.hpp"
+#include "lse/backends/hrx/hipc/hip_types.hpp"
 #include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/kernels/wmma.hpp"
 #include "lse/core/hash.hpp"

@@ -8,10 +8,10 @@
 
 add_library(lse_backend_hrx
   hrx_backend.cpp
-  hip_emitter.cpp
-  phase_emit.cpp
-  hip_sources.cpp
-  comgr_compiler.cpp
+  hipc/hip_emitter.cpp
+  hipc/phase_emit.cpp
+  hipc/hip_sources.cpp
+  hipc/comgr_compiler.cpp
   trace.cpp
   kernels/matmul.cpp
   kernels/reduction.cpp
@@ -28,7 +28,7 @@ add_library(lse_backend_hrx
   kernels/sdpa.cpp
   kernels/kv_write.cpp
   kernels/gdn.cpp
-  hip_types.cpp
+  hipc/hip_types.cpp
   kernels/wmma_linear.cpp
   kernels/lds_linear.cpp
   kernels/quant_linear.cpp

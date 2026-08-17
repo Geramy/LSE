@@ -1,4 +1,4 @@
-#include "lse/backends/hrx/comgr_compiler.hpp"
+#include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 
 #include <cstdlib>
 #include <string>
