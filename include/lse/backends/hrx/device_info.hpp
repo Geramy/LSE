@@ -1,9 +1,11 @@
 // AMD GPU specifics, published as a DeviceInfo extension.
 //
 // These are the numbers a tile chooser needs and nobody else can interpret: a
-// wavefront, an LDS budget and a matrix-core generation mean nothing on a
-// device that has none of them. The HRX backend owns the block; code that
-// already targets AMD reads it with device_extension<AmdDeviceInfo>().
+// matrix-core generation and a dot4 form mean nothing on a device that has
+// none of them. The HRX backend owns the block; code that already targets AMD
+// reads it with device_extension<AmdDeviceInfo>(). Wavefront width, LDS budget
+// and resident waves per CU are *not* here — every GPU has them, so they are
+// DeviceInfo fields the scheduler reads without naming a vendor.
 #pragma once
 
 #include <cstdint>
@@ -104,12 +106,7 @@ struct AmdDeviceInfo {
   static constexpr std::string_view kExtensionId = "amd";
 
   std::uint32_t l2_cache_bytes = 0;
-  std::uint32_t lds_bytes_per_workgroup = 0;
   std::uint32_t clock_khz = 0;               // HRX CLOCK_RATE, 0 if unknown
-  std::uint8_t max_waves_per_cu = 0;
-  // Selected launch width. RDNA3/3.5: 32. CDNA: 64. RDNA4: 32 or 64
-  // (LSE_WAVEFRONT picks; default 32).
-  std::uint8_t wavefront_size = 0;
   MatrixCore matrix_core = MatrixCore::kNone;
   // ALU bf16, which is not the same question as whether the *matrix core* has
   // a bf16 operand form: CDNA1 has MFMA and no bf16 at all, and the two could
@@ -124,13 +121,11 @@ struct AmdDeviceInfo {
 // HRX reports the live arch; the width is an ISA constant of that arch.
 // Unknown gfx* still gets 16 — every GCN/RDNA/CDNA part we ship for has
 // dwordx4. Non-AMD or empty arch falls back to a scalar dword.
-// Workgroup LDS budget from the live device. 0 if unknown or not AMD —
-// the Lds object then does not refuse allocations.
+// Workgroup LDS budget from the live device. 0 if unknown — the Lds object
+// then does not refuse allocations.
 [[nodiscard]] inline std::uint32_t workgroup_lds_bytes(
     const DeviceInfo* info) noexcept {
-  if (info == nullptr) return 0;
-  const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*info);
-  return amd != nullptr ? amd->lds_bytes_per_workgroup : 0;
+  return info != nullptr ? info->lds_bytes_per_workgroup : 0;
 }
 
 [[nodiscard]] inline std::uint8_t max_load_bytes(const DeviceInfo& info) noexcept {
@@ -165,14 +160,14 @@ struct AmdDeviceInfo {
     const DeviceInfo& info, std::uint32_t threads,
     std::uint32_t lds_bytes) noexcept {
   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(info);
-  if (amd == nullptr || threads == 0 || amd->wavefront_size == 0) return 0;
+  if (amd == nullptr || threads == 0 || info.wavefront_size == 0) return 0;
   if (threads > info.max_threads_per_workgroup) return 0;
-  if (lds_bytes > amd->lds_bytes_per_workgroup) return 0;
+  if (lds_bytes > info.lds_bytes_per_workgroup) return 0;
   const std::uint32_t waves =
-      (threads + amd->wavefront_size - 1) / amd->wavefront_size;
-  const std::uint32_t wave_limit = amd->max_waves_per_cu / waves;
+      (threads + info.wavefront_size - 1) / info.wavefront_size;
+  const std::uint32_t wave_limit = info.max_waves_per_cu / waves;
   if (lds_bytes == 0) return wave_limit;
-  const std::uint32_t lds_limit = amd->lds_bytes_per_workgroup / lds_bytes;
+  const std::uint32_t lds_limit = info.lds_bytes_per_workgroup / lds_bytes;
   return wave_limit < lds_limit ? wave_limit : lds_limit;
 }
 

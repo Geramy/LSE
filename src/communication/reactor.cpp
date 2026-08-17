@@ -11,7 +11,7 @@
 
 #include "lse/communication/transport.hpp"
 #include "lse/core/debug.hpp"
-#include "poller.hpp"
+#include "lse/communication/poller.hpp"
 
 namespace lse::comm {
 

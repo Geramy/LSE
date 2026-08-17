@@ -103,11 +103,11 @@ std::string DeviceInfo::describe() const {
      << (unified_memory ? " (unified)" : "") << "\n"
      << "  occupancy: " << compute_units << " CU, "
      << max_threads_per_workgroup << " threads/wg\n";
-  if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*this)) {
+  if (device_extension<AmdDeviceInfo>(*this) != nullptr) {
     os << "  family   : " << arch_family_name(arch_family(arch))
-       << ", wave" << static_cast<unsigned>(amd->wavefront_size);
-    if (amd->lds_bytes_per_workgroup != 0) {
-      os << ", " << (amd->lds_bytes_per_workgroup >> 10) << " KiB LDS";
+       << ", wave" << wavefront_size;
+    if (lds_bytes_per_workgroup != 0) {
+      os << ", " << (lds_bytes_per_workgroup >> 10) << " KiB LDS";
     }
     os << "\n";
   } else if (extension != nullptr && !extension_id.empty()) {

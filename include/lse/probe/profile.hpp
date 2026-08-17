@@ -126,11 +126,14 @@ struct DeviceProfile {
   // What is actually available to hold a shard, which is the only number a
   // placement may be sized against. `total_memory` is the part number: on a
   // device already holding a model, a context, or another process, the two
-  // differ by everything that decides whether the shard fits. A backend probe
-  // fills this from its own runtime's query — HRX has
-  // `hrx_device_memory_info(device, &free, &total)` — and until one does it
-  // stays kUnknown, because a capacity inferred from the total is exactly the
-  // invented number that hands a 40 GB shard to a device with 2 GB left.
+  // differ by everything that decides whether the shard fits. Filled from
+  // backend::IBackend::sample_free_memory(); a backend whose runtime has no
+  // such query leaves it kUnknown, because a capacity inferred from the total
+  // is exactly the invented number that hands a 40 GB shard to a device with
+  // 2 GB left.
+  //
+  // The one field here that is not a property of the hardware: it is true of an
+  // instant, so it is sampled per run and never replayed from a stored profile.
   Measured free_memory;
   std::uint16_t compute_units = 0;
   bool unified_memory = false;

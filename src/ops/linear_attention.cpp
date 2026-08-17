@@ -16,9 +16,14 @@ constexpr float kBetaFloor = 1e-4f;
 // copy count down. A null or empty tail is the stateless full-sequence path.
 Array conv_stream(const Array& x, const Array& weight, const Array& bias,
                   bool has_bias, Array* tail) {
+  // weight.dtype(), not x's: the conv kernel reads filter and bias through one
+  // element type, so a bias in the activation's dtype fails its argument bind.
+  // On HRX that surfaces as a kernel with an empty body and an output of exactly
+  // zero, not as an error — Qwen3.5 is the only model with conv_bias == false,
+  // and it produced zeros from block 0 until this matched.
   const Array b = has_bias
                       ? bias
-                      : Array::zeros(Shape{weight.shape().dim(0)}, x.dtype());
+                      : Array::zeros(Shape{weight.shape().dim(0)}, weight.dtype());
   if (tail == nullptr || !tail->valid()) return graph::causal_conv1d(x, weight, b);
   const Array prev = *tail;
   *tail = graph::conv_tail(prev, x);
@@ -71,22 +76,31 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
                         state != nullptr ? &state->conv_v : nullptr);
   }
 
+  if (spec.conv_activation) {
+    q_raw = graph::silu(q_raw);
+    k_raw = graph::silu(k_raw);
+    v_raw = graph::silu(v_raw);
+  }
+
   const Shape key_shape{batch, seq, kh, kd};
   Array q = graph::l2_normalize(graph::reshape(q_raw, key_shape), spec.eps);
   Array k = graph::l2_normalize(graph::reshape(k_raw, key_shape), spec.eps);
   Array v = graph::reshape(v_raw, Shape{batch, seq, vh, vd});
+  if (spec.query_scale != 1.0f) {
+    q = q * Array::full(Shape{1}, DType::kF32, spec.query_scale);
+  }
 
-  // alpha = exp(-softplus(exp(A_log)) * softplus(a + dt_bias)) — the decay
-  // applied to the recurrent state each step.
+  // alpha = exp(-rate * softplus(a + dt_bias)) — the decay applied to the
+  // recurrent state each step. The rate is where the two models part company.
   Array a = graph::linear(x, w.in_proj_a);
   // Widened once, at the weight boundary: the decay multiplies the recurrent
   // state on every step, so its error compounds without bound, and the
   // delta-rule solve this feeds NaNs outright in bf16. `a + dt_bias` is a
   // binary op and already promotes to f32; the exp chain would not.
-  Array decay =
-      graph::softplus(graph::exp(graph::cast(w.a_log, DType::kF32)));
+  Array rate = graph::exp(graph::cast(w.a_log, DType::kF32));
+  if (spec.decay == DecayRate::kSoftplusExpALog) rate = graph::softplus(rate);
   Array alpha =
-      graph::exp(graph::neg(decay * graph::softplus(a + w.dt_bias)));
+      graph::exp(graph::neg(rate * graph::softplus(a + w.dt_bias)));
   Array beta = graph::clamp(graph::sigmoid(graph::linear(x, w.in_proj_b)),
                             kBetaFloor, 1.0f - kBetaFloor);
 
@@ -113,7 +127,9 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   o = graph::rms_norm(o, w.norm, spec.norm_eps, spec.zero_centered_norm);
   o = graph::reshape(o, Shape{batch, seq, value_width});
 
-  Array gate = graph::sigmoid(graph::linear(x, w.gate_proj));
+  Array gate_lin = graph::linear(x, w.gate_proj);
+  Array gate = spec.gate == GateActivation::kSiLU ? graph::silu(gate_lin)
+                                                  : graph::sigmoid(gate_lin);
   return graph::linear(o * gate, w.out_proj);
 }
 

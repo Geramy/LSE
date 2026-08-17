@@ -47,16 +47,26 @@ class PortableProbe final : public IDeviceProbe {
   explicit PortableProbe(backend::IBackend& be)
       : declined_(host_executed(be)
                       ? "host-executed backend: memory and dispatch are the "
-                        "host's, there is no matrix core to rate, and free "
-                        "memory needs a runtime query IBackend does not carry"
+                        "host's, and there is no matrix core to rate"
                       : "this backend registered no device probe, so its "
                         "kernel-side rates (streaming bandwidth, dispatch "
                         "cost, matrix-core throughput) are unknown here "
-                        "rather than guessed; free memory needs a runtime "
-                        "query IBackend does not carry either") {}
+                        "rather than guessed") {
+    // Asked here rather than reported after the fact: declined() names what
+    // this probe cannot reach on this backend, and whether the backend answers
+    // a memory query is a property of the backend, not of the run.
+    if (!be.sample_free_memory().ok()) {
+      declined_ += "; this backend's runtime answers no memory query, so free "
+                   "memory stays unknown rather than being taken from the "
+                   "declared total";
+    }
+  }
 
   Status run(backend::IBackend& be, DeviceProfile& out) override {
     const Status transfer = measure_transfers(be, out);
+    if (const Measured sampled = sample_free_memory(be); sampled.known()) {
+      out.free_memory = sampled;
+    }
     if (host_executed(be)) measure_host_execution(out);
     return transfer;
   }
@@ -141,7 +151,7 @@ class PortableProbe final : public IDeviceProbe {
     }
   }
 
-  std::string_view declined_;
+  std::string declined_;
 };
 
 }  // namespace
@@ -156,6 +166,15 @@ void register_device_probe(std::string_view backend_name,
 std::unique_ptr<IDeviceProbe> make_portable_device_probe(
     backend::IBackend& backend) {
   return std::make_unique<PortableProbe>(backend);
+}
+
+Measured sample_free_memory(const backend::IBackend& backend) {
+  auto free_bytes = backend.sample_free_memory();
+  if (!free_bytes.ok()) return Measured::unknown();
+  // Zero is a real answer here — a device with nothing left — so unlike the
+  // rates below it is not screened out. What it must not be is a stand-in for
+  // "did not ask".
+  return Measured::measured(static_cast<double>(*free_bytes));
 }
 
 std::unique_ptr<IDeviceProbe> create_device_probe(backend::IBackend& backend) {
@@ -181,9 +200,9 @@ DeviceProfile device_identity(const backend::IBackend& backend) {
   p.name = info.name;
   // total_memory is the declared part size and deliberately does not become
   // free_memory: a device already holding a model has the same total and no
-  // room. IBackend answers no memory query, so free_memory stays kUnknown until
-  // a backend's own probe fills it — HRX from hrx_device_memory_info(), which
-  // is the one call between here and a capacity-aware placement on this box.
+  // room. free_memory is a measurement and is left to the probe, so that a
+  // profile read from disk can be checked against this without either of them
+  // carrying a figure nobody sampled this run.
   p.total_memory = info.total_memory;
   p.compute_units = info.compute_units;
   p.unified_memory = info.unified_memory;

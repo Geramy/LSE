@@ -18,6 +18,129 @@ void read(const nlohmann::json& j, const char* key, T& out) {
   if (j.contains(key) && !j[key].is_null()) out = j[key].get<T>();
 }
 
+// The HF path reads through this instead: a missing field there is an error,
+// not a default, because the defaults describe a 256-wide toy model and would
+// let a 4B checkpoint load into the wrong shape without a word.
+template <typename T>
+Status need(const nlohmann::json& j, const char* key, T& out) {
+  if (!j.contains(key) || j[key].is_null()) {
+    return LSE_ERROR(kNotFound, "model config is missing '", key, "'");
+  }
+  try {
+    out = j[key].get<T>();
+  } catch (const std::exception& e) {
+    return LSE_ERROR(kInvalidArgument, "model config field '", key,
+                     "' has the wrong type: ", e.what());
+  }
+  return OkStatus();
+}
+
+// Qwen3.5 (dense and MoE), read off Qwen/Qwen3.5-0.8B, Qwen/Qwen3.5-4B and
+// Qwen/Qwen3.5-35B-A3B and cross-checked against
+// transformers/models/qwen3_5/configuration_qwen3_5.py. Both are gated
+// DeltaNet hybrids, not plain transformer stacks.
+Result<Config> from_hf_json(const nlohmann::json& root) {
+  const nlohmann::json& t = root["text_config"];
+  Config c;
+
+  LSE_RETURN_IF_ERROR(need(t, "vocab_size", c.vocab_size));
+  LSE_RETURN_IF_ERROR(need(t, "hidden_size", c.hidden_size));
+  LSE_RETURN_IF_ERROR(need(t, "num_hidden_layers", c.num_layers));
+  LSE_RETURN_IF_ERROR(need(t, "rms_norm_eps", c.rms_eps));
+  LSE_RETURN_IF_ERROR(need(t, "full_attention_interval", c.full_attention_interval));
+
+  LSE_RETURN_IF_ERROR(need(t, "num_attention_heads", c.attn_q_heads));
+  LSE_RETURN_IF_ERROR(need(t, "num_key_value_heads", c.attn_kv_heads));
+  LSE_RETURN_IF_ERROR(need(t, "head_dim", c.attn_head_dim));
+
+  LSE_RETURN_IF_ERROR(need(t, "linear_num_key_heads", c.gdn_qk_heads));
+  LSE_RETURN_IF_ERROR(need(t, "linear_num_value_heads", c.gdn_v_heads));
+  LSE_RETURN_IF_ERROR(need(t, "linear_conv_kernel_dim", c.gdn_conv_kernel));
+  std::int32_t key_head_dim = 0;
+  std::int32_t value_head_dim = 0;
+  LSE_RETURN_IF_ERROR(need(t, "linear_key_head_dim", key_head_dim));
+  LSE_RETURN_IF_ERROR(need(t, "linear_value_head_dim", value_head_dim));
+  // The delta rule carries a square state, so the engine has one head dim.
+  if (key_head_dim != value_head_dim) {
+    return LSE_ERROR(kUnimplemented, "linear_key_head_dim (",
+                     std::to_string(key_head_dim), ") and linear_value_head_dim (",
+                     std::to_string(value_head_dim), ") differ; the delta rule "
+                     "this engine implements carries a square state");
+  }
+  c.gdn_head_dim = key_head_dim;
+
+  if (!t.contains("rope_parameters") || !t["rope_parameters"].is_object()) {
+    return LSE_ERROR(kNotFound, "model config is missing 'rope_parameters'");
+  }
+  const nlohmann::json& rope = t["rope_parameters"];
+  LSE_RETURN_IF_ERROR(need(rope, "rope_theta", c.rope_theta));
+  float partial = 0.0f;
+  LSE_RETURN_IF_ERROR(need(rope, "partial_rotary_factor", partial));
+  const auto rotary = static_cast<std::int32_t>(
+      static_cast<float>(c.attn_head_dim) * partial + 0.5f);
+  if (rotary <= 0 || rotary % 2 != 0 || rotary > c.attn_head_dim) {
+    return LSE_ERROR(kInvalidArgument, "partial_rotary_factor ",
+                     std::to_string(partial), " of head_dim ",
+                     std::to_string(c.attn_head_dim), " gives a rope width of ",
+                     std::to_string(rotary), ", which must be even and positive");
+  }
+  c.rope_dim = rotary;
+
+  // Qwen has no sliding window; every full-attention layer sees the whole
+  // prefix, which is what a zero window selects in GatedAttention::load.
+  c.sliding_window = 0;
+  c.global_attention_layers.clear();
+
+  if (t.contains("num_experts")) {
+    LSE_RETURN_IF_ERROR(need(t, "num_experts", c.num_experts));
+    LSE_RETURN_IF_ERROR(need(t, "num_experts_per_tok", c.num_active_experts));
+    LSE_RETURN_IF_ERROR(need(t, "moe_intermediate_size", c.expert_intermediate));
+    LSE_RETURN_IF_ERROR(
+        need(t, "shared_expert_intermediate_size", c.shared_expert_intermediate));
+    c.num_shared_experts = 1;
+    c.mlp_intermediate = 0;
+    // Plain top-k with renormalization; there is no band and no router bias.
+    c.expert_score_band = 1.0f;
+  } else {
+    LSE_RETURN_IF_ERROR(need(t, "intermediate_size", c.mlp_intermediate));
+    c.num_experts = 0;
+    c.num_active_experts = 0;
+    c.num_shared_experts = 0;
+    c.expert_intermediate = 0;
+  }
+
+  read(root, "tie_word_embeddings", c.tie_word_embeddings);
+  read(t, "tie_word_embeddings", c.tie_word_embeddings);
+  read(t, "dtype", c.dtype);
+  read(t, "max_position_embeddings", c.train_seq_len);
+
+  // layer_types is the checkpoint's own statement of which layers attend. The
+  // engine derives that from full_attention_interval, so a disagreement means
+  // the interval rule does not describe this model and every mixer after the
+  // first divergence would be built wrong.
+  if (t.contains("layer_types") && t["layer_types"].is_array()) {
+    const auto types = t["layer_types"].get<std::vector<std::string>>();
+    if (static_cast<std::int32_t>(types.size()) != c.num_layers) {
+      return LSE_ERROR(kInvalidArgument, "layer_types has ",
+                       std::to_string(types.size()), " entries but "
+                       "num_hidden_layers is ", std::to_string(c.num_layers));
+    }
+    for (std::size_t i = 0; i < types.size(); ++i) {
+      const bool attends = types[i] == "full_attention";
+      if (attends != c.is_attention_layer(static_cast<std::int32_t>(i))) {
+        return LSE_ERROR(kUnimplemented, "layer_types says layer ",
+                         std::to_string(i), " is '", types[i],
+                         "' but full_attention_interval ",
+                         std::to_string(c.full_attention_interval),
+                         " says otherwise");
+      }
+    }
+  }
+
+  LSE_RETURN_IF_ERROR(c.validate());
+  return c;
+}
+
 }  // namespace
 
 Result<Config> Config::from_json_string(const std::string& text) {
@@ -26,6 +149,10 @@ Result<Config> Config::from_json_string(const std::string& text) {
     j = nlohmann::json::parse(text);
   } catch (const std::exception& e) {
     return LSE_ERROR(kInvalidArgument, "model config is not valid JSON: ", e.what());
+  }
+
+  if (j.contains("text_config") && j["text_config"].is_object()) {
+    return from_hf_json(j);
   }
 
   Config c;
@@ -48,10 +175,13 @@ Result<Config> Config::from_json_string(const std::string& text) {
   read(j, "gdn_conv_kernel", c.gdn_conv_kernel);
   read(j, "gdn_chunk_size", c.gdn_chunk_size);
 
+  read(j, "mlp_intermediate", c.mlp_intermediate);
   read(j, "num_experts", c.num_experts);
   read(j, "num_active_experts", c.num_active_experts);
   read(j, "num_shared_experts", c.num_shared_experts);
   read(j, "expert_intermediate", c.expert_intermediate);
+  read(j, "shared_expert_intermediate", c.shared_expert_intermediate);
+  read(j, "tie_word_embeddings", c.tie_word_embeddings);
   read(j, "router_aux_loss_coef", c.router_aux_loss_coef);
   read(j, "router_z_loss_coef", c.router_z_loss_coef);
   read(j, "expert_score_band", c.expert_score_band);
@@ -97,10 +227,13 @@ std::string Config::to_json() const {
   j["gdn_head_dim"] = gdn_head_dim;
   j["gdn_conv_kernel"] = gdn_conv_kernel;
   j["gdn_chunk_size"] = gdn_chunk_size;
+  j["mlp_intermediate"] = mlp_intermediate;
   j["num_experts"] = num_experts;
   j["num_active_experts"] = num_active_experts;
   j["num_shared_experts"] = num_shared_experts;
   j["expert_intermediate"] = expert_intermediate;
+  j["shared_expert_intermediate"] = shared_expert_intermediate;
+  j["tie_word_embeddings"] = tie_word_embeddings;
   j["router_aux_loss_coef"] = router_aux_loss_coef;
   j["router_z_loss_coef"] = router_z_loss_coef;
   j["expert_score_band"] = expert_score_band;
@@ -129,8 +262,15 @@ Status Config::validate() const {
                      std::to_string(attn_q_heads), ") to be a multiple of "
                      "attn_kv_heads (", std::to_string(attn_kv_heads), ")");
   }
-  if (gdn_qk_heads % gdn_v_heads != 0) {
-    return LSE_ERROR(kInvalidArgument, "gdn_qk_heads must be a multiple of gdn_v_heads");
+  if (gdn_qk_heads <= 0 || gdn_v_heads <= 0 ||
+      (gdn_qk_heads % gdn_v_heads != 0 && gdn_v_heads % gdn_qk_heads != 0)) {
+    // Either direction: lemonseed's layer runs v at the key width and reads
+    // gdn_v_heads as a divisor of it, Qwen shares 16 key heads across 32 value
+    // heads. Both are GQA over the same state, counted from opposite ends.
+    return LSE_ERROR(kInvalidArgument, "gdn_qk_heads (",
+                     std::to_string(gdn_qk_heads), ") and gdn_v_heads (",
+                     std::to_string(gdn_v_heads),
+                     ") must be positive and one must divide the other");
   }
   if (num_active_experts > num_experts) {
     return LSE_ERROR(kInvalidArgument, "num_active_experts exceeds num_experts");

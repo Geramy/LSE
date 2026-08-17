@@ -154,6 +154,13 @@ Result<Array> routed_experts(const Array& x, const Array& router,
   Array idx;
   Array w = graph::topk(graph::softmax(logits, -1), cfg.num_active, -1, &idx,
                         cfg.score_band);
+  if (cfg.renormalize) {
+    Array total = last_slot(w, 0);
+    for (std::int32_t s = 1; s < cfg.num_active; ++s) {
+      total = total + last_slot(w, s);
+    }
+    w = w / total;
+  }
 
   Array out;
   for (std::int32_t s = 0; s < cfg.num_active; ++s) {

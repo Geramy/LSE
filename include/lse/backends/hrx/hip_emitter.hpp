@@ -15,20 +15,18 @@ class Node;
 
 namespace lse::backend {
 
-class HipEmitter final : public graph::IKernelEmitter {
+class HipEmitter final : public graph::IKernelEmitter,
+                         public graph::IPhaseStaging {
  public:
   Result<graph::EmittedKernel> emit(const graph::FusionGroup& group,
                                     const DeviceInfo& device) const override;
 
   static Result<graph::EmittedKernel> emit_phase(
       const graph::FusionGroup& group, const DeviceInfo& device);
-  static bool phase_can_stage(const graph::Node& n) noexcept;
 
-  // Independent work items the node could spend if it owned the launch. The
-  // phase splitter breaks a chain here: a stage wanting thousands of them
-  // cannot share the one-workgroup fallback its dependent neighbours need.
-  static std::uint32_t phase_stage_threads(const graph::Node& n,
-                                           const DeviceInfo& device);
+  [[nodiscard]] bool can_stage(const graph::Node& n) const noexcept override;
+  [[nodiscard]] std::uint32_t stage_threads(
+      const graph::Node& n, const DeviceInfo& device) const override;
 
   static void bind_phase(const graph::FusionGroup& group,
                          graph::EmittedKernel& out);
@@ -46,6 +44,10 @@ class HipEmitter final : public graph::IKernelEmitter {
   [[nodiscard]] std::string_view prelude() const noexcept override;
 
   [[nodiscard]] graph::DialectSourceTable sources() const noexcept override;
+
+  [[nodiscard]] const graph::IPhaseStaging* staging() const noexcept override {
+    return this;
+  }
 
   // ConstantsLayout is offsets and sizes; the C spelling of a 4- or 8-byte
   // scalar is HIP's business, so the struct text is rendered here.

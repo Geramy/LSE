@@ -41,18 +41,18 @@ const graph::KernelPrimitiveBase* wmma_linear_for(const graph::KernelShapes& s);
   switch (arch_family(info.arch)) {
     case ArchFamily::kRdna3:
     case ArchFamily::kRdna35:
-      if (amd->matrix_core == MatrixCore::kWMMA && amd->wavefront_size == 32) {
+      if (amd->matrix_core == MatrixCore::kWMMA && info.wavefront_size == 32) {
         return lse::math::MatrixTarget::kRdna3;
       }
       return std::nullopt;
     case ArchFamily::kRdna4:
-      if (amd->matrix_core == MatrixCore::kWMMA && amd->wavefront_size == 32) {
+      if (amd->matrix_core == MatrixCore::kWMMA && info.wavefront_size == 32) {
         return lse::math::MatrixTarget::kRdna4;
       }
       return std::nullopt;
     case ArchFamily::kCdna3:
     case ArchFamily::kCdna4:
-      if (amd->matrix_core == MatrixCore::kMFMA && amd->wavefront_size == 64) {
+      if (amd->matrix_core == MatrixCore::kMFMA && info.wavefront_size == 64) {
         return lse::math::MatrixTarget::kCdna3;
       }
       return std::nullopt;

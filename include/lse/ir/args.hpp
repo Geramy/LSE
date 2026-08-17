@@ -60,6 +60,12 @@ template <>
 struct elem_dtype<std::int32_t> {
   static constexpr DType value = DType::kI32;
 };
+// The packed plane of a group-affine weight: several codes to a lane, at a bit
+// width the tag does not name (quant/group_affine.hpp).
+template <>
+struct elem_dtype<std::uint32_t> {
+  static constexpr DType value = DType::kU32;
+};
 
 namespace detail {
 

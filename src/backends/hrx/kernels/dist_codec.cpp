@@ -314,15 +314,13 @@ class HrxCodecEngine final : public dist::CodecEngine {
   Status launch(DType format, bool pack, const DeviceBuffer& in,
                 const DeviceBuffer& out, std::uint32_t nblocks) {
     LSE_ASSIGN_OR(const KernelHandle kernel, kernel_for(format, pack));
-    const AmdDeviceInfo* amd =
-        device_extension<AmdDeviceInfo>(be_.device_info());
     const std::uint32_t threads =
         be_.device_info().max_threads_per_workgroup >= 256 ? 256u : 64u;
 
     LaunchDims dims;
     dims.workgroup_size[0] = threads;
     dims.workgroup_count[0] = (nblocks + threads - 1) / threads;
-    dims.subgroup_size = amd != nullptr ? amd->wavefront_size : 0;
+    dims.subgroup_size = be_.device_info().wavefront_size;
 
     const BufferRef refs[] = {{&in, 0, in.size_bytes - in.offset},
                               {&out, 0, out.size_bytes - out.offset}};

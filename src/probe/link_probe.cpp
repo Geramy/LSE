@@ -7,7 +7,7 @@
 #include <chrono>
 #include <cstring>
 
-#include "wire.hpp"
+#include "lse/probe/wire.hpp"
 
 namespace lse::probe {
 

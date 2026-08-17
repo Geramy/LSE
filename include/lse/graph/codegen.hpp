@@ -59,6 +59,27 @@ struct EmittedKernel {
   bool persist_grid = false;
 };
 
+// Folding a run of nodes into one launch body. Which nodes an emitter can
+// carry as a stage, and how wide each would be if it owned the launch, are
+// properties of that emitter's lowering — the graph asks, it does not decide.
+//
+// An emitter whose lowering has no staged form declines by returning nullptr
+// from IKernelEmitter::staging(). The scheduler then gives every node a group
+// of its own, which is already the path a declined node takes.
+class IPhaseStaging {
+ public:
+  virtual ~IPhaseStaging() = default;
+
+  // Can `n` be one stage of a phase body this emitter writes?
+  [[nodiscard]] virtual bool can_stage(const Node& n) const noexcept = 0;
+
+  // Independent work items the node could spend if it owned the launch. The
+  // phase splitter breaks a chain here: a stage wanting thousands of them
+  // cannot share the one-workgroup fallback its dependent neighbours need.
+  [[nodiscard]] virtual std::uint32_t stage_threads(
+      const Node& n, const backend::DeviceInfo& device) const = 0;
+};
+
 class IKernelEmitter {
  public:
   virtual ~IKernelEmitter() = default;
@@ -84,6 +105,12 @@ class IKernelEmitter {
   // How this backend spells each built-in primitive. Primitives carry no
   // device text of their own unless they are written against an intrinsic.
   [[nodiscard]] virtual DialectSourceTable sources() const noexcept = 0;
+
+  // nullptr when this emitter writes one node per launch and has no staged
+  // phase body to fold them into.
+  [[nodiscard]] virtual const IPhaseStaging* staging() const noexcept {
+    return nullptr;
+  }
 };
 
 class IKernelCompiler {

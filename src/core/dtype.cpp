@@ -88,6 +88,7 @@ const std::array<DTypeInfo, kNumDTypes>& table() {
       {DType::kQ8,   "q8",   0, kQuantBlockElems, kQuantBlockBytesQ8, false, true},
       {DType::kQ6,   "q6",   0, kQuantBlockElems, kQuantBlockBytesQ6, false, true},
       {DType::kQ4,   "q4",   0, kQuantBlockElems, kQuantBlockBytesQ4, false, true},
+      {DType::kU32,  "u32",  4, 1, 4, false, false},
   }};
   return kTable;
 }

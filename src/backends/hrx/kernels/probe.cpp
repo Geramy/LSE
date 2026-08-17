@@ -619,9 +619,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
   }
 
   std::uint32_t wavefront() const noexcept {
-    const AmdDeviceInfo* amd =
-        device_extension<AmdDeviceInfo>(be_.device_info());
-    return amd != nullptr ? amd->wavefront_size : 0u;
+    return be_.device_info().wavefront_size;
   }
 
   IBackend& be_;

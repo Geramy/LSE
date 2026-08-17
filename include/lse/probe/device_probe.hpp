@@ -60,6 +60,17 @@ struct DeviceProbeRegistrar {
 [[nodiscard]] std::unique_ptr<IDeviceProbe> make_portable_device_probe(
     backend::IBackend& backend);
 
+// What is free on this device right now, or kUnknown when the backend's
+// runtime declines to say. kMeasured, never kDeclared: unlike every other
+// number in a profile this one is not a property of the part, it is an
+// observation of this device in this process at this instant, and it changes
+// under any other process on the box.
+//
+// Split out of the probe because it is the one field a memoized profile may
+// not replay — see qualify_pool, which drops it on a cache hit and calls this
+// instead. Cheap enough to redo: one driver query, no kernel, no allocation.
+[[nodiscard]] Measured sample_free_memory(const backend::IBackend& backend);
+
 // Identity from the backend, then the probe. The whole per-device deliverable.
 [[nodiscard]] Result<DeviceProfile> probe_device(backend::IBackend& backend);
 

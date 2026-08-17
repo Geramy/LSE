@@ -33,6 +33,7 @@ class HrxBackend : public Backend<HrxBackend> {
 
   Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls);
   void deallocate_impl(DeviceBuffer& buf) noexcept;
+  Result<std::size_t> sample_free_memory_impl() const;
 
   Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
                        std::size_t dst_offset);

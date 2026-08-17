@@ -147,6 +147,7 @@ std::string_view device_scalar(DType dt) noexcept {
     case DType::kI32: return "int";
     case DType::kI8: return "signed char";
     case DType::kU8: return "unsigned char";
+    case DType::kU32: return "unsigned int";
     default: return "float";
   }
 }
@@ -220,7 +221,7 @@ LaunchDims HipEmitter::choose_dims(const FusionGroup& group,
   // the device actually permits.
   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device);
   const std::uint32_t wave =
-      (amd != nullptr && amd->wavefront_size != 0) ? amd->wavefront_size : 64;
+      device.wavefront_size != 0 ? device.wavefront_size : 64;
   const std::uint32_t cap =
       device.max_threads_per_workgroup ? device.max_threads_per_workgroup : 256;
 
@@ -309,10 +310,8 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
     }
   }
   if (self) mix_name(h, self->name());
-  if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
-    h ^= amd->wavefront_size;
-    h *= 1099511628211ull;
-  }
+  h ^= device.wavefront_size;
+  h *= 1099511628211ull;
   // Persist-grid source (gbar, lse_grid_sync, grid-stride walks) is a
   // different kernel from the one-workgroup walk. Disk and emit caches
   // key on this, so a 1-CU box cannot reuse a 40-CU object.
@@ -527,9 +526,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.dims.workgroup_count[d] = unified.workgroup_count[d];
     }
     out.lds_bytes = unified.lds_bytes;
-    if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
-      out.dims.subgroup_size = amd->wavefront_size;
-    }
+    out.dims.subgroup_size = device.wavefront_size;
     emit_cache_[sig] = CachedEmit{out.source, out.entry_name, out.dims};
     return out;
   }
@@ -866,9 +863,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.dims.workgroup_count[d] = tp.workgroup_count[d];
     }
     out.lds_bytes = tp.lds_bytes;
-    if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
-      out.dims.subgroup_size = amd->wavefront_size;
-    }
+    out.dims.subgroup_size = device.wavefront_size;
     emit_cache_[sig] = CachedEmit{out.source, out.entry_name, out.dims};
     return out;
   }

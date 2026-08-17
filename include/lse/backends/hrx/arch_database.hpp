@@ -91,8 +91,8 @@ inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
   if (info.max_threads_per_workgroup == 0 && isa != nullptr) {
     info.max_threads_per_workgroup = isa->max_threads_per_workgroup;
   }
-  if (amd.lds_bytes_per_workgroup == 0 && isa != nullptr) {
-    amd.lds_bytes_per_workgroup = isa->lds_bytes_per_workgroup;
+  if (info.lds_bytes_per_workgroup == 0 && isa != nullptr) {
+    info.lds_bytes_per_workgroup = isa->lds_bytes_per_workgroup;
   }
   if (amd.l2_cache_bytes == 0) {
     if (board != nullptr && board->l2_cache_bytes != 0) {
@@ -101,11 +101,11 @@ inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
       amd.l2_cache_bytes = isa->l2_cache_bytes;
     }
   }
-  if (amd.max_waves_per_cu == 0 && isa != nullptr) {
-    amd.max_waves_per_cu = isa->max_waves_per_cu;
+  if (info.max_waves_per_cu == 0 && isa != nullptr) {
+    info.max_waves_per_cu = isa->max_waves_per_cu;
   }
-  if (amd.wavefront_size == 0 && isa != nullptr) {
-    amd.wavefront_size = isa->wavefront_size;
+  if (info.wavefront_size == 0 && isa != nullptr) {
+    info.wavefront_size = isa->wavefront_size;
   }
   if (amd.matrix_core == MatrixCore::kNone && isa != nullptr) {
     amd.matrix_core = isa->matrix_core;
@@ -120,7 +120,8 @@ inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
     if (amd.max_load_bytes == 0) amd.max_load_bytes = isa->max_load_bytes;
     if (amd.max_store_bytes == 0) amd.max_store_bytes = isa->max_store_bytes;
   }
-  amd.wavefront_size = select_wavefront(info.arch, amd.wavefront_size);
+  info.wavefront_size = select_wavefront(
+      info.arch, static_cast<std::uint8_t>(info.wavefront_size));
 }
 
 }  // namespace lse::backend

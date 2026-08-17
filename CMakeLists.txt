@@ -41,6 +41,7 @@ add_library(lse_core
   src/core/dtype.cpp
   src/core/shape.cpp
   src/core/status.cpp
+  src/quant/group_affine.cpp
 )
 add_library(lse::core ALIAS lse_core)
 
@@ -155,18 +156,13 @@ add_library(lse_graph
   src/graph/interpreter.cpp
   src/graph/scheduler.cpp
   src/graph/stream_plan.cpp
+  src/graph/sharding.cpp
 )
 add_library(lse::graph ALIAS lse_graph)
 target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry)
-
-if(LSE_ENABLE_CPU)
-  target_link_libraries(lse_graph PUBLIC lse_backend_cpu)
-endif()
-# Backends self-register, so anything holding a graph must be able to see them.
-# Without this the CLI links only the CPU backend and silently never finds a GPU.
-if(TARGET lse_backend_hrx)
-  target_link_libraries(lse_graph PUBLIC lse_backend_hrx)
-endif()
+# No backend edge here, in either direction of the build: lse_backend_hrx links
+# lse_graph because it implements graph's emitter and compiler seams, so an edge
+# back would be a cycle. Executables link lse_backends to make one selectable.
 # Primitives self-register from a TU with no referenced symbols.
 target_link_options(lse_graph INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_graph>,--no-whole-archive")
@@ -213,6 +209,9 @@ add_library(lse_model
   src/model/registry.cpp
   src/model/weights.cpp
   src/models/lemonseed.cpp
+  src/models/qwen3_5.cpp
+  src/models/qwen3_5_common.cpp
+  src/models/qwen3_5_moe.cpp
 )
 add_library(lse::model ALIAS lse_model)
 # Model kernels self-register from a TU nothing references.
@@ -232,7 +231,8 @@ if(TARGET lse_tokenizer)
     target_compile_definitions(lse PRIVATE
       LSE_HSA_RUNTIME_DIR="${LSE_ROCM_RUNTIME_DIR}")
   endif()
-  target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer)
+  target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer
+                                    lse_probe lse_backends)
   lse_apply_common_flags(lse)
 endif()
 

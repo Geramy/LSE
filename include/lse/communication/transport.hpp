@@ -22,7 +22,7 @@
 
 namespace lse::comm {
 
-// The readiness mechanism, defined in src/communication/poller.hpp. A transport
+// The readiness mechanism, defined in lse/communication/poller.hpp. A transport
 // registers its descriptors with it and is driven from the reactor's one wait;
 // replacing epoll with io_uring replaces that file alone.
 class Poller;

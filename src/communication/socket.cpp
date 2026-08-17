@@ -23,11 +23,11 @@
 #include <utility>
 #include <vector>
 
-#include "frame.hpp"
+#include "lse/communication/frame.hpp"
 #include "lse/communication/adapter.hpp"
 #include "lse/communication/transport.hpp"
-#include "poller.hpp"
-#include "stream_link.hpp"
+#include "lse/communication/poller.hpp"
+#include "lse/communication/stream_link.hpp"
 
 namespace lse::comm {
 

@@ -6,6 +6,8 @@
 #include <limits>
 #include <vector>
 
+#include "lse/quant/group_affine.hpp"
+
 namespace lse::graph::interpreter {
 
 namespace {
@@ -557,6 +559,54 @@ Status eval_linear(Node& n) {
   return OkStatus();
 }
 
+// The reference the emitted quant_linear kernel is diffed against. A U32 lane
+// holds several codes, so the packed plane is read at its own width rather
+// than through load_element, which speaks in floats.
+Status eval_quant_matmul(Node& n) {
+  const Node& x = *n.inputs[0];
+  const Node& packed = *n.inputs[1];
+  const Node& scales = *n.inputs[2];
+  const Node& biases = *n.inputs[3];
+  LSE_ASSIGN_OR(const quant::GroupAffine spec,
+                quant::GroupAffine::make(n.iattrs[0], n.iattrs[1]));
+
+  const auto out_dim = static_cast<std::size_t>(packed.shape.dim(0));
+  const auto lanes = static_cast<std::size_t>(packed.shape.dim(1));
+  const auto groups = static_cast<std::size_t>(scales.shape.dim(1));
+  const std::size_t in_dim = lanes * 32 / static_cast<std::size_t>(spec.bits);
+  if (groups != spec.group_count(in_dim)) {
+    return LSE_ERROR(kInvalidArgument, "quant_linear scale plane has ",
+                     std::to_string(groups), " groups, ",
+                     std::to_string(in_dim), " weights at group size ",
+                     std::to_string(spec.group_size), " need ",
+                     std::to_string(spec.group_count(in_dim)));
+  }
+  const auto* w = static_cast<const std::uint32_t*>(host_bytes(packed));
+  if (w == nullptr) {
+    return LSE_ERROR(kInternal, "quant_linear has no host copy of its packed "
+                                "plane to read");
+  }
+  const std::size_t rows = x.element_count() / in_dim;
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t o = 0; o < out_dim; ++o) {
+      const std::uint32_t* row = w + o * lanes;
+      double acc = 0.0;
+      for (std::size_t i = 0; i < in_dim; ++i) {
+        const std::size_t g = i / static_cast<std::size_t>(spec.group_size);
+        const float wv =
+            static_cast<float>(spec.code_at(row, i)) *
+                load_element(scales, o * groups + g) +
+            load_element(biases, o * groups + g);
+        acc += static_cast<double>(load_element(x, r * in_dim + i)) *
+               static_cast<double>(wv);
+      }
+      store_element(n, r * out_dim + o, static_cast<float>(acc));
+    }
+  }
+  return OkStatus();
+}
+
 // x [.., width] viewed as [N, width]; rows[i] selects a row.
 Status eval_gather_rows(Node& n) {
   const Node& x = *n.inputs[0];
@@ -841,6 +891,11 @@ float load_element(const Node& node, std::size_t index) noexcept {
       return static_cast<float>(static_cast<const std::int8_t*>(p)[index]);
     case DType::kU8:
       return static_cast<float>(static_cast<const std::uint8_t*>(p)[index]);
+    // Exact only below 2^24, same as kI32. A packed group-affine plane routinely
+    // exceeds that, which is why eval_quant_matmul reads its lanes directly
+    // instead of coming through here.
+    case DType::kU32:
+      return static_cast<float>(static_cast<const std::uint32_t*>(p)[index]);
     default: return 0.0f;
   }
 }
@@ -870,6 +925,9 @@ void store_element(Node& node, std::size_t index, float value) noexcept {
       break;
     case DType::kU8:
       static_cast<std::uint8_t*>(p)[index] = static_cast<std::uint8_t>(value);
+      break;
+    case DType::kU32:
+      static_cast<std::uint32_t*>(p)[index] = static_cast<std::uint32_t>(value);
       break;
     default: break;
   }
@@ -973,6 +1031,10 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
 
     case OpKind::kLinear:
       LSE_RETURN_IF_ERROR(eval_linear(n));
+      break;
+
+    case OpKind::kQuantMatMul:
+      LSE_RETURN_IF_ERROR(eval_quant_matmul(n));
       break;
 
     case OpKind::kMoEDispatch:

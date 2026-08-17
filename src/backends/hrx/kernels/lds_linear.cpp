@@ -27,11 +27,8 @@ constexpr std::int64_t kMaxRows = 16;
 
 std::uint32_t wave_of(const DeviceInfo* device) {
   if (device == nullptr) return 32;
-  const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*device);
-  if (amd != nullptr && (amd->wavefront_size == 32 || amd->wavefront_size == 64)) {
-    return amd->wavefront_size;
-  }
-  return 32;
+  const std::uint32_t wave = device->wavefront_size;
+  return (wave == 32 || wave == 64) ? wave : 32u;
 }
 
 struct LinearDims {

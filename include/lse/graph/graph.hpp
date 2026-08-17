@@ -22,7 +22,6 @@
 #include "lse/core/status.hpp"
 #include "lse/graph/fallback.hpp"
 #include "lse/graph/primitive.hpp"
-#include "lse/graph/sharding.hpp"
 #include "lse/graph/workgroup.hpp"
 
 namespace lse::graph {
@@ -106,7 +105,6 @@ class Node {
   const Primitive* prim = nullptr;   // non-null only for kCustom
   Shape shape;
   DType dtype = DType::kF32;
-  Sharding sharding;
   std::vector<NodePtr> inputs;
 
   std::array<float, 4> attrs{};

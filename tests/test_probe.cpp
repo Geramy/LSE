@@ -654,6 +654,58 @@ LSE_TEST(a_hundred_gigabyte_model_on_eight_devices_is_a_capacity_split) {
   for (const auto& s : refused.shares) LSE_EXPECT_EQ(s.fraction, 0.0);
 }
 
+LSE_TEST(a_sampled_free_memory_turns_an_unknown_verdict_into_a_decision) {
+  const Work w = resident_work(40 * kGB);
+  const DeviceId a = dev("hrx", 0);
+
+  // What every device on this box answered before the backend seam carried a
+  // memory query: no basis, so no verdict.
+  const PoolProfile blind = lopsided_pool(-1.0, -1.0);
+  const Capacity before = CostModel(blind).capacity_for(w, a);
+  LSE_EXPECT(before.fit == Fit::kUnknown);
+  LSE_EXPECT(!before.known());
+  LSE_EXPECT(before.provenance == Provenance::kUnknown);
+
+  // Same device, same work, one number the backend answered.
+  const PoolProfile sampled = lopsided_pool(80 * kGB, 80 * kGB);
+  const Capacity after = CostModel(sampled).capacity_for(w, a);
+  LSE_EXPECT(after.fit == Fit::kFits);
+  LSE_EXPECT(after.fits());
+  // Measured, not declared: this is an observation of one instant on one
+  // machine, not a fact about the part that a table could have held.
+  LSE_EXPECT(after.provenance == Provenance::kMeasured);
+  LSE_EXPECT_EQ(after.bytes_free, 80 * kGB);
+  LSE_EXPECT_EQ(after.bytes_resident, w.bytes_resident);
+}
+
+LSE_TEST(forty_gigabytes_resident_on_a_sixteen_gigabyte_device_reads_exceeds) {
+  const Work w = resident_work(40 * kGB);
+  const DeviceId b = dev("hrx", 1);
+
+  // Unsampled, this is the verdict — a refusal, but not a statement about the
+  // device. It is the state the whole defect consisted of.
+  const PoolProfile blind = lopsided_pool(80 * kGB, -1.0);
+  LSE_EXPECT(CostModel(blind).capacity_for(w, b).fit == Fit::kUnknown);
+
+  // Sampled, the constraint binds: 40 GB resident against 16 GB free is not an
+  // expensive plan, it is not a plan.
+  const PoolProfile tight = lopsided_pool(80 * kGB, 16 * kGB);
+  const Capacity c = CostModel(tight).capacity_for(w, b);
+  LSE_EXPECT(c.fit == Fit::kExceeds);
+  LSE_EXPECT(c.known());
+  LSE_EXPECT(!c.fits());
+  LSE_EXPECT(c.provenance == Provenance::kMeasured);
+  LSE_EXPECT_EQ(c.bytes_free, 16 * kGB);
+  LSE_EXPECT_EQ(c.bytes_resident, w.bytes_resident);
+
+  // A device with nothing left is a measurement of zero, not an absence of
+  // one, and it must exceed rather than go unknown.
+  const PoolProfile full = lopsided_pool(80 * kGB, 0.0);
+  const Capacity empty = CostModel(full).capacity_for(w, b);
+  LSE_EXPECT(empty.fit == Fit::kExceeds);
+  LSE_EXPECT(empty.known());
+}
+
 LSE_TEST(unknown_free_memory_is_an_unknown_verdict_not_a_pass) {
   const Work w = resident_work(40 * kGB);
   const DeviceId a = dev("hrx", 0);
@@ -1092,6 +1144,63 @@ LSE_TEST(qualifying_a_pool_measures_once_and_then_reads_it_back) {
   fs::remove_all(scratch_dir(), ec);
 }
 
+LSE_TEST(a_cached_pool_never_replays_the_free_memory_it_was_saved_with) {
+  backend::IBackend* be = host_backend();
+  if (be == nullptr) {
+    std::printf("       skipped: no cpu backend in this build\n");
+    return;
+  }
+  const fs::path dir = scratch_dir() / "stale";
+  PoolMember m;
+  m.id = dev("cpu", 0);
+  m.rank = 0;
+  m.host = "test-host";
+  m.backend = be;
+  const PoolMember members[] = {m};
+
+  PoolOptions opts;
+  opts.profile_dir = dir.string();
+
+  auto first = qualify_pool(members, nullptr, opts);
+  LSE_EXPECT(first.ok());
+  if (!first.ok()) return;
+
+  // Age the entry the way an hour on a shared box would: same fingerprint,
+  // same hardware, a free-memory figure that was true when it was written.
+  // The fingerprint is folded from device identity and is deliberately blind
+  // to anything volatile, so it cannot tell the difference — which is exactly
+  // why the reader has to.
+  auto fingerprint = pool_fingerprint(members, nullptr);
+  LSE_EXPECT(fingerprint.ok());
+  if (!fingerprint.ok()) return;
+  PoolProfile stale = first.release();
+  stale.devices[0].free_memory = Measured::measured(999e9);
+  LSE_EXPECT_OK(save_pool_profile(stale, dir.string()));
+  auto reread = load_pool_profile(*fingerprint, dir.string());
+  LSE_EXPECT(reread.ok());
+  // The store is a faithful serializer; it is qualify_pool that refuses.
+  if (reread.ok()) LSE_EXPECT_EQ(reread->devices[0].free_memory.value, 999e9);
+
+  auto second = qualify_pool(members, nullptr, opts);
+  LSE_EXPECT(second.ok());
+  if (!second.ok()) return;
+  // A cache hit: the numbers that are properties of the hardware came straight
+  // off the disk, bit for bit.
+  LSE_EXPECT_EQ(second->devices[0].dram_bytes_per_s.value,
+                stale.devices[0].dram_bytes_per_s.value);
+  LSE_EXPECT_EQ(second->devices[0].launch_overhead_ns.value,
+                stale.devices[0].launch_overhead_ns.value);
+  // The one that is a property of the moment did not.
+  LSE_EXPECT(second->devices[0].free_memory.value != 999e9);
+  // This backend declines the query, so nothing sampled it this run and the
+  // verdict is a refusal rather than a stale pass.
+  LSE_EXPECT(!second->devices[0].free_memory.known());
+  LSE_EXPECT_EQ(second->devices[0].free_memory.value, 0.0);
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
 // ---------------------------------------------------------------------------
 // The probe never invents a number
 // ---------------------------------------------------------------------------
@@ -1178,6 +1287,43 @@ LSE_TEST(a_probe_that_cannot_reach_a_number_leaves_it_unknown) {
               profiled->launch_overhead_ns.value);
 }
 
+LSE_TEST(a_backend_that_declines_the_memory_query_leaves_free_memory_unknown) {
+  backend::IBackend* be = host_backend();
+  if (be == nullptr) {
+    std::printf("       skipped: no cpu backend in this build\n");
+    return;
+  }
+  // The seam refuses with a status. It does not answer zero, which would read
+  // as a full device, and it does not answer the declared total, which would
+  // read as an empty one.
+  const auto answer = be->sample_free_memory();
+  LSE_EXPECT(!answer.ok());
+  LSE_EXPECT(answer.status().code() == StatusCode::kUnimplemented);
+  LSE_EXPECT(!sample_free_memory(*be).known());
+  LSE_EXPECT_EQ(sample_free_memory(*be).value, 0.0);
+
+  auto profiled = probe_device(*be);
+  LSE_EXPECT(profiled.ok());
+  if (!profiled.ok()) return;
+  LSE_EXPECT(!profiled->free_memory.known());
+  LSE_EXPECT_EQ(profiled->free_memory.value, 0.0);
+
+  // A decline is a hole the profile can name, not a silent one.
+  auto probe = create_device_probe(*be);
+  LSE_EXPECT(probe->declined().find("memory query") != std::string_view::npos);
+
+  // And downstream it refuses a placement rather than approving one.
+  PoolProfile pool;
+  pool.fingerprint = "cpu-only";
+  pool.devices.push_back(*profiled);
+  pool.links.push_back(
+      fake_link(profiled->id, profiled->id, PathKind::kSameDevice, 0.0, 0.0));
+  const Capacity c =
+      CostModel(pool).capacity_for(resident_work(kGB), profiled->id);
+  LSE_EXPECT(c.fit == Fit::kUnknown);
+  LSE_EXPECT(!c.fits());
+}
+
 LSE_TEST(the_device_probe_measures_the_roofline_and_the_matrix_rows) {
   backend::IBackend* be = device_backend();
   if (be == nullptr) {
@@ -1207,6 +1353,19 @@ LSE_TEST(the_device_probe_measures_the_roofline_and_the_matrix_rows) {
               profiled->launch_overhead_ns.value / 1e3,
               profiled->h2d_bytes_per_s.value / 1e9,
               profiled->d2h_bytes_per_s.value / 1e9);
+  std::printf("       memory: %.2f GB free of %.2f GB declared (%s)\n",
+              profiled->free_memory.value / 1e9,
+              static_cast<double>(profiled->total_memory) / 1e9,
+              std::string(to_string(profiled->free_memory.provenance)).c_str());
+  // This device's runtime does answer the memory query, so the figure is here
+  // and it is an observation rather than the part number.
+  LSE_EXPECT(profiled->free_memory.known());
+  LSE_EXPECT(profiled->free_memory.provenance == Provenance::kMeasured);
+  LSE_EXPECT(profiled->free_memory.value >= 0.0);
+  // Two samples a moment apart are both valid answers to different instants,
+  // and neither is the declared total. A low reading on a busy box is the
+  // correct answer, not a fault.
+  LSE_EXPECT(sample_free_memory(*be).known());
   for (const MatrixRowRate& r : profiled->rows) {
     std::printf("         %-32s %-10s %8.2f TFLOP/s (table ratio %d)\n",
                 r.key.c_str(), std::string(to_string(r.support)).c_str(),

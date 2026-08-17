@@ -6,6 +6,43 @@
 
 namespace lse::model {
 
+namespace {
+
+// layer.hpp warns that an unclaimed tensor is the likeliest silent failure when
+// a second architecture arrives, and nothing checked for one. This is that
+// check: it runs on every load, and it names the tensors rather than just their
+// count so the report says which part of the checkpoint went unread.
+Status audit_unclaimed(const WeightBinder& binder,
+                       const std::vector<std::string>& ignored) {
+  std::vector<std::string> missed;
+  for (const std::string& name : binder.unclaimed()) {
+    bool covered = false;
+    for (const std::string& prefix : ignored) {
+      if (name.rfind(prefix, 0) == 0) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) missed.push_back(name);
+  }
+  if (missed.empty()) return OkStatus();
+
+  std::string names;
+  const std::size_t shown = missed.size() < 8 ? missed.size() : 8;
+  for (std::size_t i = 0; i < shown; ++i) {
+    if (i != 0) names += ", ";
+    names += missed[i];
+  }
+  if (missed.size() > shown) {
+    names += ", and " + std::to_string(missed.size() - shown) + " more";
+  }
+  return LSE_ERROR(kInvalidArgument, "no layer claimed ",
+                   std::to_string(missed.size()),
+                   " checkpoint tensor(s): ", names);
+}
+
+}  // namespace
+
 Status HybridLM::load(WeightBinder& binder) {
   LSE_ASSIGN_OR(embed_weight_, binder.require(spec_.embed_name));
   LSE_ASSIGN_OR(final_norm_weight_, binder.require(spec_.final_norm_name));
@@ -28,7 +65,7 @@ Status HybridLM::load(WeightBinder& binder) {
     LSE_RETURN_IF_ERROR(block->load(binder, prefix, ctx));
     blocks_.push_back(std::move(block));
   }
-  return OkStatus();
+  return audit_unclaimed(binder, spec_.ignored_prefixes);
 }
 
 Result<Array> HybridLM::embed(const Array& tokens) const {
@@ -129,11 +166,14 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   if (states != nullptr && tokens.valid()) {
     const auto batch = tokens.shape().dim(0);
-    const auto vh = static_cast<std::int64_t>(config_.gdn_qk_heads);
-    const auto vd = static_cast<std::int64_t>(config_.gdn_head_dim);
+    const auto vh = static_cast<std::int64_t>(
+        spec_.gdn_state_heads > 0 ? spec_.gdn_state_heads : config_.gdn_qk_heads);
+    const auto vd = static_cast<std::int64_t>(
+        spec_.gdn_state_dim > 0 ? spec_.gdn_state_dim : config_.gdn_head_dim);
     const auto tail = config_.gdn_conv_kernel > 1
                           ? static_cast<std::int64_t>(config_.gdn_conv_kernel - 1)
                           : 0;
+    const auto fused = static_cast<std::int64_t>(spec_.gdn_conv_width);
     const auto width = vh * vd;
     for (std::size_t i = 0; i < states->size(); ++i) {
       if (config_.is_attention_layer(static_cast<std::int32_t>(i))) continue;
@@ -141,7 +181,15 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       if (!st.gdn_state.valid()) {
         st.gdn_state = Array::zeros(Shape{batch, vh, vd, vd}, DType::kF32);
       }
-      if (tail > 0 && width > 0) {
+      if (tail <= 0) continue;
+      // The tail is not an optimization: causal_conv1d zero-pads, so a decode
+      // step with no tail convolves against zeros where the previous kernel-1
+      // tokens belong.
+      if (fused > 0) {
+        if (!st.gdn_conv_qkv.valid()) {
+          st.gdn_conv_qkv = Array::zeros(Shape{batch, tail, fused}, DType::kF32);
+        }
+      } else if (width > 0) {
         if (!st.gdn_conv_q.valid()) {
           st.gdn_conv_q = Array::zeros(Shape{batch, tail, width}, DType::kF32);
         }

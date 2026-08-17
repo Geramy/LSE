@@ -30,6 +30,7 @@ add_library(lse_backend_hrx
   hip_types.cpp
   kernels/wmma_linear.cpp
   kernels/lds_linear.cpp
+  kernels/quant_linear.cpp
   kernels/linked.cpp
   kernels/dist_codec.cpp
   kernels/probe.cpp

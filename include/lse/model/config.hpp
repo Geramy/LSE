@@ -1,6 +1,12 @@
 // Field names match the JSON keys lemonseed's save_model() writes beside the
 // .safetensors, so its checkpoints load without conversion.
 // Source of truth: reference/lemonseed/lemonseed/config.py @ 6fb97de
+//
+// A HuggingFace config.json shares none of those names and nests the decoder
+// under "text_config", so from_json_string dispatches on that key and reads
+// the HF spelling instead. Every field the HF path needs is required there:
+// silently keeping a default would hand the builder a model of the wrong
+// shape that still passes validate().
 #pragma once
 
 #include <cstdint>
@@ -35,11 +41,17 @@ struct Config {
   std::int32_t gdn_conv_kernel = 4;
   std::int32_t gdn_chunk_size = 64;
 
+  // Dense feed-forward width. 0 means every layer's FFN is routed.
+  std::int32_t mlp_intermediate = 0;
+
   // MoE
   std::int32_t num_experts = 8;
   std::int32_t num_active_experts = 2;  // upper cap, see expert_score_band
   std::int32_t num_shared_experts = 1;
   std::int32_t expert_intermediate = 256;
+  // 0 means the shared expert is as wide as a routed one, which is lemonseed's
+  // layout; Qwen sizes the two independently.
+  std::int32_t shared_expert_intermediate = 0;
   float router_aux_loss_coef = 0.01f;
   float router_z_loss_coef = 0.001f;
   // Keep experts within this fraction of the top expert's probability.
@@ -54,6 +66,9 @@ struct Config {
   // Mirrors LEMONSEED_MOE_BIAS_BALANCE: the expert_bias in the checkpoint only
   // steers routing when this is on. Default off, matching the reference.
   bool moe_bias_balance = false;
+
+  // False means the checkpoint carries a separate lm_head.
+  bool tie_word_embeddings = true;
 
   // Training-side
   std::int32_t train_seq_len = 128;

@@ -27,6 +27,9 @@ DType dtype_from_safetensors(std::string_view s) noexcept {
   if (s == "I32") return DType::kI32;
   if (s == "I8") return DType::kI8;
   if (s == "U8") return DType::kU8;
+  // MLX writes the packed plane of a group-affine weight as U32; the codes
+  // inside a lane are narrower than any dtype names.
+  if (s == "U32") return DType::kU32;
   return DType::kCount;
 }
 

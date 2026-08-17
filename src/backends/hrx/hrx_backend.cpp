@@ -63,26 +63,27 @@ template <typename T>
   return std::string(buffer);
 }
 
-// The agent's own answer to "how many queues may exist on you at once"
-// (HSA_AGENT_INFO_QUEUES_MAX; 128 on gfx1151). hrx has no property for it, so
-// it is read from the copy of libhsa-runtime64 that hrx has *already* loaded —
-// dlopen by soname returns that same handle, never a second runtime. The three
-// entry points below have been ABI-stable since HSA 1.0 and are declared here
-// rather than by including <hsa/hsa.h>, which is not a build input of this
-// backend. Returns 0 when the runtime is not reachable, which is not an error:
-// the caller then bounds the stream count by the compute units alone.
-std::uint32_t agent_queue_maximum(std::uint8_t ordinal) noexcept {
+// One attribute of the `ordinal`-th GPU agent, read from the copy of
+// libhsa-runtime64 that hrx has *already* loaded — dlopen by soname returns
+// that same handle, never a second runtime. The three entry points below have
+// been ABI-stable since HSA 1.0 and are declared here rather than by including
+// <hsa/hsa.h>, which is not a build input of this backend. hsa_agent_get_info
+// writes exactly the attribute's own width, so `out` must be that wide and
+// there is no size to pass.
+//
+// False when the runtime is not reachable or the agent will not answer. Each
+// caller has its own answer for not knowing; neither invents one.
+bool agent_attribute(std::uint8_t ordinal, int attribute, void* out) noexcept {
   struct HsaAgent {
     std::uint64_t handle;
   };
   using HsaStatus = int;
   constexpr HsaStatus kSuccess = 0;
-  constexpr int kInfoQueuesMax = 12;
   constexpr int kInfoDevice = 17;
   constexpr int kDeviceTypeGpu = 1;
 
   void* lib = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
-  if (lib == nullptr) return 0;
+  if (lib == nullptr) return false;
 
   using IterateFn = HsaStatus (*)(HsaStatus (*)(HsaAgent, void*), void*);
   using GetInfoFn = HsaStatus (*)(HsaAgent, int, void*);
@@ -90,15 +91,17 @@ std::uint32_t agent_queue_maximum(std::uint8_t ordinal) noexcept {
   auto get_info = reinterpret_cast<GetInfoFn>(dlsym(lib, "hsa_agent_get_info"));
   if (iterate == nullptr || get_info == nullptr) {
     dlclose(lib);
-    return 0;
+    return false;
   }
 
   struct Visit {
     GetInfoFn get_info;
     std::uint8_t want;
     std::uint8_t seen;
-    std::uint32_t queues;
-  } visit{get_info, ordinal, 0, 0};
+    int attribute;
+    void* out;
+    bool filled;
+  } visit{get_info, ordinal, 0, attribute, out, false};
 
   iterate(
       [](HsaAgent agent, void* data) -> HsaStatus {
@@ -107,17 +110,36 @@ std::uint32_t agent_queue_maximum(std::uint8_t ordinal) noexcept {
         if (v->get_info(agent, kInfoDevice, &type) != kSuccess) return kSuccess;
         if (type != kDeviceTypeGpu) return kSuccess;
         if (v->seen++ != v->want) return kSuccess;
-        std::uint32_t queues = 0;
-        if (v->get_info(agent, kInfoQueuesMax, &queues) == kSuccess) {
-          v->queues = queues;
-        }
+        v->filled = v->get_info(agent, v->attribute, v->out) == kSuccess;
         return kSuccess;
       },
       &visit);
 
   dlclose(lib);
-  return visit.queues;
+  return visit.filled;
 }
+
+// The agent's own answer to "how many queues may exist on you at once"
+// (HSA_AGENT_INFO_QUEUES_MAX; 128 on gfx1151). hrx has no property for it.
+// Returns 0 when the agent cannot be asked, which is not an error: the caller
+// then bounds the stream count by the compute units alone.
+std::uint32_t agent_queue_maximum(std::uint8_t ordinal) noexcept {
+  constexpr int kInfoQueuesMax = 12;
+  std::uint32_t queues = 0;
+  if (!agent_attribute(ordinal, kInfoQueuesMax, &queues)) return 0;
+  return queues;
+}
+
+#if LSE_HRX_LINKED
+// Bytes free across every global pool this agent owns
+// (HSA_AMD_AGENT_INFO_MEMORY_AVAIL, hsa_ext_amd.h). A live figure: it falls as
+// any process on the box allocates and rises as they free. This is the same
+// query hipMemGetInfo answers with, one layer further out than hrx.
+bool agent_memory_available(std::uint8_t ordinal, std::uint64_t* out) noexcept {
+  constexpr int kInfoMemoryAvail = 0xA015;
+  return agent_attribute(ordinal, kInfoMemoryAvail, out);
+}
+#endif
 
 // How many logical queues this device's submission path can address, asked of
 // the device rather than read off a header.
@@ -276,10 +298,10 @@ Status HrxBackend::init_impl(int device_ordinal) {
     info_.max_threads_per_workgroup = static_cast<std::uint16_t>(u32);
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_WARP_SIZE, &u32).ok()) {
-    amd_.wavefront_size = static_cast<std::uint8_t>(u32);
+    info_.wavefront_size = static_cast<std::uint16_t>(u32);
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_MAX_SHARED_MEMORY, &u32).ok()) {
-    amd_.lds_bytes_per_workgroup = u32;
+    info_.lds_bytes_per_workgroup = u32;
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_CLOCK_RATE, &u32).ok()) {
     amd_.clock_khz = u32;
@@ -486,6 +508,42 @@ void HrxBackend::deallocate_impl(DeviceBuffer& buf) noexcept {
   buf.handle = 0;
   buf.ptr = nullptr;
   buf.size_bytes = 0;
+}
+
+Result<std::size_t> HrxBackend::sample_free_memory_impl() const {
+#if !LSE_HRX_LINKED
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
+  // hrx_device_memory_info rejects a null total_bytes, so the declared total
+  // is read and dropped — info_.total_memory already carries it, and it is a
+  // different quantity from the one being sampled here.
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  const hrx_status_t status = hrx_device_memory_info(
+      static_cast<hrx_device_t>(device_), &free_bytes, &total_bytes);
+  if (hrx_status_is_ok(status)) return free_bytes;
+  // UNAVAILABLE is this HAL declining to publish an availability observation,
+  // which is an absent query and not a broken device — from_hrx would fold it
+  // into kDeviceError and a caller that stops on device errors would turn an
+  // unanswerable question into a failed run. It is also the answer on every
+  // device LSE runs on today: the AMDGPU HAL populates its memory observation
+  // from the device spec and therefore sets the total only
+  // (iree/hal/drivers/amdgpu/logical_device.c). The agent underneath still
+  // knows, so ask it before giving up; hrx stays first so that the day the HAL
+  // publishes the figure it is the one that is used.
+  if (hrx_status_code(status) != HRX_STATUS_UNAVAILABLE) {
+    return from_hrx(status, "hrx_device_memory_info");
+  }
+  hrx_status_ignore(status);
+  std::uint64_t available = 0;
+  if (!agent_memory_available(info_.ordinal, &available)) {
+    return LSE_ERROR(kUnimplemented,
+                     "neither this device's HAL nor its agent publishes an "
+                     "available-memory figure");
+  }
+  return static_cast<std::size_t>(available);
+#endif
 }
 
 Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,

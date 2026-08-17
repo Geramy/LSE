@@ -7,7 +7,7 @@
 #include "lse/graph/codegen.hpp"
 #include "lse/probe/device_probe.hpp"
 #include "lse/probe/profile_store.hpp"
-#include "wire.hpp"
+#include "lse/probe/wire.hpp"
 
 namespace lse::probe {
 
@@ -157,7 +157,25 @@ Result<PoolProfile> qualify_pool(std::span<const PoolMember> members,
     for (std::size_t i = 0; i < members.size(); ++i) {
       if (!(cached->devices[i].id == members[i].id)) matches = false;
     }
-    if (matches) return cached.release();
+    if (matches) {
+      PoolProfile pool = cached.release();
+      // Every other number in a profile is a property of the hardware and
+      // holds until the fingerprint changes. Free memory is a property of the
+      // moment — it moves with every other process on the box — and the
+      // fingerprint is deliberately blind to exactly that. Replayed, it would
+      // reach capacity_for labelled kMeasured with no way to tell it is hours
+      // old, and a stale pass is worse than the refusal an unknown produces.
+      // So the stored figure is dropped for every member, and only the one
+      // something can sample right now gets a figure back. A peer stays
+      // unknown until a rank that can reach it probes again, which is the same
+      // refusal an unmeasured device already gets.
+      for (DeviceProfile& d : pool.devices) d.free_memory = Measured::unknown();
+      if (members[self].backend != nullptr) {
+        pool.devices[self].free_memory =
+            sample_free_memory(*members[self].backend);
+      }
+      return pool;
+    }
   }
 
   DeviceProfile local = bare_profile(members[self]);

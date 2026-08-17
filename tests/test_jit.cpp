@@ -51,9 +51,6 @@ struct JitHostOnly final : ElementwisePrimitive<JitHostOnly, 1> {
 const backend::AmdDeviceInfo& gfx1151_amd() {
   static const backend::AmdDeviceInfo amd = [] {
     backend::AmdDeviceInfo a;
-    a.wavefront_size = 32;
-    a.max_waves_per_cu = 32;
-    a.lds_bytes_per_workgroup = 65536;
     a.matrix_core = backend::MatrixCore::kWMMA;
     a.has_bf16_arith = true;
     a.max_load_bytes = 16;
@@ -69,6 +66,9 @@ backend::DeviceInfo gfx1151() {
   d.arch = "gfx1151";
   d.compute_units = 40;
   d.max_threads_per_workgroup = 1024;
+  d.wavefront_size = 32;
+  d.max_waves_per_cu = 32;
+  d.lds_bytes_per_workgroup = 65536;
   d.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d.extension = &gfx1151_amd();
   return d;
@@ -254,14 +254,14 @@ LSE_TEST(hrx_reported_cus_are_not_overwritten_by_the_table) {
   info.arch = "gfx1151";
   info.compute_units = 7;
   info.max_threads_per_workgroup = 256;
+  info.lds_bytes_per_workgroup = 12345;
+  info.wavefront_size = 32;
   backend::AmdDeviceInfo amd;
-  amd.lds_bytes_per_workgroup = 12345;
-  amd.wavefront_size = 32;
   backend::apply_arch_defaults(info, amd);
   LSE_EXPECT_EQ(info.compute_units, 7);
   LSE_EXPECT_EQ(info.max_threads_per_workgroup, 256);
-  LSE_EXPECT_EQ(amd.lds_bytes_per_workgroup, 12345u);
-  LSE_EXPECT_EQ(amd.wavefront_size, 32);
+  LSE_EXPECT_EQ(info.lds_bytes_per_workgroup, 12345u);
+  LSE_EXPECT_EQ(info.wavefront_size, 32);
   LSE_EXPECT(amd.matrix_core == backend::MatrixCore::kWMMA);
 }
 
@@ -271,7 +271,7 @@ LSE_TEST(unknown_family_still_gets_isa_from_the_arch_string) {
   backend::AmdDeviceInfo amd;
   backend::apply_arch_defaults(info, amd);
   LSE_EXPECT(backend::arch_family(info.arch) == backend::ArchFamily::kRdna3);
-  LSE_EXPECT_EQ(amd.wavefront_size, 32);
+  LSE_EXPECT_EQ(info.wavefront_size, 32);
   LSE_EXPECT(amd.matrix_core == backend::MatrixCore::kWMMA);
 }
 
@@ -283,11 +283,12 @@ LSE_TEST(rdna4_profile_honours_lse_wavefront) {
   info.arch = "gfx1201";
   backend::AmdDeviceInfo amd;
   backend::apply_arch_defaults(info, amd);
-  LSE_EXPECT_EQ(amd.wavefront_size, 32);
+  LSE_EXPECT_EQ(info.wavefront_size, 32);
   ::setenv("LSE_WAVEFRONT", "64", 1);
   amd = {};
+  info.wavefront_size = 0;
   backend::apply_arch_defaults(info, amd);
-  LSE_EXPECT_EQ(amd.wavefront_size, 64);
+  LSE_EXPECT_EQ(info.wavefront_size, 64);
   if (!saved.empty()) ::setenv("LSE_WAVEFRONT", saved.c_str(), 1);
   else ::unsetenv("LSE_WAVEFRONT");
 }
@@ -303,8 +304,7 @@ LSE_TEST(emitter_chooses_a_legal_workgroup_size) {
   const std::uint32_t threads = e->dims.workgroup_size[0];
   LSE_EXPECT(threads > 0);
   LSE_EXPECT(threads <= d.max_threads_per_workgroup);
-  const backend::AmdDeviceInfo& amd = gfx1151_amd();
-  LSE_EXPECT(threads % amd.wavefront_size == 0);
+  LSE_EXPECT(threads % d.wavefront_size == 0);
   LSE_EXPECT(backend::occupancy_per_cu(d, threads, 0) > 0);
 
   // Enough workgroups to cover every element.
@@ -1353,7 +1353,6 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   // gfx1201 and gfx942 name a target — the family is known — but no row of
   // theirs is emittable, so the linear declines and the group falls back.
   backend::AmdDeviceInfo amd12;
-  amd12.wavefront_size = 32;
   amd12.matrix_core = backend::MatrixCore::kWMMA;
   amd12.matrix_core_bf16 = true;
   amd12.max_load_bytes = 16;
@@ -1361,6 +1360,7 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   backend::DeviceInfo d12;
   d12.arch = "gfx1201";
   d12.max_threads_per_workgroup = 1024;
+  d12.wavefront_size = 32;
   d12.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d12.extension = &amd12;
   LSE_EXPECT(backend::hrx_kernels::matrix_target(d12).has_value());
@@ -1368,7 +1368,6 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
              MatrixTarget::kRdna4);
 
   backend::AmdDeviceInfo amd942;
-  amd942.wavefront_size = 64;
   amd942.matrix_core = backend::MatrixCore::kMFMA;
   amd942.matrix_core_bf16 = true;
   amd942.max_load_bytes = 16;
@@ -1376,6 +1375,7 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   backend::DeviceInfo d942;
   d942.arch = "gfx942";
   d942.max_threads_per_workgroup = 1024;
+  d942.wavefront_size = 64;
   d942.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d942.extension = &amd942;
   LSE_EXPECT(*backend::hrx_kernels::matrix_target(d942) ==

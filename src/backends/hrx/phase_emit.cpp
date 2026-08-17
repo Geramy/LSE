@@ -29,6 +29,7 @@ std::string_view device_scalar(DType dt) noexcept {
     case DType::kF16: return "_Float16";
     case DType::kBF16: return "__bf16";
     case DType::kI32: return "int";
+    case DType::kU32: return "unsigned int";
     default: return "float";
   }
 }
@@ -133,7 +134,7 @@ bool wave_gemv_beats_lanes(const Node& node, const GemvShape& g) noexcept {
 // Independent work items the stage can spend. A primitive that owns its
 // indexing sizes its own grid (a decode gdn_chunk_scan wants 16384 threads
 // for a 512-element output), so its plan is the only honest answer.
-std::uint32_t stage_threads(const Node& node, const KernelShapes& sh,
+std::uint32_t stage_thread_count(const Node& node, const KernelShapes& sh,
                             const KernelPrimitiveBase* spec) {
   if (spec != nullptr && spec->owns_indexing() &&
       !is_linear_name(spec->name())) {
@@ -171,10 +172,8 @@ std::string gemv_stage(const std::string& x, const std::string& w,
       idxp = &ib;
     }
     std::uint32_t wave = 32;
-    if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
-      if (amd->wavefront_size == 32 || amd->wavefront_size == 64) {
-        wave = amd->wavefront_size;
-      }
+    if (device.wavefront_size == 32 || device.wavefront_size == 64) {
+      wave = device.wavefront_size;
     }
     hrx_kernels::emit_gemv<W>(body, xb, wb, idxp, keep, slot, N, K, M,
                               hrx_kernels::device_load_bytes(&device), grid,
@@ -294,24 +293,7 @@ const Node* written_buf(const Node& n) noexcept {
   return &n;
 }
 
-}  // namespace
-
-void HipEmitter::bind_phase(const FusionGroup& group, EmittedKernel& out) {
-  out.binding_order.clear();
-  out.scratch_bytes = 0;
-  std::unordered_set<const Node*> bound;
-  auto bind = [&](const NodePtr& n) {
-    if (!n || !bound.insert(n.get()).second) return;
-    out.binding_order.push_back(n);
-  };
-  for (const NodePtr& in : group.inputs) bind(in);
-  for (const NodePtr& n : group.nodes) {
-    if (n->kind == OpKind::kReshape) continue;
-    bind(n);
-  }
-}
-
-bool HipEmitter::phase_can_stage(const Node& n) noexcept {
+bool node_can_stage(const Node& n) noexcept {
   if (n.kind == OpKind::kReshape || n.kind == OpKind::kConstant ||
       n.kind == OpKind::kBuffer || n.kind == OpKind::kCast ||
       n.kind == OpKind::kBroadcast || n.kind == OpKind::kRepeat) {
@@ -331,8 +313,7 @@ bool HipEmitter::phase_can_stage(const Node& n) noexcept {
   return !kp->owns_indexing();
 }
 
-std::uint32_t HipEmitter::phase_stage_threads(const Node& n,
-                                              const DeviceInfo& device) {
+std::uint32_t node_stage_threads(const Node& n, const DeviceInfo& device) {
   if (n.kind == OpKind::kReshape || n.kind == OpKind::kConstant ||
       n.kind == OpKind::kBuffer) {
     return 0;
@@ -358,7 +339,33 @@ std::uint32_t HipEmitter::phase_stage_threads(const Node& n,
   sh.types = type_table;
   sh.intrinsics = &spellings;
   const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
-  return stage_threads(n, sh, phase_spec(kp, sh));
+  return stage_thread_count(n, sh, phase_spec(kp, sh));
+}
+
+}  // namespace
+
+void HipEmitter::bind_phase(const FusionGroup& group, EmittedKernel& out) {
+  out.binding_order.clear();
+  out.scratch_bytes = 0;
+  std::unordered_set<const Node*> bound;
+  auto bind = [&](const NodePtr& n) {
+    if (!n || !bound.insert(n.get()).second) return;
+    out.binding_order.push_back(n);
+  };
+  for (const NodePtr& in : group.inputs) bind(in);
+  for (const NodePtr& n : group.nodes) {
+    if (n->kind == OpKind::kReshape) continue;
+    bind(n);
+  }
+}
+
+bool HipEmitter::can_stage(const Node& n) const noexcept {
+  return node_can_stage(n);
+}
+
+std::uint32_t HipEmitter::stage_threads(const Node& n,
+                                        const DeviceInfo& device) const {
+  return node_stage_threads(n, device);
 }
 
 Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
@@ -378,7 +385,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     return LSE_ERROR(kUnimplemented, "phase group is views only");
   }
   for (const NodePtr& n : group.nodes) {
-    if (!phase_can_stage(*n)) {
+    if (!node_can_stage(*n)) {
       return LSE_ERROR(kUnimplemented, "phase kernel cannot stage ",
                        std::string(to_string(n->kind)));
     }
@@ -447,7 +454,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     {
       KernelShapes sh = shapes_for(n);
       const auto* kpn = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
-      const std::uint32_t want = stage_threads(*n, sh, phase_spec(kpn, sh));
+      const std::uint32_t want = stage_thread_count(*n, sh, phase_spec(kpn, sh));
       if (want > max_threads) max_threads = want;
     }
     for (const NodePtr& in : n->inputs) {
@@ -672,7 +679,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
         body.replace(pos, 7, "continue;");
         pos += 9;
       }
-      const std::uint32_t nthreads = stage_threads(*n, sh, spec);
+      const std::uint32_t nthreads = stage_thread_count(*n, sh, spec);
       stages << "    {\n";
       for (std::size_t a = 0; a < n->inputs.size(); ++a) {
         const std::string b = bname(n->inputs[a].get());
@@ -839,9 +846,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     out.dims.workgroup_count[1] = 1;
     out.lds_bytes = 256 * 4;
   }
-  if (const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device)) {
-    out.dims.subgroup_size = amd->wavefront_size;
-  }
+  out.dims.subgroup_size = device.wavefront_size;
   return out;
 }
 

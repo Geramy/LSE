@@ -244,6 +244,23 @@ Array linear(const Array& x, const Array& w) {
   return Array(n);
 }
 
+Array quant_linear(const Array& x, const Array& packed, const Array& scales,
+                   const Array& biases, int bits, int group_size) {
+  const Shape& sx = x.shape();
+  Shape out;
+  for (std::size_t i = 0; i + 1 < sx.rank(); ++i) out.push_back(sx.dim(i));
+  out.push_back(packed.shape().dim(0));
+  // f32 regardless of how the scales are stored: the codes carry the weight,
+  // the scale only places it, and the product is an activation.
+  auto n = make(OpKind::kQuantMatMul, out, DType::kF32,
+                {x.node(), packed.node(), scales.node(), biases.node()});
+  n->iattrs[0] = bits;
+  n->iattrs[1] = group_size;
+  n->prim = find_primitive("quant_linear");
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+
 Array embedding(const Array& table, const Array& ids) {
   Shape out;
   for (std::size_t i = 0; i < ids.shape().rank(); ++i) out.push_back(ids.shape().dim(i));

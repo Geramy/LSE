@@ -12,6 +12,7 @@
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/math.hpp"
+#include "lse/quant/group_affine_codec.hpp"
 
 using namespace lse::graph;
 
@@ -239,6 +240,114 @@ LSE_TEST(gemv_k_walk_covers_every_element_once) {
       }
     }
   }
+}
+
+namespace {
+
+// What quant_linear binds: the packed plane plus the two group planes.
+template <class E, class S = lse::bf16>
+struct QuantArgs {
+  env::In<std::uint32_t, E> packed;
+  env::In<S, E> scales;
+  env::In<S, E> biases;
+  env::Out<kir::f32, E> out;
+};
+
+constexpr lse::DType kQuantIn[] = {lse::DType::kU32, lse::DType::kBF16,
+                                   lse::DType::kBF16};
+
+// A row of pseudo-random codes plus one scale/bias pair per group.
+struct QuantRow {
+  std::vector<std::uint32_t> packed;
+  std::vector<lse::bfloat16_t> scales;
+  std::vector<lse::bfloat16_t> biases;
+  std::vector<float> want;
+};
+
+QuantRow make_row(const lse::quant::GroupAffine& q, std::size_t k) {
+  QuantRow r;
+  r.packed.assign(q.packed_words(k), 0u);
+  r.scales.resize(q.group_count(k));
+  r.biases.resize(q.group_count(k));
+  r.want.resize(k);
+  std::uint32_t state = 12345u;
+  for (std::size_t c = 0; c < k; ++c) {
+    state = state * 1664525u + 1013904223u;
+    q.set_code(r.packed.data(), c, (state >> 13) & q.max_code());
+  }
+  for (std::size_t g = 0; g < r.scales.size(); ++g) {
+    r.scales[g] = lse::bfloat16_t(g % 2 == 0 ? 0.0078125f : -0.015625f);
+    r.biases[g] = lse::bfloat16_t(g % 2 == 0 ? -0.0625f : 0.25f);
+  }
+  q.dequantize_row<lse::bfloat16_t>(r.packed.data(), r.scales.data(),
+                                    r.biases.data(), k, r.want.data());
+  return r;
+}
+
+}  // namespace
+
+// The dequant that quant_linear runs in register, executed on the host. Every
+// legal bit width, so the straddling path 3/5/6 bits take is covered too.
+LSE_TEST(group_affine_dequant_runs_the_same_on_the_host) {
+  for (int bits : lse::quant::kGroupAffineBits) {
+    auto spec = lse::quant::GroupAffine::make(bits, 64);
+    LSE_EXPECT(spec.ok());
+    if (!spec.ok()) continue;
+    const lse::quant::GroupAffine q = *spec;
+    const std::size_t k = 128;
+    const QuantRow r = make_row(q, k);
+
+    const auto vals = static_cast<std::size_t>(q.values_per_chunk());
+    const auto words = static_cast<std::size_t>(q.words_per_chunk());
+    const std::size_t per_group = 64 / vals;
+    std::vector<float> got(k, 1e9f);
+
+    QuantArgs<env::Cpu> a{{r.packed.data()},
+                          {r.scales.data()},
+                          {r.biases.data()},
+                          {got.data()}};
+    env::Cpu e{0};
+    for (std::size_t chunk = 0; chunk < k / vals; ++chunk) {
+      const std::size_t g = chunk / per_group;
+      lse::quant::dequant_chunk(
+          e, a.packed, q, static_cast<std::uint32_t>(chunk * words),
+          r.scales[g].to_float(), r.biases[g].to_float(),
+          [&](int c, float v) { got[chunk * vals + static_cast<std::size_t>(c)] = v; });
+    }
+    for (std::size_t i = 0; i < k; ++i) {
+      LSE_EXPECT(std::fabs(got[i] - r.want[i]) < 1e-6f);
+    }
+  }
+}
+
+LSE_TEST(group_affine_dequant_records_shift_free_source) {
+  auto spec = lse::quant::GroupAffine::make(4, 64);
+  LSE_EXPECT(spec.ok());
+  if (!spec.ok()) return;
+  kir::KernelBody k(kTypes, kTable);
+  QuantArgs<env::Emit> args;
+  LSE_EXPECT(env::bind(k, args, kQuantIn, lse::DType::kF32));
+  env::Emit e{&k};
+  auto acc = e.var(0.0f);
+  lse::quant::dequant_chunk(e, args.packed, *spec, e.thread_id(), e.f32(0.25f),
+                            e.f32(-1.0f),
+                            [&](int, const kir::Val<kir::f32>& v) {
+                              acc = v + acc.read();
+                            });
+  const std::string src = k.str();
+
+  // The lane is read at its own width, not widened on the way in.
+  LSE_EXPECT(src.find("unsigned int") != std::string::npos);
+  // Field extraction is division and modulus: kir has no bitwise operators,
+  // and on unsigned values these are the same operation.
+  LSE_EXPECT(src.find(">>") == std::string::npos);
+  LSE_EXPECT(src.find("0xF") == std::string::npos);
+  // Code 5 of a 4-bit chunk sits at bit 20, so its divisor is 2^20, and every
+  // code is masked back to [0, 16).
+  LSE_EXPECT(src.find("/ 1048576u") != std::string::npos);
+  LSE_EXPECT(src.find("% 16u") != std::string::npos);
+  // The weight becomes a value through one fma per code, in register.
+  LSE_EXPECT(src.find("fmaf(") != std::string::npos);
 }
 
 LSE_TEST_MAIN()

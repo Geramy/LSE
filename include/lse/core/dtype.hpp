@@ -17,6 +17,11 @@ enum class DType : std::uint8_t {
   kQ8,     // 8-bit block-quantized  (see quant/traits.hpp)
   kQ6,     // 6-bit block-quantized
   kQ4,     // 4-bit block-quantized
+  // A 32-bit lane. Its one use is the packed plane of a group-affine weight
+  // (quant/group_affine.hpp), where a lane holds several codes of a bit width
+  // the tag cannot name. Appended rather than inserted: the numeric values
+  // above are part of the JIT cache key and the stored device profile.
+  kU32,
   kCount,
 };
 
@@ -117,6 +122,15 @@ struct DTypeTraits<std::uint8_t> {
   static constexpr std::string_view kName = "u8";
 };
 
+template <>
+struct DTypeTraits<std::uint32_t> {
+  static constexpr DType kDType = DType::kU32;
+  static constexpr std::size_t kSize = 4;
+  static constexpr bool kIsFloat = false;
+  static constexpr bool kIsQuantized = false;
+  static constexpr std::string_view kName = "u32";
+};
+
 struct DTypeInfo {
   DType dtype = DType::kF32;
   std::string_view name;
@@ -146,6 +160,13 @@ inline constexpr std::size_t kQuantBlockBytesQ8 = 34;  // fp16 scale + 32 int8
 inline constexpr std::size_t kQuantBlockBytesQ6 = 26;  // scale + 16 low + 8 high
 inline constexpr std::size_t kQuantBlockBytesQ4 = 18;  // scale + 16 packed
 
+// True only for the block schemes, whose geometry is a property of the tag:
+// dtype_storage_bytes can answer for them from block_elems/block_bytes alone.
+// kU32 is deliberately excluded. A group-affine weight's bit width and group
+// size are per tensor — a mixed-precision checkpoint overrides them by tensor
+// path — so no tag could size it, and its scales and biases are separate
+// tensors besides. That geometry lives in quant::GroupAffine, beside the
+// plane; the plane itself really is just 32-bit lanes.
 constexpr bool is_quantized(DType dtype) noexcept {
   return dtype == DType::kQ8 || dtype == DType::kQ6 || dtype == DType::kQ4;
 }

@@ -1,4 +1,5 @@
 // lse — load a checkpoint, tokenize a prompt, stream the continuation.
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,11 +14,14 @@
 
 #include "lse/backend/backend.hpp"
 #include "lse/core/debug.hpp"
+#include "lse/graph/graph.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/ir/pass/pass.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
+#include "lse/probe/pool.hpp"
+#include "lse/probe/profile_store.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 
@@ -178,6 +182,105 @@ int fail(const Status& s, const char* what) {
   return 1;
 }
 
+// Enough of a store entry to tell a rewrite from an untouched read.
+struct StoreEntry {
+  bool present = false;
+  std::uintmax_t size = 0;
+  std::filesystem::file_time_type written{};
+  friend bool operator==(const StoreEntry&, const StoreEntry&) = default;
+};
+
+StoreEntry stat_entry(const std::string& path) {
+  StoreEntry e;
+  std::error_code ec;
+  if (path.empty() || !std::filesystem::is_regular_file(path, ec)) return e;
+  e.size = std::filesystem::file_size(path, ec);
+  if (ec) return e;
+  e.written = std::filesystem::last_write_time(path, ec);
+  if (ec) return e;
+  e.present = true;
+  return e;
+}
+
+struct Qualification {
+  probe::PoolProfile pool;
+  // Non-ok when nothing could be qualified at all. A device that merely could
+  // not be measured is not a failure: it comes back with kUnknown numbers.
+  Status status;
+  bool from_cache = false;
+  double ms = 0.0;
+};
+
+// What this process will run on, measured before anything is placed on it.
+//
+// Called before the weights are bound, for two reasons that both matter: free
+// memory has to mean "what could hold a shard", not "what the model left over",
+// and the probe's own transfers must not be timed against the checkpoint
+// streaming to the same device.
+Qualification qualify_startup_pool() {
+  Qualification q;
+
+  // Untimed on purpose: this brings the backend up, which the engine pays for
+  // either way — building the model was the first caller before this one. The
+  // clock below measures qualification, not device init, or a warm start would
+  // report a couple of hundred milliseconds it did not add.
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    q.status = LSE_ERROR(kDeviceError, "no backend came up to qualify");
+    return q;
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto finish = [&](Qualification&& out) {
+    out.ms = std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - started)
+                 .count();
+    return std::move(out);
+  };
+
+  backend::IBackend& device = sched->backend();
+  probe::PoolMember member;
+  member.id.backend = std::string(device.name());
+  member.id.ordinal = static_cast<int>(device.device_info().ordinal);
+  member.backend = &device;
+  const probe::PoolMember members[] = {member};
+
+  // Whether this start read a profile or paid for one is not the same question
+  // as whether a file was there: a truncated, foreign or unreadable entry is
+  // present and still re-measured, and a store that cannot be written back is
+  // re-measured on every start. Only a measurement rewrites the entry, so the
+  // entry is its own witness — and it stays one however qualify_pool decides
+  // what it will serve.
+  std::string entry;
+  if (auto fingerprint = probe::pool_fingerprint(members, nullptr);
+      fingerprint.ok()) {
+    entry = probe::profile_path(probe::default_profile_dir(), *fingerprint);
+  }
+  const StoreEntry before = stat_entry(entry);
+
+  auto pool = probe::qualify_pool(members, nullptr);
+  q.from_cache = before.present && stat_entry(entry) == before;
+  if (!pool.ok()) {
+    q.status = pool.status();
+    return finish(std::move(q));
+  }
+  q.pool = pool.release();
+  return finish(std::move(q));
+}
+
+void report_pool(const Qualification& q) {
+  if (!q.status.ok()) {
+    std::fprintf(stderr, "probe declined in %.2f ms: %s\n", q.ms,
+                 q.status.to_string().c_str());
+    return;
+  }
+  std::fprintf(stderr, "probe %s in %.2f ms | %zu device%s | cost model %s\n",
+               q.from_cache ? "cached" : "measured", q.ms,
+               q.pool.devices.size(), q.pool.devices.size() == 1 ? "" : "s",
+               q.pool.complete() ? "complete" : "incomplete");
+  std::fputs(q.pool.describe().c_str(), stderr);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -210,17 +313,6 @@ int main(int argc, char** argv) {
   auto weights = model::SafeTensors::open(paths->weights);
   if (!weights.ok()) return fail(weights.status(), "opening the weights");
 
-  // Building the tokenizer is a 248k-entry automaton and binding the weights
-  // streams the whole checkpoint; neither needs the other, so the smaller
-  // hides behind the larger. jthread so an early return below still joins.
-  const std::string tok_dir =
-      paths->weights.substr(0, paths->weights.find_last_of('/'));
-  std::optional<Result<tokenizer::Tokenizer>> tok_slot;
-  std::jthread tok_load([&] {
-    tok_slot.emplace(
-        tokenizer::Tokenizer::for_model_dir(tok_dir, opt.tokenizer_repo));
-  });
-
   auto arch = model::detect_architecture(*cfg, *weights);
   if (opt.arch.empty() && !arch.ok()) {
     return fail(arch.status(), "identifying the architecture");
@@ -229,6 +321,22 @@ int main(int argc, char** argv) {
                opt.arch.empty() ? std::string((*arch)->name).c_str()
                                 : opt.arch.c_str(),
                cfg->num_layers, cfg->hidden_size);
+
+  const Qualification qual = qualify_startup_pool();
+
+  // Building the tokenizer is a 248k-entry automaton and binding the weights
+  // streams the whole checkpoint; neither needs the other, so the smaller
+  // hides behind the larger. jthread so an early return below still joins.
+  // Started after qualification, not before: the automaton saturates a core
+  // for over a second, and a bandwidth or dispatch figure timed against it is
+  // stamped kMeasured and memoized under a fingerprint that cannot see load.
+  const std::string tok_dir =
+      paths->weights.substr(0, paths->weights.find_last_of('/'));
+  std::optional<Result<tokenizer::Tokenizer>> tok_slot;
+  std::jthread tok_load([&] {
+    tok_slot.emplace(
+        tokenizer::Tokenizer::for_model_dir(tok_dir, opt.tokenizer_repo));
+  });
 
   auto built = model::build_model(*cfg, *weights, opt.arch);
   if (!built.ok()) return fail(built.status(), "building the model");
@@ -298,6 +406,7 @@ int main(int argc, char** argv) {
                  static_cast<unsigned long long>(s.jit_disk_hits),
                  static_cast<unsigned long long>(s.jit_compiles),
                  static_cast<double>(s.jit_compile_ns) / 1e9);
+    report_pool(qual);
     // What the kernel IR's middle end actually did, per pass. A pass that
     // reports zero here fired on nothing in this model and is dead weight.
     const std::vector<lse::ir::PassStat> passes = lse::ir::pass_totals();

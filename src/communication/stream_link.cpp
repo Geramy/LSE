@@ -1,4 +1,4 @@
-#include "stream_link.hpp"
+#include "lse/communication/stream_link.hpp"
 
 #include <sys/socket.h>
 #include <sys/uio.h>

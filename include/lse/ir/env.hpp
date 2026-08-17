@@ -129,6 +129,15 @@ struct In<T, Cpu> {
   }
 };
 
+// A 32-bit lane is a bit pattern, not a number. Handing it back as float would
+// round every value past 2^24, which a packed quantization lane is most of the
+// time, so this reads it at its own width — the same width `Emit` gives it.
+template <>
+struct In<std::uint32_t, Cpu> {
+  const std::uint32_t* p = nullptr;
+  [[nodiscard]] std::uint32_t operator[](std::uint32_t i) const { return p[i]; }
+};
+
 template <typename T>
 struct Out<T, Cpu> {
   host_storage_t<T>* p = nullptr;

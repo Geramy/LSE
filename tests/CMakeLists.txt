@@ -14,15 +14,18 @@ endfunction()
 
 lse_add_test(test_dtype)
 lse_add_test(test_reflect)
-lse_add_test(test_kernel_env lse_graph)
-lse_add_test(test_ir lse_ir lse_graph)
+# lse_backends is the set of backends this build ships. A test that runs a
+# graph links it directly: lse_graph implements the seam backends plug into and
+# deliberately does not link any of them, so nothing arrives transitively.
+lse_add_test(test_kernel_env lse_graph lse_backends)
+lse_add_test(test_ir lse_ir lse_graph lse_backends)
 lse_add_test(test_quant)
 lse_add_test(test_shape)
-lse_add_test(test_model lse_model)
+lse_add_test(test_model lse_model lse_backends)
 
 if(LSE_ENABLE_CPU)
-  lse_add_test(test_reference lse_model lse_graph)
-  lse_add_test(test_runtime lse_runtime lse_model lse_graph)
+  lse_add_test(test_reference lse_model lse_graph lse_backends)
+  lse_add_test(test_runtime lse_runtime lse_model lse_graph lse_backends)
 endif()
 
 if(TARGET lse_tokenizer)
@@ -31,13 +34,13 @@ endif()
 
 if(LSE_ENABLE_CPU)
   lse_add_test(test_backend_cpu lse_backend_cpu)
-  lse_add_test(test_graph lse_graph)
-  lse_add_test(test_primitive lse_graph)
+  lse_add_test(test_graph lse_graph lse_backends)
+  lse_add_test(test_primitive lse_graph lse_backends)
 endif()
 
 # Codegen belongs to the backend now, so its test needs one that has codegen.
 if(TARGET lse_backend_hrx)
-  lse_add_test(test_jit lse_graph lse_backend_hrx)
+  lse_add_test(test_jit lse_graph lse_backends)
 endif()
 
 # Client and server both run in this process over a real socket and a real
@@ -50,7 +53,7 @@ lse_add_test(test_communication lse_communication)
 # with no GPU the device cases skip and the host ones still cover the algebra.
 lse_add_test(test_dist lse_dist)
 if(TARGET lse_backend_hrx)
-  target_link_libraries(test_dist PRIVATE lse_graph lse_backend_hrx)
+  target_link_libraries(test_dist PRIVATE lse_graph lse_backends)
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(test_dist PRIVATE Threads::Threads)
@@ -59,11 +62,9 @@ target_link_libraries(test_dist PRIVATE Threads::Threads)
 # and the link matrix runs its ranks on threads over the loopback transport.
 lse_add_test(test_probe lse_probe lse_dist)
 if(TARGET lse_backend_hrx)
-  target_link_libraries(test_probe PRIVATE lse_graph lse_backend_hrx)
+  target_link_libraries(test_probe PRIVATE lse_graph)
 endif()
-if(LSE_ENABLE_CPU)
-  target_link_libraries(test_probe PRIVATE lse_backend_cpu)
-endif()
+target_link_libraries(test_probe PRIVATE lse_backends)
 target_link_libraries(test_probe PRIVATE Threads::Threads)
 
 # The GPU backend needs the 7.13 HSA runtime on the loader path; without it the

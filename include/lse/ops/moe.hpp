@@ -28,9 +28,14 @@ struct RouteConfig {
   std::int32_t num_experts = 0;
   std::int32_t num_active = 0;
   // Among the top-k, drop experts whose probability falls below
-  // (1 - score_band) * top. 1.0 disables the band, i.e. plain top-k, which is
-  // what Qwen3.6 uses; lemonseed uses 0.15.
+  // (1 - score_band) * top, then renormalize over what is left. 1.0 disables
+  // the band, i.e. plain top-k; lemonseed uses 0.15.
   float score_band = 1.0f;
+  // Divide the kept weights by their sum. Independent of the band, which
+  // renormalizes as part of dropping experts: Qwen3.5 keeps all k and still
+  // renormalizes, and with 8 of 256 experts the kept mass is far below 1, so
+  // skipping it rescales every FFN output.
+  bool renormalize = false;
 };
 
 struct ExpertChoice {

@@ -54,6 +54,19 @@ class WeightBinder {
   Result<Array> require(std::string_view name);
   Result<Array> optional(std::string_view name);
 
+  // Reads `name` keeping only the rows in `order`, in that order, and reports
+  // the result as `shape`. A row is one span of the tensor's last axis, so a
+  // rank-1 tensor has one element per row.
+  //
+  // This is where a checkpoint's channel layout is converted to the engine's,
+  // once at load: reordering weights costs nothing per token, while the slices
+  // and transposes that would express the same permutation in the graph are
+  // paid on every forward. Both uses today are Qwen3.5's — de-interleaving the
+  // attention gate out of q_proj, and splitting a fused gate_up expert.
+  Result<Array> require_rows(std::string_view name,
+                             const std::vector<std::int64_t>& order,
+                             Shape shape);
+
   [[nodiscard]] std::vector<std::string> unclaimed() const;
   [[nodiscard]] std::size_t claimed_count() const noexcept { return claimed_.size(); }
 
@@ -136,18 +149,27 @@ class MixerAdapter final : public IMixer {
   Derived impl_;
 };
 
+// Suffixes of the two block norms, appended to the block prefix. lemonseed
+// names them norm1/norm2, Qwen input_layernorm/post_attention_layernorm.
+struct HybridBlockSpec {
+  std::string norm1_name = ".norm1.weight";
+  std::string norm2_name = ".norm2.weight";
+};
+
 // norm1 -> mixer -> residual -> norm2 -> ffn -> residual.
 // `mod` is optional: lemonseed routes only a token subset through the FFN,
-// Qwen3.6 has no MoD at all. It gates IFeedForward::forward only; whatever
+// Qwen3.5 has no MoD at all. It gates IFeedForward::forward only; whatever
 // IFeedForward::ungated returns is added afterwards.
 class HybridBlock {
  public:
   HybridBlock(std::unique_ptr<IMixer> mixer, std::unique_ptr<IFeedForward> ffn,
               bool zero_centered_norm,
-              std::unique_ptr<IModGate> mod = nullptr)
+              std::unique_ptr<IModGate> mod = nullptr,
+              HybridBlockSpec spec = {})
       : mixer_(std::move(mixer)),
         ffn_(std::move(ffn)),
         mod_(std::move(mod)),
+        spec_(std::move(spec)),
         zero_centered_norm_(zero_centered_norm) {}
 
   Status load(WeightBinder& binder, std::string_view prefix,
@@ -163,6 +185,7 @@ class HybridBlock {
   std::unique_ptr<IMixer> mixer_;
   std::unique_ptr<IFeedForward> ffn_;
   std::unique_ptr<IModGate> mod_;
+  HybridBlockSpec spec_;
   Array norm1_weight_;
   Array norm2_weight_;
   bool zero_centered_norm_ = false;

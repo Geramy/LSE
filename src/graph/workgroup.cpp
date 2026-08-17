@@ -1,6 +1,5 @@
 #include "lse/graph/workgroup.hpp"
 
-#include "lse/backends/hrx/device_info.hpp"
 #include "lse/core/dtype.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -77,13 +76,11 @@ WorkgroupDevice WorkgroupDevice::from(const backend::DeviceInfo* info) noexcept 
   if (info->max_threads_per_workgroup != 0) {
     d.max_threads = info->max_threads_per_workgroup;
   }
-  const auto* amd = backend::device_extension<backend::AmdDeviceInfo>(*info);
-  if (amd == nullptr) return d;
-  if (amd->lds_bytes_per_workgroup != 0) {
-    d.lds_bytes = amd->lds_bytes_per_workgroup;
+  if (info->lds_bytes_per_workgroup != 0) {
+    d.lds_bytes = info->lds_bytes_per_workgroup;
   }
-  if (amd->wavefront_size != 0) d.wavefront = amd->wavefront_size;
-  if (amd->max_waves_per_cu != 0) d.max_waves_per_cu = amd->max_waves_per_cu;
+  if (info->wavefront_size != 0) d.wavefront = info->wavefront_size;
+  if (info->max_waves_per_cu != 0) d.max_waves_per_cu = info->max_waves_per_cu;
   return d;
 }
 

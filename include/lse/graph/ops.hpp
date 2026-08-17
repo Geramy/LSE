@@ -53,6 +53,13 @@ Array linear(const Array& x, const Array& w);
 // of `idx` [..., k], so MoE runs the k winners without slicing weights.
 Array linear_indexed(const Array& x, const Array& w, const Array& idx,
                      int slot = 0);
+// The same contraction against a group-affine weight the kernel unpacks in
+// register: `packed` is the U32 plane [out, in*bits/32], `scales` and `biases`
+// are [out, in/group_size] in the checkpoint's own narrow float. The weight is
+// never widened in memory — that is the whole point of the op existing rather
+// than a dequantize pass feeding `linear`.
+Array quant_linear(const Array& x, const Array& packed, const Array& scales,
+                   const Array& biases, int bits, int group_size);
 Array embedding(const Array& table, const Array& ids);
 
 // Row gather/scatter over the last-axis-major layout every op here assumes.

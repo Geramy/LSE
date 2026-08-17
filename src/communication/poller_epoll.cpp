@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "poller.hpp"
+#include "lse/communication/poller.hpp"
 
 namespace lse::comm {
 

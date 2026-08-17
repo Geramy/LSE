@@ -2,6 +2,7 @@
 #include "lse/model/layer.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 // host_bytes / sync_to_device: a checkpoint tensor is host data and Array has
@@ -26,14 +27,16 @@ namespace {
 
 // The dtype a checkpoint tensor is held in on the device. Float formats keep
 // the format they were stored in — widening them in memory is a pure bandwidth
-// tax on every token, and converting in register costs nothing. Integer and
-// block-quantized storage has no device kernel that reads it directly yet, so
-// it still widens here.
+// tax on every token, and converting in register costs nothing. So does the
+// packed plane of a group-affine weight: quant_linear unpacks it in register,
+// and widening it here would not just cost bandwidth, it would destroy the
+// codes. Block-quantized storage still widens; no kernel reads it directly.
 DType device_storage(DType checkpoint) noexcept {
   switch (checkpoint) {
     case DType::kF32:
     case DType::kF16:
     case DType::kBF16:
+    case DType::kU32:
       return checkpoint;
     default:
       return DType::kF32;
@@ -81,6 +84,73 @@ Result<Array> WeightBinder::optional(std::string_view name) {
   return a;
 }
 
+Result<Array> WeightBinder::require_rows(std::string_view name,
+                                         const std::vector<std::int64_t>& order,
+                                         Shape shape) {
+  const TensorView* v = weights_->find(name);
+  if (v == nullptr) {
+    return LSE_ERROR(kNotFound, "checkpoint has no tensor '", std::string(name),
+                     "'");
+  }
+  const std::size_t rank = v->shape.rank();
+  const auto width =
+      static_cast<std::size_t>(rank >= 2 ? v->shape.dim(rank - 1) : 1);
+  const std::size_t rows = width > 0 ? v->element_count() / width : 0;
+  if (width == 0 || shape.elem_count() != order.size() * width) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' has ",
+                     std::to_string(rows), " rows of ", std::to_string(width),
+                     "; taking ", std::to_string(order.size()),
+                     " of them cannot fill the requested ",
+                     std::to_string(shape.elem_count()), " elements");
+  }
+  for (std::int64_t r : order) {
+    if (r < 0 || static_cast<std::size_t>(r) >= rows) {
+      return LSE_ERROR(kOutOfRange, "row ", std::to_string(r), " of '",
+                       std::string(name), "' is outside its ",
+                       std::to_string(rows), " rows");
+    }
+  }
+
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no usable backend to load '",
+                     std::string(name), "' into");
+  }
+  backend::IBackend& be = sched->backend();
+
+  const DType dt = device_storage(v->dtype);
+  Array a = Array::zeros(shape, dt);
+  graph::Node& n = *a.node();
+  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be));
+
+  // Staged whole rather than read row by row: TensorView reads the mapping,
+  // and one sequential pass over it beats `order.size()` scattered ones.
+  const bool native = dt == v->dtype;
+  const std::size_t elem = dtype_storage_bytes(dt, 1);
+  std::vector<std::byte> staged(dtype_storage_bytes(dt, v->element_count()));
+  if (native) {
+    LSE_RETURN_IF_ERROR(v->read_native(staged.data(), staged.size()));
+  } else {
+    LSE_RETURN_IF_ERROR(v->read_f32(reinterpret_cast<float*>(staged.data()),
+                                    v->element_count()));
+  }
+  auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
+  const std::size_t row_bytes = width * elem;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    std::memcpy(dst + i * row_bytes,
+                staged.data() + static_cast<std::size_t>(order[i]) * row_bytes,
+                row_bytes);
+  }
+
+  n.host_dirty = true;
+  n.device_dirty = false;
+  n.materialized = true;
+  LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
+
+  claimed_.emplace_back(name);
+  return a;
+}
+
 std::vector<std::string> WeightBinder::unclaimed() const {
   std::vector<std::string> out;
   for (const auto& [name, _] : weights_->tensors()) {
@@ -94,8 +164,8 @@ std::vector<std::string> WeightBinder::unclaimed() const {
 Status HybridBlock::load(WeightBinder& binder, std::string_view prefix,
                          const LayerContext& ctx) {
   const std::string p(prefix);
-  LSE_ASSIGN_OR(norm1_weight_, binder.require(p + ".norm1.weight"));
-  LSE_ASSIGN_OR(norm2_weight_, binder.require(p + ".norm2.weight"));
+  LSE_ASSIGN_OR(norm1_weight_, binder.require(p + spec_.norm1_name));
+  LSE_ASSIGN_OR(norm2_weight_, binder.require(p + spec_.norm2_name));
   LSE_RETURN_IF_ERROR(mixer_->load(binder, prefix, ctx));
   LSE_RETURN_IF_ERROR(ffn_->load(binder, prefix, ctx));
   if (mod_) LSE_RETURN_IF_ERROR(mod_->load(binder, prefix));

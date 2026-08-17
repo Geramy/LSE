@@ -19,7 +19,6 @@
 #include "lse/graph/program.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
-#include "lse/backends/hrx/hip_emitter.hpp"
 
 namespace lse::graph {
 
@@ -415,6 +414,9 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
 
   if (mode_ == Mode::kDeviceFirst && backend_.emitter() != nullptr &&
       !replayed) {
+    // Null when this emitter has no staged phase body: every node then takes
+    // the same one-group path a node it refuses to stage already takes.
+    const IPhaseStaging* staging = backend_.emitter()->staging();
     for (Workgroup& wg : planned) {
       FusionGroup g = Partitioner::phase_group(wg, roots);
       if (g.nodes.empty()) continue;
@@ -520,7 +522,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
           phase_groups.push_back(std::move(one));
           continue;
         }
-        if (!backend::HipEmitter::phase_can_stage(*n)) {
+        if (staging == nullptr || !staging->can_stage(*n)) {
           flush_staged();
           if (join_gdn_pair(n)) continue;
           FusionGroup one;
@@ -538,8 +540,8 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         // costs ~2 us against tens of microseconds of idle CUs. 2048 is
         // eight workgroups — below that the grid is not worth the split.
         constexpr std::uint32_t kGridStage = 2048;
-        const bool fat = backend::HipEmitter::phase_stage_threads(
-                             *n, backend_.device_info()) >= kGridStage;
+        const bool fat =
+            staging->stage_threads(*n, backend_.device_info()) >= kGridStage;
         const bool grid_chunk = staged_grid && !staged.nodes.empty();
         // A grid chunk keeps growing while its stages stay independent, so
         // sibling wide stages cost one launch, not one each.

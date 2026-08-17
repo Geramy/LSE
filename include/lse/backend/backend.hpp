@@ -215,25 +215,33 @@ struct DeviceInfo {
   std::string arch;   // "gfx1151" — part of the JIT cache key
 
   std::size_t total_memory = 0;              // working-set / KV-cache budgeting
+  // Occupancy limits. Every GPU has all three under some name — wave/warp/
+  // subgroup, LDS/shared memory, resident waves per CU/SM — so a scheduler
+  // deciding whether a tile can co-reside reads them without knowing the
+  // vendor. 0 is unknown, never a guess.
+  std::uint32_t lds_bytes_per_workgroup = 0;
   std::uint16_t compute_units = 0;
   std::uint16_t max_threads_per_workgroup = 0;
+  std::uint16_t wavefront_size = 0;
+  std::uint16_t max_waves_per_cu = 0;
   std::uint8_t ordinal = 0;
   // Host and device memory are one physical pool, so uploads are pointer
   // handoffs and staging buffers are pure waste. A real behavioural branch.
   bool unified_memory = false;
 
-  // Vendor-specific block the backend owns and outlives this struct: wavefront
-  // width, LDS budget, matrix-core generation and so on, which only code that
-  // already targets that vendor may read. Reach it through device_extension().
+  // Vendor-specific block the backend owns and outlives this struct: cache
+  // sizes, matrix-core generation, per-type arithmetic support and so on,
+  // which only code that already targets that vendor may read. Reach it
+  // through device_extension().
   std::string_view extension_id;
   const void* extension = nullptr;
 
   [[nodiscard]] std::string describe() const;
 };
 
-// Scalars: 8 (size_t) + 2 + 2 + 2x1 (padded to 8) + 16 (string_view) + 8 (ptr).
-// Pinned so adding a field is a deliberate act, not a drift.
-static_assert(sizeof(DeviceInfo) == 2 * sizeof(std::string) + 40,
+// Scalars: 8 (size_t) + 4 + 4x2 + 2x1 (padded to 24) + 16 (string_view)
+// + 8 (ptr). Pinned so adding a field is a deliberate act, not a drift.
+static_assert(sizeof(DeviceInfo) == 2 * sizeof(std::string) + 48,
               "DeviceInfo scalar budget changed — justify the field, then "
               "update this assert");
 
@@ -274,6 +282,25 @@ class Backend {
   }
 
   void deallocate(DeviceBuffer& buf) noexcept { derived().deallocate_impl(buf); }
+
+  // Bytes free on this device at the instant of the call.
+  //
+  // A sample, not an identity. DeviceInfo::total_memory is the part number and
+  // never moves; this moves with every allocation on the device, this process's
+  // or another process's, so two calls a second apart may legitimately
+  // disagree and no caller may memoize it.
+  //
+  // A backend whose runtime cannot answer refuses here, and in particular never
+  // substitutes total_memory: a capacity inferred from the total is exactly the
+  // number that hands a 40 GB shard to a device with 2 GB left.
+  Result<std::size_t> sample_free_memory() const {
+    if constexpr (requires { derived().sample_free_memory_impl(); }) {
+      return derived().sample_free_memory_impl();
+    } else {
+      return LSE_ERROR(kUnimplemented, "backend '", std::string(Derived::kName),
+                       "' has no device memory query");
+    }
+  }
 
   Status copy_h2d(const void* src, DeviceBuffer& dst, std::size_t bytes,
                   std::size_t dst_offset = 0) {
@@ -416,6 +443,14 @@ class IBackend {
   virtual Result<DeviceBuffer> allocate(std::size_t bytes,
                                         MemoryClass cls) = 0;
   virtual void deallocate(DeviceBuffer& buf) noexcept = 0;
+  // Bytes free on this device right now — a sample that moves under the
+  // caller, never the declared total in DeviceInfo. A backend whose runtime
+  // has no such query refuses, and a refusal means unknown: the reader is a
+  // capacity constraint, and an unknown there declines a placement while an
+  // invented figure would approve one.
+  virtual Result<std::size_t> sample_free_memory() const {
+    return LSE_ERROR(kUnimplemented, "backend has no device memory query");
+  }
   virtual Status copy_h2d(const void* src, DeviceBuffer& dst, std::size_t bytes,
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,
@@ -478,6 +513,9 @@ class BackendAdapter final : public IBackend {
     return impl_.allocate(b, c);
   }
   void deallocate(DeviceBuffer& b) noexcept override { impl_.deallocate(b); }
+  Result<std::size_t> sample_free_memory() const override {
+    return impl_.sample_free_memory();
+  }
   Status copy_h2d(const void* s, DeviceBuffer& d, std::size_t n,
                   std::size_t off) override {
     return impl_.copy_h2d(s, d, n, off);

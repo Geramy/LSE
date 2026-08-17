@@ -9,8 +9,12 @@
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
+#include "lse/graph/sharding.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/workgroup.hpp"
+#include "lse/quant/group_affine.hpp"
+
+#include <cstring>
 
 using namespace lse;
 using namespace lse::graph;
@@ -1153,6 +1157,491 @@ LSE_TEST(a_group_whose_buffers_are_unknown_is_ordered_after_everything) {
                               placed(12, 256, {10}), placed(0, 256, {})};
   const StreamPlan p = plan_streams(gs, four_streams(), wide_device());
   LSE_EXPECT(!p.waits[3].empty());
+}
+
+// ---- sharding: the vocabulary a partitioner reports its answer in ----------
+
+namespace {
+
+DeviceMesh two_way() { return DeviceMesh({{"tp", 2}}); }
+
+Sharding replicated(std::uint8_t axes) {
+  Sharding s;
+  s.axis_count = axes;
+  return s;
+}
+
+Sharding sharded(std::int8_t dim) {
+  Sharding s;
+  s.axis_count = 1;
+  s.axes[0] = AxisPlacement::shard(dim);
+  return s;
+}
+
+Sharding partial_sum() {
+  Sharding s;
+  s.axis_count = 1;
+  s.axes[0] = AxisPlacement::partial();
+  return s;
+}
+
+using Prop = graph::detail::ShardingPropagator;
+
+}  // namespace
+
+LSE_TEST(mesh_ranks_are_row_major_so_the_last_axis_is_contiguous) {
+  const DeviceMesh mesh({{"pp", 2}, {"tp", 4}});
+  LSE_EXPECT_EQ(mesh.rank_count(), 8u);
+  LSE_EXPECT_EQ(mesh.axis_index("tp"), 1);
+  LSE_EXPECT_EQ(mesh.axis_index("dp"), -1);
+  LSE_EXPECT_EQ(mesh.coordinate(5, 0), 1);
+  LSE_EXPECT_EQ(mesh.coordinate(5, 1), 1);
+  const std::vector<dist::Rank> tp = mesh.group_along(5, 1);
+  LSE_EXPECT(tp == std::vector<dist::Rank>({4, 5, 6, 7}));
+  const std::vector<dist::Rank> pp = mesh.group_along(5, 0);
+  LSE_EXPECT(pp == std::vector<dist::Rank>({1, 5}));
+}
+
+LSE_TEST(a_rank_outside_the_mesh_has_no_coordinate_and_no_group) {
+  const DeviceMesh mesh({{"pp", 2}, {"tp", 4}});
+  LSE_EXPECT_EQ(mesh.coordinate(8, 0), -1);
+  LSE_EXPECT_EQ(mesh.coordinate(0, 2), -1);
+  LSE_EXPECT(mesh.group_along(8, 0).empty());
+}
+
+LSE_TEST(uneven_shards_tile_the_global_extent_exactly) {
+  const DeviceMesh mesh({{"tp", 3}});
+  const Shape global{10};
+  std::int64_t total = 0;
+  for (dist::Rank r = 0; r < 3; ++r) {
+    total += sharded(0).local_shape(global, mesh, r).dim(0);
+  }
+  LSE_EXPECT_EQ(total, 10);
+  LSE_EXPECT_EQ(sharded(0).local_shape(global, mesh, 0).dim(0), 4);
+  LSE_EXPECT_EQ(sharded(0).local_shape(global, mesh, 2).dim(0), 3);
+}
+
+LSE_TEST(two_mesh_axes_splitting_one_dimension_still_tile_it) {
+  const DeviceMesh mesh({{"a", 2}, {"b", 3}});
+  Sharding s;
+  s.axis_count = 2;
+  s.axes[0] = AxisPlacement::shard(0);
+  s.axes[1] = AxisPlacement::shard(0);
+  const Shape global{10};
+  std::int64_t total = 0;
+  for (dist::Rank r = 0; r < 6; ++r) total += s.local_shape(global, mesh, r).dim(0);
+  LSE_EXPECT_EQ(total, 10);
+}
+
+LSE_TEST(a_placement_the_mesh_cannot_honour_degrades_to_replicated) {
+  // Over-allocating is recoverable; returning an extent nobody holds is not.
+  const DeviceMesh mesh = two_way();
+  const Shape global{4, 8};
+  LSE_EXPECT(sharded(5).local_shape(global, mesh, 0) == global);
+  LSE_EXPECT(sharded(0).local_shape(global, mesh, 99) == global);
+}
+
+LSE_TEST(a_dimension_shorter_than_its_axis_leaves_the_tail_holding_nothing) {
+  // Empty, not an error: the sum still tiles, and a rank with no rows is a
+  // rank with no work rather than a plan that has to be rejected.
+  const DeviceMesh mesh({{"tp", 4}});
+  const Shape global{2, 8};
+  LSE_EXPECT_EQ(sharded(0).local_shape(global, mesh, 0).dim(0), 1);
+  LSE_EXPECT_EQ(sharded(0).local_shape(global, mesh, 1).dim(0), 1);
+  LSE_EXPECT_EQ(sharded(0).local_shape(global, mesh, 3).dim(0), 0);
+  LSE_EXPECT_EQ(sharded(0).local_shape(global, mesh, 3).dim(1), 8);
+}
+
+LSE_TEST(one_device_is_the_whole_tensor) {
+  // The single-device case is the engine's normal case today, so a sharding
+  // must be inert on it rather than a special case callers check for.
+  const DeviceMesh mesh({{"tp", 1}});
+  const Shape global{6, 8};
+  LSE_EXPECT_EQ(mesh.rank_count(), 1u);
+  LSE_EXPECT_EQ(mesh.coordinate(0, 0), 0);
+  LSE_EXPECT(mesh.group_along(0, 0) == std::vector<dist::Rank>({0}));
+  LSE_EXPECT(sharded(0).local_shape(global, mesh, 0) == global);
+}
+
+LSE_TEST(a_mesh_with_no_axes_is_one_rank_and_shards_nothing) {
+  const DeviceMesh mesh;
+  const Shape global{6, 8};
+  LSE_EXPECT_EQ(mesh.rank_count(), 1u);
+  LSE_EXPECT_EQ(mesh.axis_count(), 0u);
+  LSE_EXPECT_EQ(mesh.axis_size(0), 1);
+  LSE_EXPECT_EQ(mesh.coordinate(0, 0), -1);
+  LSE_EXPECT(mesh.group_along(0, 0).empty());
+  LSE_EXPECT(sharded(0).local_shape(global, mesh, 0) == global);
+  // Nothing to propagate over and nothing to move.
+  const Sharding in[1]{sharded(0)};
+  const Shape shapes[1]{global};
+  LSE_EXPECT(Prop::propagate(OpKind::kSum, in, shapes, mesh).input_reshards.empty());
+  LSE_EXPECT(Prop::plan(sharded(0), replicated(0), mesh).empty());
+}
+
+LSE_TEST(a_scalar_has_no_dimension_to_split) {
+  const DeviceMesh mesh = two_way();
+  const Shape scalar;
+  LSE_EXPECT_EQ(scalar.rank(), 0u);
+  LSE_EXPECT(sharded(0).local_shape(scalar, mesh, 0) == scalar);
+}
+
+LSE_TEST(reshard_kinds_differ_by_more_than_a_constant) {
+  const DeviceMesh mesh({{"tp", 4}});
+  const Shape global{1024};
+  auto bytes = [&](Reshard::Kind k) {
+    Reshard r;
+    r.kind = k;
+    return r.traffic_bytes(global, DType::kF32, mesh);
+  };
+  LSE_EXPECT_EQ(bytes(Reshard::Kind::kAllGather), 3072u);
+  LSE_EXPECT_EQ(bytes(Reshard::Kind::kReduceScatter), 3072u);
+  // An all-reduce is a reduce-scatter followed by an all-gather.
+  LSE_EXPECT_EQ(bytes(Reshard::Kind::kAllReduce), 6144u);
+  // The factor of P that makes a free parallel axis beat splitting a
+  // contraction whenever the graph has one.
+  LSE_EXPECT_EQ(bytes(Reshard::Kind::kAllToAll), 768u);
+  LSE_EXPECT_EQ(bytes(Reshard::Kind::kBroadcast), 4096u);
+  LSE_EXPECT_EQ(bytes(Reshard::Kind::kNone), 0u);
+}
+
+LSE_TEST(an_axis_with_no_peers_carries_no_traffic) {
+  const DeviceMesh mesh({{"tp", 1}});
+  Reshard r;
+  r.kind = Reshard::Kind::kAllReduce;
+  LSE_EXPECT_EQ(r.traffic_bytes(Shape{1024}, DType::kF32, mesh), 0u);
+}
+
+LSE_TEST(a_tensor_smaller_than_the_mesh_still_costs_something_to_move) {
+  // 8 bytes over 8 ranks: the all-to-all share is 8*7/64, which truncates to
+  // zero. Zero reads as free, and free is the one price a collective that
+  // actually runs must never be given.
+  const DeviceMesh mesh({{"tp", 8}});
+  Reshard r;
+  r.kind = Reshard::Kind::kAllToAll;
+  LSE_EXPECT(r.traffic_bytes(Shape{2}, DType::kF32, mesh) > 0u);
+  r.kind = Reshard::Kind::kAllGather;
+  LSE_EXPECT(r.traffic_bytes(Shape{1}, DType::kI8, mesh) > 0u);
+  // Rounding up must not disturb a share that divides exactly.
+  const DeviceMesh four({{"tp", 4}});
+  Reshard e;
+  e.kind = Reshard::Kind::kAllToAll;
+  LSE_EXPECT_EQ(e.traffic_bytes(Shape{1024}, DType::kF32, four), 768u);
+  // An empty tensor moves nothing; there is no collective to under-price.
+  LSE_EXPECT_EQ(e.traffic_bytes(Shape{0}, DType::kF32, four), 0u);
+}
+
+LSE_TEST(a_sharding_renders_one_entry_per_mesh_axis) {
+  Sharding s;
+  s.axis_count = 2;
+  s.axes[0] = AxisPlacement::shard(1);
+  s.axes[1] = AxisPlacement::partial();
+  LSE_EXPECT(s.to_string() == "[S1,P(sum)]");
+  LSE_EXPECT(s.has_partial());
+  LSE_EXPECT(!s.is_fully_replicated());
+  LSE_EXPECT(replicated(2).is_fully_replicated());
+}
+
+LSE_TEST(a_column_parallel_matmul_costs_no_collective) {
+  // x[4,64] @ w[128,64]^T with the weight split along its output dim. This is
+  // the rule the whole column/row sandwich is built on.
+  const DeviceMesh mesh = two_way();
+  const Sharding in[2]{replicated(1), sharded(0)};
+  const Shape shapes[2]{Shape{4, 64}, Shape{128, 64}};
+  const Prop::Result r = Prop::propagate(OpKind::kLinear, in, shapes, mesh);
+  LSE_EXPECT(r.input_reshards.empty());
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kSharded);
+  LSE_EXPECT_EQ(static_cast<int>(r.output.axes[0].tensor_dim), 1);
+}
+
+LSE_TEST(a_row_parallel_matmul_yields_a_partial_and_defers_the_all_reduce) {
+  const DeviceMesh mesh = two_way();
+  const Sharding in[2]{sharded(1), sharded(1)};  // both split on K
+  const Shape shapes[2]{Shape{4, 64}, Shape{128, 64}};
+  const Prop::Result r = Prop::propagate(OpKind::kLinear, in, shapes, mesh);
+  LSE_EXPECT(r.input_reshards.empty());
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kPartial);
+  // propagate never decides to reduce; leaving the value partial is legal and
+  // is what lets the reduction move past the next linear op.
+  LSE_EXPECT(r.output_reshard.kind == Reshard::Kind::kNone);
+}
+
+LSE_TEST(a_replicated_operand_meets_a_split_contraction_for_free) {
+  // The activation holds every K slice already and reads only its own.
+  const DeviceMesh mesh = two_way();
+  const Sharding in[2]{replicated(1), sharded(1)};
+  const Shape shapes[2]{Shape{4, 64}, Shape{128, 64}};
+  const Prop::Result r = Prop::propagate(OpKind::kLinear, in, shapes, mesh);
+  LSE_EXPECT(r.input_reshards.empty());
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kPartial);
+}
+
+LSE_TEST(a_partial_activation_carries_through_a_matmul) {
+  const DeviceMesh mesh = two_way();
+  const Sharding in[2]{partial_sum(), replicated(1)};
+  const Shape shapes[2]{Shape{4, 64}, Shape{128, 64}};
+  const Prop::Result r = Prop::propagate(OpKind::kLinear, in, shapes, mesh);
+  LSE_EXPECT(r.input_reshards.empty());
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kPartial);
+}
+
+LSE_TEST(a_bias_add_onto_a_sharded_activation_stays_sharded) {
+  // The bias is replicated and rank 1, the activation rank 2: the shard dims
+  // only agree once both are read from the trailing end.
+  const DeviceMesh mesh = two_way();
+  const Sharding in[2]{sharded(1), replicated(1)};
+  const Shape shapes[2]{Shape{4, 128}, Shape{128}};
+  const Prop::Result r = Prop::propagate(OpKind::kAdd, in, shapes, mesh);
+  LSE_EXPECT(r.input_reshards.empty());
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kSharded);
+  LSE_EXPECT_EQ(static_cast<int>(r.output.axes[0].tensor_dim), 1);
+}
+
+LSE_TEST(a_shard_of_a_broadcast_extent_is_gathered_not_assumed_replicated) {
+  // [8,16] split on dim 1 times a [1] "split" on dim 0. The one element lives
+  // on coordinate 0 alone — local_shape says so — so the other ranks have
+  // nothing to broadcast and the operand has to be gathered. Treating an
+  // extent-1 shard as replicated is silently wrong on every rank but the first.
+  const DeviceMesh mesh({{"tp", 4}});
+  const Sharding in[2]{sharded(1), sharded(0)};
+  const Shape shapes[2]{Shape{8, 16}, Shape{1}};
+  LSE_EXPECT_EQ(in[1].local_shape(Shape{1}, mesh, 0).dim(0), 1);
+  LSE_EXPECT_EQ(in[1].local_shape(Shape{1}, mesh, 2).dim(0), 0);
+  const Prop::Result r = Prop::propagate(OpKind::kMul, in, shapes, mesh);
+  LSE_EXPECT_EQ(r.input_reshards.size(), 1u);
+  LSE_EXPECT_EQ(r.input_reshards[0].first, 1u);
+  LSE_EXPECT(r.input_reshards[0].second.kind == Reshard::Kind::kAllGather);
+  // The real shard survives: only the degenerate one moved.
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kSharded);
+  LSE_EXPECT_EQ(static_cast<int>(r.output.axes[0].tensor_dim), 1);
+}
+
+LSE_TEST(a_gathered_broadcast_extent_is_not_gathered_again_by_a_conflict) {
+  // The degenerate operand moves once even when its neighbours disagree and
+  // send the whole op down the conflict path.
+  const DeviceMesh mesh({{"tp", 4}});
+  const Sharding in[3]{sharded(0), sharded(1), sharded(0)};
+  const Shape shapes[3]{Shape{8, 16}, Shape{8, 16}, Shape{1}};
+  const Prop::Result r = Prop::propagate(OpKind::kWhere, in, shapes, mesh);
+  std::size_t on_two = 0;
+  for (const auto& [index, reshard] : r.input_reshards) {
+    if (index == 2) ++on_two;
+  }
+  LSE_EXPECT_EQ(on_two, 1u);
+  LSE_EXPECT(r.output.is_fully_replicated());
+}
+
+LSE_TEST(a_partial_operand_of_a_multiply_is_reduced_first) {
+  const DeviceMesh mesh = two_way();
+  const Sharding in[2]{partial_sum(), replicated(1)};
+  const Shape shapes[2]{Shape{4, 128}, Shape{4, 128}};
+  const Prop::Result r = Prop::propagate(OpKind::kMul, in, shapes, mesh);
+  LSE_EXPECT_EQ(r.input_reshards.size(), 1u);
+  LSE_EXPECT_EQ(r.input_reshards[0].first, 0u);
+  LSE_EXPECT(r.input_reshards[0].second.kind == Reshard::Kind::kAllReduce);
+  LSE_EXPECT(r.output.is_fully_replicated());
+}
+
+LSE_TEST(an_operand_is_never_resharded_twice_for_one_op) {
+  // A partial selector and two operands split on dimensions that disagree: the
+  // partial is reduced once, not once for being partial and again for the
+  // conflict its neighbours caused.
+  const DeviceMesh mesh = two_way();
+  const Sharding in[3]{partial_sum(), sharded(0), sharded(1)};
+  const Shape shapes[3]{Shape{4, 128}, Shape{4, 128}, Shape{4, 128}};
+  const Prop::Result r = Prop::propagate(OpKind::kWhere, in, shapes, mesh);
+  LSE_EXPECT_EQ(r.input_reshards.size(), 3u);
+  std::size_t on_zero = 0;
+  for (const auto& [index, reshard] : r.input_reshards) {
+    if (index == 0) ++on_zero;
+  }
+  LSE_EXPECT_EQ(on_zero, 1u);
+  LSE_EXPECT(r.output.is_fully_replicated());
+}
+
+LSE_TEST(a_sum_over_the_split_dimension_stays_partial) {
+  const DeviceMesh mesh = two_way();
+  const Sharding in[1]{sharded(1)};
+  const Shape shapes[1]{Shape{4, 128}};
+  const Prop::Result r = Prop::propagate(OpKind::kSum, in, shapes, mesh);
+  LSE_EXPECT(r.input_reshards.empty());
+  LSE_EXPECT(r.output.axes[0].placement == Placement::kPartial);
+}
+
+LSE_TEST(a_softmax_over_the_split_dimension_gathers_rather_than_guesses) {
+  // The distributed form is an online pass with its own max and denominator
+  // exchange — a different program, not this one plus a collective.
+  const DeviceMesh mesh = two_way();
+  const Sharding in[1]{sharded(1)};
+  const Shape shapes[1]{Shape{4, 128}};
+  const Prop::Result r = Prop::propagate(OpKind::kSoftmax, in, shapes, mesh);
+  LSE_EXPECT_EQ(r.input_reshards.size(), 1u);
+  LSE_EXPECT(r.input_reshards[0].second.kind == Reshard::Kind::kAllGather);
+  LSE_EXPECT(r.output.is_fully_replicated());
+}
+
+LSE_TEST(a_shard_on_a_kept_dimension_shifts_when_the_reduced_one_drops) {
+  const DeviceMesh mesh = two_way();
+  const Sharding in[1]{sharded(1)};
+  const Shape shapes[1]{Shape{4, 128}};
+  const Prop::Result dropped =
+      Prop::propagate(OpKind::kSum, in, shapes, mesh, /*reduce_dim=*/0);
+  LSE_EXPECT(dropped.output.axes[0].placement == Placement::kSharded);
+  LSE_EXPECT_EQ(static_cast<int>(dropped.output.axes[0].tensor_dim), 0);
+  const Prop::Result kept =
+      Prop::propagate(OpKind::kSum, in, shapes, mesh, 0, /*keepdims=*/true);
+  LSE_EXPECT_EQ(static_cast<int>(kept.output.axes[0].tensor_dim), 1);
+}
+
+LSE_TEST(an_unmodelled_op_gathers_rather_than_inventing_a_sharding) {
+  const DeviceMesh mesh = two_way();
+  const Sharding in[1]{sharded(0)};
+  const Shape shapes[1]{Shape{4, 128}};
+  const Prop::Result r = Prop::propagate(OpKind::kTranspose, in, shapes, mesh);
+  LSE_EXPECT_EQ(r.input_reshards.size(), 1u);
+  LSE_EXPECT(r.output.is_fully_replicated());
+}
+
+LSE_TEST(replicated_to_sharded_moves_nothing) {
+  // Every rank already holds the bytes and keeps its own slice, so this is
+  // absent from the plan rather than present at zero cost.
+  const DeviceMesh mesh = two_way();
+  LSE_EXPECT(Prop::plan(replicated(1), sharded(0), mesh).empty());
+}
+
+LSE_TEST(a_partial_becomes_one_reduce_scatter_not_an_all_reduce_and_a_slice) {
+  const DeviceMesh mesh = two_way();
+  const std::vector<Reshard> p = Prop::plan(partial_sum(), sharded(1), mesh);
+  LSE_EXPECT_EQ(p.size(), 1u);
+  LSE_EXPECT(p[0].kind == Reshard::Kind::kReduceScatter);
+  LSE_EXPECT_EQ(static_cast<int>(p[0].to_dim), 1);
+}
+
+LSE_TEST(changing_which_dimension_is_split_is_one_all_to_all) {
+  const DeviceMesh mesh = two_way();
+  const std::vector<Reshard> p = Prop::plan(sharded(0), sharded(1), mesh);
+  LSE_EXPECT_EQ(p.size(), 1u);
+  LSE_EXPECT(p[0].kind == Reshard::Kind::kAllToAll);
+  LSE_EXPECT_EQ(static_cast<int>(p[0].from_dim), 0);
+  LSE_EXPECT_EQ(static_cast<int>(p[0].to_dim), 1);
+}
+
+LSE_TEST(a_plan_reduces_while_the_tensor_is_still_split) {
+  // Axis 0 needs a gather and axis 1 a reduction. Taken in axis order the
+  // gather would run first and the reduction would then cost twice as much,
+  // so the plan is ordered by what it does, not by which axis it is on.
+  const DeviceMesh mesh({{"a", 2}, {"b", 2}});
+  Sharding from;
+  from.axis_count = 2;
+  from.axes[0] = AxisPlacement::shard(0);
+  from.axes[1] = AxisPlacement::partial();
+  const std::vector<Reshard> p = Prop::plan(from, replicated(2), mesh);
+  LSE_EXPECT_EQ(p.size(), 2u);
+  LSE_EXPECT(p[0].kind == Reshard::Kind::kAllReduce);
+  LSE_EXPECT_EQ(static_cast<int>(p[0].mesh_axis), 1);
+  LSE_EXPECT(p[1].kind == Reshard::Kind::kAllGather);
+  LSE_EXPECT_EQ(static_cast<int>(p[1].mesh_axis), 0);
+}
+
+namespace {
+
+Array typed_host_array(const std::vector<float>& values, Shape shape,
+                       DType dt) {
+  Array a = Array::zeros(shape, dt);
+  (void)a.eval();
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    interpreter::store_element(*a.node(), i, values[i]);
+  }
+  return a;
+}
+
+// A packed plane cannot go through store_element: a lane is a bit pattern, and
+// float would round every value past 2^24.
+Array packed_host_array(const std::vector<std::uint32_t>& lanes, Shape shape) {
+  Array a = Array::zeros(shape, DType::kU32);
+  (void)a.eval();
+  Node& n = *a.node();
+  std::memcpy(interpreter::host_bytes(n), lanes.data(), lanes.size() * 4);
+  n.host_dirty = true;
+  n.device_dirty = false;
+  return a;
+}
+
+}  // namespace
+
+// The whole point of the op: a weight that stays packed all the way to the
+// register produces the same numbers as one dequantized ahead of time.
+LSE_TEST(quant_linear_matches_a_dequantized_linear) {
+  for (int bits : {4, 6, 8}) {
+    auto spec = quant::GroupAffine::make(bits, 64);
+    LSE_EXPECT(spec.ok());
+    if (!spec.ok()) continue;
+    const quant::GroupAffine q = *spec;
+
+    constexpr std::int64_t kN = 32, kK = 128;
+    const auto lanes_per_row = q.packed_words(kK);
+    const auto groups_per_row = q.group_count(kK);
+
+    std::vector<float> x(kK);
+    for (std::int64_t i = 0; i < kK; ++i) {
+      x[static_cast<std::size_t>(i)] =
+          0.1f * std::sin(0.7f * static_cast<float>(i));
+    }
+
+    std::vector<std::uint32_t> packed(
+        static_cast<std::size_t>(kN) * lanes_per_row);
+    std::vector<float> scales(static_cast<std::size_t>(kN) * groups_per_row);
+    std::vector<float> biases(scales.size());
+    std::vector<float> dequantized(static_cast<std::size_t>(kN * kK));
+
+    for (std::int64_t r = 0; r < kN; ++r) {
+      std::vector<float> row(static_cast<std::size_t>(kK));
+      for (std::int64_t c = 0; c < kK; ++c) {
+        row[static_cast<std::size_t>(c)] =
+            0.05f * std::cos(0.13f * static_cast<float>(r * kK + c));
+      }
+      const auto ro = static_cast<std::size_t>(r);
+      std::vector<bfloat16_t> s(groups_per_row), b(groups_per_row);
+      q.quantize_row<bfloat16_t>(row.data(), static_cast<std::size_t>(kK),
+                                 packed.data() + ro * lanes_per_row, s.data(),
+                                 b.data());
+      q.dequantize_row<bfloat16_t>(
+          packed.data() + ro * lanes_per_row, s.data(), b.data(),
+          static_cast<std::size_t>(kK),
+          dequantized.data() + ro * static_cast<std::size_t>(kK));
+      for (std::size_t g = 0; g < groups_per_row; ++g) {
+        scales[ro * groups_per_row + g] = s[g].to_float();
+        biases[ro * groups_per_row + g] = b[g].to_float();
+      }
+    }
+
+    Array xa = host_array(x, Shape{1, kK});
+    Array pa = packed_host_array(
+        packed, Shape{kN, static_cast<std::int64_t>(lanes_per_row)});
+    Array sa = typed_host_array(
+        scales, Shape{kN, static_cast<std::int64_t>(groups_per_row)},
+        DType::kBF16);
+    Array ba = typed_host_array(
+        biases, Shape{kN, static_cast<std::int64_t>(groups_per_row)},
+        DType::kBF16);
+    // The plane reached the graph at its own width; nothing widened it.
+    LSE_EXPECT(pa.dtype() == DType::kU32);
+
+    Array wa = host_array(dequantized, Shape{kN, kK});
+    Array want = linear(xa, wa);
+    Array got = quant_linear(xa, pa, sa, ba, bits, 64);
+    LSE_EXPECT(got.node()->kind == OpKind::kQuantMatMul);
+    LSE_EXPECT(got.node()->inputs.size() == 4);
+
+    const std::vector<float> w = drain(want);
+    const std::vector<float> g = drain(got);
+    LSE_EXPECT(w.size() == static_cast<std::size_t>(kN));
+    LSE_EXPECT(g.size() == w.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+      LSE_EXPECT_NEAR(g[i], w[i],
+                      1e-4 + 1e-4 * std::fabs(static_cast<double>(w[i])));
+    }
+  }
 }
 
 LSE_TEST_MAIN()

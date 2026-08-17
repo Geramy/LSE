@@ -29,6 +29,23 @@ struct HybridLMSpec {
   // Empty means the head reuses the embedding table.
   std::string lm_head_name;
   bool zero_centered_norm = true;
+
+  // Checkpoint tensors that are deliberately not part of the decoder stack —
+  // Qwen3.5 ships a vision tower and a multi-token-prediction head in the same
+  // file. Everything else must be claimed by some layer: an unclaimed tensor is
+  // a builder that misread the checkpoint, and it fails load rather than
+  // quietly producing a model with pieces missing.
+  std::vector<std::string> ignored_prefixes;
+
+  // Recurrent state for the linear-attention layers, [B, heads, dim, dim].
+  // Zero derives it from the Config the way lemonseed's mixer does, where the
+  // value heads run at the key width.
+  std::int32_t gdn_state_heads = 0;
+  std::int32_t gdn_state_dim = 0;
+  // Channel width of a single fused q|k|v conv tail. Zero means the model
+  // convolves the three streams separately, which is what a split projection
+  // layout needs.
+  std::int32_t gdn_conv_width = 0;
 };
 
 class HybridLM {

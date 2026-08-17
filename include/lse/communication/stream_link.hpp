@@ -15,10 +15,10 @@
 #include <deque>
 #include <vector>
 
-#include "frame.hpp"
+#include "lse/communication/frame.hpp"
 #include "lse/communication/endpoint.hpp"
 #include "lse/communication/transport.hpp"
-#include "poller.hpp"
+#include "lse/communication/poller.hpp"
 
 namespace lse::comm {
 
