@@ -331,8 +331,13 @@ std::int64_t linear_n(const Node& n) noexcept {
   if (kp == nullptr && n.kind != OpKind::kLinear) return 0;
   if (kp != nullptr) {
     const auto name = kp->name();
+    // Keep in step with the same list in scheduler.cpp's join_wide_linear.
+    // quant_linear stages a row and is priced into run_lds_bytes like the dense
+    // kernels, so omitting it here is what kept every wide linear in a
+    // quantized checkpoint in its own launch.
     if (name != "linear" && name != "linear.lds" &&
-        name != "linear_indexed" && name != "linear_indexed.lds") {
+        name != "linear_indexed" && name != "linear_indexed.lds" &&
+        name != "quant_linear") {
       return 0;
     }
   }

@@ -455,8 +455,13 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
         if (kp == nullptr) return 0;
         const auto name = kp->name();
+        // quant_linear belongs here too: it stages a row and is priced into
+        // run_lds_bytes exactly as the dense kernels are, so leaving it out of
+        // this list is what made every wide linear in a quantized checkpoint
+        // its own launch.
         if (name != "linear" && name != "linear.lds" &&
-            name != "linear_indexed" && name != "linear_indexed.lds") {
+            name != "linear_indexed" && name != "linear_indexed.lds" &&
+            name != "quant_linear") {
           return 0;
         }
         const Shape& w = n.inputs[1]->shape;
