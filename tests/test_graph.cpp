@@ -804,6 +804,113 @@ LSE_TEST(sibling_linears_are_one_fusion_group) {
   for (float v : kv) LSE_EXPECT_NEAR(v, 6.4, 1e-4);
 }
 
+// What one launch costs in workgroup scratch: every DISTINCT staged row once,
+// summed. Two `__shared__` declarations do not overlap even in disjoint block
+// scopes, so a max here would say a two-row launch costs one row.
+LSE_TEST(a_launch_is_priced_for_every_distinct_row_it_stages) {
+  const WorkgroupDevice dev;
+  Array x0 = Array::full(Shape{1, 1024}, DType::kF32, 1.0f);
+  Array x1 = Array::full(Shape{1, 1024}, DType::kF32, 2.0f);
+  Array wa = Array::full(Shape{128, 1024}, DType::kF32, 0.1f);
+  Array wb = Array::full(Shape{128, 1024}, DType::kF32, 0.2f);
+  Array wc = Array::full(Shape{128, 1024}, DType::kF32, 0.3f);
+  Array a = linear(x0, wa);
+  Array b = linear(x0, wb);
+  Array c = linear(x1, wc);
+
+  LSE_EXPECT_EQ(staged_row_bytes(*a.node(), dev), 4096u);
+  // Two siblings off one activation share the panel the emitter hoists.
+  const Node* shared[] = {a.node().get(), b.node().get()};
+  LSE_EXPECT_EQ(group_lds_bytes(shared, dev), 4096u);
+  // A third off a different buffer brings its own.
+  const Node* both[] = {a.node().get(), b.node().get(), c.node().get()};
+  LSE_EXPECT_EQ(group_lds_bytes(both, dev), 8192u);
+
+  // A row too wide to stage at all costs nothing: the emitter reads that
+  // activation from global instead. This is the 27B's down projection, whose
+  // 17408-long row would want 69632 bytes.
+  Array wide = Array::full(Shape{1, 17408}, DType::kF32, 1.0f);
+  Array wd = Array::full(Shape{128, 17408}, DType::kF32, 0.1f);
+  Array d = linear(wide, wd);
+  LSE_EXPECT_EQ(staged_row_bytes(*d.node(), dev), 0u);
+}
+
+// The gate on sibling fusion is a workgroup-scratch budget, and it has to be in
+// the unit the hardware charges in.
+//
+// A solo grid GEMV already stages its whole activation row against the ENTIRE
+// device budget — the 4B's K=9216 down projection declares 36864 bytes on its
+// own, verified in the emitted dumps — so merging siblings that share that row
+// costs no occupancy at all. The rule this replaced held one row to a quarter of
+// the budget, 16384 bytes, and so refused the 27B's 5120-wide hidden while the
+// emitter was already emitting more than twice that in a single stage.
+LSE_TEST(sibling_linears_fuse_at_a_row_the_quarter_budget_rule_refused) {
+  const WorkgroupDevice dev;
+  // At least one workgroup per CU: on a 64 KiB pool shared by two CUs that is
+  // half the budget, not a quarter of it.
+  LSE_EXPECT_EQ(dev.resident_lds_bytes(), 32768u);
+
+  // 27B geometry: hidden 5120, so the row gate and up both stage is 20480 B.
+  //
+  // The MLP shape is what needs the gate: DFS post-order is x, wg, gate, silu,
+  // wu, up, and the silu between the two linears is exactly what
+  // group_sibling_linears exists to rotate past. Refuse on the budget and the
+  // rotation never happens, so gate and up stay in separate groups and separate
+  // launches.
+  Array x = Array::full(Shape{1, 5120}, DType::kF32, 1.0f);
+  Array wgate = Array::full(Shape{128, 5120}, DType::kF32, 0.1f);
+  Array wu = Array::full(Shape{128, 5120}, DType::kF32, 0.2f);
+  // Weights are materialized buffers in a real checkpoint, so they are not in
+  // the traversal and cannot hold the rotation back on their own account.
+  (void)x.eval();
+  (void)wgate.eval();
+  (void)wu.eval();
+  Array gate = linear(x, wgate);
+  Array up = linear(x, wu);
+  Array out = silu(gate) * up;
+
+  const Node* run[] = {gate.node().get(), up.node().get()};
+  LSE_EXPECT_EQ(group_lds_bytes(run, dev), 20480u);
+  // Over the old quarter rule, under the honest one.
+  LSE_EXPECT(20480u > dev.lds_bytes / 4u);
+  LSE_EXPECT(20480u <= dev.resident_lds_bytes());
+
+  // group_sibling_linears runs in phases(), which is what pulls `up` past the
+  // silu so cuts() can put both in one grid launch.
+  const NodePtr roots[] = {out.node()};
+  const auto wgs = Partitioner::phases(roots);
+  LSE_EXPECT(!wgs.empty());
+  if (wgs.empty()) return;
+  bool one_launch = false;
+  std::size_t cut_count = 0;
+  for (const Workgroup& phase : wgs) {
+    for (const WorkgroupCut& cut : phase.cuts()) {
+      ++cut_count;
+      std::size_t hits = 0;
+      for (const NodePtr& n : cut.nodes) {
+        for (const Node* m : run) {
+          if (n.get() == m) ++hits;
+        }
+      }
+      if (hits == 2) {
+        one_launch = true;
+        LSE_EXPECT(cut.grid_linears);
+      }
+    }
+  }
+  LSE_EXPECT(one_launch);
+  if (!one_launch) {
+    std::printf("       gate and up split across %zu cut(s)\n", cut_count);
+  }
+  // The phase's worst launch is that one shared row, counted once.
+  LSE_EXPECT_EQ(wgs.front().lds_bytes(), 20480u);
+
+  // And the answer is still the answer: silu(512) * 1024, 5120 terms each.
+  const auto ov = drain(out);
+  LSE_EXPECT_EQ(ov.size(), 128u);
+  for (float e : ov) LSE_EXPECT_NEAR(e, 512.0 * 1024.0, 4.0);
+}
+
 LSE_TEST(sibling_linears_at_hidden_width) {
   Array x = Array::full(Shape{4, 1024}, DType::kF32, 1.0f);
   Array wq = Array::full(Shape{1024, 1024}, DType::kF32, 0.01f);

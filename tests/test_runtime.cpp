@@ -522,3 +522,49 @@ LSE_TEST(the_device_clock_is_named_and_rated_or_cleanly_refused) {
 }
 
 LSE_TEST_MAIN()
+
+// The SwiGLU chain, at lemonseed's expert width, through the real scheduler.
+// gate and up join one wide-linear group, silu and mul are one lane-fused grid
+// launch, down is its own: three launches, not four. The pair used to split
+// because stage_threads(2176) marks each stage fat and a fat stage that read the
+// chunk forced a flush — 120 launches per token on lemonseed, 32% of them, for a
+// barrier the chain never needed. Counted here rather than in the emitter
+// because the splitter and the emitter have to agree: if only one of them
+// changes, the pair still merges and then lands on ONE workgroup, which measured
+// slower than the two launches it replaced.
+LSE_TEST(the_swiglu_chain_costs_three_launches_not_four) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+  if (sched->backend().emitter() == nullptr) return;
+
+  constexpr std::int64_t kHidden = 1024;
+  constexpr std::int64_t kInter = 2176;
+  graph::Array h = graph::Array::zeros(Shape{1, 1, kHidden}, DType::kF32);
+  graph::Array wg = graph::Array::zeros(Shape{kInter, kHidden}, DType::kF32);
+  graph::Array wu = graph::Array::zeros(Shape{kInter, kHidden}, DType::kF32);
+  graph::Array wd = graph::Array::zeros(Shape{kHidden, kInter}, DType::kF32);
+  // Resident before the step, the way loaded weights are: an unmaterialized
+  // weight is still a node in the topological order, and a sibling whose weight
+  // has not been reached yet is not admitted to the run — so without this the
+  // two projections never share a launch and the shape under test is gone.
+  for (graph::Array* w : {&h, &wg, &wu, &wd}) {
+    LSE_EXPECT(w->eval().ok());
+  }
+  // Built in the model's order: both projections, then the pair over them.
+  // The phase splitter walks the nodes as they were recorded, so building the
+  // gate's silu before the up projection is a different graph to the one
+  // lemonseed records and would not exercise this.
+  graph::Array gate = graph::linear(h, wg);
+  graph::Array up = graph::linear(h, wu);
+  graph::Array hid = graph::silu(gate) * up;
+  graph::Array out = graph::linear(hid, wd);
+
+  sched->reset_accumulated_trace();
+  const Status ev = out.eval();
+  LSE_EXPECT(ev.ok());
+  if (!ev.ok()) return;
+  const auto& t = sched->last_trace();
+  LSE_EXPECT_EQ(t.host_groups, 0u);
+  LSE_EXPECT_EQ(t.kernels_launched, 3u);
+}

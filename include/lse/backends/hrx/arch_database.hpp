@@ -23,6 +23,9 @@ struct FamilyIsa {
   std::uint32_t l2_cache_bytes;
   std::uint8_t max_waves_per_cu;
   std::uint8_t wavefront_size;
+  // RDNA pairs two CUs into a WGP that shares one LDS block; CDNA gives each
+  // CU its own. See DeviceInfo::cus_per_lds_pool for the gfx1151 measurement.
+  std::uint8_t cus_per_lds_pool;
   MatrixCore matrix_core;
   bool has_bf16_arith;
   bool matrix_core_bf16;
@@ -39,21 +42,21 @@ struct BoardFallback {
 };
 
 inline constexpr FamilyIsa kFamilyIsa[] = {
-    {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 16, 32, MatrixCore::kNone,
+    {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kNone,
      false, false, true, 16, 16},
-    {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 16, 32, MatrixCore::kWMMA,
+    {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kWMMA,
      true, true, true, 16, 16},
-    {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, MatrixCore::kWMMA,
+    {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, 2, MatrixCore::kWMMA,
      true, true, true, 16, 16},
-    {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 16, 32, MatrixCore::kWMMA,
+    {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kWMMA,
      true, true, true, 16, 16},
-    {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, MatrixCore::kMFMA,
+    {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, 1, MatrixCore::kMFMA,
      false, false, true, 16, 16},
-    {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 40, 64, MatrixCore::kMFMA,
+    {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 40, 64, 1, MatrixCore::kMFMA,
      true, true, true, 16, 16},
-    {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, MatrixCore::kMFMA,
+    {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, 1, MatrixCore::kMFMA,
      true, true, true, 16, 16},
-    {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, MatrixCore::kMFMA,
+    {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, 1, MatrixCore::kMFMA,
      true, true, true, 16, 16},
 };
 
@@ -104,6 +107,8 @@ inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
   if (info.max_waves_per_cu == 0 && isa != nullptr) {
     info.max_waves_per_cu = isa->max_waves_per_cu;
   }
+  // Not "if zero": HRX has no query for it, so the ISA row is the only source.
+  if (isa != nullptr) info.cus_per_lds_pool = isa->cus_per_lds_pool;
   if (info.wavefront_size == 0 && isa != nullptr) {
     info.wavefront_size = isa->wavefront_size;
   }

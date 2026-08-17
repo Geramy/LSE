@@ -123,6 +123,17 @@ class Body {
   }
   [[nodiscard]] bool contains(OpKind k) const;
 
+  // Workgroup scratch this body declares, in bytes, 16-byte aligned per array
+  // the way kir::Lds prices a reservation.
+  //
+  // Read off the allocations lowering will print, so a fused group's LDS is
+  // *derived from its text* instead of predicted alongside it. Concatenated
+  // stage bodies each declaring their own row cost the sum, not the max, even
+  // in disjoint block scopes: two `__shared__ float[2176]` in separate braces
+  // report sharedSizeBytes 17408 and 3 blocks/multiprocessor, against 8704 and
+  // 7 for one (measured, gfx1151, hipFuncGetAttributes).
+  [[nodiscard]] std::uint32_t workgroup_bytes() const noexcept;
+
   // Splice every op of `other`'s entry region onto the end of this body's
   // region `into`, remapping its ids. Used to merge fused sibling stages into
   // one body so a pass can see across what used to be separate kernels.

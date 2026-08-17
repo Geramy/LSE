@@ -426,6 +426,8 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       staged.launches = 1;
       staged.anchor_class = FusionClass::kBarrier;
       bool staged_grid = false;
+      bool staged_lane = true;
+      bool staged_fused = false;
       auto flush_staged = [&] {
         if (staged.nodes.empty()) return;
         auto chunks = Partitioner::phase_chunks(staged, 480);
@@ -548,13 +550,43 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         const bool fat =
             staging->stage_threads(*n, backend_.device_info()) >= kGridStage;
         const bool grid_chunk = staged_grid && !staged.nodes.empty();
+        // Mirrors the emitter's `lane_chunk`: every stage per-lane over one
+        // element count, every read of the chunk at the index the reading
+        // thread wrote. The launch boundary a dependence normally buys is a
+        // grid-wide barrier, and this chain never leaves the thread — so the
+        // chunk keeps it and the pair costs one launch. The predicate has to
+        // hold for the whole chunk, not just the edge, or the emitter would
+        // decline the grid and the merged stages would land on one workgroup.
+        bool lane_fits = staged_lane && staging->lane_stage(*n);
+        if (lane_fits) {
+          for (const NodePtr& m : staged.nodes) {
+            if (!staging->lane_aligned(*m, *n)) {
+              lane_fits = false;
+              break;
+            }
+          }
+        }
+        const bool lane_join = grid_chunk && lane_fits;
+        // A chunk holding a dependence only its lane shape can carry has to
+        // keep that shape. Admitting a stage that breaks it makes the emitter
+        // refuse the grid, and then every stage in the chunk — including the
+        // wide ones that were already on a grid — runs on one workgroup.
+        const bool breaks_lane_fused = staged_fused && !lane_fits;
         // A grid chunk keeps growing while its stages stay independent, so
         // sibling wide stages cost one launch, not one each.
-        if (fat ? (!grid_chunk || reads_staged(n))
-                : (grid_chunk && reads_staged(n))) {
+        if (breaks_lane_fused ||
+            (fat ? (!grid_chunk || (reads_staged(n) && !lane_join))
+                 : (grid_chunk && reads_staged(n) && !lane_join))) {
           flush_staged();
         }
-        if (staged.nodes.empty()) staged_grid = fat;
+        if (staged.nodes.empty()) {
+          staged_grid = fat;
+          staged_lane = staging->lane_stage(*n);
+          staged_fused = false;
+        } else {
+          staged_lane = lane_fits;
+          if (lane_join && reads_staged(n)) staged_fused = true;
+        }
         staged.nodes.push_back(n);
       }
       flush_staged();

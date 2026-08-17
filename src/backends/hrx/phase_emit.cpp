@@ -276,7 +276,9 @@ StageUse stage_use(const Node& n) noexcept {
 
 // Any recorded RAW/WAR/WAW needs a barrier. Bindings are __restrict__, so
 // two nodes that share a slot look like distinct pointers; skipping the
-// barrier lets the compiler reorder those accesses.
+// barrier lets the compiler reorder those accesses. What the StageUse decides
+// is not whether to order but how wide the barrier has to be — see
+// lane_aligned_edge.
 bool needs_sync(const StageUse&, const StageUse&) noexcept { return true; }
 
 bool needs_sync_war(const StageUse&, const StageUse&) noexcept { return true; }
@@ -291,6 +293,39 @@ const Node* written_buf(const Node& n) noexcept {
     }
   }
   return &n;
+}
+
+// Thread i of this stage touches element i and nothing else, and its store
+// lands in its own binding rather than back into an input.
+bool lane_stage_node(const Node& n) noexcept {
+  const StageUse u = stage_use(n);
+  if (u.write != LaneUse::kLane || u.read != LaneUse::kLane) return false;
+  if (u.elems == 0 || written_buf(n) != &n) return false;
+  // stage_use answers kLane for every elementwise/cast/broadcast node without
+  // looking at its operands, but the elementwise stage indexes each input
+  // through broadcast_index(in->shape, n->shape) — so a broadcast operand is
+  // read at a computed index, not at `i`. Build the same map the emitter will
+  // and take the answer from it: an operand that is not 1:1 makes this thread
+  // touch an element it did not write, which is the one thing a lane chunk
+  // promises does not happen. Slot recycling then has a cross-workgroup WAR
+  // that __syncthreads cannot order.
+  for (const NodePtr& in : n.inputs) {
+    if (!in) continue;
+    if (!BroadcastMap::build(in->shape, n.shape).identity) return false;
+  }
+  return true;
+}
+
+// `consumer` reads `producer` at the index the producing thread wrote, over
+// one element count, so the read-after-write between the two never leaves the
+// thread. __syncthreads is then the whole barrier: the stages can share a fat
+// grid instead of buying grid-wide ordering they never use with a launch
+// boundary. Anything gathering, reducing or owning its indexing fails here and
+// still pays for the split.
+bool lane_aligned_edge(const Node& producer, const Node& consumer) noexcept {
+  if (!lane_stage_node(producer) || !lane_stage_node(consumer)) return false;
+  if (producer.element_count() != consumer.element_count()) return false;
+  return BroadcastMap::build(producer.shape, consumer.shape).identity;
 }
 
 bool node_can_stage(const Node& n) noexcept {
@@ -344,6 +379,75 @@ std::uint32_t node_stage_threads(const Node& n, const DeviceInfo& device) {
 
 }  // namespace
 
+Result<std::uint32_t> HipEmitter::shared_bytes(std::string_view source) {
+  const kir::TypeTable types = hip_types();
+  // Both spellings come from the same tables the lowering prints with, so this
+  // reads what was written rather than what someone believed was written.
+  const std::string_view kMark = hip_sources().find("shared");
+  if (types.scalar == nullptr || kMark.empty()) {
+    return LSE_ERROR(kInternal, "the HIP dialect cannot spell workgroup memory");
+  }
+  std::uint32_t total = 0;
+  for (std::size_t at = 0;
+       (at = source.find(kMark, at)) != std::string_view::npos;) {
+    const std::size_t decl = at;
+    at += kMark.size();
+    while (at < source.size() && (source[at] == ' ' || source[at] == '\t' ||
+                                  source[at] == '\n')) {
+      ++at;
+    }
+    // Longest spelling wins, so "unsigned int" is not read as the "int" row.
+    std::size_t width = 0;
+    kir::Scalar elem = kir::Scalar::kF32;
+    for (std::size_t i = 0; i <= static_cast<std::size_t>(kir::Scalar::kBool);
+         ++i) {
+      const auto s = static_cast<kir::Scalar>(i);
+      const std::string_view spelling = types.scalar(s);
+      if (spelling.empty() || spelling.size() <= width) continue;
+      if (source.compare(at, spelling.size(), spelling) == 0) {
+        width = spelling.size();
+        elem = s;
+      }
+    }
+    if (width == 0) {
+      return LSE_ERROR(kInternal, "workgroup declaration at offset ",
+                       std::to_string(decl),
+                       " has no element type this dialect can spell");
+    }
+    const std::size_t open = source.find('[', at + width);
+    const std::size_t close = open == std::string_view::npos
+                                  ? std::string_view::npos
+                                  : source.find(']', open);
+    if (open == std::string_view::npos || close == std::string_view::npos) {
+      return LSE_ERROR(kInternal, "workgroup declaration at offset ",
+                       std::to_string(decl),
+                       " is not an array with a literal extent");
+    }
+    std::uint64_t count = 0;
+    bool digits = false;
+    for (std::size_t i = open + 1; i < close; ++i) {
+      const char c = source[i];
+      if (c == ' ' || c == '\t') continue;
+      if (c < '0' || c > '9') {
+        digits = false;
+        break;
+      }
+      digits = true;
+      count = count * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    if (!digits) {
+      return LSE_ERROR(kInternal, "workgroup declaration at offset ",
+                       std::to_string(decl),
+                       " has a non-literal extent");
+    }
+    const auto bytes =
+        static_cast<std::uint32_t>(count * kir::scalar_bytes(elem));
+    total += (bytes + 15u) & ~15u;
+    at = close;
+  }
+  return total;
+}
+
 void HipEmitter::bind_phase(const FusionGroup& group, EmittedKernel& out) {
   out.binding_order.clear();
   out.scratch_bytes = 0;
@@ -366,6 +470,15 @@ bool HipEmitter::can_stage(const Node& n) const noexcept {
 std::uint32_t HipEmitter::stage_threads(const Node& n,
                                         const DeviceInfo& device) const {
   return node_stage_threads(n, device);
+}
+
+bool HipEmitter::lane_stage(const Node& n) const noexcept {
+  return lane_stage_node(n);
+}
+
+bool HipEmitter::lane_aligned(const Node& producer,
+                              const Node& consumer) const noexcept {
+  return lane_aligned_edge(producer, consumer);
 }
 
 Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
@@ -440,6 +553,11 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   for (const NodePtr& n : group.nodes) members.insert(n.get());
   bool only_linears = true;
   bool dependent = false;
+  // Every stage pure per-lane over one element count, every in-group read at
+  // the index its own thread wrote. Then no dependence in the body crosses a
+  // thread, let alone a workgroup, and the chain can keep the fat grid.
+  bool lane_chunk = true;
+  std::uint32_t lane_elems = 0;
   std::uint32_t max_n = 0;
   std::uint32_t max_m = 1;
   std::uint32_t max_threads = 0;
@@ -457,6 +575,9 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       const std::uint32_t want = stage_thread_count(*n, sh, phase_spec(kpn, sh));
       if (want > max_threads) max_threads = want;
     }
+    if (!lane_stage_node(*n)) lane_chunk = false;
+    if (lane_elems == 0) lane_elems = elems;
+    if (elems != lane_elems) lane_chunk = false;
     for (const NodePtr& in : n->inputs) {
       const Node* p = in.get();
       while (p && p->kind == OpKind::kReshape && p->inputs.size() == 1) {
@@ -465,6 +586,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       if (p && members.count(p) && p->kind != OpKind::kConstant &&
           p->kind != OpKind::kBuffer && p->kind != OpKind::kReshape) {
         dependent = true;
+        if (!lane_aligned_edge(*p, *n)) lane_chunk = false;
       }
     }
     const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
@@ -481,14 +603,20 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     if (N > max_n) max_n = N;
     if (M > max_m) max_m = M;
   }
-  // Independent stages can use a fat grid. Dependent stages share one
-  // workgroup so __syncthreads is enough. A multi-WG software barrier
-  // deadlocks here: this launch path does not keep the whole grid resident.
+  // Independent stages can use a fat grid, and so does a lane chunk: its
+  // dependences are intra-thread, so __syncthreads carries them at any grid
+  // width. Every other dependent group shares one workgroup, where
+  // __syncthreads is the whole grid. A multi-WG software barrier deadlocks
+  // here: this launch path does not keep the whole grid resident.
   const bool persist = false;
   const bool grid_gemv =
       !persist && only_linears && compute > 0 && max_n >= 256;
-  const bool grid_elem =
-      !persist && !grid_gemv && !dependent && max_threads >= 512;
+  const bool grid_elem = !persist && !grid_gemv &&
+                         (!dependent || lane_chunk) && max_threads >= 512;
+  // A grid launch orders independent stages by having nothing to order. Only
+  // the lane chunk brings a dependence into one, and only its barriers are
+  // workgroup-wide facts; grid_gemv keeps the no-barrier form it always had.
+  const bool lane_fused = grid_elem && dependent;
   // Every stage of a grid launch walks the same flat thread space, so the
   // stride is one literal for the whole kernel.
   const std::uint32_t grid_wgs =
@@ -526,7 +654,10 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   const bool grid_stages = grid_gemv || grid_elem;
 
   auto sync_before = [&]() {
-    if (grid_stages || stage_i >= static_cast<int>(staged.size())) return;
+    if ((grid_stages && !lane_fused) ||
+        stage_i >= static_cast<int>(staged.size())) {
+      return;
+    }
     const StageUse& me = uses[static_cast<std::size_t>(stage_i)];
     const Node* dest =
         written_buf(*staged[static_cast<std::size_t>(stage_i)]);
@@ -832,20 +963,33 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   if (persist) {
     out.dims.workgroup_count[0] = persist_wgs;
     out.dims.workgroup_count[1] = 1;
-    out.lds_bytes = 0;
   } else if (grid_gemv) {
     out.dims.workgroup_count[0] = (max_n + 7u) / 8u;
     out.dims.workgroup_count[1] = max_m == 0 ? 1u : max_m;
-    out.lds_bytes = 256 * 4;
   } else if (grid_elem) {
     out.dims.workgroup_count[0] = grid_wgs;
     out.dims.workgroup_count[1] = 1;
-    out.lds_bytes = 256 * 4;
   } else {
     out.dims.workgroup_count[0] = 1;
     out.dims.workgroup_count[1] = 1;
-    out.lds_bytes = 256 * 4;
   }
+
+  // What the phase actually declares, not a constant per geometry. Every stage
+  // here builds its body against the whole device budget and none of them can
+  // see the others, so the only place the total exists is the assembled text:
+  // two staged GEMVs at K=2176 declare 17408 bytes between them where this used
+  // to report 1024, and a phase that overruns the budget does not fail to
+  // launch — it fails to compile, and the group silently falls to the host
+  // interpreter for the rest of the run.
+  auto declared = shared_bytes(out.source);
+  if (!declared.ok()) return declared.status();
+  const std::uint32_t budget = workgroup_lds_bytes(&device);
+  if (budget != 0 && *declared > budget) {
+    return LSE_ERROR(kOutOfMemory, "phase declares ", std::to_string(*declared),
+                     " bytes of workgroup scratch, device allows ",
+                     std::to_string(budget));
+  }
+  out.lds_bytes = *declared;
   out.dims.subgroup_size = device.wavefront_size;
   return out;
 }

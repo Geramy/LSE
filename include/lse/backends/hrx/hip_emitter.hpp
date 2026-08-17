@@ -27,6 +27,10 @@ class HipEmitter final : public graph::IKernelEmitter,
   [[nodiscard]] bool can_stage(const graph::Node& n) const noexcept override;
   [[nodiscard]] std::uint32_t stage_threads(
       const graph::Node& n, const DeviceInfo& device) const override;
+  [[nodiscard]] bool lane_stage(const graph::Node& n) const noexcept override;
+  [[nodiscard]] bool lane_aligned(
+      const graph::Node& producer,
+      const graph::Node& consumer) const noexcept override;
 
   static void bind_phase(const graph::FusionGroup& group,
                          graph::EmittedKernel& out);
@@ -54,6 +58,23 @@ class HipEmitter final : public graph::IKernelEmitter,
   [[nodiscard]] static std::string constants_decl(
       const graph::ConstantsLayout& layout);
 
+  // Workgroup scratch a generated kernel declares, in bytes, read off its
+  // source.
+  //
+  // A phase kernel is assembled as text — braced stage bodies, plus `__device__`
+  // helpers in the preamble that may hold scratch of their own — so the text is
+  // where its total lives; there is no single ir::Body to ask. Every declaration
+  // is charged once and 16-byte aligned, disjoint block scopes included:
+  // separate declarations get separate offsets, and two
+  // `__shared__ float[2176]` in sibling braces report sharedSizeBytes 17408
+  // against 8704 for one (measured, gfx1151, hipFuncGetAttributes).
+  //
+  // Fails on a declaration whose element type is not in the dialect's spelling
+  // table rather than guessing its width, since a guess is how an accounting
+  // comes to under-report the one case it was built to catch.
+  [[nodiscard]] static Result<std::uint32_t> shared_bytes(
+      std::string_view source);
+
  private:
   // Workgroup size and per-thread element count, chosen against the device's
   // occupancy limits. Returns the candidate with the highest occupancy that
@@ -66,6 +87,8 @@ class HipEmitter final : public graph::IKernelEmitter,
     std::string source;
     std::string entry_name;
     LaunchDims dims{};
+    // Measured off the cached text, not re-predicted on a cache hit.
+    std::uint32_t lds_bytes = 0;
     std::size_t scratch_bytes = 0;
     bool persist_grid = false;
   };

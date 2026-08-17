@@ -361,6 +361,17 @@ struct DeviceInfo {
   std::uint16_t max_threads_per_workgroup = 0;
   std::uint16_t wavefront_size = 0;
   std::uint16_t max_waves_per_cu = 0;
+  // How many CUs draw workgroup scratch from one physical LDS pool. 1 unless
+  // the architecture pairs CUs behind a shared block, as RDNA's WGP does — and
+  // that pairing is why `lds_bytes_per_workgroup / request` counts resident
+  // workgroups across a *pool*, not per CU. Getting this wrong overstates
+  // occupancy by exactly this factor, which is how a 16 KiB request came to be
+  // described as "four workgroups per CU" when the hardware seats two.
+  // Measured on gfx1151 with hipOccupancyMaxActiveBlocksPerMultiprocessor at
+  // 256 threads: 8 blocks/MP at 8192 B, 4 at 16384, 3 at 20480, 2 at 32768,
+  // 1 at 65536, and HIP's multiprocessor is the WGP — multiProcessorCount 20
+  // against the 40 CUs rocminfo reports.
+  std::uint8_t cus_per_lds_pool = 1;
   std::uint8_t ordinal = 0;
   // Host and device memory are one physical pool, so uploads are pointer
   // handoffs and staging buffers are pure waste. A real behavioural branch.
@@ -377,7 +388,8 @@ struct DeviceInfo {
 };
 
 // Scalars: 8 (size_t) + 4 + 4x2 + 2x1 (padded to 24) + 16 (string_view)
-// + 8 (ptr). Pinned so adding a field is a deliberate act, not a drift.
+// + 8 (ptr). `cus_per_lds_pool` fits in the existing tail padding beside
+// `ordinal`. Pinned so adding a field is a deliberate act, not a drift.
 static_assert(sizeof(DeviceInfo) == 2 * sizeof(std::string) + 48,
               "DeviceInfo scalar budget changed — justify the field, then "
               "update this assert");

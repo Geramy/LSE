@@ -73,12 +73,16 @@ struct StagedRun {
   std::uint32_t tiles_a = 8;
   std::uint32_t tiles_b = 8;
   bool same_source = true;
+  // The buffers the stages stage from, named so a test can hand the store
+  // epilogue a longer name that contains one of them.
+  std::string_view source = "b0";
+  std::string_view other = "b1";
 };
 
 void build_two_stages(ir::KernelBody& kb, const StagedRun& cfg) {
   env::Emit e{&kb};
-  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "b0");
-  const ir::Buffer<ir::f32> y(&kb, &kb.types(), "b1");
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), std::string(cfg.source));
+  const ir::Buffer<ir::f32> y(&kb, &kb.types(), std::string(cfg.other));
   const std::uint32_t tiles[2] = {cfg.tiles_a, cfg.tiles_b};
   for (int stage = 0; stage < 2; ++stage) {
     const auto lid = e.let(lse::math::local_id());
@@ -466,6 +470,97 @@ LSE_TEST(lds_fold_refuses_two_stagings_from_different_sources) {
   LSE_EXPECT_EQ(fired, 0u);
   const std::string after = ir::lower(kb.ir());
   LSE_EXPECT_EQ(count_of(after, "__shared__ float"), 2u);
+}
+
+// "What this body writes" is read off raw statement text, and that read has to
+// match whole identifiers. A store epilogue into `b10` does not write `b1`, but
+// a substring search says it does — and a staging whose source is falsely marked
+// written never folds. The case is real, not hypothetical: a 13-binding
+// quantized sibling run stores through b10, b11 and b12.
+LSE_TEST(lds_fold_reads_a_raw_store_as_identifiers_not_substrings) {
+  ir::KernelBody kb(kTypes, kTable);
+  kb.set_store([](std::string_view index, std::string_view value) {
+    return "b10[" + std::string(index) + "] = " + std::string(value) + ";\n";
+  });
+  build_two_stages(kb, StagedRun{64, 8, 8, true, "b1", "b2"});
+  {
+    env::Emit e{&kb};
+    e.store(e.let(lse::math::workgroup_id_y()), e.f32(1.0f));
+  }
+  const std::string before = ir::lower(kb.ir());
+  LSE_EXPECT_EQ(count_of(before, "__shared__ float"), 2u);
+  LSE_EXPECT(before.find("b10[") != std::string::npos);
+
+  (void)run_one(kb.ir(), ir::make_cse());
+  LSE_EXPECT(run_one(kb.ir(), ir::make_lds_fold()) >= 1);
+  (void)run_one(kb.ir(), ir::make_dce());
+  LSE_EXPECT_EQ(count_of(ir::lower(kb.ir()), "__shared__ float"), 1u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+}
+
+// The other direction of the same predicate: a store that really does name the
+// staged buffer must still block the fold, or the pass approves a staging whose
+// source this kernel has already overwritten.
+LSE_TEST(lds_fold_still_refuses_when_the_store_names_the_staged_buffer) {
+  ir::KernelBody kb(kTypes, kTable);
+  kb.set_store([](std::string_view index, std::string_view value) {
+    return "b1[" + std::string(index) + "] = " + std::string(value) + ";\n";
+  });
+  build_two_stages(kb, StagedRun{64, 8, 8, true, "b1", "b2"});
+  {
+    env::Emit e{&kb};
+    e.store(e.let(lse::math::workgroup_id_y()), e.f32(1.0f));
+  }
+  (void)run_one(kb.ir(), ir::make_cse());
+  LSE_EXPECT_EQ(run_one(kb.ir(), ir::make_lds_fold()), 0u);
+  LSE_EXPECT_EQ(count_of(ir::lower(kb.ir()), "__shared__ float"), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// Workgroup scratch accounting
+// ---------------------------------------------------------------------------
+
+// The number a fused group is admitted on has to be the number its text asks
+// for, and separate declarations SUM: the hardware gives each one its own LDS
+// offset even in disjoint block scopes (two `__shared__ float[2176]` in sibling
+// braces report sharedSizeBytes 17408 on gfx1151, against 8704 for one).
+LSE_TEST(a_body_reports_the_workgroup_bytes_its_text_declares) {
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), 0u);
+
+  auto a = e.lds<ir::f32>(64);
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), 256u);
+  auto b = e.lds<ir::f32>(64);
+  // Summed, not maximized. A max would still say 256 here.
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), 512u);
+  // 16-byte aligned per array, the way kir::Lds prices a reservation: three
+  // floats cost a whole 16-byte line, so this is 512 + 16 and not 512 + 12.
+  auto c = e.lds<ir::f32>(3);
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), 528u);
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), kb.lds().used());
+
+  auto acc = e.var(0.0f);
+  acc = acc.read() + a[0].read() + b[0].read() + c[0].read();
+  LSE_EXPECT_EQ(count_of(ir::lower(kb.ir()), "__shared__ float"), 3u);
+}
+
+// An array a fold left unread but DCE has not deleted is still an array the
+// compiler charges for, so it is still counted. Correctness of the budget can
+// therefore not depend on either pass having fired.
+LSE_TEST(workgroup_bytes_counts_scratch_until_it_is_actually_deleted) {
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  auto used = e.lds<ir::f32>(64);
+  auto unread = e.lds<ir::f32>(64);
+  (void)unread;
+  auto acc = e.var(0.0f);
+  acc = acc.read() + used[0].read();
+
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), 512u);
+  LSE_EXPECT(run_one(kb.ir(), ir::make_dce()) >= 1);
+  LSE_EXPECT_EQ(kb.ir().workgroup_bytes(), 256u);
+  LSE_EXPECT_EQ(count_of(ir::lower(kb.ir()), "__shared__ float"), 1u);
 }
 
 // ---------------------------------------------------------------------------

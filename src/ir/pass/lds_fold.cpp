@@ -25,12 +25,37 @@ struct Staging {
   bool barrier_after = false;
 };
 
+// True when `name` occurs in `text` as a whole identifier rather than as part of
+// a longer one.
+//
+// The raw scan used a plain substring search, so `b1` and `b2` were both marked
+// written by a store epilogue that mentions only `b10`, `b11` and `b12` — real
+// and reproducible on a 13-binding body. That direction only ever *adds* marks,
+// so it declined folds rather than approving wrong ones, but a predicate that
+// silently disables the pass on any body with ten or more bindings is not a
+// predicate. `b0` inside `b100` is the same bug at the next order of magnitude.
+bool mentions_identifier(const std::string& text, const std::string& name) {
+  if (name.empty()) return false;
+  const auto part = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+  };
+  for (std::size_t at = 0;
+       (at = text.find(name, at)) != std::string::npos; at += 1) {
+    const bool left = at > 0 && part(text[at - 1]);
+    const std::size_t end = at + name.size();
+    const bool right = end < text.size() && part(text[end]);
+    if (!left && !right) return true;
+  }
+  return false;
+}
+
 // Every memory reference this body writes. A staging whose source reads one of
 // them is not reproducible, so the two fills would not be idempotent.
 //
 // A raw statement is opaque text — the store epilogue is one — so any buffer
-// whose name appears in one counts as written. Conservative by design: a false
-// positive costs a fold, a false negative costs an answer.
+// whose name appears in one as an identifier counts as written. Conservative by
+// design: a false positive costs a fold, a false negative costs an answer.
 void collect_written(const Body& b, std::vector<bool>& written) {
   for (OpId id = 0; id < b.op_count(); ++id) {
     const Operation& o = b.op(id);
@@ -57,8 +82,11 @@ void collect_written(const Body& b, std::vector<bool>& written) {
   if (raw.empty()) return;
   for (ValueId v = 0; v < b.value_count(); ++v) {
     const ValueDef& d = b.value(v);
+    // A nameless memory value cannot be reached by name from raw text, so this
+    // scan has nothing to say about it. What writes it structurally is already
+    // marked by the loop above, which does not look at names at all.
     if (d.type.space == Space::kNone || d.name.empty()) continue;
-    if (raw.find(d.name) != std::string::npos) written[v] = true;
+    if (mentions_identifier(raw, d.name)) written[v] = true;
   }
 }
 

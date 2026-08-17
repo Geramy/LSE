@@ -69,6 +69,11 @@ backend::DeviceInfo gfx1151() {
   d.wavefront_size = 32;
   d.max_waves_per_cu = 32;
   d.lds_bytes_per_workgroup = 65536;
+  // Fills what HRX has no query for — the CUs behind one LDS pool — from the
+  // ISA row, so the model under test is the one a live device would get. Every
+  // field above is already non-zero and is left alone.
+  backend::AmdDeviceInfo amd = gfx1151_amd();
+  backend::apply_arch_defaults(d, amd);
   d.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d.extension = &gfx1151_amd();
   return d;
@@ -263,6 +268,140 @@ LSE_TEST(phase_dependent_kernel_stays_one_workgroup) {
   LSE_EXPECT(le->dims.workgroup_count[0] > 1u);
 }
 
+// The SwiGLU pair. Two fat stages over one element count where thread i writes
+// element i and thread i reads it back: nothing in the chain crosses a thread,
+// so a workgroup barrier orders it at any grid width and the pair belongs in
+// one launch. Splitting it was 120 launches per token on lemonseed, 32% of
+// them. A gather anywhere in the chain still has to split — __syncthreads is
+// not a grid-wide barrier, and the launch boundary is the only one this path
+// has.
+LSE_TEST(a_fat_lane_chain_is_one_grid_launch) {
+  auto nsync = [](const std::string& src) {
+    std::size_t n = 0, pos = 0;
+    while ((pos = src.find("__syncthreads", pos)) != std::string::npos) {
+      ++n;
+      pos += 13;
+    }
+    return n;
+  };
+  const backend::DeviceInfo dev = gfx1151();
+  const backend::HipEmitter emitter;
+
+  Array gate = Array::full(Shape{1, 1, 2176}, DType::kF32, 0.5f);
+  Array up = Array::full(Shape{1, 1, 2176}, DType::kF32, 0.25f);
+  Array act = silu(gate);
+  Array hid = act * up;
+  const NodePtr lane_roots[] = {hid.node()};
+  const auto lane_wgs = Partitioner::phases(lane_roots);
+  LSE_EXPECT(!lane_wgs.empty());
+  if (lane_wgs.empty()) return;
+  const FusionGroup lane = Partitioner::phase_group(lane_wgs[0], lane_roots);
+  auto e = backend::HipEmitter::emit_phase(lane, dev);
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) return;
+  // 2176 elements over 256 threads is nine workgroups, not one.
+  LSE_EXPECT_EQ(e->dims.workgroup_count[0], 9u);
+  LSE_EXPECT(!e->persist_grid);
+  // Exactly one, and it must stay: bindings are __restrict__, so two nodes on
+  // one slot look like distinct pointers and dropping the barrier lets the
+  // compiler reorder the two stages' accesses.
+  LSE_EXPECT_EQ(nsync(e->source), 1u);
+
+  // The scheduler splits the chain on the same predicate the emitter uses to
+  // pick the geometry. If the two ever disagree the pair still merges and then
+  // lands on ONE workgroup, which measured slower than the two launches it
+  // replaced — so the agreement is the thing under test.
+  const graph::IPhaseStaging* staging = emitter.staging();
+  LSE_EXPECT(staging != nullptr);
+  if (staging == nullptr) return;
+  LSE_EXPECT(staging->lane_stage(*act.node()));
+  LSE_EXPECT(staging->lane_stage(*hid.node()));
+  LSE_EXPECT(staging->lane_aligned(*act.node(), *hid.node()));
+
+  // A reduction reading the same chain: thread i now needs an element some
+  // other thread wrote, so the split has to survive.
+  Array w = Array::full(Shape{2176}, DType::kF32, 1.0f);
+  Array pre = silu(gate);
+  Array normed = rms_norm(pre, w, 1e-6f);
+  const NodePtr gather_roots[] = {normed.node()};
+  const auto gather_wgs = Partitioner::phases(gather_roots);
+  LSE_EXPECT(!gather_wgs.empty());
+  if (gather_wgs.empty()) return;
+  const FusionGroup gather =
+      Partitioner::phase_group(gather_wgs[0], gather_roots);
+  auto ge = backend::HipEmitter::emit_phase(gather, dev);
+  LSE_EXPECT(ge.ok());
+  if (!ge.ok()) return;
+  LSE_EXPECT_EQ(ge->dims.workgroup_count[0], 1u);
+  LSE_EXPECT(nsync(ge->source) >= 1u);
+  LSE_EXPECT(!staging->lane_aligned(*pre.node(), *normed.node()));
+
+  // Equal element count is part of the question, not a detail: a broadcast
+  // consumer reads an index its own thread never wrote.
+  Array scalar = Array::full(Shape{1, 1, 1}, DType::kF32, 2.0f);
+  Array scaled = silu(gate) * scalar;
+  const NodePtr bcast_roots[] = {scaled.node()};
+  const auto bcast_wgs = Partitioner::phases(bcast_roots);
+  LSE_EXPECT(!bcast_wgs.empty());
+  if (bcast_wgs.empty()) return;
+  LSE_EXPECT(!staging->lane_aligned(*scalar.node(), *scaled.node()));
+}
+
+LSE_TEST(a_stage_that_reads_a_broadcast_operand_is_not_a_lane_stage) {
+  // The edge test above only catches a broadcast whose SOURCE is in the chunk.
+  // When the broadcast operand comes from outside — a per-head scale, a slice
+  // already materialized — no edge is recorded and only lane_stage() stands
+  // between the chunk and a fat grid. `stage_use` answers kLane for every
+  // elementwise node without looking at its operands, so this is the case where
+  // "thread i touches element i and nothing else" has to be checked rather than
+  // assumed: slot recycling puts unrelated nodes on one allocation, and a
+  // cross-workgroup write-after-read there is not something __syncthreads can
+  // order. Shapes mirror what lemonseed actually emits: 4096 elements reading a
+  // 4-element operand at (i / 1024) % 4.
+  auto nsync = [](const std::string& src) {
+    std::size_t n = 0, pos = 0;
+    while ((pos = src.find("__syncthreads", pos)) != std::string::npos) {
+      ++n;
+      pos += 13;
+    }
+    return n;
+  };
+  const backend::DeviceInfo dev = gfx1151();
+  const backend::HipEmitter emitter;
+  const graph::IPhaseStaging* staging = emitter.staging();
+  LSE_EXPECT(staging != nullptr);
+  if (staging == nullptr) return;
+
+  Array x = Array::full(Shape{1, 4, 1024}, DType::kF32, 0.5f);
+  Array scale = Array::full(Shape{1, 4, 1}, DType::kF32, 2.0f);
+  Array res = Array::full(Shape{1, 4, 1024}, DType::kF32, 0.25f);
+  Array gated = x * scale;
+  Array out = res + gated;
+
+  LSE_EXPECT(!staging->lane_stage(*gated.node()));
+  LSE_EXPECT(staging->lane_stage(*out.node()));
+  // The consumer reads the producer at its own index, so the EDGE looks fine;
+  // the producer's own operand is what disqualifies the chunk.
+  LSE_EXPECT(!staging->lane_aligned(*gated.node(), *out.node()));
+
+  const NodePtr roots[] = {out.node()};
+  const auto wgs = Partitioner::phases(roots);
+  LSE_EXPECT(!wgs.empty());
+  if (wgs.empty()) return;
+  const FusionGroup g = Partitioner::phase_group(wgs[0], roots);
+  auto e = backend::HipEmitter::emit_phase(g, dev);
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) return;
+  // One workgroup, where __syncthreads is the whole grid. Merged onto 16 the
+  // barrier orders one sixteenth of the threads that need ordering.
+  LSE_EXPECT_EQ(e->dims.workgroup_count[0], 1u);
+  LSE_EXPECT(nsync(e->source) >= 1u);
+  // And the read really is at a computed index, not at `i` — the reason the
+  // geometry above is the right answer rather than a conservative one.
+  LSE_EXPECT(e->source.find("/ 1024") != std::string::npos ||
+             e->source.find("/1024") != std::string::npos);
+}
+
 LSE_TEST(rdna_is_wave32_cdna_is_wave64_rdna4_can_be_either) {
   LSE_EXPECT(backend::arch_family("gfx1100") == backend::ArchFamily::kRdna3);
   LSE_EXPECT(backend::arch_family("gfx1151") == backend::ArchFamily::kRdna35);
@@ -353,7 +492,7 @@ LSE_TEST(emitter_chooses_a_legal_workgroup_size) {
   LSE_EXPECT(threads > 0);
   LSE_EXPECT(threads <= d.max_threads_per_workgroup);
   LSE_EXPECT(threads % d.wavefront_size == 0);
-  LSE_EXPECT(backend::occupancy_per_cu(d, threads, 0) > 0);
+  LSE_EXPECT(backend::occupancy_per_lds_pool(d, threads, 0) > 0);
 
   // Enough workgroups to cover every element.
   LSE_EXPECT(e->dims.workgroup_count[0] * threads >= 1024u);
@@ -1503,6 +1642,159 @@ LSE_TEST(siblings_over_different_rows_get_their_own_staging) {
   LSE_EXPECT(code.ok());
 }
 
+// The occupancy model must be the hardware's, in the hardware's unit. On RDNA a
+// WGP pairs two CUs behind ONE 64 KiB pool, which is what HIP calls a
+// multiprocessor, so `budget / request` counts workgroups per pool and describing
+// it as per-CU overstates residency by 2x. Every row below is
+// hipOccupancyMaxActiveBlocksPerMultiprocessor on gfx1151, measured.
+LSE_TEST(the_occupancy_model_reproduces_the_measured_hardware_table) {
+  const backend::DeviceInfo d = gfx1151();
+  LSE_EXPECT_EQ(backend::cus_per_lds_pool(d), 2u);
+
+  struct Row {
+    std::uint32_t threads;
+    std::uint32_t lds;
+    std::uint32_t blocks;
+  };
+  // 256 threads: the 2048-thread cap allows 8 per pool, and LDS takes over from
+  // 12288 up. 512 threads: the thread cap is 4 and LDS binds from 32768.
+  constexpr Row kMeasured[] = {
+      {256, 4096, 8},  {256, 8192, 8},   {256, 12288, 5}, {256, 16384, 4},
+      {256, 20480, 3}, {256, 26112, 2},  {256, 32768, 2}, {256, 65536, 1},
+      {512, 4096, 4},  {512, 16384, 4},  {512, 32768, 2},
+  };
+  for (const Row& r : kMeasured) {
+    const std::uint32_t got =
+        backend::occupancy_per_lds_pool(d, r.threads, r.lds);
+    LSE_EXPECT_EQ(got, r.blocks);
+    if (got != r.blocks) {
+      std::printf("       threads=%u lds=%u got=%u want=%u\n", r.threads, r.lds,
+                  got, r.blocks);
+    }
+  }
+  // Past the device's own limit there is no legal launch at all.
+  LSE_EXPECT_EQ(backend::occupancy_per_lds_pool(d, 256, 65552), 0u);
+  // Half the budget is where residency reaches exactly one workgroup per CU:
+  // 2 per pool, and a pool is 2 CUs. That is the number the fusion gate is held
+  // to, stated here in the unit it is derived from.
+  LSE_EXPECT_EQ(backend::occupancy_per_lds_pool(d, 256, 32768),
+                backend::cus_per_lds_pool(d));
+  LSE_EXPECT(backend::occupancy_per_lds_pool(d, 256, 40960) <
+             backend::cus_per_lds_pool(d));
+}
+
+// A run is admitted on a number, and that number has to be what its text asks
+// for. Two panels at exactly half the device budget each fill it and must still
+// be emitted; one line of f32 more and the run cannot be launched at all, so it
+// is refused rather than emitted over budget and left for the compiler to reject
+// — a JIT failure is not fatal here, it drops the group onto the host
+// interpreter for the rest of the run.
+LSE_TEST(a_sibling_run_over_the_workgroup_budget_is_refused_not_emitted) {
+  ::unsetenv("LSE_WMMA");
+  const backend::DeviceInfo dev = gfx1151();
+  const std::uint32_t budget = dev.lds_bytes_per_workgroup;
+  LSE_EXPECT_EQ(budget, 65536u);
+
+  // Two distinct activations, each staging half the budget: 8192 f32 = 32768 B.
+  {
+    Array x0 = Array::full(Shape{1, 8192}, DType::kF32, 1.0f);
+    Array x1 = Array::full(Shape{1, 8192}, DType::kF32, 2.0f);
+    Array wa = Array::full(Shape{16, 8192}, DType::kF32, 0.5f);
+    Array wb = Array::full(Shape{16, 8192}, DType::kF32, 0.25f);
+    auto e = kEmitter.emit(sibling_group({linear(x0, wa), linear(x1, wb)}), dev);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) {
+      std::printf("       %s\n", e.status().to_string().c_str());
+      return;
+    }
+    LSE_EXPECT_EQ(shared_arrays(e->source).size(), 2u);
+    // Summed to exactly the budget. A max over the stages would say 32768 and
+    // would keep saying it while a third panel walked off the end.
+    LSE_EXPECT_EQ(e->lds_bytes, budget);
+    // And the number is the text's, not a prediction sitting beside it.
+    auto counted = backend::HipEmitter::shared_bytes(e->source);
+    LSE_EXPECT(counted.ok());
+    if (counted.ok()) LSE_EXPECT_EQ(*counted, e->lds_bytes);
+    if (kCompiler.available()) {
+      auto code = kCompiler.compile(e->source, "gfx1151");
+      if (!code.ok()) {
+        std::printf("       %s\n", code.status().message().c_str());
+      }
+      LSE_EXPECT(code.ok());
+    }
+  }
+
+  // One f32 line over: 32768 + 32784 = 65552. The run is not emitted as a fused
+  // body, and whatever is emitted instead stays inside the budget.
+  {
+    Array x0 = Array::full(Shape{1, 8192}, DType::kF32, 1.0f);
+    Array x1 = Array::full(Shape{1, 8196}, DType::kF32, 2.0f);
+    Array wa = Array::full(Shape{16, 8192}, DType::kF32, 0.5f);
+    Array wb = Array::full(Shape{16, 8196}, DType::kF32, 0.25f);
+    auto e = kEmitter.emit(sibling_group({linear(x0, wa), linear(x1, wb)}), dev);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) return;
+    LSE_EXPECT(e->lds_bytes <= budget);
+    LSE_EXPECT(shared_arrays(e->source).size() < 2u);
+    auto counted = backend::HipEmitter::shared_bytes(e->source);
+    LSE_EXPECT(counted.ok());
+    if (counted.ok()) LSE_EXPECT_EQ(*counted, e->lds_bytes);
+  }
+}
+
+// A phase is several stage bodies concatenated, each built against the whole
+// device budget and blind to the others, so its workgroup scratch is the SUM of
+// what they declare. It used to report a constant 1024 for every geometry, which
+// is 17x under for a two-GEMV phase — and an over-budget phase does not fail to
+// launch, it fails to compile, and the scheduler then runs the group on the host
+// interpreter for the rest of the run.
+LSE_TEST(a_phase_is_priced_for_every_row_its_stages_stage) {
+  auto phase_of = [](Array& root) {
+    const NodePtr roots[] = {root.node()};
+    const auto wgs = Partitioner::phases(roots);
+    return wgs.empty() ? FusionGroup{}
+                       : Partitioner::phase_group(wgs[0], roots);
+  };
+
+  // One staged GEMV. A phase only puts a GEMV on a grid at N >= 256, and only a
+  // grid launch has a workgroup-constant row to stage: K=1024 f32 = 4096 B.
+  Array x = Array::full(Shape{1, 1024}, DType::kF32, 1.0f);
+  Array w2 = Array::full(Shape{256, 1024}, DType::kF32, 0.2f);
+  Array solo = linear(x, w2);
+  const FusionGroup g1 = phase_of(solo);
+  auto e1 = backend::HipEmitter::emit_phase(g1, gfx1151());
+  LSE_EXPECT(e1.ok());
+  if (!e1.ok()) {
+    std::printf("       %s\n", e1.status().to_string().c_str());
+    return;
+  }
+  LSE_EXPECT_EQ(shared_arrays(e1->source).size(), 1u);
+  LSE_EXPECT_EQ(e1->lds_bytes, 4096u);
+
+  // Two staged GEMVs in one phase, over two different activations, so neither
+  // can reuse the other's row. The declarations sit in disjoint braces and still
+  // sum: the hardware gives each its own LDS offset.
+  Array w1 = Array::full(Shape{1024, 1024}, DType::kF32, 0.1f);
+  Array chain = linear(linear(x, w1), w2);
+  const FusionGroup g2 = phase_of(chain);
+  auto e2 = backend::HipEmitter::emit_phase(g2, gfx1151());
+  LSE_EXPECT(e2.ok());
+  if (!e2.ok()) {
+    std::printf("       %s\n", e2.status().to_string().c_str());
+    return;
+  }
+  const std::size_t rows_two = shared_arrays(e2->source).size();
+  LSE_EXPECT_EQ(rows_two, 2u);
+  if (rows_two != 2) return;
+  LSE_EXPECT_EQ(e2->lds_bytes, 8192u);
+  // Read off the text, which is where a concatenated phase's total lives.
+  auto counted = backend::HipEmitter::shared_bytes(e2->source);
+  LSE_EXPECT(counted.ok());
+  if (counted.ok()) LSE_EXPECT_EQ(*counted, e2->lds_bytes);
+  // Not the max, which is what a per-geometry constant amounts to.
+  LSE_EXPECT(e2->lds_bytes > e1->lds_bytes);
+}
+
 // Width invariance: a token must not depend on how many rows are in the pass.
 // The staged and unstaged activation reads index differently — the panel holds
 // the row, so it is read from 0, while global is read from `row * K` — and a
@@ -2011,4 +2303,113 @@ LSE_TEST(matrix_core_int4_reuses_the_body_at_another_fragment_width) {
   LSE_EXPECT(got.size() == want.size());
   if (got.size() != want.size()) return;
   LSE_EXPECT_EQ(worst_abs(got, want), 0.0);
+}
+
+// Width invariance for the merged SwiGLU pair, on the device. Both stages bake
+// the element count and the grid width into the body, so an M-row pass has to
+// compute every row from its own data — the recurring defect in this tree is a
+// kernel that reads row 0 for all of them and still produces fluent text. Row r
+// is compared bit-for-bit across pass widths, which needs no reference model and
+// no tolerance; a host reference then catches every row being wrong the same
+// way. The grid must also grow with M: a body that kept one row's count would
+// launch the same nine workgroups at every width and leave rows 1.. at zero.
+LSE_TEST(the_fused_swiglu_pair_holds_its_own_row_at_every_pass_width) {
+  backend::IBackend* be = live_hrx();
+  if (be == nullptr || !kCompiler.available()) return;
+  const backend::DeviceInfo& dev = be->device_info();
+  if (backend::device_extension<backend::AmdDeviceInfo>(dev) == nullptr) return;
+
+  constexpr std::int64_t kInner = 2176;
+  // Rows must differ, or reading row 0 for everything would pass.
+  auto gval = [](std::size_t r, std::size_t t) {
+    return static_cast<float>(
+               small_int(static_cast<std::uint32_t>(r * 1013u + t * 37u), 9)) *
+           0.25f;
+  };
+  auto uval = [](std::size_t r, std::size_t t) {
+    return static_cast<float>(
+               small_int(static_cast<std::uint32_t>(r * 617u + t * 53u + 7u),
+                         9)) *
+           0.5f;
+  };
+
+  auto run = [&](std::int64_t m) -> std::vector<float> {
+    Array g = Array::zeros(Shape{m, kInner}, DType::kF32);
+    Array u = Array::zeros(Shape{m, kInner}, DType::kF32);
+    Array hid = silu(g) * u;
+    const NodePtr roots[] = {hid.node()};
+    const auto wgs = Partitioner::phases(roots);
+    LSE_EXPECT(!wgs.empty());
+    if (wgs.empty()) return {};
+    const FusionGroup grp = Partitioner::phase_group(wgs[0], roots);
+    auto e = backend::HipEmitter::emit_phase(grp, dev);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) {
+      std::printf("       m=%lld: %s\n", static_cast<long long>(m),
+                  e.status().to_string().c_str());
+      return {};
+    }
+    // One launch for the pair, and a grid that covers the whole pass.
+    const auto want_wgs =
+        static_cast<std::uint32_t>((m * kInner + 255) / 256);
+    LSE_EXPECT_EQ(e->dims.workgroup_count[0], want_wgs);
+
+    const auto n = static_cast<std::size_t>(m * kInner);
+    std::vector<float> gs(n), us(n);
+    for (std::size_t r = 0; r < static_cast<std::size_t>(m); ++r) {
+      for (std::size_t t = 0; t < static_cast<std::size_t>(kInner); ++t) {
+        gs[r * kInner + t] = gval(r, t);
+        us[r * kInner + t] = uval(r, t);
+      }
+    }
+    const std::vector<std::vector<float>> got = run_emitted(
+        *e, dev, *be, {{g.node().get(), gs}, {u.node().get(), us}});
+    if (got.size() != e->binding_order.size()) {
+      LSE_EXPECT(false);
+      return {};
+    }
+    for (std::size_t i = 0; i < e->binding_order.size(); ++i) {
+      if (e->binding_order[i].get() == hid.node().get()) return got[i];
+    }
+    LSE_EXPECT(false);
+    return {};
+  };
+
+  const std::vector<float> wide = run(5);
+  LSE_EXPECT(wide.size() == static_cast<std::size_t>(5 * kInner));
+  if (wide.size() != static_cast<std::size_t>(5 * kInner)) return;
+
+  for (const std::int64_t m : {std::int64_t{1}, std::int64_t{2},
+                               std::int64_t{3}, std::int64_t{17}}) {
+    const std::vector<float> got = run(m);
+    LSE_EXPECT(got.size() == static_cast<std::size_t>(m * kInner));
+    if (got.size() != static_cast<std::size_t>(m * kInner)) continue;
+    const auto span = static_cast<std::ptrdiff_t>((m < 5 ? m : 5) * kInner);
+    std::vector<float> a(got.begin(), got.begin() + span);
+    std::vector<float> b(wide.begin(), wide.begin() + span);
+    const double worst = worst_abs(a, b);
+    if (worst != 0.0) {
+      std::printf("       m=%lld differs from the 5-row pass by %g\n",
+                  static_cast<long long>(m), worst);
+    }
+    LSE_EXPECT_EQ(worst, 0.0);
+  }
+
+  // Every row wrong the same way would survive the comparison above.
+  std::vector<float> want(static_cast<std::size_t>(5 * kInner), 0.0f);
+  for (std::size_t r = 0; r < 5; ++r) {
+    for (std::size_t t = 0; t < static_cast<std::size_t>(kInner); ++t) {
+      const float x = gval(r, t);
+      want[r * kInner + t] = x / (1.0f + std::exp(-x)) * uval(r, t);
+    }
+  }
+  double worst = 0.0;
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    worst = std::max(worst, std::fabs(static_cast<double>(wide[i]) -
+                                      static_cast<double>(want[i])));
+  }
+  // __expf is the device's fast exponential, so this is an agreement bound and
+  // not an equality: measured worst here is ~1e-7.
+  if (worst > 1e-5) std::printf("       host disagreement %g\n", worst);
+  LSE_EXPECT(worst <= 1e-5);
 }

@@ -93,16 +93,31 @@ std::vector<RowPanel> row_panels(const std::vector<IndexedStage>& stages,
   return panels;
 }
 
-// What the run's workgroup scratch actually costs: every distinct row once,
-// plus whatever a stage that shares nothing takes on its own.
+// What the run's workgroup scratch is expected to cost: every hoisted panel
+// once, plus whatever each remaining stage takes on its own.
+//
+// The arms must cover the stages exactly. A stage that reported a staged row but
+// got no panel — row_panels declines a non-f32 activation, and will decline more
+// once activations narrow — still self-stages `align(K*4)` inside its own body,
+// so keying the second arm on `row.count == 0` rather than on "did not get a
+// panel" made such a stage contribute nothing at all.
+//
+// This is only a prediction, used to choose a path before any text exists. What
+// is ENFORCED is Body::workgroup_bytes() on the emitted body, so nothing the
+// hardware charges for rests on this number being right; a test pins the two
+// together so a drift shows up at build time rather than as a launch nobody
+// checked.
 std::uint32_t run_lds_bytes(const std::vector<IndexedStage>& stages,
-                            const std::vector<RowPanel>& panels) {
+                            const std::vector<RowPanel>& panels,
+                            const std::vector<std::size_t>& panel_of) {
   std::uint32_t bytes = 0;
   for (const RowPanel& p : panels) {
     bytes += kir::Lds::align(p.count * kir::pack_elem_bytes<kir::f32>());
   }
-  for (const IndexedStage& st : stages) {
-    if (st.row.count == 0) bytes += kir::Lds::align(st.plan.lds_bytes);
+  for (std::size_t si = 0; si < stages.size(); ++si) {
+    if (panel_of[si] == kNoPanel) {
+      bytes += kir::Lds::align(stages[si].plan.lds_bytes);
+    }
   }
   return bytes;
 }
@@ -306,11 +321,11 @@ LaunchDims HipEmitter::choose_dims(const FusionGroup& group,
       device.max_threads_per_workgroup ? device.max_threads_per_workgroup : 256;
 
   // Every legal workgroup size keeps the same number of threads resident on a
-  // CU — occupancy_per_cu counts *workgroups*, and workgroups x threads is
-  // constant — so maximizing it just picks the smallest size every time. That
-  // is how a 254M-element fill came to launch 7.9M workgroups of 32 threads.
-  // What actually differs is the launch count, so take the largest size that
-  // still fits, bounded by the work there is to do.
+  // pool — occupancy counts *workgroups*, and workgroups x threads is constant
+  // — so maximizing it just picks the smallest size every time. That is how a
+  // 254M-element fill came to launch 7.9M workgroups of 32 threads. What
+  // actually differs is the launch count, so take the largest size that still
+  // fits, bounded by the work there is to do.
   std::uint32_t needed = wave;
   while (needed < elements && needed < cap) needed *= 2;
 
@@ -318,7 +333,7 @@ LaunchDims HipEmitter::choose_dims(const FusionGroup& group,
   for (std::uint32_t threads = wave; threads <= cap && threads <= needed;
        threads *= 2) {
     const std::uint32_t occ =
-        amd != nullptr ? occupancy_per_cu(device, threads, lds_bytes) : 1;
+        amd != nullptr ? occupancy_per_lds_pool(device, threads, lds_bytes) : 1;
     if (occ > 0) best = threads;
   }
 
@@ -423,6 +438,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.dims = it->second.dims;
       out.pointer_table = false;
       out.constants.add("count", 4);
+      out.lds_bytes = it->second.lds_bytes;
       out.scratch_bytes = it->second.scratch_bytes;
       out.persist_grid = it->second.persist_grid;
       bind_phase(group, out);
@@ -430,9 +446,10 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     }
     auto emitted = emit_phase(group, device);
     if (emitted.ok()) {
-      emit_cache_[key] = CachedEmit{emitted->source, emitted->entry_name,
-                                    emitted->dims, emitted->scratch_bytes,
-                                    emitted->persist_grid};
+      emit_cache_[key] =
+          CachedEmit{emitted->source,        emitted->entry_name,
+                     emitted->dims,          emitted->lds_bytes,
+                     emitted->scratch_bytes, emitted->persist_grid};
     }
     return emitted;
   }
@@ -473,7 +490,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   std::vector<std::size_t> panel_of;
   std::vector<RowPanel> panels = row_panels(stages, panel_of);
   const std::uint32_t lds_budget = workgroup_lds_bytes(&device);
-  const std::uint32_t lds_needed = run_lds_bytes(stages, panels);
+  const std::uint32_t lds_needed = run_lds_bytes(stages, panels, panel_of);
   if (sibling_stages(group, stages, lds_needed, lds_budget)) {
     EmittedKernel out;
     out.entry_name = "lse_fused_" + std::to_string(group.signature());
@@ -503,7 +520,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.source = it->second.source;
       out.entry_name = it->second.entry_name;
       out.dims = it->second.dims;
-      out.lds_bytes = lds_needed;
+      // The measured total of the cached text, not today's prediction of it.
+      out.lds_bytes = it->second.lds_bytes;
       return out;
     }
 
@@ -665,17 +683,28 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       return LSE_ERROR(kInternal, "fused sibling body: ", s.message());
     }
     ir::record_pass_totals(pass_stats);
+
+    // The run's real workgroup scratch, read off the body that is about to be
+    // printed: every `__shared__` array it still declares, summed. Nothing here
+    // depends on lds_fold having collapsed anything — an array it left standing
+    // is still an array the compiler charges for, and it is counted.
+    const std::uint32_t lds_emitted = merged.workgroup_bytes();
+    if (lds_budget != 0 && lds_emitted > lds_budget) {
+      return LSE_ERROR(kOutOfMemory, "fused run needs ",
+                       std::to_string(lds_emitted),
+                       " bytes of workgroup scratch, device allows ",
+                       std::to_string(lds_budget));
+    }
     body << ir::lower(merged) << "\n}\n";
     out.source = body.str();
     for (int d = 0; d < 3; ++d) {
       out.dims.workgroup_size[d] = unified.workgroup_size[d];
       out.dims.workgroup_count[d] = unified.workgroup_count[d];
     }
-    // The run's rows, each counted once — not the widest stage's, which is what
-    // a max over the stage plans would have said.
-    out.lds_bytes = lds_needed;
+    out.lds_bytes = lds_emitted;
     out.dims.subgroup_size = device.wavefront_size;
-    emit_cache_[sig] = CachedEmit{out.source, out.entry_name, out.dims};
+    emit_cache_[sig] =
+        CachedEmit{out.source, out.entry_name, out.dims, lds_emitted};
     return out;
   }
 
@@ -1010,9 +1039,21 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.dims.workgroup_size[d] = tp.workgroup_size[d];
       out.dims.workgroup_count[d] = tp.workgroup_count[d];
     }
-    out.lds_bytes = tp.lds_bytes;
+    // The primitive's own text, plus whatever the epilogue spliced in. A plan
+    // that under-declared its scratch would be believed if this were tp's
+    // number, and the epilogue is not in the plan at all.
+    auto declared = shared_bytes(out.source);
+    if (!declared.ok()) return declared.status();
+    if (lds_budget != 0 && *declared > lds_budget) {
+      return LSE_ERROR(kOutOfMemory, "'", std::string(self_indexed->name()),
+                       "' declares ", std::to_string(*declared),
+                       " bytes of workgroup scratch, device allows ",
+                       std::to_string(lds_budget));
+    }
+    out.lds_bytes = *declared;
     out.dims.subgroup_size = device.wavefront_size;
-    emit_cache_[sig] = CachedEmit{out.source, out.entry_name, out.dims};
+    emit_cache_[sig] =
+        CachedEmit{out.source, out.entry_name, out.dims, *declared};
     return out;
   }
 
@@ -1161,8 +1202,21 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   src << "}\n";
 
   out.source = src.str();
+  // Measured, not left at whatever `out.lds_bytes` was initialized to: this is
+  // the one place choose_dims reads it, and it used to be structurally 0 here
+  // because every path that assigns it returns before reaching this line.
+  auto declared = shared_bytes(out.source);
+  if (!declared.ok()) return declared.status();
+  if (lds_budget != 0 && *declared > lds_budget) {
+    return LSE_ERROR(kOutOfMemory, "element scaffold declares ",
+                     std::to_string(*declared),
+                     " bytes of workgroup scratch, device allows ",
+                     std::to_string(lds_budget));
+  }
+  out.lds_bytes = *declared;
   out.dims = choose_dims(group, device, out.lds_bytes);
-  emit_cache_[sig] = CachedEmit{out.source, out.entry_name, out.dims};
+  emit_cache_[sig] =
+      CachedEmit{out.source, out.entry_name, out.dims, *declared};
   return out;
 }
 

@@ -153,10 +153,25 @@ struct AmdDeviceInfo {
   return 1;
 }
 
-// How many workgroups of `threads` can co-reside on one CU given an LDS
-// request. 0 means the request cannot be satisfied — including when `info` is
-// not an AMD device, since then no AMD tile is legal on it.
-[[nodiscard]] inline std::uint32_t occupancy_per_cu(
+// How many CUs share one workgroup-scratch pool. Never 0, so it is safe as a
+// divisor.
+[[nodiscard]] inline std::uint32_t cus_per_lds_pool(
+    const DeviceInfo& info) noexcept {
+  return info.cus_per_lds_pool == 0 ? 1u : info.cus_per_lds_pool;
+}
+
+// How many workgroups of `threads` co-reside on the CUs that share one LDS
+// pool. That pool, not the CU, is what an LDS-heavy launch competes for, and
+// it is the unit hipOccupancyMaxActiveBlocksPerMultiprocessor reports — the
+// two halves of this function must therefore be in the same unit, which is
+// what pairing the per-CU wave cap with the pool's byte budget does.
+//
+// Reproduces the measured gfx1151 table exactly (256 threads: 8 8 5 4 3 2 2 1
+// at 4/8/12/16/20/26.1/32/64 KiB; 512 threads: 4 4 2 at 4/16/32 KiB).
+//
+// 0 means the request cannot be satisfied — including when `info` is not an
+// AMD device, since then no AMD tile is legal on it.
+[[nodiscard]] inline std::uint32_t occupancy_per_lds_pool(
     const DeviceInfo& info, std::uint32_t threads,
     std::uint32_t lds_bytes) noexcept {
   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(info);
@@ -165,7 +180,8 @@ struct AmdDeviceInfo {
   if (lds_bytes > info.lds_bytes_per_workgroup) return 0;
   const std::uint32_t waves =
       (threads + info.wavefront_size - 1) / info.wavefront_size;
-  const std::uint32_t wave_limit = info.max_waves_per_cu / waves;
+  const std::uint32_t wave_limit =
+      (info.max_waves_per_cu * cus_per_lds_pool(info)) / waves;
   if (lds_bytes == 0) return wave_limit;
   const std::uint32_t lds_limit = info.lds_bytes_per_workgroup / lds_bytes;
   return wave_limit < lds_limit ? wave_limit : lds_limit;

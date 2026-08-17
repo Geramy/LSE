@@ -251,6 +251,22 @@ bool Body::contains(OpKind k) const {
   return false;
 }
 
+std::uint32_t Body::workgroup_bytes() const noexcept {
+  std::uint32_t total = 0;
+  // `walk` visits exactly the ops lowering prints, so an allocation left
+  // unread by a fold but not yet deleted by DCE is still counted — the
+  // compiler charges for a declaration nobody reads.
+  walk([&](OpId id) {
+    const Operation& o = ops_[id];
+    if (o.kind != OpKind::kAlloc || o.type.space != Space::kWorkgroup) return;
+    const auto elems =
+        o.has(kFlagArray) ? static_cast<std::uint32_t>(o.imm) : o.type.lanes;
+    const std::uint32_t bytes = elems * scalar_bytes(o.type.elem);
+    total += (bytes + 15u) & ~15u;
+  });
+  return total;
+}
+
 void Body::splice(const Body& other, RegionId into) {
   std::vector<ValueId> vmap(other.values_.size(), kNoValue);
 

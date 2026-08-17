@@ -78,6 +78,20 @@ class IPhaseStaging {
   // cannot share the one-workgroup fallback its dependent neighbours need.
   [[nodiscard]] virtual std::uint32_t stage_threads(
       const Node& n, const backend::DeviceInfo& device) const = 0;
+
+  // Would thread i of this stage touch element i and nothing else? No gather,
+  // no reduction, no primitive that owns its indexing, no store back into an
+  // input.
+  [[nodiscard]] virtual bool lane_stage(const Node& n) const noexcept = 0;
+
+  // Does `consumer` read `producer`'s output at the index the producing thread
+  // wrote, over the same element count? Both are then one flat space under one
+  // map, so a read-after-write between them never leaves the thread: a
+  // workgroup barrier orders it and the two can share one fat grid. Every
+  // other dependence needs the grid-wide barrier a launch boundary is, which
+  // is why the splitter breaks the chain there and not here.
+  [[nodiscard]] virtual bool lane_aligned(
+      const Node& producer, const Node& consumer) const noexcept = 0;
 };
 
 class IKernelEmitter {

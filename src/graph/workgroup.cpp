@@ -37,7 +37,31 @@ bool is_kernel_prim(const Node& n) noexcept {
   return dynamic_cast<const KernelPrimitiveBase*>(n.prim) != nullptr;
 }
 
-std::uint32_t estimate_lds(const Node&) noexcept { return 0; }
+// The activation buffer a wide linear stages, and how many f32 of it.
+struct StagedPanelKey {
+  const Node* act = nullptr;
+  std::uint32_t count = 0;
+
+  friend bool operator==(const StagedPanelKey&, const StagedPanelKey&) = default;
+};
+
+StagedPanelKey staged_panel(const Node& n) noexcept {
+  if (!is_wide_linear(n) || n.inputs.empty() || !n.inputs[0]) return {};
+  const Shape& x = n.inputs[0]->shape;
+  const std::int64_t k = x.rank() == 0 ? 0 : x.dim(x.rank() - 1);
+  if (k <= 0) return {};
+  return {n.inputs[0].get(), static_cast<std::uint32_t>(k)};
+}
+
+// f32 row, 16-byte aligned: kir::Lds::align of count * sizeof(float). 0 when
+// the row cannot be staged at all, which is what the emitter decides by asking
+// whether it fits the device budget.
+std::uint32_t panel_bytes(const StagedPanelKey& p,
+                          const WorkgroupDevice& dev) noexcept {
+  if (p.act == nullptr) return 0;
+  const std::uint32_t bytes = ((p.count * 4u) + 15u) & ~15u;
+  return dev.lds_bytes != 0 && bytes > dev.lds_bytes ? 0u : bytes;
+}
 
 void collect_kp_ancestors(const Node* n,
                           const std::unordered_set<const Node*>& members,
@@ -54,6 +78,9 @@ void collect_kp_ancestors(const Node* n,
   }
 }
 
+// Workgroups of `threads` resident on the CUs sharing one LDS pool. Must agree
+// with backend::occupancy_per_lds_pool — same unit for both halves, which is
+// why the per-CU wave cap is scaled up to the pool.
 std::uint32_t occupancy_of(const WorkgroupDevice& d, std::uint32_t threads,
                            std::uint32_t lds) noexcept {
   if (threads == 0 || d.wavefront == 0) return 0;
@@ -61,7 +88,8 @@ std::uint32_t occupancy_of(const WorkgroupDevice& d, std::uint32_t threads,
   if (d.lds_bytes != 0 && lds > d.lds_bytes) return 0;
   const std::uint32_t waves = (threads + d.wavefront - 1) / d.wavefront;
   if (waves == 0 || d.max_waves_per_cu < waves) return 0;
-  const std::uint32_t wave_limit = d.max_waves_per_cu / waves;
+  const std::uint32_t pool = d.cus_per_lds_pool == 0 ? 1u : d.cus_per_lds_pool;
+  const std::uint32_t wave_limit = (d.max_waves_per_cu * pool) / waves;
   if (lds == 0 || d.lds_bytes == 0) return wave_limit;
   const std::uint32_t lds_limit = d.lds_bytes / lds;
   return wave_limit < lds_limit ? wave_limit : lds_limit;
@@ -81,6 +109,7 @@ WorkgroupDevice WorkgroupDevice::from(const backend::DeviceInfo* info) noexcept 
   }
   if (info->wavefront_size != 0) d.wavefront = info->wavefront_size;
   if (info->max_waves_per_cu != 0) d.max_waves_per_cu = info->max_waves_per_cu;
+  if (info->cus_per_lds_pool != 0) d.cus_per_lds_pool = info->cus_per_lds_pool;
   return d;
 }
 
@@ -153,8 +182,12 @@ bool Workgroup::can_add(const Node& n) const noexcept {
     return false;
   }
 
-  const std::uint32_t extra = estimate_lds(n);
-  const std::uint32_t lds = extra > lds_used_ ? extra : lds_used_;
+  // A Workgroup is a whole phase and `cuts()` splits it into launches, so the
+  // phase-wide sum is not a quantity the hardware ever sees. What every launch
+  // must clear on its own is the row of the member it holds: that is the floor
+  // this admits against, and lds_bytes() reports the honest worst launch.
+  const std::uint32_t row = staged_row_bytes(n, device_);
+  const std::uint32_t lds = row > lds_used_ ? row : lds_used_;
   if (device_.lds_bytes != 0 && lds > device_.lds_bytes) return false;
 
   const std::uint32_t threads = 256u < device_.max_threads ? 256u
@@ -164,8 +197,8 @@ bool Workgroup::can_add(const Node& n) const noexcept {
 
 bool Workgroup::try_add(NodePtr n) {
   if (!n || !can_add(*n)) return false;
-  const std::uint32_t extra = estimate_lds(*n);
-  if (extra > lds_used_) lds_used_ = extra;
+  const std::uint32_t row = staged_row_bytes(*n, device_);
+  if (row > lds_used_) lds_used_ = row;
   const std::uint64_t elems = n->element_count();
   if (elems > job_) job_ = elems;
   const std::uint32_t r = rows_of(*n);
@@ -253,13 +286,28 @@ bool Workgroup::all_linear_like() const noexcept {
   return any;
 }
 
-std::uint32_t Workgroup::occupancy() const noexcept {
+std::uint32_t Workgroup::occupancy() const {
   const std::uint32_t threads = 256u < device_.max_threads ? 256u
                                                            : device_.max_threads;
-  return occupancy_of(device_, threads == 0 ? 1 : threads, lds_used_);
+  return occupancy_of(device_, threads == 0 ? 1 : threads, lds_bytes());
 }
 
-std::uint32_t Workgroup::lds_bytes() const noexcept { return lds_used_; }
+std::uint32_t Workgroup::lds_bytes() const {
+  // The worst launch, not the phase: within one launch the distinct staged rows
+  // SUM, across launches they do not compose at all. `lds_used_` is only the
+  // largest single row, which is a floor on this and the right answer whenever
+  // no cut holds two.
+  std::uint32_t worst = lds_used_;
+  std::vector<const Node*> nodes;
+  for (const WorkgroupCut& cut : cuts()) {
+    nodes.clear();
+    nodes.reserve(cut.nodes.size());
+    for (const NodePtr& n : cut.nodes) nodes.push_back(n.get());
+    const std::uint32_t need = group_lds_bytes(nodes, device_);
+    if (need > worst) worst = need;
+  }
+  return worst;
+}
 
 std::uint64_t Workgroup::job_elems() const noexcept { return job_; }
 
@@ -281,19 +329,22 @@ WorkgroupPhase Workgroup::phase() const noexcept {
   return phase_of_rows(rows_);
 }
 
-std::uint32_t Workgroup::ideal_launches() const noexcept {
+std::uint32_t Workgroup::ideal_launches() const {
   if (members_.empty()) return 0;
-  if (occupancy() == 0) return kernel_count();
-  if (device_.lds_bytes != 0 && lds_used_ > device_.lds_bytes) {
+  const std::uint32_t lds = lds_bytes();
+  const std::uint32_t threads = 256u < device_.max_threads ? 256u
+                                                           : device_.max_threads;
+  if (occupancy_of(device_, threads == 0 ? 1 : threads, lds) == 0) {
     return kernel_count();
   }
+  if (device_.lds_bytes != 0 && lds > device_.lds_bytes) return kernel_count();
   // One phase, one launch. Decode: one hardware workgroup owns the token
   // and walks every stage. Prefill: one grid, one workgroup per row-tile.
   // Forks and staged edges are stages of that launch, not extra phases.
   return 1;
 }
 
-std::uint32_t Workgroup::launches() const noexcept {
+std::uint32_t Workgroup::launches() const {
   const std::uint32_t ideal = ideal_launches();
   if (ideal <= 1 && emittable()) return ideal == 0 ? 0u : 1u;
   return kernel_count();
@@ -380,6 +431,30 @@ bool reads_large_in_cut(const WorkgroupCut& cut, const Node& n) noexcept {
 }  // namespace
 
 bool is_wide_linear(const Node& n) noexcept { return linear_n(n) >= 128; }
+
+std::uint32_t staged_row_bytes(const Node& n,
+                               const WorkgroupDevice& dev) noexcept {
+  return panel_bytes(staged_panel(n), dev);
+}
+
+std::uint32_t group_lds_bytes(std::span<const Node* const> nodes,
+                              const WorkgroupDevice& dev) noexcept {
+  std::uint32_t bytes = 0;
+  std::vector<StagedPanelKey> seen;
+  for (const Node* n : nodes) {
+    if (n == nullptr) continue;
+    const StagedPanelKey p = staged_panel(*n);
+    if (p.act == nullptr) continue;
+    bool dup = false;
+    for (const StagedPanelKey& s : seen) {
+      if (s == p) dup = true;
+    }
+    if (dup) continue;
+    seen.push_back(p);
+    bytes += panel_bytes(p, dev);
+  }
+  return bytes;
+}
 
 std::vector<WorkgroupCut> Workgroup::cuts() const {
   std::vector<WorkgroupCut> out;

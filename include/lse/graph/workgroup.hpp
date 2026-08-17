@@ -27,8 +27,17 @@ struct WorkgroupDevice {
   std::uint32_t wavefront = 32;
   std::uint32_t max_waves_per_cu = 32;
   std::uint32_t max_threads = 256;
+  // See backend::DeviceInfo::cus_per_lds_pool. `lds_bytes / request` counts
+  // workgroups per pool, so the per-CU answer is that over this.
+  std::uint32_t cus_per_lds_pool = 2;
 
   static WorkgroupDevice from(const backend::DeviceInfo* info) noexcept;
+
+  // The largest workgroup-scratch request that still seats one workgroup on
+  // every CU — the budget a fusion decision is held to.
+  [[nodiscard]] std::uint32_t resident_lds_bytes() const noexcept {
+    return lds_bytes / (cus_per_lds_pool == 0 ? 1u : cus_per_lds_pool);
+  }
 };
 
 // Collectives are the only hard isolate. Everything else is a stage of
@@ -38,6 +47,27 @@ struct WorkgroupDevice {
 // A GEMV wide enough to want a grid of its own rather than a slot in a staged
 // body. Matches the cut the scheduler makes when it groups sibling linears.
 [[nodiscard]] bool is_wide_linear(const Node& n) noexcept;
+
+// Workgroup scratch this node stages for itself, in bytes: its activation row,
+// f32, 16-byte aligned. 0 when it stages nothing — including when the row does
+// not fit the device at all, which is the emitter's own condition for reading
+// the activation from global instead. The 27B's down projection is that case: a
+// 17408-long row wants 69632 bytes, so it never stages and never pays.
+//
+// A wide linear stages this row whether or not it is fused — the solo grid GEMV
+// reserves it against the whole device budget — so this is what one of these
+// launches already costs, not a price fusion introduces.
+[[nodiscard]] std::uint32_t staged_row_bytes(
+    const Node& n, const WorkgroupDevice& dev) noexcept;
+
+// What `nodes` cost in workgroup scratch sharing ONE launch: every DISTINCT
+// staged row once. Distinct means a different activation buffer or a different
+// length; the emitter hoists one panel per pair and the stages read it by name.
+//
+// Summed, never maximized: separate `__shared__` declarations get separate LDS
+// offsets even in disjoint block scopes.
+[[nodiscard]] std::uint32_t group_lds_bytes(
+    std::span<const Node* const> nodes, const WorkgroupDevice& dev) noexcept;
 
 enum class WorkgroupPhase : std::uint8_t {
   kUnknown,
@@ -81,18 +111,20 @@ class Workgroup {
 
   // Dispatches we will actually issue (emit cuts). 1 only when a fused
   // body exists. A whole decode/prefill phase still reports ideal 1.
-  [[nodiscard]] std::uint32_t launches() const noexcept;
+  [[nodiscard]] std::uint32_t launches() const;
 
   // A connected device phase is one launch: decode owns the token in one
   // hardware workgroup; prefill is one grid. Host cuts and a dead
   // occupancy are the only reasons this is not 1.
-  [[nodiscard]] std::uint32_t ideal_launches() const noexcept;
+  [[nodiscard]] std::uint32_t ideal_launches() const;
 
   [[nodiscard]] bool fused() const noexcept;
   [[nodiscard]] bool emittable() const noexcept;
   [[nodiscard]] ThreadPlan plan() const noexcept;
-  [[nodiscard]] std::uint32_t lds_bytes() const noexcept;
-  [[nodiscard]] std::uint32_t occupancy() const noexcept;
+  // The worst launch this phase would issue, not the phase: scratch sums inside
+  // a cut and does not compose across cuts. Walks cuts(), so not noexcept.
+  [[nodiscard]] std::uint32_t lds_bytes() const;
+  [[nodiscard]] std::uint32_t occupancy() const;
   [[nodiscard]] std::uint64_t job_elems() const noexcept;
 
   [[nodiscard]] const std::vector<NodePtr>& members() const noexcept {

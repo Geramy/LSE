@@ -131,6 +131,7 @@ void group_sibling_linears(std::vector<NodePtr>& order,
 
   std::vector<std::size_t> take;
   std::vector<const Node*> run;
+  std::vector<const Node*> probe;
   for (std::size_t p = 0; p < order.size(); ++p) {
     emitted.insert(order[p].get());
     if (!is_wide_linear(*order[p]) || order[p]->inputs.empty()) continue;
@@ -139,23 +140,42 @@ void group_sibling_linears(std::vector<NodePtr>& order,
     const std::int64_t k = activation_k(*order[p]);
     if (k <= 0) continue;
 
-    // The run stages the shared activation row in workgroup scratch (the grid
-    // arm of emit_gemv in lds_linear.cpp). The emitter stages it ONCE for the
-    // whole run — one allocation, one fill, one barrier ahead of every stage —
-    // so what has to fit is one row, not one per stage. Hold it to a quarter of
-    // the workgroup budget so four of these GEMV workgroups still fit on a CU;
-    // past that the launch saved costs more occupancy than it buys.
-    const auto staged = static_cast<std::uint32_t>(k) * 4u;
-    if (staged != 0 && staged > dev.lds_bytes / 4u) continue;
     const std::size_t cap = kMaxSiblingRun;
 
     run.assign(1, order[p].get());
     take.clear();
+
+    // What the run may spend on workgroup scratch.
+    //
+    // The emitter hoists ONE panel per distinct (activation, length) and every
+    // stage reads it by name, so a run whose members share an activation costs
+    // exactly what any one of them already costs alone: the solo grid GEMV
+    // reserves the same row against the whole device budget. Merging is
+    // LDS-neutral there, and the budget must not pretend otherwise — the rule
+    // this replaced held one row to a quarter of the budget and so refused the
+    // 27B's 20480-byte row while the emitter was already emitting a single
+    // unfused stage at 36864 bytes on the 4B (verified in the dumps).
+    //
+    // A run that brings a SECOND distinct row does add scratch, and that is the
+    // only place occupancy binds. Hold the sum to resident_lds_bytes(): the
+    // largest request that still seats one workgroup on every CU (32768 on
+    // gfx1151, where 65536/request counts workgroups per two-CU pool).
+    const std::uint32_t solo = staged_row_bytes(*order[p], dev);
+    const std::uint32_t budget = std::max(solo, dev.resident_lds_bytes());
+    auto run_fits = [&](const Node& candidate) {
+      probe.assign(run.begin(), run.end());
+      for (std::size_t t : take) probe.push_back(order[t].get());
+      probe.push_back(&candidate);
+      const std::uint32_t need = group_lds_bytes(probe, dev);
+      return need <= budget && (dev.lds_bytes == 0 || need <= dev.lds_bytes);
+    };
+
     for (std::size_t j = p + 1;
          j < order.size() && run.size() + take.size() < cap; ++j) {
       const Node& c = *order[j];
       if (!is_wide_linear(c) || c.inputs.empty()) continue;
       if (c.inputs[0].get() != x || activation_k(c) != k) continue;
+      if (!run_fits(c)) continue;
       // Mixing kinds in one run is legal only where every kind has a
       // self-indexing form. `linear` gains a matrix-core form at M >= 16;
       // `linear_indexed` has only the wave-per-column GEMV, which needs a
