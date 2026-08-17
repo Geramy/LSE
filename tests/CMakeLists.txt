@@ -40,6 +40,12 @@ if(TARGET lse_backend_hrx)
   lse_add_test(test_jit lse_graph lse_backend_hrx)
 endif()
 
+# Client and server both run in this process over a real socket and a real
+# abstract unix pipe, so this suite needs no network and no device. It is
+# unguarded on purpose: a transport seam that cannot be exercised on a bare
+# machine is one nobody reviews.
+lse_add_test(test_communication lse_communication)
+
 # dist runs its ranks on threads and its codecs on whatever device answers;
 # with no GPU the device cases skip and the host ones still cover the algebra.
 lse_add_test(test_dist lse_dist)

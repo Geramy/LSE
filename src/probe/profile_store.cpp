@@ -14,7 +14,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kFormatVersion = 1;
+// 2 added DeviceProfile::free_memory to the device record. A stale entry then
+// fails the version check, which is the re-measure path rather than an error.
+constexpr int kFormatVersion = 2;
 // A field with no text. Spaces separate fields, so an empty one needs a mark.
 constexpr std::string_view kNone = "-";
 
@@ -82,6 +84,7 @@ void write_device(std::ostringstream& out, const DeviceProfile& d) {
   append_measured(out, d.launch_overhead_ns);
   append_measured(out, d.h2d_bytes_per_s);
   append_measured(out, d.d2h_bytes_per_s);
+  append_measured(out, d.free_memory);
   // Free text, so it is last and takes the rest of the line.
   out << ' ' << text_or_none(d.name) << '\n';
   for (const MatrixRowRate& r : d.rows) {
@@ -116,6 +119,7 @@ bool read_device_line(std::istringstream& in, DeviceProfile* d) {
   if (!read_measured(in, &d->launch_overhead_ns)) return false;
   if (!read_measured(in, &d->h2d_bytes_per_s)) return false;
   if (!read_measured(in, &d->d2h_bytes_per_s)) return false;
+  if (!read_measured(in, &d->free_memory)) return false;
   std::string rest;
   std::getline(in, rest);
   const std::size_t first = rest.find_first_not_of(' ');

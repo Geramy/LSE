@@ -242,12 +242,15 @@ std::string PoolProfile::describe() const {
   char line[256];
   for (const DeviceProfile& d : devices) {
     std::snprintf(line, sizeof(line),
-                  "  %-8s %-10s  dram %8.1f GB/s (%s)  launch %7.2f us (%s)\n",
+                  "  %-8s %-10s  dram %8.1f GB/s (%s)  launch %7.2f us (%s)"
+                  "  free %7.1f GB (%s)\n",
                   d.id.str().c_str(), d.arch.c_str(),
                   d.dram_bytes_per_s.value / 1e9,
                   std::string(to_string(d.dram_bytes_per_s.provenance)).c_str(),
                   d.launch_overhead_ns.value / 1e3,
-                  std::string(to_string(d.launch_overhead_ns.provenance)).c_str());
+                  std::string(to_string(d.launch_overhead_ns.provenance)).c_str(),
+                  d.free_memory.value / 1e9,
+                  std::string(to_string(d.free_memory.provenance)).c_str());
     out += line;
     for (const ComputePath& p : d.paths) {
       std::snprintf(line, sizeof(line),

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "lse/backend/backend.hpp"
+#include "lse/communication/capabilities.hpp"
 #include "lse/core/dtype.hpp"
 #include "lse/core/status.hpp"
 
@@ -24,26 +25,16 @@ using Rank = std::int32_t;
 
 enum class ReduceOp : std::uint8_t { kSum, kProd, kMin, kMax, kAvg };
 
-struct Capabilities {
+// The link half — device_memory_direct, reliable, ordered, full_duplex,
+// bandwidth, latency, max_message_bytes — lives in comm::Capabilities, because
+// a connection has those facts and a world does not. There is one capability
+// vocabulary, and the cost model reads it whether the bytes cross a socket, a
+// DMA ring or a peer copy. The two below are world facts and belong here.
+struct Capabilities : comm::Capabilities {
   bool native_collectives = false;
-  // GPUDirect / XGMI / PCIe P2P. When false every transfer stages through a
-  // host bounce buffer, and the cost model doubles the byte cost.
-  bool device_memory_direct = false;
-  // False for UDP-style transports; the engine layers sequencing/retry on top.
-  bool reliable = true;
-  bool ordered = true;
-  bool full_duplex = true;
+  // Whether point-to-point send buffers, which is what decides the
+  // deadlock-free ordering in collectives.hpp.
   bool asynchronous = true;
-
-  std::uint64_t bandwidth_bytes_per_s = 0;
-  std::uint64_t latency_ns = 0;
-  std::size_t max_message_bytes = 0;   // 0 = unbounded
-  // Below this, latency dominates and a tree beats a ring.
-  [[nodiscard]] std::size_t latency_bound_threshold() const noexcept {
-    return bandwidth_bytes_per_s
-               ? static_cast<std::size_t>(latency_ns * bandwidth_bytes_per_s / 1'000'000'000ull)
-               : 0;
-  }
 };
 
 struct CommBuffer {

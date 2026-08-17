@@ -79,6 +79,33 @@ lse_apply_common_flags(lse_ir)
 add_subdirectory(src/backends)
 
 # ---------------------------------------------------------------------------
+# communication — the transport seam: listen on an endpoint or connect to one,
+# then send and receive asynchronously on a loop the caller drives. Above
+# nothing but core, because a peer that only moves bytes must not drag in the
+# IR or a backend; whether an endpoint is a socket, a DMA ring or a queue pair
+# is chosen from the endpoint string and the declared capabilities, never
+# named by a caller.
+# ---------------------------------------------------------------------------
+add_library(lse_communication
+  src/communication/endpoint.cpp
+  src/communication/capabilities.cpp
+  src/communication/transport.cpp
+  src/communication/reactor.cpp
+  src/communication/poller_epoll.cpp
+  src/communication/stream_link.cpp
+  src/communication/socket.cpp
+  src/communication/rdma.cpp
+)
+add_library(lse::communication ALIAS lse_communication)
+# ${CMAKE_DL_LIBS} is for dlopen, which is how a fabric transport asks this
+# machine what it has. It is not a build dependency on any fabric: there is none.
+target_link_libraries(lse_communication PUBLIC lse_core ${CMAKE_DL_LIBS})
+# Transports self-register from a TU with no referenced symbols.
+target_link_options(lse_communication INTERFACE
+  "LINKER:--whole-archive,$<TARGET_FILE:lse_communication>,--no-whole-archive")
+lse_apply_common_flags(lse_communication)
+
+# ---------------------------------------------------------------------------
 # dist — transports and collectives. Deliberately below lse_graph: a backend
 # registers its device codec engine here, so this must not depend on lse_graph
 # (which link-depends on the backends).
@@ -90,7 +117,7 @@ add_library(lse_dist
   src/dist/collective.cpp
 )
 add_library(lse::dist ALIAS lse_dist)
-target_link_libraries(lse_dist PUBLIC lse_core lse_ir lse_backend_registry)
+target_link_libraries(lse_dist PUBLIC lse_core lse_ir lse_backend_registry lse_communication)
 # Transports self-register from a TU with no referenced symbols.
 target_link_options(lse_dist INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_dist>,--no-whole-archive")

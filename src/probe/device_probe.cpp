@@ -47,11 +47,13 @@ class PortableProbe final : public IDeviceProbe {
   explicit PortableProbe(backend::IBackend& be)
       : declined_(host_executed(be)
                       ? "host-executed backend: memory and dispatch are the "
-                        "host's, and there is no matrix core to rate"
+                        "host's, there is no matrix core to rate, and free "
+                        "memory needs a runtime query IBackend does not carry"
                       : "this backend registered no device probe, so its "
                         "kernel-side rates (streaming bandwidth, dispatch "
                         "cost, matrix-core throughput) are unknown here "
-                        "rather than guessed") {}
+                        "rather than guessed; free memory needs a runtime "
+                        "query IBackend does not carry either") {}
 
   Status run(backend::IBackend& be, DeviceProfile& out) override {
     const Status transfer = measure_transfers(be, out);
@@ -177,6 +179,11 @@ DeviceProfile device_identity(const backend::IBackend& backend) {
   p.id.ordinal = static_cast<int>(info.ordinal);
   p.arch = info.arch;
   p.name = info.name;
+  // total_memory is the declared part size and deliberately does not become
+  // free_memory: a device already holding a model has the same total and no
+  // room. IBackend answers no memory query, so free_memory stays kUnknown until
+  // a backend's own probe fills it — HRX from hrx_device_memory_info(), which
+  // is the one call between here and a capacity-aware placement on this box.
   p.total_memory = info.total_memory;
   p.compute_units = info.compute_units;
   p.unified_memory = info.unified_memory;

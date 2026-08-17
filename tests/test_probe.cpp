@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -379,7 +380,9 @@ LSE_TEST(a_heterogeneous_split_follows_measured_throughput) {
   w.launches = 1;
 
   const DeviceId set[] = {a, b};
-  const auto shares = model.split(w, set, a);
+  const auto even = model.split(w, set, a);
+  LSE_EXPECT(even.feasible());
+  const auto& shares = even.shares;
   LSE_EXPECT_EQ(shares.size(), 2u);
   double total = 0.0;
   for (const auto& s : shares) total += s.fraction;
@@ -400,7 +403,8 @@ LSE_TEST(a_heterogeneous_split_follows_measured_throughput) {
   Work moved = w;
   moved.bytes_moved = 1u << 30;
   const CostModel costly_model(costly);
-  const auto shallow = costly_model.split(moved, set, a, 1);
+  const auto shallow_split = costly_model.split(moved, set, a, 1);
+  const auto& shallow = shallow_split.shares;
   std::printf("       slow link, depth 1:  %.3f / %.3f\n",
               shallow[0].fraction, shallow[1].fraction);
   LSE_EXPECT(shallow[1].fraction < shares[1].fraction);
@@ -410,7 +414,8 @@ LSE_TEST(a_heterogeneous_split_follows_measured_throughput) {
   // carry of the next item overlaps the compute of the current one. The
   // latency-bound answer above is the depth-1 limit of this, not a different
   // model.
-  const auto deep = costly_model.split(moved, set, a, 32);
+  const auto deep_split = costly_model.split(moved, set, a, 32);
+  const auto& deep = deep_split.shares;
   std::printf("       slow link, depth 32: %.3f / %.3f\n", deep[0].fraction,
               deep[1].fraction);
   LSE_EXPECT(deep[1].fraction > shallow[1].fraction);
@@ -438,7 +443,11 @@ LSE_TEST(a_device_without_the_operand_form_is_still_a_pool_member) {
   fp8.operand = math::MatrixElem::kFp8;
   fp8.bytes_streamed = 1u << 20;
   const Cost native_cost = model.compute_cost(
-      Work{fp8.bytes_streamed, fp8.flops, math::MatrixElem::kBF16, 0, 1}, a);
+      Work{.bytes_streamed = fp8.bytes_streamed,
+           .flops = fp8.flops,
+           .operand = math::MatrixElem::kBF16,
+           .launches = 1},
+      a);
   const Cost fallback_cost = model.compute_cost(fp8, a);
   LSE_EXPECT(fallback_cost.known());
   // A fallback is priced, and priced worse — which is what makes a split
@@ -448,11 +457,11 @@ LSE_TEST(a_device_without_the_operand_form_is_still_a_pool_member) {
   LSE_EXPECT(fallback_cost.provenance == Provenance::kDeclared);
 
   const DeviceId set[] = {a, b};
-  const auto shares = model.split(fp8, set, a);
+  const auto split = model.split(fp8, set, a);
   double total = 0.0;
-  for (const auto& s : shares) total += s.fraction;
+  for (const auto& s : split.shares) total += s.fraction;
   LSE_EXPECT_NEAR(total, 1.0, 1e-9);
-  for (const auto& s : shares) LSE_EXPECT(s.fraction > 0.0);
+  for (const auto& s : split.shares) LSE_EXPECT(s.fraction > 0.0);
 
   // The bytes a shard costs to move are the checkpoint's own, and they do not
   // depend on which member receives it. Nothing widens a tensor to suit a
@@ -465,6 +474,413 @@ LSE_TEST(a_device_without_the_operand_form_is_still_a_pool_member) {
 }
 
 // ---------------------------------------------------------------------------
+// Capacity, which is a constraint and not a cost
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bytes, decimal, so the arithmetic in the assertions below is the arithmetic a
+// reader does in their head.
+constexpr double kGB = 1e9;
+
+// Twice the roofline on device 1, no link cost, so time alone splits this
+// 1/3 : 2/3 — the answer the existing heterogeneous-split case proves.
+PoolProfile lopsided_pool(double free_a, double free_b) {
+  PoolProfile pool = two_device_pool(200e9, 50e12, 400e9, 100e12, 0.0, 1e30);
+  pool.devices[0].launch_overhead_ns = Measured::measured(0.0);
+  pool.devices[1].launch_overhead_ns = Measured::measured(0.0);
+  if (free_a >= 0.0) pool.devices[0].free_memory = Measured::measured(free_a);
+  if (free_b >= 0.0) pool.devices[1].free_memory = Measured::measured(free_b);
+  return pool;
+}
+
+Work resident_work(double bytes) {
+  Work w;
+  w.bytes_streamed = static_cast<std::size_t>(bytes);
+  w.bytes_resident = static_cast<std::size_t>(bytes);
+  w.operand = math::MatrixElem::kBF16;
+  w.launches = 1;
+  return w;
+}
+
+// Identical members, free links: the split is then decided by capacity alone,
+// which is the point of the case that uses it.
+PoolProfile uniform_pool(std::size_t n, double free_each) {
+  PoolProfile pool;
+  pool.fingerprint = "injected";
+  for (std::size_t i = 0; i < n; ++i) {
+    DeviceProfile d = fake_device(dev("hrx", static_cast<int>(i)), 200e9, 0.0,
+                                  50e12, math::MatrixElem::kBF16);
+    d.free_memory = Measured::measured(free_each);
+    pool.devices.push_back(std::move(d));
+  }
+  pool.links.reserve(n * n);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      pool.links.push_back(
+          i == j ? fake_link(pool.devices[i].id, pool.devices[j].id,
+                             PathKind::kSameDevice, 0.0, 0.0)
+                 : fake_link(pool.devices[i].id, pool.devices[j].id,
+                             PathKind::kPeerDirect, 0.0, 1e30));
+    }
+  }
+  return pool;
+}
+
+}  // namespace
+
+LSE_TEST(a_forty_gigabyte_share_never_lands_on_a_sixteen_gigabyte_device) {
+  // The defect this whole file exists to close. Device 1 is twice as fast, so
+  // optimizing time alone hands it two thirds of a 40 GB weight set — 26.7 GB —
+  // and it has 16 GB. That plan is not expensive, it is impossible, and a
+  // planner that reports it as the optimum is worse than one that refuses.
+  const Work w = resident_work(40 * kGB);
+  const DeviceId a = dev("hrx", 0);
+  const DeviceId b = dev("hrx", 1);
+  const DeviceId set[] = {a, b};
+
+  const PoolProfile roomy_pool = lopsided_pool(80 * kGB, 80 * kGB);
+  const auto roomy = CostModel(roomy_pool).split(w, set, a);
+  LSE_EXPECT(roomy.feasible());
+  LSE_EXPECT_NEAR(roomy.shares[1].fraction, 2.0 / 3.0, 1e-4);
+  // With room, the time-optimal share is what it always was...
+  const double time_optimal_bytes = roomy.shares[1].fraction * 40 * kGB;
+  std::printf("       80 GB free: time-optimal share is %.1f GB\n",
+              time_optimal_bytes / kGB);
+  // ...and on a 16 GB device that same share is 10 GB of wishful thinking.
+  LSE_EXPECT(time_optimal_bytes > 16 * kGB);
+
+  const PoolProfile tight_pool = lopsided_pool(80 * kGB, 16 * kGB);
+  const auto tight = CostModel(tight_pool).split(w, set, a);
+  LSE_EXPECT(tight.feasible());
+  LSE_EXPECT(tight.fit == Fit::kFits);
+  // Capped at what it can hold, 16/40, and the slower device carries the rest.
+  LSE_EXPECT_NEAR(tight.shares[1].fraction, 0.4, 1e-4);
+  LSE_EXPECT_NEAR(tight.shares[0].fraction, 0.6, 1e-4);
+  double total = 0.0;
+  for (const auto& s : tight.shares) total += s.fraction;
+  LSE_EXPECT_NEAR(total, 1.0, 1e-9);
+  std::printf("       16 GB free: %.1f GB / %.1f GB, both resident-feasible\n",
+              tight.shares[0].fraction * 40.0, tight.shares[1].fraction * 40.0);
+
+  // Every share that was handed out fits on the member that got it, stated as
+  // a verdict rather than left for the caller to re-derive.
+  for (const auto& s : tight.shares) {
+    LSE_EXPECT(s.capacity.fits());
+    LSE_EXPECT(static_cast<double>(s.capacity.bytes_resident) <=
+               s.capacity.bytes_free);
+  }
+  LSE_EXPECT(static_cast<double>(tight.shares[1].capacity.bytes_resident) <=
+             16 * kGB);
+  // Capacity is what moved the share, not a change in either device's rate.
+  LSE_EXPECT(tight.shares[1].fraction < roomy.shares[1].fraction);
+  LSE_EXPECT(tight.shares[1].per_item.known());
+}
+
+LSE_TEST(a_pool_with_no_room_anywhere_says_so_distinctly) {
+  // Three outcomes, one enum, and a caller has to be able to tell them apart:
+  // a partition, a measured refusal, and the absence of a measurement. Only
+  // the first is a plan, and the last two must never be read as either of the
+  // others.
+  const Work w = resident_work(40 * kGB);
+  const DeviceId a = dev("hrx", 0);
+  const DeviceId b = dev("hrx", 1);
+  const DeviceId set[] = {a, b};
+
+  // 8 + 8 GB of measured free memory against 40 GB of weights. No assignment
+  // of this work to this set exists at any price.
+  const PoolProfile cramped = lopsided_pool(8 * kGB, 8 * kGB);
+  const auto refused = CostModel(cramped).split(w, set, a);
+  LSE_EXPECT(!refused.feasible());
+  LSE_EXPECT(refused.fit == Fit::kExceeds);
+  LSE_EXPECT(refused.provenance == Provenance::kMeasured);
+  for (const auto& s : refused.shares) LSE_EXPECT_EQ(s.fraction, 0.0);
+  std::printf("       refused: %s\n", std::string(refused.reason).c_str());
+  LSE_EXPECT(refused.reason.find("fits") != std::string_view::npos);
+
+  // The same set, enough room: a plan, and a different verdict.
+  const PoolProfile roomy = lopsided_pool(80 * kGB, 80 * kGB);
+  const auto planned = CostModel(roomy).split(w, set, a);
+  LSE_EXPECT(planned.feasible());
+  LSE_EXPECT(planned.fit == Fit::kFits);
+  LSE_EXPECT(planned.reason != refused.reason);
+
+  // The same set, room measured but nothing priced: not a refusal. Nothing
+  // here has been shown not to fit — nothing here has been shown at all.
+  PoolProfile unpriced = roomy;
+  unpriced.devices[0].dram_bytes_per_s = Measured::unknown();
+  unpriced.devices[1].dram_bytes_per_s = Measured::unknown();
+  const auto unknown = CostModel(unpriced).split(w, set, a);
+  LSE_EXPECT(!unknown.feasible());
+  LSE_EXPECT(unknown.fit == Fit::kUnknown);
+  LSE_EXPECT(unknown.reason != refused.reason);
+  std::printf("       unpriced: %s\n", std::string(unknown.reason).c_str());
+}
+
+LSE_TEST(a_hundred_gigabyte_model_on_eight_devices_is_a_capacity_split) {
+  // PLAN.md's headline regime, which the model could not express at all before
+  // capacity existed: the model does not fit on any one member, so splitting is
+  // mandatory rather than an optimization, and the members are identical so
+  // nothing but capacity decides the answer.
+  constexpr std::size_t kMembers = 8;
+  const Work model_weights = resident_work(100 * kGB);
+  std::vector<DeviceId> set;
+  for (std::size_t i = 0; i < kMembers; ++i) {
+    set.push_back(dev("hrx", static_cast<int>(i)));
+  }
+
+  // Exactly enough, summed: 8 x 12.5 GB. The boundary is checked in bytes and
+  // not in eighths, because eight eighths do not add to one in binary.
+  const PoolProfile exact = uniform_pool(kMembers, 12.5 * kGB);
+  const auto split = CostModel(exact).split(model_weights, set, set[0]);
+  LSE_EXPECT(split.feasible());
+  double total = 0.0;
+  for (const auto& s : split.shares) {
+    total += s.fraction;
+    LSE_EXPECT(s.capacity.fits());
+    LSE_EXPECT(static_cast<double>(s.capacity.bytes_resident) <= 12.5 * kGB);
+  }
+  LSE_EXPECT_NEAR(total, 1.0, 1e-9);
+  LSE_EXPECT_NEAR(split.shares[0].fraction, 0.125, 1e-6);
+  std::printf("       100 GB over 8 x 12.5 GB: %.1f GB each\n",
+              split.shares[0].fraction * 100.0);
+
+  // One gigabyte short across the whole set, and there is no plan. Not a worse
+  // plan — none, and the difference is the entire point.
+  const PoolProfile short_pool = uniform_pool(kMembers, 12.375 * kGB);
+  const auto refused = CostModel(short_pool).split(model_weights, set, set[0]);
+  LSE_EXPECT(!refused.feasible());
+  LSE_EXPECT(refused.fit == Fit::kExceeds);
+  for (const auto& s : refused.shares) LSE_EXPECT_EQ(s.fraction, 0.0);
+}
+
+LSE_TEST(unknown_free_memory_is_an_unknown_verdict_not_a_pass) {
+  const Work w = resident_work(40 * kGB);
+  const DeviceId a = dev("hrx", 0);
+  const DeviceId b = dev("hrx", 1);
+  const DeviceId set[] = {a, b};
+
+  // Nothing filled free memory — which is the state of every device on this
+  // box, because IBackend carries no memory query. The model must not treat
+  // that as room, and must not treat it as a refusal either.
+  const PoolProfile blind = lopsided_pool(-1.0, -1.0);
+  const CostModel model(blind);
+
+  const Capacity c = model.capacity_for(w, a);
+  LSE_EXPECT(c.fit == Fit::kUnknown);
+  LSE_EXPECT(!c.known());
+  LSE_EXPECT(!c.fits());
+  LSE_EXPECT_EQ(c.bytes_free, 0.0);
+  LSE_EXPECT_EQ(c.bytes_resident, w.bytes_resident);
+
+  const auto blind_split = model.split(w, set, a);
+  LSE_EXPECT(!blind_split.feasible());
+  LSE_EXPECT(blind_split.fit == Fit::kUnknown);
+  for (const auto& s : blind_split.shares) LSE_EXPECT_EQ(s.fraction, 0.0);
+  LSE_EXPECT(blind_split.reason.find("unknown") != std::string_view::npos);
+
+  const auto blind_move = model.should_offload(w, a, b, w.bytes_moved, 4096);
+  LSE_EXPECT(!blind_move.relocate);
+  LSE_EXPECT(blind_move.reason.find("unknown") != std::string_view::npos);
+  LSE_EXPECT(!blind_move.home_capacity.fits());
+  LSE_EXPECT(!blind_move.candidate_capacity.fits());
+
+  // Work that holds nothing resident still splits on an unmeasured pool: that
+  // is a fact about the work, not a claim about the devices, and it is why the
+  // whole cost model did not stop working the day this field was added.
+  Work streaming = w;
+  streaming.bytes_resident = 0;
+  LSE_EXPECT(model.capacity_for(streaming, a).fits());
+  const auto streamed = model.split(streaming, set, a);
+  LSE_EXPECT(streamed.feasible());
+  LSE_EXPECT_NEAR(streamed.shares[1].fraction, 2.0 / 3.0, 1e-4);
+
+  // One member measured, one not: the split uses what it knows, gives the
+  // unmeasured member nothing, and says which member it left out and why.
+  const PoolProfile half_known = lopsided_pool(80 * kGB, -1.0);
+  const auto partial = CostModel(half_known).split(w, set, a);
+  LSE_EXPECT(partial.feasible());
+  LSE_EXPECT_NEAR(partial.shares[0].fraction, 1.0, 1e-9);
+  LSE_EXPECT_EQ(partial.shares[1].fraction, 0.0);
+  LSE_EXPECT(partial.shares[0].capacity.fits());
+  LSE_EXPECT(partial.shares[1].capacity.fit == Fit::kUnknown);
+  std::printf("       one member unmeasured: %s\n",
+              std::string(partial.reason).c_str());
+}
+
+LSE_TEST(capacity_overrides_a_favourable_time_cost_in_both_directions) {
+  // The peer from the depth case: eight times the roofline, behind a link the
+  // queue pays for. At depth 32 moving is measurably the faster plan.
+  const DeviceId home = dev("hrx", 0);
+  const DeviceId peer = dev("hrx", 1);
+  constexpr std::size_t kBytes = 4u << 20;
+  constexpr double kResident = 16.0 * 1024 * 1024;
+
+  Work w;
+  w.bytes_streamed = 16u << 20;
+  w.bytes_resident = static_cast<std::size_t>(kResident);
+  w.operand = math::MatrixElem::kBF16;
+
+  const auto pool_with = [](double free_home, double free_peer) {
+    PoolProfile p = two_device_pool(200e9, 50e12, 1600e9, 400e12, 5000.0, 100e9);
+    p.devices[0].free_memory = Measured::measured(free_home);
+    p.devices[1].free_memory = Measured::measured(free_peer);
+    return p;
+  };
+
+  // Room at both ends: the throughput rule decides, exactly as before.
+  const PoolProfile roomy = pool_with(4 * kResident, 4 * kResident);
+  const auto fast = CostModel(roomy).should_offload(w, home, peer, kBytes,
+                                                    kBytes, 32);
+  LSE_EXPECT(fast.relocate);
+  LSE_EXPECT(fast.moved.items_per_s > fast.stay.items_per_s);
+  LSE_EXPECT(fast.candidate_capacity.fits());
+
+  // Same numbers, same measured advantage, and the peer cannot hold the work.
+  const PoolProfile small_peer = pool_with(4 * kResident, kResident / 2);
+  const auto refused = CostModel(small_peer).should_offload(w, home, peer,
+                                                            kBytes, kBytes, 32);
+  LSE_EXPECT(!refused.relocate);
+  LSE_EXPECT(refused.candidate_capacity.fit == Fit::kExceeds);
+  // The time advantage is still there and still measured. It simply does not
+  // get a vote: a faster device that cannot hold the work is not a placement.
+  LSE_EXPECT(refused.moved.known() && refused.stay.known());
+  LSE_EXPECT(refused.moved.items_per_s > refused.stay.items_per_s);
+  std::printf("       refused a %.0f%% throughput win: %s\n",
+              (refused.moved.items_per_s / refused.stay.items_per_s - 1.0) *
+                  100.0,
+              std::string(refused.reason).c_str());
+
+  // And the other direction, which is the regime PLAN.md leads with: home
+  // cannot hold the model, so moving is mandatory rather than worthwhile. At
+  // depth 1 the throughput rule says stay and is overruled, because a slower
+  // plan that runs beats a faster one that cannot be allocated.
+  const PoolProfile small_home = pool_with(kResident / 2, 4 * kResident);
+  const auto forced = CostModel(small_home).should_offload(w, home, peer,
+                                                           kBytes, kBytes, 1);
+  LSE_EXPECT(forced.relocate);
+  LSE_EXPECT(forced.home_capacity.fit == Fit::kExceeds);
+  LSE_EXPECT(forced.candidate_capacity.fits());
+  LSE_EXPECT(forced.moved.items_per_s < forced.stay.items_per_s);
+  std::printf("       forced a %.0f%% throughput loss: %s\n",
+              (1.0 - forced.moved.items_per_s / forced.stay.items_per_s) *
+                  100.0,
+              std::string(forced.reason).c_str());
+}
+
+LSE_TEST(a_split_never_claims_a_partition_it_did_not_produce) {
+  // kFits is a claim about the shares, so it has to be checked against them.
+  // A free-memory figure that is not a byte count is the case that separates
+  // asserting the verdict from verifying it: NaN compares false against every
+  // bound, so `min(1, free/resident)` yields a ceiling of 1 and the member bids
+  // for the whole work — while capacity_for, comparing the other way, calls the
+  // same share kExceeds. One of those is wrong whatever NaN means, and the
+  // split must not answer kFits while holding a share it has itself ruled out.
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const DeviceId a = dev("hrx", 0);
+  const DeviceId b = dev("hrx", 1);
+  const DeviceId set[] = {a, b};
+  const Work w = resident_work(400 * kGB);
+
+  PoolProfile pool = lopsided_pool(-1.0, 8 * kGB);
+  pool.devices[0].free_memory = Measured::measured(nan);
+  const CostModel model(pool);
+
+  // Whatever the verdict is, it may not be a partition whose own shares do not
+  // fit. Only 8 GB of this pool is founded, so 400 GB cannot be one.
+  const auto s = model.split(w, set, a);
+  for (const auto& share : s.shares) {
+    if (share.fraction > 0.0) LSE_EXPECT(share.capacity.fits());
+  }
+  LSE_EXPECT(!s.feasible());
+  // ...and the same figure reads the same way through both entry points.
+  LSE_EXPECT(!model.capacity_for(w, a).fits());
+  LSE_EXPECT(model.capacity_for(w, a).fit == Fit::kUnknown);
+}
+
+LSE_TEST(a_member_nobody_priced_does_not_harden_into_a_measured_refusal) {
+  // kExceeds is the strong claim — no assignment exists at any price — and the
+  // caller acts on it by not loading the model at all. It may only be made when
+  // the whole set was established. A member the cost model could not price is
+  // not evidence of anything, and it must not turn "we do not know" into "it
+  // does not fit": the fix for one is to measure, and for the other to buy
+  // hardware.
+  const DeviceId a = dev("hrx", 0);
+  const DeviceId b = dev("hrx", 1);
+  const DeviceId set[] = {a, b};
+  const Work w = resident_work(40 * kGB);
+
+  // Device 1 has 100 GB free and measured. The set plainly has room for 40 GB.
+  PoolProfile roomy_but_unpriced = lopsided_pool(8 * kGB, 100 * kGB);
+  roomy_but_unpriced.devices[1].dram_bytes_per_s = Measured::unknown();
+  const auto s = CostModel(roomy_but_unpriced).split(w, set, a);
+  LSE_EXPECT(!s.feasible());
+  LSE_EXPECT(s.fit != Fit::kExceeds);
+
+  // Same shape with the unpriced member also unmeasured, which is the case the
+  // three-way verdict exists for.
+  PoolProfile unpriced_and_unmeasured = lopsided_pool(8 * kGB, -1.0);
+  unpriced_and_unmeasured.devices[1].dram_bytes_per_s = Measured::unknown();
+  const auto t = CostModel(unpriced_and_unmeasured).split(w, set, a);
+  LSE_EXPECT(t.fit == Fit::kUnknown);
+  // The verdict must not turn on whether the *time* model could price the
+  // member: capacity and cost are separate questions and this is the same
+  // free-memory configuration either way.
+  PoolProfile priced = unpriced_and_unmeasured;
+  priced.devices[1].dram_bytes_per_s = Measured::measured(400e9);
+  LSE_EXPECT(CostModel(priced).split(w, set, a).fit == t.fit);
+}
+
+LSE_TEST(a_device_the_pool_never_heard_of_gets_no_verdict) {
+  // capacity_for answers about a device, and `fits()` is the affirmative. A
+  // device that is not a member is one the model has measured nothing about,
+  // so it gets the same non-answer compute_cost gives it — not a pass that
+  // happens to be true of the work.
+  const PoolProfile pool = lopsided_pool(80 * kGB, 80 * kGB);
+  const CostModel model(pool);
+  const DeviceId ghost = dev("hrx", 99);
+
+  Work streaming = resident_work(40 * kGB);
+  streaming.bytes_resident = 0;
+  LSE_EXPECT(!model.capacity_for(streaming, ghost).fits());
+  LSE_EXPECT(model.capacity_for(streaming, ghost).fit == Fit::kUnknown);
+  LSE_EXPECT(!model.compute_cost(streaming, ghost).known());
+
+  // A member with an unmeasured free-memory figure is a different thing and
+  // keeps the rule the work earns: holding nothing fits anywhere.
+  const PoolProfile blind = lopsided_pool(-1.0, -1.0);
+  LSE_EXPECT(CostModel(blind).capacity_for(streaming, dev("hrx", 0)).fits());
+}
+
+LSE_TEST(a_free_memory_figure_that_is_not_a_byte_count_is_not_a_measurement) {
+  // Provenance says who put the number there; it does not say the number is a
+  // number. A capacity that is negative or non-finite is unfounded whatever it
+  // is labelled, and reading it as one lets zero-byte work "exceed" a device
+  // and forces a relocation to fix a residency that was never there.
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const DeviceId a = dev("hrx", 0);
+  const DeviceId b = dev("hrx", 1);
+
+  for (double bad : {-1.0, nan}) {
+    PoolProfile pool = lopsided_pool(-1.0, 80 * kGB);
+    pool.devices[0].free_memory = Measured::measured(bad);
+    const CostModel model(pool);
+
+    Work streaming = resident_work(40 * kGB);
+    streaming.bytes_resident = 0;
+    LSE_EXPECT(model.capacity_for(streaming, a).fit != Fit::kExceeds);
+
+    const Work w = resident_work(40 * kGB);
+    LSE_EXPECT(model.capacity_for(w, a).fit == Fit::kUnknown);
+    // Whatever the throughput rule then decides, capacity does not force a
+    // relocation to repair a residency the work never had.
+    const auto d = model.should_offload(streaming, a, b, 1u << 20, 4096);
+    LSE_EXPECT(d.home_capacity.fit != Fit::kExceeds);
+    LSE_EXPECT(d.reason.find("cannot hold") == std::string_view::npos);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 
@@ -473,6 +889,7 @@ LSE_TEST(a_profile_survives_a_round_trip_and_a_stale_key_is_a_miss) {
   pool.fingerprint = "0123456789abcdef";
   pool.devices[0].arch = "gfx1151";
   pool.devices[0].name = "Radeon 8060S Graphics";
+  pool.devices[0].free_memory = Measured::measured(96e9);
   MatrixRowRate row;
   row.key = "wmma.f32.16x16x16.bf16";
   row.acc = math::MatrixElem::kF32;
@@ -503,6 +920,12 @@ LSE_TEST(a_profile_survives_a_round_trip_and_a_stale_key_is_a_miss) {
   LSE_EXPECT(back->devices[0].rows[1].flops.provenance ==
              Provenance::kUnsupported);
   LSE_EXPECT(back->devices[0].dram_bytes_per_s.value == 227e9);
+  // Capacity survives the wire, and a device nobody asked survives it as
+  // unknown rather than as a zero that would read as a full device.
+  LSE_EXPECT(back->devices[0].free_memory.value == 96e9);
+  LSE_EXPECT(back->devices[0].free_memory.provenance == Provenance::kMeasured);
+  LSE_EXPECT(!back->devices[1].free_memory.known());
+  LSE_EXPECT_EQ(back->devices[1].free_memory.value, 0.0);
   LSE_EXPECT(back->devices[0].paths.size() == pool.devices[0].paths.size());
   LSE_EXPECT(back->links[1].points.size() == 1u);
   LSE_EXPECT(back->links[1].path == PathKind::kPeerDirect);
@@ -683,6 +1106,12 @@ void expect_no_invented_numbers(const DeviceProfile& d) {
     if (!m.known()) LSE_EXPECT_EQ(m.value, 0.0);
     if (m.known()) LSE_EXPECT(m.value > 0.0);
   }
+  // Free memory is a capacity, not a rate, so zero is a meaningful measurement
+  // — a device with nothing left. The rule it does share is the one that
+  // matters: an unmeasured capacity carries no value to be mistaken for one,
+  // and in particular is never quietly filled in from total_memory.
+  if (!d.free_memory.known()) LSE_EXPECT_EQ(d.free_memory.value, 0.0);
+  if (d.free_memory.known()) LSE_EXPECT(d.free_memory.value >= 0.0);
   for (const MatrixRowRate& r : d.rows) {
     if (r.support == RowSupport::kAbsent) {
       LSE_EXPECT(r.flops.provenance == Provenance::kUnsupported);

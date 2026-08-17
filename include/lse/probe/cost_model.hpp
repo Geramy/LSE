@@ -37,6 +37,14 @@ struct Work {
   math::MatrixElem operand = math::MatrixElem::kF16;
   // Bytes that have to cross a link to run this somewhere other than home.
   std::size_t bytes_moved = 0;
+  // Bytes that must be RESIDENT on the device for as long as this work runs.
+  // Distinct from both of the above: bytes_streamed is traffic through the
+  // device's own memory and may be the same bytes read many times, bytes_moved
+  // is traffic across a link, and this is occupancy. For a weight shard they
+  // coincide once and diverge the moment anything is re-read; only this one
+  // binds against a device's free memory, and it is the term whose absence let
+  // the model hand a 40 GB share to a 16 GB device and call it optimal.
+  std::size_t bytes_resident = 0;
   std::uint32_t launches = 1;
 
   [[nodiscard]] Work scaled(double fraction) const noexcept;
@@ -56,6 +64,37 @@ struct Cost {
   }
   static Cost of(double ns, Provenance p) noexcept { return {ns, p}; }
   static Cost unknown() noexcept { return {}; }
+};
+
+#define LSE_FIT_LIST(X)                                                      \
+  X(kUnknown, "unknown")   /* nobody measured what this device has free */   \
+  X(kFits, "fits")                                                           \
+  X(kExceeds, "exceeds")   /* the work needs more than the device has */
+
+LSE_DECLARE_ENUM(Fit, std::uint8_t, LSE_FIT_LIST)
+
+// Whether a device can hold what a piece of work needs resident.
+//
+// A constraint, not a cost. Time and capacity do not trade against each other:
+// an assignment that does not fit is not a slow assignment, it is not an
+// assignment, and no throughput advantage anywhere else in the plan buys it
+// back. That is why this is a separate verdict rather than a term added to
+// Cost::ns — a large enough number would otherwise still be beaten by a fast
+// enough device, which is precisely the wrong answer.
+struct Capacity {
+  Fit fit = Fit::kUnknown;
+  std::size_t bytes_resident = 0;   // what the work needs held here
+  double bytes_free = 0.0;          // what the device had, when that is known
+  Provenance provenance = Provenance::kUnknown;
+
+  [[nodiscard]] bool known() const noexcept {
+    return provenance == Provenance::kMeasured ||
+           provenance == Provenance::kDeclared;
+  }
+  // A verdict, not an absence of one. An unknown capacity never reads as a fit.
+  [[nodiscard]] bool fits() const noexcept {
+    return fit == Fit::kFits && known();
+  }
 };
 
 // How many items are in flight. Depth is an INPUT to placement, not something
@@ -120,6 +159,15 @@ class CostModel {
   [[nodiscard]] bool runs_natively(math::MatrixElem operand,
                                    const DeviceId& device) const noexcept;
 
+  // Whether this device can hold this work's resident bytes.
+  //
+  // Work that needs nothing resident fits everywhere, and that is a fact about
+  // the work rather than a claim about the device — so it is the one case that
+  // answers kFits without a measurement behind it. Everything else needs the
+  // device's measured free memory, and says kUnknown without it.
+  [[nodiscard]] Capacity capacity_for(const Work& work,
+                                      const DeviceId& device) const noexcept;
+
   // Steady-state rate of a pipelined placement at `depth` items in flight.
   //
   // Stage i costs its own compute plus the transfer it hands on, and the items
@@ -135,6 +183,11 @@ class CostModel {
     Throughput stay;
     Throughput moved;
     Cost transfer;   // the round trip, for a caller that wants the raw number
+    // Whether each end can hold the work resident. Reported whatever the
+    // verdict, so a caller can tell "staying is faster" from "we never learned
+    // whether staying is even possible".
+    Capacity home_capacity;
+    Capacity candidate_capacity;
     std::string_view reason;
   };
 
@@ -147,6 +200,16 @@ class CostModel {
   // link latency leaves the critical path entirely. At depth 1 this reduces to
   // the latency-bound comparison, so that case is the n=1 limit rather than a
   // separate rule.
+  //
+  // Capacity is settled before any of that, in both directions. A candidate
+  // that cannot hold the work is refused however much faster it is, and a home
+  // that cannot hold it makes the move mandatory rather than merely
+  // worthwhile — the throughput margin does not get a vote on an assignment
+  // that is not physically available.
+  //
+  // `relocate == false` means this call does not move the work, which covers
+  // both "staying is better" and "nothing here is founded enough to move on".
+  // `reason` and the two Capacity members are what separate those.
   [[nodiscard]] OffloadDecision should_offload(
       const Work& work, const DeviceId& home, const DeviceId& candidate,
       std::size_t bytes_out, std::size_t bytes_back,
@@ -158,6 +221,29 @@ class CostModel {
     // Per-item time this member sustains at the requested depth. Equal across
     // every member that got a share — that is what the split is solving for.
     Cost per_item;
+    // The verdict on what this member was actually given: its own share when it
+    // got one, and the whole work when it got nothing, which is what explains
+    // why. A zero fraction with kFits is a member the model could not price; a
+    // zero fraction with kUnknown is one whose free memory nobody measured.
+    Capacity capacity;
+  };
+
+  // What dividing one operation across a set comes to, which has three
+  // outcomes and not two.
+  //
+  // kFits is a partition. kExceeds is the statement that no partition of this
+  // work onto this set is resident-feasible at any price — not a bad plan, the
+  // absence of one. kUnknown is the statement that the set's free memory was
+  // never measured, so the question has no founded answer here. A caller that
+  // cannot tell the middle one from "the split is not worth it" runs the work
+  // anyway and dies on an allocation.
+  struct Split {
+    std::vector<Share> shares;
+    Fit fit = Fit::kUnknown;
+    Provenance provenance = Provenance::kUnknown;
+    std::string_view reason;
+
+    [[nodiscard]] bool feasible() const noexcept { return fit == Fit::kFits; }
   };
 
   // How to divide one operation across a heterogeneous set, at a queue depth.
@@ -177,9 +263,18 @@ class CostModel {
   // A member whose cost cannot be priced gets nothing and says so with an
   // unknown per-item time. So does one that cannot repay its own fixed cost at
   // any share.
-  [[nodiscard]] std::vector<Share> split(
-      const Work& work, std::span<const DeviceId> devices,
-      const DeviceId& home, std::uint32_t depth = kDefaultQueueDepth) const;
+  //
+  // Capacity bounds each member's share before time divides what is left.
+  // Residency is downward-closed in the fraction — half the work needs half
+  // the bytes — so it is a ceiling on each member rather than a second search,
+  // and a member that can hold only a third of the work simply never bids
+  // above a third however fast it is. When the ceilings together cannot cover
+  // the work, there is no split, and the result says which of "it does not
+  // fit" and "nobody measured whether it fits" that is.
+  [[nodiscard]] Split split(const Work& work,
+                            std::span<const DeviceId> devices,
+                            const DeviceId& home,
+                            std::uint32_t depth = kDefaultQueueDepth) const;
 
  private:
   // A member's transfer and compute halves at a given share of the work.

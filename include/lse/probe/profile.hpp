@@ -123,6 +123,15 @@ struct DeviceProfile {
   std::string arch;
   std::string name;
   std::size_t total_memory = 0;
+  // What is actually available to hold a shard, which is the only number a
+  // placement may be sized against. `total_memory` is the part number: on a
+  // device already holding a model, a context, or another process, the two
+  // differ by everything that decides whether the shard fits. A backend probe
+  // fills this from its own runtime's query — HRX has
+  // `hrx_device_memory_info(device, &free, &total)` — and until one does it
+  // stays kUnknown, because a capacity inferred from the total is exactly the
+  // invented number that hands a 40 GB shard to a device with 2 GB left.
+  Measured free_memory;
   std::uint16_t compute_units = 0;
   bool unified_memory = false;
 
