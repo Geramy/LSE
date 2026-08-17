@@ -107,7 +107,8 @@ std::uint32_t chunks_per_step(const QuantDims& d, std::uint32_t max_bytes) {
   return cpl;
 }
 
-ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave) {
+ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave,
+                     std::uint32_t lds_budget) {
   if (wave != 32 && wave != 64) wave = 32;
   const std::uint32_t waves = kBlock / wave;
   ThreadPlan tp;
@@ -116,6 +117,9 @@ ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave) {
       static_cast<std::uint32_t>((d.n + waves - 1) / waves);
   tp.workgroup_count[1] = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
   tp.workgroup_count[2] = 1;
+  const std::uint32_t need = kir::Lds::align(
+      static_cast<std::uint32_t>(d.k) * kir::pack_elem_bytes<kir::f32>());
+  if (lds_budget == 0 || need <= lds_budget) tp.lds_bytes = need;
   return tp;
 }
 
@@ -185,13 +189,21 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   const auto row = e.let(math::workgroup_id_y());
   const auto col = e.let(tile * waves + wave_id);
 
+  // A fused run stages the shared row once, ahead of every sibling's body;
+  // `s.staged` is that panel. Otherwise this body owns the staging.
   kir::Tile<kir::f32> xs;
-  const bool stage = e.lds_fits<kir::f32>(k);
-  if (stage) xs = e.lds<kir::f32>(k);
+  bool fill = false;
+  if (s.staged.count == k && !s.staged.name.empty()) {
+    xs = kir::Tile<kir::f32>(&kb, &kb.types(), std::string(s.staged.name), k);
+  } else if (e.lds_fits<kir::f32>(k)) {
+    xs = e.lds<kir::f32>(k);
+    fill = true;
+  }
+  const bool stage = static_cast<bool>(xs);
 
   auto acc = e.var(0.0f);
   if (auto in_grid = e.when(tile < ntiles && row < m)) {
-    if (stage) {
+    if (fill) {
       for (auto t : e.range(lid, e.u32(k), kBlock)) {
         xs[t] = a.x[row * k + t];
       }
@@ -240,6 +252,13 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }
 
+  StagedRow staged_row(const KernelShapes& s) const override {
+    const QuantDims d = dims_of(s);
+    if (!shape_ok(d) || !device_fits(s)) return {};
+    return {0, static_cast<std::uint32_t>(d.k),
+            static_cast<std::uint32_t>(d.m)};
+  }
+
   std::string emit_kernel(const KernelShapes& s) const override {
     const QuantDims d = dims_of(s);
     if (!shape_ok(d) || !device_fits(s) || s.types.scalar == nullptr ||
@@ -269,7 +288,8 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   }
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
-    return gemv_plan(dims_of(s), wave_of(s.device));
+    return gemv_plan(dims_of(s), wave_of(s.device),
+                     workgroup_lds_bytes(s.device));
   }
 };
 

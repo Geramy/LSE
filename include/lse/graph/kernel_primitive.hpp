@@ -36,6 +36,18 @@
 
 namespace lse::graph {
 
+// An activation panel in workgroup scratch: `count` f32 elements holding row
+// `workgroup_id_y` of one operand, spelled `name` in the body being built.
+//
+// The row offset lives in the panel, not in the subscript — element j of the
+// panel is element `workgroup_id_y * count + j` of the operand. Reading it with
+// a row term added back is the width-invariance defect: every row of the pass
+// would then read some other row's activation.
+struct StagedPanel {
+  std::string_view name;
+  std::uint32_t count = 0;
+};
+
 // What a kernel primitive is told about the invocation it must cover.
 struct KernelShapes {
   std::span<const Shape> inputs;
@@ -62,6 +74,16 @@ struct KernelShapes {
   // that writes the output buffer itself cannot be given an epilogue.
   std::function<std::string(std::string_view index, std::string_view value)>
       store;
+
+  // The panel the emitter has already staged for this body, matching what
+  // `staged_row()` asked for. Empty name means it staged nothing and the
+  // primitive owns the question.
+  //
+  // A named panel is a completed fill: the declaration, the fill loop and the
+  // barrier behind it are all already in the body, under a workgroup-uniform
+  // guard that dominates everything spliced after it. Allocate nothing, fill
+  // nothing, barrier nothing — just read it.
+  StagedPanel staged{};
 };
 
 struct ThreadPlan {
@@ -101,6 +123,26 @@ class KernelPrimitiveBase : public Primitive {
   //
   // In scope for such a body: `i` (the flat thread id) and `k.count`.
   virtual bool owns_indexing() const noexcept { return false; }
+
+  // The activation panel this primitive puts in workgroup scratch when it owns
+  // the launch: `count` f32 elements of operand `input`, holding row
+  // `workgroup_id_y` of it, for a launch covering `rows` rows. `count == 0`
+  // means it stages nothing.
+  //
+  // Independent siblings sharing one launch also share that row, so the emitter
+  // stages it once and hands every one of them the same panel. That makes this
+  // a contract rather than a hint. Answering with a panel says: the bytes the
+  // body reads from `input` are exactly row `workgroup_id_y` of it and nothing
+  // else, and KernelShapes::staged is accepted in place of staging it here.
+  //
+  // The emitter also sums these to price the run's scratch, so a primitive that
+  // understates its panel understates the launch's occupancy cost.
+  struct StagedRow {
+    std::size_t input = 0;
+    std::uint32_t count = 0;
+    std::uint32_t rows = 0;
+  };
+  virtual StagedRow staged_row(const KernelShapes&) const { return {}; }
 
   // The primitive that should actually run for this invocation.
   //

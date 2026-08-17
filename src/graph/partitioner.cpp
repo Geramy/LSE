@@ -70,20 +70,23 @@ void topo_visit(const NodePtr& n, std::unordered_set<const Node*>& seen,
 //
 // This used to be four because the LDS budget made it four: every stage staged
 // its own copy of the shared activation row and the compiler summed them, so
-// `run * 4 * K` had to fit a quarter of the workgroup budget. The kernel IR's
-// `lds_fold` pass now merges those copies — every sibling in a run shares
-// `inputs[0]` and K by construction, so the fill is provably the same fill —
-// and the budget term stopped scaling with the run (see the check below).
+// `run * 4 * K` had to fit a quarter of the workgroup budget. The emitter now
+// stages the shared row once for the whole run and prices the run's scratch by
+// its distinct rows, so nothing about workgroup scratch scales with the run
+// length any more — and a run whose rows genuinely do not fit is refused there
+// rather than mis-emitted here.
 //
-// What binds instead is the composition rule in the run loop below: a run
-// whose members do not all have a self-indexing form at this shape is refused
-// by the emitter, and the WHOLE group then falls back to the per-element
-// scaffold. Six is the ceiling this model can present — the MoE block has two
-// shared-expert and four routed wide linears off one normed activation — and
-// eight and ten measure identically because the candidates run out.
+// What binds instead is the pool of candidates. Six is the ceiling lemonseed
+// can present — the MoE block has two shared-expert and four routed wide
+// linears off one normed activation, and nothing else in the model offers a
+// seventh — so this is a pool limit, not a resource limit.
 //
-// Median of 5 at `-n 32`, idle box (rocm-smi VRAM 8%), groups per decode token
-// in brackets: run 4 gives 99.5 tok/s [395], run 6 gives 100.5 tok/s [375].
+// Measured, `-n 32` on one gfx1151, same tree, only this constant changed: caps
+// 6, 8 and 12 emit a byte-identical program (sha256 over all 62 dumped kernels
+// agrees), 12661 launches and `cse=92 lds_fold=0 dce=0` in all three. Raising
+// it past six is therefore unmeasurable here and is not done on the strength of
+// a model nobody has run. What the earlier cap did buy, for the record: run 4
+// gives 99.5 tok/s at 395 groups per decode token, run 6 gives 100.5 at 375.
 constexpr std::size_t kMaxSiblingRun = 6;
 
 // Rows the linear covers. One is the decode shape, where every wide-linear
@@ -137,12 +140,11 @@ void group_sibling_linears(std::vector<NodePtr>& order,
     if (k <= 0) continue;
 
     // The run stages the shared activation row in workgroup scratch (the grid
-    // arm of emit_gemv in lds_linear.cpp). It stages it ONCE for the whole run
-    // — the stages are one IR body and `lds_fold` merges the identical
-    // allocations — so what has to fit is one row, not one per stage. Hold it
-    // to a quarter of the workgroup budget so four of these GEMV workgroups
-    // still fit on a CU; past that the launch saved costs more occupancy than
-    // it buys.
+    // arm of emit_gemv in lds_linear.cpp). The emitter stages it ONCE for the
+    // whole run — one allocation, one fill, one barrier ahead of every stage —
+    // so what has to fit is one row, not one per stage. Hold it to a quarter of
+    // the workgroup budget so four of these GEMV workgroups still fit on a CU;
+    // past that the launch saved costs more occupancy than it buys.
     const auto staged = static_cast<std::uint32_t>(k) * 4u;
     if (staged != 0 && staged > dev.lds_bytes / 4u) continue;
     const std::size_t cap = kMaxSiblingRun;

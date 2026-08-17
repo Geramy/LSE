@@ -110,6 +110,143 @@ struct StreamEvent {
   [[nodiscard]] bool valid() const noexcept { return timeline != 0; }
 };
 
+// Which clock a tick was read from.
+//
+// The distinction is not bookkeeping. A host clock read at the moment the host
+// hands work to a device measures submission, queueing and interrupt wake, and
+// on a batched submission path that is most of what it measures — so a host
+// tick labelled as a device one turns dispatch jitter into a kernel duration
+// and a cost model acts on it. Naming the domain is what stops that, and it is
+// the reason kHostSystem exists as its own value rather than being folded into
+// the device case just because a vendor runtime published it.
+enum class ClockDomain : std::uint8_t {
+  kUnknown = 0,
+  // The device's own counter — the only domain in which a dispatch's duration
+  // is the dispatch's duration. Counted per *physical device*: two devices on
+  // one box count independently from unrelated origins, so a matching domain is
+  // necessary for a subtraction and not sufficient (see DeviceClock::ordinal).
+  kDeviceAgent,
+  // A host clock the vendor runtime publishes under a device-scoped name. A
+  // backend that has only this says so here instead of passing it off as
+  // kDeviceAgent, which is the substitution this whole seam exists to prevent.
+  kHostSystem,
+  // std::chrono::steady_clock — the domain every host-side span is already in.
+  kHostSteady,
+};
+
+[[nodiscard]] constexpr std::string_view clock_domain_name(
+    ClockDomain domain) noexcept {
+  switch (domain) {
+    case ClockDomain::kDeviceAgent: return "device-agent";
+    case ClockDomain::kHostSystem:  return "host-system";
+    case ClockDomain::kHostSteady:  return "host-steady";
+    case ClockDomain::kUnknown:     break;
+  }
+  return "unknown";
+}
+
+// The clock a device's timestamps are counted on, as the facts a duration can
+// actually be computed from.
+//
+// `ticks_per_second` is queried from the device or measured on it, never
+// assumed, because the plausible guesses are all wrong: on gfx1151 the agent
+// counter runs at 99,810,000 Hz, so rounding to 100 MHz is 0.19% off and taking
+// the host-scope rate the same runtime reports for its system clock (1 GHz) is
+// off by 10.019x. A rate nobody could answer stays 0, and 0 makes every
+// duration derived from it unknown rather than approximate.
+struct DeviceClock {
+  ClockDomain domain = ClockDomain::kUnknown;
+  std::uint64_t ticks_per_second = 0;
+  // Bits of a tick that count before the counter wraps; above them the value is
+  // unspecified. A subtraction that ignores this reads a wrap as a few thousand
+  // years, so it is carried rather than assumed to be 64. 0 is unknown.
+  std::uint8_t valid_bits = 0;
+  // Which device's counter this is, within the backend that published it. Two
+  // ticks from different devices are unrelated however alike their clocks look,
+  // and nothing in the tick itself says so. Across machines even the ordinal is
+  // not enough — that comparison belongs to whoever holds the pool's device
+  // identities, and it starts by refusing here.
+  std::uint8_t ordinal = 0;
+
+  // Everything a duration needs is present. False means a tick from this clock
+  // converts to no number at all.
+  [[nodiscard]] bool known() const noexcept {
+    return domain != ClockDomain::kUnknown && ticks_per_second > 0 &&
+           valid_bits > 0;
+  }
+
+  // Whether two ticks may be subtracted: same clock, same device, same rate.
+  [[nodiscard]] bool same_source_as(const DeviceClock& other) const noexcept {
+    return known() && other.known() && domain == other.domain &&
+           ticks_per_second == other.ticks_per_second &&
+           valid_bits == other.valid_bits && ordinal == other.ordinal;
+  }
+};
+
+// One reading. The clock travels with the tick so that a record which outlives
+// the backend that produced it still says what it means — a bare uint64 in a
+// trace is a number nobody can convert and nobody can refuse.
+struct DeviceTimestamp {
+  std::uint64_t tick = 0;
+  DeviceClock clock{};
+
+  [[nodiscard]] bool valid() const noexcept { return clock.known(); }
+};
+
+// Ticks elapsed from `start` to `end`, wrap-corrected against the clock's
+// valid_bits. Refuses across domains, across devices and on an unknown rate:
+// an unknown duration is the honest answer and a plausible one is not.
+//
+// A narrower-than-64-bit counter really does wrap, so a decreasing tick is
+// masked back into a duration; that is correct while the true interval is under
+// one wrap, which is the standing assumption for such counters, and nothing
+// here can detect a double wrap. At 64 bits it is the opposite: 2^64 ticks is
+// ~5900 years at the ~100 MHz these counters run, so a decreasing tick is not a
+// wrap but the clock moving backwards — which happens for real, because a
+// device clock resynced against the host can roll back (IREE says so of these
+// very timestamps in hal/drivers/amdgpu/abi/signal.h). Masking that would enter
+// a several-thousand-year span into a profile as the largest number in it, so
+// it refuses instead.
+[[nodiscard]] inline Result<std::uint64_t> ticks_between(
+    const DeviceTimestamp& start, const DeviceTimestamp& end) {
+  if (!start.clock.known() || !end.clock.known()) {
+    return LSE_ERROR(kInvalidArgument,
+                     "cannot subtract timestamps from an unknown clock");
+  }
+  if (!start.clock.same_source_as(end.clock)) {
+    return LSE_ERROR(kInvalidArgument, "cannot subtract a ",
+                     std::string(clock_domain_name(end.clock.domain)),
+                     " tick on device ", std::to_string(end.clock.ordinal),
+                     " from a ",
+                     std::string(clock_domain_name(start.clock.domain)),
+                     " tick on device ", std::to_string(start.clock.ordinal),
+                     ": unrelated counters");
+  }
+  const std::uint8_t bits = start.clock.valid_bits;
+  if (bits >= 64) {
+    if (end.tick < start.tick) {
+      return LSE_ERROR(kInvalidArgument, "device clock went backwards: ",
+                       std::to_string(start.tick), " to ",
+                       std::to_string(end.tick));
+    }
+    return end.tick - start.tick;
+  }
+  const std::uint64_t mask = (std::uint64_t{1} << bits) - 1;
+  return ((end.tick - start.tick) & mask);
+}
+
+// The same subtraction in nanoseconds, which is the only form a cost model has
+// any use for. Integer ticks over an integer rate, in double, because the two
+// differ by ~10x between the domains on one device and truncating first loses a
+// microsecond-scale span entirely.
+[[nodiscard]] inline Result<double> nanoseconds_between(
+    const DeviceTimestamp& start, const DeviceTimestamp& end) {
+  auto ticks = ticks_between(start, end);
+  if (!ticks.ok()) return ticks.status();
+  return static_cast<double>(*ticks) * 1e9 /
+         static_cast<double>(start.clock.ticks_per_second);
+}
+
 // Which part of a dispatch's work this launch covers, as a half-open range of
 // work items. `count == 0` means the whole dispatch, which is every launch
 // today: a kernel still declares a grid, and a grid cannot be cut.
@@ -302,6 +439,42 @@ class Backend {
     }
   }
 
+  // The clock this device counts its timestamps on: domain, rate, width.
+  //
+  // A measurement seam, so it refuses rather than describing some other clock.
+  // In particular a backend never answers with the host's clock because the
+  // host's is the one it can reach — a duration measured on the host around a
+  // device is submission latency, and the whole point of naming a domain is
+  // that nothing downstream has to guess which one it got.
+  //
+  // Answering here says what a tick would mean, not that one can be had:
+  // sample_device_time() is a separate question and a backend may well be able
+  // to describe a counter it cannot read.
+  Result<DeviceClock> device_clock() const {
+    if constexpr (requires { derived().device_clock_impl(); }) {
+      return derived().device_clock_impl();
+    } else {
+      return LSE_ERROR(kUnimplemented, "backend '", std::string(Derived::kName),
+                       "' publishes no device clock");
+    }
+  }
+
+  // One tick of that clock, read now.
+  //
+  // A sample, like sample_free_memory: it moves under the caller and nothing
+  // may memoize it. What it is *not* is a dispatch's duration — it is the
+  // primitive a duration is built from, and a backend that can only obtain a
+  // tick by making the device stop and tell it should refuse here rather than
+  // sell a round trip as a clock read.
+  Result<DeviceTimestamp> sample_device_time() const {
+    if constexpr (requires { derived().sample_device_time_impl(); }) {
+      return derived().sample_device_time_impl();
+    } else {
+      return LSE_ERROR(kUnimplemented, "backend '", std::string(Derived::kName),
+                       "' has no device timestamp source");
+    }
+  }
+
   Status copy_h2d(const void* src, DeviceBuffer& dst, std::size_t bytes,
                   std::size_t dst_offset = 0) {
     return derived().copy_h2d_impl(src, dst, bytes, dst_offset);
@@ -451,6 +624,20 @@ class IBackend {
   virtual Result<std::size_t> sample_free_memory() const {
     return LSE_ERROR(kUnimplemented, "backend has no device memory query");
   }
+  // What a tick from this device would mean, and one such tick. Both refuse by
+  // default, and a refusal means unknown: the reader is a cost model, and an
+  // unknown duration leaves it on whatever it already measured while a
+  // substituted host clock would feed it submission jitter as device time.
+  //
+  // Two questions rather than one because they have different answers on the
+  // same device — a backend can often name and rate the counter its dispatches
+  // run against while having no way to read it.
+  virtual Result<DeviceClock> device_clock() const {
+    return LSE_ERROR(kUnimplemented, "backend publishes no device clock");
+  }
+  virtual Result<DeviceTimestamp> sample_device_time() const {
+    return LSE_ERROR(kUnimplemented, "backend has no device timestamp source");
+  }
   virtual Status copy_h2d(const void* src, DeviceBuffer& dst, std::size_t bytes,
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,
@@ -515,6 +702,12 @@ class BackendAdapter final : public IBackend {
   void deallocate(DeviceBuffer& b) noexcept override { impl_.deallocate(b); }
   Result<std::size_t> sample_free_memory() const override {
     return impl_.sample_free_memory();
+  }
+  Result<DeviceClock> device_clock() const override {
+    return impl_.device_clock();
+  }
+  Result<DeviceTimestamp> sample_device_time() const override {
+    return impl_.sample_device_time();
   }
   Status copy_h2d(const void* s, DeviceBuffer& d, std::size_t n,
                   std::size_t off) override {

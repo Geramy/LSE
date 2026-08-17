@@ -139,6 +139,22 @@ bool agent_memory_available(std::uint8_t ordinal, std::uint64_t* out) noexcept {
   constexpr int kInfoMemoryAvail = 0xA015;
   return agent_attribute(ordinal, kInfoMemoryAvail, out);
 }
+
+// Ticks per second of this agent's own counter
+// (HSA_AMD_AGENT_INFO_TIMESTAMP_FREQUENCY, hsa_ext_amd.h). Measured 99810000
+// on gfx1151 — not the 100 MHz the number invites you to round to, and an
+// order of magnitude off the 1000000000 the same runtime reports for the
+// host-scope HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY. Dividing agent ticks by the
+// system rate inflates every duration by 10.019x and still looks plausible,
+// which is why the rate is asked for rather than written down.
+//
+// This is the domain the device's PM4 timestamp packets and its shader-visible
+// steady counter both sample, so it is the denominator for any tick the device
+// itself writes.
+bool agent_timestamp_frequency(std::uint8_t ordinal, std::uint64_t* out) noexcept {
+  constexpr int kInfoTimestampFrequency = 0xA016;
+  return agent_attribute(ordinal, kInfoTimestampFrequency, out);
+}
 #endif
 
 // How many logical queues this device's submission path can address, asked of
@@ -543,6 +559,70 @@ Result<std::size_t> HrxBackend::sample_free_memory_impl() const {
                      "available-memory figure");
   }
   return static_cast<std::size_t>(available);
+#endif
+}
+
+Result<DeviceClock> HrxBackend::device_clock_impl() const {
+#if !LSE_HRX_LINKED
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
+  // hrx has no property for this. HRX_DEVICE_PROPERTY_CLOCK_RATE is declared in
+  // hrx_runtime.h but no case implements it in device.c, and it would be the
+  // engine clock in MHz rather than a tick rate even if it did. The agent
+  // underneath answers, through the runtime hrx has already loaded.
+  std::uint64_t hz = 0;
+  if (!agent_timestamp_frequency(info_.ordinal, &hz) || hz == 0) {
+    return LSE_ERROR(kUnimplemented,
+                     "neither this device's HAL nor its agent publishes a "
+                     "timestamp tick rate");
+  }
+  DeviceClock clock;
+  clock.domain = ClockDomain::kDeviceAgent;
+  clock.ticks_per_second = hz;
+  // The AMDGPU HAL stamps all 64 bits as counting, per queue family and per
+  // device (iree/hal/drivers/amdgpu/device_spec_builder.c). Stated here rather
+  // than assumed because a narrower counter is normal elsewhere and a wrap read
+  // as elapsed time is a duration of several thousand years.
+  clock.valid_bits = 64;
+  clock.ordinal = info_.ordinal;
+  return clock;
+#endif
+}
+
+Result<DeviceTimestamp> HrxBackend::sample_device_time_impl() const {
+#if !LSE_HRX_LINKED
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
+  // Declining on purpose, and the alternatives were checked rather than assumed:
+  //
+  //   - hrx exposes exactly one timing call, hrx_event_elapsed_time, and it is
+  //     a host clock. libhrx/src/libhrx/event.c takes iree_time_now() when the
+  //     *host* calls record — before the flush, so it orders host calls, not
+  //     device work — and returns the difference as a device duration. Calling
+  //     it would report submission jitter, which on a batched command buffer is
+  //     most of what it would report.
+  //   - hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP) is likewise a host clock
+  //     despite the name: measured here it reads in 22.8 ns, which is vDSO
+  //     speed and admits no device access, and it drifts -19.2 ppm against
+  //     CLOCK_MONOTONIC_RAW, which is NTP slewing a host counter. Two host
+  //     clocks, no device.
+  //   - ROCr exports no call returning a current agent-domain tick, and
+  //     hsaKmtGetClockCounters, which would, is static inside libhsakmt.a and
+  //     not an exported symbol of libhsa-runtime64.so.1.
+  //
+  // What remains is asking the device: a dispatch that writes its own counter,
+  // which costs a submission and a completion wait. That is the ~3 us round
+  // trip already measured and rejected for this engine's dispatch path, so it
+  // is not sold here as a clock read.
+  return LSE_ERROR(kUnimplemented,
+                   "hrx cannot read this device's counter: it exposes no "
+                   "timestamp call, and its one timing call "
+                   "(hrx_event_elapsed_time) is a host clock. Needs "
+                   "hrx_stream_timestamp() forwarding "
+                   "iree_hal_device_queue_timestamp(), which the AMDGPU HAL "
+                   "already implements");
 #endif
 }
 

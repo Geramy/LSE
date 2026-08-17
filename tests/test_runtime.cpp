@@ -5,13 +5,16 @@
 // logits as running the whole sequence at once. Everything else in M7 rests on
 // that.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "harness.hpp"
+#include "lse/backend/backend.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/model/config.hpp"
@@ -429,6 +432,93 @@ LSE_TEST(a_continued_session_only_scores_the_new_tokens) {
               gen.stats().prompt_tokens, next.size());
   LSE_EXPECT(gen.stats().prompt_tokens == expected);
   LSE_EXPECT(gen.stats().prompt_tokens < static_cast<std::int32_t>(next.size()));
+}
+
+// --- device clock, against whatever device this box actually has ------------
+
+LSE_TEST(the_device_clock_is_named_and_rated_or_cleanly_refused) {
+  // The process-wide backend the rest of this suite already runs on, rather
+  // than a fresh one: bringing the GPU up is a process-wide act, and a second
+  // create+init returns "GPU accelerator already initialized" -- a failure with
+  // nothing to do with clocks that would silently skip this whole case.
+  //
+  // The contract is the same whichever backend answers, and neither half of it
+  // is optional: a clock that is claimed is fully specified, a timestamp that
+  // is handed over carries a usable clock and moves forward, and anything
+  // absent is kUnimplemented rather than a device error or a half-filled
+  // struct. It passes today because hrx declines the timestamp, and it keeps
+  // passing unchanged on the day hrx can answer -- which is the point of
+  // writing it against the contract rather than against today's gap.
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+  backend::IBackend& be = sched->backend();
+  const std::string name(be.name());
+
+  auto clock = be.device_clock();
+  if (clock.ok()) {
+    LSE_EXPECT(clock->known());
+    LSE_EXPECT(clock->domain != backend::ClockDomain::kUnknown);
+    LSE_EXPECT(clock->ticks_per_second > 0);
+    LSE_EXPECT(clock->valid_bits > 0);
+  } else {
+    LSE_EXPECT(clock.status().code() == StatusCode::kUnimplemented);
+  }
+
+  // hrx cannot read a tick today, but it can say which counter a tick would be
+  // on and how fast that counter runs, and that answer is a live device query
+  // rather than a constant. This guards the query: a wrong attribute ordinal
+  // returns some neighbouring field's value, a plausible-looking number that
+  // nothing else in the system would catch.
+  if (name == "hrx") {
+    LSE_EXPECT(clock.ok());
+    if (clock.ok()) {
+      LSE_EXPECT(clock->domain == backend::ClockDomain::kDeviceAgent);
+      // A tick rate, which is neither the engine clock in MHz nor the host's
+      // in GHz -- both values this could be confused with, and both outside
+      // this decade.
+      LSE_EXPECT(clock->ticks_per_second >= 10'000'000);
+      LSE_EXPECT(clock->ticks_per_second <= 500'000'000);
+      LSE_EXPECT_EQ(clock->valid_bits, 64u);
+    }
+  }
+  if (clock.ok()) {
+    std::printf("       %s device clock: %s, %llu Hz, %u bits\n", name.c_str(),
+                std::string(backend::clock_domain_name(clock->domain)).c_str(),
+                static_cast<unsigned long long>(clock->ticks_per_second),
+                clock->valid_bits);
+  } else {
+    std::printf("       %s device clock: declined (%s)\n", name.c_str(),
+                clock.status().to_string().c_str());
+  }
+
+  auto first = be.sample_device_time();
+  if (!first.ok()) {
+    LSE_EXPECT(first.status().code() == StatusCode::kUnimplemented);
+    std::printf("       %s device timestamp: declined (%s)\n", name.c_str(),
+                first.status().to_string().c_str());
+    return;
+  }
+
+  // A timestamp exists, so it must behave like one: usable clock, moving
+  // forward, and a known sleep coming back as that interval in the clock's own
+  // units. The band is wide against scheduler slop and still an order of
+  // magnitude tighter than the ~10x error a mistaken tick rate produces, which
+  // is the failure it is here to catch.
+  LSE_EXPECT(first->valid());
+  constexpr double kSleepNs = 20'000'000.0;
+  std::this_thread::sleep_for(
+      std::chrono::nanoseconds(static_cast<std::int64_t>(kSleepNs)));
+  auto second = be.sample_device_time();
+  LSE_EXPECT(second.ok());
+  if (!second.ok()) return;
+
+  auto elapsed = backend::nanoseconds_between(*first, *second);
+  LSE_EXPECT(elapsed.ok());
+  if (elapsed.ok()) {
+    LSE_EXPECT(*elapsed > 0.0);
+    LSE_EXPECT_NEAR(*elapsed, kSleepNs, kSleepNs * 0.25);
+  }
 }
 
 LSE_TEST_MAIN()

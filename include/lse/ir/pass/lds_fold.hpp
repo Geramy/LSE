@@ -1,11 +1,13 @@
 // Fold workgroup-scratch allocations that hold the same bytes.
 //
-// The motivating case, measured: sibling GEMV fusion puts N stage bodies in one
-// kernel, and each stage independently stages the SAME activation row into its
-// own `__shared__ float[K]`. The compiler sums those arrays, so at K = 1024 the
-// fused q/k/v/g kernel carries four identical 4 KB copies and the run cap comes
-// out of `run * 4 * K <= lds_bytes / 4` — four stages, which is exactly the
-// attention run and one short of the MoE group.
+// The motivating case was sibling GEMV fusion, where each stage independently
+// staged the SAME activation row into its own `__shared__ float[K]` and the
+// compiler summed them. That is now shared by construction: the emitter stages
+// the row once for the whole run and hands every stage the one array, so on
+// lemonseed this pass fires zero times. It stays as the net under any lowering
+// that still emits duplicate stagings, not as the mechanism that shares them —
+// folding after the fact leaves the redundant barriers standing and depends on
+// the widest stage happening to be emitted first.
 //
 // This pass merges those allocations. Two are the same storage when they have
 // the same element type and count, each is written from exactly one fill loop,

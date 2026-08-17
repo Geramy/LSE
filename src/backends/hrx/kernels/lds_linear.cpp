@@ -80,7 +80,8 @@ bool lds_shape_ok(const LinearDims& d) {
   return d.valid && d.m > 0 && d.m < kMaxRows && d.n >= 16 && d.k >= 16;
 }
 
-ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave) {
+ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave,
+                     std::uint32_t lds_budget) {
   if (wave != 32 && wave != 64) wave = 32;
   const std::uint32_t waves = kBlock / wave;
   ThreadPlan tp;
@@ -91,6 +92,12 @@ ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave) {
       static_cast<std::uint32_t>((d.n + waves - 1) / waves);
   tp.workgroup_count[1] = static_cast<std::uint32_t>(d.m);
   tp.workgroup_count[2] = 1;
+  // The staged activation row, priced the way kir::Lds prices it. Whoever asks
+  // for the plan is asking what the launch costs, and a K-float workgroup array
+  // is most of what one of these costs in occupancy.
+  const std::uint32_t need = kir::Lds::align(
+      static_cast<std::uint32_t>(d.k) * kir::pack_elem_bytes<kir::f32>());
+  if (lds_budget == 0 || need <= lds_budget) tp.lds_bytes = need;
   return tp;
 }
 
@@ -163,7 +170,7 @@ void emit_gemv(env::Emit& e, const F32In& x, const WIn<W>& w, const F32In* idx,
                std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
                std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
                bool grid, std::uint32_t wave, bool persist,
-               std::uint32_t persist_wgs) {
+               std::uint32_t persist_wgs, StagedPanel staged) {
   if (wave != 32 && wave != 64) wave = 32;
   if (persist_wgs == 0) persist_wgs = 1;
   const auto lid = e.let(math::local_id());
@@ -192,13 +199,24 @@ void emit_gemv(env::Emit& e, const F32In& x, const WIn<W>& w, const F32In* idx,
     // loads hold the same outstanding-request capacity the weight stream needs
     // — measured 66.2 -> 41.3 us (134 -> 216 GB/s) at N=2176 K=1024. Only a
     // grid launch has a workgroup-constant row, so only it stages.
+    //
+    // In a fused run the emitter has already staged the row for every sibling
+    // that shares it — one array, one fill, one barrier, all of it ahead of
+    // this body. `staged` is that panel; taking it is the whole point of
+    // reporting it from staged_row().
     kir::Tile<kir::f32> xs;
-    const bool stage = e.lds_fits<kir::f32>(K);
-    if (stage) xs = e.lds<kir::f32>(K);
+    bool fill = false;
+    if (staged.count == K && !staged.name.empty()) {
+      xs = kir::Tile<kir::f32>(e.k, &e.k->types(), std::string(staged.name), K);
+    } else if (e.lds_fits<kir::f32>(K)) {
+      xs = e.lds<kir::f32>(K);
+      fill = true;
+    }
+    const bool stage = static_cast<bool>(xs);
     const auto tile = e.let(math::workgroup_id_x());
     const auto row = e.let(math::workgroup_id_y());
     if (auto in_grid = e.when(tile < ntiles && row < M)) {
-      if (stage) {
+      if (fill) {
         for (auto t : e.range(lid, e.u32(K), kBlock)) {
           xs[t] = x[row * K + t];
         }
@@ -223,7 +241,7 @@ void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
                std::uint32_t keep, std::uint32_t slot, std::uint32_t N,
                std::uint32_t K, std::uint32_t M, std::uint32_t load_bytes,
                bool grid, std::uint32_t wave, bool persist,
-               std::uint32_t persist_wgs) {
+               std::uint32_t persist_wgs, StagedPanel staged) {
   env::Emit e{&k};
   const F32In xi{x, &k.types()};
   const WIn<W> wi{w, &k.types()};
@@ -234,23 +252,50 @@ void emit_gemv(kir::KernelBody& k, const kir::Buffer<kir::f32>& x,
     idxp = &ii;
   }
   emit_gemv<W>(e, xi, wi, idxp, keep, slot, N, K, M, load_bytes, grid, wave,
-               persist, persist_wgs);
+               persist, persist_wgs, staged);
 }
 
 #define LSE_GEMV_INSTANTIATE(W_)                                               \
   template void emit_gemv<W_>(                                                 \
       env::Emit&, const F32In&, const WIn<W_>&, const F32In*, std::uint32_t,   \
       std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,              \
-      std::uint32_t, bool, std::uint32_t, bool, std::uint32_t);                \
+      std::uint32_t, bool, std::uint32_t, bool, std::uint32_t, StagedPanel);   \
   template void emit_gemv<W_>(                                                 \
       kir::KernelBody&, const kir::Buffer<kir::f32>&, const kir::Buffer<W_>&,  \
       const kir::Buffer<kir::f32>*, std::uint32_t, std::uint32_t,              \
       std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool,        \
-      std::uint32_t, bool, std::uint32_t);
+      std::uint32_t, bool, std::uint32_t, StagedPanel);
 LSE_GEMV_INSTANTIATE(kir::f32)
 LSE_GEMV_INSTANTIATE(lse::bf16)
 LSE_GEMV_INSTANTIATE(lse::f16)
 #undef LSE_GEMV_INSTANTIATE
+
+std::string emit_staged_row(kir::KernelBody& k,
+                            const kir::Buffer<kir::f32>& x,
+                            std::uint32_t count, std::uint32_t rows,
+                            std::uint32_t block) {
+  if (count == 0 || rows == 0 || block == 0) return {};
+  env::Emit e{&k};
+  if (!e.lds_fits<kir::f32>(count)) return {};
+  const auto xs = e.lds<kir::f32>(count);
+  if (!xs) return {};
+  std::string name = xs.name();
+  const auto lid = e.let(math::local_id());
+  const auto row = e.let(math::workgroup_id_y());
+  // Guarded on the row alone, not on the tile. A sibling with a wider N owns
+  // tiles a narrower one does not, and it needs the row in every one of them —
+  // filling under the narrow guard is exactly how a shared panel comes to be
+  // read before it is written. `row < rows` is workgroup-uniform, so the
+  // barrier is taken by a whole workgroup or by none of it, and it dominates
+  // every read the emitter splices after this.
+  if (auto in_rows = e.when(row < rows)) {
+    for (auto t : e.range(lid, e.u32(count), block)) {
+      xs[t] = x[row * count + t];
+    }
+    e.barrier();
+  }
+  return name;
+}
 
 namespace {
 
@@ -272,6 +317,13 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   std::size_t arity() const noexcept override { return 2; }
   bool owns_indexing() const noexcept override { return true; }
 
+  StagedRow staged_row(const KernelShapes& s) const override {
+    const LinearDims d = dims_of_linear(s);
+    if (!lds_shape_ok(d) || !device_fits(s)) return {};
+    return {0, static_cast<std::uint32_t>(d.k),
+            static_cast<std::uint32_t>(d.m)};
+  }
+
   std::string emit_kernel(const KernelShapes& s) const override {
     const LinearDims d = dims_of_linear(s);
     if (!lds_shape_ok(d) || !device_fits(s) || s.types.scalar == nullptr ||
@@ -287,7 +339,7 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
       emit_gemv<W>(e, a.x, a.w, nullptr, 0, 0, static_cast<std::uint32_t>(d.n),
                    static_cast<std::uint32_t>(d.k),
                    static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
-                   true, wave_of(s.device));
+                   true, wave_of(s.device), false, 1, s.staged);
       if (!k.lds().ok()) return {};
       return k.str();
     });
@@ -304,7 +356,8 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
     return in.empty() ? DType::kF32 : in[0];
   }
   static ThreadPlan plan_impl(const KernelShapes& s) {
-    return gemv_plan(dims_of_linear(s), wave_of(s.device));
+    return gemv_plan(dims_of_linear(s), wave_of(s.device),
+                     workgroup_lds_bytes(s.device));
   }
 };
 
@@ -323,6 +376,13 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
 
   std::size_t arity() const noexcept override { return 3; }
   bool owns_indexing() const noexcept override { return true; }
+
+  StagedRow staged_row(const KernelShapes& s) const override {
+    const LinearDims d = dims_of_indexed(s);
+    if (!lds_shape_ok(d) || !device_fits(s)) return {};
+    return {0, static_cast<std::uint32_t>(d.k),
+            static_cast<std::uint32_t>(d.m)};
+  }
 
   std::string emit_kernel(const KernelShapes& s) const override {
     const LinearDims d = dims_of_indexed(s);
@@ -346,7 +406,7 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
                    static_cast<std::uint32_t>(d.n),
                    static_cast<std::uint32_t>(d.k),
                    static_cast<std::uint32_t>(d.m), device_load_bytes(s.device),
-                   true, wave_of(s.device));
+                   true, wave_of(s.device), false, 1, s.staged);
       if (!k.lds().ok()) return {};
       return k.str();
     });
@@ -365,7 +425,8 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
     return in.empty() ? DType::kF32 : in[0];
   }
   static ThreadPlan plan_impl(const KernelShapes& s) {
-    return gemv_plan(dims_of_indexed(s), wave_of(s.device));
+    return gemv_plan(dims_of_indexed(s), wave_of(s.device),
+                     workgroup_lds_bytes(s.device));
   }
 };
 

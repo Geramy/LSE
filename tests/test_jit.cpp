@@ -1317,7 +1317,390 @@ backend::IBackend* live_hrx() {
   return be.get();
 }
 
+// Names of the workgroup arrays a kernel declares, in source order.
+std::vector<std::string> shared_arrays(const std::string& src) {
+  std::vector<std::string> out;
+  const std::string decl = "__shared__ float ";
+  for (std::size_t at = src.find(decl); at != std::string::npos;
+       at = src.find(decl, at)) {
+    const std::size_t from = at + decl.size();
+    const std::size_t open = src.find('[', from);
+    if (open == std::string::npos) break;
+    out.push_back(src.substr(from, open - from));
+    at = open;
+  }
+  return out;
+}
+
+// Assignments into `name[...]`, which for a staged activation row is its fill —
+// as opposed to the reads, which are the same subscript on the other side.
+std::size_t fills_of(const std::string& src, const std::string& name) {
+  std::size_t n = 0;
+  const std::string open = name + "[";
+  for (std::size_t at = src.find(open); at != std::string::npos;
+       at = src.find(open, at + open.size())) {
+    const std::size_t close = src.find(']', at);
+    if (close != std::string::npos && src.compare(close, 4, "] = ") == 0) ++n;
+  }
+  return n;
+}
+
+// Compile an emitted kernel, give every binding a device buffer, run it, and
+// hand back what each binding holds afterwards, in binding order. `host`
+// supplies the bytes for the input bindings by node; anything without an entry
+// starts zeroed, which is what an output wants.
+std::vector<std::vector<float>> run_emitted(
+    const EmittedKernel& e, const backend::DeviceInfo& dev,
+    backend::IBackend& be,
+    const std::vector<std::pair<const Node*, std::vector<float>>>& host) {
+  auto code = kCompiler.compile(e.source, std::string(dev.arch));
+  if (!code.ok()) {
+    std::printf("       compile failed:\n%s\n", code.status().message().c_str());
+    return {};
+  }
+  auto handle = be.load_executable(e.entry_name, *code);
+  if (!handle.ok()) return {};
+
+  const std::size_t n = e.binding_order.size();
+  std::vector<backend::DeviceBuffer> bufs(n);
+  std::vector<std::vector<float>> data(n);
+  std::vector<backend::BufferRef> binds(n);
+  bool ok = true;
+  std::size_t made = 0;
+  for (; made < n && ok; ++made) {
+    const Node* b = e.binding_order[made].get();
+    data[made].assign(b->element_count(), 0.0f);
+    for (const auto& [node, v] : host) {
+      if (node == b && v.size() == data[made].size()) data[made] = v;
+    }
+    auto a = be.allocate(data[made].size() * 4, backend::MemoryClass::kDevice);
+    ok = a.ok();
+    if (!ok) break;
+    bufs[made] = a.release();
+    binds[made] = {&bufs[made], 0, bufs[made].size_bytes};
+    ok = be.copy_h2d(data[made].data(), bufs[made], data[made].size() * 4, 0)
+             .ok();
+  }
+
+  if (ok) {
+    std::uint32_t count = 0;
+    for (const std::vector<float>& v : data) {
+      count = std::max(count, static_cast<std::uint32_t>(v.size()));
+    }
+    std::array<std::byte, sizeof(std::uint32_t)> constants{};
+    std::memcpy(constants.data(), &count, sizeof(count));
+    backend::DispatchArgs args;
+    args.bindings = binds;
+    args.constants = constants;
+    ok = be.launch(*handle, e.dims, args).ok() && be.synchronize().ok();
+    for (std::size_t i = 0; i < n && ok; ++i) {
+      ok = be.copy_d2h(bufs[i], data[i].data(), data[i].size() * 4, 0).ok();
+    }
+  }
+  for (std::size_t i = 0; i < made; ++i) be.deallocate(bufs[i]);
+  return ok ? data : std::vector<std::vector<float>>{};
+}
+
 }  // namespace
+
+// A fused run stages the shared activation row ONCE, by construction: the
+// emitter declares one array, fills it under a workgroup-uniform row guard and
+// barriers behind it, and every sibling reads that array. Before this the stages
+// each staged their own copy and `lds_fold` merged them afterwards, which left
+// the surviving barriers behind and depended on the widest stage happening to
+// come first — a narrow stage first and the fills could not be folded at all.
+LSE_TEST(one_staging_serves_every_sibling_that_shares_the_row) {
+  ::unsetenv("LSE_WMMA");
+  Array x = Array::full(Shape{1, 256}, DType::kF32, 1.0f);
+  Array wa = Array::full(Shape{128, 256}, DType::kF32, 0.5f);
+  // Narrower N first: this one covers 2 tiles where the others cover 16, so a
+  // fill under its own tile guard would leave 14 tiles reading a row nothing
+  // wrote. The staging is guarded on the row alone for exactly that reason.
+  Array wb = Array::full(Shape{16, 256}, DType::kF32, 0.25f);
+  Array wc = Array::full(Shape{128, 256}, DType::kF32, 0.125f);
+  auto e = kEmitter.emit(
+      sibling_group({linear(x, wb), linear(x, wa), linear(x, wc)}), gfx1151());
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) {
+    std::printf("       %s\n", e.status().to_string().c_str());
+    return;
+  }
+
+  const std::vector<std::string> arrays = shared_arrays(e->source);
+  LSE_EXPECT_EQ(arrays.size(), 1u);
+  if (arrays.empty()) {
+    std::printf("---- source ----\n%s\n", e->source.c_str());
+    return;
+  }
+  LSE_EXPECT_EQ(fills_of(e->source, arrays[0]), 1u);
+  // One barrier publishes the row; the other two are the convoy between the
+  // three stages, which is a memory-locality decision and not a dependence.
+  // Three stages that each published their own row would need three.
+  LSE_EXPECT_EQ(count_of(e->source, "__syncthreads()"), 3u);
+  // Three stages, three reads of the one array, and every one of them reaches
+  // it without a row term: the row offset is in the panel.
+  LSE_EXPECT(count_of(e->source, arrays[0] + "[") >= 5u);
+  LSE_EXPECT(e->source.find(arrays[0] + "[((") == std::string::npos);
+  // The group's scratch is one row of 64 floats, 16-byte aligned — not the four
+  // copies a max over the stage plans used to report as one.
+  LSE_EXPECT_EQ(e->lds_bytes, 1024u);
+
+  // And the fill does carry the row stride, which is the other half of the
+  // contract: the panel holds row blockIdx.y, not row 0.
+  LSE_EXPECT(e->source.find("* 256u)") != std::string::npos);
+
+  if (!kCompiler.available()) return;
+  auto code = kCompiler.compile(e->source, "gfx1151");
+  if (!code.ok()) {
+    std::printf("       %s\n", code.status().message().c_str());
+  }
+  LSE_EXPECT(code.ok());
+}
+
+// Siblings that do not share the row must not share the staging. The predicate
+// is the activation node, its length and its row count — not a shape that
+// merely agrees — so two runs over two different buffers of the same K get one
+// panel each and the run is priced for both.
+LSE_TEST(siblings_over_different_rows_get_their_own_staging) {
+  ::unsetenv("LSE_WMMA");
+  Array x0 = Array::full(Shape{1, 256}, DType::kF32, 1.0f);
+  Array x1 = Array::full(Shape{1, 256}, DType::kF32, 2.0f);
+  Array wa = Array::full(Shape{128, 256}, DType::kF32, 0.5f);
+  Array wb = Array::full(Shape{128, 256}, DType::kF32, 0.25f);
+  Array wc = Array::full(Shape{128, 256}, DType::kF32, 0.125f);
+  Array wd = Array::full(Shape{128, 256}, DType::kF32, 0.0625f);
+  auto e = kEmitter.emit(sibling_group({linear(x0, wa), linear(x1, wb),
+                                        linear(x0, wc), linear(x1, wd)}),
+                         gfx1151());
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) {
+    std::printf("       %s\n", e.status().to_string().c_str());
+    return;
+  }
+
+  const std::vector<std::string> arrays = shared_arrays(e->source);
+  LSE_EXPECT_EQ(arrays.size(), 2u);
+  if (arrays.size() != 2) {
+    std::printf("---- source ----\n%s\n", e->source.c_str());
+    return;
+  }
+  LSE_EXPECT(arrays[0] != arrays[1]);
+  for (const std::string& a : arrays) LSE_EXPECT_EQ(fills_of(e->source, a), 1u);
+  // Two publications, one per row, plus three convoy barriers for four stages.
+  LSE_EXPECT_EQ(count_of(e->source, "__syncthreads()"), 5u);
+  // Two rows, both charged to the run.
+  LSE_EXPECT_EQ(e->lds_bytes, 2048u);
+  // Each panel is filled from its own buffer, and the two buffers are the
+  // first two bindings.
+  LSE_EXPECT(e->source.find(arrays[0] + "[p0_") != std::string::npos);
+  LSE_EXPECT(e->source.find(arrays[1] + "[p1_") != std::string::npos);
+
+  if (!kCompiler.available()) return;
+  auto code = kCompiler.compile(e->source, "gfx1151");
+  if (!code.ok()) {
+    std::printf("       %s\n", code.status().message().c_str());
+  }
+  LSE_EXPECT(code.ok());
+}
+
+// Width invariance: a token must not depend on how many rows are in the pass.
+// The staged and unstaged activation reads index differently — the panel holds
+// the row, so it is read from 0, while global is read from `row * K` — and a
+// staging change that gets that wrong makes every row read row 0. That is the
+// defect this whole path can reproduce, so it is checked by running the fused
+// kernel at four widths against a host reference rather than by reading source.
+LSE_TEST(a_shared_staged_row_holds_its_own_row_at_every_pass_width) {
+  ::unsetenv("LSE_WMMA");
+  backend::IBackend* be = live_hrx();
+  if (be == nullptr || !kCompiler.available()) return;
+  const backend::DeviceInfo& dev = be->device_info();
+  if (backend::device_extension<backend::AmdDeviceInfo>(dev) == nullptr) return;
+
+  constexpr std::int64_t kK = 256;
+  constexpr std::int64_t kN = 32;
+  // Rows must differ, or reading row 0 for everything would pass.
+  auto xrow = [](std::size_t r, std::size_t t) {
+    return static_cast<float>(
+        small_int(static_cast<std::uint32_t>(r * 1013u + t * 37u + 5u), 9));
+  };
+  std::vector<float> wa(kN * kK), wb(kN * kK);
+  for (std::size_t c = 0; c < static_cast<std::size_t>(kN); ++c) {
+    for (std::size_t t = 0; t < static_cast<std::size_t>(kK); ++t) {
+      wa[c * kK + t] = static_cast<float>(
+          small_int(static_cast<std::uint32_t>(c * 409u + t * 17u), 7));
+      wb[c * kK + t] = static_cast<float>(
+          small_int(static_cast<std::uint32_t>(c * 811u + t * 53u + 3u), 7));
+    }
+  }
+
+  for (const std::int64_t m : {std::int64_t{1}, std::int64_t{2},
+                               std::int64_t{3}, std::int64_t{5}}) {
+    Array x = Array::zeros(Shape{m, kK}, DType::kF32);
+    Array w0 = Array::zeros(Shape{kN, kK}, DType::kF32);
+    Array w1 = Array::zeros(Shape{kN, kK}, DType::kF32);
+    Array ya = linear(x, w0);
+    Array yb = linear(x, w1);
+    auto e = kEmitter.emit(sibling_group({ya, yb}), dev);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) {
+      std::printf("       m=%lld: %s\n", static_cast<long long>(m),
+                  e.status().to_string().c_str());
+      continue;
+    }
+    // One row of the pass in scratch whatever the width is.
+    LSE_EXPECT_EQ(shared_arrays(e->source).size(), 1u);
+
+    std::vector<float> xs(static_cast<std::size_t>(m * kK));
+    for (std::size_t r = 0; r < static_cast<std::size_t>(m); ++r) {
+      for (std::size_t t = 0; t < static_cast<std::size_t>(kK); ++t) {
+        xs[r * kK + t] = xrow(r, t);
+      }
+    }
+    const std::vector<std::vector<float>> got = run_emitted(
+        *e, dev, *be,
+        {{x.node().get(), xs},
+         {w0.node().get(), wa},
+         {w1.node().get(), wb}});
+    LSE_EXPECT(got.size() == e->binding_order.size());
+    if (got.size() != e->binding_order.size()) continue;
+
+    // Every row against a host dot product over that row's own activation.
+    // Small integers, so f32 is exact and the comparison is too.
+    for (int which = 0; which < 2; ++which) {
+      const Node* out = (which == 0 ? ya : yb).node().get();
+      const std::vector<float>& w = which == 0 ? wa : wb;
+      std::size_t at = e->binding_order.size();
+      for (std::size_t i = 0; i < e->binding_order.size(); ++i) {
+        if (e->binding_order[i].get() == out) at = i;
+      }
+      LSE_EXPECT(at < e->binding_order.size());
+      if (at >= e->binding_order.size()) continue;
+      std::vector<float> want(static_cast<std::size_t>(m * kN), 0.0f);
+      for (std::size_t r = 0; r < static_cast<std::size_t>(m); ++r) {
+        for (std::size_t c = 0; c < static_cast<std::size_t>(kN); ++c) {
+          float acc = 0.0f;
+          for (std::size_t t = 0; t < static_cast<std::size_t>(kK); ++t) {
+            acc += xs[r * kK + t] * w[c * kK + t];
+          }
+          want[r * kN + c] = acc;
+        }
+      }
+      const double worst = worst_abs(got[at], want);
+      if (worst != 0.0) {
+        std::printf("       m=%lld output %d worst %.3f\n",
+                    static_cast<long long>(m), which, worst);
+      }
+      LSE_EXPECT_EQ(worst, 0.0);
+    }
+  }
+}
+
+// The shape that actually runs: lemonseed's routed experts are `linear_indexed`
+// siblings off one normed activation, and at a prefill width they are the only
+// sibling run in the program that carries a shared panel over more than one row.
+//
+// Two row offsets have to be right at once here and they are read from different
+// buffers — the panel holds row `blockIdx.y` of the activation and is therefore
+// subscripted from 0, while the expert index is still read out of global at
+// `row * keep + slot`. Dropping either one leaves every row on row 0's data,
+// which is fluent and wrong, so both are checked by running the fused kernel
+// against a host reference at four widths with a different expert per row.
+LSE_TEST(a_shared_row_and_a_per_row_expert_agree_at_every_pass_width) {
+  ::unsetenv("LSE_WMMA");
+  backend::IBackend* be = live_hrx();
+  if (be == nullptr || !kCompiler.available()) return;
+  const backend::DeviceInfo& dev = be->device_info();
+  if (backend::device_extension<backend::AmdDeviceInfo>(dev) == nullptr) return;
+
+  constexpr std::int64_t kK = 256;
+  constexpr std::int64_t kN = 32;
+  constexpr std::int64_t kE = 4;
+  constexpr std::int64_t kKeep = 2;
+  // Every expert plane differs, or routing to the wrong one would still agree.
+  std::vector<float> ws(static_cast<std::size_t>(kE * kN * kK));
+  for (std::size_t e = 0; e < static_cast<std::size_t>(kE); ++e) {
+    for (std::size_t c = 0; c < static_cast<std::size_t>(kN); ++c) {
+      for (std::size_t t = 0; t < static_cast<std::size_t>(kK); ++t) {
+        ws[(e * kN + c) * kK + t] = static_cast<float>(small_int(
+            static_cast<std::uint32_t>(e * 2003u + c * 409u + t * 17u), 7));
+      }
+    }
+  }
+  auto xrow = [](std::size_t r, std::size_t t) {
+    return static_cast<float>(
+        small_int(static_cast<std::uint32_t>(r * 1013u + t * 37u + 5u), 9));
+  };
+  // Distinct per row AND per slot, so neither a lost row offset nor a lost slot
+  // can land on the right expert.
+  auto expert = [](std::size_t r, std::size_t slot) {
+    return (r * 3u + slot * 2u + 1u) % static_cast<std::size_t>(kE);
+  };
+
+  for (const std::int64_t m : {std::int64_t{1}, std::int64_t{2},
+                               std::int64_t{3}, std::int64_t{5}}) {
+    Array x = Array::zeros(Shape{m, kK}, DType::kF32);
+    Array w = Array::zeros(Shape{kE, kN, kK}, DType::kF32);
+    Array idx = Array::zeros(Shape{m, kKeep}, DType::kF32);
+    Array y0 = linear_indexed(x, w, idx, 0);
+    Array y1 = linear_indexed(x, w, idx, 1);
+    auto e = kEmitter.emit(sibling_group({y0, y1}), dev);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) {
+      std::printf("       m=%lld: %s\n", static_cast<long long>(m),
+                  e.status().to_string().c_str());
+      continue;
+    }
+    LSE_EXPECT_EQ(shared_arrays(e->source).size(), 1u);
+
+    std::vector<float> xs(static_cast<std::size_t>(m * kK));
+    for (std::size_t r = 0; r < static_cast<std::size_t>(m); ++r) {
+      for (std::size_t t = 0; t < static_cast<std::size_t>(kK); ++t) {
+        xs[r * kK + t] = xrow(r, t);
+      }
+    }
+    std::vector<float> ids(static_cast<std::size_t>(m * kKeep));
+    for (std::size_t r = 0; r < static_cast<std::size_t>(m); ++r) {
+      for (std::size_t s = 0; s < static_cast<std::size_t>(kKeep); ++s) {
+        ids[r * kKeep + s] = static_cast<float>(expert(r, s));
+      }
+    }
+
+    const std::vector<std::vector<float>> got =
+        run_emitted(*e, dev, *be,
+                    {{x.node().get(), xs},
+                     {w.node().get(), ws},
+                     {idx.node().get(), ids}});
+    LSE_EXPECT(got.size() == e->binding_order.size());
+    if (got.size() != e->binding_order.size()) continue;
+
+    for (std::size_t slot = 0; slot < static_cast<std::size_t>(kKeep); ++slot) {
+      const Node* out = (slot == 0 ? y0 : y1).node().get();
+      std::size_t at = e->binding_order.size();
+      for (std::size_t i = 0; i < e->binding_order.size(); ++i) {
+        if (e->binding_order[i].get() == out) at = i;
+      }
+      LSE_EXPECT(at < e->binding_order.size());
+      if (at >= e->binding_order.size()) continue;
+      std::vector<float> want(static_cast<std::size_t>(m * kN), 0.0f);
+      for (std::size_t r = 0; r < static_cast<std::size_t>(m); ++r) {
+        const std::size_t ex = expert(r, slot);
+        for (std::size_t c = 0; c < static_cast<std::size_t>(kN); ++c) {
+          float acc = 0.0f;
+          for (std::size_t t = 0; t < static_cast<std::size_t>(kK); ++t) {
+            acc += xs[r * kK + t] * ws[(ex * kN + c) * kK + t];
+          }
+          want[r * kN + c] = acc;
+        }
+      }
+      const double worst = worst_abs(got[at], want);
+      if (worst != 0.0) {
+        std::printf("       m=%lld slot %zu worst %.3f\n",
+                    static_cast<long long>(m), slot, worst);
+      }
+      LSE_EXPECT_EQ(worst, 0.0);
+    }
+  }
+}
 
 // One table, one row per variant, and an unmapped combination is a compile
 // error rather than a fallthrough to whichever variant was there first.

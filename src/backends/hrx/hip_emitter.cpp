@@ -13,6 +13,7 @@
 #include "lse/graph/ops.hpp"
 #include "lse/ir/lower.hpp"
 #include "lse/ir/pass/pass.hpp"
+#include "lse/backends/hrx/kernels/lds_linear.hpp"
 #include "lse/backends/hrx/kernels/linked.hpp"
 
 namespace lse::backend {
@@ -33,7 +34,78 @@ struct IndexedStage {
   NodePtr node;
   const KernelPrimitiveBase* prim = nullptr;
   ThreadPlan plan;
+  // The activation panel this stage puts in workgroup scratch, as the stage
+  // itself declares it. Asked at specialize time so the run can share it.
+  KernelPrimitiveBase::StagedRow row;
 };
+
+// One activation row, staged once for every stage of a run that reads it.
+struct RowPanel {
+  const Node* act = nullptr;
+  std::uint32_t count = 0;
+  std::uint32_t rows = 0;
+  std::size_t members = 0;
+  // The array in the merged body, once the prologue has declared it. Empty
+  // while the row belongs to a single stage, which stages it itself.
+  std::string name;
+};
+
+constexpr std::size_t kNoPanel = static_cast<std::size_t>(-1);
+
+// Which stages of a run stage the same row.
+//
+// The predicate is deliberately narrow: the same activation *node* — hence the
+// same pointer at runtime, since bindings are keyed on the node — at the same
+// element count, over the same number of rows, in f32. Nothing is inferred from
+// shapes that merely agree, and nothing is inferred about what a body reads:
+// staged_row() is the stage's own statement that row `workgroup_id_y` of that
+// operand is all it takes from it.
+//
+// Two stages over different buffers, different K, or different row counts land
+// in different panels and are staged separately, which is the correct answer
+// rather than a missed opportunity.
+std::vector<RowPanel> row_panels(const std::vector<IndexedStage>& stages,
+                                 std::vector<std::size_t>& panel_of) {
+  std::vector<RowPanel> panels;
+  panel_of.assign(stages.size(), kNoPanel);
+  for (std::size_t si = 0; si < stages.size(); ++si) {
+    const IndexedStage& st = stages[si];
+    if (st.row.count == 0 || st.row.rows == 0) continue;
+    if (st.row.input >= st.node->inputs.size()) continue;
+    const Node* act = st.node->inputs[st.row.input].get();
+    // The panel is f32; a narrower activation buffer would need the fill to
+    // widen, which is not what the panel promises.
+    if (act->dtype != DType::kF32) continue;
+    std::size_t at = panels.size();
+    for (std::size_t p = 0; p < panels.size(); ++p) {
+      if (panels[p].act == act && panels[p].count == st.row.count &&
+          panels[p].rows == st.row.rows) {
+        at = p;
+        break;
+      }
+    }
+    if (at == panels.size()) {
+      panels.push_back(RowPanel{act, st.row.count, st.row.rows, 0, {}});
+    }
+    ++panels[at].members;
+    panel_of[si] = at;
+  }
+  return panels;
+}
+
+// What the run's workgroup scratch actually costs: every distinct row once,
+// plus whatever a stage that shares nothing takes on its own.
+std::uint32_t run_lds_bytes(const std::vector<IndexedStage>& stages,
+                            const std::vector<RowPanel>& panels) {
+  std::uint32_t bytes = 0;
+  for (const RowPanel& p : panels) {
+    bytes += kir::Lds::align(p.count * kir::pack_elem_bytes<kir::f32>());
+  }
+  for (const IndexedStage& st : stages) {
+    if (st.row.count == 0) bytes += kir::Lds::align(st.plan.lds_bytes);
+  }
+  return bytes;
+}
 
 // Identity of the `__device__` helper the per-element scaffold emits for a
 // kernel primitive.
@@ -99,14 +171,22 @@ std::vector<IndexedStage> indexed_stages(const FusionGroup& group,
     probe.intrinsics = &spellings;
     const KernelPrimitiveBase* chosen = kp->specialize(probe);
     if (chosen == nullptr || !chosen->owns_indexing()) continue;
-    out.push_back(IndexedStage{n, chosen, chosen->plan(probe)});
+    out.push_back(
+        IndexedStage{n, chosen, chosen->plan(probe), chosen->staged_row(probe)});
   }
   return out;
 }
 
 bool sibling_stages(const FusionGroup& group,
-                    const std::vector<IndexedStage>& stages) {
+                    const std::vector<IndexedStage>& stages,
+                    std::uint32_t lds_needed, std::uint32_t lds_budget) {
   if (stages.size() < 2) return false;
+  // One launch, one workgroup scratch allocation, so the run's rows are summed
+  // and not maximized. Nothing checked this before the rows were shared by
+  // construction, because the fold pass reduced them to one afterwards and one
+  // always fit; a run whose distinct rows do not fit cannot be launched at all,
+  // so it goes back to a group per node the same way an uncovered run does.
+  if (lds_budget != 0 && lds_needed > lds_budget) return false;
   std::unordered_set<const Node*> stage_set;
   std::unordered_set<const Node*> outputs;
   for (const IndexedStage& s : stages) stage_set.insert(s.node.get());
@@ -390,7 +470,11 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   };
 
   const auto stages = indexed_stages(group, device);
-  if (sibling_stages(group, stages)) {
+  std::vector<std::size_t> panel_of;
+  std::vector<RowPanel> panels = row_panels(stages, panel_of);
+  const std::uint32_t lds_budget = workgroup_lds_bytes(&device);
+  const std::uint32_t lds_needed = run_lds_bytes(stages, panels);
+  if (sibling_stages(group, stages, lds_needed, lds_budget)) {
     EmittedKernel out;
     out.entry_name = "lse_fused_" + std::to_string(group.signature());
 
@@ -419,6 +503,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.source = it->second.source;
       out.entry_name = it->second.entry_name;
       out.dims = it->second.dims;
+      out.lds_bytes = lds_needed;
       return out;
     }
 
@@ -437,16 +522,50 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
          << "  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n";
 
     // One IR body for the whole run, not N texts concatenated. That is the
-    // whole reason the middle end exists: every stage stages the SAME
-    // activation row into its own `__shared__` array, and no pass can see that
-    // while the stages are strings. Spliced into one body they are ordinary
-    // sibling ops, and `lds_fold` folds the copies.
+    // whole reason the middle end exists: the stages are ordinary sibling ops
+    // once they are in one body, and a pass can see across them.
     //
     // Each stage records against the run's real binding names (`b3`, not
     // `in1`), so two stages reading one buffer name the same IR value, and
     // against a name prefix, so their generated locals cannot collide once the
     // per-stage braces are gone.
     ir::Body merged(type_table, spellings);
+
+    // The shared rows come first, one staging each, so the barrier behind each
+    // fill dominates every stage read spliced after it. Stages then reference
+    // the array by name — splice interns symbols, so all of them name the one
+    // allocation the prologue declared.
+    //
+    // A row only one stage wants is left to that stage. Hoisting it would put
+    // the fill under `row < rows` alone, and every workgroup of the run would
+    // then pay for it, including the ones covering tiles that stage does not
+    // have.
+    const std::uint32_t run_block = stages.front().plan.workgroup_size[0];
+    for (std::size_t p = 0; p < panels.size(); ++p) {
+      RowPanel& panel = panels[p];
+      if (panel.members < 2) continue;
+      const auto ait = binding_of.find(panel.act);
+      if (ait == binding_of.end()) {
+        return LSE_ERROR(kInternal,
+                         "the row a sibling run shares is not bound in it");
+      }
+      const std::string act_buf = "b" + std::to_string(ait->second);
+      const std::string prefix = "p" + std::to_string(p) + "_";
+      const ir::RecordOptions opts{{}, {}, prefix};
+      const ir::KernelBody::Recording rec(opts);
+      ir::KernelBody::Capture cap;
+      {
+        kir::KernelBody kb(type_table, spellings, lds_budget);
+        const kir::Buffer<kir::f32> act(&kb, &kb.types(), act_buf);
+        panel.name = hrx_kernels::emit_staged_row(kb, act, panel.count,
+                                                  panel.rows, run_block);
+      }
+      if (panel.name.empty() || !cap.has()) {
+        return LSE_ERROR(kInternal, "the shared activation row did not stage");
+      }
+      merged.splice(cap.body(), merged.entry());
+    }
+
     ThreadPlan unified;
     unified.workgroup_size[0] = 1;
     unified.workgroup_count[0] = 1;
@@ -477,6 +596,10 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
         input_names.push_back("b" + std::to_string(iit->second));
       }
       const std::string prefix = "s" + std::to_string(si) + "_";
+      if (panel_of[si] != kNoPanel) {
+        const RowPanel& panel = panels[panel_of[si]];
+        if (!panel.name.empty()) shapes.staged = {panel.name, panel.count};
+      }
 
       std::string stage_text;
       {
@@ -501,6 +624,30 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
         merged.splice(cap.body(), merged.entry());
       }
 
+      // A workgroup barrier between stages, carrying no data dependence: the
+      // shared row was published by the prologue and nothing here writes it.
+      // It is a convoy for the weight stream. Left to themselves the waves of a
+      // workgroup drift onto different stages, so the workgroup has one weight
+      // matrix per stage in flight at once instead of one in total, and a
+      // DRAM-bound GEMV pays for it. Measured, lemonseed decode at `-n 128` on
+      // gfx1151, mean of 8 runs: 93.4 tok/s with, 92.6 without.
+      //
+      // This is why removing the per-stage barriers that `lds_fold` used to
+      // leave behind was not the win it looked like.
+      if (si + 1 < stages.size()) {
+        const ir::RecordOptions opts{{}, {}, "c" + std::to_string(si) + "_"};
+        const ir::KernelBody::Recording rec(opts);
+        ir::KernelBody::Capture cap;
+        {
+          kir::KernelBody kb(type_table, spellings, 0);
+          kb.barrier();
+        }
+        if (!cap.has()) {
+          return LSE_ERROR(kInternal, "sibling convoy barrier did not record");
+        }
+        merged.splice(cap.body(), merged.entry());
+      }
+
       const ThreadPlan& tp = st.plan;
       for (int d = 0; d < 3; ++d) {
         if (tp.workgroup_size[d] > unified.workgroup_size[d]) {
@@ -510,7 +657,6 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
           unified.workgroup_count[d] = tp.workgroup_count[d];
         }
       }
-      if (tp.lds_bytes > unified.lds_bytes) unified.lds_bytes = tp.lds_bytes;
     }
 
     std::vector<ir::PassStat> pass_stats;
@@ -525,7 +671,9 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.dims.workgroup_size[d] = unified.workgroup_size[d];
       out.dims.workgroup_count[d] = unified.workgroup_count[d];
     }
-    out.lds_bytes = unified.lds_bytes;
+    // The run's rows, each counted once — not the widest stage's, which is what
+    // a max over the stage plans would have said.
+    out.lds_bytes = lds_needed;
     out.dims.subgroup_size = device.wavefront_size;
     emit_cache_[sig] = CachedEmit{out.source, out.entry_name, out.dims};
     return out;

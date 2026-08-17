@@ -34,6 +34,12 @@ class HrxBackend : public Backend<HrxBackend> {
   Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls);
   void deallocate_impl(DeviceBuffer& buf) noexcept;
   Result<std::size_t> sample_free_memory_impl() const;
+  // The agent counter this device's dispatches run against — named and rated
+  // from the device, though nothing hrx exposes can currently read a tick off
+  // it. Both answers are stated here rather than left to the seam's generic
+  // refusal so the missing piece is the one named at the call site.
+  Result<DeviceClock> device_clock_impl() const;
+  Result<DeviceTimestamp> sample_device_time_impl() const;
 
   Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
                        std::size_t dst_offset);
