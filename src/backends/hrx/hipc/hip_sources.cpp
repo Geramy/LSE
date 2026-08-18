@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 55> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 57> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -63,6 +63,25 @@ constexpr std::array<graph::PrimitiveSource, 55> kHipSources{{
      "((unsigned int)__builtin_bit_cast(unsigned short, (_Float16)($0)))"},
     {"value.f16",
      "((float)__builtin_bit_cast(_Float16, (unsigned short)($0)))"},
+
+    // Mixed-signedness dot product, i32 accumulator: four SIGNED bytes of $0
+    // against four UNSIGNED bytes of $1. `sudot4` is how clang spells
+    // v_dot4_i32_iu8; the leading true and the middle false are the two
+    // operand signednesses and the trailing false disables output clamping.
+    //
+    // The signed form (sdot4/sdot8) is NOT the same instruction family:
+    // v_dot8_i32_i4 is dot1-insts, gfx906 only, and asking for it on gfx11
+    // fails the build with "needs target feature dot1-insts". The sudot
+    // family is what RDNA has, and mixed signedness is what a group-affine
+    // contraction wants anyway.
+    {"dot4.i32.iu8",
+     "__builtin_amdgcn_sudot4(true, $0, false, $1, $2, false)"},
+
+    // Round to nearest, ties to even — one v_rndne_f32. `round` above is
+    // roundf and is several instructions, because a block codec has to match
+    // the host packer's std::round bit for bit. Quantizing an activation has
+    // no such counterpart to match, so it takes the cheap rounding.
+    {"rint", "rintf($0)"},
 
     // Matrix core. Spelling only — the widths, the K step and the lane
     // mappings are the descriptor's, in lse::math's table, and a kernel reads

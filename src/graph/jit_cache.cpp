@@ -134,7 +134,11 @@ void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key) {
 
   std::error_code ec;
   fs::create_directories(dir, ec);
-  write_text(dir / (name + ".hip"), emitted.source);
+  // Extension is the dialect's own name, so a dump directory holding both
+  // languages says which is which. kHip spells "hip", so the HIP path's files
+  // are named exactly as before.
+  write_text(dir / (name + "." + std::string(to_string(emitted.dialect))),
+             emitted.source);
 }
 
 std::string hip_dump_directory() {
@@ -193,10 +197,13 @@ struct JitCache::Impl {
     std::uint64_t source_hash = 0;
     std::string arch;
   };
-  // One map per member. A KernelHandle is an executable loaded on ONE device;
-  // handing member B the handle member A loaded is a wrong-device dispatch that
-  // no runtime here reports, and two same-arch devices would otherwise share
-  // the entry because the disk key is deliberately the same for them.
+  // One map per (member, dialect). A KernelHandle is an executable loaded on
+  // ONE device; handing member B the handle member A loaded is a wrong-device
+  // dispatch that no runtime here reports, and two same-arch devices would
+  // otherwise share the entry because the disk key is deliberately the same for
+  // them. Splitting by dialect as well is what makes try_get — the one lookup
+  // that answers without seeing source — unable to return the other language's
+  // object even if two dialects ever collided on a key.
   std::vector<std::unordered_map<std::uint64_t, Slot>> memory;
 };
 
@@ -204,11 +211,16 @@ JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
     : devices_(devices),
       cache_dir_(std::move(cache_dir)),
       impl_(std::make_unique<Impl>()) {
-  impl_->memory.resize(devices_.size());
-  compiler_id_.resize(devices_.size(), 0);
+  impl_->memory.resize(devices_.size() * kDialectCount);
+  compiler_id_.resize(devices_.size() * kDialectCount, 0);
   for (std::size_t i = 0; i < devices_.size(); ++i) {
-    const IKernelCompiler* cc = devices_.device(i).compiler();
-    compiler_id_[i] = cc != nullptr ? fnv(cc->identity()) : 0;
+    // Every dialect the member declares, not just its front one: an object
+    // built by the Loom compiler must not sit in a slot keyed by comgr's
+    // identity, and the two are told apart here or nowhere.
+    for (const KernelToolchain& tc : devices_.device(i).toolchains()) {
+      if (tc.compiler == nullptr) continue;
+      compiler_id_[toolchain_slot(i, tc.dialect)] = fnv(tc.compiler->identity());
+    }
   }
   purge_kernel_artifacts();
 }
@@ -220,29 +232,37 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
       named_compiler_(&compiler),
       cache_dir_(std::move(cache_dir)),
       impl_(std::make_unique<Impl>()) {
-  compiler_id_.push_back(fnv(compiler.identity()));
-  impl_->memory.resize(1);
+  // The caller named one compiler for every dialect it will ask for, so every
+  // slot carries that one identity and two dialects share a key. They still do
+  // not share an entry: the memory table is one map per dialect, and on disk an
+  // object is named by the hash of the source it was built from.
+  compiler_id_.assign(kDialectCount, fnv(compiler.identity()));
+  impl_->memory.resize(kDialectCount);
   purge_kernel_artifacts();
 }
 
 JitCache::~JitCache() = default;
 
-const IKernelCompiler* JitCache::compiler_for(
-    std::size_t member) const noexcept {
+const IKernelCompiler* JitCache::compiler_for(std::size_t member,
+                                              Dialect dialect) const noexcept {
   if (named_compiler_ != nullptr) return named_compiler_;
-  return devices_.device(member).compiler();
+  const KernelToolchain* tc = devices_.device(member).toolchain_for(dialect);
+  return tc != nullptr ? tc->compiler : nullptr;
 }
 
-std::uint64_t JitCache::slot_key(std::size_t member,
+std::uint64_t JitCache::slot_key(std::size_t member, Dialect dialect,
                                  std::uint64_t signature) const noexcept {
   // A cached object is only valid for the toolchain that built it, and
   // source_hash cannot tell two toolchains apart. The compiler reports its own
   // identity (version + option lists) rather than a human bumping a revision
   // constant here, which was one forgotten increment away from serving an
-  // object built by a different pipeline.
+  // object built by a different pipeline. Read at the (member, dialect) slot:
+  // one entry per member hashed the front dialect's compiler into every
+  // dialect's key, which is the same failure with the toolchains swapped.
   // Arch in the key so a device change cannot reuse another target's object.
   const backend::DeviceInfo& info = devices_.device(member).device_info();
-  std::uint64_t h = mix(mix(signature, compiler_id_[member]), fnv(info.arch));
+  std::uint64_t h = mix(mix(signature, compiler_id_[toolchain_slot(member, dialect)]),
+                        fnv(info.arch));
   // Arch is NOT enough between two devices of the same ISA. The emitter chooses
   // workgroup dimensions, an LDS budget and a persistent-grid decision from the
   // CU count, the LDS pool and the workgroup ceiling, so two gfx1151 parts with
@@ -263,10 +283,12 @@ std::uint64_t JitCache::slot_key(std::size_t member,
 }
 
 const backend::KernelHandle* JitCache::try_get(std::size_t member,
-                                               std::uint64_t signature) noexcept {
-  if (member >= impl_->memory.size()) return nullptr;
-  auto& slots = impl_->memory[member];
-  const auto it = slots.find(slot_key(member, signature));
+                                               std::uint64_t signature,
+                                               Dialect dialect) noexcept {
+  const std::size_t slot = toolchain_slot(member, dialect);
+  if (slot >= impl_->memory.size()) return nullptr;
+  auto& slots = impl_->memory[slot];
+  const auto it = slots.find(slot_key(member, dialect, signature));
   if (it == slots.end()) return nullptr;
   if (it->second.arch != devices_.device(member).device_info().arch) {
     return nullptr;
@@ -277,20 +299,25 @@ const backend::KernelHandle* JitCache::try_get(std::size_t member,
 
 Result<backend::KernelHandle> JitCache::get_or_compile(
     std::size_t member, std::uint64_t signature, const EmittedKernel& emitted) {
-  if (member >= impl_->memory.size()) {
+  const std::size_t table = toolchain_slot(member, emitted.dialect);
+  if (table >= impl_->memory.size()) {
     return LSE_ERROR(kOutOfRange, "device set has ",
-                     std::to_string(impl_->memory.size()),
+                     std::to_string(impl_->memory.size() / kDialectCount),
                      " members; there is no member ", std::to_string(member));
   }
   backend::IBackend& be = devices_.device(member);
-  const IKernelCompiler* compiler = compiler_for(member);
+  // The compiler declared beside the emitter that wrote this text, never the
+  // device's front one: the two halves of a dialect belong together, and a
+  // caller cannot hand the wrong pair here because the text names its language.
+  const IKernelCompiler* compiler = compiler_for(member, emitted.dialect);
   if (compiler == nullptr) {
     return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
-                     "' has no kernel compiler");
+                     "' has no ", std::string(to_string(emitted.dialect)),
+                     " kernel compiler");
   }
-  auto& slots = impl_->memory[member];
+  auto& slots = impl_->memory[table];
   const std::string arch(be.device_info().arch);
-  const std::uint64_t key = slot_key(member, signature);
+  const std::uint64_t key = slot_key(member, emitted.dialect, signature);
   const std::uint64_t src_hash =
       emitted.source.empty() ? 0 : fnv(emitted.source);
 

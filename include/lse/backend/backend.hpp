@@ -680,6 +680,18 @@ class Backend {
     return tcs.empty() ? nullptr : tcs.front().compiler;
   }
 
+  // nullptr when this device does not declare `dialect`. The same two
+  // questions IBackend answers, restated here because the CRTP surface is
+  // reached without going through the vtable.
+  [[nodiscard]] const graph::KernelToolchain* toolchain_for(
+      graph::Dialect dialect) const noexcept {
+    return graph::find_toolchain(toolchains(), dialect);
+  }
+  [[nodiscard]] const graph::KernelToolchain* toolchain(
+      graph::DialectPreference want) const noexcept {
+    return graph::resolve_toolchain(toolchains(), want);
+  }
+
   // Written once against the primitives above — the reason this is a base
   // class rather than a bare concept.
   Result<DeviceBuffer> upload(const void* src, std::size_t bytes) {
@@ -805,10 +817,16 @@ class IBackend {
   // specific dialect asks here and handles absence; it never assumes.
   [[nodiscard]] const graph::KernelToolchain* toolchain_for(
       graph::Dialect dialect) const noexcept {
-    for (const graph::KernelToolchain& tc : toolchains()) {
-      if (tc.dialect == dialect) return &tc;
-    }
-    return nullptr;
+    return graph::find_toolchain(toolchains(), dialect);
+  }
+
+  // A run's dialect preference resolved against this device: the named dialect
+  // when this device declares it, and otherwise the device's first choice. The
+  // degrade is the point — a preference is a runtime value naming a resource,
+  // and a member that lacks it still has to run.
+  [[nodiscard]] const graph::KernelToolchain* toolchain(
+      graph::DialectPreference want) const noexcept {
+    return graph::resolve_toolchain(toolchains(), want);
   }
 
   // Device address of `buf`, including its offset. Used to build a pointer

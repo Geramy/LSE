@@ -61,6 +61,12 @@ struct EmittedKernel {
   // Kernel takes `const float* const* buf` and binding_order[i] is buf[i].
   bool pointer_table = false;
   // Dependent stages run as a resident grid; last binding is the grid barrier.
+  //
+  // A LANDMINE for a second dialect: a resident grid is a grid-wide barrier,
+  // and Loom refuses grid-wide sync by design — the persistent-grid path can
+  // never be Loom, whatever else it gains. Harmless as it stands because
+  // nothing sets this true, so a Loom kernel never reaches the barrier
+  // binding; a dialect that sets it must first say how it synchronizes.
   bool persist_grid = false;
 };
 

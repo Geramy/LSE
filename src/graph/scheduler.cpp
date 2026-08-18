@@ -85,15 +85,17 @@ struct Scheduler::Impl {
   std::vector<std::uint8_t> outstanding;
   std::vector<backend::StreamEvent> entry_events;
 
-  Status ensure_jit(backend::IDeviceSet& devices, std::size_t member) {
+  Status ensure_jit(backend::IDeviceSet& devices, std::size_t member,
+                    const KernelToolchain& tc) {
     if (jit != nullptr) return OkStatus();
     // Asked of the member about to be dispatched to, because a set may hold a
     // device with codegen beside one without: the refusal has to name the
     // device that declined, not the set.
     const backend::IBackend& be = devices.device(member);
-    if (be.compiler() == nullptr) {
+    if (tc.compiler == nullptr) {
       return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
-                       "' has no kernel compiler");
+                       "' has no ", std::string(to_string(tc.dialect)),
+                       " kernel compiler");
     }
     jit = std::make_unique<JitCache>(devices);
     return OkStatus();
@@ -103,7 +105,8 @@ struct Scheduler::Impl {
 Scheduler::Scheduler(backend::IDeviceSet& devices)
     : devices_(devices), impl_(std::make_unique<Impl>()) {
   // Without codegen there is no code-object path, so device-first is
-  // meaningless.
+  // meaningless. Asked of the front entry: a preference is set after
+  // construction and cannot add codegen to a device that has none.
   if (backend().emitter() == nullptr) mode_ = Mode::kHostOnly;
 }
 
@@ -176,12 +179,17 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
                                      std::size_t member) {
   backend::IBackend& be = devices_.device(member);
-  const IKernelEmitter* emitter = be.emitter();
+  // The dialect this run asked for if this member declares it, and this
+  // member's own first choice otherwise. Both halves come from the one
+  // toolchain, so the compiler the cache reaches for below is the one declared
+  // beside the emitter that wrote the text.
+  const KernelToolchain* tc = be.toolchain(dialect_);
+  const IKernelEmitter* emitter = tc != nullptr ? tc->emitter : nullptr;
   if (emitter == nullptr) {
     return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
                      "' has no kernel emitter");
   }
-  LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member));
+  LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member, *tc));
 
   const std::uint64_t ident =
       emitter->cache_key(group, be.device_info());
@@ -205,7 +213,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   backend::KernelHandle launched;
   Status jit_status = OkStatus();
   if (const backend::KernelHandle* cached =
-          impl_->jit->try_get(member, ident)) {
+          impl_->jit->try_get(member, ident, emitted->dialect)) {
     launched = *cached;
   } else {
     auto kernel = impl_->jit->get_or_compile(member, ident, *emitted);
@@ -545,7 +553,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // Asked once. Four sites below need it and it is a virtual call on a
   // device-first step, and a compiler that cannot see through the repeat cannot
   // see that the null check already happened either.
-  const IKernelEmitter* const emitter = backend().emitter();
+  const KernelToolchain* const primary_tc = toolchain(devices_.primary());
+  const IKernelEmitter* const emitter =
+      primary_tc != nullptr ? primary_tc->emitter : nullptr;
   const bool device_first = mode_ == Mode::kDeviceFirst && emitter != nullptr;
   // Opened here rather than in eval() so that the trace reset and the step
   // bookkeeping around it land in the remainder instead of in a span.

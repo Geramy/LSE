@@ -12,6 +12,7 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "harness.hpp"
@@ -31,6 +32,8 @@
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/graph/graph.hpp"
+#include "lse/graph/interpreter.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/primitive.hpp"
@@ -60,6 +63,11 @@ const backend::AmdDeviceInfo& gfx1151_amd() {
     backend::AmdDeviceInfo a;
     a.matrix_core = backend::MatrixCore::kWMMA;
     a.has_bf16_arith = true;
+    // What the kRdna35 ISA row says, which is what apply_arch_defaults hands
+    // a live gfx1151. Stated here because this object is the extension the
+    // fixture publishes and nothing fills it in on the way.
+    a.has_dot4_i8 = true;
+    a.has_dot4_iu8 = true;
     a.max_load_bytes = 16;
     a.max_store_bytes = 16;
     return a;
@@ -235,30 +243,110 @@ LSE_TEST(emitter_produces_a_complete_translation_unit) {
 // N, the lane count and the group count are all distinct from K, so the K
 // stride can only have come from indexing the activation by its row.
 LSE_TEST(quant_linear_indexes_the_activation_by_its_row) {
-  constexpr int kBits = 8;
   constexpr std::int64_t kGroup = 64;
   constexpr std::int64_t kN = 16;
   const std::int64_t lds_floats = gfx1151().lds_bytes_per_workgroup / 4;
 
-  for (const std::int64_t k :
-       {std::int64_t{640}, (lds_floats / kGroup + 1) * kGroup}) {
-    const std::int64_t lanes = k * kBits / 32;
-    const std::int64_t groups = k / kGroup;
-    Array x = Array::zeros(Shape{5, k}, DType::kF32);
+  // Both widths: 4 bits reads the row to quantize it and 8 bits reads it to
+  // multiply it, and the row term has to survive either way.
+  for (const int bits : {4, 8}) {
+    for (const std::int64_t k :
+         {std::int64_t{640}, (lds_floats / kGroup + 1) * kGroup}) {
+      const std::int64_t lanes = k * bits / 32;
+      const std::int64_t groups = k / kGroup;
+      Array x = Array::zeros(Shape{5, k}, DType::kF32);
+      Array packed = Array::zeros(Shape{kN, lanes}, DType::kU32);
+      Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
+      Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
+
+      Array y = quant_linear(x, packed, scales, biases, bits, kGroup);
+      auto e = emit_anchor(y, OpKind::kQuantMatMul);
+      LSE_EXPECT(e.ok());
+      if (!e.ok()) {
+        std::printf("       bits=%d K=%lld: %s\n", bits,
+                    static_cast<long long>(k), e.status().to_string().c_str());
+        continue;
+      }
+      const std::string stride = "* " + std::to_string(k) + "u";
+      LSE_EXPECT(e->source.find(stride) != std::string::npos);
+    }
+  }
+}
+
+// A 4-bit contraction on a device whose arch database reports the mixed-
+// signedness dot product must emit it. This is the path's only static proof
+// that it is reachable: the numerics tests pass whichever inner loop ran, and
+// a capability check that quietly never fires would leave the integer path as
+// code that cannot execute.
+LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
+  constexpr std::int64_t kGroup = 64;
+  constexpr std::int64_t kN = 16;
+  constexpr std::int64_t kK = 1024;
+  constexpr std::string_view kDot = "__builtin_amdgcn_sudot4";
+
+  const auto emit_at = [&](int bits) -> std::string {
+    const std::int64_t lanes = kK * bits / 32;
+    const std::int64_t groups = kK / kGroup;
+    Array x = Array::zeros(Shape{2, kK}, DType::kF32);
     Array packed = Array::zeros(Shape{kN, lanes}, DType::kU32);
     Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
     Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
-
-    Array y = quant_linear(x, packed, scales, biases, kBits, kGroup);
+    Array y = quant_linear(x, packed, scales, biases, bits, kGroup);
     auto e = emit_anchor(y, OpKind::kQuantMatMul);
-    LSE_EXPECT(e.ok());
-    if (!e.ok()) {
-      std::printf("       K=%lld: %s\n", static_cast<long long>(k),
-                  e.status().to_string().c_str());
-      continue;
+    return e.ok() ? e->source : std::string{};
+  };
+
+  const auto count = [](const std::string& src, std::string_view what) {
+    std::size_t n = 0, at = 0;
+    while ((at = src.find(what, at)) != std::string::npos) {
+      ++n;
+      at += what.size();
     }
-    const std::string stride = "* " + std::to_string(k) + "u";
-    LSE_EXPECT(e->source.find(stride) != std::string::npos);
+    return n;
+  };
+
+  const std::string four = emit_at(4);
+  LSE_EXPECT(!four.empty());
+  LSE_EXPECT(four.find(kDot) != std::string::npos);
+
+  // 8 bits stays on the float codec — its packed word is already four unsigned
+  // bytes, so the win there is a different change and is not made here.
+  const std::string eight = emit_at(8);
+  LSE_EXPECT(!eight.empty());
+  LSE_EXPECT(eight.find(kDot) == std::string::npos);
+
+  // The structural claim, not just the presence of a builtin: the float codec
+  // spends two fmaf per weight — one to place the code, one to accumulate it —
+  // and the integer path spends none. A lane decodes 16 codes per step at 8
+  // bits, so that side is 32 of them; the integer side keeps only the group
+  // scale and the group bias.
+  LSE_EXPECT(count(eight, "fmaf(") >= 32);
+  LSE_EXPECT(count(four, "fmaf(") < 8);
+
+  // And a device without the capability takes the float codec at 4 bits too.
+  // A fresh emitter, because the emit cache keys on the group and the wave
+  // width and would otherwise hand back the source emitted just above.
+  const backend::HipEmitter fresh;
+  backend::AmdDeviceInfo no_dot = gfx1151_amd();
+  no_dot.has_dot4_iu8 = false;
+  backend::DeviceInfo plain = gfx1151();
+  plain.extension = &no_dot;
+  const std::int64_t lanes = kK * 4 / 32;
+  const std::int64_t groups = kK / kGroup;
+  Array x = Array::zeros(Shape{2, kK}, DType::kF32);
+  Array packed = Array::zeros(Shape{kN, lanes}, DType::kU32);
+  Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
+  Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
+  Array y = quant_linear(x, packed, scales, biases, 4, kGroup);
+  const NodePtr roots[] = {y.node()};
+  for (const FusionGroup& g : Partitioner::partition(roots)) {
+    if (g.anchor != OpKind::kQuantMatMul) continue;
+    auto e = fresh.emit(g, plain);
+    LSE_EXPECT(e.ok());
+    if (e.ok()) {
+      LSE_EXPECT(e->source.find(kDot) == std::string::npos);
+      LSE_EXPECT(count(e->source, "fmaf(") > 32);
+    }
   }
 }
 
@@ -1416,6 +1504,103 @@ struct TwoDialectBackend final : backend::IBackend {
   }
 };
 
+// A compiler whose object is a function of its source, and a device that loads
+// the first byte of an object as the executable id. Together they let a test
+// say WHICH source's object a handle came from, which is the only way to ask
+// whether the cache served the right dialect's bytes.
+struct EchoCompiler final : IKernelCompiler {
+  std::string id;
+  explicit EchoCompiler(std::string s) : id(std::move(s)) {}
+  Result<std::vector<std::byte>> compile(std::string_view src,
+                                         std::string_view) const override {
+    return std::vector<std::byte>{
+        static_cast<std::byte>(src.empty() ? 0 : src.front())};
+  }
+  bool available() const override { return true; }
+  std::string identity() const override { return id; }
+};
+
+struct EchoBackend final : backend::IBackend {
+  backend::DeviceInfo info;
+  std::array<KernelToolchain, 2> tcs{};
+
+  EchoBackend(const IKernelCompiler& hip, const IKernelCompiler& loom) {
+    info.arch = "gfx1151";
+    info.name = "echo";
+    tcs[0] = KernelToolchain{Dialect::kHip, nullptr, &hip};
+    tcs[1] = KernelToolchain{Dialect::kLoom, nullptr, &loom};
+  }
+  Status init(int) override { return OkStatus(); }
+  void shutdown() noexcept override {}
+  const backend::DeviceInfo& device_info() const noexcept override {
+    return info;
+  }
+  Result<backend::DeviceBuffer> allocate(std::size_t,
+                                         backend::MemoryClass) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  void deallocate(backend::DeviceBuffer&) noexcept override {}
+  Status copy_h2d(const void*, backend::DeviceBuffer&, std::size_t,
+                  std::size_t) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status copy_d2h(const backend::DeviceBuffer&, void*, std::size_t,
+                  std::size_t) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Result<backend::KernelHandle> load_executable(
+      std::string_view name, std::span<const std::byte> code) override {
+    backend::KernelHandle h;
+    h.executable = code.empty()
+                       ? 0
+                       : static_cast<std::uint64_t>(std::to_integer<unsigned char>(code.front()));
+    h.name = std::string(name);
+    return h;
+  }
+  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
+                const backend::DispatchArgs&,
+                const backend::DispatchTarget&) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status synchronize() override { return OkStatus(); }
+  std::string_view name() const noexcept override { return "echo"; }
+  std::span<const KernelToolchain> toolchains() const noexcept override {
+    return tcs;
+  }
+};
+
+// The same signature, emitted twice in two languages. What a cache must never
+// do is answer one of these with the other's object.
+struct DialectPair {
+  EmittedKernel hip;
+  EmittedKernel loom;
+  std::uint64_t signature = 0x5eed;
+
+  DialectPair() {
+    hip.dialect = Dialect::kHip;
+    hip.source = "Hhip source";
+    hip.entry_name = "k";
+    loom.dialect = Dialect::kLoom;
+    loom.source = "Lloom source";
+    loom.entry_name = "k";
+  }
+};
+
+std::size_t count_suffix(const std::filesystem::path& dir,
+                         std::string_view suffix) {
+  std::size_t n = 0;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end;
+       ++it) {
+    const std::string name = it->path().filename().string();
+    if (name.size() >= suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      ++n;
+    }
+  }
+  return n;
+}
+
 }  // namespace
 
 LSE_TEST(a_device_declares_its_dialects_and_the_default_is_the_first) {
@@ -1483,6 +1668,148 @@ LSE_TEST(the_hrx_device_declares_two_dialects_with_hip_in_front) {
   LSE_EXPECT(hrx.toolchain_for(Dialect::kCuda) == nullptr);
 }
 
+// The whole of the negotiation, exercised: no opinion takes the front entry, a
+// named dialect that is declared is handed over, and one that is not declared
+// degrades to the front entry rather than failing the run.
+LSE_TEST(a_dialect_preference_resolves_or_degrades_to_the_front_entry) {
+  TwoDialectBackend be;
+  LSE_EXPECT(be.toolchain(std::nullopt) == &be.toolchains().front());
+  LSE_EXPECT(be.toolchain(Dialect::kHip) == &be.toolchains().front());
+
+  const KernelToolchain* loom = be.toolchain(Dialect::kLoom);
+  LSE_EXPECT(loom != nullptr && loom->dialect == Dialect::kLoom);
+  LSE_EXPECT(loom == &be.toolchains()[1]);
+
+  // Undeclared. A preference names a resource; a member that lacks it still
+  // has to run, so this is the front entry and not an error.
+  LSE_EXPECT(be.toolchain(Dialect::kSpirv) == &be.toolchains().front());
+  LSE_EXPECT(be.toolchain(Dialect::kMetal) == &be.toolchains().front());
+
+  // A device with no codegen has no front entry to degrade to either.
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT(cpu.toolchain(std::nullopt) == nullptr);
+  LSE_EXPECT(cpu.toolchain(Dialect::kHip) == nullptr);
+}
+
+// A run names a dialect on the scheduler, and what the scheduler hands the
+// member is that dialect's BOTH halves.
+LSE_TEST(a_run_that_names_a_dialect_is_given_that_dialects_emitter) {
+  backend::BackendAdapter<backend::HrxBackend> hrx;
+  Scheduler sched(hrx);
+  LSE_EXPECT(!sched.dialect().has_value());
+  const KernelToolchain* front = sched.toolchain(0);
+  LSE_EXPECT(front != nullptr);
+  if (front == nullptr) return;
+  LSE_EXPECT(front->dialect == Dialect::kHip);
+
+  sched.set_dialect(Dialect::kLoom);
+  const KernelToolchain* chosen = sched.toolchain(0);
+  LSE_EXPECT(chosen != nullptr);
+  if (chosen == nullptr) return;
+  LSE_EXPECT(chosen->dialect == Dialect::kLoom);
+  LSE_EXPECT(chosen->emitter != nullptr &&
+             chosen->emitter->dialect() == Dialect::kLoom);
+  LSE_EXPECT(chosen->compiler != nullptr);
+  LSE_EXPECT(chosen->emitter != hrx.emitter());
+  LSE_EXPECT(chosen->compiler != hrx.compiler());
+
+  sched.set_dialect(Dialect::kSpirv);
+  const KernelToolchain* degraded = sched.toolchain(0);
+  LSE_EXPECT(degraded != nullptr && degraded->dialect == Dialect::kHip);
+  sched.clear_dialect();
+  const KernelToolchain* none = sched.toolchain(0);
+  LSE_EXPECT(none != nullptr && none->dialect == Dialect::kHip);
+}
+
+// Two dialects, one member, one signature. The cache must build both and hand
+// each caller back the object built from ITS OWN text.
+LSE_TEST(the_cache_never_serves_one_dialects_object_for_the_other) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+                       ("lse-jit-dialect-" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  EchoCompiler hip_cc("comgr-like");
+  EchoCompiler loom_cc("loomc-like");
+  EchoBackend be(hip_cc, loom_cc);
+  StubSet set;
+  set.members.push_back(&be);
+  DialectPair k;
+
+  JitCache cache(set, dir.string());
+  auto a = cache.get_or_compile(0, k.signature, k.hip);
+  auto b = cache.get_or_compile(0, k.signature, k.loom);
+  LSE_EXPECT_OK(a.status());
+  LSE_EXPECT_OK(b.status());
+  // Two compiles, not one and a hit: the second ask was for a different
+  // language and there was nothing to serve it.
+  LSE_EXPECT_EQ(cache.stats().compiles, 2u);
+  LSE_EXPECT_EQ(cache.stats().memory_hits, 0u);
+
+  const backend::KernelHandle* hip = cache.try_get(0, k.signature, Dialect::kHip);
+  const backend::KernelHandle* loom =
+      cache.try_get(0, k.signature, Dialect::kLoom);
+  LSE_EXPECT(hip != nullptr && loom != nullptr);
+  if (hip == nullptr || loom == nullptr) return;
+  // The echo compiler puts the source's first byte in the object and the echo
+  // device loads that byte as the executable id, so this says which text each
+  // handle was actually built from.
+  LSE_EXPECT_EQ(hip->executable, static_cast<std::uint64_t>('H'));
+  LSE_EXPECT_EQ(loom->executable, static_cast<std::uint64_t>('L'));
+
+  // Two toolchain identities are two disk slots, so neither overwrites the
+  // other's metadata and a later process finds both.
+  LSE_EXPECT_EQ(count_suffix(dir, ".meta"), 2u);
+  LSE_EXPECT_EQ(count_suffix(dir, ".co"), 2u);
+
+  // A second process finds both on disk, still not mixed up.
+  {
+    JitCache warm(set, dir.string());
+    auto wa = warm.get_or_compile(0, k.signature, k.hip);
+    auto wb = warm.get_or_compile(0, k.signature, k.loom);
+    LSE_EXPECT_OK(wa.status());
+    LSE_EXPECT_OK(wb.status());
+    LSE_EXPECT_EQ(warm.stats().compiles, 0u);
+    LSE_EXPECT_EQ(warm.stats().disk_hits, 2u);
+    LSE_EXPECT_EQ(wa->executable, static_cast<std::uint64_t>('H'));
+    LSE_EXPECT_EQ(wb->executable, static_cast<std::uint64_t>('L'));
+  }
+  fs::remove_all(dir);
+}
+
+// The case the compiler identity cannot separate: one compiler declared for
+// both dialects, so the two share a cache key. They must still not share an
+// entry — the memory table is one map per dialect, which is what stops try_get
+// from answering a Loom ask with the HIP object it happens to have.
+LSE_TEST(two_dialects_sharing_a_compiler_still_do_not_share_a_slot) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+                       ("lse-jit-shared-" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  EchoCompiler shared("one-compiler-for-both");
+  EchoBackend be(shared, shared);
+  StubSet set;
+  set.members.push_back(&be);
+  DialectPair k;
+
+  JitCache cache(set, dir.string());
+  LSE_EXPECT_OK(cache.get_or_compile(0, k.signature, k.hip).status());
+  LSE_EXPECT_OK(cache.get_or_compile(0, k.signature, k.loom).status());
+  LSE_EXPECT_EQ(cache.stats().compiles, 2u);
+
+  const backend::KernelHandle* hip = cache.try_get(0, k.signature, Dialect::kHip);
+  const backend::KernelHandle* loom =
+      cache.try_get(0, k.signature, Dialect::kLoom);
+  LSE_EXPECT(hip != nullptr && loom != nullptr);
+  if (hip == nullptr || loom == nullptr) return;
+  LSE_EXPECT_EQ(hip->executable, static_cast<std::uint64_t>('H'));
+  LSE_EXPECT_EQ(loom->executable, static_cast<std::uint64_t>('L'));
+  fs::remove_all(dir);
+}
+
 LSE_TEST(jit_compiles_only_on_miss_source_change_or_device_change) {
   namespace fs = std::filesystem;
   const fs::path dir =
@@ -1505,7 +1832,7 @@ LSE_TEST(jit_compiles_only_on_miss_source_change_or_device_change) {
     LSE_EXPECT(b.ok());
     LSE_EXPECT_EQ(cc.n, 1);
     LSE_EXPECT(cache.stats().memory_hits >= 1u);
-    LSE_EXPECT(cache.try_get(0, sig) != nullptr);
+    LSE_EXPECT(cache.try_get(0, sig, Dialect::kHip) != nullptr);
   }
   {
     JitCache cache(be, cc, dir.string());
@@ -1571,14 +1898,14 @@ LSE_TEST(one_cache_serves_two_devices_without_mixing_their_executables) {
 
   // A live handle belongs to the device it was loaded on. Serving member 1 the
   // handle member 0 loaded is a wrong-device dispatch no runtime reports.
-  const backend::KernelHandle* on_a = cache.try_get(0, sig);
-  const backend::KernelHandle* on_b = cache.try_get(1, sig);
+  const backend::KernelHandle* on_a = cache.try_get(0, sig, Dialect::kHip);
+  const backend::KernelHandle* on_b = cache.try_get(1, sig, Dialect::kHip);
   LSE_EXPECT(on_a != nullptr && on_b != nullptr);
   if (on_a != nullptr && on_b != nullptr) {
     LSE_EXPECT_EQ(on_a->executable, std::uint64_t{0xAA});
     LSE_EXPECT_EQ(on_b->executable, std::uint64_t{0xBB});
   }
-  LSE_EXPECT(cache.try_get(2, sig) == nullptr);
+  LSE_EXPECT(cache.try_get(2, sig, Dialect::kHip) == nullptr);
   LSE_EXPECT(!cache.get_or_compile(2, sig, ek).ok());
 
   std::error_code ec;
@@ -1658,6 +1985,410 @@ LSE_TEST(debug_writes_generated_hip_for_review) {
   fs::remove_all(cache, ec);
 }
 
+// ---------------------------------------------------------------------------
+// HIP against Loom, on the same graph and the same bytes.
+//
+// The dialect pair is the only variable: identical nodes, identical inputs,
+// identical device. A group Loom declines falls to the host, so a case reports
+// how much of it reached the device in each dialect; a case that reached the
+// device in both and disagrees is a Loom codegen bug, and there is no other
+// explanation available to it.
+namespace dialect_diff {
+
+// The shape decides how much is written: a case that hands a longer pool of
+// noise than its shape holds must fill the array, not walk off it.
+Array host_array(const std::vector<float>& values, Shape shape) {
+  Array a = Array::zeros(shape, DType::kF32);
+  (void)a.eval();
+  const std::size_t n = std::min(values.size(), a.shape().elem_count());
+  for (std::size_t i = 0; i < n; ++i) {
+    interpreter::store_element(*a.node(), i, values[i]);
+  }
+  return a;
+}
+
+std::vector<float> drain(Array& a) {
+  (void)a.eval();
+  std::vector<float> out(a.shape().elem_count());
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    out[i] = interpreter::load_element(*a.node(), i);
+  }
+  return out;
+}
+
+// A deterministic spread in [-1, 1); the same generator test_graph uses, so a
+// failure here and a failure there are on the same numbers.
+float spread(std::uint64_t i) {
+  std::uint64_t x = i * 0x9E3779B97F4A7C15ull + 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 30;
+  x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 27;
+  return static_cast<float>(static_cast<double>(x >> 40) / 8388608.0) - 1.0f;
+}
+
+std::vector<float> noise(std::size_t n, std::uint64_t seed) {
+  std::vector<float> v(n);
+  for (std::size_t i = 0; i < n; ++i) v[i] = spread(i + seed);
+  return v;
+}
+
+struct Side {
+  std::vector<float> out;
+  std::uint32_t device_groups = 0;
+  std::uint32_t host_groups = 0;
+};
+
+// One evaluation under one dialect, with the trace of what it did.
+template <class Build>
+Side run_under(Scheduler* sc, std::optional<Dialect> d, Build&& build) {
+  const auto prev_mode = sc->mode();
+  const DialectPreference prev = sc->dialect();
+  sc->set_mode(Scheduler::Mode::kDeviceFirst);
+  if (d.has_value()) {
+    sc->set_dialect(*d);
+  } else {
+    sc->clear_dialect();
+  }
+  Array y = build();
+  Side s;
+  s.out = drain(y);
+  s.device_groups = sc->last_trace().device_groups;
+  s.host_groups = sc->last_trace().host_groups;
+  sc->set_mode(prev_mode);
+  if (prev.has_value()) {
+    sc->set_dialect(*prev);
+  } else {
+    sc->clear_dialect();
+  }
+  return s;
+}
+
+// The worst disagreement, relative to the magnitude of the HIP answer. An
+// absolute difference on a K=1024 dot product says more about f32 than about
+// the kernel.
+double worst_rel(const std::vector<float>& a, const std::vector<float>& b) {
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+    const double scale = std::max(1e-3, std::fabs(static_cast<double>(a[i])));
+    worst = std::max(worst, std::fabs(static_cast<double>(a[i] - b[i])) / scale);
+  }
+  return worst;
+}
+
+// Every case is (name, builder). The builder is called once per dialect, and
+// the report says how much of it each one put on the device: a case Loom
+// declined runs its group on the host interpreter, so it is still compared —
+// against a looser bound, because the host arm is a different summation order
+// and not the same instruction stream.
+struct Tally {
+  int emitted = 0;
+  int declined = 0;
+};
+Tally& tally() {
+  static Tally t;
+  return t;
+}
+
+template <class Build>
+void compare(const char* name, Build&& build, double tol = 1e-5) {
+  Scheduler* sc = default_scheduler();
+  if (sc == nullptr || sc->backend().emitter() == nullptr) return;
+  const Side hip = run_under(sc, Dialect::kHip, build);
+  const Side loom = run_under(sc, Dialect::kLoom, build);
+  LSE_EXPECT_EQ(hip.out.size(), loom.out.size());
+  if (hip.out.size() != loom.out.size()) return;
+
+  const bool declined = loom.host_groups != 0;
+  if (declined) {
+    ++tally().declined;
+    tol = std::max(tol, 1e-4);
+  } else {
+    ++tally().emitted;
+  }
+  const double rel = worst_rel(hip.out, loom.out);
+  std::printf("       %-22s hip dev=%u | loom dev=%u host=%u %-8s worst rel "
+              "%.3e\n",
+              name, hip.device_groups, loom.device_groups, loom.host_groups,
+              declined ? "DECLINE" : "emit", rel);
+  LSE_EXPECT(rel <= tol);
+  if (rel > tol) {
+    std::size_t at = 0;
+    double worst = 0.0;
+    for (std::size_t i = 0; i < hip.out.size(); ++i) {
+      const double d = std::fabs(static_cast<double>(hip.out[i] - loom.out[i]));
+      if (d > worst) { worst = d; at = i; }
+    }
+    std::printf("         !! %s disagrees worst at [%zu]: hip=%.9g loom=%.9g\n",
+                name, at, static_cast<double>(hip.out[at]),
+                static_cast<double>(loom.out[at]));
+    for (std::size_t i = 0; i < std::min<std::size_t>(8, hip.out.size()); ++i) {
+      std::printf("            [%zu] hip=%.9g loom=%.9g\n", i,
+                  static_cast<double>(hip.out[i]),
+                  static_cast<double>(loom.out[i]));
+    }
+  }
+}
+
+}  // namespace dialect_diff
+
+LSE_TEST(loom_matches_hip_on_the_elementwise_vocabulary) {
+  using namespace dialect_diff;
+  const std::vector<float> a = noise(256, 11);
+  const std::vector<float> b = noise(256, 977);
+  compare("mul+add+silu", [&] {
+    Array x = host_array(a, Shape{256});
+    Array y = host_array(b, Shape{256});
+    return silu(x * y + x);
+  });
+  compare("sigmoid+exp+neg", [&] {
+    Array x = host_array(a, Shape{256});
+    return sigmoid(exp(neg(x)));
+  });
+  compare("softplus+clamp", [&] {
+    Array x = host_array(a, Shape{256});
+    return clamp(softplus(x), -2.0f, 2.0f);
+  });
+  compare("softmax", [&] {
+    Array x = host_array(a, Shape{8, 32});
+    return softmax(x, -1);
+  });
+  compare("l2_normalize", [&] {
+    Array x = host_array(a, Shape{8, 32});
+    return l2_normalize(x);
+  });
+}
+
+LSE_TEST(loom_matches_hip_on_the_shape_kernels) {
+  using namespace dialect_diff;
+  const std::vector<float> a = noise(512, 4241);
+  compare("transpose", [&] {
+    Array x = host_array(a, Shape{16, 32});
+    return transpose(x, {1, 0});
+  });
+  compare("slice", [&] {
+    Array x = host_array(a, Shape{16, 32});
+    return slice(x, 1, 4, 20);
+  });
+  compare("embedding", [&] {
+    Array t = host_array(a, Shape{16, 32});
+    Array ids = host_array({3, 0, 9, 15}, Shape{4});
+    return embedding(t, ids);
+  });
+  // The router's own shape: 8 experts, 2 active, which is what lemonseed and
+  // the Qwen MoE checkpoints both route with.
+  compare("topk 8->2", [&] {
+    Array x = host_array(a, Shape{4, 8});
+    Array idx;
+    return topk(x, 2, -1, &idx);
+  });
+}
+
+LSE_TEST(loom_matches_hip_on_the_linear_kernels) {
+  using namespace dialect_diff;
+  // The three shapes that pick the three gemv bodies a decode step uses: a
+  // narrow K that stays in one wave, the LDS-panel tile, and a K wide enough
+  // to run the packed loop.
+  for (const auto& [n, k] : std::initializer_list<std::pair<int, int>>{
+           {8, 64}, {64, 512}, {32, 1024}}) {
+    const std::vector<float> xs = noise(static_cast<std::size_t>(k), 7);
+    const std::vector<float> ws =
+        noise(static_cast<std::size_t>(n) * static_cast<std::size_t>(k), 33);
+    char label[64];
+    std::snprintf(label, sizeof(label), "linear %dx%d", n, k);
+    compare(label, [&] {
+      Array x = host_array(xs, Shape{1, k});
+      Array w = host_array(ws, Shape{n, k});
+      return linear(x, w);
+    }, 2e-4);
+  }
+  // The checkpoint's own storage. lemonseed's weights are bf16 and the gemv
+  // reads them in that format, so an f32-only differential would never touch
+  // the widening path the real model runs.
+  for (const DType dt : {DType::kBF16, DType::kF16}) {
+    const std::vector<float> xw = noise(512, 7);
+    const std::vector<float> ww = noise(64 * 512, 33);
+    char label[64];
+    std::snprintf(label, sizeof(label), "linear 64x512 %s",
+                  dt == DType::kBF16 ? "bf16" : "f16");
+    compare(label, [&] {
+      Array x = host_array(xw, Shape{1, 512});
+      Array w = cast(host_array(ww, Shape{64, 512}), dt);
+      return linear(x, w);
+    }, 2e-2);
+  }
+  const std::vector<float> xs = noise(512, 91);
+  const std::vector<float> ws = noise(4 * 32 * 512, 137);
+  compare("linear_indexed", [&] {
+    Array x = host_array(xs, Shape{1, 512});
+    Array w = host_array(ws, Shape{4, 32, 512});
+    Array idx = host_array({2, 0}, Shape{1, 2});
+    return linear_indexed(x, w, idx, 0);
+  }, 2e-4);
+}
+
+LSE_TEST(loom_matches_hip_on_a_gemv_with_an_epilogue) {
+  using namespace dialect_diff;
+  const std::vector<float> xs = noise(512, 7);
+  const std::vector<float> ws = noise(64 * 512, 33);
+  const std::vector<float> gs = noise(64, 51);
+  compare("linear*vec", [&] {
+    Array x = host_array(xs, Shape{1, 512});
+    Array w = host_array(ws, Shape{64, 512});
+    Array g = host_array(gs, Shape{64});
+    return linear(x, w) * g;
+  }, 2e-4);
+  // The shape the gated paths actually multiply by: a trailing axis of 1
+  // stretched over the row, which is a strided reindex of the operand rather
+  // than a whole-array or a same-shape read.
+  compare("mul by [1,4,1]", [&] {
+    Array x = host_array(noise(4096, 13), Shape{1, 4, 1024});
+    Array g = host_array(noise(4, 991), Shape{1, 4, 1});
+    return x * g;
+  });
+  compare("mul by [1,1,1]", [&] {
+    Array x = host_array(noise(1024, 13), Shape{1, 1, 1024});
+    Array g = host_array(noise(1, 991), Shape{1, 1, 1});
+    return x * g;
+  });
+  compare("linear*scalar", [&] {
+    Array x = host_array(xs, Shape{1, 512});
+    Array w = host_array(ws, Shape{64, 512});
+    Array g = host_array({0.37f}, Shape{1});
+    return linear(x, w) * g;
+  }, 2e-4);
+  // The six fused shapes lemonseed's decode step actually builds, weights in
+  // the checkpoint's own bf16. These are the groups the model runs; the
+  // isolated ones above are not the same code.
+  {
+    const std::vector<float> hid = noise(1024, 401);
+    const std::vector<float> big = noise(2176 * 1024, 403);
+    const std::vector<float> gate = noise(2176, 407);
+    compare("gemv2176*vec bf16", [&] {
+      Array x = host_array(hid, Shape{1, 1, 1024});
+      Array w = cast(host_array(big, Shape{2176, 1024}), DType::kBF16);
+      Array g = host_array(gate, Shape{1, 1, 2176});
+      return linear(x, w) * g;
+    }, 2e-2);
+    compare("sigmoid*x", [&] {
+      Array x = host_array(hid, Shape{1, 1, 1024});
+      Array y = host_array(noise(1024, 409), Shape{1, 1, 1024});
+      return sigmoid(x) * y;
+    });
+    compare("mul[1,1,1]+add", [&] {
+      Array x = host_array(hid, Shape{1, 1, 1024});
+      Array g = host_array(noise(1, 411), Shape{1, 1, 1});
+      Array y = host_array(noise(1024, 413), Shape{1, 1, 1024});
+      return x * g + y;
+    });
+    // Every operand is materialized first, so the group the scheduler sees is
+    // the one the model builds: a kernel primitive, a reshape and an
+    // elementwise consumer over FOUR bindings. With the operands unevaluated
+    // the same expression partitions into three groups and never exercises it.
+    compare("rms+reshape*x", [&] {
+      Array x = host_array(noise(512, 415), Shape{1, 1, 8, 64});
+      Array nw = cast(host_array(noise(64, 417), Shape{64}), DType::kBF16);
+      (void)nw.eval();
+      Array y = host_array(noise(512, 419), Shape{1, 1, 512});
+      return reshape(rms_norm(x, nw, 1e-6f, true), Shape{1, 1, 512}) * y;
+    }, 2e-2);
+    compare("router chain", [&] {
+      Array x = host_array(hid, Shape{1, 1, 1024});
+      Array w = cast(host_array(noise(8 * 1024, 421), Shape{8, 1024}),
+                     DType::kBF16);
+      Array b = cast(host_array(noise(8, 423), Shape{8}), DType::kBF16);
+      Array s = host_array(noise(8, 425), Shape{8});
+      return exp(neg(softplus(linear(x, w) + b) * s));
+    }, 2e-2);
+  }
+  // A one-column gemv: the wave reduction still runs, but every lane after the
+  // first has no column of its own. lemonseed's per-layer gate is this shape.
+  compare("gemv N=1 bf16", [&] {
+    Array x = host_array(noise(1024, 601), Shape{1, 1, 1024});
+    Array w = cast(host_array(noise(1024, 603), Shape{1, 1024}), DType::kBF16);
+    Array b = cast(host_array(noise(1, 605), Shape{1}), DType::kBF16);
+    return sigmoid(linear(x, w) + b);
+  }, 2e-2);
+  // Four gemvs over one activation row: the shared staged panel, which is the
+  // only path where one kernel's LDS is filled for siblings it does not own.
+  compare("four siblings 512", [&] {
+    Array x = host_array(noise(1024, 607), Shape{1, 1, 1024});
+    Array a1 = cast(host_array(noise(512 * 1024, 609), Shape{512, 1024}),
+                    DType::kBF16);
+    Array a2 = cast(host_array(noise(512 * 1024, 611), Shape{512, 1024}),
+                    DType::kBF16);
+    return linear(x, a1) + linear(x, a2);
+  }, 2e-2);
+  compare("swiglu+linear", [&] {
+    Array x = host_array(xs, Shape{1, 512});
+    Array w1 = host_array(ws, Shape{64, 512});
+    Array w2 = host_array(noise(64 * 512, 909), Shape{64, 512});
+    return silu(linear(x, w1)) * linear(x, w2);
+  }, 2e-4);
+  compare("rms_norm+linear", [&] {
+    Array x = host_array(xs, Shape{1, 512});
+    Array nw = host_array(noise(512, 71), Shape{512});
+    Array w = host_array(ws, Shape{64, 512});
+    return linear(rms_norm(x, nw, 1e-6f, true), w);
+  }, 2e-4);
+}
+
+LSE_TEST(loom_matches_hip_on_the_attention_and_recurrent_kernels) {
+  using namespace dialect_diff;
+  compare("rms_norm", [&] {
+    Array x = host_array(noise(4 * 128, 5), Shape{4, 128});
+    Array w = host_array(noise(128, 61), Shape{128});
+    return rms_norm(x, w, 1e-6f, true);
+  });
+  // [B, H, T, Dh] against a [T, Dh] angle table. The primitive takes T from
+  // x.dim(rank-2), so a table with fewer rows than that is read past its end —
+  // in C that is a silent out-of-bounds load, and in Loom the printer's
+  // `index.assume` on the same subscript becomes a false promise. The shapes
+  // here are the ones the kernel's own contract admits.
+  compare("rope", [&] {
+    Array x = host_array(noise(1 * 4 * 2 * 64, 17), Shape{1, 4, 2, 64});
+    Array cs = host_array(noise(2 * 64, 23), Shape{2, 64});
+    Array sn = host_array(noise(2 * 64, 29), Shape{2, 64});
+    return rope(x, cs, sn, 0);
+  });
+  compare("causal_conv1d", [&] {
+    Array x = host_array(noise(2 * 8 * 16, 3), Shape{2, 8, 16});
+    Array w = host_array(noise(16 * 4, 71), Shape{16, 4});
+    Array b = host_array(noise(16, 83), Shape{16});
+    return causal_conv1d(x, w, b);
+  });
+  // The three kernels lemonseed runs that Loom declines. They are in the
+  // differential so the decline is measured rather than assumed, and so a
+  // later change that makes one of them emit is compared the same way.
+  compare("conv_tail", [&] {
+    Array tail = host_array(noise(2 * 3 * 16, 201), Shape{2, 3, 16});
+    Array x = host_array(noise(2 * 8 * 16, 203), Shape{2, 8, 16});
+    return conv_tail(tail, x);
+  });
+  compare("gated_delta_step", [&] {
+    Array q = host_array(noise(1 * 1 * 2 * 16, 211), Shape{1, 1, 2, 16});
+    Array k = host_array(noise(1 * 1 * 2 * 16, 213), Shape{1, 1, 2, 16});
+    Array v = host_array(noise(1 * 1 * 2 * 16, 215), Shape{1, 1, 2, 16});
+    Array al = host_array(noise(1 * 1 * 2, 217), Shape{1, 1, 2});
+    Array be = host_array(noise(1 * 1 * 2, 219), Shape{1, 1, 2});
+    Array st = host_array(noise(1 * 2 * 16 * 16, 221), Shape{1, 2, 16, 16});
+    return gated_delta_step(q, k, v, al, be, st, nullptr);
+  }, 1e-3);
+  compare("kv_page_write", [&] {
+    Array dst = host_array(noise(4 * 2 * 8 * 16, 231), Shape{4, 2, 8, 16});
+    Array src = host_array(noise(1 * 2 * 1 * 16, 233), Shape{1, 2, 1, 16});
+    Array meta = host_array({0, 1, 1}, Shape{3});
+    Array table = host_array({0, 1, 2, 3}, Shape{1, 4});
+    return kv_page_write(dst, src, meta, table, 8);
+  });
+  compare("sdpa", [&] {
+    Array q = host_array(noise(1 * 4 * 1 * 32, 101), Shape{1, 4, 1, 32});
+    Array k = host_array(noise(1 * 4 * 8 * 32, 103), Shape{1, 4, 8, 32});
+    Array v = host_array(noise(1 * 4 * 8 * 32, 107), Shape{1, 4, 8, 32});
+    return sdpa(q, k, v, 0.176776695f, MaskKind::kCausal);
+  }, 1e-4);
+}
+
+
 LSE_TEST_MAIN()
 
 // linear is a barrier, so its operands materialize as their own groups first;
@@ -1673,6 +2404,15 @@ static Result<EmittedKernel> emit_last_for(Array& root) {
 // what the tables were asked for rather than on the kernel's own text: the
 // intrinsic spelling and the vector typedef must both have come from the HIP
 // tables, and the launch must be sized in waves-per-tile, not output elements.
+LSE_TEST(loom_reports_what_fraction_of_the_cases_it_emitted) {
+  using namespace dialect_diff;
+  const Tally& t = tally();
+  if (t.emitted + t.declined == 0) return;
+  std::printf("       %d of %d differential cases emit through Loom; %d "
+              "decline and fall to the host\n",
+              t.emitted, t.emitted + t.declined, t.declined);
+}
+
 LSE_TEST(live_arch_picks_the_widest_load) {
   // HRX gives us gfx1151 at init; the width is that ISA's dwordx4, not a
   // compile-time #ifdef and not an HRX property.

@@ -280,6 +280,23 @@ class Scheduler {
   void set_mode(Mode m) noexcept { mode_ = m; }
   [[nodiscard]] Mode mode() const noexcept { return mode_; }
 
+  // Which dialect this run would rather its kernels were written in.
+  //
+  // A runtime value naming a resource, the way the pool names devices: unset
+  // is the ordinary case and every dialect it can name is compiled into this
+  // binary either way. A member that does not declare the named dialect is
+  // given its own first choice instead of failing, so naming one cannot turn a
+  // run that would have worked into a run that does not.
+  void set_dialect(Dialect d) noexcept { dialect_ = d; }
+  void clear_dialect() noexcept { dialect_.reset(); }
+  [[nodiscard]] DialectPreference dialect() const noexcept { return dialect_; }
+  // What `member` will actually be handed, preference resolved against what
+  // that device declares. nullptr when the member has no codegen at all.
+  [[nodiscard]] const KernelToolchain* toolchain(
+      std::size_t member) const noexcept {
+    return devices_.device(member).toolchain(dialect_);
+  }
+
   // Why a node cannot run on `backend`, or empty if it can.
   static std::string device_gap(const Node& node, const backend::IBackend& backend);
 
@@ -462,6 +479,7 @@ class Scheduler {
   std::unique_ptr<backend::SingleDevice> own_set_;
   backend::IDeviceSet& devices_;
   Mode mode_ = Mode::kDeviceFirst;
+  DialectPreference dialect_;
   FallbackChain* fallbacks_ = nullptr;
   Trace trace_;
   Trace acc_;

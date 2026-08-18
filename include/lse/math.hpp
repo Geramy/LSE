@@ -38,6 +38,7 @@ inline float select(bool c, float a, float b) { return c ? a : b; }
 // required to be bit-identical to quant::QuantScheme's host pack, which uses
 // std::round, so this must NOT become rint/nearbyint (round-half-to-even).
 inline float round(float x) { return std::round(x); }
+inline float rint(float x) { return std::rint(x); }
 
 
 // Expression type of this library. The recorder lives in lse::ir; authors
@@ -98,9 +99,22 @@ struct Round {
   static constexpr std::string_view key = "round";
   using result = lse::f32;
 };
+struct Rint {
+  static constexpr std::string_view key = "rint";
+  using result = lse::f32;
+};
 struct ShflXor {
   static constexpr std::string_view key = "wave.shfl_xor";
   using result = lse::f32;
+};
+// Four signed bytes against four unsigned bytes into an i32 accumulator. The
+// mixed signedness is not a convenience: a group-affine code is unsigned by
+// construction and a quantized activation is signed, so the two operands are
+// genuinely different types and a same-signedness dot would have to waste a
+// bit on one of them.
+struct Dot4Iu8 {
+  static constexpr std::string_view key = "dot4.i32.iu8";
+  using result = ir::i32;
 };
 struct LocalId {
   static constexpr std::string_view key = "thread.local_id";
@@ -163,6 +177,10 @@ inline Val<lse::f32> min(const Val<lse::f32>& a, const Val<lse::f32>& b) {
 inline Val<lse::f32> neg_inf() { return emit<op::NegInf>(); }
 inline Val<lse::f32> abs(const Val<lse::f32>& x) { return emit<op::Abs>(x); }
 inline Val<lse::f32> round(const Val<lse::f32>& x) { return emit<op::Round>(x); }
+// Ties to even, which is the hardware's own rounding and a single
+// instruction. `round` is the one a codec that must agree with a host packer
+// asks for; this is the one everything else should ask for.
+inline Val<lse::f32> rint(const Val<lse::f32>& x) { return emit<op::Rint>(x); }
 namespace detail {
 
 // The dialect rows a narrow float format selects when a kernel needs its bit
@@ -268,6 +286,14 @@ inline Val<ir::u32> grid_dim_x() { return emit<op::GridDimX>(); }
 inline void barrier() {
   ir::KernelBody* body = ir::KernelBody::try_current();
   if (body != nullptr) body->barrier();
+}
+
+// `x` supplies the signed bytes, `codes` the unsigned ones. Both ride in an
+// i32 lane; the byte pairing is the instruction's and is measured, not chosen
+// here — see quant::dot4_operand_slot.
+inline Val<ir::i32> dot4_iu8(const Val<ir::i32>& x, const Val<ir::i32>& codes,
+                             const Val<ir::i32>& acc) {
+  return emit<op::Dot4Iu8>(x, codes, acc);
 }
 
 inline Val<lse::f32> shfl_xor(const Val<lse::f32>& v,

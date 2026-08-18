@@ -114,6 +114,13 @@ struct AmdDeviceInfo {
   bool has_bf16_arith = false;
   bool matrix_core_bf16 = false;
   bool has_dot4_i8 = false;
+  // v_dot4_i32_iu8, the MIXED-signedness form clang spells
+  // __builtin_amdgcn_sudot4. Not implied by has_dot4_i8: the same-signedness
+  // v_dot4_i32_i8 is dot7-insts and reaches back to RDNA2 and every CDNA,
+  // while the iu8 form is dot8-insts and arrived with RDNA3. Asking for it
+  // anywhere else fails the build with "needs target feature dot8-insts", so a
+  // kernel that emits sudot4 must gate on this flag and not on the one above.
+  bool has_dot4_iu8 = false;
   std::uint8_t max_load_bytes = 0;
   std::uint8_t max_store_bytes = 0;
 };

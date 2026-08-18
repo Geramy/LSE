@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include "lse/core/enum_names.hpp"
 #include <span>
@@ -29,6 +30,20 @@ namespace lse::ir {
   X(kLoom, "loom")
 
 LSE_DECLARE_ENUM(Dialect, std::uint8_t, LSE_DIALECT_LIST)
+
+// How many there are, for anything that indexes a table by dialect.
+inline constexpr std::size_t kDialectCount = enum_count(Dialect{});
+
+// The dialect spelled `name`, or nothing when nothing is spelled that way.
+// Names are the ones the list above declares, which is what to_string prints,
+// so a caller that accepts a name and a reader of a report see the same words.
+[[nodiscard]] constexpr std::optional<Dialect> dialect_from_name(
+    std::string_view name) noexcept {
+  for (const auto& entry : kEnumEntries_Dialect) {
+    if (entry.second == name) return entry.first;
+  }
+  return std::nullopt;
+}
 
 struct PrimitiveSource {
   std::string_view primitive;

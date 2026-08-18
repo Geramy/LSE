@@ -53,15 +53,22 @@ class JitCache {
 
   // `signature` is the emitter's cache identity (group + specialization);
   // `member` is which device of the set will run it. The device's arch and the
-  // geometry the source was emitted against are mixed in here.
+  // geometry the source was emitted against are mixed in here, and so is
+  // `emitted.dialect` — the text names its own language, and the compiler this
+  // object is built with is the one declared beside the emitter that wrote it.
   Result<backend::KernelHandle> get_or_compile(std::size_t member,
                                                std::uint64_t signature,
                                                const EmittedKernel& emitted);
 
-  // Live handle if this process already loaded the kernel ON THIS MEMBER. Does
-  // not compile, emit, or read disk. Counts as a memory hit.
+  // Live handle if this process already loaded the kernel ON THIS MEMBER in
+  // THIS DIALECT. Does not compile, emit, or read disk. Counts as a memory
+  // hit. `dialect` is not optional and has no default: this is the one lookup
+  // that returns a handle without seeing the source it was built from, so a
+  // caller that forgot to say which language it asked for would be handed the
+  // other one's kernel.
   const backend::KernelHandle* try_get(std::size_t member,
-                                       std::uint64_t signature) noexcept;
+                                       std::uint64_t signature,
+                                       Dialect dialect) noexcept;
 
   struct Stats {
     std::uint64_t memory_hits = 0;
@@ -74,10 +81,16 @@ class JitCache {
  private:
   // Everything that decides what SOURCE this device would be given, which is
   // what an object on disk is only valid for.
-  [[nodiscard]] std::uint64_t slot_key(std::size_t member,
+  [[nodiscard]] std::uint64_t slot_key(std::size_t member, Dialect dialect,
                                        std::uint64_t signature) const noexcept;
+  // The compiler declared beside the emitter that writes `dialect`, or nullptr
+  // when this member declares no such dialect.
   [[nodiscard]] const IKernelCompiler* compiler_for(
-      std::size_t member) const noexcept;
+      std::size_t member, Dialect dialect) const noexcept;
+  [[nodiscard]] std::size_t toolchain_slot(std::size_t member,
+                                           Dialect dialect) const noexcept {
+    return member * kDialectCount + static_cast<std::size_t>(dialect);
+  }
 
   // Only when the single-device constructor was used: the set that backend is,
   // and the compiler the caller named for it. Declared before devices_ so the
@@ -85,8 +98,11 @@ class JitCache {
   std::unique_ptr<backend::SingleDevice> own_set_;
   backend::IDeviceSet& devices_;
   const IKernelCompiler* named_compiler_ = nullptr;
-  // Hash of each member's compiler identity, taken once: slot_key runs per
-  // group per token and identity() builds strings.
+  // Hash of each (member, dialect)'s compiler identity, taken once: slot_key
+  // runs per group per token and identity() builds strings. Indexed by
+  // toolchain_slot, NOT by member: a member declaring two dialects declares two
+  // compilers, and one entry per member would have hashed the front one's
+  // identity into the other one's cache slots.
   std::vector<std::uint64_t> compiler_id_;
   std::string cache_dir_;
   Stats stats_;

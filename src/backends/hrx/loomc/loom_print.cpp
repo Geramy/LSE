@@ -1,5 +1,6 @@
 #include "lse/backends/hrx/loomc/loom_print.hpp"
 
+#include <cctype>
 #include <map>
 #include <set>
 #include <string>
@@ -230,27 +231,36 @@ class Printer {
     });
   }
 
-  bool clamp_is_observable(ValueId v, int depth = 0) const {
-    if (depth > 32 || v >= users_.size()) return true;
-    for (OpId id : users_[v]) {
-      const Operation& u = b_.op(id);
-      switch (u.kind) {
-        case OpKind::kSubscript:
-        case OpKind::kLoadVec:
-        case OpKind::kStoreVec:
-        case OpKind::kFor:
-        case OpKind::kAssign:
-          break;
-        case OpKind::kBinary: {
-          const std::string& k = u.key;
-          const bool arith = k == "+" || k == "-" || k == "*" || k == "/" ||
-                             k == "%";
-          if (!arith) return true;
-          if (clamp_is_observable(u.result, depth + 1)) return true;
-          break;
+  // Walked, not recursed: a use graph this wide reconverges, and the recursive
+  // form visited every path through it. topk's index chain has enough of them
+  // that the printer exhausted memory before it emitted a line.
+  bool clamp_is_observable(ValueId v) const {
+    std::vector<ValueId> work{v};
+    std::unordered_set<ValueId> seen{v};
+    while (!work.empty()) {
+      const ValueId at = work.back();
+      work.pop_back();
+      if (at >= users_.size()) return true;
+      for (OpId id : users_[at]) {
+        const Operation& u = b_.op(id);
+        switch (u.kind) {
+          case OpKind::kSubscript:
+          case OpKind::kLoadVec:
+          case OpKind::kStoreVec:
+          case OpKind::kFor:
+          case OpKind::kAssign:
+            break;
+          case OpKind::kBinary: {
+            const std::string& k = u.key;
+            const bool arith = k == "+" || k == "-" || k == "*" || k == "/" ||
+                               k == "%";
+            if (!arith) return true;
+            if (seen.insert(u.result).second) work.push_back(u.result);
+            break;
+          }
+          default:
+            return true;
         }
-        default:
-          return true;
       }
     }
     return false;
@@ -503,6 +513,14 @@ class Printer {
     if (a == nullptr || b == nullptr) {
       return unsupported("operand of '" + o.key + "' was never defined");
     }
+    // C has one u32 for an address and a packed word; Loom has `index` and
+    // `i32`. Converting the odd one out here is not enough: the quantized
+    // codecs carry the same value through both roles for a dozen lines, and a
+    // per-operator conversion leaves every OTHER use of it in the role the
+    // classifier picked. Measured — coercing at this site turns the decline
+    // into `TYPE/001` on a value the store hook then writes as f32. The role
+    // has to be decided for the whole body, which is what classify_words does
+    // not yet do for a codec, so this stays a decline.
     if (a->type != b->type) {
       return unsupported("'" + o.key + "' mixes " + a->type + " and " +
                          b->type +
@@ -612,6 +630,24 @@ class Printer {
     return Status{};
   }
 
+  // An `index` the printer just minted from a value that is not one.
+  //
+  // LSE types every index as u32, but a Loom `index` is a signed carrier with
+  // no width until a fact gives it one, and this target's integer contract
+  // guards every index.add/madd/mul with `amdgpu.address.u32` — the operand
+  // must be PROVEN to fit in 32 unsigned bits. A value that entered the index
+  // domain through a cast carries no such proof, so the first address it feeds
+  // is rejected at the target rather than at the cast. The range restated here
+  // is the source type's own: kU32, exactly. Measured: without it the rope and
+  // gdn address chains fail as `rejected 'index.add' address-width 'u32'`.
+  void assume_u32(ValueId v, int depth) {
+    const std::string in = name(v);
+    const std::string r = fresh("u32");
+    line(depth, r + " = index.assume " + in + " [range(" + in +
+                    ", 0, 4294967295)] : index");
+    cur_[v] = r;
+  }
+
   Status emit_cast(const Operation& o, int depth) {
     if (o.operands.empty()) return unsupported("cast with an operand");
     const Typed* src = operand(o.operands[0]);
@@ -651,7 +687,9 @@ class Printer {
       const std::string t = fresh("cast");
       line(depth, t + " = scalar.fptoui " + in + " : " + src->type + " to i32");
       line(depth, res + " = index.cast " + t + " : i32 to index");
-      return done();
+      auto st = done();
+      assume_u32(o.result, depth);
+      return st;
     }
     if (src_float) {
       const char* op = dst_cls == Cls::kSignedInt ? "scalar.fptosi"
@@ -678,7 +716,9 @@ class Printer {
     if (src->cls == Cls::kIndex || dst_cls == Cls::kIndex) {
       line(depth, res + " = index.cast " + in + " : " + src->type + " to " +
                       dst_type);
-      return done();
+      auto st = done();
+      if (dst_cls == Cls::kIndex) assume_u32(o.result, depth);
+      return st;
     }
     if (src->cls == Cls::kBool || dst_cls == Cls::kBool) {
       return unsupported("a cast to or from i1");
@@ -827,13 +867,22 @@ class Printer {
       // constants.
       const ValueId lane = resolve(o.operands[1]);
       const ValueDef& d = b_.value(lane);
-      if (d.def == kNoOp || !b_.op(d.def).has(kFlagIntConst)) {
+      const bool literal = d.def != kNoOp && b_.op(d.def).has(kFlagIntConst);
+      // A lane that is not already a literal is legal only when the loop that
+      // varies it is one the target's `unroll-scf-for` will peel: the pass runs
+      // before the cleanup that folds an exact-valued dynamic index back into
+      // `static_indices`, so the extract is static by the time the AMDGPU
+      // lowering sees it. A lane from any other loop would survive to codegen
+      // as a dynamic lane select, which this target has no plan for, so it
+      // declines instead of emitting something that fails downstream.
+      if (!literal && !unrolled_iv_.count(lane)) {
         return unsupported("a register-vector lane that is not a literal");
       }
       const std::string elem(loom_storage_type(base->elem));
+      const std::string at =
+          literal ? std::to_string(b_.op(d.def).imm) : name(o.operands[1]);
       line(depth, name(o.result) + " = vector.extract " +
-                      name(o.operands[0]) + "[" +
-                      std::to_string(b_.op(d.def).imm) + "] : " + base->type +
+                      name(o.operands[0]) + "[" + at + "] : " + base->type +
                       " -> " + elem);
       define(o.result, elem, base->elem,
              class_of(base->elem, base->elem == Scalar::kU32));
@@ -967,10 +1016,53 @@ class Printer {
     return Status{};
   }
 
+  // The name a raw statement spelled, retargeted to what that value is called
+  // here and now.
+  //
+  // A store hook runs at RECORD time and names its operands with ssa_name, so
+  // an accumulator comes out as the slot's own `%vN`. In SSA the slot is not a
+  // value: it is whatever name currently holds it, which the printer only
+  // knows once it has walked the assignments. Emitting the recorded text
+  // verbatim referenced a `%vN` that no statement defines — the epilogue of
+  // every `owns its indexing` kernel parsed as an undefined SSA value.
+  const std::string& raw_name_map_entry(std::string_view tok) {
+    static const std::string kNone;
+    if (raw_names_.empty()) {
+      for (ValueId v = 0; v < b_.value_count(); ++v) {
+        std::string n = ssa_name(b_, v);
+        if (!n.empty()) raw_names_.emplace(std::move(n), v);
+      }
+    }
+    const auto it = raw_names_.find(std::string(tok));
+    if (it == raw_names_.end()) return kNone;
+    retarget_ = name(it->second);
+    return retarget_;
+  }
+
   Status emit_raw(const Operation& o, int depth) {
-    // Text a store hook produced. It is already Loom — the hook was installed
-    // by the Loom emitter and the values it names came from ssa_name.
-    line(depth, o.text);
+    std::string out;
+    out.reserve(o.text.size());
+    for (std::size_t i = 0; i < o.text.size();) {
+      if (o.text[i] != '%') {
+        out += o.text[i++];
+        continue;
+      }
+      std::size_t j = i + 1;
+      while (j < o.text.size() &&
+             (std::isalnum(static_cast<unsigned char>(o.text[j])) != 0 ||
+              o.text[j] == '_')) {
+        ++j;
+      }
+      const std::string_view tok(o.text.data() + i, j - i);
+      const std::string& to = raw_name_map_entry(tok);
+      if (to.empty()) {
+        out.append(tok);
+      } else {
+        out += to;
+      }
+      i = j;
+    }
+    line(depth, out);
     return Status{};
   }
 
@@ -1067,6 +1159,18 @@ class Printer {
     return Status{};
   }
 
+  // The literal an index value is, when it is one.
+  bool int_const(ValueId v, std::int64_t* out) const {
+    const ValueId r = resolve(v);
+    if (r >= b_.value_count()) return false;
+    const ValueDef& d = b_.value(r);
+    if (d.def == kNoOp) return false;
+    const Operation& def = b_.op(d.def);
+    if (!def.has(kFlagIntConst)) return false;
+    *out = def.imm;
+    return true;
+  }
+
   Status emit_for(const Operation& o, int depth) {
     if (o.operands.size() != 3) return unsupported("a loop with 3 bounds");
     for (ValueId v : o.operands) {
@@ -1076,6 +1180,12 @@ class Printer {
       }
     }
     define(o.result, "index", Scalar::kU32, Cls::kIndex);
+    std::int64_t lo = 0, hi = 0, st = 0;
+    if (o.has(kFlagUnroll) && int_const(o.operands[0], &lo) &&
+        int_const(o.operands[1], &hi) && int_const(o.operands[2], &st) &&
+        st > 0 && hi > lo) {
+      unrolled_iv_.insert(o.result);
+    }
     const std::string span = "[" + name(o.operands[0]) + " to " +
                              name(o.operands[1]) + " step " +
                              name(o.operands[2]) + "]";
@@ -1131,6 +1241,11 @@ class Printer {
   std::vector<std::vector<OpId>> users_;
   std::unordered_map<ValueId, Access> pending_store_;
   std::unordered_set<ValueId> unprefixed_;
+  std::unordered_map<std::string, ValueId> raw_names_;
+  std::string retarget_;
+  // Induction variables of `unroll`-marked loops with a constant trip
+  // count: the values the target's unroller turns into literals.
+  std::unordered_set<ValueId> unrolled_iv_;
   std::uint32_t seq_ = 0;
 };
 

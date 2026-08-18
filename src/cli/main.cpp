@@ -42,6 +42,10 @@ struct Options {
   std::string arch;
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
+  // Which source dialect this run would rather its kernels were written in.
+  // Empty means the device's own first choice, which is what every run that
+  // does not say gets.
+  std::string dialect;
   bool show_stats = false;
   bool list_devices = false;
   bool list_cache = false;
@@ -98,6 +102,10 @@ void usage() {
       "                         and best first: hrx:0,cpu:0 (default $LSE_POOL,\n"
       "                         else one device -- the first backend that comes\n"
       "                         up, at $LSE_DEVICE's ordinal)\n"
+      "      --dialect NAME     source dialect to generate kernels in: hip or\n"
+      "                         loom. A device that does not declare it is\n"
+      "                         given its own first choice instead (default:\n"
+      "                         every device's first choice)\n"
       "  -h, --help             this message");
 }
 
@@ -126,6 +134,13 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->list_cache = true;
     } else if (a == "--pool") {
       if (!take_value(argc, argv, i, "--pool", &opt->pool)) return false;
+    } else if (a == "--dialect") {
+      if (!take_value(argc, argv, i, "--dialect", &opt->dialect)) return false;
+      if (!graph::dialect_from_name(opt->dialect).has_value()) {
+        std::fprintf(stderr, "lse: no dialect is spelled '%s'\n",
+                     opt->dialect.c_str());
+        return false;
+      }
     } else if (a == "--stats") {
       opt->show_stats = true;
     } else if (a == "--debug") {
@@ -402,9 +417,29 @@ Qualification qualify_startup_pool(const Options& opt) {
                  std::string(devices->declined()).c_str(),
                  std::string(first.name()).c_str());
   }
-  if (graph::default_scheduler() == nullptr) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
     q.status = LSE_ERROR(kDeviceError, "no scheduler could be built");
     return q;
+  }
+  if (!opt.dialect.empty()) {
+    // parse() refuses a name no dialect is spelled with, so the only remaining
+    // question is what each member declares.
+    const graph::Dialect want = *graph::dialect_from_name(opt.dialect);
+    sched->set_dialect(want);
+    for (std::size_t i = 0; i < devices->size(); ++i) {
+      const graph::KernelToolchain* tc = sched->toolchain(i);
+      if (tc == nullptr) continue;
+      // Said out loud either way. A run that asked for a dialect and quietly
+      // got the other one is exactly what this selection path exists to make
+      // visible, and a degrade that prints nothing is that failure.
+      std::fprintf(stderr, "lse: %s generates %s%s\n",
+                   std::string(devices->device(i).name()).c_str(),
+                   std::string(to_string(tc->dialect)).c_str(),
+                   tc->dialect == want
+                       ? ""
+                       : " -- it does not declare the one asked for");
+    }
   }
 
   const auto started = std::chrono::steady_clock::now();

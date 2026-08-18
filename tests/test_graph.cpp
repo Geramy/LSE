@@ -20,6 +20,7 @@
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
 #include "lse/graph/sharding.hpp"
+#include "lse/backends/hrx/device_info.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/workgroup.hpp"
 #include "lse/quant/group_affine.hpp"
@@ -1703,8 +1704,24 @@ struct QuantPlane {
   // What the codes actually encode. A reference contraction against this
   // cancels the quantization error instead of spending it on the tolerance.
   std::vector<float> dequantized;
+  // The weights before quantization. Their distance from `dequantized` is the
+  // error the storage format itself carries, which is the yardstick a kernel's
+  // own error is measured against.
+  std::vector<float> source;
   std::size_t lanes_per_row = 0;
   std::size_t groups_per_row = 0;
+
+  // Root-mean-square of what quantizing the weights cost.
+  [[nodiscard]] double round_trip_rmse() const {
+    double acc = 0.0;
+    for (std::size_t i = 0; i < source.size(); ++i) {
+      const double d = static_cast<double>(source[i]) -
+                       static_cast<double>(dequantized[i]);
+      acc += d * d;
+    }
+    return source.empty() ? 0.0
+                          : std::sqrt(acc / static_cast<double>(source.size()));
+  }
 };
 
 QuantPlane quantize_plane(const quant::GroupAffine& q, std::int64_t n,
@@ -1716,6 +1733,7 @@ QuantPlane quantize_plane(const quant::GroupAffine& q, std::int64_t n,
   p.scales.resize(static_cast<std::size_t>(n) * p.groups_per_row);
   p.biases.resize(p.scales.size());
   p.dequantized.resize(static_cast<std::size_t>(n * k));
+  p.source.resize(static_cast<std::size_t>(n * k));
 
   std::vector<float> row(static_cast<std::size_t>(k));
   std::vector<bfloat16_t> s(p.groups_per_row), b(p.groups_per_row);
@@ -1725,6 +1743,9 @@ QuantPlane quantize_plane(const quant::GroupAffine& q, std::int64_t n,
           0.05f * spread(static_cast<std::uint64_t>(r * k + c));
     }
     const auto ro = static_cast<std::size_t>(r);
+    std::copy(row.begin(), row.end(),
+              p.source.begin() +
+                  static_cast<std::ptrdiff_t>(ro * static_cast<std::size_t>(k)));
     q.quantize_row<bfloat16_t>(row.data(), static_cast<std::size_t>(k),
                                p.packed.data() + ro * p.lanes_per_row, s.data(),
                                b.data());
@@ -1738,6 +1759,53 @@ QuantPlane quantize_plane(const quant::GroupAffine& q, std::int64_t n,
     }
   }
   return p;
+}
+
+// Whether a 4-bit contraction takes the integer path on the device this suite
+// is running against. Not a preference — the kernel reads the same flag, and a
+// device without the instruction decodes with the float codec instead.
+bool integer_quant_path(int bits) {
+  if (bits != 4) return false;
+  Scheduler* sc = default_scheduler();
+  if (sc == nullptr) return false;
+  const auto* amd = backend::device_extension<backend::AmdDeviceInfo>(
+      sc->backend().device_info());
+  return amd != nullptr && amd->has_dot4_iu8;
+}
+
+// What one output of a quantized contraction is allowed to be off by, against
+// a reference taken over the weights the codes encode.
+//
+// Two independent terms. The float one is the backward error of a float32 dot
+// product: it tracks the sum of the term magnitudes, because the result
+// cancels down to a small fraction of that and would set an unmeetable bar.
+// The other is what the integer path's activation quantization can cost — it
+// rounds each activation to int8 against the largest magnitude in its own
+// group, so each carries at most half a step of that group and each product at
+// most |w| times it.
+//
+// Worst case summed, not an RMS: this is the bound the kernel cannot exceed on
+// any row, which is exactly what a per-tensor activation scale fails on a row
+// with an outlier, since its step is the whole row's rather than the group's.
+double admissible_error(const float* x, const float* w, std::int64_t k,
+                        std::int64_t group_size, bool integer) {
+  double mag = 0.0;
+  for (std::int64_t c = 0; c < k; ++c) {
+    mag += std::fabs(static_cast<double>(x[c]) * static_cast<double>(w[c]));
+  }
+  double quant = 0.0;
+  if (integer) {
+    for (std::int64_t g0 = 0; g0 < k; g0 += group_size) {
+      double amax = 0.0;
+      double wsum = 0.0;
+      for (std::int64_t c = g0; c < g0 + group_size && c < k; ++c) {
+        amax = std::max(amax, std::fabs(static_cast<double>(x[c])));
+        wsum += std::fabs(static_cast<double>(w[c]));
+      }
+      quant += amax / 254.0 * wsum;
+    }
+  }
+  return 1e-6 + 1e-6 * mag + quant;
 }
 
 // MLX's SwitchGLU layout: one plane of E * N rows, read as [E, N, lanes]. It is
@@ -1813,52 +1881,140 @@ StackedArrays stacked_arrays(const QuantPlane& p, std::int64_t experts,
 // graph::linear, whose kernel narrows to f16 operands above a tile and would
 // then be the less precise side of the comparison.
 //
+// Two bounds, and neither is a fixed epsilon.
+//
+// Per output, `admissible_error` — the worst case a correct implementation of
+// this path can produce for this row and this column. That one is what catches
+// a scaling bug: a per-tensor activation scale exceeds it by 30x on the
+// outlier row below, because its step is the whole row's largest magnitude
+// rather than the group's.
+//
+// Then an RMS bound against the weight round-trip RMSE of the bit width under
+// test. A 4-bit contraction on a device with v_dot4_i32_iu8 quantizes the
+// activation to int8 per group of 64 and contracts in integers, so it is not
+// bit-comparable to an fma chain and never was going to be; what has to hold
+// is that its own error stays inside the error the weight format it decodes
+// already carries. Measured on gfx1151, as a fraction of e_w * ||x||:
+//
+//   4-bit, smooth row        0.087 - 0.109
+//   4-bit, one 30x outlier   0.60  - 1.08
+//   every other width        < 1e-5   (the float codec, f32 rounding only)
+//
+// so the bars are 1.5 and 0.02. The outlier row is the honest cost of the
+// specified granularity: one activation 30x its neighbours spends most of the
+// int8 range of its own group of 64, and the other 63 quantize against it.
+//
 // Every bit width MLX emits, at one row (decode) and at more rows than a tile
-// (prefill): 3, 5 and 6 bits are the ones whose codes straddle two lanes.
+// (prefill): 3, 5 and 6 bits are the ones whose codes straddle two lanes. Two
+// K's, because K = 128 leaves the 4-bit lane run entirely in the tail loop and
+// K = 1024 is the first that fills the aligned one. Two activation fills,
+// because a uniformly benign row cannot tell a per-group activation scale from
+// a per-tensor one — the outlier row can.
 LSE_TEST(quant_linear_matches_the_weights_it_encodes) {
+  constexpr double kIntegerShare = 1.5;
+  constexpr double kFloatShare = 0.02;
   for (int bits : {2, 3, 4, 5, 6, 8}) {
-    for (std::int64_t rows : {std::int64_t{1}, std::int64_t{20}}) {
-      auto spec = quant::GroupAffine::make(bits, 64);
-      LSE_EXPECT(spec.ok());
-      if (!spec.ok()) continue;
-      const quant::GroupAffine q = *spec;
+    for (std::int64_t kk : {std::int64_t{128}, std::int64_t{1024}}) {
+      for (bool outlier : {false, true}) {
+        for (std::int64_t rows : {std::int64_t{1}, std::int64_t{20}}) {
+          auto spec = quant::GroupAffine::make(bits, 64);
+          LSE_EXPECT(spec.ok());
+          if (!spec.ok()) continue;
+          const quant::GroupAffine q = *spec;
 
-      constexpr std::int64_t kN = 32, kK = 128;
-      const QuantPlane p = quantize_plane(q, kN, kK);
+          constexpr std::int64_t kN = 32;
+          const QuantPlane p = quantize_plane(q, kN, kk);
 
-      std::vector<float> x(static_cast<std::size_t>(rows * kK));
-      for (std::size_t i = 0; i < x.size(); ++i) {
-        x[i] = 0.1f * std::sin(0.7f * static_cast<float>(i));
-      }
-
-      Array xa = host_array(x, Shape{rows, kK});
-      Array pa = packed_host_array(
-          p.packed, Shape{kN, static_cast<std::int64_t>(p.lanes_per_row)});
-      Array sa = typed_host_array(
-          p.scales, Shape{kN, static_cast<std::int64_t>(p.groups_per_row)},
-          DType::kBF16);
-      Array ba = typed_host_array(
-          p.biases, Shape{kN, static_cast<std::int64_t>(p.groups_per_row)},
-          DType::kBF16);
-      // The plane reached the graph at its own width; nothing widened it.
-      LSE_EXPECT(pa.dtype() == DType::kU32);
-
-      Array got = quant_linear(xa, pa, sa, ba, bits, 64);
-      LSE_EXPECT(got.node()->kind == OpKind::kQuantMatMul);
-      LSE_EXPECT(got.node()->inputs.size() == 4);
-
-      const std::vector<float> g = drain(got);
-      LSE_EXPECT(g.size() == static_cast<std::size_t>(rows * kN));
-      for (std::int64_t r = 0; r < rows; ++r) {
-        for (std::int64_t o = 0; o < kN; ++o) {
-          double want = 0.0;
-          for (std::int64_t c = 0; c < kK; ++c) {
-            want += static_cast<double>(x[static_cast<std::size_t>(r * kK + c)]) *
-                    static_cast<double>(
-                        p.dequantized[static_cast<std::size_t>(o * kK + c)]);
+          std::vector<float> x(static_cast<std::size_t>(rows * kk));
+          for (std::size_t i = 0; i < x.size(); ++i) {
+            x[i] = 0.1f * std::sin(0.7f * static_cast<float>(i));
           }
-          LSE_EXPECT_NEAR(g[static_cast<std::size_t>(r * kN + o)], want,
-                          1e-5 + 1e-5 * std::fabs(want));
+          if (outlier) {
+            // One element per row, 30x the rest of it. Its own group of 64
+            // keeps its own scale, so every other group is unaffected; a
+            // single scale for the row would quantize all of them against
+            // this one number instead.
+            for (std::int64_t r = 0; r < rows; ++r) {
+              const auto at = static_cast<std::size_t>(
+                  r * kk + (r * 37 + 11) % kk);
+              x[at] = 3.0f;
+            }
+          }
+
+          Array xa = host_array(x, Shape{rows, kk});
+          Array pa = packed_host_array(
+              p.packed, Shape{kN, static_cast<std::int64_t>(p.lanes_per_row)});
+          Array sa = typed_host_array(
+              p.scales, Shape{kN, static_cast<std::int64_t>(p.groups_per_row)},
+              DType::kBF16);
+          Array ba = typed_host_array(
+              p.biases, Shape{kN, static_cast<std::int64_t>(p.groups_per_row)},
+              DType::kBF16);
+          // The plane reached the graph at its own width; nothing widened it.
+          LSE_EXPECT(pa.dtype() == DType::kU32);
+
+          Array got = quant_linear(xa, pa, sa, ba, bits, 64);
+          LSE_EXPECT(got.node()->kind == OpKind::kQuantMatMul);
+          LSE_EXPECT(got.node()->inputs.size() == 4);
+
+          const std::vector<float> g = drain(got);
+          LSE_EXPECT(g.size() == static_cast<std::size_t>(rows * kN));
+          if (g.size() != static_cast<std::size_t>(rows * kN)) continue;
+
+          // What an error the size of the weight format's own would do to
+          // this contraction: e_w per weight, against this row of x, over a
+          // dot product whose terms carry independent signs.
+          const double e_w = p.round_trip_rmse();
+          const bool integer = integer_quant_path(bits);
+          double err = 0.0;
+          double yardstick = 0.0;
+          double worst = 0.0;
+          for (std::int64_t r = 0; r < rows; ++r) {
+            double xnorm = 0.0;
+            for (std::int64_t c = 0; c < kk; ++c) {
+              const double v = x[static_cast<std::size_t>(r * kk + c)];
+              xnorm += v * v;
+            }
+            const double bar = e_w * std::sqrt(xnorm);
+            for (std::int64_t o = 0; o < kN; ++o) {
+              double want = 0.0;
+              for (std::int64_t c = 0; c < kk; ++c) {
+                want += static_cast<double>(x[static_cast<std::size_t>(r * kk + c)]) *
+                        static_cast<double>(
+                            p.dequantized[static_cast<std::size_t>(o * kk + c)]);
+              }
+              const double d =
+                  static_cast<double>(g[static_cast<std::size_t>(r * kN + o)]) -
+                  want;
+              // The hard bound first: what any correct implementation of this
+              // path can be off by, row by row and column by column.
+              LSE_EXPECT_NEAR(
+                  g[static_cast<std::size_t>(r * kN + o)], want,
+                  admissible_error(&x[static_cast<std::size_t>(r * kk)],
+                                   &p.dequantized[static_cast<std::size_t>(o * kk)],
+                                   kk, 64, integer));
+              err += d * d;
+              yardstick += bar * bar;
+              const double rel = std::fabs(d) / (bar + 1e-12);
+              if (rel > worst) worst = rel;
+            }
+          }
+          const auto count = static_cast<double>(rows * kN);
+          const double err_rms = std::sqrt(err / count);
+          const double bar_rms = std::sqrt(yardstick / count);
+          const double share = integer ? kIntegerShare : kFloatShare;
+          // 1e-6 is the float32 accumulation floor at these magnitudes; it is
+          // what carries the widths whose weight error is smaller than it.
+          const bool within = err_rms <= 1e-6 + share * bar_rms;
+          LSE_EXPECT(within);
+          if (!within) {
+            std::printf(
+                "       bits=%d K=%lld rows=%lld outlier=%d: rms %.3e "
+                "e_w*|x| %.3e ratio %.3f worst %.2f\n",
+                bits, static_cast<long long>(kk),
+                static_cast<long long>(rows), outlier ? 1 : 0, err_rms,
+                bar_rms, err_rms / (bar_rms + 1e-30), worst);
+          }
         }
       }
     }
@@ -2022,8 +2178,19 @@ LSE_TEST(quant_linear_indexed_matches_the_expert_it_selects) {
       std::vector<double> mag;
       const std::vector<double> want = indexed_reference(
           p, x, idx, kRows, kKeep, slot, kN, kK, &mag);
+      // Same admissible bound as the unstacked op, against the expert this
+      // row actually routed to.
+      const bool integer = integer_quant_path(bits);
       for (std::size_t i = 0; i < want.size(); ++i) {
-        LSE_EXPECT_NEAR(g[i], want[i], 1e-6 + 1e-6 * mag[i]);
+        const auto r = static_cast<std::int64_t>(i) / kN;
+        const auto e = static_cast<std::int64_t>(
+            idx[static_cast<std::size_t>(r * kKeep + slot)]);
+        const auto col = e * kN + static_cast<std::int64_t>(i) % kN;
+        LSE_EXPECT_NEAR(
+            g[i], want[i],
+            admissible_error(&x[static_cast<std::size_t>(r * kK)],
+                             &p.dequantized[static_cast<std::size_t>(col * kK)],
+                             kK, 64, integer));
       }
 
       // And it is not some other expert's answer that happens to be close: the
@@ -2040,7 +2207,11 @@ LSE_TEST(quant_linear_indexed_matches_the_expert_it_selects) {
         for (std::int64_t o = 0; o < kN && all_close; ++o) {
           const auto i = static_cast<std::size_t>(r * kN + o);
           all_close = std::fabs(static_cast<double>(g[i]) - wrong[i]) <
-                      1e-6 + 1e-6 * mag[i];
+                      admissible_error(
+                          &x[static_cast<std::size_t>(r * kK)],
+                          &p.dequantized[static_cast<std::size_t>(
+                              (e * kN + o) * kK)],
+                          kK, 64, integer);
         }
         LSE_EXPECT(!all_close);
       }

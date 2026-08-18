@@ -30,6 +30,8 @@ struct FamilyIsa {
   bool has_bf16_arith;
   bool matrix_core_bf16;
   bool has_dot4_i8;
+  // dot8-insts, RDNA3 and later only. See AmdDeviceInfo::has_dot4_iu8.
+  bool has_dot4_iu8;
   std::uint8_t max_load_bytes;
   std::uint8_t max_store_bytes;
 };
@@ -43,21 +45,21 @@ struct BoardFallback {
 
 inline constexpr FamilyIsa kFamilyIsa[] = {
     {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kNone,
-     false, false, true, 16, 16},
+     false, false, true, false, 16, 16},
     {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kWMMA,
-     true, true, true, 16, 16},
+     true, true, true, true, 16, 16},
     {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, 2, MatrixCore::kWMMA,
-     true, true, true, 16, 16},
+     true, true, true, true, 16, 16},
     {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kWMMA,
-     true, true, true, 16, 16},
+     true, true, true, true, 16, 16},
     {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, 1, MatrixCore::kMFMA,
-     false, false, true, 16, 16},
+     false, false, true, false, 16, 16},
     {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 40, 64, 1, MatrixCore::kMFMA,
-     true, true, true, 16, 16},
+     true, true, true, false, 16, 16},
     {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, 1, MatrixCore::kMFMA,
-     true, true, true, 16, 16},
+     true, true, true, false, 16, 16},
     {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, 1, MatrixCore::kMFMA,
-     true, true, true, 16, 16},
+     true, true, true, false, 16, 16},
 };
 
 inline constexpr BoardFallback kBoardFallback[] = {
@@ -122,6 +124,7 @@ inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
     amd.has_bf16_arith = isa->has_bf16_arith;
     amd.matrix_core_bf16 = isa->matrix_core_bf16;
     amd.has_dot4_i8 = isa->has_dot4_i8;
+    amd.has_dot4_iu8 = isa->has_dot4_iu8;
     if (amd.max_load_bytes == 0) amd.max_load_bytes = isa->max_load_bytes;
     if (amd.max_store_bytes == 0) amd.max_store_bytes = isa->max_store_bytes;
   }

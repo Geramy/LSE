@@ -10,7 +10,9 @@
 namespace lse::graph {
 
 using ir::Dialect;
+using ir::dialect_from_name;
 using ir::DialectExpr;
+using ir::kDialectCount;
 using ir::DialectSourceTable;
 using ir::expr_for;
 using ir::PrimitiveSource;
