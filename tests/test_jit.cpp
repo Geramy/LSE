@@ -319,9 +319,13 @@ LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
   // spends two fmaf per weight — one to place the code, one to accumulate it —
   // and the integer path spends none. A lane decodes 16 codes per step at 8
   // bits, so that side is 32 of them; the integer side keeps only the group
-  // scale and the group bias.
+  // scale, the group bias and the per-chunk activation step, and it keeps one
+  // of each for every row the workgroup covers. This x is two rows, so the
+  // bound is per row -- what the claim rests on is that neither side of it
+  // grows with K.
+  constexpr std::size_t kRows = 2;
   LSE_EXPECT(count(eight, "fmaf(") >= 32);
-  LSE_EXPECT(count(four, "fmaf(") < 8);
+  LSE_EXPECT(count(four, "fmaf(") < 8 * kRows);
 
   // And a device without the capability takes the float codec at 4 bits too.
   // A fresh emitter, because the emit cache keys on the group and the wave

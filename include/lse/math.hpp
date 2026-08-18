@@ -87,6 +87,14 @@ struct Min {
   static constexpr std::string_view key = "min";
   using result = lse::f32;
 };
+struct MinU {
+  static constexpr std::string_view key = "min.u32";
+  using result = ir::u32;
+};
+struct MaxU {
+  static constexpr std::string_view key = "max.u32";
+  using result = ir::u32;
+};
 struct NegInf {
   static constexpr std::string_view key = "neg_inf";
   using result = lse::f32;
@@ -173,6 +181,12 @@ inline Val<lse::f32> max(const Val<lse::f32>& a, const Val<lse::f32>& b) {
 }
 inline Val<lse::f32> min(const Val<lse::f32>& a, const Val<lse::f32>& b) {
   return emit<op::Min>(a, b);
+}
+inline Val<ir::u32> min(const Val<ir::u32>& a, const Val<ir::u32>& b) {
+  return emit<op::MinU>(a, b);
+}
+inline Val<ir::u32> max(const Val<ir::u32>& a, const Val<ir::u32>& b) {
+  return emit<op::MaxU>(a, b);
 }
 inline Val<lse::f32> neg_inf() { return emit<op::NegInf>(); }
 inline Val<lse::f32> abs(const Val<lse::f32>& x) { return emit<op::Abs>(x); }

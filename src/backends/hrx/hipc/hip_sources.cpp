@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 57> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 59> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -45,6 +45,8 @@ constexpr std::array<graph::PrimitiveSource, 57> kHipSources{{
     // this target's spelling, rather than writing fmaf/fmaxf itself.
     {"fma", "fmaf($0, $1, $2)"},
     {"max", "fmaxf($0, $1)"},
+    {"min.u32", "min($0, $1)"},
+    {"max.u32", "max($0, $1)"},
     {"min", "fminf($0, $1)"},
     {"neg_inf", "-INFINITY"},
     {"abs", "fabsf($0)"},

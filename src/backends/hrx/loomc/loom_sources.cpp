@@ -34,7 +34,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 33> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -121,6 +121,8 @@ constexpr std::array<graph::PrimitiveSource, 33> kLoomSources{{
 
     {"fma", "$r = scalar.fmaf $0, $1, $2 : f32"},
     {"max", "$r = scalar.maxnumf $0, $1 : f32"},
+    {"min.u32", "$r = scalar.minui $0, $1 : i32"},
+    {"max.u32", "$r = scalar.maxui $0, $1 : i32"},
     {"min", "$r = scalar.minnumf $0, $1 : f32"},
     {"neg_inf", "$r = scalar.constant -inf : f32"},
     {"abs", "$r = scalar.absf $0 : f32"},

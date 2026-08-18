@@ -165,14 +165,17 @@ std::uint32_t chunks_per_step(const QuantDims& d, std::uint32_t max_bytes) {
 }
 
 ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave,
-                     std::uint32_t lds_budget, std::uint32_t staged_bytes) {
+                     std::uint32_t lds_budget, std::uint32_t staged_bytes,
+                     std::uint32_t rows_per_wg) {
   if (wave != 32 && wave != 64) wave = 32;
   const std::uint32_t waves = kBlock / wave;
   ThreadPlan tp;
   tp.workgroup_size[0] = kBlock;
   tp.workgroup_count[0] =
       static_cast<std::uint32_t>((d.n + waves - 1) / waves);
-  tp.workgroup_count[1] = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
+  const std::uint32_t rows = rows_per_wg != 0 ? rows_per_wg : 1;
+  const auto m = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
+  tp.workgroup_count[1] = (m + rows - 1) / rows;
   tp.workgroup_count[2] = 1;
   const std::uint32_t need =
       staged_bytes != 0
@@ -260,12 +263,53 @@ bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
 // LDS the body will reserve, which is not the float panel's size once the
 // integer path is on. The plan and the body have to agree, or occupancy is
 // computed against a launch that never happens.
-std::uint32_t staged_bytes(const KernelShapes& s, const QuantDims& d) {
+// Rows one workgroup covers, so the weight tile it reads is spent on more than
+// one of them.
+//
+// The weight index does not depend on the row, so a grid of one workgroup per
+// row streams the whole matrix once per row: a 128 token prefill pass moved 128
+// times the weight bytes of a single token and cost exactly 128 times as much,
+// which is the whole of the prefill gap. R rows in one workgroup cut that to
+// m/R passes over the matrix.
+//
+// Only on the integer path: it is the one that stages activations small enough
+// for several rows to share the scratch, at about an eighth of the float
+// panel. The ladder is powers of two so the JIT sees a bounded set of shapes,
+// the same reason the prefill chunk ladder exists.
+constexpr std::uint32_t kMaxRowsPerGroup = 8;
+
+// `indexed` rows route to their own expert, so the weight matrix a row reads
+// is chosen by that row and there is no shared tile to spend twice. Reuse is
+// only available where the rows agree on the matrix.
+std::uint32_t rows_per_group(const QuantDims& d, bool dot, bool indexed,
+                             std::uint32_t lds_budget) {
+  if (!dot || indexed || d.m <= 1) return 1;
+  const auto m = static_cast<std::uint32_t>(d.m);
+  std::uint32_t r = 1;
+  while (r * 2 <= kMaxRowsPerGroup && r * 2 <= m) r <<= 1;
+  // Every row it covers has to fit its staged codes beside the others.
+  const std::uint32_t per_row = dot_lds_bytes(d);
+  while (r > 1 && lds_budget != 0 && r * per_row > lds_budget) r >>= 1;
+  return r;
+}
+
+// R for this shape, or 1 when the integer path does not apply. The plan and
+// the body must agree on it exactly: it sets the grid and the scratch.
+std::uint32_t dot_rows(const KernelShapes& s, const QuantDims& d,
+                       bool indexed) {
+  if (!d.valid) return 1;
+  const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
+  if (!dot_ok(s, d, wave_of(s.device), cpl)) return 1;
+  return rows_per_group(d, true, indexed, workgroup_lds_bytes(s.device));
+}
+
+std::uint32_t staged_bytes(const KernelShapes& s, const QuantDims& d,
+                           bool indexed) {
   if (!d.valid) return 0;
   const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
   if (!dot_ok(s, d, wave_of(s.device), cpl)) return 0;
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
-  const std::uint32_t need = dot_lds_bytes(d);
+  const std::uint32_t need = dot_rows(s, d, indexed) * dot_lds_bytes(d);
   return (budget == 0 || need <= budget) ? need : 0;
 }
 
@@ -362,43 +406,58 @@ void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
 // The bias half of `code * scale + bias` is not here at all: it multiplies the
 // group's activation sum and is added once per group, in `emit_bias`.
 template <class A>
-void emit_run_dot(env::Emit& e, const A& a, const DotActs& q,
+void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
                   const kir::Val<kir::u32>& row_base,
                   const kir::Val<kir::u32>& scale_base,
                   const kir::Val<kir::u32>& chunk0, std::uint32_t count,
-                  const kir::LValue<kir::f32>& acc, std::uint32_t cpg) {
-  auto facc = e.var(e.f32(0.0f));
+                  std::span<const kir::LValue<kir::f32>> acc,
+                  std::uint32_t cpg) {
+  std::vector<kir::LValue<kir::f32>> facc;
+  facc.reserve(acc.size());
+  for (std::size_t r = 0; r < acc.size(); ++r) facc.push_back(e.var(e.f32(0.0f)));
   for (std::uint32_t u = 0; u < count; ++u) {
     const auto chunk = e.let(chunk0 + u);
+    // Read once, spend on every row this workgroup owns. This is the whole
+    // point of the row tile: the weight word and its two unpacked planes do
+    // not depend on the row, and they are the only global traffic in here.
     const auto word = e.let(a.packed[row_base + chunk]);
     const auto slot = e.let(chunk * 2u);
-    auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
-    for (int p = 0; p < 2; ++p) {
-      const auto codes = quant::dot4_code_plane(e, word, p);
-      const auto x =
-          e.let(q.codes[e.let(slot + static_cast<std::uint32_t>(p))].read());
-      iacc = math::dot4_iu8(kir::cast<kir::i32>(x), kir::cast<kir::i32>(codes),
-                            iacc.read());
+    std::array<kir::Val<kir::u32>, 2> planes;
+    for (std::size_t p = 0; p < 2; ++p) {
+      planes[p] = quant::dot4_code_plane(e, word, static_cast<int>(p));
     }
-    facc = math::fma(q.scale[chunk].read(), kir::cast<kir::f32>(iacc.read()),
-                     facc.read());
+    for (std::size_t r = 0; r < acc.size(); ++r) {
+      auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
+      for (std::size_t p = 0; p < 2; ++p) {
+        const auto x =
+            e.let(q[r].codes[e.let(slot + static_cast<std::uint32_t>(p))].read());
+        iacc = math::dot4_iu8(kir::cast<kir::i32>(x),
+                              kir::cast<kir::i32>(planes[p]), iacc.read());
+      }
+      facc[r] = math::fma(q[r].scale[chunk].read(),
+                          kir::cast<kir::f32>(iacc.read()), facc[r].read());
+    }
   }
   const auto group = e.let(chunk0 / cpg);
-  acc = math::fma(math::widen(a.scales[scale_base + group]), facc.read(),
-                  acc.read());
+  const auto wscale = e.let(math::widen(a.scales[scale_base + group]));
+  for (std::size_t r = 0; r < acc.size(); ++r) {
+    acc[r] = math::fma(wscale, facc[r].read(), acc[r].read());
+  }
 }
 
 // acc += bias_g * sum of group g's activations, over the groups this lane
 // owns. One global load and one fma per group of `group_size` weights, where
 // the float path pays an fma per weight for the same term.
 template <class A>
-void emit_bias(env::Emit& e, const A& a, const DotActs& q,
+void emit_bias(env::Emit& e, const A& a, std::span<const DotActs> q,
                const kir::Val<kir::u32>& scale_base,
                const kir::Val<kir::u32>& lane, std::uint32_t groups,
-               std::uint32_t wave, const kir::LValue<kir::f32>& acc) {
+               std::uint32_t wave, std::span<const kir::LValue<kir::f32>> acc) {
   for (auto g : e.range(lane, e.u32(groups), wave)) {
-    acc = math::fma(math::widen(a.biases[scale_base + g]), q.sum[g].read(),
-                    acc.read());
+    const auto b = e.let(math::widen(a.biases[scale_base + g]));
+    for (std::size_t r = 0; r < acc.size(); ++r) {
+      acc[r] = math::fma(b, q[r].sum[g].read(), acc[r].read());
+    }
   }
 }
 
@@ -456,7 +515,6 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   const auto wave_id = e.let(lid / wave);
   const auto lane = e.let(lid % wave);
   const auto tile = e.let(math::workgroup_id_x());
-  const auto row = e.let(math::workgroup_id_y());
   const auto col = e.let(tile * waves + wave_id);
 
   // The integer path, when the device has the instruction and the quantized
@@ -467,6 +525,17 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
       s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
   const bool dot = dot_ok(s, d, wave, cpl) &&
                    (quant_hoisted || kb.lds().fits(dot_lds_bytes(d)));
+  // Exactly what plan_impl sized the grid and the scratch for, and it cannot
+  // depend on anything plan_impl does not see. Deciding it from the hoisted
+  // panel instead left the grid covering m/R rows while each workgroup wrote
+  // one, so most rows were never computed at all.
+  const std::uint32_t rows =
+      rows_per_group(d, dot, Indexed<A>, workgroup_lds_bytes(s.device));
+  // A hoisted panel, of either kind, holds the one row its workgroup owned. A
+  // workgroup covering several cannot read its siblings' activations out of
+  // it, so it reads them from global and stages its own.
+  const bool use_hoisted = quant_hoisted && rows == 1;
+  const auto row = e.let(math::workgroup_id_y() * rows);
 
   // A fused run stages the shared row once, ahead of every sibling's body;
   // `s.staged` is that panel. Otherwise this body owns the staging — except on
@@ -474,7 +543,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   // than widening the row into scratch first.
   kir::Tile<kir::f32> xs;
   bool fill = false;
-  if (s.staged.count == k && !s.staged.name.empty()) {
+  if (rows == 1 && s.staged.count == k && !s.staged.name.empty()) {
     xs = kir::Tile<kir::f32>(&kb, &kb.types(), std::string(s.staged.name), k);
   } else if (!dot && e.lds_fits<kir::f32>(k)) {
     xs = e.lds<kir::f32>(k);
@@ -485,24 +554,40 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   // A run whose stages all quantize this row the same way hoists the int8 form
   // once, the way it already hoists the float row. Reading it costs this body
   // nothing: no tiles, no reduction, no barrier.
-  DotActs q;
+  std::vector<DotActs> q;
   if (dot) {
     const auto& sq = s.staged_quant;
-    if (quant_hoisted) {
-      q.codes = kir::Tile<kir::u32>(&kb, &kb.types(), std::string(sq.codes),
-                                    2 * nchunks);
-      q.scale =
+    if (use_hoisted) {
+      DotActs one;
+      one.codes = kir::Tile<kir::u32>(&kb, &kb.types(), std::string(sq.codes),
+                                      2 * nchunks);
+      one.scale =
           kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.scale), nchunks);
-      q.sum =
+      one.sum =
           kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.sum), groups);
+      q.push_back(one);
     } else {
-      q.codes = e.lds<kir::u32>(2 * nchunks);
-      q.scale = e.lds<kir::f32>(nchunks);
-      q.sum = e.lds<kir::f32>(groups);
+      // One allocation per kind, one view per row. The views share the
+      // declaration, so the scratch is what plan_impl sized and the rows sit
+      // contiguously rather than in `rows` separate arrays.
+      const auto codes = e.lds<kir::u32>(2 * nchunks * rows);
+      const auto scale = e.lds<kir::f32>(nchunks * rows);
+      const auto sum = e.lds<kir::f32>(groups * rows);
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        DotActs one;
+        one.codes = codes.slice(2 * nchunks * r, 2 * nchunks);
+        one.scale = scale.slice(nchunks * r, nchunks);
+        one.sum = sum.slice(groups * r, groups);
+        q.push_back(one);
+      }
     }
   }
+  const std::span<const DotActs> qs{q};
 
-  auto acc = e.var(0.0f);
+  std::vector<kir::LValue<kir::f32>> acc;
+  acc.reserve(rows);
+  for (std::uint32_t r = 0; r < rows; ++r) acc.push_back(e.var(0.0f));
+  const std::span<const kir::LValue<kir::f32>> accs{acc};
   if (auto in_grid = e.when(tile < ntiles && row < m)) {
     if (fill) {
       for (auto t : e.range(lid, e.u32(k), kBlock)) {
@@ -512,13 +597,22 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     }
     // Outside the column guard: every thread of the workgroup stages, and the
     // waves that own a column all read what they wrote.
-    if (dot && !quant_hoisted) {
-      // Zero on the staged arm; the row term otherwise. See the note on
-      // x_base below — it is the same rule, and this is now the only place
-      // the activation is read.
-      const auto x_base = e.let(stage ? e.u32(0) : row * k);
-      stage_dot_acts<A>(e, a, stage ? &xs : nullptr, x_base, q, lid, nchunks,
-                        chunks_per_group, device_load_bytes(s.device));
+    if (dot && !use_hoisted) {
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        // Zero on the staged arm; the row term otherwise. See the note on
+        // x_base below — it is the same rule, and this is now the only place
+        // the activation is read. A row past the end stages whatever the
+        // clamp lands on; its accumulator is never stored.
+        // Workgroup uniform: `row` comes from the workgroup id and `r` and
+        // `m` are constants, so the barrier inside is taken by all of the
+        // workgroup or none of it.
+        if (auto live = e.when(row + r < m)) {
+          const auto x_base = e.let(stage ? e.u32(0) : (row + r) * k);
+          stage_dot_acts<A>(e, a, stage ? &xs : nullptr, x_base, q[r], lid,
+                            nchunks, chunks_per_group,
+                            device_load_bytes(s.device));
+        }
+      }
     }
     if (auto in_cols = e.when(col < n)) {
       // The expert's matrix within the stack. `linear` and `linear_indexed`
@@ -539,12 +633,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
       for (auto c0 : e.range(0u, aligned, span)) {
         const auto chunk0 = e.let(c0 + lane * cpl);
         if (dot) {
-          emit_run_dot<A>(e, a, q, row_base, scale_base, chunk0, cpl, acc,
+          emit_run_dot<A>(e, a, qs, row_base, scale_base, chunk0, cpl, accs,
                           chunks_per_group);
         } else {
           for (std::uint32_t u = 0; u < cpl; ++u) {
             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
-                          scale_base, x_base, e.let(chunk0 + u), acc,
+                          scale_base, x_base, e.let(chunk0 + u), acc[0],
                           chunks_per_group);
           }
         }
@@ -552,29 +646,34 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
       if (aligned < nchunks) {
         for (auto chunk : e.range(e.u32(aligned) + lane, e.u32(nchunks), wave)) {
           if (dot) {
-            emit_run_dot<A>(e, a, q, row_base, scale_base, chunk, 1, acc,
+            emit_run_dot<A>(e, a, qs, row_base, scale_base, chunk, 1, accs,
                             chunks_per_group);
           } else {
             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
-                          scale_base, x_base, chunk, acc, chunks_per_group);
+                          scale_base, x_base, chunk, acc[0], chunks_per_group);
           }
         }
       }
       // The bias half of the algebra, once per group rather than once per
       // weight. The scale half rode the integer accumulator above.
       if (dot) {
-        emit_bias<A>(e, a, q, scale_base, lane, groups, wave, acc);
+        emit_bias<A>(e, a, qs, scale_base, lane, groups, wave, accs);
       }
     }
   }
 
   // Outside every guard: shfl_xor is wave-cooperative, and the guards above are
   // workgroup-uniform, so a wave that owns no column still has to take part.
-  for (std::uint32_t bit = 1; bit < wave; bit <<= 1) {
-    acc = acc.read() + math::shfl_xor(acc.read(), e.u32(bit));
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    for (std::uint32_t bit = 1; bit < wave; bit <<= 1) {
+      acc[r] = acc[r].read() + math::shfl_xor(acc[r].read(), e.u32(bit));
+    }
   }
-  if (auto lane0 = e.when(lane == 0 && col < n && row < m)) {
-    e.store(row * n + col, acc.read());
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    const auto rr = e.let(row + r);
+    if (auto lane0 = e.when(lane == 0 && col < n && rr < m)) {
+      e.store(rr * n + col, acc[r].read());
+    }
   }
   if (!kb.lds().ok()) return {};
   return kb.str();
@@ -689,7 +788,7 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     const QuantDims d = dims_of(s, false);
     return gemv_plan(d, wave_of(s.device), workgroup_lds_bytes(s.device),
-                     staged_bytes(s, d));
+                     staged_bytes(s, d, false), dot_rows(s, d, false));
   }
 };
 
@@ -744,7 +843,7 @@ struct QuantLinearIndexedKernel final
   static ThreadPlan plan_impl(const KernelShapes& s) {
     const QuantDims d = dims_of(s, true);
     return gemv_plan(d, wave_of(s.device), workgroup_lds_bytes(s.device),
-                     staged_bytes(s, d));
+                     staged_bytes(s, d, true), dot_rows(s, d, true));
   }
 };
 

@@ -91,7 +91,7 @@ std::vector<RowPanel> row_panels(const std::vector<IndexedStage>& stages,
       }
     }
     if (at == panels.size()) {
-      panels.push_back(RowPanel{act, st.row.count, st.row.rows, 0, {}});
+      panels.push_back(RowPanel{act, st.row.count, st.row.rows, 0, {}, {}, false, {}});
     }
     ++panels[at].members;
     panel_of[si] = at;

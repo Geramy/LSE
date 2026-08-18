@@ -404,6 +404,19 @@ class Tile {
     return body_ != nullptr;
   }
   [[nodiscard]] std::uint32_t size() const noexcept { return n_; }
+
+  // A view of `count` elements starting at `start` of the same allocation.
+  // No copy and no second declaration: the subscript is shifted and the
+  // extent narrowed, so writes through the view land in the original and a
+  // caller holding one region can hand it to something that wants a whole
+  // tile.
+  [[nodiscard]] Tile slice(std::uint32_t start,
+                           std::uint32_t count) const noexcept {
+    Tile t = *this;
+    t.off_ += start;
+    t.n_ = count;
+    return t;
+  }
   [[nodiscard]] const std::string& name() const noexcept {
     return ir_->value(id_).name;
   }
@@ -411,11 +424,17 @@ class Tile {
 
   template <typename I>
   [[nodiscard]] LValue<T> operator[](const Val<I>& index) const {
-    return {body_, tt_, ir_, detail::subscript<T>(ir_, id_, index.id())};
+    if (off_ == 0) {
+      return {body_, tt_, ir_, detail::subscript<T>(ir_, id_, index.id())};
+    }
+    return {body_, tt_, ir_,
+            detail::subscript<T>(ir_, id_, (index + off_).id())};
   }
   [[nodiscard]] LValue<T> operator[](int index) const {
     return {body_, tt_, ir_,
-            detail::subscript<T>(ir_, id_, detail::int_literal(ir_, index))};
+            detail::subscript<T>(
+                ir_, id_,
+                detail::int_literal(ir_, index + static_cast<int>(off_)))};
   }
 
  private:
@@ -424,6 +443,8 @@ class Tile {
   Body* ir_ = nullptr;
   ValueId id_ = kNoValue;
   std::uint32_t n_ = 0;
+  // Element this view starts at within the allocation `id_` names.
+  std::uint32_t off_ = 0;
 };
 
 // A local whose elements are addressable — a fragment register, in practice.
