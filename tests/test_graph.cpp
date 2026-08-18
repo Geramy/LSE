@@ -1,10 +1,19 @@
 #include "lse/graph/graph.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
+#include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
+
+#include <unistd.h>
 
 #include "harness.hpp"
 #include "lse/graph/interpreter.hpp"
@@ -1731,6 +1740,71 @@ QuantPlane quantize_plane(const quant::GroupAffine& q, std::int64_t n,
   return p;
 }
 
+// MLX's SwitchGLU layout: one plane of E * N rows, read as [E, N, lanes]. It is
+// quantize_plane over E * N rows and nothing more, which is the point — the
+// stack is not a new storage format, only a longer plane the kernel indexes
+// into. Rows must differ across experts as well as within one, or a kernel that
+// ignores the expert term passes.
+QuantPlane quantize_stack(const quant::GroupAffine& q, std::int64_t experts,
+                          std::int64_t n, std::int64_t k) {
+  return quantize_plane(q, experts * n, k);
+}
+
+// Reference contraction against what the codes encode: row `r` of `x` times the
+// matrix of expert `idx[r * keep + slot]`. Deliberately the same address
+// arithmetic the kernel uses, in double.
+std::vector<double> indexed_reference(const QuantPlane& p,
+                                      const std::vector<float>& x,
+                                      const std::vector<float>& idx,
+                                      std::int64_t rows, std::int64_t keep,
+                                      std::int64_t slot, std::int64_t n,
+                                      std::int64_t k,
+                                      std::vector<double>* magnitude) {
+  std::vector<double> want(static_cast<std::size_t>(rows * n), 0.0);
+  if (magnitude != nullptr) magnitude->assign(want.size(), 0.0);
+  for (std::int64_t r = 0; r < rows; ++r) {
+    const auto e =
+        static_cast<std::int64_t>(idx[static_cast<std::size_t>(r * keep + slot)]);
+    for (std::int64_t o = 0; o < n; ++o) {
+      const std::int64_t wrow = e * n + o;
+      double acc = 0.0, mag = 0.0;
+      for (std::int64_t c = 0; c < k; ++c) {
+        const double t =
+            static_cast<double>(x[static_cast<std::size_t>(r * k + c)]) *
+            static_cast<double>(
+                p.dequantized[static_cast<std::size_t>(wrow * k + c)]);
+        acc += t;
+        mag += std::fabs(t);
+      }
+      want[static_cast<std::size_t>(r * n + o)] = acc;
+      if (magnitude != nullptr) {
+        (*magnitude)[static_cast<std::size_t>(r * n + o)] = mag;
+      }
+    }
+  }
+  return want;
+}
+
+// The three planes of a stack as graph inputs, at the checkpoint's own widths.
+struct StackedArrays {
+  Array packed, scales, biases;
+};
+
+StackedArrays stacked_arrays(const QuantPlane& p, std::int64_t experts,
+                             std::int64_t n) {
+  StackedArrays a;
+  a.packed = packed_host_array(
+      p.packed,
+      Shape{experts, n, static_cast<std::int64_t>(p.lanes_per_row)});
+  a.scales = typed_host_array(
+      p.scales, Shape{experts, n, static_cast<std::int64_t>(p.groups_per_row)},
+      DType::kBF16);
+  a.biases = typed_host_array(
+      p.biases, Shape{experts, n, static_cast<std::int64_t>(p.groups_per_row)},
+      DType::kBF16);
+  return a;
+}
+
 }  // namespace
 
 // The whole point of the op: a weight that stays packed all the way to the
@@ -1889,6 +1963,353 @@ LSE_TEST(quant_linear_row_survives_the_unstaged_path) {
       LSE_EXPECT(!duplicates_row0);
     }
   }
+}
+
+// The indexed form against every width MLX emits. Two things have to hold at
+// once and each hides the other's failure: the contraction must equal the
+// weights the codes encode (the quant half) and it must be the *selected*
+// expert's weights (the index half). A kernel that always read expert 0 would
+// pass a test whose rows all route to expert 0, and a kernel that decoded at
+// the wrong width would pass a test that only compared expert ids.
+LSE_TEST(quant_linear_indexed_matches_the_expert_it_selects) {
+  constexpr std::int64_t kExperts = 6;
+  constexpr std::int64_t kN = 24;
+  constexpr std::int64_t kK = 128;
+  constexpr std::int64_t kRows = 5;
+  constexpr std::int64_t kKeep = 3;
+
+  // Row r routes to a different expert in every slot, and no two rows share a
+  // slot's expert. Expert 0 appears only in row 4's last slot, so a body that
+  // dropped the index term reads a matrix nothing else asks for.
+  const std::vector<float> idx{
+      5, 3, 1,  //
+      2, 4, 3,  //
+      1, 5, 4,  //
+      4, 2, 5,  //
+      3, 1, 0,  //
+  };
+
+  for (int bits : {2, 3, 4, 5, 6, 8}) {
+    auto spec = quant::GroupAffine::make(bits, 64);
+    LSE_EXPECT(spec.ok());
+    if (!spec.ok()) continue;
+    const QuantPlane p = quantize_stack(*spec, kExperts, kN, kK);
+
+    std::vector<float> x(static_cast<std::size_t>(kRows * kK));
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      x[i] = 0.1f * spread(static_cast<std::uint64_t>(i) + (1ull << 33));
+    }
+
+    Array xa = host_array(x, Shape{kRows, kK});
+    const StackedArrays w = stacked_arrays(p, kExperts, kN);
+    Array ia = host_array(idx, Shape{kRows, kKeep});
+    // The stack reached the graph as a rank-3 u32 plane; nothing widened it and
+    // nothing unstacked it.
+    LSE_EXPECT(w.packed.dtype() == DType::kU32);
+    LSE_EXPECT(w.packed.shape().rank() == 3u);
+
+    for (std::int64_t slot = 0; slot < kKeep; ++slot) {
+      Array got = quant_linear_indexed(xa, w.packed, w.scales, w.biases, ia,
+                                       static_cast<int>(slot), bits, 64);
+      LSE_EXPECT(got.node()->kind == OpKind::kMoEDispatch);
+      LSE_EXPECT(got.node()->inputs.size() == 5u);
+      LSE_EXPECT(got.shape() == (Shape{kRows, kN}));
+
+      const std::vector<float> g = drain(got);
+      LSE_EXPECT_EQ(g.size(), static_cast<std::size_t>(kRows * kN));
+      if (g.size() != static_cast<std::size_t>(kRows * kN)) continue;
+
+      std::vector<double> mag;
+      const std::vector<double> want = indexed_reference(
+          p, x, idx, kRows, kKeep, slot, kN, kK, &mag);
+      for (std::size_t i = 0; i < want.size(); ++i) {
+        LSE_EXPECT_NEAR(g[i], want[i], 1e-6 + 1e-6 * mag[i]);
+      }
+
+      // And it is not some other expert's answer that happens to be close: the
+      // same row against the wrong expert must differ everywhere.
+      for (std::int64_t r = 0; r < kRows; ++r) {
+        const auto e =
+            static_cast<std::int64_t>(idx[static_cast<std::size_t>(
+                r * kKeep + slot)]);
+        const std::int64_t other = (e + 1) % kExperts;
+        std::vector<float> wrong_idx(idx.size(), static_cast<float>(other));
+        const std::vector<double> wrong = indexed_reference(
+            p, x, wrong_idx, kRows, kKeep, slot, kN, kK, nullptr);
+        bool all_close = true;
+        for (std::int64_t o = 0; o < kN && all_close; ++o) {
+          const auto i = static_cast<std::size_t>(r * kN + o);
+          all_close = std::fabs(static_cast<double>(g[i]) - wrong[i]) <
+                      1e-6 + 1e-6 * mag[i];
+        }
+        LSE_EXPECT(!all_close);
+      }
+    }
+  }
+}
+
+// The row-offset hazard, one op over. quant_linear shipped with the row term
+// missing on its unstaged arm and every prefill token came out as token 0 —
+// fluent, and uniformly wrong. The indexed body is the same two index
+// expressions (zero against a staged panel, `row * K` against global memory)
+// so it carries the identical hazard, and only a K on each side of the LDS
+// budget covers both. Routing makes it worse here than there: each row also
+// reads a different expert, so a dropped row term silently contracts row 0
+// against row r's expert.
+LSE_TEST(quant_linear_indexed_row_survives_the_unstaged_path) {
+  Scheduler* sc = default_scheduler();
+  const std::uint32_t lds =
+      sc != nullptr ? sc->backend().device_info().lds_bytes_per_workgroup : 0;
+
+  constexpr int kBits = 8;
+  constexpr std::int64_t kGroup = 64;
+  constexpr std::int64_t kExperts = 4;
+  constexpr std::int64_t kN = 16;
+  constexpr std::int64_t kRows = 5;
+  constexpr std::int64_t kKeep = 2;
+  constexpr std::int64_t kSlot = 1;
+
+  // Smallest multiple of the group size past `lds_bytes / 4`: the first K that
+  // cannot stage, which is the narrowest crossing of the boundary.
+  const std::int64_t unstaged =
+      lds != 0 ? (static_cast<std::int64_t>(lds / 4) / kGroup + 1) * kGroup
+               : std::int64_t{20480};
+
+  auto spec = quant::GroupAffine::make(kBits, kGroup);
+  LSE_EXPECT(spec.ok());
+  if (!spec.ok()) return;
+
+  // Every row a different expert, so row confusion and expert confusion cannot
+  // cancel into a right answer.
+  const std::vector<float> idx{0, 3, 1, 2, 2, 1, 3, 0, 0, 2};
+
+  for (const std::int64_t k : {std::int64_t{640}, unstaged}) {
+    const QuantPlane p = quantize_stack(*spec, kExperts, kN, k);
+
+    std::vector<float> x(static_cast<std::size_t>(kRows * k));
+    for (std::int64_t r = 0; r < kRows; ++r) {
+      for (std::int64_t c = 0; c < k; ++c) {
+        x[static_cast<std::size_t>(r * k + c)] =
+            0.1f * spread(static_cast<std::uint64_t>(r * k + c) + (1ull << 41));
+      }
+    }
+
+    Array xa = host_array(x, Shape{kRows, k});
+    const StackedArrays w = stacked_arrays(p, kExperts, kN);
+    Array ia = host_array(idx, Shape{kRows, kKeep});
+
+    Array got = quant_linear_indexed(xa, w.packed, w.scales, w.biases, ia,
+                                     static_cast<int>(kSlot), kBits, kGroup);
+    const std::vector<float> g = drain(got);
+    LSE_EXPECT_EQ(g.size(), static_cast<std::size_t>(kRows * kN));
+    if (g.size() != static_cast<std::size_t>(kRows * kN)) return;
+
+    // A silent host fallback would make this a no-op on the one path it exists
+    // to guard.
+    if (sc != nullptr && sc->backend().emitter() != nullptr) {
+      LSE_EXPECT_EQ(sc->last_trace().host_fallbacks, 0u);
+      LSE_EXPECT_EQ(sc->last_trace().host_groups, 0u);
+    }
+
+    std::vector<double> mag;
+    const std::vector<double> want =
+        indexed_reference(p, x, idx, kRows, kKeep, kSlot, kN, k, &mag);
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      LSE_EXPECT_NEAR(g[i], want[i], 1e-6 + 1e-6 * mag[i]);
+    }
+
+    // The exact shape of the original failure, named separately so a regression
+    // says which invariant broke. Rows 0 and 4 route to the same expert, so a
+    // dropped row term makes them identical while every other pair still
+    // differs by its expert.
+    bool duplicates_row0 = true;
+    for (std::int64_t o = 0; o < kN && duplicates_row0; ++o) {
+      duplicates_row0 = g[static_cast<std::size_t>(4 * kN + o)] ==
+                        g[static_cast<std::size_t>(o)];
+    }
+    LSE_EXPECT(!duplicates_row0);
+  }
+}
+
+// The device kernel against the host reference, on the same graph and the same
+// bytes. This is the only oracle a mis-decoded router has: the interpreter's
+// arm addresses the stack in place exactly as the emitted body does, so a
+// disagreement is a decode bug rather than a layout one. Reported as a
+// magnitude-relative worst case, because a plain absolute difference at K in
+// the thousands says more about float32 than about the kernel.
+LSE_TEST(quant_linear_indexed_agrees_with_the_host_reference) {
+  Scheduler* sc = default_scheduler();
+  if (sc == nullptr || sc->backend().emitter() == nullptr) return;
+
+  constexpr std::int64_t kExperts = 8;
+  constexpr std::int64_t kN = 32;
+  constexpr std::int64_t kK = 512;  // the 35B's hidden_size
+  constexpr std::int64_t kRows = 4;
+  constexpr std::int64_t kKeep = 2;
+  const std::vector<float> idx{7, 2, 0, 5, 3, 6, 6, 1};
+
+  // 6 and 8 bits are the two widths the MoE checkpoints actually store, and in
+  // the 6-bit one they appear together: experts at 6, routers overridden to 8.
+  for (int bits : {6, 8}) {
+    auto spec = quant::GroupAffine::make(bits, 64);
+    LSE_EXPECT(spec.ok());
+    if (!spec.ok()) continue;
+    const QuantPlane p = quantize_stack(*spec, kExperts, kN, kK);
+
+    std::vector<float> x(static_cast<std::size_t>(kRows * kK));
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      x[i] = 0.1f * spread(static_cast<std::uint64_t>(i) + (1ull << 37));
+    }
+
+    for (std::int64_t slot = 0; slot < kKeep; ++slot) {
+      const auto run = [&](Scheduler::Mode mode) {
+        const auto prev = sc->mode();
+        sc->set_mode(mode);
+        Array xa = host_array(x, Shape{kRows, kK});
+        const StackedArrays w = stacked_arrays(p, kExperts, kN);
+        Array ia = host_array(idx, Shape{kRows, kKeep});
+        Array got = quant_linear_indexed(xa, w.packed, w.scales, w.biases, ia,
+                                         static_cast<int>(slot), bits, 64);
+        std::vector<float> out = drain(got);
+        const std::uint64_t fallbacks = sc->last_trace().host_fallbacks;
+        sc->set_mode(prev);
+        // The device run must really have gone to the device, or the two sides
+        // are the same code and the comparison is vacuous.
+        if (mode != Scheduler::Mode::kHostOnly) LSE_EXPECT_EQ(fallbacks, 0u);
+        return out;
+      };
+      const std::vector<float> dev = run(Scheduler::Mode::kDeviceFirst);
+      const std::vector<float> host = run(Scheduler::Mode::kHostOnly);
+      LSE_EXPECT_EQ(dev.size(), host.size());
+      if (dev.size() != host.size()) continue;
+
+      std::vector<double> mag;
+      const std::vector<double> want =
+          indexed_reference(p, x, idx, kRows, kKeep, slot, kN, kK, &mag);
+
+      double worst_rel = 0.0, worst_dev = 0.0, worst_host = 0.0;
+      for (std::size_t i = 0; i < dev.size(); ++i) {
+        const double scale = mag[i] > 0.0 ? mag[i] : 1.0;
+        const double d = dev[i];
+        const double h = host[i];
+        worst_rel = std::max(worst_rel, std::fabs(d - h) / scale);
+        worst_dev = std::max(worst_dev, std::fabs(d - want[i]) / scale);
+        worst_host = std::max(worst_host, std::fabs(h - want[i]) / scale);
+      }
+      std::printf("       %d-bit slot %d: device-vs-host %.3e, "
+                  "device-vs-double %.3e, host-vs-double %.3e (K=%d)\n",
+                  bits, static_cast<int>(slot), worst_rel, worst_dev,
+                  worst_host, static_cast<int>(kK));
+      // Both sides sum the same terms in a different order in f32; the bound is
+      // the backward error of the dot product, relative to the sum of term
+      // magnitudes rather than to the cancelled result.
+      LSE_EXPECT(worst_rel < 1e-6);
+      LSE_EXPECT(worst_dev < 1e-6);
+      LSE_EXPECT(worst_host < 1e-6);
+    }
+  }
+}
+
+// A stacked weight carrying its own planes picks the routed quantized
+// contraction, the way a rank-2 one picks quant_linear. That is the seam:
+// ops::routed_experts says linear_indexed once and the storage format decides,
+// so no model file learns a second spelling.
+LSE_TEST(a_stacked_group_affine_weight_picks_its_own_contraction) {
+  constexpr std::int64_t kExperts = 4, kN = 8, kK = 64;
+  constexpr int kBits = 6, kGroup = 64;
+  const std::int64_t lanes = kK * kBits / 32;
+
+  Array x = host_array(std::vector<float>(kK, 0.5f), Shape{1, kK});
+  Array packed = packed_host_array(
+      std::vector<std::uint32_t>(
+          static_cast<std::size_t>(kExperts * kN * lanes), 0u),
+      Shape{kExperts, kN, lanes});
+  Array sa = typed_host_array(
+      std::vector<float>(static_cast<std::size_t>(kExperts * kN), 1.0f),
+      Shape{kExperts, kN, 1}, DType::kBF16);
+  auto planes = std::make_shared<QuantPlanes>();
+  planes->scales = sa.node();
+  planes->biases = sa.node();
+  planes->bits = kBits;
+  planes->group_size = kGroup;
+  planes->in_features = kK;
+  packed.node()->quant = planes;
+
+  // The expert axis survives: only the last axis of the plane counts lanes, so
+  // a config check against {experts, out, in} can still be made.
+  LSE_EXPECT(weight_shape(packed) == (Shape{kExperts, kN, kK}));
+
+  Array idx = host_array({2.0f, 0.0f}, Shape{1, 2});
+  Array y = linear_indexed(x, packed, idx, 0);
+  LSE_EXPECT(y.node()->kind == OpKind::kMoEDispatch);
+  LSE_EXPECT(y.node()->inputs.size() == 5u);
+  // iattrs[0] stays the slot, as it is for the dense form; the geometry follows
+  // it. All four are mixed into the emitted device function's name, which is
+  // what gives a 6-bit expert and an 8-bit router distinct bodies.
+  LSE_EXPECT_EQ(y.node()->iattrs[0], 0);
+  LSE_EXPECT_EQ(y.node()->iattrs[1], kBits);
+  LSE_EXPECT_EQ(y.node()->iattrs[2], kGroup);
+
+  // A dense stack still takes the dense op: the fork is on the weight, not on
+  // a flag the caller sets.
+  Array dense = host_array(
+      std::vector<float>(static_cast<std::size_t>(kExperts * kN * kK), 0.25f),
+      Shape{kExperts, kN, kK});
+  Array d = linear_indexed(x, dense, idx, 0);
+  LSE_EXPECT(d.node()->kind == OpKind::kMoEDispatch);
+  LSE_EXPECT(d.node()->inputs.size() == 3u);
+}
+
+// The 6-bit checkpoint's landmine end to end: 80 modules are overridden to 8
+// bits and the rest are 6, so two contractions in the same layer must carry
+// different geometry. Mis-decoding a router permutes which experts win and the
+// model still reads fluently, so the only place this can be caught is here.
+LSE_TEST(an_overridden_width_reaches_the_routed_contraction) {
+  constexpr std::int64_t kExperts = 4, kN = 8, kK = 64;
+  Array x = host_array(std::vector<float>(kK, 0.5f), Shape{1, kK});
+  Array idx = host_array({1.0f}, Shape{1, 1});
+
+  const auto build = [&](int bits) {
+    const std::int64_t lanes = kK * bits / 32;
+    Array packed = packed_host_array(
+        std::vector<std::uint32_t>(
+            static_cast<std::size_t>(kExperts * kN * lanes), 0u),
+        Shape{kExperts, kN, lanes});
+    Array sa = typed_host_array(
+        std::vector<float>(static_cast<std::size_t>(kExperts * kN), 1.0f),
+        Shape{kExperts, kN, 1}, DType::kBF16);
+    auto planes = std::make_shared<QuantPlanes>();
+    planes->scales = sa.node();
+    planes->biases = sa.node();
+    planes->bits = bits;
+    planes->group_size = 64;
+    planes->in_features = kK;
+    packed.node()->quant = planes;
+    return linear_indexed(x, packed, idx, 0);
+  };
+
+  Array at6 = build(6);
+  Array at8 = build(8);
+  LSE_EXPECT_EQ(at6.node()->iattrs[1], 6);
+  LSE_EXPECT_EQ(at8.node()->iattrs[1], 8);
+  // Same logical shape from two different plane widths, which is what the
+  // shapes-vs-config cross-check in the loader depends on.
+  LSE_EXPECT(at6.shape() == at8.shape());
+  LSE_EXPECT(at6.node()->inputs[1]->shape.dim(2) == 12);
+  LSE_EXPECT(at8.node()->inputs[1]->shape.dim(2) == 16);
+
+  // A plane whose lane count solves to a different width than the attrs claim
+  // is refused rather than run at the claimed one — the case an ignored
+  // override produces.
+  Array wrong = packed_host_array(
+      std::vector<std::uint32_t>(
+          static_cast<std::size_t>(kExperts * kN * 12), 0u),
+      Shape{kExperts, kN, 12});
+  Array sa = typed_host_array(
+      std::vector<float>(static_cast<std::size_t>(kExperts * kN), 1.0f),
+      Shape{kExperts, kN, 1}, DType::kBF16);
+  Array bad = quant_linear_indexed(x, wrong, sa, sa, idx, 0, 8, 64);
+  LSE_EXPECT(!bad.eval().ok());
 }
 
 // The gather half of the same op. A tied head reads this table as a matrix and
@@ -2112,6 +2533,248 @@ LSE_TEST(a_scheduler_over_a_bare_backend_is_the_set_that_backend_is) {
   LSE_EXPECT_EQ(sched.devices().size(), std::size_t{1});
   LSE_EXPECT(&sched.backend() == be->get());
   LSE_EXPECT(sched.devices().residency(0) == (*be)->device_index());
+}
+
+
+// ---------------------------------------------------------------------------
+// The timing report. Two defects motivated these: partition_ns bracketed the
+// whole dispatch loop and so contained emit, compile and submit, and emit_ns
+// bracketed the JIT and so contained compile. Both made the report sum to more
+// than the step it described, and the second made a cold run's "emit" 98% a
+// compile that was also printed on its own line.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::uint64_t attributed_span_ns(const Scheduler::Trace::Spans& s) {
+  return s.partition.ns + s.schedule.ns + s.emit.ns + s.jit_lookup.ns +
+         s.jit_compile.ns + s.bind.ns + s.submit.ns + s.host_wait.ns +
+         s.readback.ns + s.host_exec.ns;
+}
+
+// Every host span in the engine is steady_clock, and each number says so on its
+// own rather than by convention.
+void expect_all_host_steady(const Scheduler::Trace::Spans& s) {
+  const backend::ClockDomain host = backend::ClockDomain::kHostSteady;
+  LSE_EXPECT(s.partition.clock == host);
+  LSE_EXPECT(s.schedule.clock == host);
+  LSE_EXPECT(s.emit.clock == host);
+  LSE_EXPECT(s.jit_lookup.clock == host);
+  LSE_EXPECT(s.jit_compile.clock == host);
+  LSE_EXPECT(s.bind.clock == host);
+  LSE_EXPECT(s.submit.clock == host);
+  LSE_EXPECT(s.host_wait.clock == host);
+  LSE_EXPECT(s.readback.clock == host);
+  LSE_EXPECT(s.host_exec.clock == host);
+  LSE_EXPECT(s.step.clock == host);
+  LSE_EXPECT(s.unattributed.clock == host);
+}
+
+}  // namespace
+
+LSE_TEST(the_spans_of_a_step_do_not_overlap_and_the_remainder_is_reported) {
+  Scheduler* sched = default_scheduler();
+  if (sched == nullptr) {
+    std::printf("       no scheduler: skipped\n");
+    return;
+  }
+  Array x = Array::full(Shape{1, 64}, DType::kF32, 1.0f);
+  Array w = Array::full(Shape{64, 64}, DType::kF32, 0.01f);
+  Array y = silu(linear(x, w));
+  LSE_EXPECT_OK(y.eval());
+
+  const Scheduler::Trace::Spans& s = sched->last_trace().spans;
+  expect_all_host_steady(s);
+
+  // The step happened, so it took time.
+  LSE_EXPECT(s.step.ns > 0);
+  // DISJOINT: the parts plus the reported remainder are the step exactly. Under
+  // the old counters this identity was off by the whole of emit + launch, which
+  // partition_ns also contained.
+  const std::uint64_t parts = attributed_span_ns(s);
+  LSE_EXPECT_EQ(parts + s.unattributed.ns, s.step.ns);
+  // Which also means no single span can exceed the step it sits in.
+  LSE_EXPECT(s.partition.ns <= s.step.ns);
+  LSE_EXPECT(s.emit.ns <= s.step.ns);
+  LSE_EXPECT(s.jit_compile.ns <= s.step.ns);
+  LSE_EXPECT(s.host_wait.ns <= s.step.ns);
+
+  std::printf("       step=%.3f ms attributed=%.3f unattributed=%.3f (%.1f%%)\n",
+              s.step.seconds() * 1e3,
+              static_cast<double>(parts) * 1e-6,
+              s.unattributed.seconds() * 1e3,
+              100.0 * static_cast<double>(s.unattributed.ns) /
+                  static_cast<double>(s.step.ns));
+}
+
+// The other exit: a host-only step never reaches the phase dispatch loop, so it
+// closes its pre-dispatch region at Partitioner::partition instead and spends
+// its time in the interpreter. Both paths have to balance, and the interpreter's
+// time has to be a span rather than an unexplained remainder.
+LSE_TEST(a_host_only_step_balances_too_and_names_its_interpreter_time) {
+  auto be = backend::create_backend("cpu");
+  LSE_EXPECT(be.ok());
+  if (!be.ok()) return;
+  LSE_EXPECT_OK((*be)->init(0));
+
+  Scheduler sched(**be);
+  sched.set_mode(Scheduler::Mode::kHostOnly);
+  Array x = Array::full(Shape{256}, DType::kF32, 1.5f);
+  Array y = silu(x + x) * x;
+  const NodePtr roots[] = {y.node()};
+  LSE_EXPECT_OK(sched.eval(roots, true));
+
+  const Scheduler::Trace::Spans& s = sched.last_trace().spans;
+  expect_all_host_steady(s);
+  LSE_EXPECT_EQ(attributed_span_ns(s) + s.unattributed.ns, s.step.ns);
+  // Nothing was emitted, compiled or submitted on this path.
+  LSE_EXPECT_EQ(s.emit.ns, std::uint64_t{0});
+  LSE_EXPECT_EQ(s.jit_compile.ns, std::uint64_t{0});
+  LSE_EXPECT_EQ(s.submit.ns, std::uint64_t{0});
+  LSE_EXPECT_EQ(s.host_wait.ns, std::uint64_t{0});
+  // The interpreter ran, and it is named rather than left in the remainder.
+  LSE_EXPECT(s.host_exec.ns > 0);
+  LSE_EXPECT(s.partition.ns > 0);
+  std::printf("       host-only step=%.3f ms partition=%.3f host_exec=%.3f "
+              "unattributed=%.3f\n",
+              s.step.seconds() * 1e3, s.partition.seconds() * 1e3,
+              s.host_exec.seconds() * 1e3, s.unattributed.seconds() * 1e3);
+}
+
+LSE_TEST(a_cold_compile_is_charged_to_compile_and_never_to_emit) {
+  // The JIT reads LSE_CACHE_DIR when a JitCache is built, which is the first
+  // time a scheduler dispatches. So this needs a scheduler of its own over a
+  // fresh directory; deleting the cache the rest of the suite shares would make
+  // every later case pay for it.
+  auto be = backend::create_default_backend();
+  if (!be.ok()) {
+    std::printf("       no backend: skipped\n");
+    return;
+  }
+  auto owned = be.release();
+  if (const Status up = owned->init(0); !up.ok()) {
+    std::printf("       backend declined: %s\n", up.message().c_str());
+    return;
+  }
+  if (owned->emitter() == nullptr || owned->compiler() == nullptr ||
+      !owned->compiler()->available()) {
+    std::printf("       no device compiler: skipped\n");
+    return;
+  }
+
+  const std::string dir = "/tmp/lse-cold-spans-" + std::to_string(::getpid());
+  std::string saved;
+  const bool had = std::getenv("LSE_CACHE_DIR") != nullptr;
+  if (had) saved = std::getenv("LSE_CACHE_DIR");
+  ::setenv("LSE_CACHE_DIR", dir.c_str(), 1);
+
+  Scheduler cold(*owned);
+  // A shape the shared cache is unlikely to hold, so the compile is real even
+  // if the fresh directory somehow is not.
+  Array x = Array::full(Shape{1, 37}, DType::kF32, 1.0f);
+  Array y = silu(x + x) * x;
+  const NodePtr roots[] = {y.node()};
+  const Status ran = cold.eval(roots, true);
+
+  if (had) ::setenv("LSE_CACHE_DIR", saved.c_str(), 1);
+  else ::unsetenv("LSE_CACHE_DIR");
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+
+  LSE_EXPECT_OK(ran);
+  if (!ran.ok()) return;
+
+  const Scheduler::Trace::Spans& s = cold.last_trace().spans;
+  const Scheduler::JitStats jit = cold.jit_stats();
+  expect_all_host_steady(s);
+  LSE_EXPECT_EQ(attributed_span_ns(s) + s.unattributed.ns, s.step.ns);
+
+  // jit_compile is the JitCache's own measurement, not a second reading of it.
+  LSE_EXPECT_EQ(s.jit_compile.ns, jit.compile_ns);
+  std::printf("       compiles=%llu compile=%.3f ms emit=%.3f ms "
+              "jit_lookup=%.3f ms step=%.3f ms\n",
+              static_cast<unsigned long long>(jit.compiles),
+              s.jit_compile.seconds() * 1e3, s.emit.seconds() * 1e3,
+              s.jit_lookup.seconds() * 1e3, s.step.seconds() * 1e3);
+
+  if (jit.compiles == 0) {
+    std::printf("       nothing compiled (warm disk): containment still holds\n");
+    return;
+  }
+  LSE_EXPECT(s.jit_compile.ns > 0);
+  // The point of the change. Emitting HIP text is microseconds; comgr is tens
+  // of milliseconds. While compile was nested inside emit, emit could never be
+  // the smaller of the two, and on a cold prefill it read as 98.5% compile.
+  LSE_EXPECT(s.emit.ns < s.jit_compile.ns);
+  // And it is not hiding in the lookup span either.
+  LSE_EXPECT(s.emit.ns + s.jit_lookup.ns + s.jit_compile.ns <= s.step.ns);
+}
+
+LSE_TEST(the_wait_span_is_host_scoped_and_invents_no_device_duration) {
+  Scheduler* sched = default_scheduler();
+  if (sched == nullptr) {
+    std::printf("       no scheduler: skipped\n");
+    return;
+  }
+  Array x = Array::full(Shape{1, 64}, DType::kF32, 2.0f);
+  Array y = silu(x + x);
+  LSE_EXPECT_OK(y.eval());
+
+  const Scheduler::Trace& t = sched->last_trace();
+  // The blocking wait is host wall and says so.
+  LSE_EXPECT(t.spans.host_wait.clock == backend::ClockDomain::kHostSteady);
+  // The device interval that wait contains is UNKNOWN, and asking for it is a
+  // refusal rather than the host number wearing a device label.
+  LSE_EXPECT(!t.device_exec.known());
+  auto device = t.device_exec.duration_ns();
+  LSE_EXPECT(!device.ok());
+  std::printf("       device_exec: %s\n", device.status().message().c_str());
+
+  // A backend may publish its clock and still be unable to read a tick. That
+  // is two questions, and the published clock must not become a duration.
+  auto clock = sched->backend().device_clock();
+  if (clock.ok()) {
+    std::printf("       backend clock: %s %llu Hz %u bits ordinal %u\n",
+                std::string(backend::clock_domain_name(clock->domain)).c_str(),
+                static_cast<unsigned long long>(clock->ticks_per_second),
+                static_cast<unsigned>(clock->valid_bits),
+                static_cast<unsigned>(clock->ordinal));
+    LSE_EXPECT(clock->known());
+    LSE_EXPECT(!t.device_exec.duration_ns().ok());
+  }
+}
+
+LSE_TEST(the_span_split_costs_one_clock_read_per_boundary) {
+  // The split reads steady_clock five times per fusion group where the four old
+  // counters read four: emit open, emit close / jit open, jit close / bind open,
+  // bind close / submit open, submit close. Adjacent spans share the tick
+  // between them, so the added cost is exactly one read per group.
+  constexpr int kReps = 200'000;
+  std::uint64_t sink = 0;
+  double best = 1e30;
+  for (int trial = 0; trial < 5; ++trial) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kReps; ++i) {
+      sink += static_cast<std::uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    const double ns =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count()) /
+        kReps;
+    best = std::min(best, ns);
+  }
+  LSE_EXPECT(sink != 0);
+  // 315 fusion groups is one lemonseed decode token.
+  const double per_token_us = best * 315.0 * 1e-3;
+  std::printf("       steady_clock::now() = %.1f ns (best of 5 x %d); "
+              "+1 read/group = %.1f us per 315-group token\n",
+              best, kReps, per_token_us);
+  // A decode token is ~9 ms. 100 us of added instrumentation would be ~1%,
+  // which is the line this must stay well under.
+  LSE_EXPECT(per_token_us < 100.0);
 }
 
 LSE_TEST_MAIN()

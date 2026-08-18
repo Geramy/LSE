@@ -12,6 +12,11 @@ add_library(lse_backend_hrx
   hipc/phase_emit.cpp
   hipc/hip_sources.cpp
   hipc/comgr_compiler.cpp
+  loomc/loomc_compiler.cpp
+  loomc/loom_types.cpp
+  loomc/loom_sources.cpp
+  loomc/loom_print.cpp
+  loomc/loom_emitter.cpp
   trace.cpp
   kernels/matmul.cpp
   kernels/reduction.cpp
@@ -61,6 +66,25 @@ if(LSE_HAVE_COMGR)
   target_link_libraries(lse_backend_hrx PUBLIC ${LSE_COMGR_LIBRARY})
 else()
   target_compile_definitions(lse_backend_hrx PUBLIC LSE_HAVE_COMGR=0)
+endif()
+
+if(LSE_HAVE_LOOMC)
+  target_compile_definitions(lse_backend_hrx PUBLIC LSE_HAVE_LOOMC=1)
+  # SYSTEM so loomc's headers are not held to this project's warning flags, and
+  # the installed library rather than a rebuild: libloomc exports only loomc_*,
+  # statically absorbs its own IREE and pulls in no LLVM, ROCm or HSA, so it
+  # sits beside libhrx with nothing to reconcile.
+  target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_LOOMC_INCLUDE_DIR})
+  target_link_libraries(lse_backend_hrx PUBLIC ${LSE_LOOMC_LIBRARY})
+  target_compile_definitions(lse_backend_hrx PUBLIC LOOMC_USING_SHARED_LIBRARY)
+  # loomc publishes no version query and its .so carries no build-id note, so
+  # identity() stats the resolved library to notice a rebuild at the same
+  # version. Both are baked, not searched for, at runtime.
+  target_compile_definitions(lse_backend_hrx PRIVATE
+    LSE_LOOMC_VERSION="${LSE_LOOMC_VERSION}"
+    LSE_LOOMC_LIBRARY_PATH="${LSE_LOOMC_LIBRARY}")
+else()
+  target_compile_definitions(lse_backend_hrx PUBLIC LSE_HAVE_LOOMC=0)
 endif()
 
 if(LSE_HRX_LIBRARY)

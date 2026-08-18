@@ -1,8 +1,11 @@
 // Emitter -> comgr -> code object. Runs the full JIT path when ROCm is
 // present; the source-shape checks run everywhere.
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -14,12 +17,16 @@
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
 #include "lse/core/debug.hpp"
+#include "lse/backends/cpu/cpu_backend.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
-#include "lse/backends/hrx/comgr_compiler.hpp"
+#include "lse/backends/hrx/hrx_backend.hpp"
+#include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/hip_emitter.hpp"
-#include "lse/backends/hrx/hip_sources.hpp"
-#include "lse/backends/hrx/hip_types.hpp"
+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
+#include "lse/backends/hrx/hipc/hip_sources.hpp"
+#include "lse/backends/hrx/hipc/hip_types.hpp"
+#include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 #include "lse/backends/hrx/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -81,6 +88,75 @@ backend::DeviceInfo gfx1151() {
 
 const backend::HipEmitter kEmitter;
 const backend::ComgrCompiler kCompiler;
+const backend::LoomcCompiler kLoom;
+
+// A complete Loom kernel for one concrete matmul shape: one thread per output
+// element, a sequential fmaf walk over K. Bit-exact against the HIP kernel for
+// the same shape, so it is the fixture the loom half of the toolchain is
+// checked against.
+std::string loom_matmul_source(int m, int k, int n, unsigned threads) {
+  const auto elems = static_cast<unsigned>(m * n);
+  const std::string md = std::to_string(m);
+  const std::string kd = std::to_string(k);
+  const std::string nd = std::to_string(n);
+  const std::string xt = "view<" + md + "x" + kd + "xf32, #dense>";
+  const std::string yt = "view<" + kd + "x" + nd + "xf32, #dense>";
+  const std::string ot = "view<" + md + "x" + nd + "xf32, #dense>";
+  std::string s;
+  s += "kernel.def export(\"lse_matmul_loom\") @lse_matmul_loom() {\n";
+  s += "  %unit = index.constant 1 : index\n";
+  s += "  %wg = index.constant " + std::to_string(threads) + " : index\n";
+  s += "  %groups = index.constant " +
+       std::to_string((elems + threads - 1) / threads) + " : index\n";
+  s += "  kernel.launch.config workgroups(%groups, %unit, %unit) "
+       "workgroup_size(%wg, %unit, %unit) : index\n";
+  s += "} launch(%x: buffer, %y: buffer, %out: buffer, %count: i32) {\n";
+  s += "  %base = index.constant 0 : offset\n";
+  s += "  %zero = index.constant 0 : index\n";
+  s += "  %unit = index.constant 1 : index\n";
+  s += "  %wg = index.constant " + std::to_string(threads) + " : index\n";
+  s += "  %kdim = index.constant " + kd + " : index\n";
+  s += "  %cols = index.constant " + nd + " : index\n";
+  s += "  %zero_f32 = scalar.constant 0.0 : f32\n";
+  s += "  %group = kernel.workgroup.id<x> : index\n";
+  s += "  %lane = kernel.workitem.id<x> : index\n";
+  s += "  %i = index.madd %group, %wg, %lane : index\n";
+  s += "  %elems = index.constant " + std::to_string(elems) + " : index\n";
+  s += "  %limit0 = index.cast %count : i32 to index\n";
+  s += "  %limit = index.assume %limit0 [range(%limit0, 0, " +
+       std::to_string(elems) + "), le(%limit0, %elems)] : index\n";
+  s += "  %live = index.cmp ult, %i, %limit : index\n";
+  s += "  %xn, %yn, %on = buffer.assume.noalias %x, %y, %out : buffer, buffer, "
+       "buffer\n";
+  s += "  %xv = buffer.view %xn[%base] : buffer -> " + xt + "\n";
+  s += "  %yv = buffer.view %yn[%base] : buffer -> " + yt + "\n";
+  s += "  %ov = buffer.view %on[%base] : buffer -> " + ot + "\n";
+  s += "  scf.if %live {\n";
+  s += "    %row = index.div %i, %cols : index\n";
+  s += "    %col = index.rem %i, %cols : index\n";
+  s += "    %acc = scf.for %t = [%zero to %kdim step %unit](%a = %zero_f32 : "
+       "f32) -> (f32) {\n";
+  s += "      %xval = view.load %xv[%row, %t] : " + xt + " -> f32\n";
+  s += "      %yval = view.load %yv[%t, %col] : " + yt + " -> f32\n";
+  s += "      %next = scalar.fmaf %xval, %yval, %a : f32\n";
+  s += "      scf.yield %next : f32\n";
+  s += "    }\n";
+  s += "    view.store %acc, %ov[%row, %col] : f32, " + ot + "\n";
+  s += "  }\n";
+  s += "  kernel.return\n";
+  s += "}\n";
+  return s;
+}
+
+// Value of `key=` in an identity string, up to the next space.
+std::string identity_field(const std::string& id, std::string_view key) {
+  const std::size_t at = id.find(key);
+  if (at == std::string::npos) return {};
+  const std::size_t begin = at + key.size();
+  const std::size_t end = id.find(' ', begin);
+  return id.substr(begin, end == std::string::npos ? std::string::npos
+                                                   : end - begin);
+}
 
 Result<EmittedKernel> emit_for(Array& root) {
   const NodePtr roots[] = {root.node()};
@@ -928,6 +1004,181 @@ LSE_TEST(compile_rejects_empty_input) {
   LSE_EXPECT(!a.ok());
 }
 
+LSE_TEST(the_loom_compiler_reports_available_when_loomc_is_linked) {
+  if (!kLoom.available()) {
+    std::printf("       (skipped: loomc not in this build)\n");
+    LSE_EXPECT(kLoom.identity() == "no-compiler");
+    return;
+  }
+  LSE_EXPECT(kLoom.available());
+  std::printf("       %s\n", kLoom.identity().c_str());
+}
+
+LSE_TEST(a_loom_kernel_compiles_to_an_amdgpu_code_object) {
+  if (!kLoom.available()) return;
+
+  const std::string src = loom_matmul_source(32, 16, 32, 64);
+  auto code = kLoom.compile(src, "gfx1151");
+  if (!code.ok()) {
+    std::printf("       compile failed:\n%s\n", code.status().message().c_str());
+    std::printf("       ---- source ----\n%s\n", src.c_str());
+  }
+  LSE_EXPECT(code.ok());
+  if (!code.ok()) return;
+
+  LSE_EXPECT(code->size() > 512u);
+  const auto* b = reinterpret_cast<const unsigned char*>(code->data());
+  LSE_EXPECT(b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F');
+  // ELFCLASS64, and EM_AMDGPU rather than whatever host object a misrouted
+  // emitter would hand back.
+  LSE_EXPECT_EQ(static_cast<int>(b[4]), 2);
+  const int machine = b[18] | (b[19] << 8);
+  LSE_EXPECT_EQ(machine, 224);
+  std::printf("       code object: %zu bytes, e_machine=%d for gfx1151\n",
+              code->size(), machine);
+}
+
+LSE_TEST(target_id_features_in_the_arch_string_reach_the_code_object) {
+  if (!kLoom.available()) return;
+
+  // `gfx942:sramecc+:xnack-` is a legal thing for HRX to report and the
+  // suffixes select a different object, so they cannot be dropped on the way
+  // into the target profile.
+  const std::string src =
+      "kernel.def export(\"lse_loom_store\") @lse_loom_store() {\n"
+      "  %unit = index.constant 1 : index\n"
+      "  %wg = index.constant 64 : index\n"
+      "  kernel.launch.config workgroups(%unit, %unit, %unit) "
+      "workgroup_size(%wg, %unit, %unit) : index\n"
+      "} launch(%out: buffer) {\n"
+      "  %base = index.constant 0 : offset\n"
+      "  %lane = kernel.workitem.id<x> : index\n"
+      "  %v = scalar.constant 1.0 : f32\n"
+      "  %ov = buffer.view %out[%base] : buffer -> view<64xf32, #dense>\n"
+      "  view.store %v, %ov[%lane] : f32, view<64xf32, #dense>\n"
+      "  kernel.return\n"
+      "}\n";
+
+  // e_flags of an ELF64 header, where AMDGPU records the target id.
+  const auto flags = [](const std::vector<std::byte>& code) {
+    unsigned v = 0;
+    for (int i = 3; i >= 0; --i) {
+      v = (v << 8) | static_cast<unsigned char>(code[48u + static_cast<unsigned>(i)]);
+    }
+    return v;
+  };
+
+  auto plain = kLoom.compile(src, "gfx942");
+  auto featured = kLoom.compile(src, "gfx942:sramecc+:xnack-");
+  LSE_EXPECT(plain.ok());
+  LSE_EXPECT(featured.ok());
+  if (!plain.ok() || !featured.ok()) {
+    if (!featured.ok()) {
+      std::printf("       %s\n", featured.status().message().c_str());
+    }
+    return;
+  }
+  LSE_EXPECT(flags(*plain) != flags(*featured));
+  std::printf("       gfx942 e_flags 0x%x vs sramecc+/xnack- 0x%x\n",
+              flags(*plain), flags(*featured));
+}
+
+LSE_TEST(loom_identity_carries_the_install_and_every_option) {
+  if (!kLoom.available()) return;
+  const std::string id = kLoom.identity();
+
+  // Stable across calls: the JIT cache reads it once per device and would
+  // otherwise invalidate itself.
+  LSE_EXPECT(id == kLoom.identity());
+  // Arch is mixed in by the cache, not here, so it must not appear.
+  LSE_EXPECT(id.find("gfx") == std::string::npos);
+
+  // Every option the invocation runs with is named, so editing one moves the
+  // key. The struct they come from is the same one compile() reads.
+  LSE_EXPECT(id.find("loomc.") == 0u);
+  LSE_EXPECT(id.find("pipeline=prepared_low") != std::string::npos);
+  LSE_EXPECT(id.find("control_flow=cfg") != std::string::npos);
+  LSE_EXPECT(id.find("max_errors=") != std::string::npos);
+  LSE_EXPECT(id.find("compile_artifacts=") != std::string::npos);
+  LSE_EXPECT(id.find("runtime_globals=") != std::string::npos);
+  LSE_EXPECT(id.find("format=amdgpu-hsaco") != std::string::npos);
+  LSE_EXPECT(id.find("manifest=none") != std::string::npos);
+
+  // The install stamp is real: loomc publishes no version query and its .so
+  // carries no build-id, so identity() stats the library it resolved. A rebuild
+  // at the same package version has to move this or the cache serves objects a
+  // different compiler produced.
+  const std::string lib = identity_field(id, "lib=");
+  LSE_EXPECT(!lib.empty());
+  struct ::stat st{};
+  LSE_EXPECT_EQ(::stat(lib.c_str(), &st), 0);
+  LSE_EXPECT(identity_field(id, "size=") ==
+             std::to_string(static_cast<long long>(st.st_size)));
+  LSE_EXPECT(identity_field(id, "mtime=") ==
+             std::to_string(static_cast<long long>(st.st_mtime)));
+
+  // Two dialects on one device must not share a compiler identity.
+  LSE_EXPECT(kLoom.identity() != kCompiler.identity());
+}
+
+LSE_TEST(loom_compile_errors_name_the_problem_instead_of_crashing) {
+  if (!kLoom.available()) return;
+
+  auto syntax = kLoom.compile("kernel.def @broken( {\n", "gfx1151");
+  LSE_EXPECT(!syntax.ok());
+  LSE_EXPECT(syntax.status().code() == StatusCode::kCompileError);
+  // The diagnostic code and message, not a bare status name.
+  LSE_EXPECT(syntax.status().message().find("PARSE/") != std::string::npos);
+
+  // A well-formed module with no kernel.def has nothing to specialize, and that
+  // is a different failure from a parse error.
+  auto no_kernel = kLoom.compile(
+      "func.def inline @helper(%a: f32) -> (f32) {\n"
+      "  func.return %a : f32\n"
+      "}\n",
+      "gfx1151");
+  LSE_EXPECT(!no_kernel.ok());
+  LSE_EXPECT(no_kernel.status().message().find("kernel.def") !=
+             std::string::npos);
+
+  // A type error survives the parse and fails in lowering, so the stage the
+  // message names has to change with it.
+  const std::string bad_type =
+      "kernel.def @bad_type() {\n"
+      "  %unit = index.constant 1 : index\n"
+      "  kernel.launch.config workgroups(%unit, %unit, %unit) "
+      "workgroup_size(%unit, %unit, %unit) : index\n"
+      "} launch(%out: buffer) {\n"
+      "  %base = index.constant 0 : offset\n"
+      "  %zero = index.constant 0 : index\n"
+      "  %v = scalar.constant 1.0 : f32\n"
+      "  %ov = buffer.view %out[%base] : buffer -> view<4xi32, #dense>\n"
+      "  view.store %v, %ov[%zero] : f32, view<4xi32, #dense>\n"
+      "  kernel.return\n"
+      "}\n";
+  auto typed = kLoom.compile(bad_type, "gfx1151");
+  LSE_EXPECT(!typed.ok());
+  LSE_EXPECT(typed.status().message().find("element type") != std::string::npos);
+  std::printf("       %s\n", typed.status().message().c_str());
+
+  auto no_arch = kLoom.compile(loom_matmul_source(4, 4, 4, 16), "");
+  LSE_EXPECT(!no_arch.ok());
+  LSE_EXPECT(no_arch.status().code() == StatusCode::kInvalidArgument);
+  auto empty = kLoom.compile("", "gfx1151");
+  LSE_EXPECT(!empty.ok());
+  LSE_EXPECT(empty.status().code() == StatusCode::kInvalidArgument);
+
+  // An architecture no loom target table knows is a real failure, and it must
+  // arrive as a Status naming the arch.
+  auto bad_arch = kLoom.compile(loom_matmul_source(4, 4, 4, 16), "gfx0000");
+  LSE_EXPECT(!bad_arch.ok());
+  LSE_EXPECT(bad_arch.status().message().find("gfx0000") != std::string::npos);
+
+  // The toolchain is still usable after every one of those.
+  auto good = kLoom.compile(loom_matmul_source(8, 8, 8, 32), "gfx1151");
+  LSE_EXPECT(good.ok());
+}
+
 LSE_TEST(lds_calculator_enforces_the_workgroup_budget) {
   kir::Lds pad(64);
   LSE_EXPECT(pad.fits(64));
@@ -1001,8 +1252,9 @@ struct CacheStubBackend final : backend::IBackend {
   }
   Status synchronize() override { return OkStatus(); }
   std::string_view name() const noexcept override { return "stub"; }
-  const IKernelEmitter* emitter() const noexcept override { return nullptr; }
-  const IKernelCompiler* compiler() const noexcept override { return nullptr; }
+  std::span<const KernelToolchain> toolchains() const noexcept override {
+    return {};
+  }
 };
 
 // One member of a device set: its own geometry, its own executables. The
@@ -1012,9 +1264,11 @@ struct SetStubBackend final : backend::IBackend {
   backend::DeviceInfo info;
   const IKernelCompiler* cc = nullptr;
   std::uint64_t exec_id = 1;
+  std::array<KernelToolchain, 1> tcs{};
 
   SetStubBackend(std::uint64_t id, const IKernelCompiler* compiler)
       : cc(compiler), exec_id(id) {
+    tcs[0] = KernelToolchain{Dialect::kHip, nullptr, cc};
     info.arch = "gfx1151";
     info.name = "stub";
     info.compute_units = 40;
@@ -1054,8 +1308,9 @@ struct SetStubBackend final : backend::IBackend {
   }
   Status synchronize() override { return OkStatus(); }
   std::string_view name() const noexcept override { return "stub"; }
-  const IKernelEmitter* emitter() const noexcept override { return nullptr; }
-  const IKernelCompiler* compiler() const noexcept override { return cc; }
+  std::span<const KernelToolchain> toolchains() const noexcept override {
+    return tcs;
+  }
 };
 
 struct StubSet final : backend::IDeviceSet {
@@ -1084,7 +1339,149 @@ struct CountingCompiler final : IKernelCompiler {
   std::string identity() const override { return "counting-compiler"; }
 };
 
+struct NamedCompiler final : IKernelCompiler {
+  std::string id;
+  explicit NamedCompiler(std::string s) : id(std::move(s)) {}
+  Result<std::vector<std::byte>> compile(std::string_view,
+                                         std::string_view) const override {
+    return std::vector<std::byte>(16, std::byte{2});
+  }
+  bool available() const override { return true; }
+  std::string identity() const override { return id; }
+};
+
+struct NamedEmitter final : IKernelEmitter {
+  Dialect d;
+  explicit NamedEmitter(Dialect dialect) : d(dialect) {}
+  Result<EmittedKernel> emit(const FusionGroup&,
+                            const backend::DeviceInfo&) const override {
+    EmittedKernel k;
+    k.dialect = d;
+    k.entry_name = "stub";
+    return k;
+  }
+  Dialect dialect() const noexcept override { return d; }
+  std::string_view prelude() const noexcept override { return {}; }
+  DialectSourceTable sources() const noexcept override { return {}; }
+};
+
+// A device that declares two dialects. Nothing in the engine selects one yet;
+// what this proves is that the seam can carry the second at all, and that the
+// dialect-blind accessors keep answering with the first.
+struct TwoDialectBackend final : backend::IBackend {
+  backend::DeviceInfo info;
+  NamedEmitter hip_emitter{Dialect::kHip};
+  NamedEmitter loom_emitter{Dialect::kLoom};
+  NamedCompiler hip_compiler{"hip-compiler"};
+  NamedCompiler loom_compiler{"loom-compiler"};
+  std::array<KernelToolchain, 2> tcs{};
+
+  TwoDialectBackend() {
+    info.arch = "gfx1151";
+    info.name = "stub";
+    tcs[0] = KernelToolchain{Dialect::kHip, &hip_emitter, &hip_compiler};
+    tcs[1] = KernelToolchain{Dialect::kLoom, &loom_emitter, &loom_compiler};
+  }
+  Status init(int) override { return OkStatus(); }
+  void shutdown() noexcept override {}
+  const backend::DeviceInfo& device_info() const noexcept override {
+    return info;
+  }
+  Result<backend::DeviceBuffer> allocate(std::size_t,
+                                         backend::MemoryClass) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  void deallocate(backend::DeviceBuffer&) noexcept override {}
+  Status copy_h2d(const void*, backend::DeviceBuffer&, std::size_t,
+                  std::size_t) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status copy_d2h(const backend::DeviceBuffer&, void*, std::size_t,
+                  std::size_t) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Result<backend::KernelHandle> load_executable(
+      std::string_view, std::span<const std::byte>) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
+                const backend::DispatchArgs&,
+                const backend::DispatchTarget&) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status synchronize() override { return OkStatus(); }
+  std::string_view name() const noexcept override { return "stub"; }
+  std::span<const KernelToolchain> toolchains() const noexcept override {
+    return tcs;
+  }
+};
+
 }  // namespace
+
+LSE_TEST(a_device_declares_its_dialects_and_the_default_is_the_first) {
+  TwoDialectBackend be;
+  LSE_EXPECT_EQ(be.toolchains().size(), 2u);
+  // The dialect-blind accessors every existing caller uses answer with the
+  // first declared entry, unchanged by the second being there.
+  LSE_EXPECT(be.emitter() == &be.hip_emitter);
+  LSE_EXPECT(be.compiler() == &be.hip_compiler);
+  LSE_EXPECT(be.emitter()->dialect() == Dialect::kHip);
+
+  const KernelToolchain* loom = be.toolchain_for(Dialect::kLoom);
+  LSE_EXPECT(loom != nullptr);
+  if (loom == nullptr) return;
+  LSE_EXPECT(loom->emitter == &be.loom_emitter);
+  LSE_EXPECT(loom->compiler == &be.loom_compiler);
+  // Two dialects are two JIT identities, which is what keeps their objects out
+  // of each other's cache slots.
+  LSE_EXPECT(loom->compiler->identity() != be.compiler()->identity());
+}
+
+LSE_TEST(an_undeclared_dialect_is_absent_not_substituted) {
+  TwoDialectBackend be;
+  LSE_EXPECT(be.toolchain_for(Dialect::kSpirv) == nullptr);
+  LSE_EXPECT(be.toolchain_for(Dialect::kCuda) == nullptr);
+}
+
+LSE_TEST(a_device_with_no_codegen_declares_no_dialect) {
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT(cpu.toolchains().empty());
+  LSE_EXPECT(cpu.emitter() == nullptr);
+  LSE_EXPECT(cpu.compiler() == nullptr);
+  LSE_EXPECT(cpu.toolchain_for(Dialect::kHip) == nullptr);
+}
+
+LSE_TEST(emitted_source_carries_the_dialect_of_its_emitter) {
+  Array x = Array::full(Shape{64}, DType::kF32, 1.0f);
+  Array y = x * x + x;
+  auto e = emit_for(y);
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) return;
+  LSE_EXPECT(e->dialect == kEmitter.dialect());
+  LSE_EXPECT(e->dialect == Dialect::kHip);
+}
+
+LSE_TEST(the_hrx_device_declares_two_dialects_with_hip_in_front) {
+  backend::BackendAdapter<backend::HrxBackend> hrx;
+  LSE_EXPECT_EQ(hrx.toolchains().size(), 2u);
+  // kHip stays the front entry, which is the whole of what keeps every caller
+  // that asks the device for "its" emitter unchanged.
+  LSE_EXPECT(hrx.toolchains().front().dialect == Dialect::kHip);
+  LSE_EXPECT(hrx.emitter() != nullptr);
+  LSE_EXPECT(hrx.compiler() != nullptr);
+  LSE_EXPECT(hrx.emitter()->dialect() == Dialect::kHip);
+  LSE_EXPECT(hrx.toolchain_for(Dialect::kHip) == &hrx.toolchains().front());
+
+  const KernelToolchain* loom = hrx.toolchain_for(Dialect::kLoom);
+  LSE_EXPECT(loom != nullptr);
+  if (loom == nullptr) return;
+  LSE_EXPECT(loom->emitter != nullptr && loom->compiler != nullptr);
+  LSE_EXPECT(loom->emitter->dialect() == Dialect::kLoom);
+  // Both halves of one dialect, and neither is the other dialect's.
+  LSE_EXPECT(loom->emitter != hrx.emitter());
+  LSE_EXPECT(loom->compiler != hrx.compiler());
+  LSE_EXPECT(hrx.toolchain_for(Dialect::kCuda) == nullptr);
+}
 
 LSE_TEST(jit_compiles_only_on_miss_source_change_or_device_change) {
   namespace fs = std::filesystem;
@@ -1651,11 +2048,11 @@ std::size_t fills_of(const std::string& src, const std::string& name) {
 // hand back what each binding holds afterwards, in binding order. `host`
 // supplies the bytes for the input bindings by node; anything without an entry
 // starts zeroed, which is what an output wants.
-std::vector<std::vector<float>> run_emitted(
-    const EmittedKernel& e, const backend::DeviceInfo& dev,
-    backend::IBackend& be,
+std::vector<std::vector<float>> run_emitted_with(
+    const graph::IKernelCompiler& cc, const EmittedKernel& e,
+    const backend::DeviceInfo& dev, backend::IBackend& be,
     const std::vector<std::pair<const Node*, std::vector<float>>>& host) {
-  auto code = kCompiler.compile(e.source, std::string(dev.arch));
+  auto code = cc.compile(e.source, std::string(dev.arch));
   if (!code.ok()) {
     std::printf("       compile failed:\n%s\n", code.status().message().c_str());
     return {};
@@ -1701,6 +2098,13 @@ std::vector<std::vector<float>> run_emitted(
   }
   for (std::size_t i = 0; i < made; ++i) be.deallocate(bufs[i]);
   return ok ? data : std::vector<std::vector<float>>{};
+}
+
+std::vector<std::vector<float>> run_emitted(
+    const EmittedKernel& e, const backend::DeviceInfo& dev,
+    backend::IBackend& be,
+    const std::vector<std::pair<const Node*, std::vector<float>>>& host) {
+  return run_emitted_with(kCompiler, e, dev, be, host);
 }
 
 }  // namespace
@@ -2575,4 +2979,525 @@ LSE_TEST(the_fused_swiglu_pair_holds_its_own_row_at_every_pass_width) {
   // not an equality: measured worst here is ~1e-7.
   if (worst > 1e-5) std::printf("       host disagreement %g\n", worst);
   LSE_EXPECT(worst <= 1e-5);
+}
+
+// ---------------------------------------------------------------------------
+// The loom generator: the same fusion group, through the other dialect.
+//
+// Every check here is DIFFERENTIAL. A Loom kernel is only interesting if it is
+// the same kernel: same bindings, same launch, same bytes out. Where the two
+// dialects cannot be bit-identical the difference is measured and printed
+// rather than asserted away.
+// ---------------------------------------------------------------------------
+namespace {
+
+const backend::LoomEmitter kLoomEmitter;
+
+FusionGroup group_anchored(Array& root, OpKind kind) {
+  const NodePtr roots[] = {root.node()};
+  for (const FusionGroup& g : Partitioner::partition(roots)) {
+    if (g.anchor == kind) return g;
+  }
+  return FusionGroup{};
+}
+
+struct Diff {
+  bool ran = false;
+  std::size_t compared = 0;
+  std::size_t nonzero = 0;
+  std::size_t mismatched = 0;
+  double worst_abs = 0.0;
+  double worst_rel = 0.0;
+};
+
+// A real device buffer behind a graph input. Array::zeros/full record a
+// kConstant, which the emitter folds into the source as a literal — so a
+// differential over those would be comparing two kernels with no inputs.
+Array device_input(backend::IBackend& be, Shape shape,
+                   const std::vector<float>& host) {
+  auto buf = be.allocate(host.size() * 4, backend::MemoryClass::kDevice);
+  if (!buf.ok()) return Array::zeros(shape, DType::kF32);
+  backend::DeviceBuffer owned = buf.release();
+  (void)be.copy_h2d(host.data(), owned, host.size() * 4, 0);
+  return Array::from_buffer(std::move(owned), shape, DType::kF32);
+}
+
+// Emit `group` both ways, compile each with its own dialect's compiler, run
+// both against identical inputs and compare what the OUTPUT bindings hold.
+Diff differential(const FusionGroup& group,
+                  const std::vector<std::pair<const Node*, std::vector<float>>>& host,
+                  const char* label) {
+  Diff d;
+  backend::IBackend* be = live_hrx();
+  if (be == nullptr || !kLoom.available() || !kCompiler.available()) return d;
+  const backend::DeviceInfo& dev = be->device_info();
+
+  auto hip = kEmitter.emit(group, dev);
+  auto loom = kLoomEmitter.emit(group, dev);
+  if (!hip.ok()) {
+    std::printf("       %s: hip declined: %s\n", label,
+                hip.status().message().c_str());
+    return d;
+  }
+  if (!loom.ok()) {
+    std::printf("       %s: loom declined: %s\n", label,
+                loom.status().message().c_str());
+    return d;
+  }
+  LSE_EXPECT(loom->dialect == Dialect::kLoom);
+  LSE_EXPECT_EQ(loom->binding_order.size(), hip->binding_order.size());
+  for (std::size_t i = 0; i < loom->binding_order.size() &&
+                          i < hip->binding_order.size(); ++i) {
+    LSE_EXPECT(loom->binding_order[i] == hip->binding_order[i]);
+  }
+  LSE_EXPECT_EQ(loom->constants.total_bytes, hip->constants.total_bytes);
+  for (int k = 0; k < 3; ++k) {
+    LSE_EXPECT_EQ(loom->dims.workgroup_size[k], hip->dims.workgroup_size[k]);
+    LSE_EXPECT_EQ(loom->dims.workgroup_count[k], hip->dims.workgroup_count[k]);
+  }
+
+  const auto a = run_emitted_with(kCompiler, *hip, dev, *be, host);
+  const auto b = run_emitted_with(kLoom, *loom, dev, *be, host);
+  if (a.empty() || b.empty() || a.size() != b.size()) {
+    if (b.empty()) {
+      const std::string path = std::string("/tmp/lse-loom-") + label + ".loom";
+      if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fwrite(loom->source.data(), 1, loom->source.size(), f);
+        std::fclose(f);
+        std::printf("       %s: loom source written to %s\n", label,
+                    path.c_str());
+      }
+    }
+    return d;
+  }
+  std::unordered_set<const Node*> outs;
+  for (const NodePtr& o : group.outputs) outs.insert(o.get());
+  d.ran = true;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (outs.count(hip->binding_order[i].get()) == 0) continue;
+    for (std::size_t j = 0; j < a[i].size() && j < b[i].size(); ++j) {
+      ++d.compared;
+      const float x = a[i][j];
+      const float y = b[i][j];
+      if (x != 0.0f) ++d.nonzero;
+      if (std::memcmp(&x, &y, sizeof(float)) == 0) continue;
+      ++d.mismatched;
+      const double abs_err =
+          std::fabs(static_cast<double>(x) - static_cast<double>(y));
+      d.worst_abs = std::max(d.worst_abs, abs_err);
+      const double mag = std::fabs(static_cast<double>(x));
+      if (mag > 0.0) d.worst_rel = std::max(d.worst_rel, abs_err / mag);
+    }
+  }
+  std::printf("       %s: %zu output values (%zu nonzero), %zu differ, "
+              "worst |abs| %.3g, worst rel %.3g\n",
+              label, d.compared, d.nonzero, d.mismatched, d.worst_abs,
+              d.worst_rel);
+  return d;
+}
+
+}  // namespace
+
+// The simplest real kernel: self-indexing, no workgroup scratch, no loop, one
+// store through the hook — and an in-place input, so it is also the case where
+// `buffer.assume.noalias` would be a miscompile.
+LSE_TEST(loom_overwrite_slice_is_bit_exact_against_hip) {
+  Array dst = Array::zeros(Shape{1, 64, 32}, DType::kF32);
+  Array src = Array::full(Shape{1, 1, 32}, DType::kF32, 2.5f);
+  Array begin = Array::full(Shape{1}, DType::kF32, 7.0f);
+  Array y = overwrite_slice(dst, src, 1, begin);
+  const FusionGroup g = group_anchored(y, OpKind::kOverwriteSlice);
+  LSE_EXPECT(!g.nodes.empty());
+  if (g.nodes.empty()) return;
+
+  std::vector<float> dst_host(64 * 32);
+  for (std::size_t i = 0; i < dst_host.size(); ++i) {
+    dst_host[i] = static_cast<float>(i) * 0.5f;
+  }
+  const std::vector<float> src_host(32, 2.5f);
+  const std::vector<float> begin_host(1, 7.0f);
+
+  auto* be = live_hrx();
+  if (be == nullptr) {
+    std::printf("       (skipped: no hrx device)\n");
+    return;
+  }
+  auto loom = kLoomEmitter.emit(g, be->device_info());
+  LSE_EXPECT(loom.ok());
+  if (!loom.ok()) {
+    std::printf("       %s\n", loom.status().message().c_str());
+    return;
+  }
+  // The source states the whole ABI: buffers in binding order, then the
+  // dispatch constant, and the guard the primitive wrote as an early return.
+  LSE_EXPECT(loom->source.find("kernel.def export(\"") == 0u);
+  LSE_EXPECT(loom->source.find("launch(%in0: buffer, %in1: buffer, "
+                               "%in2: buffer, %out: buffer, %count: i32)") !=
+             std::string::npos);
+  // in0 IS out. Asserting they do not alias would be a miscompile.
+  LSE_EXPECT(loom->source.find("buffer.assume.noalias") == std::string::npos);
+  LSE_EXPECT(loom->source.find("scalar.xori") != std::string::npos);
+
+  const Diff d = differential(g,
+                              {{dst.node().get(), dst_host},
+                               {src.node().get(), src_host},
+                               {begin.node().get(), begin_host}},
+                              "overwrite_slice");
+  LSE_EXPECT(d.ran);
+  LSE_EXPECT_EQ(d.mismatched, 0u);
+}
+
+// The other shape a group takes: no primitive owns the indexing, so the
+// scaffold loads every input at the broadcast index, runs the primitive rows
+// and stores. Arithmetic only — the two dialects spell the same operations.
+LSE_TEST(loom_elementwise_fusion_is_bit_exact_against_hip) {
+  auto* be = live_hrx();
+  if (be == nullptr) {
+    std::printf("       (skipped: no hrx device)\n");
+    return;
+  }
+  std::vector<float> xs(256);
+  std::vector<float> ys(256);
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    xs[i] = static_cast<float>(i) * 0.125f - 8.0f;
+    ys[i] = static_cast<float>(i) * -0.0625f + 3.0f;
+  }
+  Array x = device_input(*be, Shape{256}, xs);
+  Array y = device_input(*be, Shape{256}, ys);
+  Array z = x * y + x;
+  const FusionGroup g = group_anchored(z, OpKind::kMul);
+  LSE_EXPECT(!g.nodes.empty());
+  if (g.nodes.empty()) return;
+
+  const Diff d = differential(
+      g, {{x.node().get(), xs}, {y.node().get(), ys}}, "mul+add");
+  LSE_EXPECT(d.ran);
+  LSE_EXPECT(d.nonzero > 0u);
+  LSE_EXPECT_EQ(d.mismatched, 0u);
+}
+
+// A broadcast operand, so the scaffold's index arithmetic is exercised rather
+// than the identity map.
+LSE_TEST(loom_broadcast_operand_is_bit_exact_against_hip) {
+  auto* be = live_hrx();
+  if (be == nullptr) {
+    std::printf("       (skipped: no hrx device)\n");
+    return;
+  }
+  std::vector<float> xs(256);
+  std::vector<float> bs(32);
+  for (std::size_t i = 0; i < xs.size(); ++i) xs[i] = static_cast<float>(i);
+  for (std::size_t i = 0; i < bs.size(); ++i) {
+    bs[i] = static_cast<float>(i) * 0.25f;
+  }
+  Array x = device_input(*be, Shape{8, 32}, xs);
+  Array bias = device_input(*be, Shape{1, 32}, bs);
+  Array z = x + bias;
+  const FusionGroup g = group_anchored(z, OpKind::kAdd);
+  LSE_EXPECT(!g.nodes.empty());
+  if (g.nodes.empty()) return;
+
+  const Diff d = differential(
+      g, {{x.node().get(), xs}, {bias.node().get(), bs}}, "broadcast add");
+  LSE_EXPECT(d.ran);
+  LSE_EXPECT(d.nonzero > 0u);
+  LSE_EXPECT_EQ(d.mismatched, 0u);
+}
+
+// The transcendental rows. HIP's `__expf` and Loom's `scalar.expf<afn>` are
+// both the hardware approximation, so the point of the test is to MEASURE the
+// gap rather than to assume there is none.
+LSE_TEST(loom_silu_matches_hip_across_the_range) {
+  auto* be = live_hrx();
+  if (be == nullptr) {
+    std::printf("       (skipped: no hrx device)\n");
+    return;
+  }
+  std::vector<float> xs(1024);
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    xs[i] = static_cast<float>(i) * 0.02f - 10.0f;
+  }
+  Array x = device_input(*be, Shape{1024}, xs);
+  Array z = silu(x);
+  const FusionGroup g = group_anchored(z, OpKind::kSiLU);
+  LSE_EXPECT(!g.nodes.empty());
+  if (g.nodes.empty()) return;
+
+  const Diff d = differential(g, {{x.node().get(), xs}}, "silu");
+  LSE_EXPECT(d.ran);
+  LSE_EXPECT(d.nonzero > 0u);
+  if (!d.ran) return;
+  // A relative error past 1e-5 would mean the two rows are not the same
+  // function, rather than that one rounded a hardware approximation
+  // differently.
+  LSE_EXPECT(d.worst_rel < 1e-5);
+}
+
+// A self-indexing primitive with a fused elementwise epilogue: the store hook
+// runs in Loom, at the stored index, on the value still in register.
+LSE_TEST(loom_matmul_with_an_epilogue_matches_hip) {
+  auto* be = live_hrx();
+  if (be == nullptr) {
+    std::printf("       (skipped: no hrx device)\n");
+    return;
+  }
+  ::unsetenv("LSE_WMMA");
+  std::vector<float> xs(4 * 64);
+  std::vector<float> ws(64 * 32);
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    xs[i] = static_cast<float>((i % 13)) * 0.125f - 0.5f;
+  }
+  for (std::size_t i = 0; i < ws.size(); ++i) {
+    ws[i] = static_cast<float>((i % 7)) * 0.25f - 0.75f;
+  }
+  Array x = device_input(*be, Shape{4, 64}, xs);
+  Array w = device_input(*be, Shape{64, 32}, ws);
+  Array z = relu(matmul(x, w));
+  const FusionGroup g = group_anchored(z, OpKind::kMatMul);
+  LSE_EXPECT(!g.nodes.empty());
+  if (g.nodes.empty()) return;
+
+  const Diff d = differential(
+      g, {{x.node().get(), xs}, {w.node().get(), ws}}, "matmul+relu");
+  LSE_EXPECT(d.ran);
+  LSE_EXPECT(d.nonzero > 0u);
+  LSE_EXPECT_EQ(d.mismatched, 0u);
+}
+
+// Both toolchains must choose the same launch for the same group, or a
+// differential is comparing two different kernels. choose_dims is duplicated
+// between the two emitters until their shared half is extracted; this is what
+// keeps the copies honest.
+LSE_TEST(both_emitters_choose_the_same_launch) {
+  for (std::int64_t n : {std::int64_t{1}, std::int64_t{63}, std::int64_t{64},
+                         std::int64_t{4096}, std::int64_t{1 << 20}}) {
+    Array a = Array::zeros(Shape{n}, DType::kF32);
+    Array b = Array::zeros(Shape{n}, DType::kF32);
+    Array z = a * b;
+    const FusionGroup g = group_anchored(z, OpKind::kMul);
+    if (g.nodes.empty()) continue;
+    auto hip = kEmitter.emit(g, gfx1151());
+    auto loom = kLoomEmitter.emit(g, gfx1151());
+    LSE_EXPECT(hip.ok() && loom.ok());
+    if (!hip.ok() || !loom.ok()) continue;
+    for (int k = 0; k < 3; ++k) {
+      LSE_EXPECT_EQ(loom->dims.workgroup_size[k], hip->dims.workgroup_size[k]);
+      LSE_EXPECT_EQ(loom->dims.workgroup_count[k],
+                    hip->dims.workgroup_count[k]);
+    }
+    LSE_EXPECT_EQ(loom->dims.subgroup_size, hip->dims.subgroup_size);
+  }
+}
+
+// Every kernel primitive in the tree, at a representative shape, emitted both
+// ways and RUN both ways. Coverage is a measurement: what declines prints the
+// reason, and what emits has to produce the same bytes as the HIP path or the
+// test fails. Nothing here is asserted from the source text.
+LSE_TEST(loom_differential_over_every_kernel_primitive) {
+  auto* be = live_hrx();
+  if (be == nullptr || !kLoom.available()) {
+    std::printf("       (skipped: no hrx device or no loomc)\n");
+    return;
+  }
+
+  auto ramp = [](std::size_t n, float scale, float bias) {
+    std::vector<float> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      v[i] = static_cast<float>(i % 17) * scale + bias;
+    }
+    return v;
+  };
+
+  // The group that produced `root`, whichever op the partitioner anchored it
+  // on — the anchor is the partitioner's business, not this test's.
+  auto group_for = [](Array& root) {
+    const NodePtr roots[] = {root.node()};
+    FusionGroup found;
+    for (const FusionGroup& g : Partitioner::partition(roots)) {
+      for (const NodePtr& o : g.outputs) {
+        if (o.get() == root.node().get()) found = g;
+      }
+    }
+    return found;
+  };
+
+  struct Case {
+    const char* name;
+    FusionGroup group;
+    std::vector<std::pair<const Node*, std::vector<float>>> host;
+  };
+  std::vector<Case> cases;
+
+  auto one_in = [&](const char* name, Shape shape, auto&& build) {
+    const std::vector<float> h = ramp(shape.elem_count(), 0.125f, -1.0f);
+    Array in = device_input(*be, shape, h);
+    Array root = build(in);
+    cases.push_back(Case{name, group_for(root), {{in.node().get(), h}}});
+  };
+  auto two_in = [&](const char* name, Shape a, Shape b, auto&& build) {
+    const std::vector<float> ha = ramp(a.elem_count(), 0.125f, -1.0f);
+    const std::vector<float> hb = ramp(b.elem_count(), 0.25f, -0.5f);
+    Array x = device_input(*be, a, ha);
+    Array y = device_input(*be, b, hb);
+    Array root = build(x, y);
+    cases.push_back(Case{name,
+                         group_for(root),
+                         {{x.node().get(), ha}, {y.node().get(), hb}}});
+  };
+
+  ::unsetenv("LSE_WMMA");
+  two_in("elementwise", Shape{256}, Shape{256},
+         [](Array& a, Array& b) { return a * b + a; });
+  two_in("matmul", Shape{4, 64}, Shape{64, 32},
+         [](Array& a, Array& b) { return matmul(a, b); });
+  two_in("linear", Shape{4, 64}, Shape{32, 64},
+         [](Array& a, Array& b) { return linear(a, b); });
+  one_in("transpose", Shape{4, 64},
+         [](Array& a) { return transpose(a, {1, 0}); });
+  one_in("slice", Shape{4, 64}, [](Array& a) { return slice(a, 1, 8, 40); });
+  two_in("concat", Shape{4, 64}, Shape{2, 64},
+         [](Array& a, Array& b) { return concat({a, b}, 0); });
+  one_in("sum", Shape{4, 64}, [](Array& a) { return sum(a, 1); });
+  one_in("max", Shape{4, 64}, [](Array& a) { return max(a, 1); });
+  one_in("softmax", Shape{4, 64}, [](Array& a) { return softmax(a, 1); });
+  one_in("silu", Shape{256}, [](Array& a) { return silu(a); });
+  one_in("gelu", Shape{256}, [](Array& a) { return gelu(a); });
+  one_in("argmax", Shape{4, 64}, [](Array& a) { return argmax(a); });
+  two_in("rms_norm", Shape{4, 64}, Shape{64},
+         [](Array& a, Array& b) { return rms_norm(a, b, 1e-5f); });
+
+  // Cases whose operand list is not one or two plain f32 tensors.
+  {
+    const std::vector<float> hw = ramp(32 * 64, 0.0625f, -0.25f);
+    const std::vector<float> hr = {3.0f, 0.0f, 31.0f, 12.0f};
+    Array w = device_input(*be, Shape{32, 64}, hw);
+    Array rows = device_input(*be, Shape{4}, hr);
+    Array root = gather_rows(w, rows);
+    cases.push_back(Case{"gather_rows",
+                         group_for(root),
+                         {{w.node().get(), hw}, {rows.node().get(), hr}}});
+  }
+  {
+    const std::vector<float> hx = ramp(4 * 64, 0.125f, -1.0f);
+    const std::vector<float> ht = ramp(4 * 64, 0.03125f, 0.5f);
+    Array x = device_input(*be, Shape{4, 64}, hx);
+    Array cs = device_input(*be, Shape{4, 64}, ht);
+    Array sn = device_input(*be, Shape{4, 64}, ht);
+    Array root = rope(x, cs, sn, 0);
+    cases.push_back(Case{"rope",
+                         group_for(root),
+                         {{x.node().get(), hx},
+                          {cs.node().get(), ht},
+                          {sn.node().get(), ht}}});
+  }
+  {
+    const std::vector<float> hd = ramp(64 * 32, 0.5f, 0.0f);
+    const std::vector<float> hs = ramp(32, 2.0f, 1.0f);
+    const std::vector<float> hb = {7.0f};
+    Array dst = device_input(*be, Shape{1, 64, 32}, hd);
+    Array src = device_input(*be, Shape{1, 1, 32}, hs);
+    Array begin = device_input(*be, Shape{1}, hb);
+    Array root = overwrite_slice(dst, src, 1, begin);
+    cases.push_back(Case{"overwrite_slice",
+                         group_for(root),
+                         {{dst.node().get(), hd},
+                          {src.node().get(), hs},
+                          {begin.node().get(), hb}}});
+  }
+
+  std::size_t emitted = 0;
+  std::size_t exact = 0;
+  std::size_t declined = 0;
+  for (const Case& c : cases) {
+    if (c.group.nodes.empty()) {
+      std::printf("       %-16s no group\n", c.name);
+      continue;
+    }
+    auto e = kLoomEmitter.emit(c.group, be->device_info());
+    if (!e.ok()) {
+      ++declined;
+      std::printf("       %-16s DECLINES: %s\n", c.name,
+                  e.status().message().c_str());
+      continue;
+    }
+    ++emitted;
+    const Diff d = differential(c.group, c.host, c.name);
+    LSE_EXPECT(d.ran);
+    if (d.ran && d.mismatched == 0) ++exact;
+    // Bit-exact everywhere the two dialects spell the same instructions. The
+    // exception is the transcendental rows: HIP's `tanhf` is libm's and Loom's
+    // is `scalar.tanhf<afn>`, the hardware approximation, because the exact
+    // f32 form does not lower on this target at all. One ULP, measured, not
+    // assumed — anything larger means the rows are not the same function.
+    LSE_EXPECT(d.worst_rel < 2e-7);
+  }
+  std::printf("       -- %zu emit (%zu bit-exact against hip), %zu decline, "
+              "%zu of %zu cases\n",
+              emitted, exact, declined, emitted + declined, cases.size());
+  LSE_EXPECT(emitted > 0);
+}
+
+// Compile time, the one number this dialect exists for. Same process, same
+// group, the two toolchains interleaved so a thermal or scheduling drift lands
+// on both, medians of 24. This is a COMPILER measurement: it says nothing
+// about how fast the resulting kernel runs.
+LSE_TEST(loom_compiles_the_same_group_far_faster_than_comgr) {
+  auto* be = live_hrx();
+  if (be == nullptr || !kLoom.available() || !kCompiler.available()) {
+    std::printf("       (skipped: no hrx device or no loomc)\n");
+    return;
+  }
+  const backend::DeviceInfo& dev = be->device_info();
+  const std::string arch(dev.arch);
+
+  ::unsetenv("LSE_WMMA");
+  std::vector<float> xs(4 * 64, 1.0f);
+  std::vector<float> ws(64 * 32, 0.5f);
+  Array x = device_input(*be, Shape{4, 64}, xs);
+  Array w = device_input(*be, Shape{64, 32}, ws);
+  Array z = relu(matmul(x, w));
+  const NodePtr roots[] = {z.node()};
+  FusionGroup g;
+  for (const FusionGroup& c : Partitioner::partition(roots)) {
+    for (const NodePtr& o : c.outputs) {
+      if (o.get() == z.node().get()) g = c;
+    }
+  }
+  if (g.nodes.empty()) return;
+
+  auto hip = kEmitter.emit(g, dev);
+  auto loom = kLoomEmitter.emit(g, dev);
+  LSE_EXPECT(hip.ok() && loom.ok());
+  if (!hip.ok() || !loom.ok()) return;
+
+  auto median = [](std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+  };
+  auto time_one = [&](const graph::IKernelCompiler& cc, const std::string& src) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = cc.compile(src, arch);
+    const auto t1 = std::chrono::steady_clock::now();
+    LSE_EXPECT(r.ok());
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+  };
+
+  const double cold_loom = time_one(kLoom, loom->source);
+  const double cold_hip = time_one(kCompiler, hip->source);
+
+  std::vector<double> loom_ms;
+  std::vector<double> hip_ms;
+  for (int i = 0; i < 24; ++i) {
+    loom_ms.push_back(time_one(kLoom, loom->source));
+    hip_ms.push_back(time_one(kCompiler, hip->source));
+  }
+  const double lm = median(loom_ms);
+  const double hm = median(hip_ms);
+  std::printf("       matmul+relu on %s, medians of 24, interleaved:\n"
+              "         loomc  cold %.2f ms  steady %.3f ms\n"
+              "         comgr  cold %.2f ms  steady %.3f ms\n"
+              "         ratio  %.1fx\n",
+              arch.c_str(), cold_loom, lm, cold_hip, hm,
+              lm > 0.0 ? hm / lm : 0.0);
+  LSE_EXPECT(lm > 0.0 && hm > 0.0);
 }

@@ -247,6 +247,146 @@ LSE_TEST(group_affine_dequant_matches_hand_arithmetic_across_a_lane) {
   LSE_EXPECT_NEAR(out[5], 20.5, 0.0);
 }
 
+// Cells lifted out of the two 35B MoE checkpoints' *stacked* expert planes,
+// which is the shape quant_linear_indexed reads. A stack indexes as
+// [expert, out, lane], so a row of the stack is the same bit stream a rank-2
+// plane holds and the geometry below is expert-independent — that equivalence
+// is what lets one kernel body serve both, and it is what this pins.
+//
+// Every constant here is exact: the scale and bias are the checkpoint's own
+// bf16 patterns, and both have at most 7 fractional bits, so the products
+// below are exact in f32 and the tolerance is 0.
+LSE_TEST(group_affine_dequant_matches_a_real_stacked_expert_plane) {
+  // mlx-community/Qwen3.5-35B-A3B-8bit
+  //   language_model.model.layers.0.mlp.switch_mlp.down_proj
+  //   .weight [256, 2048, 128] u32, .scales/.biases [256, 2048, 8] bf16
+  //   expert 7, row 3, logical column 133, affine 8-bit g64
+  //
+  //     lane   = 133 * 8 / 32          = 33
+  //     shift  = (133 * 8) % 32        = 8
+  //     group  = 133 / 64              = 2
+  //     .weight[7, 3, 33] = 0x795b6c59
+  //     code   = (0x795b6c59 >> 8) & 0xff = 0x6c = 108
+  //     .scales[7, 3, 2]  = 0xb95e bf16 = -1.734375 * 2^-13
+  //     .biases[7, 3, 2]  = 0x3cde bf16 =  1.734375 * 2^-6
+  //                                     =  1.734375 * 128 * 2^-13
+  //     w = 1.734375 * 2^-13 * (128 - 108)
+  //       = 1.734375 * 20 / 8192 = 34.6875 / 8192 = 0.00423431396484375
+  {
+    const GroupAffine q = spec_of(8, 64);
+    const std::size_t k = 512;  // hidden_size of the 35B: 128 lanes * 32 / 8
+    std::vector<std::uint32_t> packed(128, 0u);
+    std::vector<bfloat16_t> scales(8), biases(8);
+    LSE_EXPECT_EQ(q.packed_words(k), packed.size());
+    LSE_EXPECT_EQ(q.group_count(k), scales.size());
+    packed[33] = 0x795b6c59u;
+    for (std::size_t g = 0; g < scales.size(); ++g) {
+      scales[g].bits = 0xb95e;
+      biases[g].bits = 0x3cde;
+    }
+    LSE_EXPECT_NEAR(scales[2].to_float(), -1.734375 / 8192.0, 0.0);
+    LSE_EXPECT_NEAR(biases[2].to_float(), 1.734375 / 64.0, 0.0);
+    LSE_EXPECT_EQ(q.code_at(packed.data(), 133), 108u);
+
+    std::vector<float> out(k);
+    q.dequantize_row<bfloat16_t>(packed.data(), scales.data(), biases.data(), k,
+                                 out.data());
+    LSE_EXPECT_NEAR(out[133], 34.6875 / 8192.0, 0.0);
+    LSE_EXPECT_NEAR(out[133], 0.00423431396484375, 0.0);
+  }
+
+  // lmstudio-community/Qwen3.6-35B-A3B-MLX-6bit, same tensor and same cell at
+  // the global 6 bits — where the code straddles two lanes, which the 8-bit
+  // sibling never does:
+  //   .weight [256, 2048, 96] u32
+  //     bit    = 133 * 6                = 798
+  //     lane   = 798 / 32               = 24, shift = 798 % 32 = 30
+  //     .weight[7, 3, 24] = 0xd4fe55a1, [7, 3, 25] = 0xc8619906
+  //     low  2 bits = 0xd4fe55a1 >> 30           = 0b11 = 3
+  //     high 4 bits = 0xc8619906 & 0xf           = 0x6  = 6
+  //     code = 3 + 6 * 2^2                              = 27
+  //     .scales[7, 3, 2] = 0xba5a bf16 = -1.703125 * 2^-11
+  //     .biases[7, 3, 2] = 0x3ce1 bf16 =  1.7578125 * 2^-6 = 56.25 * 2^-11
+  //     w = 2^-11 * (56.25 - 27 * 1.703125)
+  //       = 2^-11 * (56.25 - 45.984375) = 10.265625 / 2048
+  //       = 0.00501251220703125
+  {
+    const GroupAffine q = spec_of(6, 64);
+    const std::size_t k = 512;
+    std::vector<std::uint32_t> packed(96, 0u);
+    std::vector<bfloat16_t> scales(8), biases(8);
+    LSE_EXPECT_EQ(q.packed_words(k), packed.size());
+    LSE_EXPECT_EQ(q.group_count(k), scales.size());
+    packed[24] = 0xd4fe55a1u;
+    packed[25] = 0xc8619906u;
+    for (std::size_t g = 0; g < scales.size(); ++g) {
+      scales[g].bits = 0xba5a;
+      biases[g].bits = 0x3ce1;
+    }
+    LSE_EXPECT_EQ(q.code_at(packed.data(), 133), 27u);
+
+    std::vector<float> out(k);
+    q.dequantize_row<bfloat16_t>(packed.data(), scales.data(), biases.data(), k,
+                                 out.data());
+    LSE_EXPECT_NEAR(out[133], 10.265625 / 2048.0, 0.0);
+    LSE_EXPECT_NEAR(out[133], 0.00501251220703125, 0.0);
+  }
+}
+
+// The landmine, in real numbers. The 6-bit checkpoint's router is one of 80
+// modules overridden to 8 bits, and the two widths do not merely scale the
+// answer — they read different lanes, so the wrong width returns another
+// weight entirely. Routing then permutes and the model still reads fluently,
+// which is why this is asserted here and not inferred from a sample.
+LSE_TEST(a_router_read_at_the_global_width_returns_another_weight) {
+  // lmstudio-community/Qwen3.6-35B-A3B-MLX-6bit
+  //   language_model.model.layers.0.mlp.gate.weight [256, 512] u32
+  //   row 5, logical column 133. Global is 6-bit g64; the override says 8.
+  //     .weight[5, 24] = 0x8e79f65d
+  //     .weight[5, 25] = 0xc57f7500
+  //     .weight[5, 33] = 0x7ad34a7d
+  //   at 8 bits: lane 133*8/32 = 33, shift 8
+  //     code = (0x7ad34a7d >> 8) & 0xff = 0x4a = 74
+  //   at 6 bits: lane 798/32 = 24, shift 30, straddling into lane 25
+  //     code = (0x8e79f65d >> 30) + (0xc57f7500 & 0xf) * 4 = 2 + 0 = 2
+  std::vector<std::uint32_t> packed(512, 0u);
+  packed[24] = 0x8e79f65du;
+  packed[25] = 0xc57f7500u;
+  packed[33] = 0x7ad34a7du;
+
+  const GroupAffine at8 = spec_of(8, 64);
+  const GroupAffine at6 = spec_of(6, 64);
+  LSE_EXPECT_EQ(at8.code_at(packed.data(), 133), 74u);
+  LSE_EXPECT_EQ(at6.code_at(packed.data(), 133), 2u);
+
+  // The scales the checkpoint stores for that group, and the weight the two
+  // readings produce:
+  //   .scales[5, 2] = 0x3a1c bf16 =  1.21875 * 2^-11
+  //   .biases[5, 2] = 0xbdb0 bf16 = -1.375   * 2^-4 = -176 * 2^-11
+  //   at 8 bits: 2^-11 * (74 * 1.21875 - 176) = -85.8125 / 2048
+  //                                           = -0.041900634765625
+  //   at 6 bits: 2^-11 * ( 2 * 1.21875 - 176) = -173.5625 / 2048
+  //                                           = -0.08474731445312500
+  const std::size_t k = 2048;
+  std::vector<bfloat16_t> scales(32), biases(32);
+  LSE_EXPECT_EQ(at8.packed_words(k), packed.size());
+  LSE_EXPECT_EQ(at8.group_count(k), scales.size());
+  for (std::size_t g = 0; g < scales.size(); ++g) {
+    scales[g].bits = 0x3a1c;
+    biases[g].bits = 0xbdb0;
+  }
+  const auto weight_at = [&](const GroupAffine& q) {
+    return static_cast<double>(q.code_at(packed.data(), 133)) *
+               static_cast<double>(scales[2].to_float()) +
+           static_cast<double>(biases[2].to_float());
+  };
+  LSE_EXPECT_NEAR(weight_at(at8), -85.8125 / 2048.0, 0.0);
+  LSE_EXPECT_NEAR(weight_at(at6), -173.5625 / 2048.0, 0.0);
+  // Not a rescaling of the right answer: a different sign-preserving magnitude
+  // twice the size, on a router whose argmax decides which experts run.
+  LSE_EXPECT(weight_at(at8) != weight_at(at6));
+}
+
 LSE_TEST(group_affine_round_trip_error_grows_as_bits_are_removed) {
   const auto w = make_weights(4096);
   double prev = 0.0;

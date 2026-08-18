@@ -235,20 +235,32 @@ Result<Array> WeightBinder::bind_quantized(
                      "' stores its scales as ", to_string(scales.dtype),
                      " and its biases as ", to_string(biases.dtype));
   }
-  if (packed.shape.rank() != 2) {
+  // Rank 2 is one [out, in] matrix; rank 3 is MLX's SwitchGLU stack, read by
+  // quant_linear_indexed one expert at a time. Nothing is unstacked here — the
+  // expert axis stays the leading axis of the plane all the way to the kernel.
+  const std::size_t rank = packed.shape.rank();
+  if (rank != 2 && rank != 3) {
     return LSE_ERROR(kUnimplemented, "'", std::string(name), "' is ",
                      packed.shape.to_string(),
-                     "; group-affine weights are read as [out, in] matrices, "
-                     "and a stack of them needs an indexed group-affine "
-                     "contraction that this engine does not have");
+                     "; a group-affine weight is read as an [out, in] matrix "
+                     "or an [expert, out, in] stack of them");
   }
-  if (scales.shape != biases.shape || scales.shape.rank() != 2 ||
-      scales.shape.dim(0) != packed.shape.dim(0)) {
+  bool agree = scales.shape == biases.shape && scales.shape.rank() == rank;
+  for (std::size_t i = 0; agree && i + 1 < rank; ++i) {
+    if (scales.shape.dim(i) != packed.shape.dim(i)) agree = false;
+  }
+  if (!agree) {
     return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' is ",
                      packed.shape.to_string(), " with scales ",
                      scales.shape.to_string(), " and biases ",
                      biases.shape.to_string(),
-                     "; the three planes must agree on the output axis");
+                     "; the three planes must agree on every axis but the "
+                     "last, which counts lanes on one and groups on the other");
+  }
+  if (order != nullptr && rank != 2) {
+    return LSE_ERROR(kUnimplemented, "'", std::string(name),
+                     "' is a stack; taking rows out of one would have to name "
+                     "an expert as well as a row");
   }
 
   LSE_ASSIGN_OR(const quant::GroupAffine spec,

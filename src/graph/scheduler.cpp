@@ -21,6 +21,52 @@
 #include "lse/graph/kernel_primitive.hpp"
 
 namespace lse::graph {
+namespace {
+
+using SpanClock = std::chrono::steady_clock;
+
+std::uint64_t elapsed_ns(SpanClock::time_point from,
+                         SpanClock::time_point to) noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+
+// One span, closed exactly once, whichever way its region is left.
+//
+// The bind region has eight failure exits and the emit region two; charging
+// their time to nothing is why a group the emitter refused used to cost nothing
+// at all in the report. close() hands back the tick it read so the next span can
+// open on it — the spans are adjacent, so one read serves both ends and the
+// instrumentation costs one clock read per boundary rather than two.
+class SpanTimer {
+ public:
+  SpanTimer(trace::HostDuration& into, SpanClock::time_point begin) noexcept
+      : into_(&into), begin_(begin) {}
+  explicit SpanTimer(trace::HostDuration& into) noexcept
+      : SpanTimer(into, SpanClock::now()) {}
+  ~SpanTimer() {
+    if (into_ != nullptr) into_->add(elapsed_ns(begin_, SpanClock::now()));
+  }
+
+  SpanTimer(const SpanTimer&) = delete;
+  SpanTimer& operator=(const SpanTimer&) = delete;
+
+  // Idempotent: a region reached down two paths closes on whichever runs.
+  SpanClock::time_point close() noexcept {
+    const auto now = SpanClock::now();
+    if (into_ != nullptr) {
+      into_->add(elapsed_ns(begin_, now));
+      into_ = nullptr;
+    }
+    return now;
+  }
+
+ private:
+  trace::HostDuration* into_;
+  SpanClock::time_point begin_;
+};
+
+}  // namespace
 
 struct Scheduler::Impl {
   std::unique_ptr<JitCache> jit;
@@ -140,26 +186,44 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   const std::uint64_t ident =
       emitter->cache_key(group, be.device_info());
 
-  const auto t_emit = std::chrono::steady_clock::now();
+  const auto t_emit = SpanClock::now();
   auto emitted = emitter->emit(group, be.device_info());
+  const auto t_emitted = SpanClock::now();
+  trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
   if (!emitted.ok()) return emitted.status();
-  dump_hip_source(*emitted, ident);
 
   // Compile only when this kernel is not already loaded for this device.
   // Disk miss / source change / arch change still go through get_or_compile.
+  //
+  // The compiler runs INSIDE get_or_compile, which is inside this span, so its
+  // own measurement is subtracted back out rather than counted twice. Without
+  // that, a cold prefill reported 3113 ms of "emit" that was 98.5% compile, and
+  // adding the report's emit line to its jit line counted the same milliseconds
+  // three times.
+  const std::uint64_t compile_before = impl_->jit->stats().compile_ns;
+  dump_hip_source(*emitted, ident);
   backend::KernelHandle launched;
+  Status jit_status = OkStatus();
   if (const backend::KernelHandle* cached =
           impl_->jit->try_get(member, ident)) {
     launched = *cached;
   } else {
     auto kernel = impl_->jit->get_or_compile(member, ident, *emitted);
-    if (!kernel.ok()) return kernel.status();
-    launched = kernel.release();
+    if (kernel.ok()) {
+      launched = kernel.release();
+    } else {
+      jit_status = kernel.status();
+    }
   }
-  trace_.emit_ns += static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - t_emit)
-          .count());
+  const auto t_resolved = SpanClock::now();
+  const std::uint64_t compiled =
+      impl_->jit->stats().compile_ns - compile_before;
+  const std::uint64_t looked_up = elapsed_ns(t_emitted, t_resolved);
+  trace_.spans.jit_compile.add(compiled);
+  trace_.spans.jit_lookup.add(looked_up > compiled ? looked_up - compiled : 0);
+  LSE_RETURN_IF_ERROR(jit_status);
+
+  SpanTimer bind_span(trace_.spans.bind, t_resolved);
 
   for (const NodePtr& n : group.nodes) {
     if (!n || n->prim == nullptr) continue;
@@ -283,14 +347,12 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   // ones a wrong-device launch would read.
   LSE_RETURN_IF_ERROR(check_residency(bindings, member));
 
-  const auto t_launch = std::chrono::steady_clock::now();
-  LSE_RETURN_IF_ERROR(be.launch(
+  const auto t_launch = bind_span.close();
+  const Status submitted = be.launch(
       launched, emitted->dims, args,
-      backend::DispatchTarget{stream, devices_.residency(member), {}}));
-  trace_.launch_ns += static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - t_launch)
-          .count());
+      backend::DispatchTarget{stream, devices_.residency(member), {}});
+  trace_.spans.submit.add(elapsed_ns(t_launch, SpanClock::now()));
+  LSE_RETURN_IF_ERROR(submitted);
 
   for (const NodePtr& n : group.nodes) {
     n->materialized = true;
@@ -390,7 +452,32 @@ bool same_gdn_inputs(const Node& a, const Node& b) noexcept {
   return true;
 }
 
-void accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
+Status accumulate_spans(Scheduler::Trace::Spans& acc,
+                        const Scheduler::Trace::Spans& step) {
+  LSE_RETURN_IF_ERROR(acc.partition.add(step.partition));
+  LSE_RETURN_IF_ERROR(acc.schedule.add(step.schedule));
+  LSE_RETURN_IF_ERROR(acc.emit.add(step.emit));
+  LSE_RETURN_IF_ERROR(acc.jit_lookup.add(step.jit_lookup));
+  LSE_RETURN_IF_ERROR(acc.jit_compile.add(step.jit_compile));
+  LSE_RETURN_IF_ERROR(acc.bind.add(step.bind));
+  LSE_RETURN_IF_ERROR(acc.submit.add(step.submit));
+  LSE_RETURN_IF_ERROR(acc.host_wait.add(step.host_wait));
+  LSE_RETURN_IF_ERROR(acc.readback.add(step.readback));
+  LSE_RETURN_IF_ERROR(acc.host_exec.add(step.host_exec));
+  LSE_RETURN_IF_ERROR(acc.step.add(step.step));
+  LSE_RETURN_IF_ERROR(acc.unattributed.add(step.unattributed));
+  return OkStatus();
+}
+
+// Everything the step's spans account for. Disjoint, so this is a sum and not a
+// max, and `step` minus this is the remainder.
+std::uint64_t attributed_ns(const Scheduler::Trace::Spans& s) noexcept {
+  return s.partition.ns + s.schedule.ns + s.emit.ns + s.jit_lookup.ns +
+         s.jit_compile.ns + s.bind.ns + s.submit.ns + s.host_wait.ns +
+         s.readback.ns + s.host_exec.ns;
+}
+
+Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
   acc.device_groups += step.device_groups;
   acc.host_groups += step.host_groups;
   acc.phase_groups += step.phase_groups;
@@ -406,6 +493,7 @@ void accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
   acc.streams_used = std::max(acc.streams_used, step.streams_used);
   acc.stream_waits += step.stream_waits;
   acc.stream_chain += step.stream_chain;
+  LSE_RETURN_IF_ERROR(accumulate_spans(acc.spans, step.spans));
   acc.partition_ns += step.partition_ns;
   acc.emit_ns += step.emit_ns;
   acc.launch_ns += step.launch_ns;
@@ -414,6 +502,7 @@ void accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
                                 step.host_group_reasons.begin(),
                                 step.host_group_reasons.end());
   acc.replayed = acc.replayed || step.replayed;
+  return OkStatus();
 }
 
 }  // namespace
@@ -424,18 +513,51 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host) {
 
 Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
                       Program* plan) {
-  Program& rec = plan != nullptr ? *plan : impl_->program;
+  const auto t_step = SpanClock::now();
   trace_ = Trace{};
+  const Status ran = eval_step(roots, pull_host, plan);
+
+  trace_.spans.step.add(elapsed_ns(t_step, SpanClock::now()));
+  const std::uint64_t attributed = attributed_ns(trace_.spans);
+  // Saturating, so an overlap surfaces as a zero remainder rather than as a
+  // number that would hide it. The spans are disjoint by construction; this is
+  // the check on that, not a correction for it.
+  trace_.spans.unattributed.add(trace_.spans.step.ns > attributed
+                                    ? trace_.spans.step.ns - attributed
+                                    : 0);
+  // Only the partition span. The old counter never held the per-step setup
+  // either — it was written under `if (!replayed)` and so read zero on every
+  // steady-state decode token — so `schedule` is new information and reaches a
+  // reader through `spans`, not through a field whose name would not cover it.
+  trace_.partition_ns = trace_.spans.partition.ns;
+  trace_.emit_ns = trace_.spans.emit.ns;
+  trace_.launch_ns = trace_.spans.submit.ns;
+  trace_.sync_ns = trace_.spans.host_wait.ns;
+
+  const Status accumulated = accumulate(acc_, trace_);
+  if (!ran.ok()) return ran;
+  return accumulated;
+}
+
+Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
+                            Program* plan) {
+  Program& rec = plan != nullptr ? *plan : impl_->program;
+  // Asked once. Four sites below need it and it is a virtual call on a
+  // device-first step, and a compiler that cannot see through the repeat cannot
+  // see that the null check already happened either.
+  const IKernelEmitter* const emitter = backend().emitter();
+  const bool device_first = mode_ == Mode::kDeviceFirst && emitter != nullptr;
+  // Opened here rather than in eval() so that the trace reset and the step
+  // bookkeeping around it land in the remainder instead of in a span.
+  SpanTimer setup_span(trace_.spans.schedule);
   for (auto& t : impl_->phase_tables) release(t);
   impl_->phase_tables.clear();
 
-  const auto t_part = std::chrono::steady_clock::now();
   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
 
   std::vector<FusionGroup> phase_groups;
   bool replayed = false;
-  if (mode_ == Mode::kDeviceFirst && backend().emitter() != nullptr &&
-      rec.holds(roots) && !rec.groups().empty()) {
+  if (device_first && rec.holds(roots) && !rec.groups().empty()) {
     bool ready = !roots.empty();
     for (const NodePtr& r : roots) {
       if (r && !r->materialized) {
@@ -444,12 +566,13 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       }
     }
     if (ready) {
+      const auto t_ready = setup_span.close();
       if (pull_host) {
+        SpanTimer readback_span(trace_.spans.readback, t_ready);
         for (const NodePtr& r : roots) {
           if (r) LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend()));
         }
       }
-      accumulate(acc_, trace_);
       return OkStatus();
     }
     replayed = true;
@@ -459,6 +582,10 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     trace_.phase_ideal_launches = 1;
   }
 
+  // The build: what groups this step is made of. A replay reuses the retained
+  // ones and pays none of it, which is why this and `schedule` are two spans
+  // and not one.
+  SpanTimer build_span(trace_.spans.partition, setup_span.close());
   auto planned = replayed
                      ? std::vector<Workgroup>{}
                      : Partitioner::phases(roots, &backend().device_info());
@@ -469,11 +596,10 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     }
   }
 
-  if (mode_ == Mode::kDeviceFirst && backend().emitter() != nullptr &&
-      !replayed) {
+  if (device_first && !replayed) {
     // Null when this emitter has no staged phase body: every node then takes
     // the same one-group path a node it refuses to stage already takes.
-    const IPhaseStaging* staging = backend().emitter()->staging();
+    const IPhaseStaging* staging = emitter->staging();
     for (Workgroup& wg : planned) {
       FusionGroup g = Partitioner::phase_group(wg, roots);
       if (g.nodes.empty()) continue;
@@ -656,13 +782,14 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   }
 
   std::vector<FusionGroup> ran;
+  // Back to per-step setup: the stream plan and the entry barriers.
+  SpanTimer place_span(trace_.spans.schedule, build_span.close());
   // Replays run the retained groups in place: no copy of the group list, and
   // no re-retain afterwards — retain() re-walks the whole reachable graph and
   // was most of the host-side churn of a decode token.
   const std::vector<FusionGroup>& staged_groups =
       replayed ? rec.groups() : phase_groups;
-  if (mode_ == Mode::kDeviceFirst && backend().emitter() != nullptr &&
-      !staged_groups.empty()) {
+  if (device_first && !staged_groups.empty()) {
       // Placement for the whole step, decided before any of it is issued.
       impl_->plan = plan_streams(staged_groups, backend().stream_capabilities(),
                                  backend().device_info());
@@ -699,6 +826,11 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         if (ev.ok()) impl_->entry_events[s] = ev.release();
       }
       std::vector<std::uint8_t> entered(stream_count, 0);
+
+      // Nothing has been issued yet, so this is where the pre-dispatch region
+      // ends. The old partition_ns closed AFTER the loop below and so contained
+      // every emit, compile and submit in the step.
+      place_span.close();
 
       bool launched_phase = true;
       std::size_t done = 0;
@@ -752,23 +884,17 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         ++done;
       }
       if (launched_phase) {
-        if (!replayed) {
-          rec.retain(roots, std::move(planned), ran, order);
-          trace_.partition_ns = static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - t_part)
-                  .count());
-        }
+        if (!replayed) rec.retain(roots, std::move(planned), ran, order);
         if (pull_host) {
-          const auto t_sync = std::chrono::steady_clock::now();
-          LSE_RETURN_IF_ERROR(backend().synchronize());
+          const auto t_wait = SpanClock::now();
+          const Status waited = backend().synchronize();
+          trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
+          LSE_RETURN_IF_ERROR(waited);
           // The device is idle: nothing is left for a later step to be
           // ordered against, so the next one starts with no entry barriers.
+          // Host bookkeeping, and outside host_wait for that reason.
           std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
-          trace_.sync_ns += static_cast<std::uint64_t>(
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - t_sync)
-                  .count());
+          SpanTimer readback_span(trace_.spans.readback);
           for (const NodePtr& r : roots) {
             if (r) {
               LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend()));
@@ -777,7 +903,6 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         }
         for (auto& t : impl_->phase_tables) release(t);
         impl_->phase_tables.clear();
-        accumulate(acc_, trace_);
         return OkStatus();
       }
     // Prefix in `ran` already launched. Partition only the rest; retain
@@ -789,12 +914,13 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     }
   }
 
+  // Already-closed is a no-op, so a failed device-first attempt contributes its
+  // dispatch loop to the remainder rather than being folded in here — which is
+  // what the old partition_ns did, silently.
+  const auto t_repartition = place_span.close();
   std::vector<FusionGroup> groups =
       Partitioner::partition(roots, &backend().device_info());
-  trace_.partition_ns = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - t_part)
-          .count());
+  trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));
   bool launched = false;
   for (const FusionGroup& g : groups) {
     std::string desc(to_string(g.anchor));
@@ -828,12 +954,10 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     }
 
     if (launched) {
-      const auto t_sync = std::chrono::steady_clock::now();
-      LSE_RETURN_IF_ERROR(backend().synchronize());
-      trace_.sync_ns += static_cast<std::uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - t_sync)
-              .count());
+      const auto t_wait = SpanClock::now();
+      const Status waited = backend().synchronize();
+      trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
+      LSE_RETURN_IF_ERROR(waited);
       launched = false;
     }
 
@@ -844,6 +968,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
     // model on the host interpreter. Every group is now in exactly one bucket.
     if (mode_ != Mode::kDeviceFirst) ++trace_.host_groups;
 
+    SpanTimer host_exec_span(trace_.spans.host_exec);
     for (const NodePtr& n : g.nodes) {
       // Routing first: an intercepting handler may claim a node the backend
       // could have run, which is how per-op device placement is switched at
@@ -887,28 +1012,27 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
       trace_.fallback_handlers.emplace_back(handler->name());
       ++trace_.nodes_evaluated;
     }
+    host_exec_span.close();
     if (is_collective(g.anchor)) ++trace_.collectives_issued;
     ++trace_.kernels_launched;
     ran.push_back(g);
   }
 
   if (launched) {
-    const auto t_sync = std::chrono::steady_clock::now();
-    LSE_RETURN_IF_ERROR(backend().synchronize());
-    trace_.sync_ns += static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - t_sync)
-            .count());
+    const auto t_wait = SpanClock::now();
+    const Status waited = backend().synchronize();
+    trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
+    LSE_RETURN_IF_ERROR(waited);
   }
   // A host-visible eval pulls the roots back. materialize() leaves them on
   // the device so the next kernel can read them without a round trip.
   if (pull_host) {
+    SpanTimer readback_span(trace_.spans.readback);
     for (const NodePtr& root : roots) {
       LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*root, backend()));
     }
   }
   rec.retain(roots, std::move(planned), ran, order);
-  accumulate(acc_, trace_);
   return OkStatus();
 }
 

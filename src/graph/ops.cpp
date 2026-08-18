@@ -233,6 +233,10 @@ Shape weight_shape(const Array& w) {
   if (!w.valid()) return Shape{};
   const NodePtr& n = w.node();
   if (!n->quant) return n->shape;
+  // A stacked weight keeps its expert axis: only the last one counts lanes.
+  if (n->shape.rank() == 3) {
+    return Shape{n->shape.dim(0), n->shape.dim(1), n->quant->in_features};
+  }
   return Shape{n->shape.dim(0), n->quant->in_features};
 }
 
@@ -269,6 +273,31 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   n->iattrs[0] = bits;
   n->iattrs[1] = group_size;
   n->prim = find_primitive("quant_linear");
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+
+Array quant_linear_indexed(const Array& x, const Array& packed,
+                           const Array& scales, const Array& biases,
+                           const Array& idx, int slot, int bits,
+                           int group_size) {
+  const Shape& sx = x.shape();
+  Shape out;
+  for (std::size_t i = 0; i + 1 < sx.rank(); ++i) out.push_back(sx.dim(i));
+  out.push_back(packed.shape().dim(1));
+  // kMoEDispatch like the dense form, f32 like quant_linear: the packed plane
+  // is kU32 and promote() would take that for the result's width.
+  auto n = make(OpKind::kMoEDispatch, out, DType::kF32,
+                {x.node(), packed.node(), scales.node(), biases.node(),
+                 idx.node()});
+  // iattrs[0] stays the expert slot, as it is for linear_indexed, so the
+  // emitter's device_fn_name keeps slot-1 off the slot-0 body. The geometry
+  // follows it, and mixes into the same name — which is what gives a 6-bit
+  // expert and an 8-bit router distinct device functions.
+  n->iattrs[0] = slot;
+  n->iattrs[1] = bits;
+  n->iattrs[2] = group_size;
+  n->prim = find_primitive("quant_linear_indexed");
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
 }
@@ -382,6 +411,11 @@ Array argmax(const Array& x) {
 
 Array linear_indexed(const Array& x, const Array& w, const Array& idx,
                      int slot) {
+  if (w.valid() && w.node()->quant) {
+    const QuantPlanes& q = *w.node()->quant;
+    return quant_linear_indexed(x, w, Array(q.scales), Array(q.biases), idx,
+                                slot, q.bits, q.group_size);
+  }
   Shape out;
   for (std::size_t i = 0; i + 1 < x.shape().rank(); ++i) {
     out.push_back(x.shape().dim(i));

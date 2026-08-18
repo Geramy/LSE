@@ -25,7 +25,8 @@ namespace lse::ir {
   X(kHip, "hip")            \
   X(kCuda, "cuda")          \
   X(kSpirv, "spirv")        \
-  X(kMetal, "metal")
+  X(kMetal, "metal")        \
+  X(kLoom, "loom")
 
 LSE_DECLARE_ENUM(Dialect, std::uint8_t, LSE_DIALECT_LIST)
 
@@ -35,12 +36,23 @@ struct PrimitiveSource {
 };
 
 // Non-owning view over a backend's static table.
+//
+// The table carries which dialect it spells, because a body holds one of these
+// and nothing else in the body says what language its op templates are in. The
+// printer needs that: a use site is an inlined C subexpression in one dialect
+// and an SSA name in another, and `Val::text()` — what a store hook receives —
+// has only the body to ask.
 class DialectSourceTable {
  public:
   constexpr DialectSourceTable() = default;
   constexpr explicit DialectSourceTable(
       std::span<const PrimitiveSource> entries) noexcept
       : entries_(entries) {}
+  constexpr DialectSourceTable(std::span<const PrimitiveSource> entries,
+                               Dialect dialect) noexcept
+      : entries_(entries), dialect_(dialect) {}
+
+  [[nodiscard]] constexpr Dialect dialect() const noexcept { return dialect_; }
 
   // Empty when this dialect has no spelling for `primitive`.
   [[nodiscard]] constexpr std::string_view find(
@@ -57,6 +69,7 @@ class DialectSourceTable {
 
  private:
   std::span<const PrimitiveSource> entries_;
+  Dialect dialect_ = Dialect::kHip;
 };
 
 // A primitive that supplies its own source states which dialect it is for.

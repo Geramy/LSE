@@ -1,6 +1,7 @@
 #include "lse/kv/policy.hpp"
 
 #include <algorithm>
+#include <string>
 
 namespace lse::kv {
 
@@ -23,8 +24,14 @@ Admission BlockPolicy::admit(const SequenceDemand& want,
   // reserve exists to keep exactly that append possible. Anything that has not
   // started yet must leave it intact.
   const bool resuming = want.held > 0;
+  // Negative when the reserve is already larger than what is free. Kept signed
+  // rather than clamped: the comparisons below must see that the pool is over
+  // its own reserve, not that it has nothing spare.
   const std::int32_t usable =
       resuming ? pool.free_count() : pool.free_count() - reserve_;
+  const std::string spare =
+      std::to_string(pool.free_count()) + " free" +
+      (resuming ? "" : ", " + std::to_string(reserve_) + " reserved");
   if (out.blocks_needed <= usable) {
     out.reason = "fits in " + std::to_string(pool.free_count()) + " free block(s)";
     return out;
@@ -48,10 +55,9 @@ Admission BlockPolicy::admit(const SequenceDemand& want,
   if (out.blocks_needed > usable + reclaimable) {
     out.verdict = Verdict::kRefuse;
     out.reason = "needs " + std::to_string(out.blocks_needed) +
-                 " block(s); " + std::to_string(usable) +
-                 " free and " + std::to_string(reclaimable) +
-                 " reclaimable across " + std::to_string(victims.size()) +
-                 " sequence(s)";
+                 " block(s); " + spare + " and " +
+                 std::to_string(reclaimable) + " reclaimable across " +
+                 std::to_string(victims.size()) + " sequence(s)";
     return out;
   }
 
@@ -76,7 +82,7 @@ Admission BlockPolicy::admit(const SequenceDemand& want,
     out.preempt.push_back(std::move(p));
   }
   out.reason = "needs " + std::to_string(out.blocks_needed) + " block(s); " +
-               std::to_string(usable) + " free, preempting " +
+               spare + ", preempting " +
                std::to_string(out.preempt.size()) + " sequence(s)";
   return out;
 }

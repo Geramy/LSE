@@ -7,12 +7,12 @@
 // top-8, expert width 512 — lemonseed's 8-experts-top-2 does not generalise, so
 // nothing here is inherited from it.
 //
-// NOT VALIDATED BY A LOAD. Neither checkpoint can be opened by this engine:
-// both are split across six or eight shards and SafeTensors reads one file with
-// no index, and both quantize the expert stack as rank-3 group-affine planes,
-// for which there is no indexed contraction. This file is therefore correct
-// about names and shapes and unproven about everything else; the two blockers
-// are named where they bite rather than papered over.
+// Both checkpoints load and decode. The expert stack stays in the checkpoint's
+// own rank-3 group-affine layout the whole way down: graph::linear_indexed sees
+// the planes on the weight and routes to quant_linear_indexed, which selects the
+// expert and dequantizes in one body. Nothing here says "quantized" — that is
+// the seam, and it is why the 6-bit sibling, whose 80 router overrides put every
+// mlp.gate at 8 bits while the experts stay at 6, needs no branch in this file.
 #include <cstdint>
 #include <memory>
 #include <string>

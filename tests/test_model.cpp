@@ -1443,11 +1443,13 @@ void write_raw_safetensors(const std::filesystem::path& path,
 
 }  // namespace
 
-// The MoE checkpoints in the real cache detect fine and then fail to bind: a
-// stacked 3-D group-affine expert tensor has no kernel. Reporting one of them as
-// loadable is the worst output this listing can produce, so the verdict is
-// pinned to the same precondition the binder enforces.
-LSE_TEST(a_stacked_expert_checkpoint_is_reported_unloadable_not_loadable) {
+// A stacked 3-D group-affine expert tensor binds: quant_linear_indexed reads
+// one expert out of the stack in place. The verdict this listing prints is
+// pinned to the same precondition the binder enforces, and the two rules live in
+// separate files (weights.cpp restates layer.cpp's), so a checkpoint the binder
+// accepts and the listing calls unloadable — or the reverse — is the failure
+// this catches.
+LSE_TEST(a_stacked_expert_checkpoint_is_reported_loadable) {
   constexpr int kBits = 8;
   constexpr int kGroup = 32;
   const Config c = tiny_qwen_config(/*moe=*/true);
@@ -1483,12 +1485,29 @@ LSE_TEST(a_stacked_expert_checkpoint_is_reported_unloadable_not_loadable) {
   write_text(snap / "config.json", cfg);
 
   const CacheModel m = inspect_model_dir(snap.string(), "org/Stacked-8bit");
-  // Detection succeeds — which is exactly why the verdict cannot stop there.
   LSE_EXPECT(m.engine_arch == "qwen3.5-moe");
-  LSE_EXPECT(m.loadable == Loadable::kNo);
-  LSE_EXPECT(m.reason.find("switch_mlp") != std::string::npos);
-  LSE_EXPECT(m.reason.find("indexed group-affine contraction") !=
-             std::string::npos);
+  LSE_EXPECT(m.loadable == Loadable::kYes);
+  LSE_EXPECT(m.reason.empty());
+  // The geometry is reported from the config, and the stack does not change it:
+  // the expert axis is not a quantization axis.
+  LSE_EXPECT(m.quantization.find("8-bit") != std::string::npos);
+
+  // The rank the stack is not: a 4-D plane has no expert-and-row addressing, and
+  // it must be refused rather than folded into one of the two legal ranks.
+  std::vector<RawTensor> rank4;
+  for (const RawTensor& t : raw) {
+    RawTensor mod = t;
+    if (mod.name.find("switch_mlp.gate_proj") != std::string::npos) {
+      mod.dims.push_back(1);
+    }
+    rank4.push_back(mod);
+  }
+  const std::filesystem::path bad = hub.snapshot("org/Stacked-rank4");
+  write_raw_safetensors(bad / "model.safetensors", rank4);
+  write_text(bad / "config.json", cfg);
+  const CacheModel r4 = inspect_model_dir(bad.string(), "org/Stacked-rank4");
+  LSE_EXPECT(r4.loadable == Loadable::kNo);
+  LSE_EXPECT(r4.reason.find("switch_mlp") != std::string::npos);
 }
 
 LSE_TEST(a_quantized_qwen_checkpoint_binds_all_three_planes) {

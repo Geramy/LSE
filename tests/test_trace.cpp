@@ -657,6 +657,37 @@ LSE_TEST(a_device_span_from_an_unrelated_clock_is_refused) {
                   .ok());
 }
 
+// The host counterpart of the refusal above. A HostDuration is the sum of many
+// disjoint spans, and summing two totals taken on unrelated clocks is the same
+// category error as subtracting two ticks from unrelated devices: the engine's
+// scheduler spans are steady_clock, and a system-clock total added into them
+// would produce a number nobody could attribute.
+LSE_TEST(a_host_total_from_an_unrelated_clock_is_refused_not_summed) {
+  HostDuration steady;
+  LSE_EXPECT(steady.clock == backend::ClockDomain::kHostSteady);
+  steady.add(std::uint64_t{1'000});
+
+  HostDuration also_steady;
+  also_steady.add(std::uint64_t{500});
+  LSE_EXPECT_OK(steady.add(also_steady));
+  LSE_EXPECT_EQ(steady.ns, std::uint64_t{1'500});
+
+  HostDuration system;
+  system.clock = backend::ClockDomain::kHostSystem;
+  system.add(std::uint64_t{9'000});
+  const Status refused = steady.add(system);
+  LSE_EXPECT(!refused.ok());
+  // And it refused rather than half-applying: the total is untouched.
+  LSE_EXPECT_EQ(steady.ns, std::uint64_t{1'500});
+  std::printf("       %s\n", refused.message().c_str());
+
+  HostDuration unknown;
+  unknown.clock = backend::ClockDomain::kUnknown;
+  LSE_EXPECT(!steady.add(unknown).ok());
+  // Nanoseconds are nanoseconds, so seconds() is exact and needs no clock.
+  LSE_EXPECT_NEAR(steady.seconds(), 1.5e-6, 1e-15);
+}
+
 LSE_TEST(the_collector_normalizes_dispatches_to_groups_and_never_to_nodes) {
   Collector& collector = Collector::instance();
   collector.clear();

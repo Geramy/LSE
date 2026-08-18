@@ -56,7 +56,9 @@ Array linear(const Array& x, const Array& w);
 // so a shape check against the config has to ask for this rather than shape().
 [[nodiscard]] Shape weight_shape(const Array& w);
 // x[..., K] @ W[idx, :, :]^T with W stacked [E, N, K]. `slot` picks a column
-// of `idx` [..., k], so MoE runs the k winners without slicing weights.
+// of `idx` [..., k], so MoE runs the k winners without slicing weights. A
+// stack carrying QuantPlanes routes to quant_linear_indexed, so a routed FFN
+// says `linear_indexed` once whatever the checkpoint stores.
 Array linear_indexed(const Array& x, const Array& w, const Array& idx,
                      int slot = 0);
 // The same contraction against a group-affine weight the kernel unpacks in
@@ -66,6 +68,15 @@ Array linear_indexed(const Array& x, const Array& w, const Array& idx,
 // than a dequantize pass feeding `linear`.
 Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                    const Array& biases, int bits, int group_size);
+// The indexed form of the same: `packed` is [E, out, in*bits/32] and the
+// expert is `idx[..., slot]`. MLX stores a 256-expert MoE layer as one such
+// stack per projection, and 8 of the 256 are read per token, so the selection
+// has to happen inside the contraction — gathering the chosen matrices out
+// first would move 25 MiB per layer that the kernel otherwise never touches.
+Array quant_linear_indexed(const Array& x, const Array& packed,
+                           const Array& scales, const Array& biases,
+                           const Array& idx, int slot, int bits,
+                           int group_size);
 // Row gather out of a group-affine table, dequantized in register. A tied LM
 // head makes this unavoidable: the same 4-bit table is read as a matrix by
 // lm_head and as rows by embed, and widening it for the gather would widen it

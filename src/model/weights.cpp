@@ -752,11 +752,10 @@ Status group_affine_bindable(const SafeTensors& weights,
                        std::string(to_string(v.dtype)),
                        "; a group-affine plane is packed into u32 lanes");
     }
-    if (v.shape.rank() != 2) {
+    if (v.shape.rank() != 2 && v.shape.rank() != 3) {
       return LSE_ERROR(kUnimplemented, "'", name, "' is ", v.shape.to_string(),
-                       "; group-affine weights are read as [out, in] matrices, "
-                       "and a stack of them needs an indexed group-affine "
-                       "contraction that this engine does not have");
+                       "; a group-affine weight is read as an [out, in] matrix "
+                       "or an [expert, out, in] stack of them");
     }
     const Result<quant::GroupAffine> spec = quant.resolve_checked(
         name, last_dim(v.shape), last_dim(scales->shape));

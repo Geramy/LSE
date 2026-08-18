@@ -23,6 +23,7 @@
 #include "lse/graph/fallback.hpp"
 #include "lse/graph/primitive.hpp"
 #include "lse/graph/workgroup.hpp"
+#include "lse/trace/record.hpp"
 
 namespace lse::graph {
 
@@ -288,6 +289,11 @@ class Scheduler {
   [[nodiscard]] FallbackChain& fallback_chain() const noexcept;
 
  private:
+  // The step itself. eval() is the wrapper that owns the step total, the
+  // unattributed remainder and the accumulation, so those close on exactly one
+  // path and a step that returned an error still reports where its time went.
+  Status eval_step(std::span<const NodePtr> roots, bool pull_host,
+                   Program* plan);
   Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
                             std::size_t member);
   // Which member of the set runs this group: the one already holding its
@@ -339,6 +345,89 @@ class Scheduler {
     std::uint32_t stream_chain = 0;
     // Compute time that overlapped an in-flight collective.
     std::uint64_t overlap_ns = 0;
+    // Where a step's host time went, as spans that do not contain one another.
+    //
+    // Every one of these is std::chrono::steady_clock around host code, and
+    // `clock` on each says so. NONE of them is device time and none ever will
+    // be: the only device interval this engine could report is the execution
+    // slice buried inside host_wait, and that has to arrive as `device_exec`
+    // below rather than as a relabelling of a host counter.
+    //
+    // DISJOINT BY CONSTRUCTION, which the previous four counters were not:
+    // partition_ns bracketed the whole dispatch loop and so contained emit and
+    // launch, and emit_ns bracketed the JIT and so contained compile. Summing
+    // them double-counted, and a cold prefill's `emit` was 98.4% compile.
+    struct Spans {
+      // Building the groups: Partitioner::phases, the staging walk, slot
+      // planning and binding, and Partitioner::partition on the host-fallback
+      // path. WHAT to run. A replay skips all of it, so this is ~0 on a
+      // steady-state decode token - which is the property the old partition_ns
+      // appeared to have only because it was written under `if (!replayed)`.
+      trace::HostDuration partition;
+      // Setting the step up: releasing last step's pointer tables, the
+      // unmaterialized walk, plan_streams, and the entry-barrier snapshot.
+      // WHERE and in what order. Runs on every step, replay included, and the
+      // old counters charged it to nothing.
+      trace::HostDuration schedule;
+      // IKernelEmitter::emit and nothing else.
+      trace::HostDuration emit;
+      // The cache deciding whether this kernel already exists: the source dump,
+      // try_get, the meta/object read and the load. The compiler call nested
+      // inside get_or_compile is subtracted out into jit_compile.
+      trace::HostDuration jit_lookup;
+      // IKernelCompiler::compile, as measured inside JitCache and nowhere else.
+      trace::HostDuration jit_compile;
+      // Between emit and launch: in-place aliasing, output buffers, constant
+      // materialization, the H2D of host-dirty inputs, the constants block, the
+      // pointer table's allocate/copy_h2d, and check_residency. If a copy in
+      // here is ever timed on the device it becomes its own span, not part of
+      // this one.
+      trace::HostDuration bind;
+      // IBackend::launch. Recording an AQL packet into an open command buffer,
+      // plus a submit one time in flush_interval_ - so it moves with the
+      // submission policy and is NOT kernel start latency. Sweeping
+      // LSE_FLUSH_INTERVAL over {0,64,16,1} moves it 0.212 -> 0.382 ms/token
+      // for identical device work.
+      trace::HostDuration submit;
+      // Host wall around a blocking IBackend::synchronize. Four things in one
+      // number - submission of whatever is still unflushed, the drain of what
+      // was already submitted, the execution still running, and the interrupt
+      // wake - and the host cannot separate them. Named host_wait because that
+      // is what was measured; the execution part is device_exec's job.
+      trace::HostDuration host_wait;
+      // interpreter::sync_from_device of the roots, which is the D2H a
+      // host-visible read forces.
+      trace::HostDuration readback;
+      // The interpreter and the fallback handlers running nodes on the host.
+      // Zero on the device path, and the bulk of a host-only step.
+      trace::HostDuration host_exec;
+      // The whole of eval(), so the spans above can be checked against it.
+      trace::HostDuration step;
+      // step minus the spans above: the dispatch loop's own bookkeeping,
+      // cross-stream event record/wait, view aliasing, group descriptions, and
+      // this instrumentation's own clock reads. Reported rather than left
+      // missing - a reader has to be able to tell what was not measured.
+      // Saturates at zero, so `unattributed == 0` with a positive step is how
+      // an overlap would show up.
+      trace::HostDuration unattributed;
+    };
+    Spans spans;
+
+    // The device-side execution interval that host_wait contains.
+    //
+    // It stays UNKNOWN and duration_ns() refuses. `clock` is filled only by a
+    // reader that took both ticks off the device, and no backend here can:
+    // HRX publishes its agent counter (kDeviceAgent, 99,810,000 Hz, 64 bits)
+    // and declines to read a tick. Copying that published clock in would make
+    // known() true and duration_ns() return 0, and filling it from steady_clock
+    // is the substitution the whole clock-domain seam exists to prevent.
+    trace::DeviceSpan device_exec;
+
+    // The old names, kept only so src/runtime/generator.cpp keeps compiling
+    // while it belongs to another change in flight. Read `spans` instead:
+    // these are the same numbers under names that mislead - `launch_ns` is
+    // submission, `sync_ns` is a host wall around a blocking wait. Delete all
+    // four once generator.hpp carries Spans.
     std::uint64_t partition_ns = 0;
     std::uint64_t emit_ns = 0;
     std::uint64_t launch_ns = 0;

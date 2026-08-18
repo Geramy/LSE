@@ -93,6 +93,39 @@ struct GroupRecord {
   bool is_phase = false;
 };
 
+// The total of N disjoint host spans, carrying the clock they were read on.
+//
+// Not a SpanRecord: that is one interval with two ends, and a total over many
+// intervals has neither. The clock travels with the number because a bare
+// nanosecond count is precisely what let the scheduler's blocking-wait total be
+// read as device occupancy for months — at the point of use, a host number and
+// a device number are indistinguishable.
+struct HostDuration {
+  std::uint64_t ns = 0;
+  backend::ClockDomain clock = backend::ClockDomain::kHostSteady;
+
+  constexpr void add(std::uint64_t elapsed) noexcept { ns += elapsed; }
+
+  // Same clock only. Adding a steady total to a system-clock total is the same
+  // category error as subtracting across two device clocks, so it refuses
+  // rather than producing a number nobody can attribute.
+  Status add(const HostDuration& other) {
+    if (other.clock != clock) {
+      return LSE_ERROR(kInvalidArgument, "cannot add a ",
+                       std::string(backend::clock_domain_name(other.clock)),
+                       " duration to a ",
+                       std::string(backend::clock_domain_name(clock)),
+                       " total: unrelated clocks");
+    }
+    ns += other.ns;
+    return OkStatus();
+  }
+
+  [[nodiscard]] constexpr double seconds() const noexcept {
+    return static_cast<double>(ns) * 1e-9;
+  }
+};
+
 // Both ticks of a device span come from one clock.
 //
 // A span whose ends were read from different clocks is not a span, so the clock

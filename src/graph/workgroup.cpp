@@ -385,10 +385,13 @@ std::int64_t linear_n(const Node& n) noexcept {
     // Keep in step with the same list in scheduler.cpp's join_wide_linear.
     // quant_linear stages a row and is priced into run_lds_bytes like the dense
     // kernels, so omitting it here is what kept every wide linear in a
-    // quantized checkpoint in its own launch.
+    // quantized checkpoint in its own launch. quant_linear_indexed stages the
+    // same row by the same rule — the expert only moves where the weight is
+    // read from — so leaving it out would understate a routed layer's scratch
+    // by a whole activation row.
     if (name != "linear" && name != "linear.lds" &&
         name != "linear_indexed" && name != "linear_indexed.lds" &&
-        name != "quant_linear") {
+        name != "quant_linear" && name != "quant_linear_indexed") {
       return 0;
     }
   }

@@ -45,6 +45,11 @@ struct ConstantsLayout {
 
 struct EmittedKernel {
   std::string source;
+  // Which language `source` is in, so the text carries its dialect instead of
+  // the caller remembering which emitter produced it. Must equal the emitting
+  // IKernelEmitter::dialect(); the default is the dialect of the only emitter
+  // that predates this field.
+  Dialect dialect = Dialect::kHip;
   std::string entry_name;
   ConstantsLayout constants;
   std::vector<NodePtr> binding_order;

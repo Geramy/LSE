@@ -6,6 +6,11 @@
 #include <limits>
 #include <vector>
 
+// The step-descriptor layout the paged kernels read. These rules have to agree
+// with src/backends/hrx/kernels/sdpa.cpp and rope.cpp element for element: a
+// group that misses the device path runs here instead, and a host fallback that
+// disagrees is a wrong answer nothing else reports.
+#include "lse/kv/block.hpp"
 #include "lse/quant/group_affine.hpp"
 
 namespace lse::graph::interpreter {
@@ -569,15 +574,23 @@ Status eval_linear(Node& n) {
 Status check_quant_planes(const quant::GroupAffine& spec, const char* op,
                           const Shape& packed, const Shape& scales,
                           const Shape& biases, std::size_t in_dim) {
-  if (packed.rank() != 2 || scales != biases || scales.rank() != 2 ||
-      scales.dim(0) != packed.dim(0)) {
+  // Rank 2 is one matrix, rank 3 a stack of them. Only the last axis differs
+  // between the planes — lanes on one side, groups on the other — so every
+  // axis before it has to agree whichever rank this is.
+  bool shaped = scales == biases && packed.rank() == scales.rank() &&
+                (packed.rank() == 2 || packed.rank() == 3);
+  for (std::size_t i = 0; shaped && i + 1 < packed.rank(); ++i) {
+    if (packed.dim(i) != scales.dim(i)) shaped = false;
+  }
+  if (!shaped) {
     return LSE_ERROR(kInvalidArgument, op, " has a ", packed.to_string(),
                      " plane with scales ", scales.to_string(), " and biases ",
                      biases.to_string(),
-                     "; the three must be matrices agreeing on the row axis");
+                     "; the three must share a rank and agree on every axis "
+                     "but the last");
   }
-  const auto lanes = static_cast<std::size_t>(packed.dim(1));
-  const auto groups = static_cast<std::size_t>(scales.dim(1));
+  const auto lanes = static_cast<std::size_t>(packed.dim(packed.rank() - 1));
+  const auto groups = static_cast<std::size_t>(scales.dim(scales.rank() - 1));
   if (lanes * 32 != in_dim * static_cast<std::size_t>(spec.bits)) {
     return LSE_ERROR(kInvalidArgument, op, " packed plane of ",
                      std::to_string(lanes), " lanes does not hold a whole "
@@ -643,6 +656,89 @@ Status eval_quant_matmul(Node& n) {
             static_cast<float>(spec.code_at(row, i)) *
                 load_element(scales, o * groups + g) +
             load_element(biases, o * groups + g);
+        acc += static_cast<double>(load_element(x, r * in_dim + i)) *
+               static_cast<double>(wv);
+      }
+      store_element(n, r * out_dim + o, static_cast<float>(acc));
+    }
+  }
+  return OkStatus();
+}
+
+// The reference the emitted quant_linear_indexed kernel is diffed against: the
+// loop above with the expert chosen per row. Nothing is gathered — the row of
+// the stack is addressed in place, exactly as the device body addresses it, so
+// a disagreement between the two is a decode bug and not a layout one.
+//
+// This is the only oracle a mis-decoded router has. Reading the 6-bit
+// checkpoint's 8-bit routers at 6 bits permutes which experts win and the
+// model still emits fluent text, so a sample proves nothing and this does.
+Status eval_quant_linear_indexed(Node& n) {
+  if (n.inputs.size() != 5) {
+    return LSE_ERROR(kInvalidArgument,
+                     "quant_linear_indexed takes x, packed, scales, biases, "
+                     "idx");
+  }
+  const Node& x = *n.inputs[0];
+  const Node& packed = *n.inputs[1];
+  const Node& scales = *n.inputs[2];
+  const Node& biases = *n.inputs[3];
+  const Node& idx = *n.inputs[4];
+  LSE_ASSIGN_OR(const quant::GroupAffine spec,
+                quant::GroupAffine::make(n.iattrs[1], n.iattrs[2]));
+  if (packed.shape.rank() != 3) {
+    return LSE_ERROR(kInvalidArgument,
+                     "quant_linear_indexed reads a stacked [E, out, lanes] "
+                     "plane, not ", packed.shape.to_string());
+  }
+  const auto experts = static_cast<std::size_t>(packed.shape.dim(0));
+  const auto out_dim = static_cast<std::size_t>(packed.shape.dim(1));
+  const auto lanes = static_cast<std::size_t>(packed.shape.dim(2));
+  const auto groups = static_cast<std::size_t>(scales.shape.dim(2));
+  const std::size_t in_dim = lanes * 32 / static_cast<std::size_t>(spec.bits);
+  LSE_RETURN_IF_ERROR(check_quant_planes(spec, "quant_linear_indexed",
+                                         packed.shape, scales.shape,
+                                         biases.shape, in_dim));
+  const auto x_width =
+      x.shape.rank() == 0
+          ? 0
+          : static_cast<std::size_t>(x.shape.dim(x.shape.rank() - 1));
+  if (x_width != in_dim) {
+    return LSE_ERROR(kInvalidArgument,
+                     "quant_linear_indexed contracts a row of ",
+                     std::to_string(x_width), " against a weight of ",
+                     std::to_string(in_dim), " per output");
+  }
+  const auto keep =
+      static_cast<std::size_t>(idx.shape.dim(idx.shape.rank() - 1));
+  const auto slot = static_cast<std::size_t>(n.iattrs[0]);
+  if (keep == 0 || slot >= keep) {
+    return LSE_ERROR(kInvalidArgument, "quant_linear_indexed slot ",
+                     std::to_string(slot), " is outside the ",
+                     std::to_string(keep), " kept experts");
+  }
+  const auto* w = static_cast<const std::uint32_t*>(host_bytes(packed));
+  if (w == nullptr) {
+    return LSE_ERROR(kInternal, "quant_linear_indexed has no host copy of its "
+                                "packed plane to read");
+  }
+  const std::size_t rows = x.element_count() / in_dim;
+
+  for (std::size_t r = 0; r < rows; ++r) {
+    const auto e = static_cast<std::size_t>(load_element(idx, r * keep + slot));
+    if (e >= experts) {
+      return LSE_ERROR(kOutOfRange, "expert ", std::to_string(e),
+                       " is outside ", std::to_string(experts));
+    }
+    for (std::size_t o = 0; o < out_dim; ++o) {
+      const std::uint32_t* row = w + (e * out_dim + o) * lanes;
+      const std::size_t gbase = (e * out_dim + o) * groups;
+      double acc = 0.0;
+      for (std::size_t i = 0; i < in_dim; ++i) {
+        const std::size_t g = i / static_cast<std::size_t>(spec.group_size);
+        const float wv = static_cast<float>(spec.code_at(row, i)) *
+                             load_element(scales, gbase + g) +
+                         load_element(biases, gbase + g);
         acc += static_cast<double>(load_element(x, r * in_dim + i)) *
                static_cast<double>(wv);
       }
@@ -768,16 +864,32 @@ Status eval_rope(Node& n) {
   const Node& x = *n.inputs[0];
   const Node& cos = *n.inputs[1];
   const Node& sin = *n.inputs[2];
-  const auto offset = n.inputs.size() >= 4
-                          ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
-                          : static_cast<std::size_t>(n.iattrs[0]);
   const std::size_t rank = x.shape.rank();
   const auto dim = static_cast<std::size_t>(x.shape.dim(rank - 1));
   const auto seq = static_cast<std::size_t>(x.shape.dim(rank - 2));
   const std::size_t rows = x.element_count() / dim;
+  const auto batch = static_cast<std::size_t>(x.shape.dim(0));
+  const std::size_t rows_per_batch = batch == 0 ? rows : rows / batch;
+  // A step descriptor carries one origin per row; a 1-element input is the
+  // single-sequence form. Same rule as RopeKernel.
+  const bool ragged =
+      n.inputs.size() >= 4 && batch > 0 &&
+      n.inputs[3]->element_count() >=
+          static_cast<std::size_t>(kv::step_meta_elems(
+              static_cast<std::int32_t>(batch)));
+  const auto offset = n.inputs.size() >= 4
+                          ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
+                          : static_cast<std::size_t>(n.iattrs[0]);
 
   for (std::size_t r = 0; r < rows; ++r) {
-    const std::size_t t = offset + (r % seq);
+    const std::size_t row_off =
+        ragged ? static_cast<std::size_t>(load_element(
+                     *n.inputs[3],
+                     static_cast<std::size_t>(kv::kStepMetaHeader) +
+                         (r / rows_per_batch) *
+                             static_cast<std::size_t>(kv::kStepMetaPerRow)))
+               : offset;
+    const std::size_t t = row_off + (r % seq);
     for (std::size_t d = 0; d + 1 < dim; d += 2) {
       const float c = load_element(cos, t * dim + d);
       const float s = load_element(sin, t * dim + d);
@@ -819,8 +931,14 @@ Status eval_kv_page_write(Node& n) {
   }
   const auto stride =
       static_cast<std::size_t>(table.shape.dim(table.shape.rank() - 1));
-  const auto pos = static_cast<std::size_t>(load_element(meta, 0));
   const auto rows = static_cast<std::size_t>(load_element(meta, 2));
+  if (meta.element_count() <
+      static_cast<std::size_t>(
+          kv::step_meta_elems(static_cast<std::int32_t>(batch)))) {
+    return LSE_ERROR(kInvalidArgument, "kv_page_write got a step descriptor of ",
+                     std::to_string(meta.element_count()), " for ",
+                     std::to_string(batch), " rows");
+  }
 
   const bool aliased =
       n.buffer.valid() && dst.buffer.valid() &&
@@ -831,6 +949,12 @@ Status eval_kv_page_write(Node& n) {
     }
   }
   for (std::size_t r = 0; r < batch && r < rows; ++r) {
+    const std::size_t mb = static_cast<std::size_t>(kv::kStepMetaHeader) +
+                           r * static_cast<std::size_t>(kv::kStepMetaPerRow);
+    // Zero live length is a row holding no sequence: its table row still names
+    // real blocks, and they belong to whoever held the slot last.
+    if (static_cast<std::size_t>(load_element(meta, mb + 1)) == 0) continue;
+    const auto pos = static_cast<std::size_t>(load_element(meta, mb));
     for (std::size_t j = 0; j < t; ++j) {
       const std::size_t abs = pos + j;
       const std::size_t slot = abs / bs;
@@ -926,14 +1050,18 @@ Status eval_sdpa(Node& n) {
   const std::size_t stride =
       paged ? static_cast<std::size_t>(table->shape.dim(table->shape.rank() - 1))
             : 0;
-  const auto offset = n.inputs.size() >= 4
-                          ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
-                          : static_cast<std::size_t>(n.iattrs[2]);
-  const std::size_t used =
-      paged ? static_cast<std::size_t>(load_element(*n.inputs[3], 1))
-            : std::min(ts, offset + tq);
+  const auto pass_off = n.inputs.size() >= 4
+                            ? static_cast<std::size_t>(load_element(*n.inputs[3], 0))
+                            : static_cast<std::size_t>(n.iattrs[2]);
   const std::size_t rows =
       paged ? static_cast<std::size_t>(load_element(*n.inputs[3], 2)) : batch;
+  if (paged && n.inputs[3]->element_count() <
+                   static_cast<std::size_t>(kv::step_meta_elems(
+                       static_cast<std::int32_t>(batch)))) {
+    return LSE_ERROR(kInvalidArgument, "sdpa got a step descriptor of ",
+                     std::to_string(n.inputs[3]->element_count()), " for ",
+                     std::to_string(batch), " rows");
+  }
   const std::size_t group = qh / kvh;  // GQA: several q heads share one kv head
 
   // Element offset of key/value j of (b, kh). Paged form walks the block table;
@@ -946,7 +1074,7 @@ Status eval_sdpa(Node& n) {
     return ((blk * kvh + kh) * ts + (j % ts)) * width;
   };
 
-  std::vector<float> logits(used);
+  std::vector<float> logits;
   for (std::size_t b = 0; b < batch; ++b) {
     // Rows past the real count are batch padding: they run the same code path
     // on real blocks and their output is zero, so nothing downstream can tell
@@ -957,6 +1085,19 @@ Status eval_sdpa(Node& n) {
       }
       continue;
     }
+    // Every row carries its own origin and its own live length, so a batch of
+    // sequences at different positions masks and normalizes per row. A row
+    // holding no sequence has length 0 and accumulates nothing, which is the
+    // zero it must answer.
+    const std::size_t mb = static_cast<std::size_t>(kv::kStepMetaHeader) +
+                           b * static_cast<std::size_t>(kv::kStepMetaPerRow);
+    const std::size_t offset =
+        paged ? static_cast<std::size_t>(load_element(*n.inputs[3], mb))
+              : pass_off;
+    const std::size_t used =
+        paged ? static_cast<std::size_t>(load_element(*n.inputs[3], mb + 1))
+              : std::min(ts, pass_off + tq);
+    logits.assign(used, 0.0f);
     for (std::size_t h = 0; h < qh; ++h) {
       const std::size_t kh = h / group;
       for (std::size_t i = 0; i < tq; ++i) {
@@ -1224,8 +1365,12 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
       LSE_RETURN_IF_ERROR(eval_quant_matmul(n));
       break;
 
+    // Both routed contractions are the same dispatch; the fifth input is the
+    // group-affine plane's scales and biases, which is what separates them.
     case OpKind::kMoEDispatch:
-      LSE_RETURN_IF_ERROR(eval_linear_indexed(n));
+      LSE_RETURN_IF_ERROR(n.inputs.size() == 5
+                              ? eval_quant_linear_indexed(n)
+                              : eval_linear_indexed(n));
       break;
 
     case OpKind::kGather:

@@ -121,3 +121,44 @@ if(LSE_ENABLE_HRX)
                    "HRX backend will be header-checked only")
   endif()
 endif()
+
+# --- loomc discovery ---------------------------------------------------------
+# loomc is the second kernel generator inside the HRX runtime: it parses .loom
+# text and emits an AMDGPU code object itself, with no LLVM in the graph and no
+# ROCm or HSA dependency. It installs into the same prefix libhrx does, so
+# nothing new has to be pointed at.
+
+set(LSE_HAVE_LOOMC OFF)
+if(LSE_ENABLE_HRX)
+  find_path(LSE_LOOMC_INCLUDE_DIR
+    NAMES loomc/loomc.h
+    HINTS "${LSE_HRX_ROOT}/include"
+          "${CMAKE_CURRENT_SOURCE_DIR}/reference/hrx-system/build/hrx-install/include")
+  find_library(LSE_LOOMC_LIBRARY
+    NAMES loomc
+    HINTS "${LSE_HRX_ROOT}/lib"
+          "${CMAKE_CURRENT_SOURCE_DIR}/reference/hrx-system/build/hrx-install/lib")
+  find_file(LSE_LOOMC_VERSION_FILE
+    NAMES loomc-config-version.cmake
+    HINTS "${LSE_HRX_ROOT}/lib/cmake/loomc"
+          "${CMAKE_CURRENT_SOURCE_DIR}/reference/hrx-system/build/hrx-install/lib/cmake/loomc")
+  # Read out of the install rather than written here. The JIT cache key carries
+  # it, and a version constant maintained on this side is one forgotten edit
+  # away from serving an object a different loomc built.
+  set(LSE_LOOMC_VERSION "unknown")
+  if(LSE_LOOMC_VERSION_FILE)
+    file(STRINGS "${LSE_LOOMC_VERSION_FILE}" _lse_loomc_version_line
+         REGEX "^set\\(PACKAGE_VERSION ")
+    if(_lse_loomc_version_line)
+      string(REGEX REPLACE "^set\\(PACKAGE_VERSION \"([^\"]+)\".*$" "\\1"
+             LSE_LOOMC_VERSION "${_lse_loomc_version_line}")
+    endif()
+  endif()
+  if(LSE_LOOMC_INCLUDE_DIR AND LSE_LOOMC_LIBRARY)
+    set(LSE_HAVE_LOOMC ON)
+    message(STATUS "loomc ${LSE_LOOMC_VERSION}: ${LSE_LOOMC_LIBRARY}")
+  elseif(LSE_LOOMC_INCLUDE_DIR)
+    message(STATUS "loomc headers found but libloomc not built yet — "
+                   "the loom dialect will report itself unavailable")
+  endif()
+endif()

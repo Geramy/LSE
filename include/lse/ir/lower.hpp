@@ -17,9 +17,19 @@
 
 namespace lse::ir {
 
-// One expression, as the printer would inline it at a use site. A named value
-// renders as its name; an unnamed one renders its whole subtree.
+// One value, as the body's dialect names it at a use site.
+//
+// In a C-family dialect that is an inlined expression: a named value renders as
+// its name, an unnamed one renders its whole subtree. In an SSA dialect every
+// value is a name, and the subtree is a run of statements the SSA printer has
+// already emitted — see ssa_name. Which of the two a caller gets is the body's
+// to decide, because a store hook receives this text and cannot know.
 [[nodiscard]] std::string render(const Body& body, ValueId v);
+
+// The SSA spelling of a value: `%name` if it was declared, `%v<id>` otherwise.
+// One definition, shared by the SSA printer and by `render`, so a hook's
+// operand text and the statement that defined it cannot drift apart.
+[[nodiscard]] std::string ssa_name(const Body& body, ValueId v);
 
 // The whole body: the vector typedefs the kernel used, then its statements.
 // Function-scope typedefs keep the result self-contained, so a kernel authored

@@ -20,6 +20,8 @@
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
+#include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 
 namespace lse::backend {
 
@@ -89,12 +91,21 @@ class HrxBackend : public Backend<HrxBackend> {
   AmdDeviceInfo amd_{};
   HipEmitter emitter_;
   ComgrCompiler compiler_;
+  LoomEmitter loom_emitter_;
+  LoomcCompiler loom_compiler_;
   // Declared, not derived: a second dialect is one more entry, and the first
   // entry is what a caller with no dialect opinion gets. Points into this
   // object, which is why the backend is constructed in place and never moved —
   // the same reason DeviceInfo::extension can point at amd_.
-  std::array<graph::KernelToolchain, 1> toolchains_{
-      graph::KernelToolchain{graph::Dialect::kHip, &emitter_, &compiler_}};
+  //
+  // kHip stays first, so nothing that asks the device for "its" emitter sees a
+  // change. Loom is declared beside it rather than chosen by a flag: a caller
+  // that wants it looks the dialect up and either finds it or does not, which
+  // is the whole of the negotiation.
+  std::array<graph::KernelToolchain, 2> toolchains_{
+      graph::KernelToolchain{graph::Dialect::kHip, &emitter_, &compiler_},
+      graph::KernelToolchain{graph::Dialect::kLoom, &loom_emitter_,
+                             &loom_compiler_}};
   void* device_ = nullptr;    // hrx_device_t
   void* allocator_ = nullptr; // hrx_allocator_t (borrowed)
   bool initialized_ = false;

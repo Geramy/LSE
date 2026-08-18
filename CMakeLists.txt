@@ -229,6 +229,7 @@ target_link_libraries(lse_ops PUBLIC lse_core lse_graph lse_kv)
 lse_apply_common_flags(lse_ops)
 
 add_library(lse_runtime
+  src/runtime/batch.cpp
   src/runtime/generator.cpp
   src/runtime/sampler.cpp
   src/runtime/session.cpp
@@ -311,6 +312,7 @@ message(STATUS "  device std      : C++${LSE_DEVICE_CXX_STANDARD}")
 message(STATUS "  HRX backend     : ${LSE_ENABLE_HRX}")
 message(STATUS "  HIP available   : ${LSE_HAVE_HIP}")
 message(STATUS "  comgr (JIT)     : ${LSE_HAVE_COMGR}")
+message(STATUS "  loomc (JIT)     : ${LSE_HAVE_LOOMC} ${LSE_LOOMC_VERSION}")
 message(STATUS "  HRX linked      : ${LSE_HAVE_HRX}")
 message(STATUS "  HSA runtime     : ${LSE_ROCM_RUNTIME_DIR}")
 message(STATUS "  GPU targets     : ${LSE_GPU_TARGETS}")

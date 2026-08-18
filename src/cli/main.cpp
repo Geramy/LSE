@@ -1,4 +1,5 @@
 // lse — load a checkpoint, tokenize a prompt, stream the continuation.
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -23,6 +24,7 @@
 #include "lse/place/devices.hpp"
 #include "lse/probe/pool.hpp"
 #include "lse/probe/profile_store.hpp"
+#include "lse/runtime/batch.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 
@@ -45,6 +47,16 @@ struct Options {
   bool list_cache = false;
   bool debug = false;
   std::int32_t kv_len = 0;
+  // Sequences to decode in one engine. 1 keeps the single-session Generator,
+  // which is the path every baseline was taken on.
+  std::int32_t batch = 1;
+  // Blocks one attention layer's KV pool may hold. 0 sizes it so nothing is
+  // ever preempted.
+  std::int32_t kv_blocks = 0;
+  // Extra prompts, one sequence each. Their lengths differ, so the rows sit at
+  // different positions and the batch is ragged — which is the case a shared
+  // position gets wrong.
+  std::vector<std::string> prompts;
 };
 
 void usage() {
@@ -69,6 +81,15 @@ void usage() {
       "                         this build can load each one, and exit\n"
       "      --kv-len N         allocate the KV cache for N tokens and keep\n"
       "                         that shape (default: max(2*train_seq, 2048))\n"
+      "  -b, --batch N          decode N copies of the prompt as one batch,\n"
+      "                         reporting aggregate throughput and per-session\n"
+      "                         latency (default 1: the single-session path)\n"
+      "  -p, --prompt TEXT      one more sequence for the batch; repeatable,\n"
+      "                         and prompts of different lengths put the rows\n"
+      "                         at different positions\n"
+      "      --kv-blocks N      blocks one attention layer's pool may hold;\n"
+      "                         below what the batch needs, sequences are\n"
+      "                         preempted and resume (default: no limit)\n"
       "      --stats            print timings when done\n"
       "      --debug            print the HIP dump path and file count\n"
       "      --devices          report every device this build can see, with\n"
@@ -109,6 +130,15 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->show_stats = true;
     } else if (a == "--debug") {
       opt->debug = true;
+    } else if (a == "-b" || a == "--batch") {
+      if (!take_value(argc, argv, i, "--batch", &v)) return false;
+      opt->batch = std::atoi(v.c_str());
+    } else if (a == "-p" || a == "--prompt") {
+      if (!take_value(argc, argv, i, "--prompt", &v)) return false;
+      opt->prompts.push_back(v);
+    } else if (a == "--kv-blocks") {
+      if (!take_value(argc, argv, i, "--kv-blocks", &v)) return false;
+      opt->kv_blocks = std::atoi(v.c_str());
     } else if (a == "-m" || a == "--model") {
       if (!take_value(argc, argv, i, "--model", &opt->model)) return false;
     } else if (a == "-n" || a == "--max-tokens") {
@@ -504,6 +534,81 @@ int main(int argc, char** argv) {
 
   if (opt.limits.stop_tokens.empty()) {
     opt.limits.stop_tokens.push_back(tokenizer::kQwen36Eos);
+  }
+
+  // More than one sequence: the batch driver, decoding them all in one step.
+  // Aggregate throughput and per-session latency both get reported because they
+  // move in opposite directions — a wider batch raises the first and lowers the
+  // second, and printing only the first would hide the trade.
+  if (opt.batch > 1 || !opt.prompts.empty()) {
+    std::vector<std::vector<std::uint32_t>> encoded;
+    for (const std::string& text : opt.prompts) {
+      auto ids = tok->encode(text);
+      if (!ids.ok()) return fail(ids.status(), "encoding a batch prompt");
+      encoded.push_back(ids.release());
+    }
+    for (std::int32_t i = static_cast<std::int32_t>(encoded.size());
+         i < opt.batch; ++i) {
+      encoded.push_back(*prompt);
+    }
+
+    runtime::BatchLimits limits;
+    limits.max_batch = std::max<std::int32_t>(
+        opt.batch, static_cast<std::int32_t>(encoded.size()));
+    limits.max_tokens = opt.limits.max_tokens;
+    limits.stop_tokens = opt.limits.stop_tokens;
+    limits.kv_blocks = opt.kv_blocks;
+
+    runtime::BatchScheduler batch(*lm, opt.sampling, limits);
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+      const Status s = batch.submit({"s" + std::to_string(i), encoded[i],
+                                     opt.limits.max_tokens});
+      if (!s.ok()) return fail(s, "submitting a sequence");
+    }
+    auto done = batch.run();
+    if (!done.ok()) return fail(done.status(), "batched generation");
+
+    std::sort(done->begin(), done->end(),
+              [](const runtime::SequenceResult& a,
+                 const runtime::SequenceResult& b) { return a.id < b.id; });
+    for (const runtime::SequenceResult& r : *done) {
+      auto text = tok->decode(r.generated);
+      std::fprintf(stdout, "[%s] %s\n", r.id.c_str(),
+                   text.ok() ? text->c_str() : "<undecodable>");
+    }
+    std::fflush(stdout);
+
+    const runtime::BatchStats& bs = batch.stats();
+    std::fprintf(stderr,
+                 "batch %d (bucket %d): %.2f tok/s aggregate | %d token(s) in "
+                 "%.3f s over %d step(s) | occupancy %.2f\n",
+                 static_cast<int>(encoded.size()), bs.bucket,
+                 bs.aggregate_tokens_per_second(), bs.generated_tokens,
+                 static_cast<double>(bs.wall_ns) / 1e9, bs.steps,
+                 bs.occupancy());
+    std::vector<double> per_session;
+    for (const runtime::SequenceResult& r : *done) {
+      per_session.push_back(r.tokens_per_second());
+      std::fprintf(stderr,
+                   "  %-6s %4zu token(s)  ttft %8.2f ms  %7.2f tok/s"
+                   "  preempted %d\n",
+                   r.id.c_str(), r.generated.size(),
+                   static_cast<double>(r.ttft_ns) / 1e6, r.tokens_per_second(),
+                   r.preemptions);
+    }
+    std::sort(per_session.begin(), per_session.end());
+    const double median =
+        per_session.empty()
+            ? 0.0
+            : per_session[per_session.size() / 2];
+    std::fprintf(stderr,
+                 "per-session median %.2f tok/s | admissions %d | preemptions "
+                 "%d | launches %u | host groups %u | jit compiles %llu\n",
+                 median, bs.admissions, bs.preemptions, bs.kernels_launched,
+                 bs.host_groups,
+                 static_cast<unsigned long long>(bs.jit_compiles));
+    if (opt.show_stats) report_pool(qual);
+    return 0;
   }
 
   runtime::Generator gen(*lm, opt.sampling);

@@ -195,7 +195,31 @@ class Printer {
 
 }  // namespace
 
+std::string ssa_name(const Body& body, ValueId v) {
+  // `const T n = expr;` introduces a second name for one value. C needs the
+  // declaration; SSA does not have one — the value already exists and `n` IS
+  // it — so a bind resolves to what it bound. Doing that here rather than in
+  // the printer is what keeps a store hook's operand text and the statement
+  // that defined it the same string.
+  for (int hops = 0; v != kNoValue && v < body.value_count() && hops < 64;
+       ++hops) {
+    const ValueDef& def = body.value(v);
+    if (def.def == kNoOp) break;
+    const Operation& o = body.op(def.def);
+    if (o.kind != OpKind::kBind || o.operands.empty()) break;
+    v = o.operands[0];
+  }
+  if (v == kNoValue || v >= body.value_count()) return {};
+  const ValueDef& def = body.value(v);
+  return def.name.empty() ? "%v" + std::to_string(v) : "%" + def.name;
+}
+
 std::string render(const Body& body, ValueId v) {
+  // An SSA dialect has no inline expression to render: every op is a statement
+  // that names its result, so a use is that name. The whole of the dialect
+  // split at a use site is this line; the statement walk itself is a separate
+  // printer, in the generator that owns the dialect.
+  if (body.intrinsics().dialect() == Dialect::kLoom) return ssa_name(body, v);
   return Printer(body).render(v);
 }
 

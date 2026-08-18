@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,9 +24,11 @@
 #include "lse/kv/block.hpp"
 #include "lse/kv/policy.hpp"
 #include "lse/model/config.hpp"
+#include "lse/ops/rope.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/lemonseed.hpp"
 #include "lse/model/weights.hpp"
+#include "lse/runtime/batch.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/runtime/sampler.hpp"
 #include "lse/runtime/session.hpp"
@@ -712,6 +716,32 @@ std::vector<float> read_all(graph::Array& a) {
   return out;
 }
 
+// The step descriptor kv/block.hpp specifies, from one {first query position,
+// live KV length} pair per row. A length of 0 is a row holding no sequence.
+graph::Array step_meta(
+    const std::vector<std::pair<std::int32_t, std::int32_t>>& rows) {
+  const auto n = static_cast<std::int32_t>(rows.size());
+  std::vector<float> m(
+      static_cast<std::size_t>(kv::step_meta_elems(n)), 0.0f);
+  std::int32_t pos = 0;
+  std::int32_t len = 0;
+  std::int32_t live = 0;
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    if (rows[r].second == 0) continue;
+    const auto at = static_cast<std::size_t>(kv::kStepMetaHeader) +
+                    r * static_cast<std::size_t>(kv::kStepMetaPerRow);
+    m[at] = static_cast<float>(rows[r].first);
+    m[at + 1] = static_cast<float>(rows[r].second);
+    pos = std::max(pos, rows[r].first);
+    len = std::max(len, rows[r].second);
+    live = static_cast<std::int32_t>(r) + 1;
+  }
+  m[0] = static_cast<float>(pos);
+  m[1] = static_cast<float>(len);
+  m[2] = static_cast<float>(live);
+  return filled(Shape{static_cast<std::int64_t>(m.size())}, m);
+}
+
 // Deterministic and not symmetric, so an index mistake shows up as a value
 // mistake rather than cancelling out.
 float noise(std::size_t i) {
@@ -755,6 +785,13 @@ LSE_TEST(a_paged_read_matches_a_contiguous_read_exactly) {
     std::vector<float> pool(
         static_cast<std::size_t>(pool_blocks * kKvh * bs * kHd), 1e30f);
     std::vector<float> poolv(pool.size(), -1e30f);
+    // Logical block b lives in physical block `phys(b)`, which is deliberately
+    // not b: an identity table is satisfied by a kernel that ignores the table
+    // and walks the pool linearly, which is the whole thing under test. The
+    // three values below are distinct for pool_blocks == kMinPoolBlocks.
+    const auto phys = [pool_blocks](std::int32_t b) {
+      return (b * 5 + 3) % pool_blocks;
+    };
     for (std::int32_t blk = 0; blk < nblk; ++blk) {
       for (std::int64_t h = 0; h < kKvh; ++h) {
         for (std::int32_t sl = 0; sl < bs; ++sl) {
@@ -762,7 +799,7 @@ LSE_TEST(a_paged_read_matches_a_contiguous_read_exactly) {
           if (j >= live) continue;
           for (std::int64_t d = 0; d < kHd; ++d) {
             const auto dst = static_cast<std::size_t>(
-                ((blk * kKvh + h) * bs + sl) * kHd + d);
+                ((phys(blk) * kKvh + h) * bs + sl) * kHd + d);
             const auto src = static_cast<std::size_t>((h * live + j) * kHd + d);
             pool[dst] = flat[src];
             poolv[dst] = flatv[src];
@@ -780,11 +817,9 @@ LSE_TEST(a_paged_read_matches_a_contiguous_read_exactly) {
     const std::int32_t stride = 16;
     std::vector<float> table(static_cast<std::size_t>(stride), 0.0f);
     for (std::int32_t i = 0; i < nblk; ++i) table[static_cast<std::size_t>(i)] =
-        static_cast<float>(i);
+        static_cast<float>(phys(i));
     graph::Array ta = filled(Shape{1, stride}, table);
-    graph::Array meta =
-        filled(Shape{3}, {static_cast<float>(offset), static_cast<float>(live),
-                          1.0f});
+    graph::Array meta = step_meta({{offset, live}});
 
     const float scale = 0.125f;
     graph::Array contig = graph::sdpa(qa, ka, va, scale,
@@ -842,8 +877,8 @@ LSE_TEST(a_padded_batch_row_reads_its_own_blocks_and_pad_rows_answer_zero) {
   table[0] = 2.0f;
   table[static_cast<std::size_t>(stride)] = 5.0f;
   graph::Array ta = filled(Shape{bucket, stride}, table);
-  graph::Array meta = filled(
-      Shape{3}, {0.0f, static_cast<float>(live), 2.0f});
+  graph::Array meta =
+      step_meta({{0, live}, {0, live}, {0, 0}, {0, 0}});
 
   std::vector<float> q(static_cast<std::size_t>(bucket * kQh * 1 * kHd));
   for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 77);
@@ -885,8 +920,7 @@ LSE_TEST(a_padded_batch_row_reads_its_own_blocks_and_pad_rows_answer_zero) {
     one_table[0] = table[static_cast<std::size_t>(r) * stride];
     graph::Array q1 = filled(Shape{1, kQh, 1, kHd}, one_q);
     graph::Array t1 = filled(Shape{1, stride}, one_table);
-    graph::Array m1 =
-        filled(Shape{3}, {0.0f, static_cast<float>(live), 1.0f});
+    graph::Array m1 = step_meta({{0, live}});
     graph::Array o1 = graph::sdpa_paged(q1, kp, vp, 0.25f,
                                         graph::MaskKind::kCausal, 0, m1, t1, bs);
     LSE_EXPECT_OK(o1.eval());
@@ -903,6 +937,205 @@ LSE_TEST(a_padded_batch_row_reads_its_own_blocks_and_pad_rows_answer_zero) {
     std::printf("       row %d batched vs alone: %zu of %zu differ\n", r, differ,
                 per_row);
     LSE_EXPECT_EQ(differ, 0u);
+  }
+}
+
+namespace {
+
+// One ragged attention pass: `rows` gives each row's {first query position,
+// live KV length} and `blocks` its block list. Returns the whole [bucket, Hq,
+// 1, Hd] output.
+struct RaggedRow {
+  std::int32_t first = 0;
+  std::int32_t len = 0;
+  std::vector<std::int32_t> blocks;
+};
+
+constexpr std::int64_t kRagQh = 2;
+constexpr std::int64_t kRagKvh = 2;
+constexpr std::int64_t kRagHd = 8;
+constexpr std::int32_t kRagStride = 8;
+constexpr std::int32_t kRagPool = 16;
+
+std::vector<float> ragged_pass(const std::vector<RaggedRow>& rows,
+                               const std::vector<float>& q,
+                               const graph::Array& kp, const graph::Array& vp) {
+  const auto bucket = static_cast<std::int64_t>(rows.size());
+  std::vector<float> table(
+      static_cast<std::size_t>(bucket * kRagStride), 0.0f);
+  std::vector<std::pair<std::int32_t, std::int32_t>> meta;
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    for (std::size_t i = 0; i < rows[r].blocks.size(); ++i) {
+      table[r * static_cast<std::size_t>(kRagStride) + i] =
+          static_cast<float>(rows[r].blocks[i]);
+    }
+    meta.push_back({rows[r].first, rows[r].len});
+  }
+  graph::Array ta = filled(Shape{bucket, kRagStride}, table);
+  graph::Array ma = step_meta(meta);
+  graph::Array qa = filled(Shape{bucket, kRagQh, 1, kRagHd}, q);
+  graph::Array out = graph::sdpa_paged(qa, kp, vp, 0.25f,
+                                       graph::MaskKind::kCausal, 0, ma, ta,
+                                       kv::kBlockSize);
+  if (!out.eval().ok()) return {};
+  return read_all(out);
+}
+
+}  // namespace
+
+LSE_TEST(a_row_gets_the_same_bits_whoever_shares_its_step) {
+  // The acceptance gate for continuous batching, and the shape of the defect
+  // that has bitten this codebase three times: a token's answer must not depend
+  // on how many rows shared its pass, on where those rows sit, or on how long
+  // they are. Here every row is at a different absolute position with a
+  // different live length and its own blocks — the case a shared meta[0]/meta[1]
+  // gets wrong three separate ways (causal mask, softmax bound, RoPE origin)
+  // while still producing fluent text.
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+
+  std::vector<float> pool(static_cast<std::size_t>(
+      kRagPool * kRagKvh * kv::kBlockSize * kRagHd));
+  std::vector<float> poolv(pool.size());
+  for (std::size_t i = 0; i < pool.size(); ++i) {
+    pool[i] = noise(i + 17);
+    poolv[i] = noise(i + 4211);
+  }
+  graph::Array kp =
+      filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, pool);
+  graph::Array vp =
+      filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, poolv);
+
+  // Deliberately ragged: one row inside its first block, one three blocks deep,
+  // one exactly on a block boundary, one holding no sequence at all.
+  std::vector<RaggedRow> rows{
+      {4, 5, {2}},
+      {39, 40, {5, 1, 7}},
+      {15, 16, {11}},
+      {0, 0, {}},
+  };
+  const auto per_row = static_cast<std::size_t>(kRagQh * kRagHd);
+  std::vector<float> q(per_row * rows.size());
+  for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 88);
+
+  const std::vector<float> batched = ragged_pass(rows, q, kp, vp);
+  LSE_EXPECT_EQ(batched.size(), per_row * rows.size());
+  if (batched.size() != per_row * rows.size()) return;
+
+  // 1. Each live row alone, at its own position and length, gives the same bits.
+  for (std::size_t r = 0; r + 1 < rows.size(); ++r) {
+    const std::vector<RaggedRow> solo{rows[r]};
+    const std::vector<float> one_q(q.begin() + static_cast<std::ptrdiff_t>(r * per_row),
+                                   q.begin() + static_cast<std::ptrdiff_t>((r + 1) * per_row));
+    const std::vector<float> alone = ragged_pass(solo, one_q, kp, vp);
+    LSE_EXPECT_EQ(alone.size(), per_row);
+    if (alone.size() != per_row) return;
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < per_row; ++i) {
+      if (std::memcmp(&alone[i], &batched[r * per_row + i], sizeof(float)) != 0) {
+        ++differ;
+      }
+    }
+    std::printf("       row %zu (pos %d, len %d) batched vs alone: %zu of %zu differ\n",
+                r, rows[r].first, rows[r].len, differ, per_row);
+    LSE_EXPECT_EQ(differ, 0u);
+  }
+
+  // 2. A row holding no sequence answers zero and reads nobody's blocks.
+  for (std::size_t i = 0; i < per_row; ++i) {
+    LSE_EXPECT_EQ(batched[3 * per_row + i], 0.0f);
+  }
+
+  // 3. Row 0 does not move when the rest of the batch is rewritten under it.
+  // This is the assertion an index that lost its row term fails while every
+  // single-row test still passes.
+  std::vector<RaggedRow> other{
+      rows[0],
+      {7, 8, {3}},
+      {0, 0, {}},
+      {60, 61, {9, 12, 6, 14}},
+  };
+  std::vector<float> q2 = q;
+  for (std::size_t i = per_row; i < q2.size(); ++i) q2[i] = noise(i + 9999);
+  const std::vector<float> shuffled = ragged_pass(other, q2, kp, vp);
+  LSE_EXPECT_EQ(shuffled.size(), batched.size());
+  if (shuffled.size() != batched.size()) return;
+  std::size_t moved = 0;
+  for (std::size_t i = 0; i < per_row; ++i) {
+    if (std::memcmp(&shuffled[i], &batched[i], sizeof(float)) != 0) ++moved;
+  }
+  std::printf("       row 0 under a different batch: %zu of %zu moved\n", moved,
+              per_row);
+  LSE_EXPECT_EQ(moved, 0u);
+
+  // 4. The rows are not each other: a kernel that read one row's descriptor for
+  // every row would pass 1-3 above if the rows happened to agree, so say it.
+  std::size_t same = 0;
+  for (std::size_t i = 0; i < per_row; ++i) {
+    if (batched[i] == batched[per_row + i]) ++same;
+  }
+  LSE_EXPECT(same < per_row);
+}
+
+LSE_TEST(a_ragged_write_puts_each_row_at_its_own_position) {
+  // The write side of the same rule. Two rows at different absolute positions
+  // must land in their own blocks at their own slots; a shared position would
+  // have one of them overwrite the other's KV, which reads as a model that
+  // slowly forgets under load.
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+
+  const std::int32_t bs = kv::kBlockSize;
+  constexpr std::int64_t kKvh = 2;
+  constexpr std::int64_t kW = 4;
+  const std::int32_t pool_blocks = 6;
+  const std::int32_t stride = 4;
+
+  std::vector<float> zero(
+      static_cast<std::size_t>(pool_blocks * kKvh * bs * kW), 0.0f);
+  graph::Array pool = filled(Shape{pool_blocks, kKvh, bs, kW}, zero);
+
+  std::vector<float> src(static_cast<std::size_t>(3 * kKvh * 1 * kW));
+  for (std::size_t i = 0; i < src.size(); ++i) src[i] = noise(i + 61) + 3.0f;
+  graph::Array sa = filled(Shape{3, kKvh, 1, kW}, src);
+
+  // Row 0 writes position 2 of block 1; row 1 writes position 17, which is slot
+  // 1 of its *second* block, block 4; row 2 holds no sequence.
+  std::vector<float> table(static_cast<std::size_t>(3 * stride), 0.0f);
+  table[0] = 1.0f;
+  table[static_cast<std::size_t>(stride)] = 5.0f;
+  table[static_cast<std::size_t>(stride) + 1] = 4.0f;
+  table[static_cast<std::size_t>(2 * stride)] = 3.0f;
+  graph::Array ta = filled(Shape{3, stride}, table);
+  graph::Array meta = step_meta({{2, 3}, {17, 18}, {0, 0}});
+
+  graph::Array written = graph::kv_page_write(pool, sa, meta, ta, bs);
+  LSE_EXPECT_OK(written.eval());
+  const std::vector<float> got = read_all(written);
+  LSE_EXPECT_EQ(got.size(), zero.size());
+  if (got.size() != zero.size()) return;
+
+  const auto at = [&](std::int32_t blk, std::int64_t h, std::int32_t slot,
+                      std::int64_t w) {
+    return static_cast<std::size_t>(((blk * kKvh + h) * bs + slot) * kW + w);
+  };
+  for (std::int64_t h = 0; h < kKvh; ++h) {
+    for (std::int64_t w = 0; w < kW; ++w) {
+      LSE_EXPECT_EQ(got[at(1, h, 2, w)],
+                    src[static_cast<std::size_t>((0 * kKvh + h) * kW + w)]);
+      LSE_EXPECT_EQ(got[at(4, h, 1, w)],
+                    src[static_cast<std::size_t>((1 * kKvh + h) * kW + w)]);
+    }
+  }
+  // Block 3 belongs to the row holding no sequence, and blocks 0/2/5 were never
+  // a write target: all of them stay zero.
+  for (std::int32_t blk : {0, 2, 3, 5}) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kKvh * bs * kW); ++i) {
+      LSE_EXPECT_EQ(got[static_cast<std::size_t>(blk * kKvh * bs * kW) + i],
+                    0.0f);
+    }
   }
 }
 
@@ -933,9 +1166,8 @@ LSE_TEST(the_paged_write_lands_where_the_block_table_says) {
   table[1] = 3.0f;
   table[static_cast<std::size_t>(stride)] = 2.0f;
   graph::Array ta = filled(Shape{2, stride}, table);
-  graph::Array meta =
-      filled(Shape{3}, {static_cast<float>(pos), static_cast<float>(pos + t),
-                        1.0f});
+  graph::Array meta = step_meta(
+      {{pos, pos + static_cast<std::int32_t>(t)}, {0, 0}});
 
   graph::Array written = graph::kv_page_write(pool, sa, meta, ta, bs);
   LSE_EXPECT_OK(written.eval());
@@ -1084,6 +1316,355 @@ LSE_TEST(a_paged_session_holds_only_the_blocks_it_reached) {
   LSE_EXPECT(paged_bytes * 8 <= contiguous_bytes);
 }
 
+namespace {
+
+// The lemonseed fixture: the model plus the memory-mapped checkpoint its
+// weights are views into, which therefore has to outlive it. Empty when the
+// checkpoint is not on this box.
+struct Lemonseed {
+  std::unique_ptr<model::SafeTensors> weights;
+  std::unique_ptr<model::HybridLM> lm;
+  explicit operator bool() const noexcept { return lm != nullptr; }
+};
+
+Lemonseed load_lemonseed() {
+  Lemonseed out;
+  if (!have_model()) return out;
+  auto paths = model::resolve_model(model_dir());
+  if (!paths.ok()) return out;
+  auto ckpt = model::SafeTensors::open(paths->weights);
+  auto cfg = model::Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) return out;
+  out.weights = std::make_unique<model::SafeTensors>(ckpt.release());
+  auto lm = model::make_lemonseed(*cfg);
+  model::WeightBinder binder(*out.weights);
+  if (!lm->load(binder).ok()) return out;
+  out.lm = std::move(lm);
+  return out;
+}
+
+SamplingParams greedy_params() {
+  SamplingParams p;
+  p.temperature = 0.0f;
+  p.repetition_penalty = 1.0f;
+  return p;
+}
+
+std::string ids_to_string(const std::vector<std::uint32_t>& v) {
+  std::string s;
+  for (std::uint32_t id : v) {
+    if (!s.empty()) s += ' ';
+    s += std::to_string(id);
+  }
+  return s;
+}
+
+}  // namespace
+
+LSE_TEST(a_batch_of_one_says_exactly_what_the_single_session_path_says) {
+  // The batch driver is not a second engine. One sequence through it must give
+  // the same tokens as Generator gives the same sequence, because that path is
+  // where every baseline in WORK.md was measured: a batch of one that differed
+  // would mean the baselines no longer describe the engine.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  const std::vector<std::uint32_t> prompt{11u, 907u, 40u, 5u, 82u};
+  constexpr std::int32_t kWant = 24;
+
+  Generator gen(lm, greedy_params());
+  Session session("solo", lm.num_layers());
+  GenerationLimits glimits;
+  glimits.max_tokens = kWant;
+  auto want = gen.generate(session, prompt, glimits);
+  LSE_EXPECT_OK(want.status());
+  if (!want.ok()) return;
+
+  BatchLimits limits;
+  limits.max_batch = 1;
+  limits.max_tokens = kWant;
+  BatchScheduler one(lm, greedy_params(), limits);
+  LSE_EXPECT_OK(one.submit({"solo", prompt, kWant}));
+  auto got = one.run();
+  LSE_EXPECT_OK(got.status());
+  if (!got.ok() || got->empty()) return;
+
+  LSE_EXPECT_EQ(one.bucket(), 1);
+  std::printf("       generator [%s]\n       batch-of-1 [%s] | %.1f tok/s "
+              "aggregate, %.1f tok/s per session\n",
+              ids_to_string(*want).c_str(),
+              ids_to_string((*got)[0].generated).c_str(),
+              one.stats().aggregate_tokens_per_second(),
+              (*got)[0].tokens_per_second());
+  LSE_EXPECT((*got)[0].generated == *want);
+}
+
+LSE_TEST(a_sequence_decodes_the_same_whoever_shares_its_batch) {
+  // The acceptance gate for the driver, through the whole model rather than one
+  // kernel: run three sequences of different prompt lengths together, then run
+  // each of them alone in an engine of the same width, and the token streams
+  // must be identical.
+  //
+  // Three sequences into two rows on purpose. Rows admitted in the same step
+  // advance in lockstep, so they share an absolute position however different
+  // their prompts are, and a shared-scalar kernel is accidentally right about
+  // them. The third sequence joins when a row frees, at a position the other
+  // live row is nowhere near — which is the case a single meta[0] gets wrong
+  // while still producing fluent text.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  const std::vector<std::vector<std::uint32_t>> prompts{
+      {11u, 907u, 40u, 5u, 82u},
+      {3u, 19u},
+      {77u, 4u, 913u},
+  };
+  constexpr std::int32_t kWant = 6;
+
+  BatchLimits limits;
+  limits.max_batch = 2;
+  limits.max_tokens = kWant;
+
+  BatchScheduler together(lm, greedy_params(), limits);
+  for (std::size_t i = 0; i < prompts.size(); ++i) {
+    LSE_EXPECT_OK(together.submit({"s" + std::to_string(i), prompts[i], kWant}));
+  }
+  auto batched = together.run();
+  LSE_EXPECT_OK(batched.status());
+  if (!batched.ok()) return;
+  LSE_EXPECT_EQ(batched->size(), prompts.size());
+  if (batched->size() != prompts.size()) return;
+
+  std::printf("       batch of %zu: %.2f tok/s aggregate over %d step(s), "
+              "occupancy %.2f\n",
+              prompts.size(), together.stats().aggregate_tokens_per_second(),
+              together.stats().steps, together.stats().occupancy());
+
+  for (const SequenceResult& r : *batched) {
+    const std::size_t i = static_cast<std::size_t>(r.id[1] - '0');
+    BatchScheduler alone(lm, greedy_params(), limits);
+    LSE_EXPECT_OK(alone.submit({r.id, prompts[i], kWant}));
+    auto solo = alone.run();
+    LSE_EXPECT_OK(solo.status());
+    if (!solo.ok() || solo->empty()) return;
+    std::printf("       %s batched [%s] vs alone [%s] | %.1f tok/s per session, "
+                "ttft %.1f ms\n",
+                r.id.c_str(), ids_to_string(r.generated).c_str(),
+                ids_to_string((*solo)[0].generated).c_str(),
+                r.tokens_per_second(),
+                static_cast<double>(r.ttft_ns) / 1e6);
+    LSE_EXPECT_EQ(r.generated.size(), static_cast<std::size_t>(kWant));
+    LSE_EXPECT(r.generated == (*solo)[0].generated);
+  }
+}
+
+LSE_TEST(a_sequence_that_joins_a_running_batch_gets_its_own_answer) {
+  // Sessions join and leave between steps. Six sequences through four rows, with
+  // different token budgets so they retire at different steps and the ones still
+  // waiting are admitted into the rows that free up. A slot that keeps the
+  // previous occupant's recurrent state would answer this wrong, fluently.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  const std::vector<std::vector<std::uint32_t>> prompts{
+      {11u, 907u}, {3u},        {77u, 4u, 913u},
+      {5u, 6u},    {820u, 12u}, {41u},
+  };
+  const std::vector<std::int32_t> budget{2, 5, 3, 6, 4, 5};
+
+  BatchLimits limits;
+  limits.max_batch = 4;
+  limits.max_tokens = 8;
+
+  BatchScheduler mixed(lm, greedy_params(), limits);
+  for (std::size_t i = 0; i < prompts.size(); ++i) {
+    LSE_EXPECT_OK(mixed.submit(
+        {"j" + std::to_string(i), prompts[i], budget[i]}));
+  }
+  auto got = mixed.run();
+  LSE_EXPECT_OK(got.status());
+  if (!got.ok()) return;
+  LSE_EXPECT_EQ(got->size(), prompts.size());
+  if (got->size() != prompts.size()) return;
+  // More sequences than rows, so at least one was admitted into a row somebody
+  // else had already used.
+  LSE_EXPECT(mixed.stats().admissions >
+             static_cast<std::int32_t>(mixed.bucket()));
+
+  for (const SequenceResult& r : *got) {
+    const std::size_t i = static_cast<std::size_t>(r.id[1] - '0');
+    BatchScheduler alone(lm, greedy_params(), limits);
+    LSE_EXPECT_OK(alone.submit({r.id, prompts[i], budget[i]}));
+    auto solo = alone.run();
+    LSE_EXPECT_OK(solo.status());
+    if (!solo.ok() || solo->empty()) return;
+    std::printf("       %s joined mid-flight [%s] vs alone [%s]\n",
+                r.id.c_str(), ids_to_string(r.generated).c_str(),
+                ids_to_string((*solo)[0].generated).c_str());
+    LSE_EXPECT_EQ(r.generated.size(), static_cast<std::size_t>(budget[i]));
+    LSE_EXPECT(r.generated == (*solo)[0].generated);
+  }
+}
+
+LSE_TEST(churning_sessions_hand_every_block_back) {
+  // ops::ensure_paged used to reassign a layer's block tables without releasing
+  // the old ones, so every row that went away leaked its blocks. At a batch of
+  // one that path never ran; with sessions retiring and being replaced it runs
+  // constantly, and a leak shows up only much later as a pool that will not
+  // admit anything. So watch the free list directly: many sequences through few
+  // rows, twice, and the pool must come back to full both times without having
+  // had to grow the second time.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  std::vector<std::vector<std::uint32_t>> prompts;
+  std::vector<std::int32_t> budget;
+  for (std::uint32_t i = 0; i < 10u; ++i) {
+    prompts.push_back({11u + i, 40u + i * 7u, 900u - i * 13u});
+    budget.push_back(2 + static_cast<std::int32_t>(i % 5u));
+  }
+
+  BatchLimits limits;
+  limits.max_batch = 4;
+  limits.max_tokens = 8;
+  limits.kv_blocks = 8;
+  limits.kv_reserve = 0;
+
+  BatchScheduler churn(lm, greedy_params(), limits);
+  std::int32_t low_water = std::numeric_limits<std::int32_t>::max();
+  auto wave = [&](const char* tag) {
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+      LSE_EXPECT_OK(churn.submit(
+          {std::string(tag) + std::to_string(i), prompts[i], budget[i]}));
+    }
+    auto got = churn.run([&](const std::string&, std::uint32_t) {
+      low_water = std::min(low_water, churn.kv_blocks_free());
+      return true;
+    });
+    LSE_EXPECT_OK(got.status());
+    if (got.ok()) LSE_EXPECT_EQ(got->size(), prompts.size());
+    std::printf("       %s: %zu sequence(s), %d admission(s), %d preemption(s),"
+                " pool %d block(s), free %d, low water %d\n",
+                tag, prompts.size(), churn.stats().admissions,
+                churn.stats().preemptions, churn.kv_blocks_total(),
+                churn.kv_blocks_free(), low_water);
+    // Every sequence has left, so every block it held is back.
+    LSE_EXPECT_EQ(churn.kv_blocks_free(), churn.kv_blocks_total());
+  };
+
+  wave("w0");
+  const std::int32_t pool_after_first = churn.kv_blocks_total();
+  const std::int32_t admissions_first = churn.stats().admissions;
+  // Blocks were genuinely held while the batch ran, so a full free list at the
+  // end is a return rather than a pool that was never used.
+  LSE_EXPECT(low_water < pool_after_first);
+
+  wave("w1");
+  // The second wave found the pool exactly as the first left it: a leak would
+  // have forced it to a bigger rung or to more preemptions to fit.
+  LSE_EXPECT_EQ(churn.kv_blocks_total(), pool_after_first);
+  LSE_EXPECT(churn.stats().admissions >= 2 * admissions_first);
+}
+
+LSE_TEST(an_exhausted_block_pool_preempts_instead_of_failing) {
+  // Exhaustion is a decision. With a budget too small for every sequence at
+  // once, kv::BlockPolicy names victims oldest-first, they hand their blocks
+  // back, and they are re-admitted later with their history as the prompt — so
+  // every sequence still finishes, and finishes with the answer it would have
+  // given alone.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  const std::vector<std::vector<std::uint32_t>> prompts{
+      {11u, 907u, 40u}, {3u, 19u}, {77u, 4u}, {820u, 12u, 6u},
+  };
+  constexpr std::int32_t kWant = 30;
+
+  BatchLimits limits;
+  limits.max_batch = 4;
+  limits.max_tokens = kWant;
+  // A block covers 16 tokens, so each of these reaches three of them. Four rows
+  // want twelve and the pool holds six: they fit while they are short and stop
+  // fitting as they grow, which is when a running sequence — not a waiting one —
+  // is the thing that cannot get a block.
+  limits.kv_blocks = 6;
+  limits.kv_reserve = 0;
+
+  BatchScheduler tight(lm, greedy_params(), limits);
+  for (std::size_t i = 0; i < prompts.size(); ++i) {
+    LSE_EXPECT_OK(tight.submit({"p" + std::to_string(i), prompts[i], kWant}));
+  }
+  auto got = tight.run();
+  LSE_EXPECT_OK(got.status());
+  if (!got.ok()) return;
+  std::printf("       %d block(s) for %zu sequence(s): %d preemption(s), "
+              "%d admission(s)\n",
+              tight.block_ceiling(), prompts.size(),
+              tight.stats().preemptions, tight.stats().admissions);
+  LSE_EXPECT_EQ(got->size(), prompts.size());
+  if (got->size() != prompts.size()) return;
+  LSE_EXPECT(tight.stats().preemptions > 0);
+
+  BatchLimits roomy = limits;
+  roomy.kv_blocks = 0;
+  for (const SequenceResult& r : *got) {
+    const std::size_t i = static_cast<std::size_t>(r.id[1] - '0');
+    LSE_EXPECT_EQ(r.generated.size(), static_cast<std::size_t>(kWant));
+    BatchScheduler alone(lm, greedy_params(), roomy);
+    LSE_EXPECT_OK(alone.submit({r.id, prompts[i], kWant}));
+    auto solo = alone.run();
+    LSE_EXPECT_OK(solo.status());
+    if (!solo.ok() || solo->empty()) return;
+    std::printf("       %s preempted %d time(s) [%s] vs untouched [%s]\n",
+                r.id.c_str(), r.preemptions,
+                ids_to_string(r.generated).c_str(),
+                ids_to_string((*solo)[0].generated).c_str());
+    LSE_EXPECT(r.generated == (*solo)[0].generated);
+  }
+}
+
+LSE_TEST(a_pool_that_cannot_hold_one_sequence_refuses_it_by_name) {
+  // The other half of the same decision: a request that does not fit even with
+  // the pool empty is not a transient condition, so it is refused with the size
+  // rather than queued forever or allowed to fail mid-step.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  BatchLimits limits;
+  limits.max_batch = 2;
+  limits.max_tokens = 2;
+  limits.kv_blocks = 1;  // 16 tokens
+  limits.kv_reserve = 0;
+
+  BatchScheduler tiny(lm, greedy_params(), limits);
+  std::vector<std::uint32_t> long_prompt(40u, 7u);
+  LSE_EXPECT_OK(tiny.submit({"big", long_prompt, 2}));
+  auto got = tiny.run();
+  LSE_EXPECT(!got.ok());
+  std::printf("       refusal: %s\n", got.status().message().c_str());
+  LSE_EXPECT(got.status().message().find("big") != std::string::npos);
+  LSE_EXPECT(got.status().message().find("block") != std::string::npos);
+}
+
+LSE_TEST(a_batch_that_fits_no_bucket_is_refused_by_size) {
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+  BatchLimits limits;
+  limits.max_batch = 64;
+  BatchScheduler over(lm, greedy_params(), limits);
+  const Status s = over.submit({"x", {1u}, 1});
+  LSE_EXPECT(!s.ok());
+  LSE_EXPECT(s.message().find("64") != std::string::npos);
+  LSE_EXPECT(s.message().find("fits no bucket") != std::string::npos);
+}
+
 LSE_TEST(a_two_row_pass_gives_each_row_what_it_gets_alone) {
   // Width invariance for the batch axis through the whole model, not just the
   // attention kernel: MatmulKernel::specialize() picks GEMV vs WMMA by row count
@@ -1107,7 +1688,8 @@ LSE_TEST(a_two_row_pass_gives_each_row_what_it_gets_alone) {
 
   Session pair("pair", lm->num_layers());
   graph::Array tokens = filled(Shape{2, 1}, ids);
-  auto both = lm->hidden(tokens, &pair.states(), nullptr, nullptr, /*rows=*/2);
+  const model::StepRows plan{{0, 0}};
+  auto both = lm->hidden(tokens, &pair.states(), nullptr, nullptr, &plan);
   LSE_EXPECT_OK(both.status());
   if (!both.ok()) return;
   const std::vector<float> got = read_all(*both);
@@ -1289,3 +1871,716 @@ LSE_TEST(the_swiglu_chain_costs_three_launches_not_four) {
   LSE_EXPECT_EQ(t.host_groups, 0u);
   LSE_EXPECT_EQ(t.kernels_launched, 3u);
 }
+
+namespace {
+
+// Adversarial ragged-attention checks. `ragged_pass` above is the batched
+// entry; these need the pools rewritten between passes and the host reference
+// run on the identical graph, so they build the pass themselves.
+struct RagPass {
+  std::vector<float> out;
+  std::size_t per_row = 0;
+};
+
+RagPass rag_run(const std::vector<RaggedRow>& rows, const std::vector<float>& q,
+                const std::vector<float>& kbuf, const std::vector<float>& vbuf,
+                graph::MaskKind mask, int window, bool host_only) {
+  RagPass r;
+  r.per_row = static_cast<std::size_t>(kRagQh * kRagHd);
+  const auto bucket = static_cast<std::int64_t>(rows.size());
+  std::vector<float> table(static_cast<std::size_t>(bucket * kRagStride), 0.0f);
+  std::vector<std::pair<std::int32_t, std::int32_t>> meta;
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    for (std::size_t b = 0; b < rows[i].blocks.size(); ++b) {
+      table[i * static_cast<std::size_t>(kRagStride) + b] =
+          static_cast<float>(rows[i].blocks[b]);
+    }
+    meta.push_back({rows[i].first, rows[i].len});
+  }
+  graph::Array kp =
+      filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, kbuf);
+  graph::Array vp =
+      filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, vbuf);
+  graph::Array ta = filled(Shape{bucket, kRagStride}, table);
+  graph::Array ma = step_meta(meta);
+  graph::Array qa = filled(Shape{bucket, kRagQh, 1, kRagHd}, q);
+  graph::Array out =
+      graph::sdpa_paged(qa, kp, vp, 0.25f, mask, window, ma, ta, kv::kBlockSize);
+  graph::Scheduler* sched = graph::default_scheduler();
+  const auto saved = sched->mode();
+  if (host_only) sched->set_mode(graph::Scheduler::Mode::kHostOnly);
+  const bool ok = out.eval().ok();
+  sched->set_mode(saved);
+  if (!ok) return r;
+  r.out = read_all(out);
+  return r;
+}
+
+std::size_t bitdiff(const std::vector<float>& a, std::size_t ao,
+                    const std::vector<float>& b, std::size_t bo, std::size_t n) {
+  std::size_t d = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (std::memcmp(&a[ao + i], &b[bo + i], sizeof(float)) != 0) ++d;
+  }
+  return d;
+}
+
+std::vector<float> rag_noise(std::size_t seed) {
+  std::vector<float> v(static_cast<std::size_t>(kRagPool * kRagKvh *
+                                                kv::kBlockSize * kRagHd));
+  for (std::size_t i = 0; i < v.size(); ++i) v[i] = noise(i + seed);
+  return v;
+}
+
+// Overwrite one block of a [blocks, Hkv, block_size, Hd] pool.
+void poison_block(std::vector<float>& pool, std::int32_t blk, float base) {
+  const auto per = static_cast<std::size_t>(kRagKvh * kv::kBlockSize * kRagHd);
+  const std::size_t at = static_cast<std::size_t>(blk) * per;
+  for (std::size_t i = 0; i < per; ++i) {
+    pool[at + i] = base + static_cast<float>(i % 13) * 0.75f;
+  }
+}
+
+}  // namespace
+
+LSE_TEST(verify_a_pad_row_anywhere_in_the_bucket_changes_nothing) {
+  // A pad row must be inert, and not only when it sits after every live row:
+  // a session that retires mid-batch leaves a hole below the last live row, so
+  // the case that matters is a pad *between* two live rows and a pad *before*
+  // them. Both must leave every live row bit-identical to the tight batch.
+  if (graph::default_scheduler() == nullptr) return;
+  const std::vector<float> kb = rag_noise(17);
+  const std::vector<float> vb = rag_noise(4211);
+  const RaggedRow a{4, 5, {2}};
+  const RaggedRow b{39, 40, {5, 1, 7}};
+  const RaggedRow pad{0, 0, {}};
+
+  const auto per = static_cast<std::size_t>(kRagQh * kRagHd);
+  std::vector<float> q2(per * 2);
+  for (std::size_t i = 0; i < q2.size(); ++i) q2[i] = noise(i + 88);
+  const auto qrow = [&](std::size_t r) {
+    return std::vector<float>(q2.begin() + static_cast<std::ptrdiff_t>(r * per),
+                              q2.begin() +
+                                  static_cast<std::ptrdiff_t>((r + 1) * per));
+  };
+
+  const RagPass tight = rag_run({a, b}, q2, kb, vb, graph::MaskKind::kCausal, 0,
+                                false);
+  LSE_EXPECT_EQ(tight.out.size(), per * 2);
+  if (tight.out.size() != per * 2) return;
+
+  struct Layout {
+    const char* name;
+    std::vector<RaggedRow> rows;
+    std::vector<int> live;  // row index in this layout for a, then for b
+  };
+  std::vector<Layout> cases{
+      {"trailing pads", {a, b, pad, pad}, {0, 1}},
+      {"a hole between them", {a, pad, b}, {0, 2}},
+      {"pads before and between", {pad, a, pad, b, pad}, {1, 3}},
+  };
+  for (const Layout& c : cases) {
+    std::vector<float> q(per * c.rows.size(), 0.0f);
+    for (std::size_t i = 0; i < c.rows.size(); ++i) {
+      // Pad rows carry live-looking queries: inertness must come from the
+      // descriptor, not from the row happening to be zero.
+      const std::vector<float> src =
+          static_cast<int>(i) == c.live[0]   ? qrow(0)
+          : static_cast<int>(i) == c.live[1] ? qrow(1)
+                                             : qrow(i % 2);
+      std::copy(src.begin(), src.end(), q.begin() + static_cast<std::ptrdiff_t>(i * per));
+    }
+    const RagPass got =
+        rag_run(c.rows, q, kb, vb, graph::MaskKind::kCausal, 0, false);
+    LSE_EXPECT_EQ(got.out.size(), per * c.rows.size());
+    if (got.out.size() != per * c.rows.size()) return;
+    for (std::size_t k = 0; k < 2; ++k) {
+      const std::size_t d =
+          bitdiff(got.out, static_cast<std::size_t>(c.live[k]) * per, tight.out,
+                  k * per, per);
+      std::printf("       %-24s live row %zu: %zu of %zu differ\n", c.name, k, d,
+                  per);
+      LSE_EXPECT_EQ(d, 0u);
+    }
+    for (std::size_t i = 0; i < c.rows.size(); ++i) {
+      if (static_cast<int>(i) == c.live[0] || static_cast<int>(i) == c.live[1]) {
+        continue;
+      }
+      for (std::size_t e = 0; e < per; ++e) {
+        LSE_EXPECT_EQ(got.out[i * per + e], 0.0f);
+      }
+    }
+  }
+}
+
+LSE_TEST(verify_a_short_row_cannot_see_a_long_rows_keys) {
+  // Leakage, stated as a dependency: rewrite every block the short row does not
+  // own — the long row's three blocks and block 0, which is what the block
+  // table's pad resolves to — and the short row's answer must not move a bit.
+  // The long row must move, or the poison never reached the kernel.
+  if (graph::default_scheduler() == nullptr) return;
+  std::vector<float> kb = rag_noise(17);
+  std::vector<float> vb = rag_noise(4211);
+  const RaggedRow shortr{2, 3, {2}};
+  const RaggedRow longr{39, 40, {5, 1, 7}};
+
+  const auto per = static_cast<std::size_t>(kRagQh * kRagHd);
+  std::vector<float> q(per * 2);
+  for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 505);
+
+  const RagPass before =
+      rag_run({shortr, longr}, q, kb, vb, graph::MaskKind::kCausal, 0, false);
+  LSE_EXPECT_EQ(before.out.size(), per * 2);
+  if (before.out.size() != per * 2) return;
+
+  for (std::int32_t blk : {0, 1, 5, 7}) {
+    poison_block(kb, blk, 40.0f + static_cast<float>(blk));
+    poison_block(vb, blk, -70.0f - static_cast<float>(blk));
+  }
+  const RagPass after =
+      rag_run({shortr, longr}, q, kb, vb, graph::MaskKind::kCausal, 0, false);
+  LSE_EXPECT_EQ(after.out.size(), per * 2);
+  if (after.out.size() != per * 2) return;
+
+  const std::size_t moved_short = bitdiff(before.out, 0, after.out, 0, per);
+  const std::size_t moved_long =
+      bitdiff(before.out, per, after.out, per, per);
+  std::printf("       poisoned blocks 0/1/5/7: short row moved %zu of %zu, "
+              "long row moved %zu of %zu\n",
+              moved_short, per, moved_long, per);
+  LSE_EXPECT_EQ(moved_short, 0u);
+  LSE_EXPECT(moved_long > 0);
+}
+
+LSE_TEST(verify_the_causal_mask_bounds_every_row_at_its_own_position) {
+  // The mask is the whole correctness argument for raggedness: a row at
+  // position p must see nothing past p whatever its live length says. Stated
+  // exactly: giving a row 40 live keys when it sits at position 5 must be
+  // bit-identical to giving it 6, because keys 6..39 are masked away and a
+  // masked term adds 0.0f to the denominator and fma(0, v, acc) to the sum.
+  //
+  // Checked with the row under test in slot 1 and again in slot 0, at two
+  // different positions, so a kernel right about row 0 alone fails it.
+  if (graph::default_scheduler() == nullptr) return;
+  const std::vector<float> kb = rag_noise(17);
+  const std::vector<float> vb = rag_noise(4211);
+  const auto per = static_cast<std::size_t>(kRagQh * kRagHd);
+  std::vector<float> q(per * 2);
+  for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 313);
+
+  struct Case {
+    const char* name;
+    std::int32_t under;  // which row is the one being bounded
+    std::vector<RaggedRow> wide;
+    std::vector<RaggedRow> tight;
+    std::vector<RaggedRow> cut;  // one key short of the diagonal
+  };
+  const RaggedRow other{30, 31, {4, 6}};
+  std::vector<Case> cases{
+      {"row 1 at position 5",
+       1,
+       {other, {5, 40, {5, 1, 7}}},
+       {other, {5, 6, {5, 1, 7}}},
+       {other, {5, 5, {5, 1, 7}}}},
+      {"row 0 at position 20",
+       0,
+       {{20, 40, {5, 1, 7}}, other},
+       {{20, 21, {5, 1, 7}}, other},
+       {{20, 20, {5, 1, 7}}, other}},
+  };
+  for (const Case& c : cases) {
+    const RagPass wide =
+        rag_run(c.wide, q, kb, vb, graph::MaskKind::kCausal, 0, false);
+    const RagPass tight =
+        rag_run(c.tight, q, kb, vb, graph::MaskKind::kCausal, 0, false);
+    const RagPass cut =
+        rag_run(c.cut, q, kb, vb, graph::MaskKind::kCausal, 0, false);
+    if (wide.out.size() != per * 2 || tight.out.size() != per * 2 ||
+        cut.out.size() != per * 2) {
+      LSE_EXPECT(false);
+      return;
+    }
+    const std::size_t at = static_cast<std::size_t>(c.under) * per;
+    const std::size_t past = bitdiff(wide.out, at, tight.out, at, per);
+    const std::size_t diag = bitdiff(wide.out, at, cut.out, at, per);
+    std::printf("       %-20s keys past the diagonal: %zu of %zu differ; "
+                "dropping the diagonal: %zu of %zu differ\n",
+                c.name, past, per, diag, per);
+    LSE_EXPECT_EQ(past, 0u);
+    // The other row shares the pass and must not have moved either.
+    const std::size_t sibling =
+        static_cast<std::size_t>(c.under == 0 ? 1 : 0) * per;
+    LSE_EXPECT_EQ(bitdiff(wide.out, sibling, tight.out, sibling, per), 0u);
+    // Negative control: the identity above is not vacuous.
+    LSE_EXPECT(diag > 0);
+  }
+}
+
+LSE_TEST(verify_the_ragged_kernel_agrees_with_the_host_reference) {
+  // The JIT kernel against interpreter.cpp, which walks the block table in
+  // plain C++ and shares no code with the generator. Rows at four different
+  // positions and lengths, causal and sliding-window.
+  if (graph::default_scheduler() == nullptr) return;
+  const std::vector<float> kb = rag_noise(17);
+  const std::vector<float> vb = rag_noise(4211);
+  const std::vector<RaggedRow> rows{
+      {4, 5, {2}}, {39, 40, {5, 1, 7}}, {15, 16, {11}}, {0, 0, {}},
+  };
+  const auto per = static_cast<std::size_t>(kRagQh * kRagHd);
+  std::vector<float> q(per * rows.size());
+  for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 88);
+
+  struct Mode {
+    const char* name;
+    graph::MaskKind mask;
+    int window;
+  };
+  for (const Mode& m : {Mode{"causal", graph::MaskKind::kCausal, 0},
+                        Mode{"window 8", graph::MaskKind::kSlidingWindow, 8}}) {
+    const RagPass dev = rag_run(rows, q, kb, vb, m.mask, m.window, false);
+    const RagPass ref = rag_run(rows, q, kb, vb, m.mask, m.window, true);
+    LSE_EXPECT_EQ(dev.out.size(), per * rows.size());
+    LSE_EXPECT_EQ(ref.out.size(), dev.out.size());
+    if (dev.out.size() != ref.out.size() || dev.out.empty()) return;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+      double max_abs = 0.0;
+      double max_rel = 0.0;
+      for (std::size_t i = 0; i < per; ++i) {
+        const double a = dev.out[r * per + i];
+        const double b = ref.out[r * per + i];
+        const double e = std::fabs(a - b);
+        max_abs = std::max(max_abs, e);
+        const double mag = std::max(std::fabs(a), std::fabs(b));
+        if (mag > 1e-6) max_rel = std::max(max_rel, e / mag);
+      }
+      std::printf("       %-9s row %zu (pos %d, len %2d): max_abs %.3e "
+                  "max_rel %.3e\n",
+                  m.name, r, rows[r].first, rows[r].len, max_abs, max_rel);
+      LSE_EXPECT(max_abs < 1e-5);
+      LSE_EXPECT(max_rel < 1e-5);
+    }
+  }
+}
+
+LSE_TEST(verify_a_one_token_prompt_decodes_the_same_beside_a_long_one) {
+  // The widest length spread the fixture allows, end to end: a one-token prompt
+  // and a forty-token one in the same batch, generating past a block boundary
+  // so both rows cross into a second block at different steps. Each must give
+  // the tokens it gives alone.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  std::vector<std::uint32_t> longp;
+  for (std::uint32_t i = 0; i < 40u; ++i) longp.push_back(100u + i * 7u);
+  const std::vector<std::vector<std::uint32_t>> prompts{
+      {41u}, longp, {7u, 8u}, {500u, 21u, 3u, 90u, 12u, 6u, 77u},
+  };
+  constexpr std::int32_t kWant = 24;  // > kv::kBlockSize, so blocks are added
+
+  for (std::int32_t width : {2, 4}) {
+    BatchLimits limits;
+    limits.max_batch = width;
+    limits.max_tokens = kWant;
+
+    BatchScheduler together(lm, greedy_params(), limits);
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+      LSE_EXPECT_OK(
+          together.submit({"v" + std::to_string(i), prompts[i], kWant}));
+    }
+    auto batched = together.run();
+    LSE_EXPECT_OK(batched.status());
+    if (!batched.ok()) return;
+    LSE_EXPECT_EQ(batched->size(), prompts.size());
+    if (batched->size() != prompts.size()) return;
+
+    for (const SequenceResult& r : *batched) {
+      const std::size_t i = static_cast<std::size_t>(r.id[1] - '0');
+      BatchScheduler alone(lm, greedy_params(), limits);
+      LSE_EXPECT_OK(alone.submit({r.id, prompts[i], kWant}));
+      auto solo = alone.run();
+      LSE_EXPECT_OK(solo.status());
+      if (!solo.ok() || solo->empty()) return;
+      const bool same = r.generated == (*solo)[0].generated;
+      std::printf("       width %d  %s (prompt %zu): %s\n", width, r.id.c_str(),
+                  prompts[i].size(), same ? "identical" : "DIFFERS");
+      if (!same) {
+        std::printf("         batched [%s]\n         alone   [%s]\n",
+                    ids_to_string(r.generated).c_str(),
+                    ids_to_string((*solo)[0].generated).c_str());
+      }
+      LSE_EXPECT_EQ(r.generated.size(), static_cast<std::size_t>(kWant));
+      LSE_EXPECT(same);
+    }
+  }
+}
+
+LSE_TEST(verify_a_long_session_survives_short_ones_churning_beside_it) {
+  // The point of the feature, as a diff. One session decoding 40 tokens holds a
+  // row while eight two-token sessions take the other row in turn: each retires
+  // mid-flight, hands its blocks back, and the next one is admitted into the
+  // slot at a position the long row is nowhere near. The long session's tokens
+  // must be exactly the ones it produces alone.
+  //
+  // Two rows and a pool small enough that the short sessions' blocks are
+  // recycled, so the long row is decoding against a free list that is being
+  // handed back and re-acquired under it every few steps.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  const std::vector<std::uint32_t> longp{11u, 907u, 40u, 5u, 82u, 313u, 7u};
+  constexpr std::int32_t kLong = 40;  // crosses three block boundaries
+
+  BatchLimits limits;
+  limits.max_batch = 2;
+  limits.max_tokens = kLong;
+  limits.kv_blocks = 8;
+  limits.kv_reserve = 0;
+
+  BatchScheduler mixed(lm, greedy_params(), limits);
+  LSE_EXPECT_OK(mixed.submit({"long", longp, kLong}));
+  for (std::uint32_t i = 0; i < 8u; ++i) {
+    LSE_EXPECT_OK(mixed.submit(
+        {"s" + std::to_string(i), {200u + i * 31u, 5u + i}, 2}));
+  }
+  auto got = mixed.run();
+  LSE_EXPECT_OK(got.status());
+  if (!got.ok()) return;
+  LSE_EXPECT_EQ(got->size(), 9u);
+  if (got->size() != 9u) return;
+
+  BatchScheduler solo(lm, greedy_params(), limits);
+  LSE_EXPECT_OK(solo.submit({"long", longp, kLong}));
+  auto alone = solo.run();
+  LSE_EXPECT_OK(alone.status());
+  if (!alone.ok() || alone->empty()) return;
+
+  const SequenceResult* batched = nullptr;
+  for (const SequenceResult& r : *got) {
+    if (r.id == "long") batched = &r;
+  }
+  LSE_EXPECT(batched != nullptr);
+  if (batched == nullptr) return;
+
+  // Both directions. The long row is always the furthest along, so a kernel
+  // that shared one position across the batch would take *its* position and be
+  // accidentally right about it; the rows that join behind it are the ones such
+  // a kernel gets wrong. Checking only the long row is not a gate.
+  for (const SequenceResult& r : *got) {
+    if (r.id == "long") continue;
+    const std::size_t i = static_cast<std::size_t>(r.id[1] - '0');
+    BatchScheduler one(lm, greedy_params(), limits);
+    LSE_EXPECT_OK(one.submit(
+        {r.id, {200u + static_cast<std::uint32_t>(i) * 31u,
+                5u + static_cast<std::uint32_t>(i)}, 2}));
+    auto solo_short = one.run();
+    LSE_EXPECT_OK(solo_short.status());
+    if (!solo_short.ok() || solo_short->empty()) return;
+    const bool same = r.generated == (*solo_short)[0].generated;
+    if (!same) {
+      std::printf("       short %s batched [%s] vs alone [%s]\n", r.id.c_str(),
+                  ids_to_string(r.generated).c_str(),
+                  ids_to_string((*solo_short)[0].generated).c_str());
+    }
+    LSE_EXPECT(same);
+  }
+
+  std::size_t first_diff = kLong;
+  for (std::size_t i = 0; i < batched->generated.size() &&
+                          i < (*alone)[0].generated.size();
+       ++i) {
+    if (batched->generated[i] != (*alone)[0].generated[i]) {
+      first_diff = i;
+      break;
+    }
+  }
+  std::printf("       long row: %d admission(s), %d preemption(s), free %d of "
+              "%d block(s) at the end; first differing token: %s\n",
+              mixed.stats().admissions, mixed.stats().preemptions,
+              mixed.kv_blocks_free(), mixed.kv_blocks_total(),
+              first_diff == kLong ? "none" : std::to_string(first_diff).c_str());
+  if (first_diff != static_cast<std::size_t>(kLong)) {
+    std::printf("         batched [%s]\n         alone   [%s]\n",
+                ids_to_string(batched->generated).c_str(),
+                ids_to_string((*alone)[0].generated).c_str());
+  }
+  LSE_EXPECT_EQ(batched->generated.size(), static_cast<std::size_t>(kLong));
+  LSE_EXPECT(batched->generated == (*alone)[0].generated);
+  // The short rows genuinely came and went through the slot beside it.
+  LSE_EXPECT(mixed.stats().admissions >= 9);
+  LSE_EXPECT_EQ(mixed.kv_blocks_free(), mixed.kv_blocks_total());
+}
+
+LSE_TEST(verify_two_rows_prefill_together_from_different_positions) {
+  // The multi-token ragged pass. Every other case here has T == 1, because a
+  // row that is decoding has one pending token and the step width is the batch
+  // minimum. Two rows both mid-prompt at different absolute positions is the
+  // one arrangement that gives T > 1 *and* raggedness, and it is the only case
+  // that exercises the per-row origin of RoPE and of the paged write across a
+  // span of positions rather than a single one.
+  //
+  // Arranged, not hoped for: a one-token sequence takes a row for the first
+  // step and leaves, so the sequence admitted into the freed row starts its
+  // prompt while the other row is already two tokens deep.
+  Lemonseed fx = load_lemonseed();
+  if (!fx) return;
+  model::HybridLM& lm = *fx.lm;
+
+  std::vector<std::uint32_t> pa;
+  for (std::uint32_t i = 0; i < 48u; ++i) pa.push_back(60u + i * 5u);
+  std::vector<std::uint32_t> pb;
+  for (std::uint32_t i = 0; i < 32u; ++i) pb.push_back(900u - i * 11u);
+  // Sixteen tokens, so the row that joins after it starts a full block behind
+  // the row already running. A shift of a token or two is invisible: RoPE and
+  // the causal mask are both relative, so a batch whose rows are uniformly
+  // displaced still answers correctly. It is the block the displaced row then
+  // over-reads that does the damage, and that needs the gap to be a block.
+  const std::vector<std::uint32_t> hog{4u,  9u,  21u, 33u, 44u, 51u, 62u, 70u,
+                                       81u, 93u, 14u, 25u, 36u, 47u, 58u, 69u};
+  constexpr std::int32_t kWant = 12;
+  // Integration coverage, not the gate. Synthetic prompts drive this model into
+  // a repeating attractor whose argmax survives quite large perturbations, so a
+  // token diff here is evidence of a fault but agreement is not evidence of
+  // correctness. The gate for T > 1 is
+  // verify_a_multi_token_pass_is_ragged_too, which compares bits.
+
+  BatchLimits limits;
+  limits.max_batch = 2;
+  limits.max_tokens = 64;
+
+  BatchScheduler together(lm, greedy_params(), limits);
+  LSE_EXPECT_OK(together.submit({"hog", hog, 1}));
+  LSE_EXPECT_OK(together.submit({"a", pa, kWant}));
+  LSE_EXPECT_OK(together.submit({"b", pb, kWant}));
+  auto got = together.run();
+  LSE_EXPECT_OK(got.status());
+  if (!got.ok()) return;
+  LSE_EXPECT_EQ(got->size(), 3u);
+  if (got->size() != 3u) return;
+
+  // Every token of both prompts, plus what they generated, in far fewer steps
+  // than there are tokens: the prompts went in several at a time.
+  const std::int32_t steps = together.stats().steps;
+  std::printf("       %d step(s) for %zu prompt token(s) + %d generated\n",
+              steps, pa.size() + pb.size() + hog.size(), 2 * kWant + 1);
+  LSE_EXPECT(steps < static_cast<std::int32_t>(pa.size()));
+
+  for (const SequenceResult& r : *got) {
+    if (r.id == "hog") continue;
+    const std::vector<std::uint32_t>& prompt = r.id == "a" ? pa : pb;
+    BatchScheduler alone(lm, greedy_params(), limits);
+    LSE_EXPECT_OK(alone.submit({r.id, prompt, kWant}));
+    auto solo = alone.run();
+    LSE_EXPECT_OK(solo.status());
+    if (!solo.ok() || solo->empty()) return;
+    const bool same = r.generated == (*solo)[0].generated;
+    std::printf("       %s (prompt %zu): %s\n", r.id.c_str(), prompt.size(),
+                same ? "identical" : "DIFFERS");
+    if (!same) {
+      std::printf("         batched [%s]\n         alone   [%s]\n",
+                  ids_to_string(r.generated).c_str(),
+                  ids_to_string((*solo)[0].generated).c_str());
+    }
+    LSE_EXPECT_EQ(r.generated.size(), static_cast<std::size_t>(kWant));
+    LSE_EXPECT(same);
+  }
+}
+
+LSE_TEST(verify_a_multi_token_pass_is_ragged_too) {
+  // Every other ragged check here has T == 1, because a decoding row has one
+  // pending token and the step width is the batch minimum. A row still feeding
+  // its prompt beside a row that started earlier gives T > 1 at two different
+  // origins, and that is the only arrangement in which the per-query term of
+  // the causal mask, the per-row origin of RoPE and the span of positions the
+  // paged write covers are all exercised at once.
+  //
+  // Bits, at the kernel, because the end-to-end form of this cannot be a gate:
+  // a uniform displacement of one row is invisible to both RoPE and the causal
+  // mask, which are relative, so the tokens can agree while the row is reading
+  // the wrong slots.
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+
+  constexpr std::int64_t kT = 32;
+  const std::vector<float> kb = rag_noise(17);
+  const std::vector<float> vb = rag_noise(4211);
+  graph::Array kp =
+      filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, kb);
+  graph::Array vp =
+      filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, vb);
+
+  // Row 0 is starting from nothing; row 1 is a full block further on. Row 2
+  // holds no sequence.
+  struct Row {
+    std::int32_t first;
+    std::int32_t len;
+    std::vector<std::int32_t> blocks;
+  };
+  const std::vector<Row> rows{
+      {0, 32, {3, 9}}, {16, 48, {5, 1, 7}}, {0, 0, {}},
+  };
+  const auto per_row = static_cast<std::size_t>(kRagQh * kT * kRagHd);
+  std::vector<float> q(per_row * rows.size());
+  for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 1201);
+
+  const auto run = [&](const std::vector<Row>& rs,
+                       const std::vector<float>& qv) {
+    const auto n = static_cast<std::int64_t>(rs.size());
+    std::vector<float> table(static_cast<std::size_t>(n * kRagStride), 0.0f);
+    std::vector<std::pair<std::int32_t, std::int32_t>> meta;
+    for (std::size_t r = 0; r < rs.size(); ++r) {
+      for (std::size_t i = 0; i < rs[r].blocks.size(); ++i) {
+        table[r * static_cast<std::size_t>(kRagStride) + i] =
+            static_cast<float>(rs[r].blocks[i]);
+      }
+      meta.push_back({rs[r].first, rs[r].len});
+    }
+    graph::Array ta = filled(Shape{n, kRagStride}, table);
+    graph::Array ma = step_meta(meta);
+    graph::Array qa = filled(Shape{n, kRagQh, kT, kRagHd}, qv);
+    graph::Array o = graph::sdpa_paged(qa, kp, vp, 0.25f,
+                                       graph::MaskKind::kCausal, 0, ma, ta,
+                                       kv::kBlockSize);
+    std::vector<float> out;
+    if (o.eval().ok()) out = read_all(o);
+    return out;
+  };
+
+  const std::vector<float> batched = run(rows, q);
+  LSE_EXPECT_EQ(batched.size(), per_row * rows.size());
+  if (batched.size() != per_row * rows.size()) return;
+
+  for (std::size_t r = 0; r + 1 < rows.size(); ++r) {
+    const std::vector<float> one(
+        q.begin() + static_cast<std::ptrdiff_t>(r * per_row),
+        q.begin() + static_cast<std::ptrdiff_t>((r + 1) * per_row));
+    const std::vector<float> alone = run({rows[r]}, one);
+    LSE_EXPECT_EQ(alone.size(), per_row);
+    if (alone.size() != per_row) return;
+    const std::size_t d = bitdiff(alone, 0, batched, r * per_row, per_row);
+    std::printf("       T=%lld row %zu (pos %2d, len %2d): %zu of %zu differ\n",
+                static_cast<long long>(kT), r, rows[r].first, rows[r].len, d,
+                per_row);
+    LSE_EXPECT_EQ(d, 0u);
+  }
+  for (std::size_t i = 0; i < per_row; ++i) {
+    LSE_EXPECT_EQ(batched[2 * per_row + i], 0.0f);
+  }
+  // The two rows are not each other, so the comparison above had something to
+  // catch.
+  std::size_t same = 0;
+  for (std::size_t i = 0; i < per_row; ++i) {
+    if (batched[i] == batched[per_row + i]) ++same;
+  }
+  LSE_EXPECT(same < per_row);
+}
+
+LSE_TEST(verify_a_multi_token_write_covers_each_rows_own_span) {
+  // The write side at T > 1: a row's span of positions crosses a block boundary
+  // at its own offset, not at the batch's. Row 0 writes 14,15,16 — two blocks —
+  // and row 1 writes 5,6,7 inside one.
+  if (graph::default_scheduler() == nullptr) return;
+  const std::int32_t bs = kv::kBlockSize;
+  constexpr std::int64_t kKvh = 2;
+  constexpr std::int64_t kW = 4;
+  constexpr std::int64_t kT = 3;
+  const std::int32_t pool_blocks = 6;
+  const std::int32_t stride = 4;
+
+  std::vector<float> zero(
+      static_cast<std::size_t>(pool_blocks * kKvh * bs * kW), 0.0f);
+  graph::Array pool = filled(Shape{pool_blocks, kKvh, bs, kW}, zero);
+  std::vector<float> src(static_cast<std::size_t>(3 * kKvh * kT * kW));
+  for (std::size_t i = 0; i < src.size(); ++i) src[i] = noise(i + 909) + 5.0f;
+  graph::Array sa = filled(Shape{3, kKvh, kT, kW}, src);
+
+  std::vector<float> table(static_cast<std::size_t>(3 * stride), 0.0f);
+  table[0] = 1.0f;  // row 0: positions 14,15 -> block 1
+  table[1] = 4.0f;  //         position  16   -> block 4
+  table[static_cast<std::size_t>(stride)] = 2.0f;      // row 1: 5,6,7 -> block 2
+  table[static_cast<std::size_t>(2 * stride)] = 3.0f;  // row 2 holds nothing
+  graph::Array ta = filled(Shape{3, stride}, table);
+  graph::Array meta = step_meta({{14, 17}, {5, 8}, {0, 0}});
+
+  graph::Array written = graph::kv_page_write(pool, sa, meta, ta, bs);
+  LSE_EXPECT_OK(written.eval());
+  const std::vector<float> got = read_all(written);
+  LSE_EXPECT_EQ(got.size(), zero.size());
+  if (got.size() != zero.size()) return;
+
+  const auto at = [&](std::int32_t blk, std::int64_t h, std::int32_t slot,
+                      std::int64_t w) {
+    return static_cast<std::size_t>(((blk * kKvh + h) * bs + slot) * kW + w);
+  };
+  const auto from = [&](std::int64_t r, std::int64_t h, std::int64_t t,
+                        std::int64_t w) {
+    return src[static_cast<std::size_t>(((r * kKvh + h) * kT + t) * kW + w)];
+  };
+  for (std::int64_t h = 0; h < kKvh; ++h) {
+    for (std::int64_t w = 0; w < kW; ++w) {
+      LSE_EXPECT_EQ(got[at(1, h, 14, w)], from(0, h, 0, w));
+      LSE_EXPECT_EQ(got[at(1, h, 15, w)], from(0, h, 1, w));
+      LSE_EXPECT_EQ(got[at(4, h, 0, w)], from(0, h, 2, w));
+      for (std::int32_t t = 0; t < 3; ++t) {
+        LSE_EXPECT_EQ(got[at(2, h, 5 + t, w)], from(1, h, t, w));
+      }
+    }
+  }
+  // Block 3 is the row that holds no sequence; block 0 is the table's pad and
+  // the row 0 slot the span never reaches. Neither was written.
+  for (std::int32_t blk : {0, 3, 5}) {
+    for (std::size_t i = 0; i < static_cast<std::size_t>(kKvh * bs * kW); ++i) {
+      LSE_EXPECT_EQ(got[static_cast<std::size_t>(blk * kKvh * bs * kW) + i],
+                    0.0f);
+    }
+  }
+}
+
+LSE_TEST(verify_rope_rotates_each_row_to_its_own_position) {
+  // RoPE reads the same descriptor. With T > 1 a row's angles run from its own
+  // origin across its span; one shared origin rotates every row but the
+  // furthest-along one to somebody else's position.
+  if (graph::default_scheduler() == nullptr) return;
+  constexpr std::int64_t kH = 2;
+  constexpr std::int64_t kT = 4;
+  constexpr std::int64_t kD = 8;
+  constexpr std::int64_t kMaxT = 64;
+
+  auto tables = ops::build_rope(static_cast<std::int32_t>(kD), kMaxT, 10000.0f);
+  LSE_EXPECT_OK(tables.status());
+  if (!tables.ok()) return;
+
+  const auto per_row = static_cast<std::size_t>(kH * kT * kD);
+  std::vector<float> x(per_row * 2);
+  for (std::size_t i = 0; i < x.size(); ++i) x[i] = noise(i + 4004);
+
+  graph::Array xa = filled(Shape{2, kH, kT, kD}, x);
+  graph::Array off = step_meta({{0, 4}, {23, 27}});
+  graph::Array both = graph::rope(xa, tables->cos, tables->sin, off);
+  LSE_EXPECT_OK(both.eval());
+  const std::vector<float> got = read_all(both);
+  LSE_EXPECT_EQ(got.size(), per_row * 2);
+  if (got.size() != per_row * 2) return;
+
+  for (std::int32_t r = 0; r < 2; ++r) {
+    const std::int32_t origin = r == 0 ? 0 : 23;
+    std::vector<float> one(
+        x.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(r) * per_row),
+        x.begin() + static_cast<std::ptrdiff_t>((static_cast<std::size_t>(r) + 1) * per_row));
+    graph::Array x1 = filled(Shape{1, kH, kT, kD}, one);
+    // The single-sequence form: a baked offset, which is what one sequence has.
+    graph::Array o1 = graph::rope(x1, tables->cos, tables->sin, origin);
+    LSE_EXPECT_OK(o1.eval());
+    const std::vector<float> alone = read_all(o1);
+    LSE_EXPECT_EQ(alone.size(), per_row);
+    if (alone.size() != per_row) return;
+    const std::size_t d =
+        bitdiff(alone, 0, got, static_cast<std::size_t>(r) * per_row, per_row);
+    std::printf("       rope row %d at position %d: %zu of %zu differ\n", r,
+                origin, d, per_row);
+    LSE_EXPECT_EQ(d, 0u);
+  }
+}
+

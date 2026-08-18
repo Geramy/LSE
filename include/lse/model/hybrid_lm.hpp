@@ -46,6 +46,35 @@ inline constexpr std::int32_t kBatchRungs[] = {1, 2, 4, 8, 16, 32};
 
 Result<std::int32_t> batch_bucket(std::int32_t rows);
 
+// Where each row of a batched pass sits.
+//
+// `first[r]` is the absolute position of row r's first query token; a negative
+// entry means row r holds no sequence this step. One entry per row of the
+// padded bucket, so the vector's own length says which bucket the caller built
+// for and a mismatch is caught rather than silently reinterpreted.
+//
+// This is the whole difference between a batch and a wide single sequence. A
+// pass with one shared position gives every row but one the wrong causal mask,
+// the wrong softmax bound and the wrong RoPE angle — three separate wrong
+// answers, all of which still produce fluent text.
+struct StepRows {
+  std::vector<std::int32_t> first;
+
+  [[nodiscard]] std::int32_t bucket() const noexcept {
+    return static_cast<std::int32_t>(first.size());
+  }
+  // Rows up to and including the last live one. The kernels take it as a prefix
+  // bound and skip everything past it; a hole below it is still a row, and it
+  // is made harmless by its own zero length, not by this.
+  [[nodiscard]] std::int32_t live_prefix() const noexcept {
+    std::int32_t last = 0;
+    for (std::size_t r = 0; r < first.size(); ++r) {
+      if (first[r] >= 0) last = static_cast<std::int32_t>(r) + 1;
+    }
+    return last;
+  }
+};
+
 struct HybridLMSpec {
   std::string embed_name = "embed.weight";
   std::string final_norm_name = "final_norm.weight";
@@ -100,13 +129,15 @@ class HybridLM {
   // place. `trace`, when non-null, is filled with each block's output — that is
   // what lets a mismatch be localized to a layer instead of just to the logits.
   //
-  // `rows` is how many of tokens' leading rows carry a real sequence. The batch
-  // axis is padded up to a bucket so the bucket — never the true row count — is
-  // what the JIT keys on; the rows past `rows` run the same kernels on their own
-  // pad blocks and their output is discarded. 0 means every row is real.
+  // `rows` says where each row of the pass sits and which rows hold a sequence
+  // at all. The batch axis is padded up to a bucket so the bucket — never the
+  // true row count — is what the JIT keys on; a row holding no sequence runs the
+  // same kernels on its own pad blocks and answers zero. Null means one
+  // sequence spread over every row, all at the state's current position, which
+  // is what a single-session decode and every prefill pass want.
   Result<Array> hidden(const Array& tokens, std::vector<MixerState>* states,
                        Array* aux_loss, std::vector<Array>* trace = nullptr,
-                       std::int32_t rows = 0);
+                       const StepRows* rows = nullptr);
 
   // [.., D] -> [.., vocab]. Applied to only the positions a caller needs: at
   // long context the full [B,T,vocab] tensor does not fit.

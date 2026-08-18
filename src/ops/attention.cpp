@@ -1,5 +1,6 @@
 #include "lse/ops/attention.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -31,6 +32,13 @@ std::size_t PagedKvLayer::pool_bytes() const noexcept {
     total += dtype_storage_bytes(values.dtype(), values.shape().elem_count());
   }
   return total;
+}
+
+std::int32_t paged_pool_blocks(std::span<const std::int32_t> row_tokens,
+                               std::int32_t ceiling) noexcept {
+  std::int32_t want = 0;
+  for (std::int32_t t : row_tokens) want += kv::blocks_for(t, kv::kBlockSize);
+  return kv::pool_rung(want, ceiling);
 }
 
 std::int32_t paged_pool_blocks(std::int32_t tokens, std::int32_t rows,
@@ -128,23 +136,69 @@ Status upload_table(PagedKvLayer& layer) {
   return OkStatus();
 }
 
-// Allocates or grows the pools, the block table and the block lists so `rows`
-// rows can each hold `tokens` positions.
+// What each row must cover once the pending pass lands. `row_tokens` is the
+// batch driver's answer; without one, every row reaches `tokens`, which is what
+// a single sequence needs.
+Result<std::vector<std::int32_t>> row_demand(const PagedKvLayer& layer,
+                                             std::int32_t rows,
+                                             std::int32_t tokens) {
+  if (layer.row_tokens.empty()) {
+    return std::vector<std::int32_t>(static_cast<std::size_t>(rows), tokens);
+  }
+  if (layer.row_tokens.size() != static_cast<std::size_t>(rows)) {
+    return LSE_ERROR(kInvalidArgument, "paged KV has ",
+                     std::to_string(layer.row_tokens.size()),
+                     " per-row demands for a pass of ", std::to_string(rows),
+                     " rows");
+  }
+  return layer.row_tokens;
+}
+
+std::int32_t pool_ceiling(const PagedKvLayer& layer, std::int32_t rows,
+                          std::int32_t capacity) noexcept {
+  if (layer.block_ceiling > 0) return layer.block_ceiling;
+  return kv::blocks_for(capacity, kv::kBlockSize) * rows;
+}
+
+// Allocates or grows the pools, the block table and the block lists so every
+// row can hold what it is about to have written.
 Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
                     std::int32_t capacity, std::int64_t kvh, std::int64_t hd,
                     DType dtype) {
   if (rows <= 0) {
     return LSE_ERROR(kInvalidArgument, "paged KV needs at least one row");
   }
-  if (tokens > capacity) {
-    return LSE_ERROR(kOutOfRange, "KV write reaching ", std::to_string(tokens),
-                     " tokens exceeds capacity ", std::to_string(capacity));
+  LSE_ASSIGN_OR(const std::vector<std::int32_t> want_tokens,
+                row_demand(layer, rows, tokens));
+  for (std::int32_t t : want_tokens) {
+    if (t > capacity) {
+      return LSE_ERROR(kOutOfRange, "KV write reaching ", std::to_string(t),
+                       " tokens exceeds capacity ", std::to_string(capacity));
+    }
   }
   const std::int32_t stride = kv::blocks_for(capacity, kv::kBlockSize);
-  const std::int32_t want_blocks = paged_pool_blocks(tokens, rows, capacity);
+  std::int32_t want_blocks =
+      paged_pool_blocks(want_tokens, pool_ceiling(layer, rows, capacity));
+  // The pool never shrinks. Its block count is an input dimension the JIT keys
+  // on, so giving it back when a sequence leaves would recompile the attention
+  // groups on every retirement — and regrow_pool copies the used prefix, which
+  // has nowhere to go in a smaller buffer.
+  if (layer.keys.valid()) {
+    want_blocks = std::max(
+        want_blocks, static_cast<std::int32_t>(layer.keys.shape().dim(0)));
+  }
 
   if (layer.tables.size() != static_cast<std::size_t>(rows)) {
-    layer.tables.assign(static_cast<std::size_t>(rows),
+    // Rows that survive keep their blocks: widening or narrowing the batch must
+    // not cost the sequences already in it their KV. Only the rows that go away
+    // hand theirs back — dropping a table on the floor would leave its
+    // refcounts at 1 forever, and the free list would shrink by a whole batch
+    // every time the width changed.
+    for (std::size_t r = static_cast<std::size_t>(rows); r < layer.tables.size();
+         ++r) {
+      LSE_RETURN_IF_ERROR(layer.alloc.release_all(layer.tables[r]));
+    }
+    layer.tables.resize(static_cast<std::size_t>(rows),
                         kv::BlockTable(kv::kBlockSize));
     layer.table_dirty = true;
   }
@@ -175,9 +229,10 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
                   alloc_zeroed(Shape{rows, stride}, DType::kF32));
     layer.table_dirty = true;
   }
-  for (kv::BlockTable& t : layer.tables) {
+  for (std::size_t r = 0; r < layer.tables.size(); ++r) {
+    kv::BlockTable& t = layer.tables[r];
     const std::int32_t before = t.size();
-    LSE_RETURN_IF_ERROR(layer.alloc.cover(t, tokens));
+    LSE_RETURN_IF_ERROR(layer.alloc.cover(t, want_tokens[r]));
     if (t.size() != before) layer.table_dirty = true;
   }
   if (layer.table_dirty) LSE_RETURN_IF_ERROR(upload_table(layer));
@@ -188,18 +243,37 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
 
 Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens) {
   if (!layer.valid()) return true;
-  const std::int32_t want = kv::blocks_for(tokens, kv::kBlockSize);
-  for (kv::BlockTable& t : layer.tables) {
+  const auto rows = static_cast<std::int32_t>(layer.tables.size());
+  LSE_ASSIGN_OR(const std::vector<std::int32_t> want_tokens,
+                row_demand(layer, rows, tokens));
+  for (std::size_t r = 0; r < layer.tables.size(); ++r) {
+    kv::BlockTable& t = layer.tables[r];
+    const std::int32_t want = kv::blocks_for(want_tokens[r], kv::kBlockSize);
     if (want <= t.size()) continue;
     // Out of blocks: the pool has to move to a bigger rung, and that is a new
     // buffer. Say so rather than failing, so the caller rebuilds instead of
     // replaying a program that points at the old pool.
     if (want - t.size() > layer.alloc.free_count()) return true;
-    LSE_RETURN_IF_ERROR(layer.alloc.cover(t, tokens));
+    LSE_RETURN_IF_ERROR(layer.alloc.cover(t, want_tokens[r]));
     layer.table_dirty = true;
   }
   if (layer.table_dirty) LSE_RETURN_IF_ERROR(upload_table(layer));
   return false;
+}
+
+Status release_row(PagedKvLayer& layer, std::int32_t row) {
+  if (row < 0 || static_cast<std::size_t>(row) >= layer.tables.size()) {
+    return LSE_ERROR(kOutOfRange, "no paged row ", std::to_string(row),
+                     " in a layer of ", std::to_string(layer.tables.size()));
+  }
+  kv::BlockTable& t = layer.tables[static_cast<std::size_t>(row)];
+  if (t.empty()) return OkStatus();
+  LSE_RETURN_IF_ERROR(layer.alloc.release_all(t));
+  // The device image still names the blocks this row just gave up. It is
+  // re-uploaded by the next extend_paged, which every pass runs, and until then
+  // the row's live length is zero so no kernel reads through it.
+  layer.table_dirty = true;
+  return OkStatus();
 }
 
 Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,

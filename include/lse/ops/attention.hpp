@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "lse/graph/graph.hpp"
@@ -76,6 +77,18 @@ struct PagedKvLayer {
   Array table;
   kv::BlockAllocator alloc;
   std::vector<kv::BlockTable> tables;
+  // Positions each row will have written once the pending pass lands, one
+  // entry per row. Empty means every row reaches the same length, which is what
+  // a single sequence needs; a batch of sequences at different lengths sets it,
+  // and then the pool is sized to what the rows actually hold rather than to
+  // the longest row times the batch.
+  std::vector<std::int32_t> row_tokens;
+  // Blocks this layer's pool may ever hold. 0 derives it from the engine KV
+  // length times the row count, which is the single-sequence answer. A batch
+  // driver sets it to the budget it schedules against, and an admission that
+  // would pass it is a decision for kv::BlockPolicy rather than an allocation
+  // that fails mid-step.
+  std::int32_t block_ceiling = 0;
   // `table` has not been re-uploaded since `tables` last changed.
   bool table_dirty = true;
 
@@ -104,25 +117,37 @@ struct AttentionCache {
   Array keys;
   Array values;
   Array table;
-  // Per-step descriptor, f32 [3] = {first query position, live KV length, real
-  // rows}. One slot for the whole model; see model::HybridLM.
+  // Per-step descriptor, kv::step_meta_elems(rows) floats — see kv/block.hpp.
+  // One slot for the whole model; see model::HybridLM.
   Array meta;
   PagedKvLayer* paged = nullptr;
   std::int64_t capacity = 0;
   std::int32_t used = 0;
 };
 
-// Tops the block lists up to cover `tokens` positions on every row and
-// re-uploads the device table if it changed. Returns false when the pool has to
-// move to a bigger rung, which a retained program cannot absorb: the pool
-// buffer changes identity, so the caller must rebuild the graph.
+// Tops each row's block list up to cover what `layer.row_tokens` asks for —
+// or `tokens` positions on every row when it is empty — and re-uploads the
+// device table if it changed. Returns true when the pool has to move to a
+// bigger rung, which a retained program cannot absorb: the pool buffer changes
+// identity, so the caller must rebuild the graph.
 //
 // Separate from gated_attention because the decode fast path replays a held
 // program and never re-records the layer, yet still crosses a block boundary
 // every kv::kBlockSize tokens.
 Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens);
 
-// The pool rung `tokens` positions on `rows` rows needs, in blocks.
+// Hands row `row`'s blocks back to the pool and empties its list. This is what
+// a sequence leaving the batch costs — one table row, not a reallocation — and
+// it is also how a preemption frees the blocks the policy asked for.
+Status release_row(PagedKvLayer& layer, std::int32_t row);
+
+// The pool rung a set of per-row position counts needs, in blocks. `ceiling` is
+// the most the pool may ever hold and is itself a valid rung.
+[[nodiscard]] std::int32_t paged_pool_blocks(
+    std::span<const std::int32_t> row_tokens, std::int32_t ceiling) noexcept;
+
+// The uniform case: `tokens` positions on each of `rows` rows, with the ceiling
+// derived from the engine KV length.
 [[nodiscard]] std::int32_t paged_pool_blocks(std::int32_t tokens,
                                              std::int32_t rows,
                                              std::int32_t capacity) noexcept;

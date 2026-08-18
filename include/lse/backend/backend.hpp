@@ -21,11 +21,7 @@
 
 #include "lse/core/enum_names.hpp"
 #include "lse/core/status.hpp"
-
-namespace lse::graph {
-class IKernelEmitter;
-class IKernelCompiler;
-}  // namespace lse::graph
+#include "lse/graph/toolchain.hpp"
 
 namespace lse::backend {
 
@@ -669,12 +665,19 @@ class Backend {
     return static_cast<void*>(static_cast<std::byte*>(buf.ptr) + buf.offset);
   }
 
+  [[nodiscard]] std::span<const graph::KernelToolchain> toolchains()
+      const noexcept {
+    return derived().toolchains_impl();
+  }
+
   [[nodiscard]] const graph::IKernelEmitter* emitter() const noexcept {
-    return derived().emitter_impl();
+    const auto tcs = toolchains();
+    return tcs.empty() ? nullptr : tcs.front().emitter;
   }
 
   [[nodiscard]] const graph::IKernelCompiler* compiler() const noexcept {
-    return derived().compiler_impl();
+    const auto tcs = toolchains();
+    return tcs.empty() ? nullptr : tcs.front().compiler;
   }
 
   // Written once against the primitives above — the reason this is a base
@@ -781,9 +784,32 @@ class IBackend {
   virtual Status synchronize_stream(Stream) { return synchronize(); }
 
   virtual std::string_view name() const noexcept = 0;
-  // nullptr when the backend has no codegen of its own.
-  virtual const graph::IKernelEmitter* emitter() const noexcept = 0;
-  virtual const graph::IKernelCompiler* compiler() const noexcept = 0;
+
+  // Every dialect this device can generate and build, in the backend's own
+  // preference order. Empty when the backend has no codegen of its own.
+  //
+  // This is the only virtual: emitter() and compiler() below are the same
+  // question asked without a dialect, and a device answers it once.
+  virtual std::span<const graph::KernelToolchain> toolchains() const noexcept = 0;
+
+  // The default dialect's halves — nullptr when the backend has no codegen.
+  [[nodiscard]] const graph::IKernelEmitter* emitter() const noexcept {
+    const auto tcs = toolchains();
+    return tcs.empty() ? nullptr : tcs.front().emitter;
+  }
+  [[nodiscard]] const graph::IKernelCompiler* compiler() const noexcept {
+    const auto tcs = toolchains();
+    return tcs.empty() ? nullptr : tcs.front().compiler;
+  }
+  // nullptr when this device does not declare `dialect`. A caller that wants a
+  // specific dialect asks here and handles absence; it never assumes.
+  [[nodiscard]] const graph::KernelToolchain* toolchain_for(
+      graph::Dialect dialect) const noexcept {
+    for (const graph::KernelToolchain& tc : toolchains()) {
+      if (tc.dialect == dialect) return &tc;
+    }
+    return nullptr;
+  }
 
   // Device address of `buf`, including its offset. Used to build a pointer
   // table so a phase kernel is not limited by the kernarg slot count.
@@ -853,11 +879,8 @@ class BackendAdapter final : public IBackend {
     return impl_.synchronize_stream(s);
   }
   std::string_view name() const noexcept override { return Derived::kName; }
-  const graph::IKernelEmitter* emitter() const noexcept override {
-    return impl_.emitter();
-  }
-  const graph::IKernelCompiler* compiler() const noexcept override {
-    return impl_.compiler();
+  std::span<const graph::KernelToolchain> toolchains() const noexcept override {
+    return impl_.toolchains();
   }
   Result<void*> device_pointer(const DeviceBuffer& buf) const override {
     return impl_.device_pointer(buf);

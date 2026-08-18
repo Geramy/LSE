@@ -66,6 +66,34 @@ inline constexpr std::int32_t kMinPoolBlocks = 8;
   return (tokens + block_size - 1) / block_size;
 }
 
+// The per-step descriptor the paged kernels read, f32, one per pass:
+//
+//   [0]        first query position of the pass, the largest over live rows
+//   [1]        KV positions live after the pass, the largest over live rows
+//   [2]        rows that hold a sequence, as a prefix bound
+//   [3 + 2r]   row r's first query position
+//   [4 + 2r]   row r's KV positions live after the pass; 0 when row r holds no
+//              sequence
+//
+// The split is the whole point. [0] and [1] are the same for every thread, so
+// they are the only two a kernel may take as a loop bound — which is what
+// ir::verify's runtime-extent rule asks for. The per-row pair is read per
+// thread and reaches nothing but guards, so a batch of sequences at different
+// positions and different lengths never puts a varying value in a trip count
+// or an address stride.
+//
+// A row's own pair is what makes the batch composition invisible to it: a
+// short row runs the longest row's block loop with its guards false and
+// accumulates exactly the terms it would have accumulated alone, in the same
+// order. A row holding no sequence has length 0, so its softmax denominator is
+// 0 and it answers zero without a special case.
+inline constexpr std::int32_t kStepMetaHeader = 3;
+inline constexpr std::int32_t kStepMetaPerRow = 2;
+
+[[nodiscard]] constexpr std::int32_t step_meta_elems(std::int32_t rows) noexcept {
+  return kStepMetaHeader + kStepMetaPerRow * (rows > 0 ? rows : 0);
+}
+
 // What one block of one attention layer holds. `head_dim` is the K width; a
 // model whose V width differs would need two geometries, and none here does.
 struct BlockGeometry {
