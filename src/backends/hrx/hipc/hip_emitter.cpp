@@ -48,6 +48,12 @@ struct RowPanel {
   // The array in the merged body, once the prologue has declared it. Empty
   // while the row belongs to a single stage, which stages it itself.
   std::string name;
+
+  // The int8 form of the row, hoisted beside it when every member would have
+  // quantized it the same way. Empty names mean each member stages its own.
+  hrx_kernels::DotStagingPlan quant_plan;
+  bool hoist_blocked = false;
+  hrx_kernels::StagedQuantNames quant;
 };
 
 constexpr std::size_t kNoPanel = static_cast<std::size_t>(-1);
@@ -559,6 +565,33 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     // then pay for it, including the ones covering tiles that stage does not
     // have.
     const std::uint32_t run_block = stages.front().plan.workgroup_size[0];
+    // A panel hoists the int8 form only when every stage reading the row would
+    // have produced the same one. One member on the float codec, or on another
+    // group size, and the codes would be wrong for it -- so the panel keeps the
+    // row alone and each member stages for itself, exactly as before.
+    for (std::size_t si = 0; si < stages.size(); ++si) {
+      if (panel_of[si] == kNoPanel) continue;
+      RowPanel& panel = panels[panel_of[si]];
+      std::vector<Shape> plan_storage;
+      std::vector<DType> plan_dtypes;
+      const KernelShapes ps =
+          shapes_for(stages[si].node, plan_storage, plan_dtypes);
+      const bool indexed = stages[si].prim != nullptr &&
+                           stages[si].prim->name() == "quant_linear_indexed";
+      const hrx_kernels::DotStagingPlan plan =
+          hrx_kernels::dot_staging_plan(ps, indexed);
+      if (!plan.valid() || plan.count != panel.count) {
+        panel.quant_plan = {};
+        panel.hoist_blocked = true;
+      } else if (!panel.hoist_blocked) {
+        if (panel.quant_plan.valid() && !(panel.quant_plan == plan)) {
+          panel.quant_plan = {};
+          panel.hoist_blocked = true;
+        } else {
+          panel.quant_plan = plan;
+        }
+      }
+    }
     for (std::size_t p = 0; p < panels.size(); ++p) {
       RowPanel& panel = panels[p];
       if (panel.members < 2) continue;
@@ -577,6 +610,11 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
         const kir::Buffer<kir::f32> act(&kb, &kb.types(), act_buf);
         panel.name = hrx_kernels::emit_staged_row(kb, act, panel.count,
                                                   panel.rows, run_block);
+        if (!panel.name.empty() && panel.quant_plan.valid()) {
+          panel.quant = hrx_kernels::emit_staged_dot_acts(
+              kb, panel.name, panel.count, panel.quant_plan.group_size,
+              panel.rows, run_block);
+        }
       }
       if (panel.name.empty() || !cap.has()) {
         return LSE_ERROR(kInternal, "the shared activation row did not stage");
@@ -617,6 +655,12 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       if (panel_of[si] != kNoPanel) {
         const RowPanel& panel = panels[panel_of[si]];
         if (!panel.name.empty()) shapes.staged = {panel.name, panel.count};
+        if (!panel.quant.codes.empty()) {
+          shapes.staged_quant = {panel.quant.codes, panel.quant.scale,
+                                 panel.quant.sum, panel.quant_plan.count,
+                                 panel.quant_plan.group_size,
+                                 panel.quant_plan.bits};
+        }
       }
 
       std::string stage_text;

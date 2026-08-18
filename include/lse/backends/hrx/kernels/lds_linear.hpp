@@ -76,6 +76,35 @@ LSE_GEMV_EXTERN(lse::f16)
     graph::kir::KernelBody& k, const graph::kir::Buffer<graph::kir::f32>& x,
     std::uint32_t count, std::uint32_t rows, std::uint32_t block);
 
+// The int8 staging a run could hoist for one panel: the spec every stage
+// reading that row would quantize under, or bits == 0 when the integer path
+// does not apply. Two stages whose plans differ must stage for themselves.
+struct DotStagingPlan {
+  std::uint32_t count = 0;
+  std::int32_t group_size = 0;
+  std::int32_t bits = 0;
+
+  [[nodiscard]] bool valid() const noexcept { return bits != 0; }
+  [[nodiscard]] bool operator==(const DotStagingPlan&) const noexcept = default;
+};
+[[nodiscard]] DotStagingPlan dot_staging_plan(const graph::KernelShapes& s,
+                                              bool indexed);
+
+// Declare the int8 form of an already-staged row in workgroup scratch and fill
+// it: codes, one step per chunk, and one activation sum per group, then the
+// barrier that publishes them. The other half of the KernelShapes::staged_quant
+// contract, and the same fill quant_linear would otherwise write per stage.
+// `row` is the panel emit_staged_row returned. Names are empty when the tiles
+// do not fit or the spec does not divide.
+struct StagedQuantNames {
+  std::string codes;
+  std::string scale;
+  std::string sum;
+};
+[[nodiscard]] StagedQuantNames emit_staged_dot_acts(
+    graph::kir::KernelBody& k, std::string_view row, std::uint32_t count,
+    std::int32_t group_size, std::uint32_t rows, std::uint32_t block);
+
 // Small-M linear through an LDS K-panel. Null when the tile does not fit or
 // the device has no workgroup scratch.
 const graph::KernelPrimitiveBase* lds_linear_for(const graph::KernelShapes& s);

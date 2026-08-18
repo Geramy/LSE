@@ -23,6 +23,7 @@
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/backends/hrx/kernels/lds_linear.hpp"
 #include "lse/backends/hrx/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -271,31 +272,17 @@ std::uint32_t staged_bytes(const KernelShapes& s, const QuantDims& d) {
 // x -> int8, one scale per group of `group_size`, staged for the whole
 // workgroup. `xs` is the float panel a fused run already staged, or null when
 // the row is read from global.
-template <class A>
-void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
-                    const kir::Val<kir::u32>& x_base, const DotActs& q,
-                    const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
-                    std::uint32_t cpg, std::uint32_t max_bytes) {
+template <class Fetch>
+void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
+                         const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
+                         std::uint32_t cpg) {
   constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
   // An all-zero group would divide by zero; the floor is below any activation
   // that carries information and every code in such a group is 0 regardless.
   constexpr float kAmaxFloor = 1e-30f;
-  const std::uint32_t wide = row_pack(kCodes, max_bytes, 4);
   for (auto c : e.range(lid, e.u32(nchunks), kBlock)) {
-    const auto base = e.let(x_base + c * kCodes);
     std::array<kir::Val<kir::f32>, kCodes> v;
-    if (xs != nullptr) {
-      for (std::uint32_t j = 0; j < kCodes; ++j) {
-        v[j] = e.let((*xs)[e.let(base + j)].read());
-      }
-    } else {
-      for (std::uint32_t j = 0; j < kCodes; j += wide) {
-        const auto pack = e.load(a.x, e.let(base + j), max_bytes);
-        for (std::uint32_t u = 0; u < wide; ++u) {
-          v[j + u] = e.let(pack[static_cast<int>(u)]);
-        }
-      }
-    }
+    fetch(c, v);
     auto amax = e.let(math::abs(v[0]));
     auto sum = v[0];
     for (std::uint32_t j = 1; j < kCodes; ++j) {
@@ -334,6 +321,37 @@ void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
     }
   }
   e.barrier();
+}
+
+// The body's own staging: out of the staged row when a run hoisted one, out of
+// global otherwise. `x_base` carries the row term on the global arm and is
+// zero on the staged one, which is already row-relative.
+template <class A>
+void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+                    const kir::Val<kir::u32>& x_base, const DotActs& q,
+                    const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
+                    std::uint32_t cpg, std::uint32_t max_bytes) {
+  constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
+  const std::uint32_t wide = row_pack(kCodes, max_bytes, 4);
+  stage_dot_acts_from(
+      e,
+      [&](const kir::Val<kir::u32>& c,
+          std::array<kir::Val<kir::f32>, kCodes>& v) {
+        const auto base = e.let(x_base + c * kCodes);
+        if (xs != nullptr) {
+          for (std::uint32_t j = 0; j < kCodes; ++j) {
+            v[j] = e.let((*xs)[e.let(base + j)].read());
+          }
+        } else {
+          for (std::uint32_t j = 0; j < kCodes; j += wide) {
+            const auto pack = e.load(a.x, e.let(base + j), max_bytes);
+            for (std::uint32_t u = 0; u < wide; ++u) {
+              v[j + u] = e.let(pack[static_cast<int>(u)]);
+            }
+          }
+        }
+      },
+      q, lid, nchunks, cpg);
 }
 
 // acc += the codes of one lane's run of `count` chunks.
@@ -443,8 +461,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
 
   // The integer path, when the device has the instruction and the quantized
   // activation fits in scratch. It reads no float panel of its own.
-  const bool dot =
-      dot_ok(s, d, wave, cpl) && kb.lds().fits(dot_lds_bytes(d));
+  // Reading the run's hoisted int8 panel costs this body no scratch of its
+  // own, so the fit question is only about the tiles it would allocate itself.
+  const bool quant_hoisted =
+      s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
+  const bool dot = dot_ok(s, d, wave, cpl) &&
+                   (quant_hoisted || kb.lds().fits(dot_lds_bytes(d)));
 
   // A fused run stages the shared row once, ahead of every sibling's body;
   // `s.staged` is that panel. Otherwise this body owns the staging — except on
@@ -460,11 +482,24 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   }
   const bool stage = static_cast<bool>(xs);
 
+  // A run whose stages all quantize this row the same way hoists the int8 form
+  // once, the way it already hoists the float row. Reading it costs this body
+  // nothing: no tiles, no reduction, no barrier.
   DotActs q;
   if (dot) {
-    q.codes = e.lds<kir::u32>(2 * nchunks);
-    q.scale = e.lds<kir::f32>(nchunks);
-    q.sum = e.lds<kir::f32>(groups);
+    const auto& sq = s.staged_quant;
+    if (quant_hoisted) {
+      q.codes = kir::Tile<kir::u32>(&kb, &kb.types(), std::string(sq.codes),
+                                    2 * nchunks);
+      q.scale =
+          kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.scale), nchunks);
+      q.sum =
+          kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.sum), groups);
+    } else {
+      q.codes = e.lds<kir::u32>(2 * nchunks);
+      q.scale = e.lds<kir::f32>(nchunks);
+      q.sum = e.lds<kir::f32>(groups);
+    }
   }
 
   auto acc = e.var(0.0f);
@@ -477,7 +512,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     }
     // Outside the column guard: every thread of the workgroup stages, and the
     // waves that own a column all read what they wrote.
-    if (dot) {
+    if (dot && !quant_hoisted) {
       // Zero on the staged arm; the row term otherwise. See the note on
       // x_base below — it is the same rule, and this is now the only place
       // the activation is read.
@@ -546,6 +581,67 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
 }
 
 }  // namespace
+
+DotStagingPlan dot_staging_plan(const KernelShapes& s, bool indexed) {
+  const QuantDims d = dims_of(s, indexed);
+  if (!d.valid) return {};
+  const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
+  if (!dot_ok(s, d, wave_of(s.device), cpl)) return {};
+  return DotStagingPlan{static_cast<std::uint32_t>(d.k), d.spec.group_size,
+                        d.spec.bits};
+}
+
+StagedQuantNames emit_staged_dot_acts(kir::KernelBody& k, std::string_view row,
+                                      std::uint32_t count,
+                                      std::int32_t group_size,
+                                      std::uint32_t rows,
+                                      std::uint32_t block) {
+  StagedQuantNames out;
+  // The fill below strides by kBlock, which is what the bodies that read it
+  // also assume. A run of another width would leave chunks unwritten.
+  if (count == 0 || rows == 0 || block != kBlock || group_size <= 0) return out;
+  constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
+  const auto gs = static_cast<std::uint32_t>(group_size);
+  if (count % gs != 0 || gs % kCodes != 0) return out;
+  const std::uint32_t nchunks = count / kCodes;
+  const std::uint32_t cpg = gs / kCodes;
+  const std::uint32_t groups = count / gs;
+
+  env::Emit e{&k};
+  if (!e.lds_fits<kir::u32>(2 * nchunks) || !e.lds_fits<kir::f32>(nchunks) ||
+      !e.lds_fits<kir::f32>(groups)) {
+    return out;
+  }
+  const auto xs = kir::Tile<kir::f32>(&k, &k.types(), std::string(row), count);
+  if (!xs) return out;
+  DotActs q;
+  q.codes = e.lds<kir::u32>(2 * nchunks);
+  q.scale = e.lds<kir::f32>(nchunks);
+  q.sum = e.lds<kir::f32>(groups);
+  if (!q.codes || !q.scale || !q.sum) return out;
+
+  const auto lid = e.let(math::local_id());
+  const auto wg_row = e.let(math::workgroup_id_y());
+  // The same guard emit_staged_row fills under, for the same reason: the row
+  // this quantizes only exists for a workgroup that has one. It is workgroup
+  // uniform, so the barrier inside is taken by all of the workgroup or none.
+  if (auto in_rows = e.when(wg_row < rows)) {
+    stage_dot_acts_from(
+        e,
+        [&](const kir::Val<kir::u32>& c,
+            std::array<kir::Val<kir::f32>, kCodes>& v) {
+          const auto base = e.let(c * kCodes);
+          for (std::uint32_t j = 0; j < kCodes; ++j) {
+            v[j] = e.let(xs[e.let(base + j)].read());
+          }
+        },
+        q, lid, nchunks, cpg);
+  }
+  out.codes = q.codes.name();
+  out.scale = q.scale.name();
+  out.sum = q.sum.name();
+  return out;
+}
 
 struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   static constexpr std::string_view kName = "quant_linear";

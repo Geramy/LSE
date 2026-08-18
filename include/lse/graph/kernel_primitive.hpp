@@ -48,6 +48,29 @@ struct StagedPanel {
   std::uint32_t count = 0;
 };
 
+// The int8 form of a StagedPanel, hoisted once for a run whose stages all
+// quantize the same row under the same spec. Three siblings over one row
+// otherwise amax-reduce, round and pack it three times into three private
+// tiles, which is both the work and the scratch tripled.
+//
+// `count`, `group_size` and `bits` are the spec it was staged under, not a
+// request: a stage whose own spec disagrees must stage for itself rather than
+// read codes quantized to a granularity it does not expect.
+struct StagedQuantPanel {
+  std::string_view codes;
+  std::string_view scale;
+  std::string_view sum;
+  std::uint32_t count = 0;
+  std::int32_t group_size = 0;
+  std::int32_t bits = 0;
+
+  [[nodiscard]] bool matches(std::uint32_t k, std::int32_t gs,
+                             std::int32_t b) const noexcept {
+    return !codes.empty() && !scale.empty() && !sum.empty() && count == k &&
+           group_size == gs && bits == b;
+  }
+};
+
 // What a kernel primitive is told about the invocation it must cover.
 struct KernelShapes {
   std::span<const Shape> inputs;
@@ -84,6 +107,10 @@ struct KernelShapes {
   // guard that dominates everything spliced after it. Allocate nothing, fill
   // nothing, barrier nothing — just read it.
   StagedPanel staged{};
+
+  // The quantized form of `staged`, when the run hoisted one. Same contract:
+  // a named set is a completed fill, already behind its barrier.
+  StagedQuantPanel staged_quant{};
 };
 
 struct ThreadPlan {
