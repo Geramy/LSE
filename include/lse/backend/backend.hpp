@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "lse/backend/resources.hpp"
 #include "lse/core/enum_names.hpp"
 #include "lse/core/status.hpp"
 #include "lse/graph/toolchain.hpp"
@@ -397,12 +398,15 @@ ordered_single_stream() noexcept {
 // field is either an identity a cache key needs or a limit every backend can
 // answer. Vendor detail lives in `extension`.
 //
-// Two things that look missing are missing on purpose:
-//   - register budgets (VGPR/SGPR): a tile is legal only if its *actual*
-//     register usage fits, and that is not known until the kernel is compiled.
-//     It comes from the code object's metadata, not from a device query.
-//   - bandwidth / clocks: only useful once there is a roofline cost model to
-//     consume them. Add them with the model, not before.
+// Register USAGE is deliberately not here: a tile is legal only if what the
+// allocator actually gave the kernel fits, and that is not known until the
+// kernel is compiled — it arrives as KernelResources, from the code object's
+// metadata. Register CAPACITY is a different question with a different answer:
+// it is a constant of the target that the compiler's own ISA table states
+// before any compile, and it lives in `arch` below.
+//
+// Bandwidth and clocks are still missing on purpose: only useful once there is
+// a roofline cost model to consume them. Add them with the model, not before.
 struct DeviceInfo {
   std::string name;   // "Radeon 8060S Graphics"
   std::string arch;   // "gfx1151" — part of the JIT cache key
@@ -440,13 +444,24 @@ struct DeviceInfo {
   std::string_view extension_id;
   const void* extension = nullptr;
 
+  // Per-target capacity, queried from the toolchain where it can answer and
+  // declared from a table where it cannot. Every field is individually
+  // unknown-able, so a target nothing answers for yields no numbers rather
+  // than zeros a model would spend.
+  ArchFacts arch_facts;
+
   [[nodiscard]] std::string describe() const;
 };
 
 // Scalars: 8 (size_t) + 4 + 4x2 + 2x1 (padded to 24) + 16 (string_view)
-// + 8 (ptr). `cus_per_lds_pool` fits in the existing tail padding beside
-// `ordinal`. Pinned so adding a field is a deliberate act, not a drift.
-static_assert(sizeof(DeviceInfo) == 2 * sizeof(std::string) + 48,
+// + 8 (ptr) + sizeof(ArchFacts). `cus_per_lds_pool` fits in the existing tail
+// padding beside `ordinal`. Pinned so adding a field is a deliberate act, not
+// a drift — ArchFacts was added deliberately, as the capacity half of the pair
+// the occupancy model needs.
+static_assert(sizeof(ArchFacts) == 13 * sizeof(DeviceFact<std::uint32_t>),
+              "ArchFacts gained or lost a fact — say which and why");
+static_assert(sizeof(DeviceInfo) ==
+                  2 * sizeof(std::string) + 48 + sizeof(ArchFacts),
               "DeviceInfo scalar budget changed — justify the field, then "
               "update this assert");
 
@@ -988,38 +1003,9 @@ class SingleDevice final : public IDeviceSet {
 // is a free function over the registry, and what it returns is a description,
 // not a device — nothing here can allocate, launch or be dispatched to.
 
-// Where a described fact came from. An enumerator reports what it was told and
-// nothing else: a property nothing reachable can answer stays kUnknown and
-// carries no number to be mistaken for one, because at the point a placement
-// reads it a plausible substitute is indistinguishable from a real answer.
-// The same discipline as probe::Provenance, restated here because this header
-// sits below probe in the build and must not depend on it.
-#define LSE_FACT_SOURCE_LIST(X)                                             \
-  X(kUnknown, "unknown")      /* nothing reachable here answers it */       \
-  X(kInapplicable, "n/a")     /* the device has no such property at all */  \
-  X(kDeclared, "declared")    /* a table answers for this part number */    \
-  X(kQueried, "queried")      /* the device's own runtime answered */
-
-LSE_DECLARE_ENUM(FactSource, std::uint8_t, LSE_FACT_SOURCE_LIST)
-
-template <typename T>
-struct DeviceFact {
-  // Meaningless unless known(). Default-constructed rather than left
-  // uninitialized so a reader that ignores the source gets a zero it can spot,
-  // not whatever was on the stack.
-  T value{};
-  FactSource source = FactSource::kUnknown;
-
-  [[nodiscard]] bool known() const noexcept {
-    return source == FactSource::kQueried || source == FactSource::kDeclared;
-  }
-
-  static DeviceFact queried(T v) { return {std::move(v), FactSource::kQueried}; }
-  static DeviceFact declared(T v) {
-    return {std::move(v), FactSource::kDeclared};
-  }
-  static DeviceFact inapplicable() { return {T{}, FactSource::kInapplicable}; }
-};
+// FactSource and DeviceFact<T> — the "unknown is not zero" vocabulary every
+// reported fact below is spelled in — live in lse/backend/resources.hpp,
+// beside the kernel and ISA facts that use the same discipline.
 
 // Whether one device can reach another's memory. Four answers rather than a
 // bool: "not yet enabled" is a different fact from "never", and "nothing here

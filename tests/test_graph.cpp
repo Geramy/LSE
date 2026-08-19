@@ -646,7 +646,12 @@ LSE_TEST(workgroup_device_defaults_match_gfx1151) {
   LSE_EXPECT_EQ(d.lds_bytes, 65536u);
   LSE_EXPECT_EQ(d.compute_units, 40u);
   LSE_EXPECT_EQ(d.wavefront, 32u);
-  LSE_EXPECT_EQ(d.max_waves_per_cu, 32u);
+  // Per SIMD, and named that way: 16 slots on each of the 4 SIMDs behind one
+  // scratch pool is the 64 a per-CU "32" has to be doubled to reach, and
+  // getting that wrong in either direction is a plain 2x error in residency.
+  LSE_EXPECT_EQ(d.wave_slots_per_simd, 16u);
+  LSE_EXPECT_EQ(d.simds_per_lds_pool, 4u);
+  LSE_EXPECT_EQ(d.lds_bytes_per_pool, 131072u);
 }
 
 LSE_TEST(sibling_linears_share_a_workgroup) {
@@ -773,7 +778,7 @@ LSE_TEST(workgroup_refuses_an_unrelated_or_oversized_member) {
   LSE_EXPECT(!wg.try_add(z.node()));
 
   WorkgroupDevice tiny;
-  tiny.max_waves_per_cu = 0;
+  tiny.wave_slots_per_simd = 0;
   Workgroup tight(tiny);
   LSE_EXPECT(!tight.try_add(q.node()));
 }
@@ -856,9 +861,10 @@ LSE_TEST(a_launch_is_priced_for_every_distinct_row_it_stages) {
 // emitter was already emitting more than twice that in a single stage.
 LSE_TEST(sibling_linears_fuse_at_a_row_the_quarter_budget_rule_refused) {
   const WorkgroupDevice dev;
-  // At least one workgroup per CU: on a 64 KiB pool shared by two CUs that is
-  // half the budget, not a quarter of it.
-  LSE_EXPECT_EQ(dev.resident_lds_bytes(), 32768u);
+  // The gate is residency, and residency is counted against the POOL — 128 KiB
+  // behind four SIMDs — not against the 64 KiB one workgroup may ask for.
+  LSE_EXPECT_EQ(dev.lds_bytes_per_pool, 131072u);
+  LSE_EXPECT_EQ(dev.lds_bytes, 65536u);
 
   // 27B geometry: hidden 5120, so the row gate and up both stage is 20480 B.
   //
@@ -881,9 +887,14 @@ LSE_TEST(sibling_linears_fuse_at_a_row_the_quarter_budget_rule_refused) {
 
   const Node* run[] = {gate.node().get(), up.node().get()};
   LSE_EXPECT_EQ(group_lds_bytes(run, dev), 20480u);
-  // Over the old quarter rule, under the honest one.
+  // Over the old quarter rule, and residency-neutral under the model: the two
+  // siblings share one staged row, so the run asks for exactly what either
+  // asks for alone and `prefer` admits the merge on equality rather than on a
+  // budget anybody chose.
   LSE_EXPECT(20480u > dev.lds_bytes / 4u);
-  LSE_EXPECT(20480u <= dev.resident_lds_bytes());
+  const std::uint32_t threads = dev.launch_threads();
+  LSE_EXPECT(opt::prefer(workgroup_residency(dev, threads, 20480),
+                         workgroup_residency(dev, threads, 20480)));
 
   // group_sibling_linears runs in phases(), which is what pulls `up` past the
   // silu so cuts() can put both in one grid launch.

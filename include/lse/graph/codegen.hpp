@@ -105,6 +105,17 @@ class IPhaseStaging {
       const Node& producer, const Node& consumer) const noexcept = 0;
 };
 
+// Workgroup size and launch count for a group with no primitive of its own.
+//
+// ENGINE POLICY, not a backend's: it counts elements, threads and residency,
+// and nothing it counts requires knowing the target's instruction set or the
+// language the body will be written in. It lived in two emitters, restated
+// verbatim, with a test pinning the copies together — a seam kept in step by
+// hand is a seam that has already decided it should be one function.
+[[nodiscard]] backend::LaunchDims choose_launch_dims(
+    const FusionGroup& group, const backend::DeviceInfo& device,
+    std::uint32_t lds_bytes);
+
 class IKernelEmitter {
  public:
   virtual ~IKernelEmitter() = default;
@@ -138,12 +149,31 @@ class IKernelEmitter {
   }
 };
 
+// A compiled kernel and what its compiler said about it. The resources travel
+// with the bytes rather than behind a second query: the point they are cheapest
+// to read is the point the object was produced, and a separate call would be a
+// second thing to remember and a second thing to skip on a cache hit.
+struct CompiledKernel {
+  std::vector<std::byte> code;
+  // One entry per kernel symbol the object defines. Empty when the toolchain
+  // reports nothing measurable, which is a real answer and not a failure.
+  std::vector<backend::KernelResources> resources;
+
+  // Resources for `entry`, or nullptr. When the object defines exactly one
+  // kernel an empty name matches it, so a caller that never named its entry
+  // still gets the numbers.
+  [[nodiscard]] const backend::KernelResources* resources_for(
+      std::string_view entry) const noexcept;
+};
+
 class IKernelCompiler {
  public:
   virtual ~IKernelCompiler() = default;
 
-  virtual Result<std::vector<std::byte>> compile(std::string_view source,
-                                                 std::string_view arch) const = 0;
+  // The bytes, plus whatever the toolchain reports about them. A compiler with
+  // no metadata to offer returns an empty `resources` — never a row of zeros.
+  virtual Result<CompiledKernel> compile(std::string_view source,
+                                         std::string_view arch) const = 0;
 
   [[nodiscard]] virtual bool available() const = 0;
 

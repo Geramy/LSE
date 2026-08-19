@@ -1,5 +1,7 @@
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 
+#include "lse/backends/hrx/code_object.hpp"
+
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -123,8 +125,8 @@ std::vector<std::string> frontend_options() {
 // so const elements would not convert.
 const char* kBackendOptions[] = {"-O3"};
 
-Result<std::vector<std::byte>> compile_comgr(std::string_view source,
-                                             std::string_view arch) {
+Result<graph::CompiledKernel> compile_comgr(std::string_view source,
+                                            std::string_view arch) {
   const std::string target = "amdgcn-amd-amdhsa--" + std::string(arch);
 
   DataSetGuard input;
@@ -247,13 +249,19 @@ Result<std::vector<std::byte>> compile_comgr(std::string_view source,
     amd_comgr_release_data(code);
     return s;
   }
-  std::vector<std::byte> bytes(size);
-  s = check(amd_comgr_get_data(code, &size, reinterpret_cast<char*>(bytes.data())),
-            "amd_comgr_get_data(bytes)");
+  graph::CompiledKernel out;
+  out.code.resize(size);
+  s = check(
+      amd_comgr_get_data(code, &size, reinterpret_cast<char*>(out.code.data())),
+      "amd_comgr_get_data(bytes)");
   amd_comgr_release_data(code);
   if (!s.ok()) return s;
 
-  return bytes;
+  // The note is read from the bytes rather than from the still-live `code`
+  // handle so both compilers in this backend go through one reader; the walk
+  // is microseconds against a ~350 ms compile.
+  out.resources = read_code_object_resources(out.code);
+  return out;
 }
 
 #endif  // LSE_HAVE_COMGR
@@ -290,7 +298,7 @@ std::string ComgrCompiler::identity() const {
 #endif
 }
 
-Result<std::vector<std::byte>> ComgrCompiler::compile(
+Result<graph::CompiledKernel> ComgrCompiler::compile(
     std::string_view source, std::string_view arch) const {
   if (source.empty()) return LSE_ERROR(kInvalidArgument, "empty source");
   if (arch.empty()) return LSE_ERROR(kInvalidArgument, "no target arch");

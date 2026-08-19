@@ -15,6 +15,7 @@
 #include "lse/backend/backend.hpp"
 #include "lse/core/status.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/opt/occupancy.hpp"
 
 namespace lse::graph {
 
@@ -22,23 +23,45 @@ class Node;
 using NodePtr = std::shared_ptr<Node>;
 
 struct WorkgroupDevice {
+  // The most ONE workgroup may request. Not the pool it is served from.
   std::uint32_t lds_bytes = 65536;
   std::uint32_t compute_units = 40;
   std::uint32_t wavefront = 32;
-  std::uint32_t max_waves_per_cu = 32;
   std::uint32_t max_threads = 256;
-  // See backend::DeviceInfo::cus_per_lds_pool. `lds_bytes / request` counts
-  // workgroups per pool, so the per-CU answer is that over this.
-  std::uint32_t cus_per_lds_pool = 2;
+  // The scratch block a workgroup's request is charged against, the SIMDs that
+  // draw on it, and the step a request is rounded up to. `lds_bytes_per_pool`
+  // is NOT `lds_bytes` — reading the per-workgroup cap as the pool is how a
+  // fusion that fits comes to halve residency, and on this part the two differ
+  // by exactly 2x.
+  std::uint32_t lds_bytes_per_pool = 131072;
+  std::uint32_t simds_per_lds_pool = 4;
+  std::uint32_t wave_slots_per_simd = 16;
+  // 0 when nothing measured it: the model then charges the request unrounded,
+  // marks the answer inexact, and a decision holds itself to strict
+  // improvement rather than spending a number nobody established.
+  std::uint32_t lds_alloc_granule = 0;
 
   static WorkgroupDevice from(const backend::DeviceInfo* info) noexcept;
 
-  // The largest workgroup-scratch request that still seats one workgroup on
-  // every CU — the budget a fusion decision is held to.
-  [[nodiscard]] std::uint32_t resident_lds_bytes() const noexcept {
-    return lds_bytes / (cus_per_lds_pool == 0 ? 1u : cus_per_lds_pool);
+  // These numbers as the optimizer's vocabulary. Declared, not queried: a
+  // hand-built WorkgroupDevice describes a device nobody asked.
+  [[nodiscard]] opt::DeviceCapacity capacity() const noexcept;
+
+  // The workgroup size every launch decision in this file is priced at. The
+  // staged bodies bake 256 in as a literal; a device that cannot run 256 is
+  // priced at what it can.
+  [[nodiscard]] std::uint32_t launch_threads() const noexcept {
+    const std::uint32_t t = 256u < max_threads ? 256u : max_threads;
+    return t == 0 ? 1u : t;
   }
 };
+
+// Residency of a launch of `threads` asking `lds` bytes of workgroup scratch.
+// The one place the engine turns a device and a request into an occupancy, so
+// the partitioner, the phase builder and a backend cannot disagree about it.
+[[nodiscard]] opt::Occupancy workgroup_residency(const WorkgroupDevice& dev,
+                                                 std::uint32_t threads,
+                                                 std::uint32_t lds) noexcept;
 
 // Collectives are the only hard isolate. Everything else is a stage of
 // the phase Workgroup (attention, embedding, top-k included).

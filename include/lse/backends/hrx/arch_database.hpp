@@ -21,11 +21,22 @@ struct FamilyIsa {
   std::uint16_t max_threads_per_workgroup;
   std::uint32_t lds_bytes_per_workgroup;
   std::uint32_t l2_cache_bytes;
+  // Wavefront slots per CORE, which is `simds_per_cu` times the slots one SIMD
+  // holds. Filing the per-SIMD number here is the 2x error that hides a
+  // register-bound kernel, so the two fields move together.
   std::uint8_t max_waves_per_cu;
   std::uint8_t wavefront_size;
   // RDNA pairs two CUs into a WGP that shares one LDS block; CDNA gives each
   // CU its own. See DeviceInfo::cus_per_lds_pool for the gfx1151 measurement.
   std::uint8_t cus_per_lds_pool;
+  // SIMDs in one CU. RDNA is 2, GCN and CDNA are 4. With cus_per_lds_pool this
+  // is what turns a per-SIMD budget into a per-pool one.
+  std::uint8_t simds_per_cu;
+  // The workgroup-scratch block a pool allocates from, which is NOT
+  // lds_bytes_per_workgroup times cus_per_lds_pool in general — that identity
+  // holds on RDNA by coincidence and breaks where the per-workgroup cap is
+  // itself the whole block.
+  std::uint32_t lds_bytes_per_pool;
   MatrixCore matrix_core;
   bool has_bf16_arith;
   bool matrix_core_bf16;
@@ -43,24 +54,52 @@ struct BoardFallback {
   bool unified_memory;
 };
 
+// max_waves_per_cu is slots-per-SIMD times simds_per_cu: 16 x 2 on every RDNA
+// generation, 10 x 4 on CDNA1, 8 x 4 on CDNA2 and later. RDNA2/3/4 and CDNA2
+// previously carried a per-SIMD figure under the per-CU name and so undercounted
+// by 2x and 1.25x; the wave slots the occupancy model divides by are derived
+// from this pair, so a wrong cell here is now a wrong occupancy rather than an
+// unread number.
 inline constexpr FamilyIsa kFamilyIsa[] = {
-    {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kNone,
-     false, false, true, false, 16, 16},
-    {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kWMMA,
-     true, true, true, true, 16, 16},
-    {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, 2, MatrixCore::kWMMA,
-     true, true, true, true, 16, 16},
-    {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 16, 32, 2, MatrixCore::kWMMA,
-     true, true, true, true, 16, 16},
-    {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, 1, MatrixCore::kMFMA,
-     false, false, true, false, 16, 16},
-    {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 40, 64, 1, MatrixCore::kMFMA,
-     true, true, true, false, 16, 16},
-    {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, 1, MatrixCore::kMFMA,
-     true, true, true, false, 16, 16},
-    {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, 1, MatrixCore::kMFMA,
-     true, true, true, false, 16, 16},
+    {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072,
+     MatrixCore::kNone, false, false, true, false, 16, 16},
+    {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072,
+     MatrixCore::kWMMA, true, true, true, true, 16, 16},
+    {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, 2, 2, 131072,
+     MatrixCore::kWMMA, true, true, true, true, 16, 16},
+    {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072,
+     MatrixCore::kWMMA, true, true, true, true, 16, 16},
+    {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, 1, 4, 65536,
+     MatrixCore::kMFMA, false, false, true, false, 16, 16},
+    {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 32, 64, 1, 4, 65536,
+     MatrixCore::kMFMA, true, true, true, false, 16, 16},
+    {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, 1, 4, 65536,
+     MatrixCore::kMFMA, true, true, true, false, 16, 16},
+    {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, 1, 4, 65536,
+     MatrixCore::kMFMA, true, true, true, false, 16, 16},
 };
+
+// Step a workgroup-scratch request is rounded up to before it is charged
+// against the pool. Not in any ISA table and not answered by any runtime query
+// reachable from here, so this holds ONLY rows that were measured by device
+// co-residency, and a target with no row leaves the fact unknown. On gfx1151
+// the 1024 is uniquely determined: 5200 B seats 21 workgroups per pool, which
+// requires rounding to 6144 — a 512 B granule would predict 23.
+struct LdsGranule {
+  std::string_view arch;
+  std::uint32_t bytes;
+};
+
+inline constexpr LdsGranule kLdsGranule[] = {
+    {"gfx1151", 1024},
+};
+
+inline const LdsGranule* lds_granule(std::string_view arch) noexcept {
+  for (const LdsGranule& g : kLdsGranule) {
+    if (arch.rfind(g.arch, 0) == 0) return &g;
+  }
+  return nullptr;
+}
 
 inline constexpr BoardFallback kBoardFallback[] = {
     {"gfx1151", 40, 2u << 20, true},
@@ -83,6 +122,33 @@ inline const BoardFallback* board_fallback(std::string_view arch) noexcept {
     if (arch.rfind(b.arch, 0) == 0) return &b;
   }
   return nullptr;
+}
+
+// The four capacity facts an occupancy answer needs and no compiler or runtime
+// reachable from here reports: wave slots per SIMD, the SIMDs behind one
+// workgroup-scratch block, that block's size, and the step a request is rounded
+// up to. Declared for the part, and left UNKNOWN where nothing measured them —
+// comgr's MaxWavesPerCU (40) and EUsPerCU (4) are identical on every target it
+// knows and contradicted by this device's runtime, so they are not a source.
+inline void apply_residency_facts(DeviceInfo& info) {
+  const FamilyIsa* isa = family_isa(arch_family(info.arch));
+  if (isa != nullptr && isa->simds_per_cu != 0) {
+    info.arch_facts.wave_slots_per_simd = DeviceFact<std::uint32_t>::declared(
+        isa->max_waves_per_cu / isa->simds_per_cu);
+    const std::uint32_t cus = info.cus_per_lds_pool != 0
+                                  ? info.cus_per_lds_pool
+                                  : isa->cus_per_lds_pool;
+    info.arch_facts.simds_per_lds_pool = DeviceFact<std::uint32_t>::declared(
+        static_cast<std::uint32_t>(isa->simds_per_cu) * cus);
+    if (isa->lds_bytes_per_pool != 0) {
+      info.arch_facts.lds_bytes_per_pool =
+          DeviceFact<std::uint32_t>::declared(isa->lds_bytes_per_pool);
+    }
+  }
+  if (const LdsGranule* g = lds_granule(info.arch); g != nullptr) {
+    info.arch_facts.lds_alloc_granule_bytes =
+        DeviceFact<std::uint32_t>::declared(g->bytes);
+  }
 }
 
 inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
@@ -130,6 +196,7 @@ inline void apply_arch_defaults(DeviceInfo& info, AmdDeviceInfo& amd) {
   }
   info.wavefront_size = select_wavefront(
       info.arch, static_cast<std::uint8_t>(info.wavefront_size));
+  apply_residency_facts(info);
 }
 
 }  // namespace lse::backend

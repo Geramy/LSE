@@ -911,7 +911,7 @@ LSE_TEST(real_dispatches_on_a_live_device_export_a_valid_trace) {
     std::printf("       compile declined: %s\n", code.status().message().c_str());
     return;
   }
-  auto handle = backend->load_executable(entry, *code);
+  auto handle = backend->load_executable(entry, code->code);
   LSE_EXPECT_OK(handle.status());
   if (!handle.ok()) return;
   constexpr std::size_t kElements = 4096;

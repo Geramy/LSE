@@ -28,8 +28,8 @@ class LoomcCompiler final : public graph::IKernelCompiler {
   // out of the module rather than taken from the caller: `kernel.def` already
   // names them, and a second statement of the same name is a second place for
   // it to be wrong.
-  Result<std::vector<std::byte>> compile(std::string_view source,
-                                         std::string_view arch) const override;
+  Result<graph::CompiledKernel> compile(std::string_view source,
+                                        std::string_view arch) const override;
 
   [[nodiscard]] bool available() const override;
 

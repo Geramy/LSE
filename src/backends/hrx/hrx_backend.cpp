@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "lse/backends/hrx/arch_database.hpp"
+#include "lse/backends/hrx/code_object.hpp"
 
 extern "C" {
 #include "hrx_runtime.h"
@@ -777,6 +778,11 @@ Status HrxBackend::init_impl(int device_ordinal) {
 
   // HRX values already on info_/amd_ stay. Tables fill only zeros.
   apply_arch_defaults(info_, amd_);
+  // Capacity facts, after the runtime's own answers are in place so a live
+  // query can stand in for a table row. HRX has no kernel-resource or
+  // register-file query of its own — confirmed against its public runtime
+  // header — so the compiler's target table is the only source for those.
+  info_.arch_facts = arch_facts_for(info_);
   info_.extension_id = AmdDeviceInfo::kExtensionId;
   info_.extension = &amd_;
 

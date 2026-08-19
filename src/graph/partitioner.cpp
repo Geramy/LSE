@@ -147,27 +147,26 @@ void group_sibling_linears(std::vector<NodePtr>& order,
 
     // What the run may spend on workgroup scratch.
     //
-    // The emitter hoists ONE panel per distinct (activation, length) and every
-    // stage reads it by name, so a run whose members share an activation costs
-    // exactly what any one of them already costs alone: the solo grid GEMV
-    // reserves the same row against the whole device budget. Merging is
-    // LDS-neutral there, and the budget must not pretend otherwise — the rule
-    // this replaced held one row to a quarter of the budget and so refused the
-    // 27B's 20480-byte row while the emitter was already emitting a single
-    // unfused stage at 36864 bytes on the 4B (verified in the dumps).
+    // THE RULE: a merged run must seat at least as many workgroups on one
+    // scratch pool as the member would seat launching alone. Not "does the sum
+    // fit the per-workgroup cap" — fitting is not the question. Two panels
+    // summing to 64000 bytes fit a 65536-byte cap and seat 2 workgroups per
+    // pool where 32000 bytes seats 4, and that halving is what a fitting test
+    // cannot see.
     //
-    // A run that brings a SECOND distinct row does add scratch, and that is the
-    // only place occupancy binds. Hold the sum to resident_lds_bytes(): the
-    // largest request that still seats one workgroup on every CU (32768 on
-    // gfx1151, where 65536/request counts workgroups per two-CU pool).
-    const std::uint32_t solo = staged_row_bytes(*order[p], dev);
-    const std::uint32_t budget = std::max(solo, dev.resident_lds_bytes());
+    // The common case is admitted by the same rule rather than by an exception
+    // to it: the emitter hoists ONE panel per distinct (activation, length), so
+    // a run whose members share an activation asks for exactly what any one of
+    // them asks for alone. Equal residency, and `prefer` admits equality.
+    const std::uint32_t threads = dev.launch_threads();
+    const opt::Occupancy solo =
+        workgroup_residency(dev, threads, staged_row_bytes(*order[p], dev));
     auto run_fits = [&](const Node& candidate) {
       probe.assign(run.begin(), run.end());
       for (std::size_t t : take) probe.push_back(order[t].get());
       probe.push_back(&candidate);
       const std::uint32_t need = group_lds_bytes(probe, dev);
-      return need <= budget && (dev.lds_bytes == 0 || need <= dev.lds_bytes);
+      return opt::prefer(workgroup_residency(dev, threads, need), solo);
     };
 
     for (std::size_t j = p + 1;

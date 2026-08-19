@@ -15,8 +15,11 @@ namespace lse::backend {
 
 class ComgrCompiler final : public graph::IKernelCompiler {
  public:
-  Result<std::vector<std::byte>> compile(std::string_view source,
-                                         std::string_view arch) const override;
+  // The object, plus the resources its own metadata note states — read at the
+  // point the linked object is already in hand, which costs one metadata walk
+  // and no second compile.
+  Result<graph::CompiledKernel> compile(std::string_view source,
+                                        std::string_view arch) const override;
 
   [[nodiscard]] bool available() const override;
 

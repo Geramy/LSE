@@ -233,7 +233,7 @@ class HrxCodecEngine final : public dist::CodecEngine {
     }
     auto code = compiler_.compile(src, be_.device_info().arch);
     if (!code.ok()) return code.status();
-    auto handle = be_.load_executable(entry, *code);
+    auto handle = be_.load_executable(entry, code->code);
     if (!handle.ok()) return handle.status();
     kernels_.emplace(key, *handle);
     return *handle;

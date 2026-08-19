@@ -284,6 +284,32 @@ bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
 // the same reason the prefill chunk ladder exists.
 constexpr std::uint32_t kMaxRowsPerGroup = 8;
 
+// Rows one workgroup covers, so the weight tile it reads is spent on more than
+// one of them.
+//
+// R rows cut the passes over the weight matrix from m to m/R — real DRAM
+// traffic — and cost R times the workgroup scratch, which past a point seats
+// fewer workgroups on the pool. The gate below reads only the second half: it
+// asks whether R rows FIT the per-workgroup cap.
+//
+// LANDMINE, measured rather than argued, before anyone replaces this with the
+// residency rule the rest of the engine now uses. A residency-only rule (climb
+// while workgroups-per-pool is unchanged) was built and run here. It chooses
+// R=2 where this chooses 8 for the 5120-wide hidden, which is the right answer
+// — R=8 asks 64000 bytes and seats 2 workgroups per pool where R=2 seats 8,
+// and a 761-token prefill of Qwen3.8-27B-4bit measured R=1 40.71 s, R=2
+// 38.66 s, R=4 48.72 s, R=8 52.64 s, median of five. But it also drops the
+// 17408-wide projection from R=2 to R=1, because at 27200 bytes per row even
+// one doubling costs residency — and that matrix is the largest in the model,
+// so doubling its traffic cost more than the hidden's residency saved: net
+// 52.72 s -> 57.00 s on prefill and 16.45 -> 13.49 tok/s on decode.
+//
+// Both terms are real and the missing one is a FACT nobody has measured here:
+// achieved bandwidth as a function of resident workgroups. The engine's probe
+// reports DRAM bandwidth at one point only. Until it reports the curve, a rule
+// that weighs traffic against residency would be a tuned constant wearing a
+// derivation, so this site keeps the gate it had.
+//
 // `indexed` rows route to their own expert, so the weight matrix a row reads
 // is chosen by that row and there is no shared tile to spend twice. Reuse is
 // only available where the rows agree on the matrix.

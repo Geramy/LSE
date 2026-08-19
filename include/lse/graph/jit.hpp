@@ -70,6 +70,15 @@ class JitCache {
                                        std::uint64_t signature,
                                        Dialect dialect) noexcept;
 
+  // What the toolchain reported about the object behind this entry, or
+  // nullptr when nothing was reported for it. Available on a warm start too:
+  // the numbers are persisted beside the cached object, so they are a property
+  // of the kernel and not of how long this process has been running. An empty
+  // `entry` matches when the object defines exactly one kernel.
+  [[nodiscard]] const backend::KernelResources* resources(
+      std::size_t member, std::uint64_t signature, Dialect dialect,
+      std::string_view entry = {}) const noexcept;
+
   struct Stats {
     std::uint64_t memory_hits = 0;
     std::uint64_t disk_hits = 0;

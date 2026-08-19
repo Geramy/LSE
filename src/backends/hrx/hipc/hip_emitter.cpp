@@ -15,6 +15,7 @@
 #include "lse/ir/pass/pass.hpp"
 #include "lse/kernels/lds_linear.hpp"
 #include "lse/kernels/linked.hpp"
+#include "lse/opt/fusion.hpp"
 
 namespace lse::backend {
 
@@ -128,6 +129,24 @@ std::uint32_t run_lds_bytes(const std::vector<IndexedStage>& stages,
   return bytes;
 }
 
+// The largest scratch request among the launches a merge would replace. Each
+// stage on its own hoists only the panel it reads, so the unfused arrangement's
+// residency is the tightest of these — the one launch that seats fewest.
+std::uint32_t worst_solo_lds_bytes(const std::vector<IndexedStage>& stages,
+                                   const std::vector<RowPanel>& panels,
+                                   const std::vector<std::size_t>& panel_of) {
+  std::uint32_t worst = 0;
+  for (std::size_t si = 0; si < stages.size(); ++si) {
+    const std::uint32_t own =
+        panel_of[si] == kNoPanel
+            ? kir::Lds::align(stages[si].plan.lds_bytes)
+            : kir::Lds::align(panels[panel_of[si]].count *
+                              kir::pack_elem_bytes<kir::f32>());
+    if (own > worst) worst = own;
+  }
+  return worst;
+}
+
 // Identity of the `__device__` helper the per-element scaffold emits for a
 // kernel primitive.
 //
@@ -198,16 +217,12 @@ std::vector<IndexedStage> indexed_stages(const FusionGroup& group,
   return out;
 }
 
+// Whether the emitter CAN write this run as one body. Whether it SHOULD is the
+// engine's answer, taken separately: this function is lowering, and the
+// residency arithmetic that used to sit in its first line is not.
 bool sibling_stages(const FusionGroup& group,
-                    const std::vector<IndexedStage>& stages,
-                    std::uint32_t lds_needed, std::uint32_t lds_budget) {
+                    const std::vector<IndexedStage>& stages) {
   if (stages.size() < 2) return false;
-  // One launch, one workgroup scratch allocation, so the run's rows are summed
-  // and not maximized. Nothing checked this before the rows were shared by
-  // construction, because the fold pass reduced them to one afterwards and one
-  // always fit; a run whose distinct rows do not fit cannot be launched at all,
-  // so it goes back to a group per node the same way an uncovered run does.
-  if (lds_budget != 0 && lds_needed > lds_budget) return false;
   std::unordered_set<const Node*> stage_set;
   std::unordered_set<const Node*> outputs;
   for (const IndexedStage& s : stages) stage_set.insert(s.node.get());
@@ -307,48 +322,12 @@ std::string_view builtin_expr(OpKind k) noexcept {
 
 }  // namespace
 
+// The launch geometry is the engine's to choose: graph::choose_launch_dims
+// counts elements and residency, neither of which is a property of HIP.
 LaunchDims HipEmitter::choose_dims(const FusionGroup& group,
                                    const DeviceInfo& device,
                                    std::uint32_t lds_bytes) {
-  std::size_t elements = 1;
-  for (const NodePtr& out : group.outputs) {
-    elements = std::max(elements, out->element_count());
-  }
-  if (group.outputs.empty() && !group.nodes.empty()) {
-    elements = group.nodes.back()->element_count();
-  }
-
-  // Pick the workgroup size with the best occupancy among wavefront multiples
-  // the device actually permits.
-  const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device);
-  const std::uint32_t wave =
-      device.wavefront_size != 0 ? device.wavefront_size : 64;
-  const std::uint32_t cap =
-      device.max_threads_per_workgroup ? device.max_threads_per_workgroup : 256;
-
-  // Every legal workgroup size keeps the same number of threads resident on a
-  // pool — occupancy counts *workgroups*, and workgroups x threads is constant
-  // — so maximizing it just picks the smallest size every time. That is how a
-  // 254M-element fill came to launch 7.9M workgroups of 32 threads. What
-  // actually differs is the launch count, so take the largest size that still
-  // fits, bounded by the work there is to do.
-  std::uint32_t needed = wave;
-  while (needed < elements && needed < cap) needed *= 2;
-
-  std::uint32_t best = wave;
-  for (std::uint32_t threads = wave; threads <= cap && threads <= needed;
-       threads *= 2) {
-    const std::uint32_t occ =
-        amd != nullptr ? occupancy_per_lds_pool(device, threads, lds_bytes) : 1;
-    if (occ > 0) best = threads;
-  }
-
-  LaunchDims dims;
-  dims.workgroup_size[0] = best;
-  dims.workgroup_count[0] =
-      static_cast<std::uint32_t>((elements + best - 1) / best);
-  dims.subgroup_size = wave;
-  return dims;
+  return graph::choose_launch_dims(group, device, lds_bytes);
 }
 
 std::string HipEmitter::constants_decl(const graph::ConstantsLayout& layout) {
@@ -497,9 +476,25 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   std::vector<RowPanel> panels = row_panels(stages, panel_of);
   const std::uint32_t lds_budget = workgroup_lds_bytes(&device);
   const std::uint32_t lds_needed = run_lds_bytes(stages, panels, panel_of);
-  if (sibling_stages(group, stages, lds_needed, lds_budget)) {
+  const std::string run_entry =
+      "lse_fused_" + std::to_string(group.signature());
+
+  // Can the emitter write it, and should the engine ask for it. The second
+  // question is residency, which is counted from bytes and threads and is
+  // therefore not this file's to answer.
+  bool fuse = sibling_stages(group, stages);
+  if (fuse) {
+    opt::FusionCandidate candidate;
+    candidate.threads = stages.front().plan.workgroup_size[0];
+    candidate.fused_scratch_bytes = lds_needed;
+    candidate.worst_solo_scratch_bytes =
+        worst_solo_lds_bytes(stages, panels, panel_of);
+    candidate.fused_entry = run_entry;
+    fuse = opt::admit_fusion(opt::DeviceCapacity::of(device), candidate).admit;
+  }
+  if (fuse) {
     EmittedKernel out;
-    out.entry_name = "lse_fused_" + std::to_string(group.signature());
+    out.entry_name = run_entry;
 
     std::unordered_map<const Node*, std::size_t> binding_of;
     auto bind = [&](const NodePtr& n) {

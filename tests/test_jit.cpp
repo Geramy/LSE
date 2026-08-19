@@ -19,7 +19,12 @@
 #include "lse/backend/backend.hpp"
 #include "lse/core/debug.hpp"
 #include "lse/backends/cpu/cpu_backend.hpp"
+#include "lse/backend/resources.hpp"
+#include "lse/opt/occupancy.hpp"
+#include "lse/opt/fusion.hpp"
+#include "lse/opt/measurements.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
+#include "lse/backends/hrx/code_object.hpp"
 #include "lse/backends/hrx/hrx_backend.hpp"
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 #include "lse/backends/hrx/device_info.hpp"
@@ -91,6 +96,10 @@ backend::DeviceInfo gfx1151() {
   backend::apply_arch_defaults(d, amd);
   d.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d.extension = &gfx1151_amd();
+  // The same source a live device's facts come from, so the occupancy model
+  // under test is the one that will run: the compiler's ISA table where it
+  // answers, the family row where it does not.
+  d.arch_facts = backend::arch_facts_for(d);
   return d;
 }
 
@@ -660,7 +669,9 @@ LSE_TEST(emitter_chooses_a_legal_workgroup_size) {
   LSE_EXPECT(threads > 0);
   LSE_EXPECT(threads <= d.max_threads_per_workgroup);
   LSE_EXPECT(threads % d.wavefront_size == 0);
-  LSE_EXPECT(backend::occupancy_per_lds_pool(d, threads, 0) > 0);
+  opt::KernelDemand demand;
+  demand.threads = threads;
+  LSE_EXPECT(opt::occupancy(opt::DeviceCapacity::of(d), demand).seated());
 
   // Enough workgroups to cover every element.
   LSE_EXPECT(e->dims.workgroup_count[0] * threads >= 1024u);
@@ -1072,12 +1083,13 @@ LSE_TEST(generated_source_compiles_to_a_real_code_object) {
   if (!code.ok()) return;
 
   // An ELF code object, not an empty buffer.
-  LSE_EXPECT(code->size() > 512u);
-  LSE_EXPECT(static_cast<unsigned char>((*code)[0]) == 0x7F);
-  LSE_EXPECT(static_cast<char>((*code)[1]) == 'E');
-  LSE_EXPECT(static_cast<char>((*code)[2]) == 'L');
-  LSE_EXPECT(static_cast<char>((*code)[3]) == 'F');
-  std::printf("       code object: %zu bytes for gfx1151\n", code->size());
+  const std::vector<std::byte>& obj = code->code;
+  LSE_EXPECT(obj.size() > 512u);
+  LSE_EXPECT(static_cast<unsigned char>(obj[0]) == 0x7F);
+  LSE_EXPECT(static_cast<char>(obj[1]) == 'E');
+  LSE_EXPECT(static_cast<char>(obj[2]) == 'L');
+  LSE_EXPECT(static_cast<char>(obj[3]) == 'F');
+  std::printf("       code object: %zu bytes for gfx1151\n", obj.size());
 }
 
 LSE_TEST(compile_errors_carry_the_compiler_diagnostics) {
@@ -1094,6 +1106,183 @@ LSE_TEST(compile_rejects_empty_input) {
   LSE_EXPECT(!e.ok());
   auto a = kCompiler.compile("__global__ void k(){}", "");
   LSE_EXPECT(!a.ok());
+}
+
+// --- facts and measurement -------------------------------------------------
+
+LSE_TEST(an_unanswered_fact_is_not_a_zero) {
+  // The whole contract of this file in one check: a fact nobody answered holds
+  // a zero so a careless reader gets something spottable, and known() is false
+  // so a careful one never spends it.
+  backend::DeviceFact<std::uint32_t> nothing;
+  LSE_EXPECT(!nothing.known());
+  LSE_EXPECT_EQ(nothing.value, 0u);
+  LSE_EXPECT_EQ(nothing.value_or(77u), 77u);
+  LSE_EXPECT_EQ(backend::DeviceFact<std::uint32_t>::queried(0u).value_or(77u), 0u);
+  LSE_EXPECT(backend::DeviceFact<std::uint32_t>::queried(0u).known());
+
+  // And the case it exists for: a reported zero and an unreported count are
+  // different answers about spilling.
+  backend::KernelResources silent;
+  LSE_EXPECT(silent.spilled() == backend::SpillState::kUnknown);
+  backend::KernelResources clean;
+  clean.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  clean.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(clean.spilled() == backend::SpillState::kNone);
+  backend::KernelResources spilling = clean;
+  spilling.vector_spills = backend::DeviceFact<std::uint32_t>::queried(4);
+  LSE_EXPECT(spilling.spilled() == backend::SpillState::kSpilled);
+  // Scratch is not spill evidence: a kernel in this tree's own cache carries
+  // 192 B of private segment with both counts reported and zero.
+  backend::KernelResources scratchy = clean;
+  scratchy.private_segment_bytes =
+      backend::DeviceFact<std::uint32_t>::queried(192);
+  LSE_EXPECT(scratchy.spilled() == backend::SpillState::kNone);
+}
+
+LSE_TEST(isa_facts_are_queried_from_the_compilers_own_target_table) {
+  if (!kCompiler.available()) {
+    std::printf("       (skipped: comgr not in this build)\n");
+    return;
+  }
+  const backend::ArchFacts f = backend::query_isa_facts("gfx1151");
+  LSE_EXPECT(f.any());
+  LSE_EXPECT(f.vector_registers_per_simd.known());
+  LSE_EXPECT(f.vector_register_alloc_granule.known());
+  LSE_EXPECT(f.vector_registers_addressable_per_wave.known());
+  LSE_EXPECT(f.lds_bytes_addressable_per_workgroup.known());
+  LSE_EXPECT(f.max_flat_workgroup_size.known());
+  LSE_EXPECT(f.vector_registers_per_simd.source == backend::FactSource::kQueried);
+  // Sanity, not a hardcoded expectation: a register file that does not divide
+  // into whole allocation granules would mean one of the two was misread.
+  LSE_EXPECT(f.vector_register_alloc_granule.value > 0u);
+  LSE_EXPECT(f.vector_registers_per_simd.value >=
+             f.vector_registers_addressable_per_wave.value);
+  std::printf("       gfx1151 %u vgprs/SIMD, granule %u, %u addressable, "
+              "%u B LDS/wg, %u banks\n",
+              f.vector_registers_per_simd.value,
+              f.vector_register_alloc_granule.value,
+              f.vector_registers_addressable_per_wave.value,
+              f.lds_bytes_addressable_per_workgroup.value,
+              f.lds_banks.value);
+
+  // A target nothing knows answers nothing, rather than answering zero.
+  const backend::ArchFacts none = backend::query_isa_facts("gfx0000");
+  LSE_EXPECT(!none.any());
+  LSE_EXPECT(!none.vector_registers_per_simd.known());
+}
+
+LSE_TEST(isa_facts_are_real_per_target_data_not_one_constant) {
+  if (!kCompiler.available()) return;
+  // If these were compiler-model constants rather than per-target facts they
+  // would be identical across targets, and querying them would buy nothing
+  // over a hardcoded row. Two RDNA generations and one CDNA part disagree, so
+  // the query is load-bearing. (This is also why MaxWavesPerCU and EUsPerCU
+  // are deliberately not among the facts: those two ARE identical everywhere.)
+  const backend::ArchFacts a = backend::query_isa_facts("gfx1151");
+  const backend::ArchFacts b = backend::query_isa_facts("gfx1030");
+  const backend::ArchFacts c = backend::query_isa_facts("gfx942");
+  LSE_EXPECT(a.vector_registers_per_simd.known());
+  LSE_EXPECT(b.vector_registers_per_simd.known());
+  LSE_EXPECT(c.vector_registers_per_simd.known());
+  LSE_EXPECT(a.vector_registers_per_simd.value !=
+             b.vector_registers_per_simd.value);
+  LSE_EXPECT(a.vector_registers_addressable_per_wave.value !=
+             c.vector_registers_addressable_per_wave.value);
+  std::printf("       vgprs/SIMD: gfx1151 %u, gfx1030 %u, gfx942 %u\n",
+              a.vector_registers_per_simd.value,
+              b.vector_registers_per_simd.value,
+              c.vector_registers_per_simd.value);
+}
+
+LSE_TEST(the_arch_table_and_the_compiler_agree_where_both_answer) {
+  if (!kCompiler.available()) return;
+  // Two sources for one number is two places for it to be wrong. Where the
+  // compiler answers, the family row must match it; when this fails after a
+  // ROCm bump, the compiler is right and the row is stale.
+  int checked = 0;
+  for (const char* arch : {"gfx1151", "gfx1100", "gfx1201", "gfx1030",
+                           "gfx90a", "gfx942"}) {
+    const backend::ArchFacts f = backend::query_isa_facts(arch);
+    const backend::FamilyIsa* row =
+        backend::family_isa(backend::arch_family(arch));
+    if (!f.lds_bytes_addressable_per_workgroup.known() || row == nullptr) {
+      continue;
+    }
+    LSE_EXPECT_EQ(f.lds_bytes_addressable_per_workgroup.value,
+                  row->lds_bytes_per_workgroup);
+    LSE_EXPECT_EQ(f.max_flat_workgroup_size.value,
+                  static_cast<std::uint32_t>(row->max_threads_per_workgroup));
+    ++checked;
+  }
+  LSE_EXPECT(checked >= 4);
+}
+
+LSE_TEST(a_compiled_hip_kernel_carries_what_the_compiler_measured) {
+  if (!kCompiler.available()) return;
+
+  const std::string entry = "lse_measure_probe";
+  const std::string source =
+      "#include <hip/hip_runtime.h>\n"
+      "extern \"C\" __global__ void " + entry +
+      "(float* __restrict__ out, const float* __restrict__ in, unsigned n) {\n"
+      "  __shared__ float tile[512];\n"
+      "  const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+      "  tile[threadIdx.x & 511u] = i < n ? in[i] : 0.0f;\n"
+      "  __syncthreads();\n"
+      "  if (i < n) out[i] = tile[threadIdx.x & 511u] * 2.0f;\n"
+      "}\n";
+  auto built = kCompiler.compile(source, "gfx1151");
+  LSE_EXPECT_OK(built.status());
+  if (!built.ok()) return;
+
+  const backend::KernelResources* r = built->resources_for(entry);
+  LSE_EXPECT(r != nullptr);
+  if (r == nullptr) return;
+  LSE_EXPECT(r->entry == entry);
+  LSE_EXPECT(r->vector_registers.known());
+  LSE_EXPECT(r->vector_registers.value > 0u);
+  LSE_EXPECT(r->scalar_registers.known());
+  LSE_EXPECT(r->workgroup_segment_bytes.known());
+  // The kernel asks for exactly 512 floats of workgroup scratch, so this is
+  // the compiler's own answer to a question we know the answer to — which is
+  // what makes it a measurement of the reader and not just of the kernel.
+  LSE_EXPECT_EQ(r->workgroup_segment_bytes.value, 2048u);
+  LSE_EXPECT(r->private_segment_bytes.known());
+  LSE_EXPECT(r->wavefront_size.known());
+  // The HIP path's producer emits spill counts even when they are zero, so
+  // this dialect can always answer the question.
+  LSE_EXPECT(r->spilled() != backend::SpillState::kUnknown);
+  std::printf("       %s", r->describe().c_str());
+}
+
+LSE_TEST(a_compiled_loom_kernel_reports_registers_and_declines_spills) {
+  if (!kLoom.available() || !kCompiler.available()) return;
+
+  auto built = kLoom.compile(loom_matmul_source(32, 16, 32, 64), "gfx1151");
+  LSE_EXPECT_OK(built.status());
+  if (!built.ok()) return;
+  LSE_EXPECT(!built->resources.empty());
+  if (built->resources.empty()) return;
+
+  const backend::KernelResources& r = built->resources.front();
+  // loomc's HSACO carries the same amdhsa.kernels note, so one reader serves
+  // both dialects: this is the evidence, not an assumption.
+  LSE_EXPECT(!r.entry.empty());
+  LSE_EXPECT(r.vector_registers.known());
+  LSE_EXPECT(r.scalar_registers.known());
+  LSE_EXPECT(r.workgroup_segment_bytes.known());
+  LSE_EXPECT(r.wavefront_size.known());
+  // And what it does NOT carry. If loomc ever starts emitting spill counts
+  // this flips, which is worth being told about rather than silently gaining
+  // a fact nothing was checking for.
+  LSE_EXPECT(!r.vector_spills.known());
+  LSE_EXPECT(!r.scalar_spills.known());
+  LSE_EXPECT(r.spilled() == backend::SpillState::kUnknown);
+  // The compensating asymmetry: loomc states the kernel's own launch geometry
+  // where the HIP path does not.
+  LSE_EXPECT(r.required_workgroup_size.known());
+  std::printf("       %s", r.describe().c_str());
 }
 
 LSE_TEST(the_loom_compiler_reports_available_when_loomc_is_linked) {
@@ -1118,8 +1307,8 @@ LSE_TEST(a_loom_kernel_compiles_to_an_amdgpu_code_object) {
   LSE_EXPECT(code.ok());
   if (!code.ok()) return;
 
-  LSE_EXPECT(code->size() > 512u);
-  const auto* b = reinterpret_cast<const unsigned char*>(code->data());
+  LSE_EXPECT(code->code.size() > 512u);
+  const auto* b = reinterpret_cast<const unsigned char*>(code->code.data());
   LSE_EXPECT(b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F');
   // ELFCLASS64, and EM_AMDGPU rather than whatever host object a misrouted
   // emitter would hand back.
@@ -1127,7 +1316,7 @@ LSE_TEST(a_loom_kernel_compiles_to_an_amdgpu_code_object) {
   const int machine = b[18] | (b[19] << 8);
   LSE_EXPECT_EQ(machine, 224);
   std::printf("       code object: %zu bytes, e_machine=%d for gfx1151\n",
-              code->size(), machine);
+              code->code.size(), machine);
 }
 
 LSE_TEST(target_id_features_in_the_arch_string_reach_the_code_object) {
@@ -1170,9 +1359,9 @@ LSE_TEST(target_id_features_in_the_arch_string_reach_the_code_object) {
     }
     return;
   }
-  LSE_EXPECT(flags(*plain) != flags(*featured));
+  LSE_EXPECT(flags(plain->code) != flags(featured->code));
   std::printf("       gfx942 e_flags 0x%x vs sramecc+/xnack- 0x%x\n",
-              flags(*plain), flags(*featured));
+              flags(plain->code), flags(featured->code));
 }
 
 LSE_TEST(loom_identity_carries_the_install_and_every_option) {
@@ -1422,10 +1611,10 @@ struct StubSet final : backend::IDeviceSet {
 
 struct CountingCompiler final : IKernelCompiler {
   mutable int n = 0;
-  Result<std::vector<std::byte>> compile(std::string_view,
-                                         std::string_view) const override {
+  Result<CompiledKernel> compile(std::string_view,
+                                 std::string_view) const override {
     ++n;
-    return std::vector<std::byte>(16, std::byte{1});
+    return CompiledKernel{std::vector<std::byte>(16, std::byte{1}), {}};
   }
   bool available() const override { return true; }
   std::string identity() const override { return "counting-compiler"; }
@@ -1434,9 +1623,9 @@ struct CountingCompiler final : IKernelCompiler {
 struct NamedCompiler final : IKernelCompiler {
   std::string id;
   explicit NamedCompiler(std::string s) : id(std::move(s)) {}
-  Result<std::vector<std::byte>> compile(std::string_view,
-                                         std::string_view) const override {
-    return std::vector<std::byte>(16, std::byte{2});
+  Result<CompiledKernel> compile(std::string_view,
+                                 std::string_view) const override {
+    return CompiledKernel{std::vector<std::byte>(16, std::byte{2}), {}};
   }
   bool available() const override { return true; }
   std::string identity() const override { return id; }
@@ -1515,13 +1704,40 @@ struct TwoDialectBackend final : backend::IBackend {
 struct EchoCompiler final : IKernelCompiler {
   std::string id;
   explicit EchoCompiler(std::string s) : id(std::move(s)) {}
-  Result<std::vector<std::byte>> compile(std::string_view src,
-                                         std::string_view) const override {
-    return std::vector<std::byte>{
-        static_cast<std::byte>(src.empty() ? 0 : src.front())};
+  Result<CompiledKernel> compile(std::string_view src,
+                                 std::string_view) const override {
+    return CompiledKernel{
+        std::vector<std::byte>{
+            static_cast<std::byte>(src.empty() ? 0 : src.front())},
+        {}};
   }
   bool available() const override { return true; }
   std::string identity() const override { return id; }
+};
+
+// A compiler that reports a resource set with one fact deliberately missing,
+// so a round trip through the cache can be asked whether the hole survived.
+struct MeasuringCompiler final : IKernelCompiler {
+  Result<CompiledKernel> compile(std::string_view src,
+                                 std::string_view) const override {
+    CompiledKernel out;
+    out.code.assign(1, static_cast<std::byte>(src.empty() ? 0 : src.front()));
+    backend::KernelResources r;
+    r.entry = "lse_measured";
+    r.vector_registers = backend::DeviceFact<std::uint32_t>::queried(102);
+    r.scalar_registers = backend::DeviceFact<std::uint32_t>::queried(28);
+    r.workgroup_segment_bytes =
+        backend::DeviceFact<std::uint32_t>::queried(25600);
+    r.private_segment_bytes = backend::DeviceFact<std::uint32_t>::queried(0);
+    r.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+    // vector_spills deliberately left unanswered.
+    r.required_workgroup_size =
+        backend::DeviceFact<std::array<std::uint32_t, 3>>::queried({256, 1, 1});
+    out.resources.push_back(std::move(r));
+    return out;
+  }
+  bool available() const override { return true; }
+  std::string identity() const override { return "measuring-compiler"; }
 };
 
 struct EchoBackend final : backend::IBackend {
@@ -1778,6 +1994,61 @@ LSE_TEST(the_cache_never_serves_one_dialects_object_for_the_other) {
     LSE_EXPECT_EQ(warm.stats().disk_hits, 2u);
     LSE_EXPECT_EQ(wa->executable, static_cast<std::uint64_t>('H'));
     LSE_EXPECT_EQ(wb->executable, static_cast<std::uint64_t>('L'));
+  }
+  fs::remove_all(dir);
+}
+
+LSE_TEST(measured_resources_survive_a_warm_start_holes_included) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+                       ("lse-jit-measured-" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  MeasuringCompiler cc;
+  EchoBackend be(cc, cc);
+  StubSet set;
+  set.members.push_back(&be);
+  DialectPair k;
+
+  const auto check = [&](const JitCache& cache, const char* when) {
+    const backend::KernelResources* r =
+        cache.resources(0, k.signature, Dialect::kHip);
+    LSE_EXPECT(r != nullptr);
+    if (r == nullptr) {
+      std::printf("       no resources %s\n", when);
+      return;
+    }
+    LSE_EXPECT(r->entry == "lse_measured");
+    LSE_EXPECT_EQ(r->vector_registers.value, 102u);
+    LSE_EXPECT_EQ(r->scalar_registers.value, 28u);
+    LSE_EXPECT_EQ(r->workgroup_segment_bytes.value, 25600u);
+    LSE_EXPECT(r->private_segment_bytes.known());
+    LSE_EXPECT_EQ(r->private_segment_bytes.value, 0u);
+    // The hole is the point: a compiler that never answered must not come back
+    // from disk having answered zero.
+    LSE_EXPECT(!r->vector_spills.known());
+    LSE_EXPECT(r->spilled() == backend::SpillState::kNone);
+    LSE_EXPECT(r->required_workgroup_size.known());
+    LSE_EXPECT_EQ(r->required_workgroup_size.value[0], 256u);
+    // Facts nobody ever reported stay unreported through the round trip.
+    LSE_EXPECT(!r->accum_registers.known());
+    LSE_EXPECT(!r->wavefront_size.known());
+  };
+
+  {
+    JitCache cache(set, dir.string());
+    LSE_EXPECT_OK(cache.get_or_compile(0, k.signature, k.hip).status());
+    LSE_EXPECT_EQ(cache.stats().compiles, 1u);
+    check(cache, "after compiling");
+  }
+  {
+    // A second process: nothing compiles, and the numbers still arrive.
+    JitCache warm(set, dir.string());
+    LSE_EXPECT_OK(warm.get_or_compile(0, k.signature, k.hip).status());
+    LSE_EXPECT_EQ(warm.stats().compiles, 0u);
+    LSE_EXPECT_EQ(warm.stats().disk_hits, 1u);
+    check(warm, "after a warm start");
   }
   fs::remove_all(dir);
 }
@@ -2701,7 +2972,7 @@ std::vector<float> run_packed_tile(const std::string& body,
   std::vector<float> got(out_elems, -1.0f);
 
   std::vector<float> out;
-  auto handle = be.load_executable(entry, *code);
+  auto handle = be.load_executable(entry, code->code);
   if (handle.ok() &&
       be.copy_h2d(ax.data(), abuf, ax.size() * 4, 0).ok() &&
       be.copy_h2d(bx.data(), bbuf, bx.size() * 4, 0).ok() &&
@@ -2801,7 +3072,7 @@ std::vector<std::vector<float>> run_emitted_with(
     std::printf("       compile failed:\n%s\n", code.status().message().c_str());
     return {};
   }
-  auto handle = be.load_executable(e.entry_name, *code);
+  auto handle = be.load_executable(e.entry_name, code->code);
   if (!handle.ok()) return {};
 
   const std::size_t n = e.binding_order.size();
@@ -2953,65 +3224,314 @@ LSE_TEST(siblings_over_different_rows_get_their_own_staging) {
   LSE_EXPECT(code.ok());
 }
 
-// The occupancy model must be the hardware's, in the hardware's unit. On RDNA a
-// WGP pairs two CUs behind ONE 64 KiB pool, which is what HIP calls a
-// multiprocessor, so `budget / request` counts workgroups per pool and describing
-// it as per-CU overstates residency by 2x. Every row below is
-// hipOccupancyMaxActiveBlocksPerMultiprocessor on gfx1151, measured.
+// The occupancy model must be the hardware's, in the hardware's unit, and it
+// must be a MINIMUM over every limit that applies.
+//
+// The table this replaced was hipOccupancyMaxActiveBlocksPerMultiprocessor's,
+// which returns floor(65536 / lds) and is 2x low on this part: it says 1
+// workgroup at 40000 B where a live co-residency probe counts 3, and 1 at
+// 64000 B where the probe counts 2. Every row below is that probe — blocks
+// observed concurrently resident, divided by the 20 workgroup processors the
+// device reports — and it closes only on a 131072 B pool over 4 SIMDs with a
+// 1024 B allocation granule.
 LSE_TEST(the_occupancy_model_reproduces_the_measured_hardware_table) {
   const backend::DeviceInfo d = gfx1151();
   LSE_EXPECT_EQ(backend::cus_per_lds_pool(d), 2u);
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(d);
+  LSE_EXPECT(cap.usable());
+  LSE_EXPECT_EQ(cap.lds_bytes_per_pool.value_or(0u), 131072u);
+  LSE_EXPECT_EQ(cap.simds_per_lds_pool.value_or(0u), 4u);
+  LSE_EXPECT_EQ(cap.wave_slots_per_simd.value_or(0u), 16u);
+  LSE_EXPECT_EQ(cap.lds_alloc_granule_bytes.value_or(0u), 1024u);
 
   struct Row {
     std::uint32_t threads;
     std::uint32_t lds;
-    std::uint32_t blocks;
+    std::uint32_t wgs_per_pool;
   };
-  // 256 threads: the 2048-thread cap allows 8 per pool, and LDS takes over from
-  // 12288 up. 512 threads: the thread cap is 4 and LDS binds from 32768.
+  // 256-thread rows: 8 waves each, so 64 wave slots per pool cap residency at
+  // 8 and scratch takes over above 16384 B. 32-thread rows: one wave, so the
+  // slot cap is 64 and every row is the granule's answer — which is what makes
+  // 5200 B (21, not 23) pin the granule at 1024 rather than 512.
   constexpr Row kMeasured[] = {
-      {256, 4096, 8},  {256, 8192, 8},   {256, 12288, 5}, {256, 16384, 4},
-      {256, 20480, 3}, {256, 26112, 2},  {256, 32768, 2}, {256, 65536, 1},
-      {512, 4096, 4},  {512, 16384, 4},  {512, 32768, 2},
+      {256, 0, 8},     {256, 16384, 8}, {256, 32768, 4}, {256, 36000, 3},
+      {256, 40000, 3}, {256, 48000, 2}, {256, 64000, 2}, {256, 65536, 2},
+      {32, 2600, 42},  {32, 4900, 25},  {32, 5000, 25},  {32, 5200, 21},
+      {32, 8192, 16},  {32, 9000, 14},  {32, 12000, 10}, {32, 16000, 8},
   };
   for (const Row& r : kMeasured) {
-    const std::uint32_t got =
-        backend::occupancy_per_lds_pool(d, r.threads, r.lds);
-    LSE_EXPECT_EQ(got, r.blocks);
-    if (got != r.blocks) {
-      std::printf("       threads=%u lds=%u got=%u want=%u\n", r.threads, r.lds,
-                  got, r.blocks);
+    opt::KernelDemand demand;
+    demand.threads = r.threads;
+    demand.lds_bytes = r.lds;
+    const opt::Occupancy occ = opt::occupancy(cap, demand);
+    LSE_EXPECT_EQ(occ.workgroups_per_pool, r.wgs_per_pool);
+    if (occ.workgroups_per_pool != r.wgs_per_pool) {
+      std::printf("       threads=%u lds=%u got=%u want=%u\n", r.threads,
+                  r.lds, occ.workgroups_per_pool, r.wgs_per_pool);
     }
   }
-  // Past the device's own limit there is no legal launch at all.
-  LSE_EXPECT_EQ(backend::occupancy_per_lds_pool(d, 256, 65552), 0u);
-  // Half the budget is where residency reaches exactly one workgroup per CU:
-  // 2 per pool, and a pool is 2 CUs. That is the number the fusion gate is held
-  // to, stated here in the unit it is derived from.
-  LSE_EXPECT_EQ(backend::occupancy_per_lds_pool(d, 256, 32768),
-                backend::cus_per_lds_pool(d));
-  LSE_EXPECT(backend::occupancy_per_lds_pool(d, 256, 40960) <
-             backend::cus_per_lds_pool(d));
+  // Past the device's own per-workgroup cap there is no legal launch at all,
+  // and that is a different answer from "one workgroup fits".
+  opt::KernelDemand over;
+  over.threads = 256;
+  over.lds_bytes = 65552;
+  LSE_EXPECT(!opt::occupancy(cap, over).seated());
 }
 
-// A run is admitted on a number, and that number has to be what its text asks
-// for. Two panels at exactly half the device budget each fill it and must still
-// be emitted; one line of f32 more and the run cannot be launched at all, so it
-// is refused rather than emitted over budget and left for the compiler to reject
-// — a JIT failure is not fatal here, it drops the group onto the host
-// interpreter for the rest of the run.
-LSE_TEST(a_sibling_run_over_the_workgroup_budget_is_refused_not_emitted) {
+// THE RULE: occupancy is the minimum over every limit that applies, and the
+// answer must name which one bound. Nothing here is a threshold — each row is
+// a resource made scarce on its own while the others are left alone.
+LSE_TEST(occupancy_is_the_minimum_over_the_limits_that_apply) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+
+  // Nothing scarce: the wave slots are the ceiling, as they always are.
+  opt::KernelDemand plain;
+  plain.threads = 256;
+  const opt::Occupancy slots = opt::occupancy(cap, plain);
+  LSE_EXPECT(slots.binding == opt::OccupancyLimit::kWaveSlots);
+  LSE_EXPECT_EQ(slots.waves_per_simd, 16u);
+
+  // Scratch scarce, registers not.
+  opt::KernelDemand lds = plain;
+  lds.lds_bytes = 48000;
+  const opt::Occupancy by_lds = opt::occupancy(cap, lds);
+  LSE_EXPECT(by_lds.binding == opt::OccupancyLimit::kWorkgroupScratch);
+  LSE_EXPECT_EQ(by_lds.workgroups_per_pool, 2u);
+
+  if (!cap.vector_registers_per_simd.known()) {
+    std::printf("       (register arm skipped: no ISA register facts)\n");
+    return;
+  }
+
+  // Registers scarce, scratch not. 102 vgprs round to 120 on a 24-register
+  // granule, and 1536/120 is 12 — which is the number the compiler itself
+  // printed for the kernel that motivated this model, while the engine was
+  // busy cutting its workgroup scratch for nothing.
+  opt::KernelDemand regs = plain;
+  regs.vector_registers = backend::DeviceFact<std::uint32_t>::queried(102);
+  const opt::Occupancy by_regs = opt::occupancy(cap, regs);
+  LSE_EXPECT(by_regs.binding == opt::OccupancyLimit::kVectorRegisters);
+  LSE_EXPECT_EQ(by_regs.waves_per_simd, 12u);
+  LSE_EXPECT(by_regs.registers_counted);
+  LSE_EXPECT(by_regs.exact);
+  // And it really is a minimum: cutting scratch cannot buy back a wave the
+  // register file already refused.
+  opt::KernelDemand regs_no_lds = regs;
+  regs_no_lds.lds_bytes = 0;
+  LSE_EXPECT_EQ(opt::occupancy(cap, regs_no_lds).waves_per_simd, 12u);
+
+  // Both scarce: the tighter one wins, and the loser is still reported.
+  // 200 vgprs allocate 216 and give 7 waves/SIMD, i.e. 3 workgroups of 8 waves
+  // per pool; 32000 B of scratch rounds to 32768 and gives 4. Registers bind.
+  opt::KernelDemand both = plain;
+  both.lds_bytes = 32000;
+  both.vector_registers = backend::DeviceFact<std::uint32_t>::queried(200);
+  const opt::Occupancy min = opt::occupancy(cap, both);
+  LSE_EXPECT(min.binding == opt::OccupancyLimit::kVectorRegisters);
+  LSE_EXPECT_EQ(min.workgroups_per_pool, 3u);
+  LSE_EXPECT_EQ(min.waves_per_simd, 6u);
+  LSE_EXPECT_EQ(min.waves_by_scratch, 8u);
+  LSE_EXPECT(min.waves_per_simd < min.waves_by_scratch);
+}
+
+// An unanswered fact must make the model DEGRADE, not guess. A limit it cannot
+// count drops out of the min and the answer says it is no longer exact, which
+// is what stops a decision spending a number nobody established.
+LSE_TEST(an_unknown_capacity_degrades_rather_than_guessing) {
+  const opt::DeviceCapacity full = opt::DeviceCapacity::of(gfx1151());
+
+  // No register file reported: the register arm does not participate at all,
+  // rather than being read as "zero registers" or "unlimited but counted".
+  opt::DeviceCapacity no_regs = full;
+  no_regs.vector_registers_per_simd = {};
+  opt::KernelDemand d;
+  d.threads = 256;
+  d.vector_registers = backend::DeviceFact<std::uint32_t>::queried(200);
+  const opt::Occupancy blind = opt::occupancy(no_regs, d);
+  LSE_EXPECT(!blind.registers_counted);
+  LSE_EXPECT_EQ(blind.waves_by_registers, opt::Occupancy::kNoLimit);
+  LSE_EXPECT_EQ(blind.waves_per_simd, 16u);
+
+  // No allocation granule: the request is charged unrounded, which UNDERstates
+  // it, so the answer is marked inexact and a tie it cannot vouch for is
+  // refused instead of guessed.
+  opt::DeviceCapacity no_granule = full;
+  no_granule.lds_alloc_granule_bytes = {};
+  const auto ask = [](std::uint32_t bytes) {
+    opt::KernelDemand want;
+    want.threads = 256;
+    want.lds_bytes = bytes;
+    return want;
+  };
+  LSE_EXPECT(opt::occupancy(full, ask(40000)).exact);
+  LSE_EXPECT(!opt::occupancy(no_granule, ask(40000)).exact);
+
+  // 40000 and 40960 bytes seat the same 3 workgroups per pool either way. The
+  // measured granule KNOWS they round to the same allocation, so the larger
+  // request is admitted on the tie; without it the model declines to say, and
+  // refuses. Same two numbers, and the difference is only what was measured.
+  LSE_EXPECT(opt::prefer(opt::occupancy(full, ask(40960)),
+                         opt::occupancy(full, ask(40000))));
+  LSE_EXPECT(!opt::prefer(opt::occupancy(no_granule, ask(40960)),
+                          opt::occupancy(no_granule, ask(40000))));
+  // A request that did not grow is still admitted: no rounding step, known or
+  // unknown, separates two identical asks.
+  LSE_EXPECT(opt::prefer(opt::occupancy(no_granule, ask(40000)),
+                         opt::occupancy(no_granule, ask(40000))));
+
+  // Nothing known at all: no answer, rather than a plausible one.
+  const opt::DeviceCapacity nothing;
+  LSE_EXPECT(!nothing.usable());
+  LSE_EXPECT(!opt::occupancy(nothing, ask(40000)).seated());
+}
+
+// A kernel that SPILLS is a different regime, not a lower number. It must not
+// be reachable by making some other arrangement's occupancy worse.
+LSE_TEST(a_spilling_kernel_is_reported_as_spilling_not_as_less_occupancy) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+
+  backend::KernelResources clean;
+  clean.vector_registers = backend::DeviceFact<std::uint32_t>::queried(64);
+  clean.workgroup_segment_bytes =
+      backend::DeviceFact<std::uint32_t>::queried(48000);
+  clean.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  clean.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+
+  backend::KernelResources spilling = clean;
+  spilling.workgroup_segment_bytes =
+      backend::DeviceFact<std::uint32_t>::queried(0);
+  spilling.vector_spills = backend::DeviceFact<std::uint32_t>::queried(12);
+
+  const opt::Occupancy a =
+      opt::occupancy(cap, opt::KernelDemand::measured(256, clean));
+  const opt::Occupancy b =
+      opt::occupancy(cap, opt::KernelDemand::measured(256, spilling));
+  // The spilling one has the BETTER occupancy — no scratch at all — so a model
+  // that folded spilling into the number would prefer it.
+  LSE_EXPECT(b.workgroups_per_pool > a.workgroups_per_pool);
+  LSE_EXPECT(b.spill == backend::SpillState::kSpilled);
+  LSE_EXPECT(a.spill == backend::SpillState::kNone);
+  LSE_EXPECT(!opt::prefer(b, a));
+  LSE_EXPECT(opt::prefer(a, b));
+
+  // A toolchain that reports no spill counts has said nothing, and nothing
+  // must not read back as "did not spill": the state stays unknown, and only a
+  // REPORTED spill decides a comparison. (Reading silence as spilling would
+  // disable every fusion on a toolchain that never emits the counts, which is
+  // the whole Loom path.)
+  backend::KernelResources silent = clean;
+  silent.vector_spills = {};
+  silent.scalar_spills = {};
+  const opt::Occupancy c =
+      opt::occupancy(cap, opt::KernelDemand::measured(256, silent));
+  LSE_EXPECT(c.spill == backend::SpillState::kUnknown);
+  LSE_EXPECT(c.spill != backend::SpillState::kNone);
+  LSE_EXPECT(opt::prefer(c, b));
+}
+
+// THE RULE the 13x prefill regression violated: a fusion that would seat fewer
+// workgroups per scratch pool than the arrangement it replaces is refused. The
+// number is not written here — the two sides are computed and compared.
+LSE_TEST(a_fusion_that_costs_residency_is_refused_by_the_model) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  const auto at = [&](std::uint32_t bytes) {
+    opt::KernelDemand d;
+    d.threads = 256;
+    d.lds_bytes = bytes;
+    return opt::occupancy(cap, d);
+  };
+
+  // The measured failure: two ~32000-byte panels merged into one 64000-byte
+  // run. It FITS the 65536-byte per-workgroup cap, which is why a fitting test
+  // admitted it, and it seats half as many workgroups.
+  const opt::Occupancy unfused = at(32000);
+  const opt::Occupancy fused = at(64000);
+  LSE_EXPECT(fused.workgroups_per_pool < unfused.workgroups_per_pool);
+  LSE_EXPECT_EQ(fused.workgroups_per_pool, 2u);
+  LSE_EXPECT_EQ(unfused.workgroups_per_pool, 4u);
+  LSE_EXPECT(!opt::prefer(fused, unfused));
+
+  // The nearby case that must NOT be got wrong: siblings sharing one staged
+  // row ask for exactly what one of them asks for alone, so the merge is
+  // residency-neutral and is admitted on equality. The 27B's hidden is 5120,
+  // whose f32 row is 20480 bytes.
+  LSE_EXPECT(opt::prefer(at(20480), at(20480)));
+  // And a merge that seats MORE is never refused.
+  LSE_EXPECT(opt::prefer(at(16384), at(32000)));
+}
+
+// A verdict must not move under a running model. The engine re-emits every
+// group every step, so an answer that changed when a measurement landed would
+// change the kernel mid-run — and the first answer for an arrangement is
+// therefore the one that stands for the process.
+LSE_TEST(a_fusion_verdict_does_not_move_once_it_is_taken) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+
+  opt::FusionCandidate c;
+  c.threads = 256;
+  c.fused_scratch_bytes = 8192;
+  c.worst_solo_scratch_bytes = 8192;
+  c.fused_entry = "lse_fused_verdict_probe";
+  LSE_EXPECT(opt::admit_fusion(cap, c).admit);
+
+  // Now make the same arrangement look terrible, in both the ways a later
+  // answer could differ: a much larger request, and a measurement saying the
+  // kernel spills. Neither may move the answer for this process.
+  opt::KernelMeasurements& measured = opt::KernelMeasurements::instance();
+  backend::KernelResources spilling;
+  spilling.vector_registers = backend::DeviceFact<std::uint32_t>::queried(180);
+  spilling.vector_spills = backend::DeviceFact<std::uint32_t>::queried(64);
+  spilling.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  measured.record(c.fused_entry, spilling);
+
+  opt::FusionCandidate worse = c;
+  worse.fused_scratch_bytes = 64000;
+  LSE_EXPECT(opt::admit_fusion(cap, worse).admit);
+
+  // An arrangement nobody has asked about yet is scored freshly, spill and
+  // all — so the freeze is per arrangement, not a global off switch.
+  opt::FusionCandidate other = worse;
+  other.fused_entry = "lse_fused_verdict_probe_2";
+  const opt::FusionVerdict fresh = opt::admit_fusion(cap, other);
+  LSE_EXPECT(!fresh.admit);
+  LSE_EXPECT(fresh.fused.workgroups_per_pool < fresh.unfused.workgroups_per_pool);
+
+  // And a spilling measurement on a residency-neutral arrangement refuses it,
+  // which is the one thing the measurement is allowed to decide here.
+  measured.record("lse_fused_verdict_probe_3", spilling);
+  opt::FusionCandidate spills = c;
+  spills.fused_entry = "lse_fused_verdict_probe_3";
+  const opt::FusionVerdict v = opt::admit_fusion(cap, spills);
+  LSE_EXPECT(v.measured);
+  LSE_EXPECT(v.fused.spill == backend::SpillState::kSpilled);
+  LSE_EXPECT(!v.admit);
+}
+
+// A run is admitted on RESIDENCY, and refused on it. Three cases, one rule:
+// the merged body must seat at least as many workgroups on one scratch pool as
+// the tightest launch it replaces.
+//
+// The middle case is the measured failure. Two panels at exactly half the
+// per-workgroup cap sum to the whole cap, so a fitting test admits them — and
+// they seat 2 workgroups per pool where either alone seats 4. That is the same
+// shape as the 64000-byte family still sitting in this machine's kernel cache,
+// and the 141-token prefill that went 9.4 s to 126.8 s.
+LSE_TEST(a_sibling_run_is_admitted_and_refused_on_residency_not_on_fitting) {
   ::unsetenv("LSE_WMMA");
   const backend::DeviceInfo dev = gfx1151();
   const std::uint32_t budget = dev.lds_bytes_per_workgroup;
   LSE_EXPECT_EQ(budget, 65536u);
 
-  // Two distinct activations, each staging half the budget: 8192 f32 = 32768 B.
+  // Two distinct activations, 512 f32 = 2048 B each. Scratch is not the
+  // binding resource at that size — 8 workgroups of 256 threads fill the wave
+  // slots first, whether the run asks for 2048 bytes or 4096 — so the merge
+  // costs nothing and is emitted as one body with both panels. A rule that
+  // simply forbade a second distinct panel would refuse this.
   {
-    Array x0 = Array::full(Shape{1, 8192}, DType::kF32, 1.0f);
-    Array x1 = Array::full(Shape{1, 8192}, DType::kF32, 2.0f);
-    Array wa = Array::full(Shape{16, 8192}, DType::kF32, 0.5f);
-    Array wb = Array::full(Shape{16, 8192}, DType::kF32, 0.25f);
+    Array x0 = Array::full(Shape{1, 512}, DType::kF32, 1.0f);
+    Array x1 = Array::full(Shape{1, 512}, DType::kF32, 2.0f);
+    Array wa = Array::full(Shape{16, 512}, DType::kF32, 0.5f);
+    Array wb = Array::full(Shape{16, 512}, DType::kF32, 0.25f);
     auto e = kEmitter.emit(sibling_group({linear(x0, wa), linear(x1, wb)}), dev);
     LSE_EXPECT(e.ok());
     if (!e.ok()) {
@@ -3019,9 +3539,8 @@ LSE_TEST(a_sibling_run_over_the_workgroup_budget_is_refused_not_emitted) {
       return;
     }
     LSE_EXPECT_EQ(shared_arrays(e->source).size(), 2u);
-    // Summed to exactly the budget. A max over the stages would say 32768 and
-    // would keep saying it while a third panel walked off the end.
-    LSE_EXPECT_EQ(e->lds_bytes, budget);
+    // Summed, not maximized: one launch, one allocation.
+    LSE_EXPECT_EQ(e->lds_bytes, 4096u);
     // And the number is the text's, not a prediction sitting beside it.
     auto counted = backend::HipEmitter::shared_bytes(e->source);
     LSE_EXPECT(counted.ok());
@@ -3035,8 +3554,36 @@ LSE_TEST(a_sibling_run_over_the_workgroup_budget_is_refused_not_emitted) {
     }
   }
 
-  // One f32 line over: 32768 + 32784 = 65552. The run is not emitted as a fused
-  // body, and whatever is emitted instead stays inside the budget.
+  // Two distinct activations, 8192 f32 = 32768 B each. The sum is exactly the
+  // per-workgroup cap, so it FITS — and it halves residency, so it is refused.
+  {
+    Array x0 = Array::full(Shape{1, 8192}, DType::kF32, 1.0f);
+    Array x1 = Array::full(Shape{1, 8192}, DType::kF32, 2.0f);
+    Array wa = Array::full(Shape{16, 8192}, DType::kF32, 0.5f);
+    Array wb = Array::full(Shape{16, 8192}, DType::kF32, 0.25f);
+    auto e = kEmitter.emit(sibling_group({linear(x0, wa), linear(x1, wb)}), dev);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) return;
+    // The refusal is the model's, and it is not a constant: state both sides.
+    const opt::DeviceCapacity cap = opt::DeviceCapacity::of(dev);
+    opt::KernelDemand merged;
+    merged.threads = 256;
+    merged.lds_bytes = 65536;
+    opt::KernelDemand alone = merged;
+    alone.lds_bytes = 32768;
+    LSE_EXPECT_EQ(opt::occupancy(cap, merged).workgroups_per_pool, 2u);
+    LSE_EXPECT_EQ(opt::occupancy(cap, alone).workgroups_per_pool, 4u);
+    LSE_EXPECT(65536u <= budget);  // it fits, and fitting is not the question
+    LSE_EXPECT(shared_arrays(e->source).size() < 2u);
+    LSE_EXPECT(e->lds_bytes < 65536u);
+    auto counted = backend::HipEmitter::shared_bytes(e->source);
+    LSE_EXPECT(counted.ok());
+    if (counted.ok()) LSE_EXPECT_EQ(*counted, e->lds_bytes);
+  }
+
+  // One f32 line over the cap: 32768 + 32784 = 65552. Not a worse arrangement
+  // but an illegal one — no workgroup can be seated at all — and it is refused
+  // rather than emitted over budget for the compiler to reject.
   {
     Array x0 = Array::full(Shape{1, 8192}, DType::kF32, 1.0f);
     Array x1 = Array::full(Shape{1, 8196}, DType::kF32, 2.0f);
@@ -3053,12 +3600,6 @@ LSE_TEST(a_sibling_run_over_the_workgroup_budget_is_refused_not_emitted) {
   }
 }
 
-// A phase is several stage bodies concatenated, each built against the whole
-// device budget and blind to the others, so its workgroup scratch is the SUM of
-// what they declare. It used to report a constant 1024 for every geometry, which
-// is 17x under for a two-GEMV phase — and an over-budget phase does not fail to
-// launch, it fails to compile, and the scheduler then runs the group on the host
-// interpreter for the rest of the run.
 LSE_TEST(a_phase_is_priced_for_every_row_its_stages_stage) {
   auto phase_of = [](Array& root) {
     const NodePtr roots[] = {root.node()};
@@ -4244,4 +4785,31 @@ LSE_TEST(loom_compiles_the_same_group_far_faster_than_comgr) {
               arch.c_str(), cold_loom, lm, cold_hip, hm,
               lm > 0.0 ? hm / lm : 0.0);
   LSE_EXPECT(lm > 0.0 && hm > 0.0);
+}
+
+LSE_TEST(the_device_publishes_its_capacity_facts) {
+  backend::IBackend* be = live_hrx();
+  if (be == nullptr) {
+    std::printf("       (skipped: no HRX device)\n");
+    return;
+  }
+  const backend::DeviceInfo& info = be->device_info();
+  const backend::ArchFacts& f = info.arch_facts;
+  // A device the engine can see must publish an addressable LDS budget one way
+  // or another; the register facts need a compiler and may be absent.
+  LSE_EXPECT(f.lds_bytes_addressable_per_workgroup.known());
+  LSE_EXPECT(f.max_flat_workgroup_size.known());
+  if (kCompiler.available()) {
+    LSE_EXPECT(f.vector_registers_per_simd.known());
+    LSE_EXPECT(f.vector_register_alloc_granule.known());
+    LSE_EXPECT(f.vector_registers_per_simd.source ==
+               backend::FactSource::kQueried);
+  }
+  // The runtime's own LDS answer and the compiler's must not disagree.
+  if (info.lds_bytes_per_workgroup != 0 &&
+      f.lds_bytes_addressable_per_workgroup.known()) {
+    LSE_EXPECT_EQ(f.lds_bytes_addressable_per_workgroup.value,
+                  info.lds_bytes_per_workgroup);
+  }
+  std::printf("       %s\n%s", info.arch.c_str(), f.describe().c_str());
 }

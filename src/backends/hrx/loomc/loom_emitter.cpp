@@ -197,46 +197,6 @@ std::string broadcast_index(const Shape& src, const Shape& out_shape,
   return sum;
 }
 
-// Workgroup size and launch count for a group with no primitive of its own.
-//
-// This is HipEmitter::choose_dims' policy, restated: the two toolchains must
-// choose the same launch for the same group or a differential comparison is
-// comparing two different kernels, and the occupancy reasoning behind it is
-// device policy rather than a property of either language. It is duplicated
-// rather than shared because the shared half of the two emitters has not been
-// extracted yet; a test pins the two answers together so a drift shows up at
-// build time.
-LaunchDims choose_dims(const FusionGroup& group, const DeviceInfo& device,
-                       std::uint32_t lds_bytes) {
-  std::size_t elements = 1;
-  for (const NodePtr& out : group.outputs) {
-    elements = std::max(elements, out->element_count());
-  }
-  if (group.outputs.empty() && !group.nodes.empty()) {
-    elements = group.nodes.back()->element_count();
-  }
-  const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(device);
-  const std::uint32_t wave =
-      device.wavefront_size != 0 ? device.wavefront_size : 64;
-  const std::uint32_t cap =
-      device.max_threads_per_workgroup ? device.max_threads_per_workgroup : 256;
-  std::uint32_t needed = wave;
-  while (needed < elements && needed < cap) needed *= 2;
-  std::uint32_t best = wave;
-  for (std::uint32_t threads = wave; threads <= cap && threads <= needed;
-       threads *= 2) {
-    const std::uint32_t occ =
-        amd != nullptr ? occupancy_per_lds_pool(device, threads, lds_bytes) : 1;
-    if (occ > 0) best = threads;
-  }
-  LaunchDims dims;
-  dims.workgroup_size[0] = best;
-  dims.workgroup_count[0] =
-      static_cast<std::uint32_t>((elements + best - 1) / best);
-  dims.subgroup_size = wave;
-  return dims;
-}
-
 // The kernel header: the config region that states the launch, and the
 // parameter list that IS the kernarg layout. Declaration order is the layout —
 // buffers in binding order, then one by_value per ConstantsLayout field, both
@@ -429,7 +389,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       out.dims.workgroup_count[d] = tp.workgroup_count[d];
     }
   } else {
-    out.dims = choose_dims(group, device, 0);
+    out.dims = graph::choose_launch_dims(group, device, 0);
   }
   out.dims.subgroup_size = device.wavefront_size;
   const std::uint64_t grid =

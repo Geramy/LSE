@@ -1,4 +1,5 @@
 #include "lse/graph/jit.hpp"
+#include "lse/opt/measurements.hpp"
 
 #include <unistd.h>
 
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -49,7 +51,86 @@ struct DiskMeta {
   std::string arch;
   std::uint64_t source_hash = 0;
   std::string entry;
+  std::vector<backend::KernelResources> resources;
 };
+
+// A fact renders as its number or as "-", never as a 0 standing in for
+// "the toolchain declined". Reading a "-" back as kUnknown is what keeps a
+// warm start from inventing a spill count the compiler never reported.
+void write_fact(std::ostream& out, const backend::DeviceFact<std::uint32_t>& f) {
+  if (f.known()) {
+    out << ' ' << f.value;
+  } else {
+    out << " -";
+  }
+}
+
+backend::DeviceFact<std::uint32_t> read_fact(std::istream& in) {
+  std::string token;
+  if (!(in >> token) || token == "-") return {};
+  try {
+    return backend::DeviceFact<std::uint32_t>::queried(
+        static_cast<std::uint32_t>(std::stoul(token)));
+  } catch (...) {
+    return {};
+  }
+}
+
+// One line per kernel the object defines, tagged so the three fixed header
+// lines stay where they were and a meta file written before this existed still
+// reads — it simply carries no resources, which is the correct answer for it.
+void write_resources(std::ostream& out,
+                     const std::vector<backend::KernelResources>& all) {
+  for (const backend::KernelResources& r : all) {
+    out << "res " << (r.entry.empty() ? "-" : r.entry);
+    write_fact(out, r.vector_registers);
+    write_fact(out, r.scalar_registers);
+    write_fact(out, r.accum_registers);
+    write_fact(out, r.workgroup_segment_bytes);
+    write_fact(out, r.private_segment_bytes);
+    write_fact(out, r.vector_spills);
+    write_fact(out, r.scalar_spills);
+    write_fact(out, r.kernarg_segment_bytes);
+    write_fact(out, r.max_flat_workgroup_size);
+    write_fact(out, r.wavefront_size);
+    if (r.required_workgroup_size.known()) {
+      out << ' ' << r.required_workgroup_size.value[0] << ' '
+          << r.required_workgroup_size.value[1] << ' '
+          << r.required_workgroup_size.value[2];
+    } else {
+      out << " - - -";
+    }
+    out << '\n';
+  }
+}
+
+bool read_resource_line(const std::string& line,
+                        backend::KernelResources* out) {
+  std::istringstream in(line);
+  std::string tag;
+  if (!(in >> tag) || tag != "res") return false;
+  if (!(in >> out->entry)) return false;
+  if (out->entry == "-") out->entry.clear();
+  out->vector_registers = read_fact(in);
+  out->scalar_registers = read_fact(in);
+  out->accum_registers = read_fact(in);
+  out->workgroup_segment_bytes = read_fact(in);
+  out->private_segment_bytes = read_fact(in);
+  out->vector_spills = read_fact(in);
+  out->scalar_spills = read_fact(in);
+  out->kernarg_segment_bytes = read_fact(in);
+  out->max_flat_workgroup_size = read_fact(in);
+  out->wavefront_size = read_fact(in);
+  const auto x = read_fact(in);
+  const auto y = read_fact(in);
+  const auto z = read_fact(in);
+  if (x.known() && y.known() && z.known()) {
+    out->required_workgroup_size =
+        backend::DeviceFact<std::array<std::uint32_t, 3>>::queried(
+            {x.value, y.value, z.value});
+  }
+  return true;
+}
 
 bool read_meta(const fs::path& path, DiskMeta* out) {
   std::ifstream in(path);
@@ -64,7 +145,28 @@ bool read_meta(const fs::path& path, DiskMeta* out) {
   } catch (...) {
     return false;
   }
+  for (std::string line; std::getline(in, line);) {
+    backend::KernelResources r;
+    if (read_resource_line(line, &r)) out->resources.push_back(std::move(r));
+  }
   return true;
+}
+
+// Hand every measurement already on disk to the optimizer, once, before the
+// first kernel is emitted. Without this a decision made at emit time can only
+// see kernels this process has already compiled, so the first emit of a run
+// always falls back to the estimate — and the answer would then depend on how
+// long the process had been running, which is exactly what must not happen.
+void preload_measurements(const std::string& dir) {
+  std::error_code ec;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; ++it) {
+    if (it->path().extension() != ".meta") continue;
+    DiskMeta meta;
+    if (!read_meta(it->path(), &meta)) continue;
+    for (const backend::KernelResources& r : meta.resources) {
+      opt::KernelMeasurements::instance().record(r.entry, r);
+    }
+  }
 }
 
 void write_meta(const fs::path& path, const DiskMeta& meta) {
@@ -77,6 +179,7 @@ void write_meta(const fs::path& path, const DiskMeta& meta) {
   std::snprintf(buf, sizeof(buf), "%016llx",
                 static_cast<unsigned long long>(meta.source_hash));
   out << buf << '\n' << meta.entry << '\n';
+  write_resources(out, meta.resources);
   out.close();
   std::error_code ec;
   fs::rename(tmp, path, ec);
@@ -196,6 +299,10 @@ struct JitCache::Impl {
     backend::KernelHandle handle;
     std::uint64_t source_hash = 0;
     std::string arch;
+    // What the toolchain said about the object behind this handle. Carried
+    // whether the object was compiled here or read back from disk: a warm
+    // start that lost the numbers would make them a property of process age.
+    std::vector<backend::KernelResources> resources;
   };
   // One map per (member, dialect). A KernelHandle is an executable loaded on
   // ONE device; handing member B the handle member A loaded is a wrong-device
@@ -223,6 +330,7 @@ JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
     }
   }
   purge_kernel_artifacts();
+  preload_measurements(cache_dir_);
 }
 
 JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
@@ -239,6 +347,7 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
   compiler_id_.assign(kDialectCount, fnv(compiler.identity()));
   impl_->memory.resize(kDialectCount);
   purge_kernel_artifacts();
+  preload_measurements(cache_dir_);
 }
 
 JitCache::~JitCache() = default;
@@ -351,9 +460,13 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
       stem.string() + "." + std::to_string(co_hash) + ".co";
 
   std::vector<std::byte> code;
+  std::vector<backend::KernelResources> resources;
   if (device_matches && source_matches) {
     code = read_file(co_path);
-    if (!code.empty()) ++stats_.disk_hits;
+    if (!code.empty()) {
+      ++stats_.disk_hits;
+      resources = meta.resources;
+    }
   }
 
   if (code.empty()) {
@@ -364,7 +477,9 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     const auto begin = std::chrono::steady_clock::now();
     auto compiled = compiler->compile(emitted.source, arch);
     if (!compiled.ok()) return compiled.status();
-    code = compiled.release();
+    CompiledKernel built = compiled.release();
+    code = std::move(built.code);
+    resources = std::move(built.resources);
     stats_.compile_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin)
@@ -387,7 +502,8 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
       }
     }
     write_code(co_path, code);
-    write_meta(meta_path, DiskMeta{arch, src_hash, emitted.entry_name});
+    write_meta(meta_path,
+               DiskMeta{arch, src_hash, emitted.entry_name, resources});
   }
 
   auto handle = be.load_executable(
@@ -397,8 +513,32 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   backend::KernelHandle kernel = handle.release();
   const std::uint64_t stored_hash =
       src_hash != 0 ? src_hash : (meta_ok ? meta.source_hash : 0);
-  slots[key] = Impl::Slot{kernel, stored_hash, arch};
+  // Publish what the toolchain said, so a decision made BEFORE the next
+  // compile of the same kernel can consult a measurement instead of a
+  // prediction. Keyed on the entry name, which a decision site can spell
+  // before any text exists.
+  for (const backend::KernelResources& r : resources) {
+    opt::KernelMeasurements::instance().record(r.entry, r);
+  }
+  slots[key] = Impl::Slot{kernel, stored_hash, arch, std::move(resources)};
   return kernel;
+}
+
+const backend::KernelResources* JitCache::resources(
+    std::size_t member, std::uint64_t signature, Dialect dialect,
+    std::string_view entry) const noexcept {
+  const std::size_t slot = toolchain_slot(member, dialect);
+  if (slot >= impl_->memory.size()) return nullptr;
+  const auto& slots = impl_->memory[slot];
+  const auto it = slots.find(slot_key(member, dialect, signature));
+  if (it == slots.end()) return nullptr;
+  const std::vector<backend::KernelResources>& all = it->second.resources;
+  if (all.empty()) return nullptr;
+  if (entry.empty()) return all.size() == 1 ? &all.front() : nullptr;
+  for (const backend::KernelResources& r : all) {
+    if (r.entry == entry) return &r;
+  }
+  return nullptr;
 }
 
 }  // namespace lse::graph

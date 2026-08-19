@@ -78,24 +78,36 @@ void collect_kp_ancestors(const Node* n,
   }
 }
 
-// Workgroups of `threads` resident on the CUs sharing one LDS pool. Must agree
-// with backend::occupancy_per_lds_pool — same unit for both halves, which is
-// why the per-CU wave cap is scaled up to the pool.
-std::uint32_t occupancy_of(const WorkgroupDevice& d, std::uint32_t threads,
-                           std::uint32_t lds) noexcept {
-  if (threads == 0 || d.wavefront == 0) return 0;
-  if (threads > d.max_threads) return 0;
-  if (d.lds_bytes != 0 && lds > d.lds_bytes) return 0;
-  const std::uint32_t waves = (threads + d.wavefront - 1) / d.wavefront;
-  if (waves == 0 || d.max_waves_per_cu < waves) return 0;
-  const std::uint32_t pool = d.cus_per_lds_pool == 0 ? 1u : d.cus_per_lds_pool;
-  const std::uint32_t wave_limit = (d.max_waves_per_cu * pool) / waves;
-  if (lds == 0 || d.lds_bytes == 0) return wave_limit;
-  const std::uint32_t lds_limit = d.lds_bytes / lds;
-  return wave_limit < lds_limit ? wave_limit : lds_limit;
+}  // namespace
+
+// Nothing here counts anything itself: the arithmetic and the min over limits
+// live in lse::opt so that a backend, the partitioner and this file cannot
+// disagree about them.
+opt::Occupancy workgroup_residency(const WorkgroupDevice& d,
+                                   std::uint32_t threads,
+                                   std::uint32_t lds) noexcept {
+  opt::KernelDemand demand;
+  demand.threads = threads;
+  demand.lds_bytes = lds;
+  return opt::occupancy(d.capacity(), demand);
 }
 
-}  // namespace
+opt::DeviceCapacity WorkgroupDevice::capacity() const noexcept {
+  using Fact = backend::DeviceFact<std::uint32_t>;
+  opt::DeviceCapacity c;
+  c.wave_slots_per_simd = Fact::declared(wave_slots_per_simd);
+  c.simds_per_lds_pool = Fact::declared(simds_per_lds_pool);
+  c.lds_bytes_per_pool = Fact::declared(lds_bytes_per_pool);
+  if (lds_alloc_granule != 0) {
+    c.lds_alloc_granule_bytes = Fact::declared(lds_alloc_granule);
+  }
+  if (lds_bytes != 0) {
+    c.lds_bytes_addressable_per_workgroup = Fact::declared(lds_bytes);
+  }
+  c.max_flat_workgroup_size = Fact::declared(max_threads);
+  c.wavefront_size = Fact::declared(wavefront);
+  return c;
+}
 
 WorkgroupDevice WorkgroupDevice::from(const backend::DeviceInfo* info) noexcept {
   WorkgroupDevice d;
@@ -108,8 +120,19 @@ WorkgroupDevice WorkgroupDevice::from(const backend::DeviceInfo* info) noexcept 
     d.lds_bytes = info->lds_bytes_per_workgroup;
   }
   if (info->wavefront_size != 0) d.wavefront = info->wavefront_size;
-  if (info->max_waves_per_cu != 0) d.max_waves_per_cu = info->max_waves_per_cu;
-  if (info->cus_per_lds_pool != 0) d.cus_per_lds_pool = info->cus_per_lds_pool;
+  const backend::ArchFacts& f = info->arch_facts;
+  if (f.wave_slots_per_simd.known() && f.wave_slots_per_simd.value != 0) {
+    d.wave_slots_per_simd = f.wave_slots_per_simd.value;
+  }
+  if (f.simds_per_lds_pool.known() && f.simds_per_lds_pool.value != 0) {
+    d.simds_per_lds_pool = f.simds_per_lds_pool.value;
+  }
+  if (f.lds_bytes_per_pool.known() && f.lds_bytes_per_pool.value != 0) {
+    d.lds_bytes_per_pool = f.lds_bytes_per_pool.value;
+  }
+  // Left 0 where nothing measured it, which the model reads as "charge the
+  // request unrounded and say so", not as "no rounding happens".
+  d.lds_alloc_granule = f.lds_alloc_granule_bytes.value_or(0u);
   return d;
 }
 
@@ -192,7 +215,7 @@ bool Workgroup::can_add(const Node& n) const noexcept {
 
   const std::uint32_t threads = 256u < device_.max_threads ? 256u
                                                            : device_.max_threads;
-  return occupancy_of(device_, threads == 0 ? 1 : threads, lds) != 0;
+  return workgroup_residency(device_, threads == 0 ? 1 : threads, lds).seated();
 }
 
 bool Workgroup::try_add(NodePtr n) {
@@ -289,7 +312,8 @@ bool Workgroup::all_linear_like() const noexcept {
 std::uint32_t Workgroup::occupancy() const {
   const std::uint32_t threads = 256u < device_.max_threads ? 256u
                                                            : device_.max_threads;
-  return occupancy_of(device_, threads == 0 ? 1 : threads, lds_bytes());
+  return workgroup_residency(device_, threads == 0 ? 1 : threads, lds_bytes())
+      .workgroups_per_pool;
 }
 
 std::uint32_t Workgroup::lds_bytes() const {
@@ -334,7 +358,7 @@ std::uint32_t Workgroup::ideal_launches() const {
   const std::uint32_t lds = lds_bytes();
   const std::uint32_t threads = 256u < device_.max_threads ? 256u
                                                            : device_.max_threads;
-  if (occupancy_of(device_, threads == 0 ? 1 : threads, lds) == 0) {
+  if (!workgroup_residency(device_, threads == 0 ? 1 : threads, lds).seated()) {
     return kernel_count();
   }
   if (device_.lds_bytes != 0 && lds > device_.lds_bytes) return kernel_count();

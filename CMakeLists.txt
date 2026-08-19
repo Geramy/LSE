@@ -107,6 +107,20 @@ target_link_options(lse_communication INTERFACE
 lse_apply_common_flags(lse_communication)
 
 # ---------------------------------------------------------------------------
+# opt — optimization policy. The counting and the decisions that rest on it,
+# owned once so no backend reimplements them. Depends on the backend vocabulary
+# (device facts, kernel resources) and on nothing that lowers or emits.
+# ---------------------------------------------------------------------------
+add_library(lse_opt
+  src/opt/occupancy.cpp
+  src/opt/fusion.cpp
+  src/opt/measurements.cpp
+)
+add_library(lse::opt ALIAS lse_opt)
+target_link_libraries(lse_opt PUBLIC lse_core lse_backend_registry)
+lse_apply_common_flags(lse_opt)
+
+# ---------------------------------------------------------------------------
 # dist — transports and collectives. Deliberately below lse_graph: a backend
 # registers its device codec engine here, so this must not depend on lse_graph
 # (which link-depends on the backends).
@@ -179,7 +193,7 @@ add_library(lse_graph
   src/graph/sharding.cpp
 )
 add_library(lse::graph ALIAS lse_graph)
-target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry)
+target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry lse_opt)
 
 # Device kernel primitives. Written against the kir IR and a dialect source
 # table, so they belong to the engine rather than to whichever backend

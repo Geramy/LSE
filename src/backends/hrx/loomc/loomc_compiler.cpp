@@ -1,5 +1,7 @@
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 
+#include "lse/backends/hrx/code_object.hpp"
+
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -381,7 +383,7 @@ std::string LoomcCompiler::identity() const {
 #endif
 }
 
-Result<std::vector<std::byte>> LoomcCompiler::compile(
+Result<graph::CompiledKernel> LoomcCompiler::compile(
     std::string_view source, std::string_view arch) const {
   if (source.empty()) return LSE_ERROR(kInvalidArgument, "empty source");
   if (arch.empty()) return LSE_ERROR(kInvalidArgument, "no target arch");
@@ -530,7 +532,16 @@ Result<std::vector<std::byte>> LoomcCompiler::compile(
     return LSE_ERROR(kCompileError, "loom emit produced no code object for ",
                      arch);
   }
-  return code;
+  graph::CompiledKernel out;
+  out.code = std::move(code);
+  // loomc emits an AMDGPU HSACO, so the same note reader serves it. What comes
+  // back is genuinely thinner than the HIP path's: measured over every loom
+  // object this engine has cached, the register counts, segment sizes and the
+  // kernel's own required workgroup size are all present and the two spill
+  // counts are absent from every one. They therefore read as unknown, which is
+  // what the interface exists to be able to say.
+  out.resources = read_code_object_resources(out.code);
+  return out;
 #else
   return LSE_ERROR(kUnimplemented,
                    "no loom toolchain in this build; configure with an HRX "
