@@ -522,6 +522,12 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
     std::uint64_t sig = group.signature();
     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
+    if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
+      return LSE_ERROR(kOutOfMemory, "fused run needs ",
+                       std::to_string(it->second),
+                       " bytes of workgroup scratch, device allows ",
+                       std::to_string(lds_budget));
+    }
     if (const auto it = emit_cache_.find(sig); it != emit_cache_.end()) {
       out.source = it->second.source;
       out.entry_name = it->second.entry_name;
@@ -734,6 +740,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     // is still an array the compiler charges for, and it is counted.
     const std::uint32_t lds_emitted = merged.workgroup_bytes();
     if (lds_budget != 0 && lds_emitted > lds_budget) {
+      lds_refused_.emplace(sig, lds_emitted);
       return LSE_ERROR(kOutOfMemory, "fused run needs ",
                        std::to_string(lds_emitted),
                        " bytes of workgroup scratch, device allows ",
@@ -881,6 +888,13 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   // be pre-loaded as scalars at the output index — the shapes do not line up.
   std::unordered_set<const Node*> pointer_inputs;
   for (const NodePtr& n : group.nodes) {
+    // repeat reads element `src(i)` of its input, not element i, so the
+    // scaffold must not widen it at the launch index the way it does for an
+    // elementwise operand. It loads for itself, below.
+    if (n->kind == OpKind::kRepeat) {
+      for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
+      continue;
+    }
     if (dynamic_cast<const KernelPrimitiveBase*>(n->prim) == nullptr) continue;
     for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
   }
@@ -1174,6 +1188,55 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       src << ")";
       if (guarded) src << " : 0.0f";
       src << ";\n";
+      value_of[n.get()] = var;
+      continue;
+    }
+
+    if (n->kind == OpKind::kRepeat) {
+      // Same map as repeat_stage in phase_emit: the axis is spread by `count`
+      // and the elements under it ride along unchanged. Without this the op
+      // has no per-element template at all and the whole group goes to the
+      // host -- 864 of them per prefill pass on a 64 layer model, because
+      // this is how grouped-query attention widens 4 key heads to 24.
+      const Shape& sh = n->inputs[0]->shape;
+      const auto axis = static_cast<std::size_t>(n->iattrs[0]);
+      const auto count = static_cast<std::uint32_t>(n->iattrs[1]);
+      if (axis >= sh.rank() || count == 0) {
+        return LSE_ERROR(kInvalidArgument, "repeat has no axis to spread");
+      }
+      std::uint32_t inner = 1;
+      std::uint32_t in_axis = 1;
+      for (std::size_t d = 0; d < sh.rank(); ++d) {
+        const auto dim = static_cast<std::uint32_t>(sh.dim(d));
+        if (d > axis) inner *= dim;
+        else if (d == axis) in_axis = dim;
+      }
+      if (inner == 0 || in_axis == 0) {
+        return LSE_ERROR(kInvalidArgument, "repeat has an empty axis");
+      }
+      auto it = binding_of.find(n->inputs[0].get());
+      if (it == binding_of.end()) {
+        return LSE_ERROR(kInternal, "repeat input is not bound in this group");
+      }
+      const std::string var = "t" + std::to_string(temp++);
+      const std::string ib = "b" + std::to_string(it->second);
+      const std::string sv = var + "_src";
+      // The launch covers the widest member of the group, so a thread past
+      // this node's own extent must not map an index into its input: the map
+      // is not monotone in i and lands well outside the buffer rather than
+      // just past it.
+      const auto elems = static_cast<std::uint32_t>(n->element_count());
+      const bool guarded = elems < launch_elems;
+      src << "  const unsigned int " << sv << " = ";
+      if (guarded) src << "i < " << elems << "u ? ";
+      src << "((i / " << (in_axis * count * inner) << "u) * " << in_axis
+          << "u + ((i % " << (in_axis * count * inner) << "u) / " << inner
+          << "u) / " << count << "u) * " << inner << "u + (i % " << inner
+          << "u)";
+      if (guarded) src << " : 0u";
+      src << ";\n"
+          << "  const float " << var << " = "
+          << load_expr(ib, sv, n->inputs[0]->dtype) << ";\n";
       value_of[n.get()] = var;
       continue;
     }

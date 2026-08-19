@@ -869,6 +869,35 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           if (!st.ok()) break;
         }
         if (st.ok()) st = try_dispatch_group(g, on, member_for(g));
+        // A joined run the emitter cannot express is not a reason to abandon
+        // the phase: its members are independent by construction, so each one
+        // still dispatches alone. Splitting costs one launch per member;
+        // giving up costs a full repartition of the step and every group in it
+        // re-placed, which measured seconds per wide prefill pass.
+        std::vector<FusionGroup> split;
+        if (!st.ok() && !g.is_phase && g.nodes.size() > 1) {
+          Status each = OkStatus();
+          for (const NodePtr& n : g.nodes) {
+            FusionGroup one;
+            one.nodes.push_back(n);
+            one.outputs.push_back(n);
+            one.inputs = n->inputs;
+            one.anchor = n->kind;
+            one.anchor_class = n->fclass;
+            each = try_dispatch_group(one, on, member_for(one));
+            if (!each.ok()) break;
+            ++trace_.device_groups;
+            ++trace_.kernels_launched;
+            split.push_back(std::move(one));
+          }
+          if (each.ok()) {
+            st = OkStatus();
+          } else {
+            trace_.device_groups -= static_cast<std::uint32_t>(split.size());
+            trace_.kernels_launched -= static_cast<std::uint32_t>(split.size());
+            split.clear();
+          }
+        }
         if (st.ok() && impl_->plan.record_after[gi] != 0) {
           auto ev = backend().record_event(on);
           if (ev.ok()) {
@@ -887,10 +916,20 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         }
         alias_ready_reshapes(g);
         if (on.index < stream_count) impl_->outstanding[on.index] = 1;
-        ++trace_.device_groups;
-        ++trace_.kernels_launched;
+        if (split.empty()) {
+          ++trace_.device_groups;
+          ++trace_.kernels_launched;
+        }
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
-        if (!replayed) ran.push_back(g);
+        // The replay has to see what actually ran, not the group that was
+        // refused, or it re-runs the same refusal every pass.
+        if (!replayed) {
+          if (split.empty()) {
+            ran.push_back(g);
+          } else {
+            for (FusionGroup& one : split) ran.push_back(std::move(one));
+          }
+        }
         ++done;
       }
       if (launched_phase) {
@@ -931,6 +970,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   std::vector<FusionGroup> groups =
       Partitioner::partition(roots, &backend().device_info());
   trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));
+  // Every group taken here has to land in `ran`, on whichever arm ran it.
+  // retain() below is what the next step replays, and a replay first calls
+  // reset_compute() on the whole reachable graph: a cover missing the device
+  // and view groups leaves their nodes unmaterialized and unrecomputed, and the
+  // step after that reaches them again through the state carry chain and
+  // re-runs a stale KV write against a regrown pool.
   bool launched = false;
   for (const FusionGroup& g : groups) {
     std::string desc(to_string(g.anchor));
@@ -946,6 +991,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       if (try_alias_group(g).ok()) {
         ++trace_.views_aliased;
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
+        ran.push_back(g);
         continue;
       }
       Status dispatched =
@@ -955,6 +1001,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ++trace_.kernels_launched;
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
         launched = true;
+        ran.push_back(g);
         continue;
       }
       // Not a hard failure: a group the emitter cannot express falls to the

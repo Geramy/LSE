@@ -93,6 +93,11 @@ class HipEmitter final : public graph::IKernelEmitter,
     bool persist_grid = false;
   };
   mutable std::unordered_map<std::uint64_t, CachedEmit> emit_cache_;
+  // Sibling runs whose assembled body overran the workgroup budget, and by how
+  // much. The verdict is a function of the group and the device, so it is
+  // reached once; without this a prefill pass rebuilds the whole IR body of
+  // every such run on every pass only to refuse it again.
+  mutable std::unordered_map<std::uint64_t, std::uint32_t> lds_refused_;
 };
 
 }  // namespace lse::backend
