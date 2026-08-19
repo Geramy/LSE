@@ -41,6 +41,9 @@ inline constexpr std::string_view kVisionPrefix = "vision_tower.";
 
 std::unique_ptr<IMixer> make_attention();
 std::unique_ptr<IMixer> make_gdn();
+// Plain SwiGLU. The dense stack's every layer and the MTP module's one layer
+// use it; the MoE variant does not.
+std::unique_ptr<IFeedForward> make_mlp();
 
 HybridBlockSpec block_spec();
 

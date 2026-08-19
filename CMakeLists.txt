@@ -240,6 +240,7 @@ lse_apply_common_flags(lse_runtime)
 add_library(lse_model
   src/model/config.cpp
   src/model/hybrid_lm.cpp
+  src/model/mtp.cpp
   src/model/layer.cpp
   src/model/registry.cpp
   src/model/weights.cpp

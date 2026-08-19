@@ -62,6 +62,12 @@ class Program {
     return carries_;
   }
   void fold_carries() noexcept;
+  // Keeps the carried inputs where they are: the pass about to run replaces the
+  // one that just ran rather than following it, so the state it must start from
+  // is the one already on the input node. reset_compute() un-materializes that
+  // node when it is itself a produced value, which is the only reason this has
+  // to be called at all.
+  void hold_carries() noexcept;
 
  private:
   std::vector<NodePtr> roots_;

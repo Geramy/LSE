@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "lse/ops/activation.hpp"
 #include "lse/ops/attention.hpp"
 #include "lse/ops/linear_attention.hpp"
 #include "lse/ops/rope.hpp"
@@ -247,7 +248,45 @@ class Qwen35GatedDeltaNet final : public IMixer {
   ops::GatedDeltaNetSpec spec_;
 };
 
+class Qwen35MLP final : public IFeedForward {
+ public:
+  std::string_view name() const noexcept override { return "qwen3_5.mlp"; }
+
+  Status load(WeightBinder& b, std::string_view prefix,
+              const LayerContext& ctx) override {
+    const Config& c = *ctx.config;
+    const std::string p = std::string(prefix) + ".mlp";
+    const auto hidden = static_cast<std::int64_t>(c.hidden_size);
+    const auto inter = static_cast<std::int64_t>(c.mlp_intermediate);
+
+    LSE_ASSIGN_OR(gate_, b.require(p + ".gate_proj.weight"));
+    LSE_RETURN_IF_ERROR(expect_shape(gate_, p + ".gate_proj.weight",
+                                     Shape{inter, hidden}));
+    LSE_ASSIGN_OR(up_, b.require(p + ".up_proj.weight"));
+    LSE_RETURN_IF_ERROR(expect_shape(up_, p + ".up_proj.weight",
+                                     Shape{inter, hidden}));
+    LSE_ASSIGN_OR(down_, b.require(p + ".down_proj.weight"));
+    LSE_RETURN_IF_ERROR(expect_shape(down_, p + ".down_proj.weight",
+                                     Shape{hidden, inter}));
+    return OkStatus();
+  }
+
+  Result<Array> forward(const Array& x, Array* aux_loss,
+                        const LayerContext& ctx) override {
+    (void)aux_loss;
+    (void)ctx;
+    return ops::swiglu(x, gate_, up_, down_);
+  }
+
+ private:
+  Array gate_, up_, down_;
+};
+
 }  // namespace
+
+std::unique_ptr<IFeedForward> make_mlp() {
+  return std::make_unique<Qwen35MLP>();
+}
 
 std::unique_ptr<IMixer> make_attention() {
   return std::make_unique<Qwen35Attention>();

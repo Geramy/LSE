@@ -135,9 +135,23 @@ class HybridLM {
   // same kernels on its own pad blocks and answers zero. Null means one
   // sequence spread over every row, all at the state's current position, which
   // is what a single-session decode and every prefill pass want.
+  //
+  // `replaces_previous` says this pass stands in for the one that just ran
+  // rather than following it: the carried state on the input nodes is still
+  // what that pass started from, so it is held where it is instead of being
+  // folded forward. That is the whole of a speculative rollback for the
+  // recurrent layers — a rejected proposal's Gated DeltaNet state is never
+  // committed, because the pass that produced it is overwritten. The caller
+  // must put the mixer positions back first; see MixerState::position.
   Result<Array> hidden(const Array& tokens, std::vector<MixerState>* states,
                        Array* aux_loss, std::vector<Array>* trace = nullptr,
-                       const StepRows* rows = nullptr);
+                       const StepRows* rows = nullptr,
+                       bool replaces_previous = false);
+
+  // Puts every attention layer's write cursor back to `position`. The paged
+  // pool is overwritten in place by the pass that follows, so this plus a
+  // `replaces_previous` pass is what un-does a speculative step.
+  void rewind(std::vector<MixerState>& states, std::int32_t position) const;
 
   // [.., D] -> [.., vocab]. Applied to only the positions a caller needs: at
   // long context the full [B,T,vocab] tensor does not fit.
@@ -170,6 +184,10 @@ class HybridLM {
     std::vector<graph::Node*> kv_leaves;
   };
   ForwardCache cache_;
+  // Groups the last pass could not put on the device. A pass that ran anywhere
+  // else cannot be replaced: the carried state travels differently there, and
+  // the pass replacing it would start from what it is meant to discard.
+  std::uint32_t last_pass_host_groups_ = 0;
 };
 
 }  // namespace lse::model

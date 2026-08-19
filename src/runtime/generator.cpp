@@ -206,9 +206,49 @@ Result<std::uint32_t> Generator::greedy_step(Session& session,
   return static_cast<std::uint32_t>(id);
 }
 
+Status Generator::read_hidden(const Array& hidden, std::vector<float>* out) {
+  if (!hidden.valid() || hidden.dtype() != DType::kF32) {
+    return LSE_ERROR(kInternal,
+                     "the MTP module reads hidden states as f32; this pass "
+                     "produced another dtype");
+  }
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend to read from");
+  // The pass left the value on the device; nothing has asked for it on the
+  // host, so the mirror is where it has to be moved to.
+  LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(*hidden.node(),
+                                                           sched->backend()));
+  out->resize(hidden.shape().elem_count());
+  return graph::interpreter::read_raw(*hidden.node(), out->data(),
+                                      out->size() * sizeof(float));
+}
+
+// Fills the module's cache for one prefill chunk. Row j of the chunk sits at
+// absolute position `first + j`, carries the token there, and takes the
+// decoder's hidden state from the position before it — so row 0 needs the
+// previous chunk's last row, which `carry` holds (zeros before the first
+// chunk, which is the one position with no predecessor).
+Status Generator::mtp_prefill_chunk(const Array& hidden,
+                                    std::span<const std::uint32_t> tokens,
+                                    std::int32_t first,
+                                    std::vector<float>* carry) {
+  LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
+  const std::size_t width = spec_hidden_.size() / tokens.size();
+  std::vector<float> shifted(spec_hidden_.size());
+  std::copy(carry->begin(), carry->end(), shifted.begin());
+  std::copy(spec_hidden_.begin(),
+            spec_hidden_.end() - static_cast<std::ptrdiff_t>(width),
+            shifted.begin() + static_cast<std::ptrdiff_t>(width));
+  carry->assign(spec_hidden_.end() - static_cast<std::ptrdiff_t>(width),
+                spec_hidden_.end());
+  return mtp_->draft(shifted, tokens, first).status();
+}
+
 Result<std::vector<float>> Generator::step(
     Session& session, const std::vector<std::uint32_t>& tokens) {
-  if (tokens.size() == 1) {
+  // A one-token prompt still goes the long way when the module is in play: the
+  // decode head skips the hidden state the module needs for its first row.
+  if (tokens.size() == 1 && mtp_ == nullptr) {
     LSE_ASSIGN_OR(Array logits, decode_head(session, tokens[0], false));
     std::vector<float> out(logits.shape().elem_count());
     LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
@@ -220,6 +260,11 @@ Result<std::vector<float>> Generator::step(
   // split is invisible to the model: the KV write cursor, the RoPE angles and
   // the attention masks all read the shared device position slot, which counts
   // absolute tokens, not tokens within a pass.
+  const auto base = static_cast<std::int32_t>(session.position());
+  std::vector<float> carry;
+  if (mtp_ != nullptr) {
+    carry.assign(static_cast<std::size_t>(model_.config().hidden_size), 0.0f);
+  }
   Array hidden;
   std::size_t at = 0;
   for (std::size_t take : prefill_plan(tokens.size(), prefill_chunk())) {
@@ -227,8 +272,14 @@ Result<std::vector<float>> Generator::step(
     LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(
                                  first, first + static_cast<std::ptrdiff_t>(take))));
     LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr));
+    if (mtp_ != nullptr) {
+      LSE_RETURN_IF_ERROR(mtp_prefill_chunk(
+          hidden, std::span<const std::uint32_t>(&*first, take),
+          base + static_cast<std::int32_t>(at), &carry));
+    }
     at += take;
   }
+  if (mtp_ != nullptr) prefill_tail_ = std::move(carry);
   LSE_ASSIGN_OR(Array last, last_hidden(hidden));
   LSE_ASSIGN_OR(Array logits, model_.lm_head(last));
 
@@ -236,6 +287,187 @@ Result<std::vector<float>> Generator::step(
   LSE_RETURN_IF_ERROR(
       logits.to_host(out.data(), out.size() * sizeof(float)));
   return out;
+}
+
+Result<Generator::Verified> Generator::verify(Session& session,
+                                             std::uint32_t a, std::uint32_t b,
+                                             bool replaces_previous) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no usable backend for the verify pass");
+  }
+  if (!spec_ids_.valid()) {
+    const std::size_t bytes = dtype_storage_bytes(DType::kF32, 2);
+    auto buf = sched->backend().allocate(bytes, backend::MemoryClass::kDevice);
+    if (!buf.ok()) return buf.status();
+    spec_ids_ = Array::from_buffer(buf.release(), Shape{1, 2}, DType::kF32);
+  }
+  {
+    graph::Node& n = *spec_ids_.node();
+    const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
+    if (n.host_mirror.size() < bytes) n.host_mirror.resize(bytes);
+    graph::interpreter::store_element(n, 0, static_cast<float>(a));
+    graph::interpreter::store_element(n, 1, static_cast<float>(b));
+    n.materialized = true;
+  }
+
+  const std::uint64_t started = now_ns();
+  LSE_ASSIGN_OR(Array hidden,
+                model_.hidden(spec_ids_, &session.states(), nullptr, nullptr,
+                              nullptr, replaces_previous));
+
+  const SamplingParams& sp = sampler_.params();
+  const bool greedy = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+  const bool reuse = spec_.hidden.valid() && spec_.logits.valid() &&
+                     spec_.hidden.node().get() == hidden.node().get() &&
+                     spec_.greedy == greedy && (!greedy || spec_.pick.valid());
+  if (!reuse) {
+    spec_ = SpecHead{};
+    spec_.hidden = hidden;
+    spec_.greedy = greedy;
+    // [1, 2, D] -> [1, 2, vocab]: both rows go through the head, because the
+    // second row's logits are what a verified proposal buys.
+    LSE_ASSIGN_OR(spec_.logits, model_.lm_head(hidden));
+    spec_.compute = {spec_.logits.node()};
+    if (greedy) {
+      spec_.pick = graph::argmax(spec_.logits);
+      if (!spec_.pick.valid()) {
+        return LSE_ERROR(kInternal, "argmax over an empty logit row");
+      }
+      spec_.compute.push_back(spec_.pick.node()->inputs[0]);
+      spec_.compute.push_back(spec_.pick.node());
+    }
+  }
+
+  Array root = greedy ? spec_.pick : spec_.logits;
+  for (const graph::NodePtr& n : spec_.compute) {
+    if (n) n->materialized = false;
+  }
+  const graph::NodePtr roots[] = {root.node()};
+  LSE_RETURN_IF_ERROR(sched->eval(roots, true, &spec_.program));
+
+  Verified out;
+  if (greedy) {
+    out.first = static_cast<std::uint32_t>(
+        graph::interpreter::load_element(*spec_.pick.node(), 0));
+    out.second = static_cast<std::uint32_t>(
+        graph::interpreter::load_element(*spec_.pick.node(), 1));
+  } else {
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(
+        *spec_.logits.node(), sched->backend()));
+    spec_logits_.resize(spec_.logits.shape().elem_count());
+    LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
+        *spec_.logits.node(), spec_logits_.data(),
+        spec_logits_.size() * sizeof(float)));
+  }
+  LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
+  stats_.spec_verify_ns += now_ns() - started;
+  ++stats_.spec_verify_passes;
+  return out;
+}
+
+// Two tokens per decoder pass: the module proposes the second, the decoder
+// verifies it in the same pass, and a rejected proposal is undone by replaying
+// the pass with the decoder's own token in its place.
+//
+// The undo is why this is a pass and not a snapshot. After a pass the carried
+// recurrent state still sits where that pass started from — the produced state
+// lives on the other node of the carry pair and is not folded across until the
+// next step — so re-running the pass from the same input with the corrected
+// token reproduces exactly what a non-speculating decode would have carried.
+// The paged KV needs no more than its cursor put back: the redo overwrites the
+// same two slots.
+Result<std::vector<std::uint32_t>> Generator::speculate(
+    Session& session, std::vector<float>& prefill_logits,
+    const GenerationLimits& limits, const TokenCallback& on_token) {
+  std::vector<std::uint32_t> generated;
+  generated.reserve(static_cast<std::size_t>(std::max(limits.max_tokens, 0)));
+  if (limits.max_tokens <= 0) return generated;
+
+  const auto is_stop = [&limits](std::uint32_t id) {
+    return std::find(limits.stop_tokens.begin(), limits.stop_tokens.end(), id) !=
+           limits.stop_tokens.end();
+  };
+  // Emits one token. False means generation is over, either because this one
+  // is a stop token (which is not emitted), the caller cancelled, or the limit
+  // is reached.
+  const auto give = [&](std::uint32_t id) {
+    if (is_stop(id)) return false;
+    generated.push_back(id);
+    session.history().push_back(id);
+    ++stats_.generated_tokens;
+    if (on_token && !on_token(id)) return false;
+    return static_cast<std::int32_t>(generated.size()) < limits.max_tokens;
+  };
+
+  std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
+  bool running = give(pending);
+  // The module's first row: the last prompt position's hidden state paired
+  // with the token the decoder just produced there.
+  std::uint32_t draft = 0;
+  if (running) {
+    const std::uint64_t started = now_ns();
+    LSE_ASSIGN_OR(draft,
+                  mtp_->draft(prefill_tail_, std::span(&pending, 1),
+                              static_cast<std::int32_t>(session.position())));
+    stats_.spec_draft_ns += now_ns() - started;
+  }
+
+  while (running) {
+    const auto at = static_cast<std::int32_t>(session.position());
+    LSE_ASSIGN_OR(Verified v, verify(session, pending, draft, false));
+    ++stats_.spec_steps;
+
+    std::uint32_t first = v.first;
+    if (!spec_.greedy) {
+      first = sampler_.sample(
+          std::span<float>(spec_logits_.data(), spec_logits_.size() / 2),
+          session.history());
+    }
+    const bool accepted = first == draft;
+    if (accepted) ++stats_.spec_accepted;
+
+    running = give(first);
+    if (!running) {
+      session.advance(2);
+      break;
+    }
+    if (!accepted) {
+      // The proposal was wrong, so the pass that consumed it is discarded and
+      // re-run with the decoder's own token. Positions go back first: the pass
+      // must land on the same two KV slots.
+      model_.rewind(session.states(), at);
+      LSE_ASSIGN_OR(v, verify(session, pending, first, true));
+    }
+
+    std::uint32_t second = v.second;
+    if (!spec_.greedy) {
+      second = sampler_.sample(
+          std::span<float>(spec_logits_.data() + spec_logits_.size() / 2,
+                           spec_logits_.size() / 2),
+          session.history());
+    }
+    session.advance(2);
+    running = give(second);
+    pending = second;
+    if (!running) break;
+
+    const std::uint32_t pair[] = {first, second};
+    const std::uint64_t drafted = now_ns();
+    LSE_ASSIGN_OR(draft, mtp_->draft(spec_hidden_, pair, at + 1));
+    stats_.spec_draft_ns += now_ns() - drafted;
+  }
+
+  // A step that stopped between its two halves left the decoder holding one
+  // token more than was emitted, and then the cache no longer describes the
+  // text. Dropping it is what keeps a follow-up turn honest; it costs that turn
+  // a re-prefill and nothing else.
+  if (static_cast<std::size_t>(session.position()) + 1 !=
+      session.history().size()) {
+    session.clear();
+    mtp_->reset();
+  }
+  return generated;
 }
 
 Result<std::vector<std::uint32_t>> Generator::generate(
@@ -271,6 +503,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
                  prompt.begin());
   if (!continues) {
     session.clear();
+    if (mtp_ != nullptr) mtp_->reset();
   }
   const std::size_t start = continues ? covered : 0;
   const std::vector<std::uint32_t> fresh(prompt.begin() + static_cast<std::ptrdiff_t>(start),
@@ -306,6 +539,12 @@ Result<std::vector<std::uint32_t>> Generator::generate(
       sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
 
   const std::uint64_t decode_start = now_ns();
+  if (mtp_ != nullptr) {
+    LSE_ASSIGN_OR(generated, speculate(session, logits, limits, on_token));
+    stats_.decode_ns = now_ns() - decode_start;
+    snapshot_trace(&stats_, &host_reasons_);
+    return generated;
+  }
   std::uint32_t next = 0;
   if (limits.max_tokens > 0) next = sampler_.sample(logits, session.history());
   for (std::int32_t n = 0; n < limits.max_tokens; ++n) {

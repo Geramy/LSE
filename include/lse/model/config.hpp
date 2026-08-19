@@ -71,6 +71,15 @@ struct Config {
   // False means the checkpoint carries a separate lm_head.
   bool tie_word_embeddings = true;
 
+  // Layers in the multi-token-prediction module that ships beside this
+  // checkpoint. 0 means the release has none. The module is not part of the
+  // stack — see model::MtpModule — but the count is what says to look for it.
+  std::int32_t mtp_layers = 0;
+  // The module keeps its own embedding table rather than sharing the decoder's.
+  // Only the shared layout is implemented; the flag is read so a checkpoint
+  // that needs the other one fails naming it.
+  bool mtp_dedicated_embeddings = false;
+
   // Group geometry per quantized tensor, read from the checkpoint's own
   // `quantization` block including its per-module overrides. Empty for an
   // unquantized checkpoint, and a lookup on an empty map fails naming the

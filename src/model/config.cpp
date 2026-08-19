@@ -143,6 +143,8 @@ Result<Config> from_hf_json(const nlohmann::json& root) {
 
   read(root, "tie_word_embeddings", c.tie_word_embeddings);
   read(t, "tie_word_embeddings", c.tie_word_embeddings);
+  read(t, "mtp_num_hidden_layers", c.mtp_layers);
+  read(t, "mtp_use_dedicated_embeddings", c.mtp_dedicated_embeddings);
   read(t, "dtype", c.dtype);
   read(t, "max_position_embeddings", c.train_seq_len);
 
@@ -223,6 +225,8 @@ Result<Config> Config::from_json_string(const std::string& text) {
   read(j, "expert_intermediate", c.expert_intermediate);
   read(j, "shared_expert_intermediate", c.shared_expert_intermediate);
   read(j, "tie_word_embeddings", c.tie_word_embeddings);
+  read(j, "mtp_layers", c.mtp_layers);
+  read(j, "mtp_dedicated_embeddings", c.mtp_dedicated_embeddings);
   read(j, "router_aux_loss_coef", c.router_aux_loss_coef);
   read(j, "router_z_loss_coef", c.router_z_loss_coef);
   read(j, "expert_score_band", c.expert_score_band);
@@ -275,6 +279,8 @@ std::string Config::to_json() const {
   j["expert_intermediate"] = expert_intermediate;
   j["shared_expert_intermediate"] = shared_expert_intermediate;
   j["tie_word_embeddings"] = tie_word_embeddings;
+  j["mtp_layers"] = mtp_layers;
+  j["mtp_dedicated_embeddings"] = mtp_dedicated_embeddings;
   j["router_aux_loss_coef"] = router_aux_loss_coef;
   j["router_z_loss_coef"] = router_z_loss_coef;
   j["expert_score_band"] = expert_score_band;

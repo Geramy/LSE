@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -27,6 +28,8 @@
 #include "lse/ops/rope.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/lemonseed.hpp"
+#include "lse/model/mtp.hpp"
+#include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/runtime/batch.hpp"
 #include "lse/runtime/generator.hpp"
@@ -2584,3 +2587,549 @@ LSE_TEST(verify_rope_rotates_each_row_to_its_own_position) {
   }
 }
 
+
+// --- multi-token prediction --------------------------------------------------
+//
+// The module ships beside a checkpoint and is not one: no embedding table, no
+// head, one layer. These run against a synthetic Qwen3.5 pair, so they cover
+// the wiring — load, rollback, accept, and token identity — on a bare machine.
+// Acceptance rate is a property of trained weights and is not testable here.
+
+namespace {
+
+struct NamedTensor {
+  std::string name;
+  std::vector<std::int64_t> dims;
+};
+
+std::size_t tensor_elems(const NamedTensor& t) {
+  std::size_t n = 1;
+  for (std::int64_t d : t.dims) n *= static_cast<std::size_t>(d);
+  return n;
+}
+
+std::string safetensors_header(const std::vector<NamedTensor>& tensors,
+                               std::size_t* total) {
+  std::string header = "{";
+  std::size_t offset = 0;
+  for (const NamedTensor& t : tensors) {
+    std::string dims;
+    for (std::int64_t d : t.dims) {
+      if (!dims.empty()) dims += ",";
+      dims += std::to_string(d);
+    }
+    const std::size_t bytes = tensor_elems(t) * 4;
+    if (header.size() > 1) header += ",";
+    header += "\"" + t.name + "\":{\"dtype\":\"F32\",\"shape\":[" + dims +
+              "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + bytes) + "]}";
+    offset += bytes;
+  }
+  header += "}";
+  while (header.size() % 8 != 0) header += " ";
+  *total = offset;
+  return header;
+}
+
+// `value(name, index)` fills each tensor, so a fixture can hand one tensor a
+// structure and let the rest take filler.
+template <typename Fill>
+void write_shaped(const std::filesystem::path& path,
+                  const std::vector<NamedTensor>& tensors, const Fill& value) {
+  std::size_t total = 0;
+  const std::string header = safetensors_header(tensors, &total);
+  std::ofstream out(path, std::ios::binary);
+  const std::uint64_t n = header.size();
+  out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+  out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  std::vector<float> data;
+  for (const NamedTensor& t : tensors) {
+    data.resize(tensor_elems(t));
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = value(t.name, i);
+    out.write(reinterpret_cast<const char*>(data.data()),
+              static_cast<std::streamsize>(data.size() * 4));
+  }
+}
+
+// Deterministic and not symmetric: an all-zero module drafts token 0 every
+// step, which would make a rejection test pass for the wrong reason.
+float filler(std::size_t i) {
+  return 0.03f * static_cast<float>(static_cast<int>((i * 7) % 23) - 11);
+}
+
+// `gdn_head_dim` is a knob because the device Gated DeltaNet kernel only emits
+// at 16, 32, 64 and 128: any other width puts the scan on the host, which is
+// the one shape of pass a speculative rollback cannot replace.
+model::Config mtp_test_config(std::int32_t gdn_head_dim = 16) {
+  model::Config c;
+  c.vocab_size = 64;
+  c.hidden_size = 32;
+  c.num_layers = 4;
+  c.full_attention_interval = 4;
+  c.global_attention_layers.clear();
+  c.sliding_window = 0;
+  c.attn_q_heads = 2;
+  c.attn_kv_heads = 1;
+  c.attn_head_dim = 16;
+  c.rope_dim = 4;
+  c.rope_theta = 10000000.0f;
+  c.gdn_qk_heads = 2;
+  c.gdn_v_heads = 2;
+  c.gdn_head_dim = gdn_head_dim;
+  c.gdn_conv_kernel = 4;
+  c.mlp_intermediate = 64;
+  c.num_experts = 0;
+  c.num_active_experts = 0;
+  c.num_shared_experts = 0;
+  c.expert_intermediate = 0;
+  c.tie_word_embeddings = true;
+  c.dtype = "float32";
+  c.kv_length = 64;
+  c.mtp_layers = 1;
+  return c;
+}
+
+std::vector<NamedTensor> qwen_dense_tensors(const model::Config& c) {
+  const std::int64_t h = c.hidden_size;
+  const std::int64_t qh = c.attn_q_heads, kvh = c.attn_kv_heads;
+  const std::int64_t ahd = c.attn_head_dim;
+  const std::int64_t kh = c.gdn_qk_heads, vh = c.gdn_v_heads;
+  const std::int64_t ghd = c.gdn_head_dim;
+  const std::int64_t conv_dim = 2 * kh * ghd + vh * ghd;
+
+  std::vector<NamedTensor> t;
+  t.push_back({"language_model.model.embed_tokens.weight", {c.vocab_size, h}});
+  t.push_back({"language_model.model.norm.weight", {h}});
+  for (std::int32_t i = 0; i < c.num_layers; ++i) {
+    const std::string p =
+        "language_model.model.layers." + std::to_string(i) + ".";
+    t.push_back({p + "input_layernorm.weight", {h}});
+    t.push_back({p + "post_attention_layernorm.weight", {h}});
+    if (c.is_attention_layer(i)) {
+      const std::string a = p + "self_attn.";
+      t.push_back({a + "q_proj.weight", {2 * qh * ahd, h}});
+      t.push_back({a + "k_proj.weight", {kvh * ahd, h}});
+      t.push_back({a + "v_proj.weight", {kvh * ahd, h}});
+      t.push_back({a + "o_proj.weight", {h, qh * ahd}});
+      t.push_back({a + "q_norm.weight", {ahd}});
+      t.push_back({a + "k_norm.weight", {ahd}});
+    } else {
+      const std::string g = p + "linear_attn.";
+      t.push_back({g + "in_proj_qkv.weight", {conv_dim, h}});
+      t.push_back({g + "in_proj_z.weight", {vh * ghd, h}});
+      t.push_back({g + "in_proj_a.weight", {vh, h}});
+      t.push_back({g + "in_proj_b.weight", {vh, h}});
+      t.push_back({g + "conv1d.weight", {conv_dim, c.gdn_conv_kernel, 1}});
+      t.push_back({g + "A_log", {vh}});
+      t.push_back({g + "dt_bias", {vh}});
+      t.push_back({g + "norm.weight", {ghd}});
+      t.push_back({g + "out_proj.weight", {h, vh * ghd}});
+    }
+    const std::string m = p + "mlp.";
+    t.push_back({m + "gate_proj.weight", {c.mlp_intermediate, h}});
+    t.push_back({m + "up_proj.weight", {c.mlp_intermediate, h}});
+    t.push_back({m + "down_proj.weight", {h, c.mlp_intermediate}});
+  }
+  return t;
+}
+
+// The module's own file, named exactly as mlx-community/Qwen3.8-27B-MTP-4bit
+// names it: no `language_model.model` prefix and no layer index above zero.
+std::vector<NamedTensor> mtp_tensors(const model::Config& c) {
+  const std::int64_t h = c.hidden_size;
+  const std::int64_t qh = c.attn_q_heads, kvh = c.attn_kv_heads;
+  const std::int64_t ahd = c.attn_head_dim;
+  return {
+      {"fc.weight", {h, 2 * h}},
+      {"pre_fc_norm_hidden.weight", {h}},
+      {"pre_fc_norm_embedding.weight", {h}},
+      {"norm.weight", {h}},
+      {"layers.0.input_layernorm.weight", {h}},
+      {"layers.0.post_attention_layernorm.weight", {h}},
+      {"layers.0.self_attn.q_proj.weight", {2 * qh * ahd, h}},
+      {"layers.0.self_attn.k_proj.weight", {kvh * ahd, h}},
+      {"layers.0.self_attn.v_proj.weight", {kvh * ahd, h}},
+      {"layers.0.self_attn.o_proj.weight", {h, qh * ahd}},
+      {"layers.0.self_attn.q_norm.weight", {ahd}},
+      {"layers.0.self_attn.k_norm.weight", {ahd}},
+      {"layers.0.mlp.gate_proj.weight", {c.mlp_intermediate, h}},
+      {"layers.0.mlp.up_proj.weight", {c.mlp_intermediate, h}},
+      {"layers.0.mlp.down_proj.weight", {h, c.mlp_intermediate}},
+  };
+}
+
+std::string mtp_config_json(const model::Config& c) {
+  return std::string("{\"tie_word_embeddings\": true, \"text_config\": {") +
+         "\"vocab_size\": " + std::to_string(c.vocab_size) +
+         ", \"hidden_size\": " + std::to_string(c.hidden_size) +
+         ", \"num_hidden_layers\": " + std::to_string(c.num_layers) +
+         ", \"rms_norm_eps\": 1e-06" +
+         ", \"full_attention_interval\": " +
+         std::to_string(c.full_attention_interval) +
+         ", \"num_attention_heads\": " + std::to_string(c.attn_q_heads) +
+         ", \"num_key_value_heads\": " + std::to_string(c.attn_kv_heads) +
+         ", \"head_dim\": " + std::to_string(c.attn_head_dim) +
+         ", \"linear_num_key_heads\": " + std::to_string(c.gdn_qk_heads) +
+         ", \"linear_num_value_heads\": " + std::to_string(c.gdn_v_heads) +
+         ", \"linear_conv_kernel_dim\": " +
+         std::to_string(c.gdn_conv_kernel) +
+         ", \"linear_key_head_dim\": " + std::to_string(c.gdn_head_dim) +
+         ", \"linear_value_head_dim\": " + std::to_string(c.gdn_head_dim) +
+         ", \"intermediate_size\": " + std::to_string(c.mlp_intermediate) +
+         ", \"rope_parameters\": {\"rope_theta\": 10000000.0,"
+         " \"partial_rotary_factor\": 0.25}" +
+         ", \"max_position_embeddings\": 128, \"dtype\": \"float32\"" +
+         ", \"mtp_num_hidden_layers\": 1" +
+         ", \"mtp_use_dedicated_embeddings\": false}}";
+}
+
+struct MtpFixture {
+  model::Config config;
+  model::SafeTensors weights;
+  std::unique_ptr<model::HybridLM> lm;
+  std::unique_ptr<model::MtpModule> mtp;
+  std::string module_dir;
+  bool ok = false;
+};
+
+// `passthrough` writes a module that drafts the decoder's own next token
+// rather than the one after it: fc keeps the hidden half and drops the
+// embedding half, and the layer's projections are zero so the block is exactly
+// its residual. On a sequence that has reached a fixed point those two are the
+// same token, which is how the accept path gets exercised without trained
+// weights.
+MtpFixture build_mtp_fixture(bool passthrough = false,
+                             std::int32_t gdn_head_dim = 16) {
+  MtpFixture fx;
+  fx.config = mtp_test_config(gdn_head_dim);
+  const std::int64_t h = fx.config.hidden_size;
+  std::error_code ec;
+  const std::filesystem::path base =
+      std::filesystem::temp_directory_path() /
+      (passthrough ? "lse-mtp-fixture-pt"
+                   : "lse-mtp-fixture-" + std::to_string(gdn_head_dim));
+  std::filesystem::create_directories(base / "mtp", ec);
+  fx.module_dir = (base / "mtp").string();
+
+  // An untrained head puts the top two logits within a few ULP of each other
+  // and the greedy choice then follows the last bit of an f32 sum, which two
+  // differently shaped kernels are not required to agree on. Spacing the tied
+  // embedding's rows makes most of the fixture's greedy steps a property of
+  // the model rather than of the rounding.
+  const auto parent = [&](const std::string& name, std::size_t i) {
+    const std::size_t width = static_cast<std::size_t>(h);
+    float v = filler(i);
+    if (name == "language_model.model.embed_tokens.weight" &&
+        i % width == (i / width) % width) {
+      v += 2.0f;
+    }
+    return v;
+  };
+  const auto module = [&](const std::string& name, std::size_t i) {
+    if (!passthrough) return filler(i);
+    if (name == "fc.weight") {
+      const std::size_t width = 2 * static_cast<std::size_t>(h);
+      const std::size_t row = i / width;
+      const std::size_t col = i % width;
+      return col == static_cast<std::size_t>(h) + row ? 1.0f : 0.0f;
+    }
+    if (name.find(".weight") != std::string::npos &&
+        name.find("norm") != std::string::npos) {
+      return 1.0f;
+    }
+    return 0.0f;
+  };
+
+  write_shaped(base / "model.safetensors", qwen_dense_tensors(fx.config),
+               parent);
+  write_shaped(base / "mtp" / "model.safetensors", mtp_tensors(fx.config),
+               module);
+  {
+    std::ofstream out(base / "mtp" / "config.json");
+    out << mtp_config_json(fx.config);
+  }
+
+  auto st = model::SafeTensors::open((base / "model.safetensors").string());
+  if (!st.ok()) return fx;
+  fx.weights = st.release();
+  auto built = model::build_model(fx.config, fx.weights);
+  if (!built.ok()) return fx;
+  fx.lm = built.release();
+  model::WeightBinder binder(fx.weights);
+  if (!fx.lm->load(binder).ok()) return fx;
+
+  auto mod = model::MtpModule::open(fx.module_dir, fx.config, *fx.lm);
+  if (!mod.ok()) {
+    std::printf("       MTP open failed: %s\n", mod.status().to_string().c_str());
+    return fx;
+  }
+  fx.mtp = mod.release();
+  fx.ok = true;
+  return fx;
+}
+
+std::vector<float> array_to_host(const graph::Array& a) {
+  std::vector<float> v;
+  if (!a.valid()) return v;
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return v;
+  // The pass left it on the device and nothing asked for it on the host, so
+  // the mirror is stale until this moves it.
+  if (!graph::interpreter::sync_from_device(*a.node(), sched->backend()).ok()) {
+    return v;
+  }
+  v.resize(a.shape().elem_count());
+  if (!graph::interpreter::read_raw(*a.node(), v.data(),
+                                    v.size() * sizeof(float))
+           .ok()) {
+    v.clear();
+  }
+  return v;
+}
+
+// Every buffer a pass can leave behind: each Gated DeltaNet layer's recurrent
+// state and conv tail, and each attention layer's paged key/value pools.
+std::vector<std::vector<float>> states_image(
+    std::vector<model::MixerState>& states) {
+  std::vector<std::vector<float>> out;
+  for (model::MixerState& st : states) {
+    out.push_back(array_to_host(st.gdn_state));
+    out.push_back(array_to_host(st.gdn_conv_qkv));
+    out.push_back(array_to_host(st.key_cache));
+    out.push_back(array_to_host(st.value_cache));
+  }
+  return out;
+}
+
+std::size_t images_differ(const std::vector<std::vector<float>>& a,
+                          const std::vector<std::vector<float>>& b) {
+  if (a.size() != b.size()) return a.size() + b.size();
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i].size() != b[i].size()) {
+      ++n;
+      continue;
+    }
+    for (std::size_t j = 0; j < a[i].size(); ++j) {
+      if (a[i][j] != b[i][j]) {
+        ++n;
+        break;
+      }
+    }
+  }
+  return n;
+}
+
+graph::Array ids_array(const std::vector<std::uint32_t>& ids) {
+  graph::Array a = graph::Array::zeros(
+      Shape{1, static_cast<std::int64_t>(ids.size())}, DType::kF32);
+  if (!a.eval().ok()) return {};
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    graph::interpreter::store_element(*a.node(), i, static_cast<float>(ids[i]));
+  }
+  return a;
+}
+
+}  // namespace
+
+LSE_TEST(the_mtp_module_loads_beside_a_checkpoint_and_is_not_one_itself) {
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  LSE_EXPECT_EQ(fx.mtp->position(), 0);
+  LSE_EXPECT_EQ(fx.mtp->config().num_layers, 1);
+  // ...and its one layer attends, which is what its self_attn tensors describe.
+  // A layer index that answered otherwise would build a Gated DeltaNet against
+  // them and fail on a tensor name rather than on the shape that is wrong.
+  LSE_EXPECT(fx.mtp->config().is_attention_layer(0));
+
+  // The registry is right to refuse the module standalone, and that refusal is
+  // why it needs its own load path rather than an architecture entry.
+  auto st = model::SafeTensors::open(fx.module_dir + "/model.safetensors");
+  LSE_EXPECT(st.ok());
+  if (!st.ok()) return;
+  auto arch = model::detect_architecture(fx.config, *st);
+  LSE_EXPECT(!arch.ok());
+}
+
+LSE_TEST(a_rejected_draft_leaves_the_caches_where_a_clean_pass_would) {
+  // The paged KV rolls back by cursor — the redo overwrites the same slots —
+  // but the Gated DeltaNet state does not: it is a value the pass replaces.
+  // What makes that safe is that a `replaces_previous` pass starts from the
+  // same carried input the discarded one did, so the two arms below must agree
+  // bit for bit. Both end on the same two-row pass, so nothing here depends on
+  // how a two-row kernel rounds against a one-row one.
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  const std::vector<std::uint32_t> prompt{2, 11, 33};
+  const auto at = static_cast<std::int32_t>(prompt.size());
+
+  const auto run = [&](bool reject_first, std::vector<float>* hidden,
+                       std::vector<std::vector<float>>* image) {
+    std::vector<model::MixerState> st = fx.lm->make_states();
+    auto pre = fx.lm->hidden(ids_array(prompt), &st, nullptr);
+    if (!pre.ok()) return false;
+    if (reject_first) {
+      // The rejected pass: a second token the decoder did not choose.
+      auto bad = fx.lm->hidden(ids_array({19, 7}), &st, nullptr);
+      if (!bad.ok()) return false;
+      fx.lm->rewind(st, at);
+    }
+    auto got = fx.lm->hidden(ids_array({19, 18}), &st, nullptr, nullptr, nullptr,
+                             reject_first);
+    if (!got.ok()) return false;
+    *hidden = array_to_host(*got);
+    *image = states_image(st);
+    return true;
+  };
+
+  std::vector<float> clean_hidden, redo_hidden;
+  std::vector<std::vector<float>> clean_image, redo_image;
+  LSE_EXPECT(run(false, &clean_hidden, &clean_image));
+  LSE_EXPECT(run(true, &redo_hidden, &redo_image));
+  if (clean_hidden.empty() || redo_hidden.empty()) return;
+
+  LSE_EXPECT_EQ(redo_hidden.size(), clean_hidden.size());
+  std::size_t hidden_diff = 0;
+  for (std::size_t i = 0; i < clean_hidden.size() && i < redo_hidden.size(); ++i) {
+    if (clean_hidden[i] != redo_hidden[i]) ++hidden_diff;
+  }
+  LSE_EXPECT_EQ(hidden_diff, 0u);
+  LSE_EXPECT_EQ(images_differ(clean_image, redo_image), 0u);
+}
+
+LSE_TEST(a_rebuild_cannot_pretend_to_replace_the_pass_before_it) {
+  // The rollback is a replay of a held program. A rebuild would record the
+  // graph from the state the discarded pass produced, which is the one thing
+  // it must not start from, so it is refused rather than silently continued.
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  std::vector<model::MixerState> st = fx.lm->make_states();
+  auto pre = fx.lm->hidden(ids_array({2, 11, 33}), &st, nullptr);
+  LSE_EXPECT(pre.ok());
+  if (!pre.ok()) return;
+  // A width the cache has never held, so no program can be replayed for it.
+  auto refused = fx.lm->hidden(ids_array({19, 18}), &st, nullptr, nullptr,
+                               nullptr, /*replaces_previous=*/true);
+  LSE_EXPECT(!refused.ok());
+}
+
+LSE_TEST(a_pass_that_ran_on_the_host_cannot_be_replaced) {
+  // The rollback rests on the decoder's carried state still being where the
+  // discarded pass found it, and that is a property of the device path: a
+  // group the host ran leaves it somewhere else. A head dim the Gated DeltaNet
+  // kernel does not emit at is the cheapest way to produce one, and the point
+  // is that the answer is a refusal rather than a continuation from the state
+  // the pass was meant to discard.
+  MtpFixture fx = build_mtp_fixture(/*passthrough=*/false, /*gdn_head_dim=*/8);
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  std::vector<model::MixerState> st = fx.lm->make_states();
+  LSE_EXPECT(fx.lm->hidden(ids_array({2, 11, 33}), &st, nullptr).ok());
+  LSE_EXPECT(fx.lm->hidden(ids_array({19, 18}), &st, nullptr).ok());
+  fx.lm->rewind(st, 3);
+  auto refused = fx.lm->hidden(ids_array({19, 18}), &st, nullptr, nullptr,
+                               nullptr, /*replaces_previous=*/true);
+  LSE_EXPECT(!refused.ok());
+  if (refused.ok()) return;
+  LSE_EXPECT(refused.status().message().find("host") != std::string::npos);
+}
+
+LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
+  // The exhaustive form of this is a diff of a full continuation on a trained
+  // checkpoint. What a synthetic fixture can say is narrower, because its
+  // untrained logits decide some greedy steps by the last bit of an f32 sum
+  // and the one-row and two-row kernels round differently there. So each
+  // prompt is first asked whether the plain path itself is stable — the same
+  // prompt prefilled in one piece and in two — and only a prompt the decoder
+  // answers the same way twice is one whose tokens the speculative path is
+  // required to reproduce.
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+
+  GenerationLimits limits;
+  // Odd, so the last speculative step lands on its second half and the session
+  // ends holding exactly the text it emitted.
+  limits.max_tokens = 7;
+  GenerationLimits prefill_only;
+  prefill_only.max_tokens = 0;
+
+  const std::vector<std::vector<std::uint32_t>> prompts{
+      {2, 11, 33},    {1, 5, 9, 17},  {7, 7, 7},        {40, 3},
+      {60, 1, 2, 3, 4}, {12, 44, 5, 6}, {33, 2, 19}, {8, 8, 9, 10, 11}};
+
+  std::size_t compared = 0;
+  std::uint32_t rejections = 0;
+  for (const std::vector<std::uint32_t>& prompt : prompts) {
+    Generator plain(*fx.lm, greedy_params());
+    Session ps("plain", fx.lm->num_layers());
+    auto want = plain.generate(ps, prompt, limits);
+    LSE_EXPECT(want.ok());
+    if (!want.ok()) return;
+
+    Generator split(*fx.lm, greedy_params());
+    Session ss("split", fx.lm->num_layers());
+    const std::vector<std::uint32_t> head(prompt.begin(), prompt.end() - 1);
+    LSE_EXPECT(split.generate(ss, head, prefill_only).ok());
+    auto again = split.generate(ss, prompt, limits);
+    LSE_EXPECT(again.ok());
+    if (!again.ok()) return;
+    if (*again != *want) continue;  // the fixture, not the speculation
+
+    Generator spec(*fx.lm, greedy_params());
+    spec.use_mtp(*fx.mtp);
+    Session sp("spec", fx.lm->num_layers());
+    auto got = spec.generate(sp, prompt, limits);
+    LSE_EXPECT(got.ok());
+    if (!got.ok()) return;
+    LSE_EXPECT(spec.stats().spec_steps > 0);
+    rejections += spec.stats().spec_steps - spec.stats().spec_accepted;
+    ++compared;
+    LSE_EXPECT(*got == *want);
+    if (*got != *want) {
+      std::printf("       [%s] plain %s  spec %s\n",
+                  ids_to_string(prompt).c_str(), ids_to_string(*want).c_str(),
+                  ids_to_string(*got).c_str());
+    }
+  }
+  LSE_EXPECT(compared >= prompts.size() - 1);
+  // A run in which nothing was ever rejected would not have exercised the redo.
+  LSE_EXPECT(rejections > 0);
+}
+
+LSE_TEST(an_accepted_draft_still_gives_the_decoders_own_tokens) {
+  // The other half of the loop: a proposal the decoder agrees with is taken
+  // without a second pass, and the token that rides along with it is the one
+  // the decoder's own second row produced.
+  MtpFixture fx = build_mtp_fixture(/*passthrough=*/true);
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+
+  GenerationLimits limits;
+  limits.max_tokens = 7;
+  const std::vector<std::uint32_t> prompt{2, 11, 33};
+
+  Generator plain(*fx.lm, greedy_params());
+  Session ps("plain", fx.lm->num_layers());
+  auto want = plain.generate(ps, prompt, limits);
+  LSE_EXPECT(want.ok());
+  if (!want.ok()) return;
+
+  Generator spec(*fx.lm, greedy_params());
+  spec.use_mtp(*fx.mtp);
+  Session sp("spec", fx.lm->num_layers());
+  auto got = spec.generate(sp, prompt, limits);
+  LSE_EXPECT(got.ok());
+  if (!got.ok()) return;
+
+  LSE_EXPECT(spec.stats().spec_accepted > 0);
+  LSE_EXPECT(*got == *want);
+  if (*got != *want) {
+    std::printf("       accepted %u/%u  plain %s  spec %s\n",
+                spec.stats().spec_accepted, spec.stats().spec_steps,
+                ids_to_string(*want).c_str(), ids_to_string(*got).c_str());
+  }
+}

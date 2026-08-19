@@ -165,4 +165,14 @@ void Program::fold_carries() noexcept {
   }
 }
 
+void Program::hold_carries() noexcept {
+  for (Carry& c : carries_) {
+    if (!c.in || !c.out) continue;
+    c.in->materialized = true;
+    c.in->device_dirty = true;
+    c.in->host_dirty = false;
+    c.out->materialized = false;
+  }
+}
+
 }  // namespace lse::graph

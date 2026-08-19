@@ -19,6 +19,7 @@
 #include "lse/graph/jit.hpp"
 #include "lse/ir/pass/pass.hpp"
 #include "lse/model/config.hpp"
+#include "lse/model/mtp.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/place/devices.hpp"
@@ -40,6 +41,9 @@ struct Options {
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   // Empty means detect from the checkpoint.
   std::string arch;
+  // Multi-token-prediction module. Empty looks for one beside the model, which
+  // is where a release that has one puts it.
+  std::string mtp;
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
   // Which source dialect this run would rather its kernels were written in.
@@ -80,6 +84,9 @@ void usage() {
       "      --tokenizer REPO   HF repo for tokenizer.json, used only when the\n"
       "                         model directory has none (default Qwen/Qwen3.6-27B)\n"
       "      --arch NAME        force a model kernel instead of detecting one\n"
+      "      --mtp PATH         multi-token-prediction module: a directory, a\n"
+      "                         .safetensors or an HF repo id. Default: the one\n"
+      "                         beside the model, when the checkpoint has one\n"
       "      --list-models      print the registered model kernels and exit\n"
       "      --list-cache       list the models in the HF cache and whether\n"
       "                         this build can load each one, and exit\n"
@@ -171,6 +178,8 @@ bool parse(int argc, char** argv, Options* opt) {
     } else if (a == "--repeat-penalty") {
       if (!take_value(argc, argv, i, "--repeat-penalty", &v)) return false;
       opt->sampling.repetition_penalty = std::strtof(v.c_str(), nullptr);
+    } else if (a == "--mtp") {
+      if (!take_value(argc, argv, i, "--mtp", &opt->mtp)) return false;
     } else if (a == "--arch") {
       if (!take_value(argc, argv, i, "--arch", &opt->arch)) return false;
     } else if (a == "--list-models") {
@@ -646,7 +655,26 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // The module is used when there is one, and there is one when the checkpoint
+  // says so and the files are where --mtp or the model's own directory put
+  // them. Nothing turns it on or off: what it changes is how many decoder
+  // passes the same text costs.
+  std::unique_ptr<model::MtpModule> mtp;
+  if (opt.mtp.empty() && cfg->mtp_layers > 0) {
+    opt.mtp = model::MtpModule::find_beside(opt.model);
+  }
+  if (!opt.mtp.empty()) {
+    auto opened = model::MtpModule::open(opt.mtp, *cfg, *lm);
+    if (!opened.ok()) return fail(opened.status(), "loading the MTP module");
+    mtp = opened.release();
+    std::fprintf(stderr, "mtp: %s\n", mtp->path().c_str());
+  } else if (cfg->mtp_layers > 0) {
+    std::fputs("lse: this checkpoint declares an MTP module but none was found "
+               "beside it; pass --mtp to name one\n", stderr);
+  }
+
   runtime::Generator gen(*lm, opt.sampling);
+  if (mtp != nullptr) gen.use_mtp(*mtp);
   auto stream = tok->stream();
 
   // Streamed through DecodeStream so a multi-byte character is never cut in
@@ -669,6 +697,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "prompt %d tokens, prefill %.2f s | generated %d tokens, "
                  "%.2f tok/s\n"
+                 "spec steps %u accepted %u (%.1f%%) | %u verify pass(es) "
+                 "%.1f ms each | draft %.1f ms each\n"
                  "launches %u | phases %u (ideal %u launch%s) | groups "
                  "device=%u host=%u views=%u fallbacks=%u\n"
                  "streams %u of %u | cross-stream waits %u | chain %u of %u "
@@ -677,6 +707,16 @@ int main(int argc, char** argv) {
                  "jit mem=%llu disk=%llu compile=%llu (%.3f s)\n",
                  s.prompt_tokens, static_cast<double>(s.prefill_ns) / 1e9,
                  s.generated_tokens, s.decode_tokens_per_second(),
+                 s.spec_steps, s.spec_accepted, s.acceptance_rate() * 100.0,
+                 s.spec_verify_passes,
+                 s.spec_verify_passes == 0
+                     ? 0.0
+                     : static_cast<double>(s.spec_verify_ns) / 1e6 /
+                           static_cast<double>(s.spec_verify_passes),
+                 s.spec_steps == 0
+                     ? 0.0
+                     : static_cast<double>(s.spec_draft_ns) / 1e6 /
+                           static_cast<double>(s.spec_steps),
                  s.kernels_launched, s.phase_groups, s.phase_ideal_launches,
                  s.phase_ideal_launches == 1 ? "" : "es",
                  s.device_groups, s.host_groups, s.views_aliased,

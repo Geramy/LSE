@@ -159,6 +159,11 @@ Status poke_values(Array& slot, std::span<const float> values) {
   return graph::interpreter::sync_to_device(dst, sched->backend());
 }
 
+std::uint32_t host_groups_so_far() {
+  graph::Scheduler* sched = graph::default_scheduler();
+  return sched == nullptr ? 0u : sched->accumulated_trace().host_groups;
+}
+
 Status poke_tokens(Array& slot, const Array& incoming) {
   if (!slot.valid() || !incoming.valid()) {
     return LSE_ERROR(kInvalidArgument, "token poke on empty Array");
@@ -190,9 +195,17 @@ Status poke_tokens(Array& slot, const Array& incoming) {
 
 }  // namespace
 
+void HybridLM::rewind(std::vector<MixerState>& states,
+                      std::int32_t position) const {
+  for (MixerState& s : states) {
+    if (s.key_cache.valid()) s.position = position;
+  }
+}
+
 Result<Array> HybridLM::hidden(const Array& tokens,
                                std::vector<MixerState>* states, Array* aux_loss,
-                               std::vector<Array>* trace, const StepRows* rows) {
+                               std::vector<Array>* trace, const StepRows* rows,
+                               bool replaces_previous) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -359,15 +372,29 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
       cache_.states == states && !cache_.program.empty() &&
       !cache_.program.groups().empty() && kv_leaves_match();
+  if (replaces_previous && last_pass_host_groups_ != 0) {
+    return LSE_ERROR(kUnimplemented, "the pass being replaced put ",
+                     std::to_string(last_pass_host_groups_),
+                     " group(s) on the host, and a host group does not leave "
+                     "the carried state where a replacement pass has to find "
+                     "it");
+  }
+
+  const std::uint32_t host_before = host_groups_so_far();
   if (can_reuse) {
     cache_.program.reset_compute();
-    cache_.program.fold_carries();
+    if (replaces_previous) {
+      cache_.program.hold_carries();
+    } else {
+      cache_.program.fold_carries();
+    }
     LSE_RETURN_IF_ERROR(poke_tokens(cache_.tokens, tokens));
     LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
     if (graph::Scheduler* sched = graph::default_scheduler()) {
       LSE_RETURN_IF_ERROR(
           sched->eval(cache_.program.roots(), false, &cache_.program));
     }
+    last_pass_host_groups_ = host_groups_so_far() - host_before;
     if (states != nullptr) {
       for (MixerState& s : *states) {
         if (s.key_cache.valid()) {
@@ -376,6 +403,17 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       }
     }
     return cache_.hidden;
+  }
+
+  if (replaces_previous) {
+    // A rebuild records the graph from whatever the state Arrays hold now,
+    // which after the pass being replaced is the state that pass produced.
+    // There is nothing to roll back to, so this is an error rather than a
+    // silently wrong continuation.
+    return LSE_ERROR(kInternal,
+                     "a pass that replaces the previous one cannot rebuild the "
+                     "graph; the state it would start from is the one it is "
+                     "meant to discard");
   }
 
   if (meta_moved) {
@@ -455,6 +493,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   if (graph::Scheduler* sched = graph::default_scheduler()) {
     LSE_RETURN_IF_ERROR(sched->eval(roots, false, &cache_.program));
   }
+  last_pass_host_groups_ = host_groups_so_far() - host_before;
 
   cache_.tokens = tokens;
   cache_.hidden = y;

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/program.hpp"
 #include "lse/model/hybrid_lm.hpp"
+#include "lse/model/mtp.hpp"
 #include "lse/runtime/sampler.hpp"
 #include "lse/runtime/session.hpp"
 
@@ -68,6 +70,23 @@ struct GenerationStats {
   std::uint64_t jit_disk_hits = 0;
   std::uint64_t jit_compiles = 0;
   std::uint64_t jit_compile_ns = 0;
+  // Speculation. A step is one draft plus the decoder pass that verifies it;
+  // it is accepted when the decoder's own token at the drafted position is the
+  // drafted one. A rejected step costs a second decoder pass, so the rate is
+  // what decides whether the whole thing pays.
+  std::uint32_t spec_steps = 0;
+  std::uint32_t spec_accepted = 0;
+  // Where a speculative step's time goes: the decoder passes that verify a
+  // proposal (two of them when it is rejected) against the module pass that
+  // made it. The second is what speculation costs whether or not it pays.
+  std::uint64_t spec_verify_ns = 0;
+  std::uint64_t spec_draft_ns = 0;
+  std::uint32_t spec_verify_passes = 0;
+
+  [[nodiscard]] double acceptance_rate() const noexcept {
+    if (spec_steps == 0) return 0.0;
+    return static_cast<double>(spec_accepted) / static_cast<double>(spec_steps);
+  }
 
   [[nodiscard]] double decode_tokens_per_second() const noexcept {
     if (decode_ns == 0 || generated_tokens == 0) return 0.0;
@@ -106,6 +125,13 @@ class Generator {
     return host_reasons_;
   }
   [[nodiscard]] Sampler& sampler() noexcept { return sampler_; }
+
+  // Decode two tokens per decoder pass by having `mtp` propose the second one.
+  // The proposal is verified by the decoder in the same pass, so the text is
+  // whatever the decoder alone would have produced; only the number of passes
+  // it took changes. The module's cache and the session's must be reset
+  // together, which generate() does.
+  void use_mtp(model::MtpModule& mtp) noexcept { mtp_ = &mtp; }
 
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
   static Result<graph::Array> last_hidden(const graph::Array& hidden);
@@ -148,6 +174,50 @@ class Generator {
   // Persistent [1,1] token slot for decode; poked on the host and uploaded by
   // whichever program consumes it, never re-allocated per token.
   graph::Array decode_ids_;
+
+  // The two-row verify pass and its head. Same shape every step, so it is
+  // retained and replayed exactly as the one-row decode head is.
+  struct SpecHead {
+    graph::Program program;
+    graph::Array hidden;
+    graph::Array logits;
+    graph::Array pick;
+    std::vector<graph::NodePtr> compute;
+    bool greedy = false;
+  };
+  SpecHead spec_;
+  graph::Array spec_ids_;
+  // Host copies the module reads: the pass's two hidden rows, and its logits
+  // when the sampler needs more than an argmax.
+  std::vector<float> spec_hidden_;
+  std::vector<float> spec_logits_;
+  // The decoder's hidden state for the last prompt position, which is the
+  // module's input for the first proposal of the generation.
+  std::vector<float> prefill_tail_;
+
+  model::MtpModule* mtp_ = nullptr;
+
+  // What one verify pass answered: the decoder's own tokens at the two
+  // positions it covered. `second` is only the true continuation when the
+  // proposal at the first position was accepted or the pass was a redo.
+  struct Verified {
+    std::uint32_t first = 0;
+    std::uint32_t second = 0;
+  };
+  // Runs [a, b] at the session's current position. `replaces_previous` says
+  // this pass stands in for the one that just ran rather than following it,
+  // which is how a rejected proposal is undone: the decoder's carried state is
+  // still the one that pass started from.
+  Result<Verified> verify(Session& session, std::uint32_t a, std::uint32_t b,
+                          bool replaces_previous);
+  static Status read_hidden(const graph::Array& hidden,
+                            std::vector<float>* out);
+  Status mtp_prefill_chunk(const graph::Array& hidden,
+                           std::span<const std::uint32_t> tokens,
+                           std::int32_t first, std::vector<float>* carry);
+  Result<std::vector<std::uint32_t>> speculate(
+      Session& session, std::vector<float>& prefill_logits,
+      const GenerationLimits& limits, const TokenCallback& on_token);
 };
 
 }  // namespace lse::runtime
