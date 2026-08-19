@@ -474,23 +474,49 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       if (t.valid() && t.node()) roots.push_back(t.node());
     }
   }
+  // The state nodes that become a carry `out` below. Program::fold_carries
+  // hands that buffer to the carry `in` node, where it has to survive a whole
+  // replayed pass — but `in` is foreign to the retained slot plan, which never
+  // promised the bytes to anyone for that long. So a carry endpoint has to own
+  // its buffer outright. Workgroup::plan_slots recycles dead activation slots
+  // by exact byte size, and a GDN state is batch*v_heads*head_dim^2 f32
+  // whatever the pass width is — 1 MiB on the shipped models, which is exactly
+  // what a (1, 128, 2048) f32 block activation costs at a prefill width of
+  // 128. Without this the planner hands the state a slot six live activations
+  // also hold, and the next pass reads its recurrence out of bytes it
+  // overwrites before the scan runs.
+  std::vector<graph::NodePtr> carried;
   if (states != nullptr) {
-    auto add = [&](const Array& a) {
-      if (a.valid() && a.node() && !a.node()->materialized) {
-        roots.push_back(a.node());
-      }
+    auto add = [&](const Array& a, bool is_carry) {
+      if (!a.valid() || !a.node()) return;
+      if (!a.node()->materialized) roots.push_back(a.node());
+      if (is_carry) carried.push_back(a.node());
     };
     for (MixerState& st : *states) {
-      add(st.gdn_state);
-      add(st.gdn_conv_q);
-      add(st.gdn_conv_k);
-      add(st.gdn_conv_v);
-      add(st.gdn_conv_qkv);
-      add(st.key_cache);
-      add(st.value_cache);
+      add(st.gdn_state, true);
+      add(st.gdn_conv_q, true);
+      add(st.gdn_conv_k, true);
+      add(st.gdn_conv_v, true);
+      add(st.gdn_conv_qkv, true);
+      // The same condition the carry list below uses: a paged pool is written
+      // in place and is never carried.
+      const bool grows = !st.paged.valid();
+      add(st.key_cache, grows);
+      add(st.value_cache, grows);
     }
   }
   if (graph::Scheduler* sched = graph::default_scheduler()) {
+    // Before eval, because plan_slots leaves any node that already owns a
+    // buffer out of its free list. The skips mirror the planner's own: a
+    // reshape, a leaf and an in-place primitive all take their bytes from
+    // somewhere else by design.
+    for (const graph::NodePtr& n : carried) {
+      if (n->buffer.valid() || n->kind == graph::OpKind::kReshape) continue;
+      if (n->fclass == graph::FusionClass::kLeaf) continue;
+      if (n->prim != nullptr && n->prim->inplace_input() >= 0) continue;
+      LSE_RETURN_IF_ERROR(
+          graph::interpreter::ensure_output_buffer(*n, sched->backend()));
+    }
     LSE_RETURN_IF_ERROR(sched->eval(roots, false, &cache_.program));
   }
   last_pass_host_groups_ = host_groups_so_far() - host_before;

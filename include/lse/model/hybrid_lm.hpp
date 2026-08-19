@@ -161,6 +161,13 @@ class HybridLM {
     return std::vector<MixerState>(blocks_.size());
   }
 
+  // The program the last hidden() built or replayed. Exposed so a test can
+  // assert the carry-ownership invariant: a state the next pass reads must not
+  // share bytes with anything this pass writes.
+  [[nodiscard]] const graph::Program& retained_program() const noexcept {
+    return cache_.program;
+  }
+
   [[nodiscard]] const Config& config() const noexcept { return config_; }
   [[nodiscard]] std::size_t num_layers() const noexcept { return blocks_.size(); }
   [[nodiscard]] HybridBlock& block(std::size_t i) noexcept { return *blocks_[i]; }

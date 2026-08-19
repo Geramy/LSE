@@ -2,6 +2,7 @@
 // cases run everywhere.
 #include "lse/model/config.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1764,6 +1765,130 @@ LSE_TEST(a_paged_session_reserves_a_rung_not_the_capacity) {
     ++measured;
   }
   std::printf("       measured %zu checkpoint(s)\n", measured);
+}
+
+namespace {
+
+// Token ids for one prefill pass, staged on the device the way the generator
+// stages them.
+bool stage_tokens(std::int64_t width, std::int64_t first, std::int64_t vocab,
+                  graph::Array& out) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return false;
+  out = graph::Array::zeros(Shape{1, width}, DType::kF32);
+  graph::Node& n = *out.node();
+  if (!graph::interpreter::ensure_output_buffer(n, sched->backend()).ok()) {
+    return false;
+  }
+  for (std::int64_t i = 0; i < width; ++i) {
+    graph::interpreter::store_element(
+        n, static_cast<std::size_t>(i),
+        static_cast<float>((first * 7 + i * 13) % (vocab - 2) + 1));
+  }
+  n.materialized = true;
+  return graph::interpreter::sync_to_device(n, sched->backend()).ok();
+}
+
+bool buffers_overlap(const graph::Node& a, const graph::Node& b) {
+  if (!a.buffer.valid() || !b.buffer.valid()) return false;
+  if (a.buffer.handle != b.buffer.handle || a.buffer.ptr != b.buffer.ptr) {
+    return false;
+  }
+  const std::size_t as = a.buffer.offset, ae = as + a.buffer.size_bytes;
+  const std::size_t bs = b.buffer.offset, be = bs + b.buffer.size_bytes;
+  return as < be && bs < ae;
+}
+
+// Nodes this pass writes that share bytes with one of its carry endpoints.
+std::size_t carry_aliases(const graph::Program& p) {
+  std::size_t bad = 0;
+  for (const graph::Program::Carry& c : p.carries()) {
+    if (!c.in || !c.out) continue;
+    for (const graph::FusionGroup& g : p.groups()) {
+      for (const graph::NodePtr& n : g.nodes) {
+        if (!n || n.get() == c.in.get() || n.get() == c.out.get()) continue;
+        if (buffers_overlap(*n, *c.out) || buffers_overlap(*n, *c.in)) ++bad;
+      }
+    }
+  }
+  return bad;
+}
+
+}  // namespace
+
+// The same prompt, same chunking, run once with the retained program replayed
+// and once with every pass rebuilt. Passing a trace turns the reuse term in
+// HybridLM::hidden off without touching the arithmetic, so the rebuild run is
+// an oracle for the replay. Nothing compared the two paths before, which is
+// how a carried state that shared bytes with its own pass shipped: it needs
+// two consecutive same-width passes to show, i.e. a prompt past ~280 tokens.
+LSE_TEST(long_prefill_reuse_matches_a_forced_rebuild) {
+  if (graph::default_scheduler() == nullptr) return;
+  auto paths = resolve_model("mlx-community/Qwen3.5-0.8B-4bit");
+  if (!paths.ok()) return;
+  auto ckpt = paths->weights.ends_with(".index.json")
+                  ? SafeTensors::open_sharded(paths->weights)
+                  : SafeTensors::open(paths->weights);
+  auto cfg = Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) return;
+
+  // Chunks of the engine's prefill width. The first builds; once the paged
+  // pool stops growing into a bigger rung the rest replay it.
+  constexpr std::int64_t kWidth = 128;
+  constexpr int kPasses = 8;
+
+  auto run = [&](bool reuse, std::vector<float>& out, int& replays) {
+    auto lm = build_model(*cfg, *ckpt);
+    LSE_EXPECT_OK(lm.status());
+    if (!lm.ok()) return;
+    WeightBinder binder(*ckpt, &cfg->quantization);
+    LSE_EXPECT_OK((*lm)->load(binder));
+    std::vector<MixerState> states = (*lm)->make_states();
+    const graph::Node* previous = nullptr;
+    for (int p = 0; p < kPasses; ++p) {
+      graph::Array tokens;
+      LSE_EXPECT(stage_tokens(kWidth, p * kWidth, 1000, tokens));
+      std::vector<graph::Array> trace;
+      auto h = (*lm)->hidden(tokens, &states, nullptr,
+                             reuse ? nullptr : &trace);
+      LSE_EXPECT_OK(h.status());
+      if (!h.ok()) return;
+      // A replayed pass answers with the node the retained program holds; a
+      // rebuilt one answers with a fresh node. That is how this test knows it
+      // is exercising the path it claims to.
+      if (h->node().get() == previous) ++replays;
+      previous = h->node().get();
+      if (reuse) LSE_EXPECT_EQ(carry_aliases((*lm)->retained_program()), 0u);
+      if (p + 1 < kPasses) continue;
+      out.resize(static_cast<std::size_t>(h->shape().elem_count()));
+      LSE_EXPECT_OK(h->to_host(out.data(), out.size() * sizeof(float)));
+    }
+  };
+
+  std::vector<float> replayed, rebuilt;
+  int replays = 0, rebuilds = 0;
+  run(/*reuse=*/true, replayed, replays);
+  run(/*reuse=*/false, rebuilt, rebuilds);
+  std::printf("       %d of %d passes replayed the retained program\n",
+              replays, kPasses);
+  LSE_EXPECT(replays >= 2);
+  LSE_EXPECT_EQ(rebuilds, 0);
+  LSE_EXPECT(!replayed.empty());
+  LSE_EXPECT_EQ(replayed.size(), rebuilt.size());
+  if (replayed.size() != rebuilt.size() || replayed.empty()) return;
+
+  double worst = 0.0, scale = 0.0;
+  for (std::size_t i = 0; i < replayed.size(); ++i) {
+    worst = std::max(worst, (double)std::fabs(replayed[i] - rebuilt[i]));
+    scale = std::max(scale, (double)std::fabs(rebuilt[i]));
+  }
+  std::printf("       last-pass hidden: max |replay - rebuild| = %g over a "
+              "range of %g\n", worst, scale);
+  // Measured at exactly 0 on gfx1151: the replay runs the same kernels on the
+  // same bytes. The tolerance is there only so a different reduction split on
+  // another device is not a failure — a carried state read out of clobbered
+  // bytes moves this by more than the whole range.
+  LSE_EXPECT(worst <= 1e-5 * std::max(1.0, scale));
 }
 
 LSE_TEST_MAIN()
