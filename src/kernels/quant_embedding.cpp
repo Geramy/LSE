@@ -8,14 +8,17 @@
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 #include "lse/quant/group_affine_codec.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::workgroup_lds_bytes;
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -167,4 +170,4 @@ struct QuantEmbeddingKernel final : KernelPrimitive<QuantEmbeddingKernel> {
 
 LSE_REGISTER_PRIMITIVE(QuantEmbeddingKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

@@ -17,14 +17,22 @@
 #include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/core/dtype.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::MatrixCore;
+using backend::AmdDeviceInfo;
+using backend::DeviceInfo;
+using backend::arch_family;
+using backend::device_extension;
+using backend::ArchFamily;
 
 // The matrix-core form of `linear` for this invocation, or null when the
 // device, the shapes or the opt-in switch rule it out and the scalar loop
@@ -298,4 +306,4 @@ struct MatrixTile {
   }
 };
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

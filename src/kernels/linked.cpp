@@ -4,17 +4,20 @@
 // SwiGLU is the one that shows up every block: two linears from the same
 // x, silu(g)*u, then a down linear. Decode is one workgroup per row;
 // hidden lives in LDS so the down GEMV never hits global for it.
-#include "lse/backends/hrx/kernels/linked.hpp"
-#include "lse/backends/hrx/kernels/gdn.hpp"
+#include "lse/kernels/linked.hpp"
+#include "lse/kernels/gdn.hpp"
 
 #include <string>
 
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::workgroup_lds_bytes;
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -429,4 +432,4 @@ const KernelPrimitiveBase* linked_kernel_for(const FusionGroup& group,
   return nullptr;
 }
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

@@ -5,7 +5,7 @@
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 
@@ -82,4 +82,4 @@ struct ScatterAddKernel final : KernelPrimitive<ScatterAddKernel> {
 };
 LSE_REGISTER_PRIMITIVE(ScatterAddKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

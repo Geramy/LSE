@@ -11,13 +11,13 @@
 // cheaper than the host round trip it replaces.
 #include <string>
 
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -222,4 +222,4 @@ struct SoftmaxKernel final : KernelPrimitive<SoftmaxKernel> {
 };
 LSE_REGISTER_PRIMITIVE(SoftmaxKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

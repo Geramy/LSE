@@ -6,8 +6,8 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/math.hpp"
-#include "lse/backends/hrx/kernels/lds_linear.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/lds_linear.hpp"
+#include "lse/kernels/vec_mem.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -158,7 +158,7 @@ std::string gemv_stage(const std::string& x, const std::string& w,
                        const DeviceInfo& device,
                        const kir::TypeTable& types,
                        const DialectSourceTable& spellings) {
-  return hrx_kernels::with_elem(wdt, [&]<class W>() -> std::string {
+  return kernels::with_elem(wdt, [&]<class W>() -> std::string {
     kir::KernelBody body(types, spellings, workgroup_lds_bytes(&device));
     body.set_store([&](std::string_view index, std::string_view value) {
       return store_elem(out, std::string(index), odt, std::string(value));
@@ -175,8 +175,8 @@ std::string gemv_stage(const std::string& x, const std::string& w,
     if (device.wavefront_size == 32 || device.wavefront_size == 64) {
       wave = device.wavefront_size;
     }
-    hrx_kernels::emit_gemv<W>(body, xb, wb, idxp, keep, slot, N, K, M,
-                              hrx_kernels::device_load_bytes(&device), grid,
+    kernels::emit_gemv<W>(body, xb, wb, idxp, keep, slot, N, K, M,
+                              kernels::device_load_bytes(&device), grid,
                               wave, persist, persist_wgs);
     if (!body.lds().ok()) return {};
     return "    {\n" + body.str() + "\n    }\n";

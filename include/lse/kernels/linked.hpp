@@ -7,7 +7,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 // The generator walks a fusion group and, when the nodes are a linked
 // contraction pipeline (SwiGLU, exclusive RMS then linear), emits one
@@ -24,4 +24,4 @@ struct LinkedBinding {
 };
 LinkedBinding linked_bindings(const graph::FusionGroup& group);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

@@ -30,8 +30,8 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/backends/hrx/hipc/hip_sources.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
-#include "lse/backends/hrx/kernels/wmma.hpp"
+#include "lse/kernels/vec_mem.hpp"
+#include "lse/kernels/wmma.hpp"
 #include "lse/core/hash.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/graph/kernel_args.hpp"
@@ -41,6 +41,10 @@
 #include "lse/probe/probe_kernels.hpp"
 
 namespace lse::backend::hrx_kernels {
+
+// The kernel primitives themselves are engine-owned; these two stay here
+// because they name the HIP toolchain directly.
+using namespace lse::kernels;
 
 namespace {
 

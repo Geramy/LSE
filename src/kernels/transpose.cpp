@@ -5,7 +5,7 @@
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 
@@ -94,4 +94,4 @@ struct TransposeKernel final : KernelPrimitive<TransposeKernel> {
 
 LSE_REGISTER_PRIMITIVE(TransposeKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

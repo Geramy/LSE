@@ -28,7 +28,7 @@
 #include "lse/backends/hrx/hipc/hip_types.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
-#include "lse/backends/hrx/kernels/wmma.hpp"
+#include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -2642,7 +2642,7 @@ int small_int(std::uint32_t seed, std::uint32_t span) {
 // A tile over the int4 row. The only thing that differs from the int8 one the
 // linear kernel builds is the MatrixElem it names.
 struct Int4Tile
-    : backend::hrx_kernels::MatrixTile<Int4Tile, lmath::MatrixTarget::kRdna3,
+    : kernels::MatrixTile<Int4Tile, lmath::MatrixTarget::kRdna3,
                                        lmath::MatrixElem::kI32,
                                        lmath::MatrixElem::kI4, 16, 16, 16> {
   std::uint32_t cols = 0;
@@ -3397,8 +3397,8 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   d12.wavefront_size = 32;
   d12.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d12.extension = &amd12;
-  LSE_EXPECT(backend::hrx_kernels::matrix_target(d12).has_value());
-  LSE_EXPECT(*backend::hrx_kernels::matrix_target(d12) ==
+  LSE_EXPECT(kernels::matrix_target(d12).has_value());
+  LSE_EXPECT(*kernels::matrix_target(d12) ==
              MatrixTarget::kRdna4);
 
   backend::AmdDeviceInfo amd942;
@@ -3412,7 +3412,7 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   d942.wavefront_size = 64;
   d942.extension_id = backend::AmdDeviceInfo::kExtensionId;
   d942.extension = &amd942;
-  LSE_EXPECT(*backend::hrx_kernels::matrix_target(d942) ==
+  LSE_EXPECT(*kernels::matrix_target(d942) ==
              MatrixTarget::kCdna3);
 
   const Shape shapes[] = {Shape{32, 64}, Shape{48, 64}};
@@ -3430,7 +3430,7 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
     s.store = [](std::string_view i, std::string_view v) {
       return "out[" + std::string(i) + "] = " + std::string(v) + ";";
     };
-    LSE_EXPECT(backend::hrx_kernels::wmma_linear_for(s) == nullptr);
+    LSE_EXPECT(kernels::wmma_linear_for(s) == nullptr);
   }
 }
 
@@ -3469,7 +3469,7 @@ LSE_TEST(matrix_core_int8_linear_matches_a_host_integer_reference) {
     return "out[" + std::string(i) + "] = (float)(" + std::string(v) + ");";
   };
 
-  const KernelPrimitiveBase* prim = backend::hrx_kernels::wmma_linear_for(s);
+  const KernelPrimitiveBase* prim = kernels::wmma_linear_for(s);
   LSE_EXPECT(prim != nullptr);
   if (prim == nullptr) return;
   const std::string body = prim->emit_kernel(s);

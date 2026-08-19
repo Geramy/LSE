@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/kernels/linked.hpp"
+#include "lse/kernels/linked.hpp"
 #include "lse/backends/hrx/loomc/loom_print.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -331,9 +331,9 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     return s;
   };
 
-  if (hrx_kernels::linked_bindings(group).ok) {
+  if (kernels::linked_bindings(group).ok) {
     KernelShapes probe;
-    if (hrx_kernels::linked_kernel_for(group, probe) != nullptr) {
+    if (kernels::linked_kernel_for(group, probe) != nullptr) {
       return LSE_ERROR(kUnimplemented,
                        "the linked pipeline stages its activation in workgroup "
                        "scratch across a barrier and carries accumulators "

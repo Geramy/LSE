@@ -15,7 +15,10 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::workgroup_lds_bytes;
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -212,4 +215,4 @@ struct ArgMaxFinalKernel final : KernelPrimitive<ArgMaxFinalKernel> {
 };
 LSE_REGISTER_PRIMITIVE(ArgMaxFinalKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

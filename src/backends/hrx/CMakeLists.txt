@@ -18,33 +18,13 @@ add_library(lse_backend_hrx
   loomc/loom_print.cpp
   loomc/loom_emitter.cpp
   trace.cpp
-  kernels/matmul.cpp
-  kernels/reduction.cpp
-  kernels/slice.cpp
-  kernels/concat.cpp
-  kernels/transpose.cpp
-  kernels/gather.cpp
-  kernels/scatter.cpp
-  kernels/topk.cpp
-  kernels/argmax.cpp
-  kernels/linear_indexed.cpp
-  kernels/conv.cpp
-  kernels/rope.cpp
-  kernels/sdpa.cpp
-  kernels/kv_write.cpp
-  kernels/gdn.cpp
   hipc/hip_types.cpp
-  kernels/wmma_linear.cpp
-  kernels/lds_linear.cpp
-  kernels/quant_linear.cpp
-  kernels/quant_embedding.cpp
-  kernels/linked.cpp
   kernels/dist_codec.cpp
   kernels/probe.cpp
 )
 add_library(lse::backend_hrx ALIAS lse_backend_hrx)
 
-target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_dist lse_probe lse_trace)
+target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_kernels lse_dist lse_probe lse_trace)
 target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_HRX_INCLUDE_DIR})
 target_include_directories(lse_backend_hrx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

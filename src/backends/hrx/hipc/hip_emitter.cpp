@@ -13,8 +13,8 @@
 #include "lse/graph/ops.hpp"
 #include "lse/ir/lower.hpp"
 #include "lse/ir/pass/pass.hpp"
-#include "lse/backends/hrx/kernels/lds_linear.hpp"
-#include "lse/backends/hrx/kernels/linked.hpp"
+#include "lse/kernels/lds_linear.hpp"
+#include "lse/kernels/linked.hpp"
 
 namespace lse::backend {
 
@@ -51,9 +51,9 @@ struct RowPanel {
 
   // The int8 form of the row, hoisted beside it when every member would have
   // quantized it the same way. Empty names mean each member stages its own.
-  hrx_kernels::DotStagingPlan quant_plan;
+  kernels::DotStagingPlan quant_plan;
   bool hoist_blocked = false;
-  hrx_kernels::StagedQuantNames quant;
+  kernels::StagedQuantNames quant;
 };
 
 constexpr std::size_t kNoPanel = static_cast<std::size_t>(-1);
@@ -372,9 +372,9 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
   std::uint64_t h = group.signature();
   const KernelPrimitiveBase* self = nullptr;
-  if (hrx_kernels::linked_bindings(group).ok) {
+  if (kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
-    self = hrx_kernels::linked_kernel_for(group, dummy);
+    self = kernels::linked_kernel_for(group, dummy);
   }
   // A matched-but-declined linked pipeline must not erase the specialize
   // probe: emit() falls back to the specialized primitive, so the key must
@@ -584,8 +584,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
           shapes_for(stages[si].node, plan_storage, plan_dtypes);
       const bool indexed = stages[si].prim != nullptr &&
                            stages[si].prim->name() == "quant_linear_indexed";
-      const hrx_kernels::DotStagingPlan plan =
-          hrx_kernels::dot_staging_plan(ps, indexed);
+      const kernels::DotStagingPlan plan =
+          kernels::dot_staging_plan(ps, indexed);
       if (!plan.valid() || plan.count != panel.count) {
         panel.quant_plan = {};
         panel.hoist_blocked = true;
@@ -614,10 +614,10 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       {
         kir::KernelBody kb(type_table, spellings, lds_budget);
         const kir::Buffer<kir::f32> act(&kb, &kb.types(), act_buf);
-        panel.name = hrx_kernels::emit_staged_row(kb, act, panel.count,
+        panel.name = kernels::emit_staged_row(kb, act, panel.count,
                                                   panel.rows, run_block);
         if (!panel.name.empty() && panel.quant_plan.valid()) {
-          panel.quant = hrx_kernels::emit_staged_dot_acts(
+          panel.quant = kernels::emit_staged_dot_acts(
               kb, panel.name, panel.count, panel.quant_plan.group_size,
               panel.rows, run_block);
         }
@@ -787,7 +787,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     break;
   }
 
-  const auto linked = hrx_kernels::linked_bindings(group);
+  const auto linked = kernels::linked_bindings(group);
   // Active only when the linked pipeline supplies a kernel. A matched-but-
   // declined pipeline (linked_kernel_for -> nullptr) must not clobber the
   // specialize() choice above: that turned the decode lm_head GEMV back into
@@ -796,7 +796,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   if (linked.ok) {
     KernelShapes probe;
     if (const KernelPrimitiveBase* lk =
-            hrx_kernels::linked_kernel_for(group, probe)) {
+            kernels::linked_kernel_for(group, probe)) {
       linked_active = true;
       self_indexed = lk;
       for (const NodePtr& n : group.nodes) {

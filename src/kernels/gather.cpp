@@ -2,12 +2,12 @@
 
 #include <string>
 
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 
@@ -103,4 +103,4 @@ struct EmbeddingKernel final : KernelPrimitive<EmbeddingKernel> {
 };
 LSE_REGISTER_PRIMITIVE(EmbeddingKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

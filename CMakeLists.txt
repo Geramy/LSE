@@ -180,6 +180,40 @@ add_library(lse_graph
 )
 add_library(lse::graph ALIAS lse_graph)
 target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry)
+
+# Device kernel primitives. Written against the kir IR and a dialect source
+# table, so they belong to the engine rather than to whichever backend
+# happens to lower them.
+add_library(lse_kernels
+  src/kernels/argmax.cpp
+  src/kernels/concat.cpp
+  src/kernels/conv.cpp
+  src/kernels/gather.cpp
+  src/kernels/gdn.cpp
+  src/kernels/kv_write.cpp
+  src/kernels/lds_linear.cpp
+  src/kernels/linear_indexed.cpp
+  src/kernels/linked.cpp
+  src/kernels/matmul.cpp
+  src/kernels/quant_embedding.cpp
+  src/kernels/quant_linear.cpp
+  src/kernels/reduction.cpp
+  src/kernels/rope.cpp
+  src/kernels/scatter.cpp
+  src/kernels/sdpa.cpp
+  src/kernels/slice.cpp
+  src/kernels/topk.cpp
+  src/kernels/transpose.cpp
+  src/kernels/wmma_linear.cpp
+)
+add_library(lse::kernels ALIAS lse_kernels)
+target_link_libraries(lse_kernels PUBLIC lse_core lse_ir lse_graph)
+# Each primitive self-registers from a TU nothing references, so the archive
+# has to be linked whole or none of them exist at run time.
+target_link_options(lse_kernels INTERFACE
+  "LINKER:--whole-archive,$<TARGET_FILE:lse_kernels>,--no-whole-archive")
+lse_apply_common_flags(lse_kernels)
+
 # No backend edge here, in either direction of the build: lse_backend_hrx links
 # lse_graph because it implements graph's emitter and compiler seams, so an edge
 # back would be a cycle. Executables link lse_backends to make one selectable.

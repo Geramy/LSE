@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "harness.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/dialect_source.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -203,7 +203,7 @@ LSE_TEST(pack_width_divides_the_row_it_walks) {
                           2176u}) {
     for (std::uint32_t eb : {2u, 4u}) {
       const std::uint32_t n =
-          lse::backend::hrx_kernels::row_pack(k, 16u, eb);
+          lse::kernels::row_pack(k, 16u, eb);
       LSE_EXPECT(n >= 1 && n <= 16u / eb);
       LSE_EXPECT((n & (n - 1)) == 0);
       // Rows start at multiples of k, so a wider pack would land some row's
@@ -221,7 +221,7 @@ LSE_TEST(gemv_k_walk_covers_every_element_once) {
                             2176u}) {
       for (std::uint32_t eb : {2u, 4u}) {
         const std::uint32_t step =
-            lse::backend::hrx_kernels::row_pack(k, 16u, eb);
+            lse::kernels::row_pack(k, 16u, eb);
         const std::uint32_t span = wave * step;
         const std::uint32_t aligned = (k / span) * span;
         std::vector<int> hits(k, 0);

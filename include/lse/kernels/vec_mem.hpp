@@ -6,7 +6,12 @@
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::DeviceInfo;
+using backend::max_load_bytes;
+using backend::max_store_bytes;
 
 inline std::uint32_t device_load_bytes(const DeviceInfo* device) {
   return device != nullptr ? max_load_bytes(*device) : 4u;
@@ -74,4 +79,4 @@ inline void emit_dot(graph::env::Emit& e,
   }
 }
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

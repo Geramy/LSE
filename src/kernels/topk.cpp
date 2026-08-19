@@ -7,7 +7,7 @@
 #include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -215,4 +215,4 @@ struct TopKKernel final : KernelPrimitive<TopKKernel> {
 };
 LSE_REGISTER_PRIMITIVE(TopKKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

@@ -3,13 +3,15 @@
 
 #include <string>
 
-#include "lse/backends/hrx/kernels/lds_linear.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
-#include "lse/backends/hrx/kernels/wmma.hpp"
+#include "lse/kernels/lds_linear.hpp"
+#include "lse/kernels/vec_mem.hpp"
+#include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -174,4 +176,4 @@ struct LinearKernel final : KernelPrimitive<LinearKernel> {
 
 LSE_REGISTER_PRIMITIVE(LinearKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

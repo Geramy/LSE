@@ -6,7 +6,7 @@
 
 #include <string>
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -431,4 +431,4 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
 };
 LSE_REGISTER_PRIMITIVE(KvPageWriteKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

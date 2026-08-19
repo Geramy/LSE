@@ -7,7 +7,7 @@
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 // One wave per output column, lanes on consecutive K. `grid` maps tile/row
 // onto the launch; `persist` grid-strides tiles by `persist_wgs` so every
@@ -111,4 +111,4 @@ const graph::KernelPrimitiveBase* lds_linear_for(const graph::KernelShapes& s);
 const graph::KernelPrimitiveBase* lds_linear_indexed_for(
     const graph::KernelShapes& s);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

@@ -1,4 +1,4 @@
-#include "lse/backends/hrx/kernels/gdn.hpp"
+#include "lse/kernels/gdn.hpp"
 
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -8,7 +8,10 @@
 
 #include <string>
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::DeviceInfo;
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -275,4 +278,4 @@ LinkedBinding gdn_pair_bindings(const FusionGroup& group) {
   return b;
 }
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

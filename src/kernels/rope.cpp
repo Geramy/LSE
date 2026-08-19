@@ -5,7 +5,7 @@
 
 #include <string>
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 
@@ -103,4 +103,4 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
 };
 LSE_REGISTER_PRIMITIVE(RopeKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

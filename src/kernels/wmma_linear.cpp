@@ -20,19 +20,21 @@
 // matching operand form and keep the f16 one. Default is on when the live
 // device has the row's capability; LSE_WMMA=0 keeps the f32 scalar oracle,
 // which is what the lemonseed differential in test_reference compares against.
-#include "lse/backends/hrx/kernels/wmma.hpp"
+#include "lse/kernels/wmma.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -254,4 +256,4 @@ const KernelPrimitiveBase* wmma_linear_for(const KernelShapes& s) {
   return &kKernel;
 }
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

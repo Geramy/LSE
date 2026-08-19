@@ -3,17 +3,23 @@
 // W is [N, K] (or [E, N, K]). One thread per column walks a whole row, so
 // neighbouring threads are K floats apart. One wave per column, lanes on
 // consecutive K, is a coalesced row read; the wave xor-reduces in registers.
-#include "lse/backends/hrx/kernels/lds_linear.hpp"
+#include "lse/kernels/lds_linear.hpp"
 
 #include <string>
 
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/math.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
+
+// These name device facts, which the backend supplies.
+using backend::AmdDeviceInfo;
+using backend::DeviceInfo;
+using backend::device_extension;
+using backend::workgroup_lds_bytes;
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -444,4 +450,4 @@ const KernelPrimitiveBase* lds_linear_indexed_for(const KernelShapes& s) {
   return &kKernel;
 }
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

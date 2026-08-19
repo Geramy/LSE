@@ -5,7 +5,7 @@
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 
@@ -93,4 +93,4 @@ struct SliceKernel final : KernelPrimitive<SliceKernel> {
 
 LSE_REGISTER_PRIMITIVE(SliceKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels

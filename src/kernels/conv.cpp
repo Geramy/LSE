@@ -1,4 +1,4 @@
-#include "lse/backends/hrx/kernels/vec_mem.hpp"
+#include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -6,7 +6,7 @@
 
 #include <string>
 
-namespace lse::backend::hrx_kernels {
+namespace lse::kernels {
 
 using namespace lse::graph;
 namespace math = lse::math;
@@ -180,4 +180,4 @@ struct ConvTailShiftKernel final : KernelPrimitive<ConvTailShiftKernel> {
 };
 LSE_REGISTER_PRIMITIVE(ConvTailShiftKernel);
 
-}  // namespace lse::backend::hrx_kernels
+}  // namespace lse::kernels
