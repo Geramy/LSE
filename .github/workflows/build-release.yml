@@ -1,0 +1,167 @@
+name: Build & Release
+
+# Dispatch only. The repository is public and this runs on a self-hosted
+# runner, so nothing here may be triggered by a pull request.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a GitHub Release"
+        type: boolean
+        default: false
+      tag:
+        description: "Tag for the release (blank uses v<version>-<short sha>)"
+        type: string
+        default: ""
+      cdna3:
+        description: "Build for CDNA3 (gfx942)"
+        type: boolean
+        default: true
+      rdna35:
+        description: "Build for RDNA3.5 (gfx1150, gfx1151)"
+        type: boolean
+        default: true
+      rdna4:
+        description: "Build for RDNA4 (gfx1200, gfx1201)"
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, lse]
+    timeout-minutes: 180
+    env:
+      ROCM_PATH: /opt/rocm
+      HRX_ROOT: ${{ github.workspace }}/reference/hrx-system/build/hrx-install
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # release notes read the log back to the last tag
+
+      - name: Select GPU targets
+        id: targets
+        run: |
+          set -euo pipefail
+          targets=()
+          families=()
+          if [ "${{ inputs.cdna3 }}"  = "true" ]; then targets+=(gfx942);            families+=("CDNA3"); fi
+          if [ "${{ inputs.rdna35 }}" = "true" ]; then targets+=(gfx1150 gfx1151);   families+=("RDNA3.5"); fi
+          if [ "${{ inputs.rdna4 }}"  = "true" ]; then targets+=(gfx1200 gfx1201);   families+=("RDNA4"); fi
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "::error::No architecture selected. Tick at least one of CDNA3, RDNA3.5, RDNA4."
+            exit 1
+          fi
+          echo "gpu_targets=$(IFS=';'; echo "${targets[*]}")" >> "$GITHUB_OUTPUT"
+          echo "families=$(IFS=', '; echo "${families[*]}")"  >> "$GITHUB_OUTPUT"
+          echo "Building for ${targets[*]}"
+
+      - name: Check the toolchain
+        id: toolchain
+        run: |
+          set -euo pipefail
+          # g++ 16 is not optional: the host sources are C++26 and reflect over
+          # kernel argument structs. Fail here with a readable message rather
+          # than inside the reflection headers.
+          if ! command -v g++-16 >/dev/null; then
+            echo "::error::g++-16 not found. The host sources need P2996 reflection (-std=c++26 -freflection)."
+            exit 1
+          fi
+          g++-16 --version | head -1
+          cmake --version | head -1
+          ninja --version
+          cargo --version
+          echo "gcc=$(g++-16 -dumpfullversion)" >> "$GITHUB_OUTPUT"
+          echo "cmake=$(cmake --version | head -1 | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          if [ -x "$ROCM_PATH/bin/hipconfig" ]; then
+            echo "rocm=$($ROCM_PATH/bin/hipconfig --version 2>/dev/null | head -1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "rocm=$(basename "$(readlink -f "$ROCM_PATH")")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-16 \
+            -DLSE_GPU_TARGETS="${{ steps.targets.outputs.gpu_targets }}" \
+            -DLSE_ROCM_PATH="$ROCM_PATH" \
+            $( [ -d "$HRX_ROOT" ] && echo -DLSE_HRX_ROOT="$HRX_ROOT" )
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        id: test
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib:$HRX_ROOT/lib:${LD_LIBRARY_PATH:-}"
+          ctest --test-dir build --output-on-failure | tee ctest.log
+          echo "summary=$(grep -oE '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' ctest.log | tail -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          sha=$(git rev-parse --short HEAD)
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="v${version}-${sha}"
+          name="lse-${tag}-linux-x86_64"
+
+          rm -rf "dist/$name" && mkdir -p "dist/$name"
+          cp build/lse "dist/$name/"
+          find build -maxdepth 2 -name '*.a' -exec cp {} "dist/$name/" \;
+          cp README.md LICENSE.md "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "name=$name"       >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_notes.py \
+            --tag        "${{ steps.package.outputs.tag }}" \
+            --version    "${{ steps.package.outputs.version }}" \
+            --families   "${{ steps.targets.outputs.families }}" \
+            --targets    "${{ steps.targets.outputs.gpu_targets }}" \
+            --gcc        "${{ steps.toolchain.outputs.gcc }}" \
+            --cmake      "${{ steps.toolchain.outputs.cmake }}" \
+            --rocm       "${{ steps.toolchain.outputs.rocm }}" \
+            --tests      "${{ steps.test.outputs.summary }}" \
+            --artifact   "dist/${{ steps.package.outputs.name }}.tar.gz" \
+            --out        dist/RELEASE_NOTES.md
+          cat dist/RELEASE_NOTES.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+            dist/RELEASE_NOTES.md
+          retention-days: 30
+
+      - name: Publish the release
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: LSE ${{ steps.package.outputs.tag }}
+          body_path: dist/RELEASE_NOTES.md
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
