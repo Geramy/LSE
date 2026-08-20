@@ -8,6 +8,7 @@
 #include "lse/model/config.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/registry.hpp"
+#include "lse/place/devices.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/server/http_server.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
@@ -59,6 +60,7 @@ int main(int argc, char** argv) {
   std::string mtp_path;
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   std::string served_name;
+  std::string pool;
   std::int32_t kv_len = 0;
 
   for (int i = 1; i < argc; ++i) {
@@ -80,6 +82,7 @@ int main(int argc, char** argv) {
     else if (a == "--mtp") mtp_path = value("--mtp");
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
+    else if (a == "--pool") pool = value("--pool");
     else {
       std::fprintf(stderr, "lse-server: unknown option '%s'\n", a.c_str());
       return 2;
@@ -92,6 +95,29 @@ int main(int argc, char** argv) {
   }
   opt.model_id = served_name.empty() ? model : served_name;
 
+  // Bring the devices up BEFORE the weights are bound. Without this the
+  // model loads against no backend: nothing reaches the GPU, the forward
+  // pass runs through the host interpreter, and from outside it looks like
+  // the server never loaded a model at all.
+  if (const Status opened = place::open_default_devices(pool); !opened.ok()) {
+    return fail(opened, "opening the device set");
+  }
+  place::Devices* devices = place::default_devices();
+  if (devices == nullptr || devices->size() == 0) {
+    return fail(LSE_ERROR(kDeviceError, "no device came up"),
+                "opening the device set");
+  }
+  backend::IBackend& first_device = devices->device(devices->primary());
+  if (first_device.emitter() == nullptr) {
+    std::fprintf(stderr,
+                 "lse-server: no code-generating backend came up; running on '%s' through the host interpreter, which is far slower\n",
+                 std::string(first_device.name()).c_str());
+  } else {
+    std::fprintf(stderr, "lse-server: device %s\n",
+                 std::string(first_device.name()).c_str());
+  }
+
+  std::fprintf(stderr, "lse-server: loading %s\n", model.c_str());
   auto paths = model::resolve_model(model);
   if (!paths.ok()) return fail(paths.status(), "resolving the model");
 

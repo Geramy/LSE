@@ -19,12 +19,37 @@ fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 
 # A greedy answer is deterministic, so this asserts on the text rather than on
 # the exit code. Anything else means the engine is wrong, not merely slow.
+# The whole point of this engine is that the work runs on the device. A CPU
+# fallback still produces correct text, just far slower, so every check below
+# would pass while the thing under test was not being tested at all. Assert
+# the device first and refuse to continue without one.
+echo "== device =="
+devices=$("$BUILD/lse" --devices 2>&1 || true)
+if grep -qE "^(hrx|cuda|hip):" <<<"$devices"; then
+  pass "a code-generating device came up: $(grep -oE "^[a-z]+:[0-9]+" <<<"$devices" | grep -v "^cpu" | head -1)"
+else
+  fail "no code-generating device; this build would run through the host interpreter"
+  echo "$devices" | head -20
+  exit 1
+fi
+
 echo "== engine =="
-out=$("$BUILD/lse" -m "$MODEL" -n 16 -t 0 "The capital of France is" 2>/dev/null || true)
+out=$("$BUILD/lse" -m "$MODEL" -n 16 -t 0 --stats "The capital of France is" 2>&1 || true)
 if grep -qi 'paris' <<<"$out"; then
   pass "greedy decode answers with the fact"
 else
   fail "greedy decode: expected Paris, got: $(head -c 120 <<<"$out")"
+fi
+
+# A group that runs on the host is a kernel the device path could not emit.
+# It is correct and it is slow, and it is exactly the regression nobody
+# notices, so it fails the run rather than passing quietly.
+host_groups=$(grep -oE "host=[0-9]+" <<<"$out" | head -1 | cut -d= -f2)
+if [ "${host_groups:-0}" = "0" ]; then
+  pass "every group ran on the device"
+else
+  fail "$host_groups group(s) fell back to the host:"
+  grep -oE "host x[0-9]+ +[^\"]+" <<<"$out" | head -5
 fi
 
 # Recall and arithmetic fail differently. A model whose weights are bound to

@@ -61,7 +61,8 @@ jobs:
           if [ -n "${HRX_ROOT:-}" ] && [ -d "$HRX_ROOT" ]; then
             hrx_arg="-DLSE_HRX_ROOT=$HRX_ROOT"
           else
-            echo "::warning::No HRX install at '${HRX_ROOT:-<unset>}'; the GPU backend and every kernel test that needs a device will be skipped."
+            echo "::error::No HRX install at '${HRX_ROOT:-<unset>}'. CI builds and tests the GPU path; a CPU-only build passes every check while testing nothing that matters. Set the repository variable LSE_HRX_ROOT."
+            exit 1
           fi
           cmake -S . -B build -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -90,7 +91,7 @@ jobs:
           set -euo pipefail
           export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           if ! ./build/lse --list-cache 2>/dev/null | grep -q "$LSE_SMOKE_MODEL"; then
-            echo "::warning::$LSE_SMOKE_MODEL is not cached on this runner; skipping the end-to-end check."
-            exit 0
+            echo "::error::$LSE_SMOKE_MODEL is not cached on this runner. The end-to-end check asserts on generated text and on the work running on the device, and neither can be checked without the weights."
+            exit 1
           fi
           .github/scripts/smoke.sh build
