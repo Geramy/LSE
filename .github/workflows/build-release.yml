@@ -66,7 +66,9 @@ jobs:
             exit 1
           fi
           echo "gpu_targets=$(IFS=';'; echo "${targets[*]}")" >> "$GITHUB_OUTPUT"
-          echo "families=$(IFS=', '; echo "${families[*]}")"  >> "$GITHUB_OUTPUT"
+          # IFS joins on its FIRST character, so build the list explicitly
+          # rather than getting "A,B,C" where the notes read "A, B, C".
+          printf 'families=%s\n' "$(printf '%s, ' "${families[@]}" | sed 's/, $//')" >> "$GITHUB_OUTPUT"
           echo "Building for ${targets[*]}"
 
       - name: Provision the reference dependencies
