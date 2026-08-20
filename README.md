@@ -62,7 +62,31 @@ prediction module, or point at one:
 ./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
 ```
 
-`./lse --help` lists every option.
+### `lse` options
+
+| Option | Default | |
+|---|---|---|
+| `-m, --model NAME` | `$LSE_MODEL` | Checkpoint directory, `.safetensors`, or an HF repo id. A bare name resolves when it is unique |
+| `-n, --max-tokens N` | 256 | Tokens to generate |
+| `-t, --temperature F` | 0.8 | 0 or less is greedy |
+| `--top-k N` | off | Keep the N most likely tokens |
+| `--top-p F` | 1.0 | Nucleus threshold |
+| `--repeat-penalty F` | 1.0 | Above 1 discourages repeats |
+| `-s, --seed N` | 0 | Sampler seed |
+| `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
+| `--arch NAME` | detected | Force a model kernel instead of detecting one |
+| `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json`, used only when the model directory has none |
+| `--kv-len N` | `max(2*train_seq, 2048)` | Allocate the KV cache for N tokens and keep that shape |
+| `-b, --batch N` | 1 | Decode N copies of the prompt as one batch |
+| `-p, --prompt TEXT` | | One more sequence for the batch; repeatable, and differing lengths put the rows at different positions |
+| `--kv-blocks N` | no limit | Blocks one attention layer's pool may hold; below what the batch needs, sequences are preempted and resume |
+| `--pool LIST` | `$LSE_POOL` | Devices this run may use, backend-qualified and best first: `hrx:0,cpu:0` |
+| `--dialect NAME` | the device's choice | Source dialect to generate kernels in: `hip` or `loom` |
+| `--list-models` | | Print the registered model kernels and exit |
+| `--list-cache` | | List the models in the HF cache and whether this build can load each, and exit |
+| `--devices` | | Report every device this build can see, and what it will not answer |
+| `--stats` | | Print timings, launch counts and the cost model when done |
+| `--debug` | | Print the HIP dump path and file count |
 
 ## Serve an OpenAI API
 
@@ -71,12 +95,31 @@ works by changing the base URL.
 
 ```bash
 ./lse-server -m mlx-community/Qwen3.8-27B-4bit --port 8080
-# --host 0.0.0.0        bind beyond localhost
-# --api-key KEY         require Authorization: Bearer KEY
-# --served-name NAME    the id reported by /v1/models
-# --max-tokens N        refuse requests asking for more (default 4096)
-# --mtp PATH            speculative decoding module
 ```
+
+### `lse-server` options
+
+| Option | Default | |
+|---|---|---|
+| `-m, --model NAME` | `$LSE_MODEL` | Checkpoint directory, `.safetensors`, or an HF repo id |
+| `--host ADDR` | `127.0.0.1` | Address to bind. `0.0.0.0` serves every interface, not just this machine |
+| `--port N` | 8080 | Port to bind |
+| `--api-key KEY` | none | Require `Authorization: Bearer KEY`. Without it every request is served unauthenticated |
+| `--served-name ID` | the model argument | Model id reported by `/v1/models` |
+| `--max-tokens N` | 4096 | Refuse requests asking for more |
+| `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
+| `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
+| `--kv-len N` | from the config | Allocate the KV cache for N tokens |
+
+Binding beyond localhost gives anyone who can reach the machine use of the
+GPU, so pair `--host 0.0.0.0` with `--api-key`:
+
+```bash
+./lse-server -m <model> --host 0.0.0.0 --api-key "$(openssl rand -hex 24)"
+```
+
+There is no rate limit and no per-client accounting, and generation is
+serialized, so `--max-tokens` is what stops one caller holding the device.
 
 | Endpoint | |
 |---|---|
