@@ -10,7 +10,7 @@ if(NOT CMAKE_CXX_COMPILER)
 endif()
 
 project(lse
-  VERSION 0.1.0
+  VERSION 0.1.1
   DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
   LANGUAGES CXX)
 
