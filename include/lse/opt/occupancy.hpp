@@ -73,13 +73,26 @@ struct DeviceCapacity {
 // then drops out of the min and `registers_counted` says so.
 struct KernelDemand {
   std::uint32_t threads = 0;
-  std::uint32_t lds_bytes = 0;
+  // Workgroup scratch the launch asks for. A DeviceFact and not an integer for
+  // the same reason the capacity fields are: a toolchain that does not report
+  // a workgroup segment has said NOTHING, and reading that as zero hands the
+  // arrangement the best occupancy the part can give and asserts it as exact.
+  // Zero bytes and no answer are different demands and the model must not read
+  // them the same.
+  backend::DeviceFact<std::uint32_t> lds_bytes;
   backend::DeviceFact<std::uint32_t> vector_registers;
   backend::SpillState spill = backend::SpillState::kUnknown;
 
+  // Scratch this caller counted itself. Named for what it is so a bare integer
+  // can never reach `lds_bytes` without saying where it came from.
+  static KernelDemand counted(std::uint32_t threads, std::uint32_t lds_bytes);
+
   // The demand a previously compiled object justifies: its measured registers,
   // its measured scratch, and whether it spilled. `threads` stays the caller's,
-  // since a code object without launch bounds does not state its own.
+  // since a code object without launch bounds does not state its own. A object
+  // whose metadata carries no workgroup segment leaves the scratch UNKNOWN,
+  // which drops the arm and marks the answer inexact rather than seating the
+  // kernel for free.
   static KernelDemand measured(std::uint32_t threads,
                                const backend::KernelResources& r);
 };
@@ -115,8 +128,9 @@ struct Occupancy {
   // The scratch the launch asked for, carried so a comparison can tell a tie
   // it can trust from a tie an unknown allocation granule might be hiding: two
   // arrangements asking for the SAME bytes round the same way whatever the
-  // granule is, and two asking for different bytes do not.
-  std::uint32_t scratch_request_bytes = 0;
+  // granule is, and two asking for different bytes do not. Unknown when the
+  // demand itself was unanswered, which is not the same as asking for none.
+  backend::DeviceFact<std::uint32_t> scratch_request;
 
   // A SPILLING KERNEL IS A DIFFERENT REGIME, NOT A LOWER NUMBER. Occupancy
   // says how many waves fit; it says nothing about a wave that goes to memory
@@ -158,11 +172,11 @@ struct Occupancy {
 // rule that demanded strict improvement would refuse it.
 //
 // When either side is inexact — an allocation granule nobody measured, a pool
-// size nobody reported — a tie is only trustworthy when the candidate asks for
-// no more scratch than the incumbent, since a rounding step that cannot be
-// counted still cannot separate two equal requests. Otherwise the candidate
-// must be strictly better, because equality between two upper bounds is not
-// equality.
+// size nobody reported, a demand nobody answered — a tie is only trustworthy
+// when BOTH requests are known and the candidate asks for no more scratch than
+// the incumbent, since a rounding step that cannot be counted still cannot
+// separate two equal requests. Otherwise the candidate must be strictly
+// better, because equality between two upper bounds is not equality.
 [[nodiscard]] bool prefer(const Occupancy& candidate,
                           const Occupancy& incumbent);
 

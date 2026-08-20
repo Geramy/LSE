@@ -121,8 +121,7 @@ std::int64_t activation_k(const Node& n) noexcept {
 // be behind the cut. Post-order puts a node's inputs before it, so if all of
 // its *direct* inputs are behind the cut then its whole transitive cone is,
 // and the order stays topological.
-void group_sibling_linears(std::vector<NodePtr>& order,
-                           const WorkgroupDevice& dev) {
+void group_sibling_linears(std::vector<NodePtr>& order) {
   std::unordered_set<const Node*> in_order;
   std::unordered_set<const Node*> emitted;
   in_order.reserve(order.size() * 2);
@@ -131,7 +130,6 @@ void group_sibling_linears(std::vector<NodePtr>& order,
 
   std::vector<std::size_t> take;
   std::vector<const Node*> run;
-  std::vector<const Node*> probe;
   for (std::size_t p = 0; p < order.size(); ++p) {
     emitted.insert(order[p].get());
     if (!is_wide_linear(*order[p]) || order[p]->inputs.empty()) continue;
@@ -145,36 +143,27 @@ void group_sibling_linears(std::vector<NodePtr>& order,
     run.assign(1, order[p].get());
     take.clear();
 
-    // What the run may spend on workgroup scratch.
+    // NO RESIDENCY TEST HERE, and the reason is that this layer cannot state
+    // one honestly. This pass only makes candidates ADJACENT; it does not form
+    // the launch. What it could compare is `group_lds_bytes` — the run's
+    // distinct staged panels — against `staged_row_bytes` — one panel — and
+    // every candidate below is already required to share `x` and `k` with the
+    // run, so those two are the SAME panel by construction and the comparison
+    // could only ever tie. A gate that cannot fire is not a gate.
     //
-    // THE RULE: a merged run must seat at least as many workgroups on one
-    // scratch pool as the member would seat launching alone. Not "does the sum
-    // fit the per-workgroup cap" — fitting is not the question. Two panels
-    // summing to 64000 bytes fit a 65536-byte cap and seat 2 workgroups per
-    // pool where 32000 bytes seats 4, and that halving is what a fitting test
-    // cannot see.
-    //
-    // The common case is admitted by the same rule rather than by an exception
-    // to it: the emitter hoists ONE panel per distinct (activation, length), so
-    // a run whose members share an activation asks for exactly what any one of
-    // them asks for alone. Equal residency, and `prefer` admits equality.
-    const std::uint32_t threads = dev.launch_threads();
-    const opt::Occupancy solo =
-        workgroup_residency(dev, threads, staged_row_bytes(*order[p], dev));
-    auto run_fits = [&](const Node& candidate) {
-      probe.assign(run.begin(), run.end());
-      for (std::size_t t : take) probe.push_back(order[t].get());
-      probe.push_back(&candidate);
-      const std::uint32_t need = group_lds_bytes(probe, dev);
-      return opt::prefer(workgroup_residency(dev, threads, need), solo);
-    };
+    // What the two arrangements really cost is the workgroup-shared arrays the
+    // bodies declare, and only the emitter knows those: whether a stage takes
+    // the integer path, how many rows one workgroup covers, whether a hoisted
+    // panel relieves it of its own staging. The decision is therefore taken
+    // where those can be asked and where refusing still leaves the members a
+    // launch each — Scheduler::join_wide_linear, through
+    // IKernelEmitter::run_scratch and opt::admit_fusion.
 
     for (std::size_t j = p + 1;
          j < order.size() && run.size() + take.size() < cap; ++j) {
       const Node& c = *order[j];
       if (!is_wide_linear(c) || c.inputs.empty()) continue;
       if (c.inputs[0].get() != x || activation_k(c) != k) continue;
-      if (!run_fits(c)) continue;
       // Mixing kinds in one run is legal only where every kind has a
       // self-indexing form. `linear` gains a matrix-core form at M >= 16;
       // `linear_indexed` has only the wave-per-column GEMV, which needs a
@@ -296,7 +285,7 @@ std::vector<Workgroup> Partitioner::phases(
   std::vector<NodePtr> order;
   std::unordered_set<const Node*> seen;
   for (const NodePtr& r : roots) topo_visit(r, seen, order);
-  group_sibling_linears(order, dev);
+  group_sibling_linears(order);
 
   std::vector<Workgroup> out;
   for (const NodePtr& n : order) {

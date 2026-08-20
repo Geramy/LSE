@@ -53,6 +53,13 @@ class HipEmitter final : public graph::IKernelEmitter,
     return this;
   }
 
+  // What this emitter's two arrangements of `run` would declare in workgroup
+  // scratch. See IKernelEmitter::run_scratch: the bytes are this file's, the
+  // residency they buy is the engine's.
+  [[nodiscard]] RunScratch run_scratch(
+      std::span<const graph::NodePtr> run,
+      const DeviceInfo& device) const override;
+
   // ConstantsLayout is offsets and sizes; the C spelling of a 4- or 8-byte
   // scalar is HIP's business, so the struct text is rendered here.
   [[nodiscard]] static std::string constants_decl(
@@ -93,6 +100,12 @@ class HipEmitter final : public graph::IKernelEmitter,
     bool persist_grid = false;
   };
   mutable std::unordered_map<std::uint64_t, CachedEmit> emit_cache_;
+  // Priced runs, keyed on the arrangement's own signature. run_scratch is a
+  // pure function of the run and the device, and the scheduler asks it once
+  // per candidate per join attempt — quadratic in the run length, each ask
+  // specializing and planning every member. Without this the 27B pays 0.23 s
+  // of extra partition time per process for answers it already has.
+  mutable std::unordered_map<std::uint64_t, RunScratch> run_scratch_cache_;
   // Sibling runs whose assembled body overran the workgroup budget, and by how
   // much. The verdict is a function of the group and the device, so it is
   // reached once; without this a prefill pass rebuilds the whole IR body of

@@ -86,10 +86,7 @@ void collect_kp_ancestors(const Node* n,
 opt::Occupancy workgroup_residency(const WorkgroupDevice& d,
                                    std::uint32_t threads,
                                    std::uint32_t lds) noexcept {
-  opt::KernelDemand demand;
-  demand.threads = threads;
-  demand.lds_bytes = lds;
-  return opt::occupancy(d.capacity(), demand);
+  return opt::occupancy(d.capacity(), opt::KernelDemand::counted(threads, lds));
 }
 
 opt::DeviceCapacity WorkgroupDevice::capacity() const noexcept {

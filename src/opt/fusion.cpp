@@ -3,6 +3,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "lse/opt/measurements.hpp"
 
@@ -36,39 +37,65 @@ FusionVerdict admit_fusion(const DeviceCapacity& cap,
                            const FusionCandidate& candidate) {
   FusionVerdict v;
 
-  KernelDemand fused;
-  fused.threads = candidate.threads;
-  fused.lds_bytes = candidate.fused_scratch_bytes;
+  // THE ESTIMATE, both sides. What the emitter says each arrangement's body
+  // will declare, counted the same way from the same source — which is the
+  // only thing that makes the comparison below mean anything.
+  KernelDemand fused =
+      KernelDemand::counted(candidate.threads, candidate.fused_scratch_bytes);
+  KernelDemand solo = KernelDemand::counted(candidate.threads,
+                                            candidate.worst_solo_scratch_bytes);
 
-  // What the same arrangement measured last time it was built, keyed on the
-  // fused kernel's OWN entry name so an arrangement's score never depends on
+  // What these same arrangements measured last time they were built, each
+  // keyed on its OWN entry name so an arrangement's score never depends on
   // which arrangement was chosen.
-  //
-  // ONLY THE SPILL STATE IS TAKEN, and the reason is worth stating because the
-  // richer version is wrong: this is a COMPARISON, and a measurement put into
-  // one side of it has to be the same quantity as the estimate on the other.
-  // The fused kernel's measured workgroup segment is the whole body's, every
-  // stage's own staging included, while the unfused side can only be estimated
-  // from the panels — so substituting it compares two different quantities and
-  // flips the verdict on that difference alone. Measured, not feared: doing so
-  // made the 4B answer "The first part of the" where it had answered " Paris.".
-  // Spilling is not a comparison — it disqualifies an arrangement on its own —
-  // so it needs no counterpart and is safe to take.
+  const KernelMeasurements& known = KernelMeasurements::instance();
+  backend::KernelResources fused_r;
   if (!candidate.fused_entry.empty()) {
-    const backend::KernelResources r =
-        KernelMeasurements::instance().lookup(candidate.fused_entry);
-    if (r.any()) {
-      v.measured = true;
-      fused.spill = r.spilled();
+    fused_r = known.lookup(candidate.fused_entry);
+    // Spilling is not a comparison — it disqualifies an arrangement on its own
+    // — so it needs no counterpart and is taken whenever it is known.
+    if (fused_r.any()) fused.spill = fused_r.spilled();
+  }
+
+  // THE MEASUREMENT, all of it or none of it. A measured workgroup segment on
+  // one side of the comparison against an emitter's estimate on the other is a
+  // comparison of two different quantities, and the verdict then turns on that
+  // difference rather than on residency.
+  std::vector<backend::KernelResources> solo_r;
+  bool all_measured = fused_r.workgroup_segment_bytes.known() &&
+                      !candidate.solo_entries.empty();
+  if (all_measured) {
+    solo_r.reserve(candidate.solo_entries.size());
+    for (const std::string& e : candidate.solo_entries) {
+      backend::KernelResources r = known.lookup(e);
+      if (!r.workgroup_segment_bytes.known()) {
+        all_measured = false;
+        break;
+      }
+      solo_r.push_back(std::move(r));
     }
   }
 
-  KernelDemand solo;
-  solo.threads = candidate.threads;
-  solo.lds_bytes = candidate.worst_solo_scratch_bytes;
+  if (all_measured) {
+    v.measured = true;
+    v.fused = occupancy(cap, KernelDemand::measured(candidate.threads, fused_r));
+    // The unfused arrangement's residency is the TIGHTEST of the launches it
+    // is made of — the one that seats fewest — and each is scored whole, from
+    // one kernel's own registers beside its own scratch. Taking the worst of
+    // each across different kernels would describe a launch that does not
+    // exist.
+    bool first = true;
+    for (const backend::KernelResources& r : solo_r) {
+      const Occupancy one =
+          occupancy(cap, KernelDemand::measured(candidate.threads, r));
+      if (first || !prefer(one, v.unfused)) v.unfused = one;
+      first = false;
+    }
+  } else {
+    v.fused = occupancy(cap, fused);
+    v.unfused = occupancy(cap, solo);
+  }
 
-  v.fused = occupancy(cap, fused);
-  v.unfused = occupancy(cap, solo);
   // A device that answers nothing about its own capacity cannot refuse
   // anything on residency grounds: the arrangement that was emitted before any
   // of this existed is the one it keeps.

@@ -34,10 +34,39 @@ void mix_name(std::uint64_t& h, std::string_view name) {
 struct IndexedStage {
   NodePtr node;
   const KernelPrimitiveBase* prim = nullptr;
+  // The plan this stage would launch under ALONE: its own grid and the
+  // workgroup scratch its own body declares with nothing hoisted for it. The
+  // scratch half is the unfused arrangement's price for this member, and it is
+  // the same quantity as the fused body's — both are what the primitive says
+  // it will declare, asked with and without the run's panels.
   ThreadPlan plan;
   // The activation panel this stage puts in workgroup scratch, as the stage
   // itself declares it. Asked at specialize time so the run can share it.
   KernelPrimitiveBase::StagedRow row;
+  // The int8 spec this stage would quantize that row under, invalid when it
+  // takes no integer path. A run hoists the int8 form only where every member
+  // agrees on this.
+  kernels::DotStagingPlan dot_plan;
+  // The operand shapes, owned, so the stage can be re-asked with a panel
+  // described without the caller rebuilding them.
+  std::vector<Shape> in_shapes;
+  std::vector<DType> in_dtypes;
+
+  [[nodiscard]] KernelShapes shapes(const DeviceInfo& device,
+                                    const kir::TypeTable& types,
+                                    const DialectSourceTable& spellings) const {
+    KernelShapes s;
+    s.inputs = in_shapes;
+    s.input_dtypes = in_dtypes;
+    s.output = node->shape;
+    s.output_dtype = node->dtype;
+    s.attrs = node->attrs;
+    s.iattrs = node->iattrs;
+    s.device = &device;
+    s.types = types;
+    s.intrinsics = &spellings;
+    return s;
+  }
 };
 
 // One activation row, staged once for every stage of a run that reads it.
@@ -55,6 +84,12 @@ struct RowPanel {
   kernels::DotStagingPlan quant_plan;
   bool hoist_blocked = false;
   kernels::StagedQuantNames quant;
+
+  // Whether the merged body hoists this panel at all, and whether it hoists
+  // the int8 form beside it. A panel only one stage reads is left to that
+  // stage, so it is not hoisted and costs the run nothing extra.
+  bool hoisted = false;
+  bool quant_hoisted = false;
 };
 
 constexpr std::size_t kNoPanel = static_cast<std::size_t>(-1);
@@ -100,51 +135,124 @@ std::vector<RowPanel> row_panels(const std::vector<IndexedStage>& stages,
   return panels;
 }
 
-// What the run's workgroup scratch is expected to cost: every hoisted panel
-// once, plus whatever each remaining stage takes on its own.
+// A name for a panel that does not exist yet. The primitives read
+// `staged.name` to BUILD the tile and `staged.count` to decide whether the
+// panel is theirs; pricing asks only the second question, and the body gets the
+// real name the prologue returned.
+constexpr std::string_view kPricedPanel = "?panel";
+
+// What one arrangement of a run costs in workgroup scratch: the fused body's
+// declaration and the tightest of the solo bodies'.
 //
-// The arms must cover the stages exactly. A stage that reported a staged row but
-// got no panel — row_panels declines a non-f32 activation, and will decline more
-// once activations narrow — still self-stages `align(K*4)` inside its own body,
-// so keying the second arm on `row.count == 0` rather than on "did not get a
-// panel" made such a stage contribute nothing at all.
+// THE SAME QUANTITY ON BOTH SIDES, which is the whole point. Each figure is the
+// sum of the workgroup-shared arrays the body that would be printed declares,
+// asked of the primitives themselves — the fused side with the run's panels
+// described, the solo side with nothing described. Anything else makes the
+// comparison meaningless: pricing the UNFUSED arrangement as the FUSED one's
+// hoisted f32 panel, which is what this used to do, made both sides equal on
+// every run in every model and the residency gate could not fire at all. On the
+// 27B the true figures for one 5120-wide decode run are 28480 fused against
+// 8000 solo — 4 workgroups per pool against 8.
 //
-// This is only a prediction, used to choose a path before any text exists. What
-// is ENFORCED is Body::workgroup_bytes() on the emitted body, so nothing the
-// hardware charges for rests on this number being right; a test pins the two
-// together so a drift shows up at build time rather than as a launch nobody
-// checked.
-std::uint32_t run_lds_bytes(const std::vector<IndexedStage>& stages,
-                            const std::vector<RowPanel>& panels,
-                            const std::vector<std::size_t>& panel_of) {
-  std::uint32_t bytes = 0;
-  for (const RowPanel& p : panels) {
-    bytes += kir::Lds::align(p.count * kir::pack_elem_bytes<kir::f32>());
-  }
+// An ESTIMATE, in the sense that no kernel has been compiled: it is what the
+// emitter is about to write, not what the assembler emitted. It is exact by
+// construction against Body::workgroup_bytes() on the merged body, and a test
+// pins the two together so a drift shows up at build time.
+struct ScratchCounts {
+  std::uint32_t fused = 0;
+  std::uint32_t worst_solo = 0;
+};
+
+// Which panels the merged body would hoist, and the int8 spec each would hoist
+// beside its row. Fills the panels in place because the emit path needs the
+// same answers to write the prologue, and two rules that could disagree is the
+// defect this replaces.
+void plan_hoisting(const std::vector<IndexedStage>& stages,
+                   std::vector<RowPanel>& panels,
+                   const std::vector<std::size_t>& panel_of,
+                   std::uint32_t run_block, std::uint32_t lds_budget) {
+  // A panel hoists the int8 form only when every stage reading the row would
+  // have produced the same one. One member on the float codec, or on another
+  // group size, and the codes would be wrong for it -- so the panel keeps the
+  // row alone and each member stages for itself, exactly as before.
   for (std::size_t si = 0; si < stages.size(); ++si) {
-    if (panel_of[si] == kNoPanel) {
-      bytes += kir::Lds::align(stages[si].plan.lds_bytes);
+    if (panel_of[si] == kNoPanel) continue;
+    RowPanel& panel = panels[panel_of[si]];
+    const kernels::DotStagingPlan& plan = stages[si].dot_plan;
+    if (!plan.valid() || plan.count != panel.count) {
+      panel.quant_plan = {};
+      panel.hoist_blocked = true;
+    } else if (!panel.hoist_blocked) {
+      if (panel.quant_plan.valid() && !(panel.quant_plan == plan)) {
+        panel.quant_plan = {};
+        panel.hoist_blocked = true;
+      } else {
+        panel.quant_plan = plan;
+      }
     }
   }
-  return bytes;
+  // A row only one stage wants is left to that stage. Hoisting it would put
+  // the fill under `row < rows` alone, and every workgroup of the run would
+  // then pay for it, including the ones covering tiles that stage does not
+  // have.
+  std::uint32_t used = 0;
+  for (RowPanel& panel : panels) {
+    panel.hoisted = panel.members >= 2;
+    panel.quant_hoisted = false;
+    if (!panel.hoisted) continue;
+    used += kir::Lds::align(panel.count * kir::pack_elem_bytes<kir::f32>());
+    if (!panel.quant_plan.valid()) continue;
+    const std::uint32_t q = kernels::staged_dot_bytes(
+        panel.quant_plan.count, panel.quant_plan.group_size, run_block);
+    // emit_staged_dot_acts declines what will not fit beside the row, and a
+    // declined hoist leaves every member staging for itself.
+    if (q == 0 || (lds_budget != 0 && used + q > lds_budget)) continue;
+    panel.quant_hoisted = true;
+    used += q;
+  }
 }
 
-// The largest scratch request among the launches a merge would replace. Each
-// stage on its own hoists only the panel it reads, so the unfused arrangement's
-// residency is the tightest of these — the one launch that seats fewest.
-std::uint32_t worst_solo_lds_bytes(const std::vector<IndexedStage>& stages,
-                                   const std::vector<RowPanel>& panels,
-                                   const std::vector<std::size_t>& panel_of) {
-  std::uint32_t worst = 0;
-  for (std::size_t si = 0; si < stages.size(); ++si) {
-    const std::uint32_t own =
-        panel_of[si] == kNoPanel
-            ? kir::Lds::align(stages[si].plan.lds_bytes)
-            : kir::Lds::align(panels[panel_of[si]].count *
-                              kir::pack_elem_bytes<kir::f32>());
-    if (own > worst) worst = own;
+ScratchCounts count_run_scratch(const std::vector<IndexedStage>& stages,
+                                const std::vector<RowPanel>& panels,
+                                const std::vector<std::size_t>& panel_of,
+                                const DeviceInfo& device,
+                                std::uint32_t run_block) {
+  const DialectSourceTable spellings = hip_sources();
+  const kir::TypeTable type_table = hip_types();
+  ScratchCounts out;
+  for (const RowPanel& panel : panels) {
+    if (!panel.hoisted) continue;
+    out.fused += kir::Lds::align(panel.count * kir::pack_elem_bytes<kir::f32>());
+    if (panel.quant_hoisted) {
+      out.fused += kernels::staged_dot_bytes(
+          panel.quant_plan.count, panel.quant_plan.group_size, run_block);
+    }
   }
-  return worst;
+  for (std::size_t si = 0; si < stages.size(); ++si) {
+    const IndexedStage& st = stages[si];
+    // The unfused arrangement's price for this member: what its own body
+    // declares with nothing hoisted for it. The tightest of these is what the
+    // arrangement's residency is, since it is the launch that seats fewest.
+    if (st.plan.lds_bytes > out.worst_solo) out.worst_solo = st.plan.lds_bytes;
+
+    KernelShapes s = st.shapes(device, type_table, spellings);
+    const RowPanel* panel =
+        panel_of[si] == kNoPanel ? nullptr : &panels[panel_of[si]];
+    if (panel != nullptr && panel->hoisted) {
+      s.staged = graph::StagedPanel{kPricedPanel, panel->count};
+      if (panel->quant_hoisted) {
+        s.staged_quant = graph::StagedQuantPanel{
+            kPricedPanel,
+            kPricedPanel,
+            kPricedPanel,
+            panel->quant_plan.count,
+            panel->quant_plan.group_size,
+            panel->quant_plan.bits};
+      }
+    }
+    out.fused += st.prim->plan(s).lds_bytes;
+  }
+  return out;
 }
 
 // Identity of the `__device__` helper the per-element scaffold emits for a
@@ -181,38 +289,94 @@ std::string device_fn_name(const KernelPrimitiveBase& kp, const Node& n) {
   return std::string(kp.entry_name()) + "_" + std::to_string(h);
 }
 
-std::vector<IndexedStage> indexed_stages(const FusionGroup& group,
+std::vector<IndexedStage> indexed_stages(std::span<const NodePtr> nodes,
                                          const DeviceInfo& device) {
   const graph::DialectSourceTable spellings = hip_sources();
   const kir::TypeTable type_table = hip_types();
   std::vector<IndexedStage> out;
-  std::vector<Shape> storage;
-  std::vector<DType> dtypes;
-  for (const NodePtr& n : group.nodes) {
+  for (const NodePtr& n : nodes) {
     const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
     if (kp == nullptr) continue;
-    storage.clear();
-    dtypes.clear();
-    storage.reserve(n->inputs.size());
-    dtypes.reserve(n->inputs.size());
+    IndexedStage st;
+    st.node = n;
+    st.in_shapes.reserve(n->inputs.size());
+    st.in_dtypes.reserve(n->inputs.size());
     for (const NodePtr& in : n->inputs) {
-      storage.push_back(in->shape);
-      dtypes.push_back(in->dtype);
+      st.in_shapes.push_back(in->shape);
+      st.in_dtypes.push_back(in->dtype);
     }
-    KernelShapes probe;
-    probe.inputs = storage;
-    probe.input_dtypes = dtypes;
-    probe.output = n->shape;
-    probe.output_dtype = n->dtype;
-    probe.attrs = n->attrs;
-    probe.iattrs = n->iattrs;
-    probe.device = &device;
-    probe.types = type_table;
-    probe.intrinsics = &spellings;
+    const KernelShapes probe = st.shapes(device, type_table, spellings);
     const KernelPrimitiveBase* chosen = kp->specialize(probe);
     if (chosen == nullptr || !chosen->owns_indexing()) continue;
-    out.push_back(
-        IndexedStage{n, chosen, chosen->plan(probe), chosen->staged_row(probe)});
+    st.prim = chosen;
+    // Nothing is described to it, so this is what the stage declares ALONE.
+    st.plan = chosen->plan(probe);
+    st.row = chosen->staged_row(probe);
+    st.dot_plan = kernels::dot_staging_plan(
+        probe, chosen->name() == "quant_linear_indexed");
+    out.push_back(std::move(st));
+  }
+  return out;
+}
+
+// The kernel signature, with the launch geometry the object will be dispatched
+// at stated to the compiler.
+//
+// WHY IT IS SAID AT ALL. Without a bound every emitted object reports
+// max_flat_workgroup_size 1024 — the AMDGPU default, which means the compiler
+// was told nothing and had to assume the widest workgroup the target allows.
+// The register allocator then sizes a wave's registers so that SIXTEEN waves
+// of one workgroup could co-reside, for a workgroup this engine never
+// launches, and the compiler's own occupancy figure is derived from that
+// assumption rather than from the dispatch. The engine knows the geometry at
+// emit time — it is the plan the dispatch will use — so it states it.
+//
+// MEASURED, gfx1151, Qwen3.5-0.8B-4bit, 109 kernels compared before and after:
+// 108 of them move from max_flat_workgroup_size 1024 to their real 256; the
+// remaining one really is a 1024-thread scaffold. Register allocation is
+// unchanged on 104, moves by one or two on four, and moves 113 -> 165 on one
+// staged body, which is the allocator taking the room the true bound gives it.
+// Nothing spills either way.
+//
+// LANDMINE: this is a PROMISE, not a hint. A dispatch with more threads than
+// the bound fails outright, so `flat_threads` must be the product of the same
+// LaunchDims::workgroup_size the emitted kernel is launched with and nothing
+// else. 0 states nothing, which is what an emitter that cannot know it does.
+std::string kernel_signature(std::string_view entry,
+                             std::uint32_t flat_threads) {
+  std::string out = "extern \"C\" __global__ ";
+  if (flat_threads != 0) {
+    out += "__launch_bounds__(" + std::to_string(flat_threads) + ") ";
+  }
+  out += "void ";
+  out += entry;
+  out += "(\n";
+  return out;
+}
+
+std::uint32_t flat_of(const std::uint32_t (&wg)[3]) noexcept {
+  const std::uint64_t n =
+      static_cast<std::uint64_t>(wg[0]) * wg[1] * wg[2];
+  return n == 0 || n > 0xFFFFFFFFull ? 0u : static_cast<std::uint32_t>(n);
+}
+
+// The entry names the launches this run would replace are compiled as.
+//
+// A member launching alone is a one-node group — its own inputs, itself as the
+// single output — which is exactly what the scheduler builds for a wide linear
+// that joins no group before it. The signature is therefore reproducible here
+// without emitting anything, and a measurement recorded against it last run
+// scores the unfused side of the comparison.
+std::vector<std::string> solo_entry_names(
+    const std::vector<IndexedStage>& stages) {
+  std::vector<std::string> out;
+  out.reserve(stages.size());
+  for (const IndexedStage& st : stages) {
+    FusionGroup one;
+    one.nodes.push_back(st.node);
+    one.outputs.push_back(st.node);
+    one.inputs = st.node->inputs;
+    out.push_back("lse_fused_" + std::to_string(one.signature()));
   }
   return out;
 }
@@ -409,6 +573,59 @@ std::string_view HipEmitter::prelude() const noexcept {
   return kPrelude;
 }
 
+graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
+    std::span<const graph::NodePtr> run, const DeviceInfo& device) const {
+  RunScratch out;
+  if (run.size() < 2) return out;
+  // The group the scheduler would build for this run, member for member and
+  // input for input, so the entry name below is the one the merged kernel is
+  // actually compiled as and a previous compile of it can be found.
+  FusionGroup g;
+  g.nodes.assign(run.begin(), run.end());
+  g.outputs.assign(run.begin(), run.end());
+  // The first member's inputs verbatim and each later member's deduplicated
+  // against them, which is exactly how the group grows there — including the
+  // detail that a first member naming one buffer twice keeps it twice. The
+  // signature is over this list, so a difference here is a different entry
+  // name and a measurement that is never found.
+  g.inputs = run.front()->inputs;
+  for (std::size_t i = 1; i < run.size(); ++i) {
+    for (const NodePtr& in : run[i]->inputs) {
+      bool seen = false;
+      for (const NodePtr& e : g.inputs) seen = seen || e.get() == in.get();
+      if (!seen) g.inputs.push_back(in);
+    }
+  }
+  g.anchor = run.front()->kind;
+  g.anchor_class = run.front()->fclass;
+
+  const std::uint64_t key = g.signature();
+  if (const auto it = run_scratch_cache_.find(key);
+      it != run_scratch_cache_.end()) {
+    return it->second;
+  }
+
+  const std::vector<IndexedStage> stages = indexed_stages(run, device);
+  // Not a run this emitter would write as one body: nothing to report, which
+  // the engine reads as no answer rather than as a free merge.
+  if (!sibling_stages(g, stages)) return out;
+
+  std::vector<std::size_t> panel_of;
+  std::vector<RowPanel> panels = row_panels(stages, panel_of);
+  const std::uint32_t threads = stages.front().plan.workgroup_size[0];
+  plan_hoisting(stages, panels, panel_of, threads,
+                workgroup_lds_bytes(&device));
+  const ScratchCounts bytes =
+      count_run_scratch(stages, panels, panel_of, device, threads);
+  out.threads = threads;
+  out.fused = bytes.fused;
+  out.worst_solo = bytes.worst_solo;
+  out.fused_entry = "lse_fused_" + std::to_string(key);
+  out.solo_entries = solo_entry_names(stages);
+  run_scratch_cache_.emplace(key, out);
+  return out;
+}
+
 Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
                                               const DeviceInfo& device) const {
   if (group.nodes.empty()) {
@@ -471,11 +688,10 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     return s;
   };
 
-  const auto stages = indexed_stages(group, device);
+  const auto stages = indexed_stages(group.nodes, device);
   std::vector<std::size_t> panel_of;
   std::vector<RowPanel> panels = row_panels(stages, panel_of);
   const std::uint32_t lds_budget = workgroup_lds_bytes(&device);
-  const std::uint32_t lds_needed = run_lds_bytes(stages, panels, panel_of);
   const std::string run_entry =
       "lse_fused_" + std::to_string(group.signature());
 
@@ -483,13 +699,18 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   // question is residency, which is counted from bytes and threads and is
   // therefore not this file's to answer.
   bool fuse = sibling_stages(group, stages);
+  ScratchCounts run_bytes;
   if (fuse) {
+    const std::uint32_t block = stages.front().plan.workgroup_size[0];
+    plan_hoisting(stages, panels, panel_of, block, lds_budget);
+    run_bytes = count_run_scratch(stages, panels, panel_of, device, block);
     opt::FusionCandidate candidate;
     candidate.threads = stages.front().plan.workgroup_size[0];
-    candidate.fused_scratch_bytes = lds_needed;
-    candidate.worst_solo_scratch_bytes =
-        worst_solo_lds_bytes(stages, panels, panel_of);
+    candidate.fused_scratch_bytes = run_bytes.fused;
+    candidate.worst_solo_scratch_bytes = run_bytes.worst_solo;
     candidate.fused_entry = run_entry;
+    const std::vector<std::string> solo = solo_entry_names(stages);
+    candidate.solo_entries = solo;
     fuse = opt::admit_fusion(opt::DeviceCapacity::of(device), candidate).admit;
   }
   if (fuse) {
@@ -536,7 +757,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     body << "#include <hip/hip_runtime.h>\n"
          << "#include <hip/hip_bf16.h>\n\n"
          << constants_decl(out.constants) << "\n"
-         << "extern \"C\" __global__ void " << out.entry_name << "(\n";
+         << kernel_signature(out.entry_name,
+                             flat_of(stages.front().plan.workgroup_size));
     for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
       const NodePtr& b = out.binding_order[i];
       const bool is_out = output_set.count(b.get()) != 0;
@@ -566,36 +788,9 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     // then pay for it, including the ones covering tiles that stage does not
     // have.
     const std::uint32_t run_block = stages.front().plan.workgroup_size[0];
-    // A panel hoists the int8 form only when every stage reading the row would
-    // have produced the same one. One member on the float codec, or on another
-    // group size, and the codes would be wrong for it -- so the panel keeps the
-    // row alone and each member stages for itself, exactly as before.
-    for (std::size_t si = 0; si < stages.size(); ++si) {
-      if (panel_of[si] == kNoPanel) continue;
-      RowPanel& panel = panels[panel_of[si]];
-      std::vector<Shape> plan_storage;
-      std::vector<DType> plan_dtypes;
-      const KernelShapes ps =
-          shapes_for(stages[si].node, plan_storage, plan_dtypes);
-      const bool indexed = stages[si].prim != nullptr &&
-                           stages[si].prim->name() == "quant_linear_indexed";
-      const kernels::DotStagingPlan plan =
-          kernels::dot_staging_plan(ps, indexed);
-      if (!plan.valid() || plan.count != panel.count) {
-        panel.quant_plan = {};
-        panel.hoist_blocked = true;
-      } else if (!panel.hoist_blocked) {
-        if (panel.quant_plan.valid() && !(panel.quant_plan == plan)) {
-          panel.quant_plan = {};
-          panel.hoist_blocked = true;
-        } else {
-          panel.quant_plan = plan;
-        }
-      }
-    }
     for (std::size_t p = 0; p < panels.size(); ++p) {
       RowPanel& panel = panels[p];
-      if (panel.members < 2) continue;
+      if (!panel.hoisted) continue;
       const auto ait = binding_of.find(panel.act);
       if (ait == binding_of.end()) {
         return LSE_ERROR(kInternal,
@@ -611,7 +806,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
         const kir::Buffer<kir::f32> act(&kb, &kb.types(), act_buf);
         panel.name = kernels::emit_staged_row(kb, act, panel.count,
                                                   panel.rows, run_block);
-        if (!panel.name.empty() && panel.quant_plan.valid()) {
+        if (!panel.name.empty() && panel.quant_hoisted) {
           panel.quant = kernels::emit_staged_dot_acts(
               kb, panel.name, panel.count, panel.quant_plan.group_size,
               panel.rows, run_block);
@@ -626,6 +821,13 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     ThreadPlan unified;
     unified.workgroup_size[0] = 1;
     unified.workgroup_count[0] = 1;
+    // The signature above already promised the compiler a flat size, taken
+    // from the first stage because sibling_stages required every stage to
+    // agree; `unified` below is the max over the same stages and so must come
+    // out the same. A dispatch wider than the bound fails outright, so the two
+    // are checked against each other rather than assumed equal.
+    const std::uint32_t promised_threads =
+        flat_of(stages.front().plan.workgroup_size);
     for (std::size_t si = 0; si < stages.size(); ++si) {
       const IndexedStage& st = stages[si];
       std::vector<Shape> storage;
@@ -720,6 +922,12 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
           unified.workgroup_count[d] = tp.workgroup_count[d];
         }
       }
+    }
+
+    if (flat_of(unified.workgroup_size) != promised_threads) {
+      return LSE_ERROR(kInternal,
+                       "the fused run's launch geometry does not match the "
+                       "bound its signature declares");
     }
 
     std::vector<ir::PassStat> pass_stats;
@@ -1050,12 +1258,17 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
                        "' owns its indexing but never stored through the hook");
     }
 
+    // The thread map is the primitive's, not choose_dims': a tile-per-workgroup
+    // layout has nothing to do with the output element count. Asked here and
+    // not after the body, because the signature states it.
+    const ThreadPlan tp = self_indexed->plan(shapes);
+
     std::ostringstream body;
     body << "#include <hip/hip_runtime.h>\n"
          << "#include <hip/hip_bf16.h>\n\n"
          << constants_decl(out.constants) << "\n"
          << preamble.str() << "\n"
-         << "extern \"C\" __global__ void " << out.entry_name << "(\n";
+         << kernel_signature(out.entry_name, flat_of(tp.workgroup_size));
     std::unordered_set<const Node*> group_members;
     for (const NodePtr& n : group.nodes) group_members.insert(n.get());
     const int inplace =
@@ -1085,9 +1298,6 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
          << self_body << "\n}\n";
     out.source = body.str();
 
-    // The thread map is the primitive's, not choose_dims': a tile-per-workgroup
-    // layout has nothing to do with the output element count.
-    const ThreadPlan tp = self_indexed->plan(shapes);
     for (int d = 0; d < 3; ++d) {
       out.dims.workgroup_size[d] = tp.workgroup_size[d];
       out.dims.workgroup_count[d] = tp.workgroup_count[d];
@@ -1119,13 +1329,18 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     launch_elems = std::max(launch_elems, o->element_count());
   }
 
-  std::ostringstream src;
-  src << "#include <hip/hip_runtime.h>\n"
-      << "#include <hip/hip_bf16.h>\n\n"
-      << constants_decl(out.constants) << "\n"
-      << preamble.str() << "\n"
-      << "extern \"C\" __global__ void " << out.entry_name << "(\n";
+  // Two halves, joined once the launch geometry is known: choose_dims reads
+  // the scratch the finished text declares, and the signature states what
+  // choose_dims answered. Neither can be written before the other, so the
+  // signature is the last thing assembled — no declaration lives in it, so
+  // the scratch count is the same either way.
+  std::ostringstream head;
+  head << "#include <hip/hip_runtime.h>\n"
+       << "#include <hip/hip_bf16.h>\n\n"
+       << constants_decl(out.constants) << "\n"
+       << preamble.str() << "\n";
 
+  std::ostringstream src;
   for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
     const NodePtr& n = out.binding_order[i];
     const bool is_out = output_set.count(n.get()) != 0;
@@ -1303,11 +1518,10 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   src << "}\n";
 
-  out.source = src.str();
   // Measured, not left at whatever `out.lds_bytes` was initialized to: this is
   // the one place choose_dims reads it, and it used to be structurally 0 here
   // because every path that assigns it returns before reaching this line.
-  auto declared = shared_bytes(out.source);
+  auto declared = shared_bytes(head.str() + src.str());
   if (!declared.ok()) return declared.status();
   if (lds_budget != 0 && *declared > lds_budget) {
     return LSE_ERROR(kOutOfMemory, "element scaffold declares ",
@@ -1317,6 +1531,9 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   }
   out.lds_bytes = *declared;
   out.dims = choose_dims(group, device, out.lds_bytes);
+  out.source = head.str() +
+               kernel_signature(out.entry_name, flat_of(out.dims.workgroup_size)) +
+               src.str();
   emit_cache_[sig] =
       CachedEmit{out.source, out.entry_name, out.dims, *declared};
   return out;

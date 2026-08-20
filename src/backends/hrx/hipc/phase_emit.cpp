@@ -22,6 +22,12 @@ using namespace lse::graph;
 
 namespace {
 
+// The workgroup this body is written for. Every stage spliced into it strides
+// by 256 as a source literal, so the geometry is fixed by the text; naming it
+// here keeps the bound the object declares and the dims it is dispatched at
+// one number rather than two that can drift.
+constexpr std::uint32_t kPhaseBlock = 256;
+
 // Must agree with hip_types.cpp and hip_emitter.cpp: __bf16, the compiler's
 // own type, which casts to and from float directly.
 std::string_view device_scalar(DType dt) noexcept {
@@ -949,7 +955,13 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
         << "  __syncthreads();\n"
         << "}\n\n";
   }
-  src << "extern \"C\" __global__ void " << out.entry_name << "(\n";
+  // 256 is this body's own geometry — every stage it splices strides by it as
+  // a source literal — so the bound below and out.dims.workgroup_size[0] are
+  // one number, stated once here and once there. Without it the object reports
+  // the AMDGPU default of 1024, which means "unknown" and leaves the register
+  // allocator with no occupancy target.
+  src << "extern \"C\" __global__ __launch_bounds__(" << kPhaseBlock
+      << ") void " << out.entry_name << "(\n";
   for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
     src << "    float* __restrict__ b" << i << ",\n";
   }
@@ -959,7 +971,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       << stages.str() << "}\n";
   out.source = src.str();
   out.persist_grid = persist;
-  out.dims.workgroup_size[0] = 256;
+  out.dims.workgroup_size[0] = kPhaseBlock;
   if (persist) {
     out.dims.workgroup_count[0] = persist_wgs;
     out.dims.workgroup_count[1] = 1;

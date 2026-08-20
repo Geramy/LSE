@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -146,6 +147,42 @@ class IKernelEmitter {
   // phase body to fold them into.
   [[nodiscard]] virtual const IPhaseStaging* staging() const noexcept {
     return nullptr;
+  }
+
+  // What a candidate run of sibling stages would cost in workgroup scratch,
+  // both ways, so the engine can compare their residency before the run is
+  // formed.
+  //
+  // THE BACKEND REPORTS BYTES; THE ENGINE COUNTS RESIDENCY. Which arrays a
+  // merged body declares, which a solo body declares, and whether a hoisted
+  // panel relieves a stage of its own staging are all facts about this
+  // emitter's lowering. What those bytes are worth in resident workgroups is
+  // arithmetic over the device's facts, and that stays in lse::opt.
+  //
+  // BOTH FIGURES MUST BE THE SAME QUANTITY — the sum of the workgroup-shared
+  // arrays in the body that would be printed — or the comparison means
+  // nothing. Pricing the unfused arrangement as the fused one's hoisted panel
+  // makes every candidate a tie, which is exactly the state this replaced.
+  //
+  // `fused == 0` or `threads == 0` is NO ANSWER, not a free run: an emitter
+  // that would not write this run as one body has nothing to report, and the
+  // engine keeps the arrangement it had.
+  struct RunScratch {
+    std::uint32_t threads = 0;
+    std::uint32_t fused = 0;
+    std::uint32_t worst_solo = 0;
+    // Entry names the two arrangements would be compiled as, so a decision
+    // can be scored from previous compiles instead of from these counts.
+    // Empty asks nothing of the measurement table.
+    std::string fused_entry;
+    std::vector<std::string> solo_entries;
+  };
+  [[nodiscard]] virtual RunScratch run_scratch(
+      std::span<const NodePtr> run,
+      const backend::DeviceInfo& device) const {
+    (void)run;
+    (void)device;
+    return {};
   }
 };
 

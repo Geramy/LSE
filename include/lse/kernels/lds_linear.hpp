@@ -105,6 +105,15 @@ struct StagedQuantNames {
     graph::kir::KernelBody& k, std::string_view row, std::uint32_t count,
     std::int32_t group_size, std::uint32_t rows, std::uint32_t block);
 
+// Workgroup scratch emit_staged_dot_acts declares for one panel, in bytes, and
+// 0 under exactly the conditions that make it decline. Beside the call that
+// declares those arrays because a fusion's residency is counted from this
+// figure: the two drifting apart is a run admitted against a launch that never
+// happens.
+[[nodiscard]] std::uint32_t staged_dot_bytes(std::uint32_t count,
+                                             std::int32_t group_size,
+                                             std::uint32_t block);
+
 // Small-M linear through an LDS K-panel. Null when the tile does not fit or
 // the device has no workgroup scratch.
 const graph::KernelPrimitiveBase* lds_linear_for(const graph::KernelShapes& s);

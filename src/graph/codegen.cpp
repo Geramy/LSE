@@ -69,10 +69,10 @@ backend::LaunchDims choose_launch_dims(const FusionGroup& group,
       best = threads;
       continue;
     }
-    opt::KernelDemand demand;
-    demand.threads = threads;
-    demand.lds_bytes = lds_bytes;
-    if (opt::occupancy(capacity, demand).seated()) best = threads;
+    if (opt::occupancy(capacity, opt::KernelDemand::counted(threads, lds_bytes))
+            .seated()) {
+      best = threads;
+    }
   }
 
   backend::LaunchDims dims;

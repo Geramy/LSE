@@ -171,8 +171,7 @@ std::uint32_t chunks_per_step(const QuantDims& d, std::uint32_t max_bytes) {
 }
 
 ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave,
-                     std::uint32_t lds_budget, std::uint32_t staged_bytes,
-                     std::uint32_t rows_per_wg) {
+                     std::uint32_t lds_bytes, std::uint32_t rows_per_wg) {
   if (wave != 32 && wave != 64) wave = 32;
   const std::uint32_t waves = kBlock / wave;
   ThreadPlan tp;
@@ -183,12 +182,7 @@ ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave,
   const auto m = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
   tp.workgroup_count[1] = (m + rows - 1) / rows;
   tp.workgroup_count[2] = 1;
-  const std::uint32_t need =
-      staged_bytes != 0
-          ? staged_bytes
-          : kir::Lds::align(static_cast<std::uint32_t>(d.k) *
-                            kir::pack_elem_bytes<kir::f32>());
-  if (lds_budget == 0 || need <= lds_budget) tp.lds_bytes = need;
+  tp.lds_bytes = lds_bytes;
   return tp;
 }
 
@@ -325,23 +319,60 @@ std::uint32_t rows_per_group(const QuantDims& d, bool dot, bool indexed,
   return r;
 }
 
+// Whether this body takes the integer path. Not the same question as
+// dot_ok(): reading a run's hoisted int8 panel costs this body no scratch at
+// all, so a shape whose own staging would not fit still takes the path when
+// the run staged it. emit_body decides it exactly this way.
+bool body_dot(const KernelShapes& s, const QuantDims& d) {
+  if (!d.valid) return false;
+  const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
+  if (!dot_ok(s, d, wave_of(s.device), cpl)) return false;
+  const std::uint32_t budget = workgroup_lds_bytes(s.device);
+  const bool quant_hoisted = s.staged_quant.matches(
+      static_cast<std::uint32_t>(d.k), d.spec.group_size, d.spec.bits);
+  return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
+}
+
 // R for this shape, or 1 when the integer path does not apply. The plan and
 // the body must agree on it exactly: it sets the grid and the scratch.
 std::uint32_t dot_rows(const KernelShapes& s, const QuantDims& d,
                        bool indexed) {
   if (!d.valid) return 1;
-  const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
-  if (!dot_ok(s, d, wave_of(s.device), cpl)) return 1;
-  return rows_per_group(d, true, indexed, workgroup_lds_bytes(s.device));
+  return rows_per_group(d, body_dot(s, d), indexed,
+                        workgroup_lds_bytes(s.device));
 }
 
-std::uint32_t staged_bytes(const KernelShapes& s, const QuantDims& d,
-                           bool indexed) {
+// Exactly the workgroup-shared arrays emit_body declares, under exactly the
+// same conditions and in the same order of decision. The plan and the body
+// cannot be allowed to disagree: this is the number a fusion's residency is
+// counted from, so a body that declares more than this is admitted against a
+// launch that never happens.
+//
+// A run that hoists the activation row — or the row's int8 form — ahead of
+// every sibling leaves this body nothing of its own to declare. `s.staged` and
+// `s.staged_quant` are how a caller states that, so pricing an arrangement is
+// asking this with them set the way that arrangement would set them, and
+// pricing the same stage ALONE is asking with them clear. One quantity, two
+// arrangements.
+std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
+                             bool indexed) {
   if (!d.valid) return 0;
-  const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
-  if (!dot_ok(s, d, wave_of(s.device), cpl)) return 0;
+  const auto k = static_cast<std::uint32_t>(d.k);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
-  const std::uint32_t need = dot_rows(s, d, indexed) * dot_lds_bytes(d);
+  const bool quant_hoisted =
+      s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
+  const bool dot = body_dot(s, d);
+  const std::uint32_t rows = rows_per_group(d, dot, indexed, budget);
+  if (dot) {
+    // A hoisted int8 panel holds ONE row; a workgroup covering several reads
+    // its siblings' activations from global and stages them itself.
+    if (quant_hoisted && rows == 1) return 0;
+    const std::uint32_t need = rows * dot_lds_bytes(d);
+    return (budget == 0 || need <= budget) ? need : 0;
+  }
+  if (rows == 1 && s.staged.count == k && !s.staged.name.empty()) return 0;
+  const std::uint32_t need =
+      kir::Lds::align(k * kir::pack_elem_bytes<kir::f32>());
   return (budget == 0 || need <= budget) ? need : 0;
 }
 
@@ -555,8 +586,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   // own, so the fit question is only about the tiles it would allocate itself.
   const bool quant_hoisted =
       s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
-  const bool dot = dot_ok(s, d, wave, cpl) &&
-                   (quant_hoisted || kb.lds().fits(dot_lds_bytes(d)));
+  const bool dot = body_dot(s, d);
   // Exactly what plan_impl sized the grid and the scratch for, and it cannot
   // depend on anything plan_impl does not see. Deciding it from the hoisted
   // panel instead left the grid covering m/R rows while each workgroup wrote
@@ -722,6 +752,19 @@ DotStagingPlan dot_staging_plan(const KernelShapes& s, bool indexed) {
                         d.spec.bits};
 }
 
+std::uint32_t staged_dot_bytes(std::uint32_t count, std::int32_t group_size,
+                               std::uint32_t block) {
+  constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
+  if (count == 0 || block != kBlock || group_size <= 0) return 0;
+  const auto gs = static_cast<std::uint32_t>(group_size);
+  if (count % gs != 0 || gs % kCodes != 0) return 0;
+  const std::uint32_t nchunks = count / kCodes;
+  const std::uint32_t groups = count / gs;
+  constexpr std::uint32_t w = kir::pack_elem_bytes<kir::u32>();
+  return kir::Lds::align(2 * nchunks * w) + kir::Lds::align(nchunks * w) +
+         kir::Lds::align(groups * w);
+}
+
 StagedQuantNames emit_staged_dot_acts(kir::KernelBody& k, std::string_view row,
                                       std::uint32_t count,
                                       std::int32_t group_size,
@@ -819,8 +862,8 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
     const QuantDims d = dims_of(s, false);
-    return gemv_plan(d, wave_of(s.device), workgroup_lds_bytes(s.device),
-                     staged_bytes(s, d, false), dot_rows(s, d, false));
+    return gemv_plan(d, wave_of(s.device), body_lds_bytes(s, d, false),
+                     dot_rows(s, d, false));
   }
 };
 
@@ -874,8 +917,8 @@ struct QuantLinearIndexedKernel final
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
     const QuantDims d = dims_of(s, true);
-    return gemv_plan(d, wave_of(s.device), workgroup_lds_bytes(s.device),
-                     staged_bytes(s, d, true), dot_rows(s, d, true));
+    return gemv_plan(d, wave_of(s.device), body_lds_bytes(s, d, true),
+                     dot_rows(s, d, true));
   }
 };
 

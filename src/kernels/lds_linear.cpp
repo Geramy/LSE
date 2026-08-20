@@ -86,8 +86,12 @@ bool lds_shape_ok(const LinearDims& d) {
   return d.valid && d.m > 0 && d.m < kMaxRows && d.n >= 16 && d.k >= 16;
 }
 
+// `staged` is the panel a fused run hoisted ahead of this body, empty when the
+// body stands alone. It decides the answer: with a hoisted row this body
+// declares no scratch of its own, so the two arrangements are priced by asking
+// this one function twice rather than by two rules that can drift apart.
 ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave,
-                     std::uint32_t lds_budget) {
+                     std::uint32_t lds_budget, StagedPanel staged) {
   if (wave != 32 && wave != 64) wave = 32;
   const std::uint32_t waves = kBlock / wave;
   ThreadPlan tp;
@@ -101,8 +105,10 @@ ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave,
   // The staged activation row, priced the way kir::Lds prices it. Whoever asks
   // for the plan is asking what the launch costs, and a K-float workgroup array
   // is most of what one of these costs in occupancy.
-  const std::uint32_t need = kir::Lds::align(
-      static_cast<std::uint32_t>(d.k) * kir::pack_elem_bytes<kir::f32>());
+  const auto k = static_cast<std::uint32_t>(d.k);
+  if (staged.count == k && !staged.name.empty()) return tp;
+  const std::uint32_t need =
+      kir::Lds::align(k * kir::pack_elem_bytes<kir::f32>());
   if (lds_budget == 0 || need <= lds_budget) tp.lds_bytes = need;
   return tp;
 }
@@ -363,7 +369,7 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     return gemv_plan(dims_of_linear(s), wave_of(s.device),
-                     workgroup_lds_bytes(s.device));
+                     workgroup_lds_bytes(s.device), s.staged);
   }
 };
 
@@ -432,7 +438,7 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
   }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     return gemv_plan(dims_of_indexed(s), wave_of(s.device),
-                     workgroup_lds_bytes(s.device));
+                     workgroup_lds_bytes(s.device), s.staged);
   }
 };
 

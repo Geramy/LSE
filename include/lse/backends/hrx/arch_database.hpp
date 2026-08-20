@@ -32,11 +32,17 @@ struct FamilyIsa {
   // SIMDs in one CU. RDNA is 2, GCN and CDNA are 4. With cus_per_lds_pool this
   // is what turns a per-SIMD budget into a per-pool one.
   std::uint8_t simds_per_cu;
-  // The workgroup-scratch block a pool allocates from, which is NOT
-  // lds_bytes_per_workgroup times cus_per_lds_pool in general — that identity
-  // holds on RDNA by coincidence and breaks where the per-workgroup cap is
-  // itself the whole block.
+  // The workgroup-scratch block a pool allocates from, AND the CU count that
+  // figure is stated for. THE TWO ARE ONE FACT and must be read together: this
+  // is NOT lds_bytes_per_workgroup times cus_per_lds_pool in general — that
+  // identity holds on RDNA by coincidence and breaks where the per-workgroup
+  // cap is itself the whole block — so the block size cannot be rescaled to a
+  // pool of a different shape. 131072 on RDNA is the block behind a TWO-CU
+  // WGP; read at cus_per_lds_pool = 1 it is a silent factor of two in every
+  // residency answer, which is why the pair is spelled out rather than
+  // assumed.
   std::uint32_t lds_bytes_per_pool;
+  std::uint8_t lds_bytes_per_pool_cus;
   MatrixCore matrix_core;
   bool has_bf16_arith;
   bool matrix_core_bf16;
@@ -61,21 +67,21 @@ struct BoardFallback {
 // from this pair, so a wrong cell here is now a wrong occupancy rather than an
 // unread number.
 inline constexpr FamilyIsa kFamilyIsa[] = {
-    {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072,
+    {ArchFamily::kRdna2, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072, 2,
      MatrixCore::kNone, false, false, true, false, 16, 16},
-    {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072,
+    {ArchFamily::kRdna3, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072, 2,
      MatrixCore::kWMMA, true, true, true, true, 16, 16},
-    {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, 2, 2, 131072,
+    {ArchFamily::kRdna35, 1024, 65536, 2u << 20, 32, 32, 2, 2, 131072, 2,
      MatrixCore::kWMMA, true, true, true, true, 16, 16},
-    {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072,
+    {ArchFamily::kRdna4, 1024, 65536, 4u << 20, 32, 32, 2, 2, 131072, 2,
      MatrixCore::kWMMA, true, true, true, true, 16, 16},
-    {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, 1, 4, 65536,
+    {ArchFamily::kCdna1, 1024, 65536, 8u << 20, 40, 64, 1, 4, 65536, 1,
      MatrixCore::kMFMA, false, false, true, false, 16, 16},
-    {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 32, 64, 1, 4, 65536,
+    {ArchFamily::kCdna2, 1024, 65536, 8u << 20, 32, 64, 1, 4, 65536, 1,
      MatrixCore::kMFMA, true, true, true, false, 16, 16},
-    {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, 1, 4, 65536,
+    {ArchFamily::kCdna3, 1024, 65536, 4u << 20, 32, 64, 1, 4, 65536, 1,
      MatrixCore::kMFMA, true, true, true, false, 16, 16},
-    {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, 1, 4, 65536,
+    {ArchFamily::kCdna4, 1024, 65536, 4u << 20, 32, 64, 1, 4, 65536, 1,
      MatrixCore::kMFMA, true, true, true, false, 16, 16},
 };
 
@@ -140,7 +146,14 @@ inline void apply_residency_facts(DeviceInfo& info) {
                                   : isa->cus_per_lds_pool;
     info.arch_facts.simds_per_lds_pool = DeviceFact<std::uint32_t>::declared(
         static_cast<std::uint32_t>(isa->simds_per_cu) * cus);
-    if (isa->lds_bytes_per_pool != 0) {
+    // The block size and the CU count it was stated for travel together. The
+    // SIMD count above follows the live part, so a part that pairs its cores
+    // differently from the family row would otherwise inherit a block sized
+    // for the row's pairing and divide it among a pool of another shape — a
+    // factor of two that cancels on this part and on no argument. Nothing
+    // states the block for a pool of that shape, so the fact stays UNKNOWN and
+    // the scratch limit drops out of the min instead of being invented.
+    if (isa->lds_bytes_per_pool != 0 && cus == isa->lds_bytes_per_pool_cus) {
       info.arch_facts.lds_bytes_per_pool =
           DeviceFact<std::uint32_t>::declared(isa->lds_bytes_per_pool);
     }

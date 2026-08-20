@@ -19,6 +19,7 @@
 #include "lse/graph/program.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/opt/fusion.hpp"
 
 namespace lse::graph {
 namespace {
@@ -690,6 +691,33 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           for (const NodePtr& in : n->inputs) {
             if (in.get() == m.get()) return false;
           }
+        }
+        // RESIDENCY, AT THE POINT THE ALTERNATIVE STILL EXISTS. Refusing here
+        // leaves each member the group of its own it would have had, and each
+        // then gets its own self-indexed body. Refusing later, at emit time,
+        // does not: the group exists by then, and a multi-output group the
+        // emitter declines drops to the per-element scaffold, which is worse
+        // than either arrangement. So this is where the answer is taken.
+        //
+        // The emitter prices both arrangements — bytes are its lowering's
+        // business — and lse::opt counts what those bytes are worth in
+        // resident workgroups. `fused == 0` means the emitter would not write
+        // this run as one body and has nothing to say, so the arrangement
+        // stands as before.
+        std::vector<NodePtr> run(prev.nodes.begin(), prev.nodes.end());
+        run.push_back(n);
+        const IKernelEmitter::RunScratch cost =
+            emitter->run_scratch(run, backend().device_info());
+        if (cost.fused != 0 && cost.threads != 0) {
+          opt::FusionCandidate cand;
+          cand.threads = cost.threads;
+          cand.fused_scratch_bytes = cost.fused;
+          cand.worst_solo_scratch_bytes = cost.worst_solo;
+          cand.fused_entry = cost.fused_entry;
+          cand.solo_entries = cost.solo_entries;
+          const opt::DeviceCapacity cap =
+              opt::DeviceCapacity::of(backend().device_info());
+          if (!opt::admit_fusion(cap, cand).admit) return false;
         }
         prev.nodes.push_back(n);
         prev.outputs.push_back(n);

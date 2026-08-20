@@ -78,12 +78,22 @@ DeviceCapacity DeviceCapacity::of(const backend::DeviceInfo& info) {
   return c;
 }
 
+KernelDemand KernelDemand::counted(std::uint32_t threads,
+                                   std::uint32_t lds_bytes) {
+  KernelDemand d;
+  d.threads = threads;
+  d.lds_bytes = backend::DeviceFact<std::uint32_t>::queried(lds_bytes);
+  return d;
+}
+
 KernelDemand KernelDemand::measured(std::uint32_t threads,
                                     const backend::KernelResources& r) {
   KernelDemand d;
   d.threads = threads;
-  // What the compiler emitted, not what an emitter predicted it would.
-  d.lds_bytes = r.workgroup_segment_bytes.value_or(0u);
+  // What the compiler emitted, not what an emitter predicted it would — and
+  // carried WITH its provenance, so an object whose metadata never mentioned a
+  // workgroup segment arrives unknown rather than as a request for none.
+  d.lds_bytes = r.workgroup_segment_bytes;
   d.vector_registers = r.vector_registers;
   d.spill = r.spilled();
   return d;
@@ -92,7 +102,7 @@ KernelDemand KernelDemand::measured(std::uint32_t threads,
 Occupancy occupancy(const DeviceCapacity& cap, const KernelDemand& demand) {
   Occupancy occ;
   occ.spill = demand.spill;
-  occ.scratch_request_bytes = demand.lds_bytes;
+  occ.scratch_request = demand.lds_bytes;
   if (!cap.usable() || demand.threads == 0) return occ;
 
   const std::uint32_t wave = cap.wavefront_size.value;
@@ -104,7 +114,8 @@ Occupancy occupancy(const DeviceCapacity& cap, const KernelDemand& demand) {
     return occ;
   }
   if (cap.lds_bytes_addressable_per_workgroup.known() &&
-      demand.lds_bytes > cap.lds_bytes_addressable_per_workgroup.value) {
+      demand.lds_bytes.known() &&
+      demand.lds_bytes.value > cap.lds_bytes_addressable_per_workgroup.value) {
     return occ;
   }
 
@@ -148,15 +159,21 @@ Occupancy occupancy(const DeviceCapacity& cap, const KernelDemand& demand) {
   // an upper bound; see the scratch arm below.
 
   // WORKGROUP SCRATCH. Zero bytes asks nothing of the pool, which is a real
-  // answer and not a missing one.
-  if (demand.lds_bytes != 0) {
+  // answer and not a missing one — but a demand NOBODY answered is missing,
+  // and it drops the arm in the direction that understates the request. That
+  // is the same degradation an unknown pool size gets, and for the same
+  // reason: the alternative is handing the arrangement the pool's whole
+  // capacity and calling the figure exact.
+  if (!demand.lds_bytes.known()) {
+    exact = false;
+  } else if (demand.lds_bytes.value != 0) {
     if (cap.lds_bytes_per_pool.known()) {
       // An unknown granule means the request is charged unrounded, which
       // UNDER-states what it costs — so the answer is marked inexact and a
       // decision that would admit on it is held to strict improvement.
       if (!cap.lds_alloc_granule_bytes.known()) exact = false;
       const std::uint32_t granule = cap.lds_alloc_granule_bytes.value_or(1u);
-      const std::uint32_t charged = align_up(demand.lds_bytes, granule);
+      const std::uint32_t charged = align_up(demand.lds_bytes.value, granule);
       const std::uint32_t by_lds =
           charged == 0 ? wgs : cap.lds_bytes_per_pool.value / charged;
       occ.waves_by_scratch = (by_lds * waves_per_wg) / simds;
@@ -221,7 +238,13 @@ bool prefer(const Occupancy& candidate, const Occupancy& incumbent) {
   // incumbent — an unmeasured granule cannot separate two equal requests, but
   // it can hide a step between two different ones.
   if (candidate.exact && incumbent.exact) return true;
-  return candidate.scratch_request_bytes <= incumbent.scratch_request_bytes;
+  // Two requests can only be compared when both were answered. An unknown
+  // request on either side is not "no bytes"; treating it as one is how the
+  // unmeasured arrangement comes to win a tie it was never scored for.
+  if (!candidate.scratch_request.known() || !incumbent.scratch_request.known()) {
+    return false;
+  }
+  return candidate.scratch_request.value <= incumbent.scratch_request.value;
 }
 
 }  // namespace lse::opt

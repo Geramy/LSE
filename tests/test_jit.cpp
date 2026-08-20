@@ -237,7 +237,15 @@ LSE_TEST(emitter_produces_a_complete_translation_unit) {
   }
 
   LSE_EXPECT(e->source.find("#include <hip/hip_runtime.h>") != std::string::npos);
-  LSE_EXPECT(e->source.find("extern \"C\" __global__ void") != std::string::npos);
+  // The launch geometry is stated, not left at the target's "unknown" default
+  // of 1024 — see kernel_signature in hip_emitter.cpp — and the number is the
+  // flat size the dims say it will be dispatched at.
+  const std::uint32_t flat = e->dims.workgroup_size[0] *
+                             e->dims.workgroup_size[1] *
+                             e->dims.workgroup_size[2];
+  LSE_EXPECT(e->source.find("extern \"C\" __global__ __launch_bounds__(" +
+                            std::to_string(flat) + ") void") !=
+             std::string::npos);
   LSE_EXPECT(e->source.find(e->entry_name) != std::string::npos);
   LSE_EXPECT(e->source.find("if (i >= k.count) return;") != std::string::npos);
   LSE_EXPECT(e->entry_name.rfind("lse_fused_", 0) == 0);
@@ -843,8 +851,9 @@ LSE_TEST(a_matmul_kernel_becomes_a_device_function_the_emitter_wraps) {
   }
   // The primitive supplies a body; the emitter owns the entry point.
   LSE_EXPECT(e->source.find("__device__ float lse_matmul_") != std::string::npos);
-  LSE_EXPECT(e->source.find("extern \"C\" __global__ void lse_fused_") !=
+  LSE_EXPECT(e->source.find("__global__ __launch_bounds__(") !=
              std::string::npos);
+  LSE_EXPECT(e->source.find(") void lse_fused_") != std::string::npos);
   LSE_EXPECT(e->source.find("lse_matmul_") != std::string::npos);
   // Extents baked in, not read from a constant; the env names the loop var.
   LSE_EXPECT(e->source.find(" < 8u") != std::string::npos);
@@ -3260,10 +3269,8 @@ LSE_TEST(the_occupancy_model_reproduces_the_measured_hardware_table) {
       {32, 8192, 16},  {32, 9000, 14},  {32, 12000, 10}, {32, 16000, 8},
   };
   for (const Row& r : kMeasured) {
-    opt::KernelDemand demand;
-    demand.threads = r.threads;
-    demand.lds_bytes = r.lds;
-    const opt::Occupancy occ = opt::occupancy(cap, demand);
+    const opt::Occupancy occ =
+        opt::occupancy(cap, opt::KernelDemand::counted(r.threads, r.lds));
     LSE_EXPECT_EQ(occ.workgroups_per_pool, r.wgs_per_pool);
     if (occ.workgroups_per_pool != r.wgs_per_pool) {
       std::printf("       threads=%u lds=%u got=%u want=%u\n", r.threads,
@@ -3272,10 +3279,8 @@ LSE_TEST(the_occupancy_model_reproduces_the_measured_hardware_table) {
   }
   // Past the device's own per-workgroup cap there is no legal launch at all,
   // and that is a different answer from "one workgroup fits".
-  opt::KernelDemand over;
-  over.threads = 256;
-  over.lds_bytes = 65552;
-  LSE_EXPECT(!opt::occupancy(cap, over).seated());
+  LSE_EXPECT(!opt::occupancy(cap, opt::KernelDemand::counted(256, 65552))
+                  .seated());
 }
 
 // THE RULE: occupancy is the minimum over every limit that applies, and the
@@ -3285,15 +3290,14 @@ LSE_TEST(occupancy_is_the_minimum_over_the_limits_that_apply) {
   const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
 
   // Nothing scarce: the wave slots are the ceiling, as they always are.
-  opt::KernelDemand plain;
-  plain.threads = 256;
+  opt::KernelDemand plain = opt::KernelDemand::counted(256, 0);
   const opt::Occupancy slots = opt::occupancy(cap, plain);
   LSE_EXPECT(slots.binding == opt::OccupancyLimit::kWaveSlots);
   LSE_EXPECT_EQ(slots.waves_per_simd, 16u);
 
   // Scratch scarce, registers not.
   opt::KernelDemand lds = plain;
-  lds.lds_bytes = 48000;
+  lds.lds_bytes = backend::DeviceFact<std::uint32_t>::queried(48000);
   const opt::Occupancy by_lds = opt::occupancy(cap, lds);
   LSE_EXPECT(by_lds.binding == opt::OccupancyLimit::kWorkgroupScratch);
   LSE_EXPECT_EQ(by_lds.workgroups_per_pool, 2u);
@@ -3317,14 +3321,14 @@ LSE_TEST(occupancy_is_the_minimum_over_the_limits_that_apply) {
   // And it really is a minimum: cutting scratch cannot buy back a wave the
   // register file already refused.
   opt::KernelDemand regs_no_lds = regs;
-  regs_no_lds.lds_bytes = 0;
+  regs_no_lds.lds_bytes = backend::DeviceFact<std::uint32_t>::queried(0);
   LSE_EXPECT_EQ(opt::occupancy(cap, regs_no_lds).waves_per_simd, 12u);
 
   // Both scarce: the tighter one wins, and the loser is still reported.
   // 200 vgprs allocate 216 and give 7 waves/SIMD, i.e. 3 workgroups of 8 waves
   // per pool; 32000 B of scratch rounds to 32768 and gives 4. Registers bind.
   opt::KernelDemand both = plain;
-  both.lds_bytes = 32000;
+  both.lds_bytes = backend::DeviceFact<std::uint32_t>::queried(32000);
   both.vector_registers = backend::DeviceFact<std::uint32_t>::queried(200);
   const opt::Occupancy min = opt::occupancy(cap, both);
   LSE_EXPECT(min.binding == opt::OccupancyLimit::kVectorRegisters);
@@ -3358,10 +3362,7 @@ LSE_TEST(an_unknown_capacity_degrades_rather_than_guessing) {
   opt::DeviceCapacity no_granule = full;
   no_granule.lds_alloc_granule_bytes = {};
   const auto ask = [](std::uint32_t bytes) {
-    opt::KernelDemand want;
-    want.threads = 256;
-    want.lds_bytes = bytes;
-    return want;
+    return opt::KernelDemand::counted(256, bytes);
   };
   LSE_EXPECT(opt::occupancy(full, ask(40000)).exact);
   LSE_EXPECT(!opt::occupancy(no_granule, ask(40000)).exact);
@@ -3383,6 +3384,85 @@ LSE_TEST(an_unknown_capacity_degrades_rather_than_guessing) {
   const opt::DeviceCapacity nothing;
   LSE_EXPECT(!nothing.usable());
   LSE_EXPECT(!opt::occupancy(nothing, ask(40000)).seated());
+}
+
+// The mirror of the test above, and the one that was missing: an unanswered
+// DEMAND, not an unanswered capacity.
+//
+// A toolchain that reports no workgroup segment has said nothing about what
+// the kernel asks for. Read as zero, that kernel gets the best occupancy the
+// part can give — asserted as exact — and beats a measured arrangement that
+// honestly declared 32000 bytes. The unknown must lose the comparison, not win
+// it.
+LSE_TEST(an_unknown_demand_degrades_rather_than_scoring_best) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+
+  // A code object with registers and spill counts but no workgroup segment:
+  // exactly what a toolchain that does not emit the field produces.
+  backend::KernelResources silent;
+  silent.vector_registers = backend::DeviceFact<std::uint32_t>::queried(64);
+  silent.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  silent.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(!silent.workgroup_segment_bytes.known());
+
+  const opt::Occupancy unknown =
+      opt::occupancy(cap, opt::KernelDemand::measured(256, silent));
+  // The scratch arm did not run, and the answer says so rather than claiming
+  // a count it does not have.
+  LSE_EXPECT(!unknown.exact);
+  LSE_EXPECT_EQ(unknown.waves_by_scratch, opt::Occupancy::kNoLimit);
+  LSE_EXPECT(!unknown.scratch_request.known());
+
+  // Zero bytes is a DIFFERENT demand: it is an answer, the arm runs, and the
+  // figure is exact. Same occupancy, different confidence — which is the whole
+  // distinction.
+  backend::KernelResources none = silent;
+  none.workgroup_segment_bytes = backend::DeviceFact<std::uint32_t>::queried(0);
+  const opt::Occupancy zero =
+      opt::occupancy(cap, opt::KernelDemand::measured(256, none));
+  LSE_EXPECT(zero.exact);
+  LSE_EXPECT_EQ(zero.workgroups_per_pool, unknown.workgroups_per_pool);
+
+  // And the comparison: the unmeasured kernel must not displace a counted one
+  // on a tie it was never scored for.
+  backend::KernelResources heavy = none;
+  heavy.workgroup_segment_bytes =
+      backend::DeviceFact<std::uint32_t>::queried(32000);
+  const opt::Occupancy counted =
+      opt::occupancy(cap, opt::KernelDemand::measured(256, heavy));
+  LSE_EXPECT_EQ(counted.workgroups_per_pool, 4u);
+  LSE_EXPECT(!opt::prefer(unknown, zero));
+  // Nor may it win by looking roomier than an arrangement that declared more.
+  LSE_EXPECT(opt::prefer(unknown, counted) ==
+             (unknown.workgroups_per_pool > counted.workgroups_per_pool));
+  LSE_EXPECT(!opt::prefer(counted, unknown));
+}
+
+// A pool's SIZE and the CU count it was stated for are one fact. The SIMD
+// count follows the live part, so a part that pairs its cores differently from
+// the family row must not inherit a block sized for the row's pairing — that
+// is a silent factor of two in every residency answer it gives.
+LSE_TEST(a_pool_size_is_not_read_at_a_cu_count_nobody_stated_it_for) {
+  backend::DeviceInfo paired = gfx1151();
+  LSE_EXPECT(paired.arch_facts.lds_bytes_per_pool.known());
+  LSE_EXPECT_EQ(paired.arch_facts.lds_bytes_per_pool.value, 131072u);
+  LSE_EXPECT_EQ(paired.arch_facts.simds_per_lds_pool.value, 4u);
+
+  // The same part reporting one CU behind a pool: two SIMDs draw on the block,
+  // and nothing states how big that block is. The fact stays unknown and the
+  // scratch limit drops out of the min rather than charging the request
+  // against twice the block that exists.
+  backend::DeviceInfo solo_cu = paired;
+  solo_cu.cus_per_lds_pool = 1;
+  solo_cu.arch_facts = backend::arch_facts_for(solo_cu);
+  LSE_EXPECT_EQ(solo_cu.arch_facts.simds_per_lds_pool.value, 2u);
+  LSE_EXPECT(!solo_cu.arch_facts.lds_bytes_per_pool.known());
+
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(solo_cu);
+  const opt::Occupancy occ =
+      opt::occupancy(cap, opt::KernelDemand::counted(256, 40000));
+  LSE_EXPECT(!occ.exact);
+  LSE_EXPECT_EQ(occ.waves_by_scratch, opt::Occupancy::kNoLimit);
 }
 
 // A kernel that SPILLS is a different regime, not a lower number. It must not
@@ -3435,10 +3515,7 @@ LSE_TEST(a_spilling_kernel_is_reported_as_spilling_not_as_less_occupancy) {
 LSE_TEST(a_fusion_that_costs_residency_is_refused_by_the_model) {
   const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
   const auto at = [&](std::uint32_t bytes) {
-    opt::KernelDemand d;
-    d.threads = 256;
-    d.lds_bytes = bytes;
-    return opt::occupancy(cap, d);
+    return opt::occupancy(cap, opt::KernelDemand::counted(256, bytes));
   };
 
   // The measured failure: two ~32000-byte panels merged into one 64000-byte
@@ -3497,14 +3574,182 @@ LSE_TEST(a_fusion_verdict_does_not_move_once_it_is_taken) {
   LSE_EXPECT(fresh.fused.workgroups_per_pool < fresh.unfused.workgroups_per_pool);
 
   // And a spilling measurement on a residency-neutral arrangement refuses it,
-  // which is the one thing the measurement is allowed to decide here.
+  // which is the one thing a measurement of ONE side is allowed to decide:
+  // spilling disqualifies an arrangement outright rather than being compared
+  // against anything. The verdict is not `measured` — nothing was measured for
+  // the launches this merge replaces, so the residency figures on both sides
+  // are still the emitter's own counts.
   measured.record("lse_fused_verdict_probe_3", spilling);
   opt::FusionCandidate spills = c;
   spills.fused_entry = "lse_fused_verdict_probe_3";
   const opt::FusionVerdict v = opt::admit_fusion(cap, spills);
-  LSE_EXPECT(v.measured);
+  LSE_EXPECT(!v.measured);
   LSE_EXPECT(v.fused.spill == backend::SpillState::kSpilled);
   LSE_EXPECT(!v.admit);
+}
+
+// A MEASUREMENT ON ONE SIDE OF A COMPARISON IS NOT A MEASUREMENT. The fused
+// kernel's workgroup segment is the whole body's, every stage's own staging
+// included; the unfused side, before anyone has built it, can only be counted.
+// Substituting one against the other compares two different quantities and
+// turns the verdict on that difference, so the substitution is all of it or
+// none of it.
+LSE_TEST(a_measured_verdict_needs_both_sides_measured) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  opt::KernelMeasurements& measured = opt::KernelMeasurements::instance();
+
+  const auto segment = [](std::uint32_t bytes) {
+    backend::KernelResources r;
+    r.workgroup_segment_bytes =
+        backend::DeviceFact<std::uint32_t>::queried(bytes);
+    r.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+    r.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+    return r;
+  };
+
+  // The fused object is on record and the solo ones are not. The counts, not
+  // the measurement, decide — and they say the merge is neutral.
+  measured.record("lse_fused_both_sides", segment(64000));
+  const std::vector<std::string> solo = {"lse_solo_a", "lse_solo_b"};
+  opt::FusionCandidate half;
+  half.threads = 256;
+  half.fused_scratch_bytes = 8192;
+  half.worst_solo_scratch_bytes = 8192;
+  half.fused_entry = "lse_fused_both_sides";
+  half.solo_entries = solo;
+  const opt::FusionVerdict counted = opt::admit_fusion(cap, half);
+  LSE_EXPECT(!counted.measured);
+  LSE_EXPECT(counted.admit);
+
+  // Both sides on record: 64000 bytes fused against 16000 solo is 2
+  // workgroups per pool against 8, and the merge is refused on the measured
+  // figures rather than on the counted ones, which claimed a tie.
+  measured.record("lse_solo_a", segment(16000));
+  measured.record("lse_solo_b", segment(8000));
+  opt::FusionCandidate full = half;
+  full.fused_entry = "lse_fused_both_sides_2";
+  measured.record(full.fused_entry, segment(64000));
+  const opt::FusionVerdict both = opt::admit_fusion(cap, full);
+  LSE_EXPECT(both.measured);
+  LSE_EXPECT_EQ(both.fused.workgroups_per_pool, 2u);
+  // The TIGHTEST of the launches it replaces, not the loosest: 16000 rounds to
+  // 16384 and seats 8, which the wave slots cap at 8 anyway.
+  LSE_EXPECT_EQ(both.unfused.workgroups_per_pool, 8u);
+  LSE_EXPECT(!both.admit);
+}
+
+// BOTH SIDES OF THE COMPARISON MUST BE THE SAME QUANTITY, and the quantity is
+// what the emitted body declares.
+//
+// This is the arrangement that is live on Qwen3.8-27B-4bit today: two wide
+// 4-bit linears off one 5120-long f32 activation, decode shape. The old
+// pricing handed the model align(5120*4) = 20480 for BOTH arrangements — the
+// fused body's hoisted panel, quoted back as the price of a solo launch that
+// never allocates one — so `prefer` saw a tie on every run in every model and
+// the gate could not fire at all.
+//
+// The true figures, and they are not close. The merged body declares the f32
+// panel plus the int8 form it hoists beside it: 20480 + 8000 = 28480. The same
+// stage alone declares no panel at all — the integer path quantizes straight
+// out of global — so it declares only its own staging, 8000. 28480 rounds to
+// 28672 and seats 4 workgroups on a 131072-byte pool; 8000 rounds to 8192 and
+// seats 16, which the wave slots cap at 8. Four times the residency, and the
+// model was being told it was a tie.
+LSE_TEST(a_merged_run_is_priced_by_what_it_declares_not_by_its_panel) {
+  ::unsetenv("LSE_WMMA");
+  const backend::DeviceInfo dev = gfx1151();
+  constexpr std::int64_t kK = 5120;
+  constexpr std::int64_t kN = 640;
+  constexpr std::int64_t kGroup = 64;
+  constexpr int kBits = 4;
+  constexpr std::int64_t kLanes = kK * kBits / 32;
+  constexpr std::int64_t kGroups = kK / kGroup;
+
+  Array x = Array::zeros(Shape{1, kK}, DType::kF32);
+  const auto wide = [&] {
+    Array packed = Array::zeros(Shape{kN, kLanes}, DType::kU32);
+    Array scales = Array::zeros(Shape{kN, kGroups}, DType::kBF16);
+    Array biases = Array::zeros(Shape{kN, kGroups}, DType::kBF16);
+    return quant_linear(x, packed, scales, biases, kBits, kGroup);
+  };
+  Array q = wide();
+  Array k = wide();
+  const std::vector<graph::NodePtr> run = {q.node(), k.node()};
+
+  const graph::IKernelEmitter::RunScratch cost = kEmitter.run_scratch(run, dev);
+  LSE_EXPECT_EQ(cost.threads, 256u);
+  // The f32 panel, the int8 panel hoisted beside it, and nothing per stage:
+  // with both hoisted, neither body declares scratch of its own.
+  LSE_EXPECT_EQ(cost.fused, 28480u);
+  // What ONE of them declares launching alone. Not the panel: the solo body
+  // has no panel.
+  LSE_EXPECT_EQ(cost.worst_solo, 8000u);
+
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(dev);
+  const opt::Occupancy fused =
+      opt::occupancy(cap, opt::KernelDemand::counted(cost.threads, cost.fused));
+  const opt::Occupancy solo = opt::occupancy(
+      cap, opt::KernelDemand::counted(cost.threads, cost.worst_solo));
+  LSE_EXPECT_EQ(fused.workgroups_per_pool, 4u);
+  LSE_EXPECT_EQ(solo.workgroups_per_pool, 8u);
+  LSE_EXPECT(fused.binding == opt::OccupancyLimit::kWorkgroupScratch);
+
+  opt::FusionCandidate candidate;
+  candidate.threads = cost.threads;
+  candidate.fused_scratch_bytes = cost.fused;
+  candidate.worst_solo_scratch_bytes = cost.worst_solo;
+  LSE_EXPECT(!opt::admit_fusion(cap, candidate).admit);
+
+  // And the old pricing, restated, so the regression is a number and not a
+  // memory: quoting the panel on both sides ties, and a tie is admitted.
+  opt::FusionCandidate as_it_was = candidate;
+  as_it_was.fused_scratch_bytes = 20480;
+  as_it_was.worst_solo_scratch_bytes = 20480;
+  LSE_EXPECT(opt::admit_fusion(cap, as_it_was).admit);
+}
+
+// The prediction the gate is fed and the allocation the body makes are the
+// same number, not two numbers that agree today. A drift between them is a run
+// admitted against a launch that never happens, which is the whole failure
+// this area exists for, so it is pinned rather than trusted.
+LSE_TEST(the_run_price_is_the_bytes_the_merged_body_declares) {
+  ::unsetenv("LSE_WMMA");
+  const backend::DeviceInfo dev = gfx1151();
+
+  // Dense f32 siblings over one 512-wide activation: small enough that the
+  // wave slots bind and the run is admitted, so there is an emitted body to
+  // compare against.
+  Array x = Array::full(Shape{1, 512}, DType::kF32, 1.0f);
+  Array wa = Array::full(Shape{16, 512}, DType::kF32, 0.5f);
+  Array wb = Array::full(Shape{16, 512}, DType::kF32, 0.25f);
+  Array a = linear(x, wa);
+  Array b = linear(x, wb);
+  const std::vector<graph::NodePtr> run = {a.node(), b.node()};
+
+  const graph::IKernelEmitter::RunScratch cost = kEmitter.run_scratch(run, dev);
+  auto e = kEmitter.emit(sibling_group({a, b}), dev);
+  LSE_EXPECT(e.ok());
+  if (!e.ok()) {
+    std::printf("       %s\n", e.status().to_string().c_str());
+    return;
+  }
+  LSE_EXPECT(cost.fused != 0u);
+  LSE_EXPECT_EQ(cost.fused, e->lds_bytes);
+  // And the arrangement is named the same way at both sites. The decision is
+  // taken before the group exists, so the price is looked up under a name
+  // reconstructed from the run; a name that did not match would silently never
+  // find the measurement it is there to find.
+  LSE_EXPECT(cost.fused_entry == e->entry_name);
+  LSE_EXPECT_EQ(cost.solo_entries.size(), 2u);
+  // e->lds_bytes is itself read off the body, and the text agrees with it.
+  auto counted = backend::HipEmitter::shared_bytes(e->source);
+  LSE_EXPECT(counted.ok());
+  if (counted.ok()) LSE_EXPECT_EQ(*counted, cost.fused);
+  // One shared row for two stages, and the solo price is that same row, since
+  // a dense f32 GEMV alone stages exactly what the run hoists for it. Equal,
+  // and equality is admitted — this is the case a stricter rule would break.
+  LSE_EXPECT_EQ(cost.worst_solo, 2048u);
+  LSE_EXPECT_EQ(cost.fused, 2048u);
 }
 
 // A run is admitted on RESIDENCY, and refused on it. Three cases, one rule:
@@ -3566,11 +3811,8 @@ LSE_TEST(a_sibling_run_is_admitted_and_refused_on_residency_not_on_fitting) {
     if (!e.ok()) return;
     // The refusal is the model's, and it is not a constant: state both sides.
     const opt::DeviceCapacity cap = opt::DeviceCapacity::of(dev);
-    opt::KernelDemand merged;
-    merged.threads = 256;
-    merged.lds_bytes = 65536;
-    opt::KernelDemand alone = merged;
-    alone.lds_bytes = 32768;
+    const opt::KernelDemand merged = opt::KernelDemand::counted(256, 65536);
+    const opt::KernelDemand alone = opt::KernelDemand::counted(256, 32768);
     LSE_EXPECT_EQ(opt::occupancy(cap, merged).workgroups_per_pool, 2u);
     LSE_EXPECT_EQ(opt::occupancy(cap, alone).workgroups_per_pool, 4u);
     LSE_EXPECT(65536u <= budget);  // it fits, and fitting is not the question
