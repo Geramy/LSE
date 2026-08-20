@@ -334,6 +334,16 @@ lse_apply_common_flags(lse_place)
 # ---------------------------------------------------------------------------
 if(TARGET lse_tokenizer)
   add_executable(lse src/cli/main.cpp)
+
+  # The OpenAI-shaped HTTP surface. httplib and nlohmann/json are vendored
+  # headers, so this adds no package to find.
+  add_library(lse_server src/server/http_server.cpp src/server/chat.cpp)
+  target_link_libraries(lse_server PUBLIC lse_core lse_model lse_runtime lse_tokenizer)
+  lse_apply_common_flags(lse_server)
+  find_package(Threads REQUIRED)
+  target_link_libraries(lse_server PUBLIC Threads::Threads)
+
+  add_executable(lse-server src/cli/server_main.cpp)
   if(LSE_ROCM_RUNTIME_DIR)
     target_compile_definitions(lse PRIVATE
       LSE_HSA_RUNTIME_DIR="${LSE_ROCM_RUNTIME_DIR}")
@@ -341,6 +351,17 @@ if(TARGET lse_tokenizer)
   target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer
                                     lse_place lse_probe lse_backends)
   lse_apply_common_flags(lse)
+
+  # The server binds the same backends the CLI does; the device is opened by
+  # whichever of them comes up, not by the HTTP layer.
+  if(LSE_ROCM_RUNTIME_DIR)
+    target_compile_definitions(lse-server PRIVATE
+      LSE_HSA_RUNTIME_DIR="${LSE_ROCM_RUNTIME_DIR}")
+  endif()
+  target_link_libraries(lse-server PRIVATE lse_server lse_runtime lse_model
+                                           lse_tokenizer lse_place lse_probe
+                                           lse_backends)
+  lse_apply_common_flags(lse-server)
 endif()
 
 # ---------------------------------------------------------------------------

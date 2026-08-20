@@ -147,6 +147,7 @@ jobs:
 
           rm -rf "dist/$name" && mkdir -p "dist/$name"
           cp build/lse "dist/$name/"
+          cp build/lse-server "dist/$name/"
           find build -maxdepth 2 -name '*.a' -exec cp {} "dist/$name/" \;
           cp README.md LICENSE.md "dist/$name/" 2>/dev/null || true
           tar -C dist -czf "dist/${name}.tar.gz" "$name"

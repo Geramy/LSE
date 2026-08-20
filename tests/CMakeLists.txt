@@ -21,6 +21,7 @@ lse_add_test(test_kernel_env lse_graph lse_backends)
 lse_add_test(test_ir lse_ir lse_graph lse_backends)
 lse_add_test(test_quant)
 lse_add_test(test_shape)
+lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
 lse_add_test(test_model lse_model lse_backends)
 
 if(LSE_ENABLE_CPU)

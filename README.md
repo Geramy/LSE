@@ -64,9 +64,51 @@ prediction module, or point at one:
 
 `./lse --help` lists every option.
 
-**There is no HTTP server yet.** The engine is a library and a CLI; an
-OpenAI-compatible endpoint is listed under Upcoming and no binary serves one
-today.
+## Serve an OpenAI API
+
+`lse-server` answers the OpenAI wire format, so anything that already speaks it
+works by changing the base URL.
+
+```bash
+./lse-server -m mlx-community/Qwen3.8-27B-4bit --port 8080
+# --host 0.0.0.0        bind beyond localhost
+# --api-key KEY         require Authorization: Bearer KEY
+# --served-name NAME    the id reported by /v1/models
+# --max-tokens N        refuse requests asking for more (default 4096)
+# --mtp PATH            speculative decoding module
+```
+
+| Endpoint | |
+|---|---|
+| `GET /health` | liveness |
+| `GET /v1/models`, `GET /v1/models/{id}` | the loaded model |
+| `POST /v1/chat/completions` | streaming and non-streaming |
+| `POST /v1/completions` | streaming and non-streaming |
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":64}'
+```
+
+Set `"stream": true` for server-sent events: an opening chunk carrying the
+assistant role, a chunk per delta, a final chunk with `finish_reason` and
+`usage`, then `data: [DONE]`.
+
+Honoured: `messages` (string content or the array-of-parts form),
+`prompt`, `stream`, `max_tokens`, `max_completion_tokens`, `temperature`,
+`top_p`, `top_k`, `seed`, `frequency_penalty`, and `stop` as a string or an
+array. `n` must be 1. Prompts are framed as ChatML, which is what the models
+this engine targets are trained on, rather than evaluated from the
+checkpoint's own Jinja template.
+
+Endpoints outside that set — `/v1/embeddings`, `/v1/responses`,
+`/v1/audio/*`, `/v1/images/*`, `/v1/moderations` — answer `501` naming
+themselves rather than `404`.
+
+One model on one device, so generation is serialized and concurrent requests
+queue. The engine decodes several sequences in one step; putting that behind
+the server is future work and does not change the wire format.
 
 ## Requirements
 
@@ -196,9 +238,8 @@ CPU backend, which runs the same models roughly two hundred times slower.
   share proportional to its measured throughput.
 - **Communication layer** — one asynchronous client/server API over TCP and
   RDMA, with the transport hidden from callers.
-- **OpenAI-compatible HTTP server** — `/v1/chat/completions` and
-  `/v1/completions` with streaming, served over the communication layer, so a
-  release ships a binary that can be pointed at by an existing client.
+- **Batched serving** — the server's requests decoded together in one step
+  rather than queued, and `/v1/embeddings` once the engine exposes pooling.
 - **Multi-machine** — a control plane that ships IR rather than code objects, so
   each peer compiles for its own architecture.
 - **Runtime-adaptive optimization** — variant tournaments judged on measured
