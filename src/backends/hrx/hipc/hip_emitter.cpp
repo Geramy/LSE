@@ -736,6 +736,33 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     }
     out.constants.add("count", 4);
 
+    // What the run means to move. Stages that share a staged row share the
+    // activation traffic too — the panel is filled once for all of them — so
+    // charging every stage for it would restate the very saving the sharing
+    // exists to make. Weight, scale and output are per stage and never shared.
+    {
+      std::vector<Shape> tstore;
+      std::vector<DType> tdtypes;
+      std::unordered_set<std::size_t> charged;
+      opt::TrafficModel run;
+      run.stated = !stages.empty();
+      for (std::size_t i = 0; i < stages.size(); ++i) {
+        KernelShapes ts = shapes_for(stages[i].node, tstore, tdtypes);
+        opt::TrafficModel stage = stages[i].prim->traffic(ts);
+        if (!stage.stated) {
+          run = opt::TrafficModel{};
+          break;
+        }
+        const std::size_t panel = panel_of[i];
+        if (panel < panels.size() && !charged.insert(panel).second) {
+          stage.read[static_cast<std::size_t>(
+              opt::OperandClass::kActivation)] = 0;
+        }
+        run += stage;
+      }
+      out.traffic = run;
+    }
+
     std::uint64_t sig = group.signature();
     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
     if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
@@ -1026,6 +1053,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   EmittedKernel out;
   out.entry_name = "lse_fused_" + std::to_string(group.signature());
+  if (self_indexed != nullptr) out.traffic = self_indexed->traffic(si_shapes);
 
   std::unordered_map<const Node*, std::size_t> binding_of;
   auto bind = [&](const NodePtr& n) {

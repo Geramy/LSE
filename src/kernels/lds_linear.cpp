@@ -113,6 +113,36 @@ ThreadPlan gemv_plan(const LinearDims& d, std::uint32_t wave,
   return tp;
 }
 
+// One workgroup's traffic: one activation row against the `kBlock / wave`
+// weight columns its waves own. The weight is stored dense, so its element
+// width is the storage dtype's and not the accumulator's — a bf16 checkpoint
+// halves that term and leaves the activation term untouched, which is the same
+// asymmetry the packed contraction has and the reason both are counted apart.
+opt::TrafficModel linear_traffic(const KernelShapes& s, bool indexed) {
+  const LinearDims d = indexed ? dims_of_indexed(s) : dims_of_linear(s);
+  if (!lds_shape_ok(d) || !device_fits(s)) return {};
+  if (s.input_dtypes.size() < 2) return {};
+  const std::uint32_t wave = wave_of(s.device);
+  const std::uint32_t cols = kBlock / wave;
+  const auto weight_bits = static_cast<std::uint32_t>(
+      dtype_storage_bytes(s.input_dtypes[1], 1) * 8);
+  opt::TrafficModel m = opt::contraction_traffic(
+      1, cols, static_cast<std::uint64_t>(d.k), weight_bits, sizeof(float), 0,
+      static_cast<std::uint64_t>(cols) * sizeof(float));
+  if (indexed) {
+    const Shape& ix = s.inputs[2];
+    const auto keep =
+        ix.rank() == 0 ? 1u : static_cast<std::uint32_t>(ix.dim(ix.rank() - 1));
+    m.add_read(opt::OperandClass::kIndex, keep * sizeof(float));
+  }
+  // Priced as the solo arrangement: no run has hoisted a panel for it here.
+  const ThreadPlan plan =
+      gemv_plan(d, wave, workgroup_lds_bytes(s.device), StagedPanel{});
+  m.workgroups = plan.workgroup_count[0] * plan.workgroup_count[1];
+  m.workgroup_threads = plan.workgroup_size[0];
+  return m;
+}
+
 using F32In = env::In<kir::f32, env::Emit>;
 template <class W>
 using WIn = env::In<W, env::Emit>;
@@ -367,6 +397,10 @@ struct LinearLdsKernel final : KernelPrimitive<LinearLdsKernel> {
   DType infer_dtype(std::span<const DType> in) const override {
     return in.empty() ? DType::kF32 : in[0];
   }
+  opt::TrafficModel traffic(const KernelShapes& s) const override {
+    return linear_traffic(s, false);
+  }
+
   static ThreadPlan plan_impl(const KernelShapes& s) {
     return gemv_plan(dims_of_linear(s), wave_of(s.device),
                      workgroup_lds_bytes(s.device), s.staged);
@@ -436,6 +470,10 @@ struct LinearIndexedLdsKernel final : KernelPrimitive<LinearIndexedLdsKernel> {
   DType infer_dtype(std::span<const DType> in) const override {
     return in.empty() ? DType::kF32 : in[0];
   }
+  opt::TrafficModel traffic(const KernelShapes& s) const override {
+    return linear_traffic(s, true);
+  }
+
   static ThreadPlan plan_impl(const KernelShapes& s) {
     return gemv_plan(dims_of_indexed(s), wave_of(s.device),
                      workgroup_lds_bytes(s.device), s.staged);

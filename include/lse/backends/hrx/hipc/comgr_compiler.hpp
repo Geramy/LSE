@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +21,12 @@ class ComgrCompiler final : public graph::IKernelCompiler {
   // and no second compile.
   Result<graph::CompiledKernel> compile(std::string_view source,
                                         std::string_view arch) const override;
+
+  // The census of an object comgr produced, disassembled through comgr's own
+  // disassembler. Serves the warm-cache path, where the bytes exist and no
+  // compile ran.
+  [[nodiscard]] std::vector<KernelCensus> census(
+      std::span<const std::byte> object) const override;
 
   [[nodiscard]] bool available() const override;
 

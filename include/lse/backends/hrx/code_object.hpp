@@ -9,10 +9,12 @@
 
 #include <cstddef>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include "lse/backend/backend.hpp"
+#include "lse/backend/census.hpp"
 #include "lse/backend/resources.hpp"
 #include "lse/core/status.hpp"
 
@@ -28,6 +30,23 @@ namespace lse::backend {
 // spill counts at all, while comgr's carry the spill counts even when zero.
 // Absent keys come back kUnknown, never 0.
 [[nodiscard]] std::vector<KernelResources> read_code_object_resources(
+    std::span<const std::byte> object);
+
+// The target identification string the object states it was built for
+// ("amdgcn-amd-amdhsa--gfx1151"), or empty when it does not say. Read from the
+// object rather than passed in, so a reader cannot be handed the wrong one.
+[[nodiscard]] std::string read_code_object_target(
+    std::span<const std::byte> object);
+
+// What the object's instructions add up to, one entry per kernel it defines,
+// by disassembling it with the toolchain's own disassembler.
+//
+// This is the MEASUREMENT half applied to the emitted body rather than to the
+// register allocator's report: it answers "what did the compiler actually
+// write", which is the only source that can contradict what the emitter meant
+// to write. Empty when this build has no disassembler or the object carries no
+// code — an answer, not a failure.
+[[nodiscard]] std::vector<KernelCensus> read_code_object_census(
     std::span<const std::byte> object);
 
 // What the compiler's own target table says about `arch` ("gfx1151", or a

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstddef>
+#include <span>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -30,6 +31,11 @@ class LoomcCompiler final : public graph::IKernelCompiler {
   // it to be wrong.
   Result<graph::CompiledKernel> compile(std::string_view source,
                                         std::string_view arch) const override;
+
+  // loomc emits an AMDGPU code object, so the same disassembling reader serves
+  // it as serves the HIP path.
+  [[nodiscard]] std::vector<KernelCensus> census(
+      std::span<const std::byte> object) const override;
 
   [[nodiscard]] bool available() const override;
 

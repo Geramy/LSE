@@ -25,6 +25,21 @@ const backend::KernelResources* CompiledKernel::resources_for(
   return nullptr;
 }
 
+const backend::KernelCensus* CompiledKernel::census_for(
+    std::string_view entry) const noexcept {
+  if (census.empty()) return nullptr;
+  if (entry.empty()) return census.size() == 1 ? &census.front() : nullptr;
+  for (const backend::KernelCensus& c : census) {
+    if (c.entry == entry) return &c;
+  }
+  return nullptr;
+}
+
+std::vector<backend::KernelCensus> IKernelCompiler::census(
+    std::span<const std::byte>) const {
+  return {};
+}
+
 std::uint16_t ConstantsLayout::add(std::string name, std::uint8_t size) {
   const std::uint16_t offset = static_cast<std::uint16_t>(total_bytes);
   fields.push_back(Field{std::move(name), offset, size});

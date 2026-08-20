@@ -115,6 +115,7 @@ add_library(lse_opt
   src/opt/occupancy.cpp
   src/opt/fusion.cpp
   src/opt/measurements.cpp
+  src/opt/traffic.cpp
 )
 add_library(lse::opt ALIAS lse_opt)
 target_link_libraries(lse_opt PUBLIC lse_core lse_backend_registry)

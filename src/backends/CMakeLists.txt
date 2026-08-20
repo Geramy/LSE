@@ -5,6 +5,7 @@
 add_library(lse_backend_registry
   registry.cpp
   resources.cpp
+  census.cpp
 )
 add_library(lse::backend_registry ALIAS lse_backend_registry)
 target_link_libraries(lse_backend_registry PUBLIC lse_core)

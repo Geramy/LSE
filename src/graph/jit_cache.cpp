@@ -52,6 +52,7 @@ struct DiskMeta {
   std::uint64_t source_hash = 0;
   std::string entry;
   std::vector<backend::KernelResources> resources;
+  std::vector<backend::KernelCensus> census;
 };
 
 // A fact renders as its number or as "-", never as a 0 standing in for
@@ -104,6 +105,119 @@ void write_resources(std::ostream& out,
   }
 }
 
+// The census as two tags: one scalar line per kernel and one line per access
+// width, so a width the next ISA adds costs a line and not a format. Both carry
+// the entry name, so the lines are order-independent and a reader that meets an
+// `acc` before its `cen` still files it correctly.
+void write_census(std::ostream& out,
+                  const std::vector<backend::KernelCensus>& all) {
+  for (const backend::KernelCensus& c : all) {
+    const std::string name = c.entry.empty() ? "-" : c.entry;
+    out << "cen " << name;
+    write_fact(out, c.instructions);
+    write_fact(out, c.vector_alu);
+    write_fact(out, c.scalar_alu);
+    write_fact(out, c.dot_products);
+    write_fact(out, c.fused_multiply_adds);
+    write_fact(out, c.matrix_ops);
+    write_fact(out, c.lane_exchanges);
+    write_fact(out, c.branches);
+    write_fact(out, c.backward_branches);
+    write_fact(out, c.memory_waits);
+    write_fact(out, c.deepest_load_batch);
+    write_fact(out, c.serializing_waits);
+    write_fact(out, c.unclassified);
+    // Appended, not inserted: a note written before this field existed still
+    // reads, and its missing tail comes back unknown rather than zero.
+    write_fact(out, c.multiply_accumulates);
+    out << '\n';
+    const std::pair<const char*, const backend::AccessCensus*> spaces[] = {
+        {"gl", &c.global_loads},   {"gs", &c.global_stores},
+        {"sl", &c.shared_loads},   {"ss", &c.shared_stores},
+        {"pl", &c.private_loads},  {"ps", &c.private_stores},
+        {"kl", &c.scalar_loads},
+    };
+    for (const auto& [tag, access] : spaces) {
+      for (const backend::AccessCensus::Width& w : access->widths) {
+        out << "acc " << name << ' ' << tag << ' ' << w.bytes << ' ' << w.count
+            << ' ' << w.looped << '\n';
+      }
+    }
+  }
+}
+
+backend::KernelCensus* census_for(std::vector<backend::KernelCensus>* all,
+                                  const std::string& entry) {
+  for (backend::KernelCensus& c : *all) {
+    if (c.entry == entry) return &c;
+  }
+  all->push_back(backend::KernelCensus{});
+  all->back().entry = entry;
+  return &all->back();
+}
+
+bool read_census_line(const std::string& line,
+                      std::vector<backend::KernelCensus>* all) {
+  std::istringstream in(line);
+  std::string tag;
+  if (!(in >> tag) || tag != "cen") return false;
+  std::string entry;
+  if (!(in >> entry)) return false;
+  if (entry == "-") entry.clear();
+  backend::KernelCensus* c = census_for(all, entry);
+  c->instructions = read_fact(in);
+  c->vector_alu = read_fact(in);
+  c->scalar_alu = read_fact(in);
+  c->dot_products = read_fact(in);
+  c->fused_multiply_adds = read_fact(in);
+  c->matrix_ops = read_fact(in);
+  c->lane_exchanges = read_fact(in);
+  c->branches = read_fact(in);
+  c->backward_branches = read_fact(in);
+  c->memory_waits = read_fact(in);
+  c->deepest_load_batch = read_fact(in);
+  c->serializing_waits = read_fact(in);
+  c->unclassified = read_fact(in);
+  c->multiply_accumulates = read_fact(in);
+  return true;
+}
+
+bool read_access_line(const std::string& line,
+                      std::vector<backend::KernelCensus>* all) {
+  std::istringstream in(line);
+  std::string tag;
+  if (!(in >> tag) || tag != "acc") return false;
+  std::string entry;
+  std::string space;
+  std::uint32_t bytes = 0;
+  std::uint32_t count = 0;
+  std::uint32_t looped = 0;
+  if (!(in >> entry >> space >> bytes >> count >> looped)) return false;
+  if (entry == "-") entry.clear();
+  if (bytes == 0 || count == 0) return false;
+  backend::KernelCensus* c = census_for(all, entry);
+  backend::AccessCensus* access = nullptr;
+  if (space == "gl") {
+    access = &c->global_loads;
+  } else if (space == "gs") {
+    access = &c->global_stores;
+  } else if (space == "sl") {
+    access = &c->shared_loads;
+  } else if (space == "ss") {
+    access = &c->shared_stores;
+  } else if (space == "pl") {
+    access = &c->private_loads;
+  } else if (space == "ps") {
+    access = &c->private_stores;
+  } else if (space == "kl") {
+    access = &c->scalar_loads;
+  }
+  if (access == nullptr) return false;
+  access->widths.push_back(
+      backend::AccessCensus::Width{bytes, count, looped});
+  return true;
+}
+
 bool read_resource_line(const std::string& line,
                         backend::KernelResources* out) {
   std::istringstream in(line);
@@ -147,7 +261,12 @@ bool read_meta(const fs::path& path, DiskMeta* out) {
   }
   for (std::string line; std::getline(in, line);) {
     backend::KernelResources r;
-    if (read_resource_line(line, &r)) out->resources.push_back(std::move(r));
+    if (read_resource_line(line, &r)) {
+      out->resources.push_back(std::move(r));
+      continue;
+    }
+    if (read_census_line(line, &out->census)) continue;
+    read_access_line(line, &out->census);
   }
   return true;
 }
@@ -166,6 +285,9 @@ void preload_measurements(const std::string& dir) {
     for (const backend::KernelResources& r : meta.resources) {
       opt::KernelMeasurements::instance().record(r.entry, r);
     }
+    for (const backend::KernelCensus& c : meta.census) {
+      opt::KernelMeasurements::instance().record(c.entry, c);
+    }
   }
 }
 
@@ -180,6 +302,7 @@ void write_meta(const fs::path& path, const DiskMeta& meta) {
                 static_cast<unsigned long long>(meta.source_hash));
   out << buf << '\n' << meta.entry << '\n';
   write_resources(out, meta.resources);
+  write_census(out, meta.census);
   out.close();
   std::error_code ec;
   fs::rename(tmp, path, ec);
@@ -303,6 +426,7 @@ struct JitCache::Impl {
     // whether the object was compiled here or read back from disk: a warm
     // start that lost the numbers would make them a property of process age.
     std::vector<backend::KernelResources> resources;
+    std::vector<backend::KernelCensus> census;
   };
   // One map per (member, dialect). A KernelHandle is an executable loaded on
   // ONE device; handing member B the handle member A loaded is a wrong-device
@@ -461,11 +585,23 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
 
   std::vector<std::byte> code;
   std::vector<backend::KernelResources> resources;
+  std::vector<backend::KernelCensus> census;
   if (device_matches && source_matches) {
     code = read_file(co_path);
     if (!code.empty()) {
       ++stats_.disk_hits;
       resources = meta.resources;
+      census = meta.census;
+      // An object cached before anything counted instructions still has them:
+      // they are in the bytes. Counting them now and rewriting the note keeps a
+      // warm start as informed as a cold one, and costs one disassembly once.
+      if (census.empty()) {
+        census = compiler->census(code);
+        if (!census.empty()) {
+          meta.census = census;
+          write_meta(meta_path, meta);
+        }
+      }
     }
   }
 
@@ -480,6 +616,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     CompiledKernel built = compiled.release();
     code = std::move(built.code);
     resources = std::move(built.resources);
+    census = std::move(built.census);
     stats_.compile_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin)
@@ -503,7 +640,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     }
     write_code(co_path, code);
     write_meta(meta_path,
-               DiskMeta{arch, src_hash, emitted.entry_name, resources});
+               DiskMeta{arch, src_hash, emitted.entry_name, resources, census});
   }
 
   auto handle = be.load_executable(
@@ -520,8 +657,34 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   for (const backend::KernelResources& r : resources) {
     opt::KernelMeasurements::instance().record(r.entry, r);
   }
-  slots[key] = Impl::Slot{kernel, stored_hash, arch, std::move(resources)};
+  for (const backend::KernelCensus& c : census) {
+    opt::KernelMeasurements::instance().record(c.entry, c);
+  }
+  // The intent beside the count, under the same identity, so the two are
+  // comparable without anyone holding on to the EmittedKernel that produced
+  // them.
+  opt::KernelMeasurements::instance().record(emitted.entry_name,
+                                             emitted.traffic);
+  slots[key] = Impl::Slot{kernel, stored_hash, arch, std::move(resources),
+                          std::move(census)};
   return kernel;
+}
+
+const backend::KernelCensus* JitCache::census(
+    std::size_t member, std::uint64_t signature, Dialect dialect,
+    std::string_view entry) const noexcept {
+  const std::size_t slot = toolchain_slot(member, dialect);
+  if (slot >= impl_->memory.size()) return nullptr;
+  const auto& slots = impl_->memory[slot];
+  const auto it = slots.find(slot_key(member, dialect, signature));
+  if (it == slots.end()) return nullptr;
+  const std::vector<backend::KernelCensus>& all = it->second.census;
+  if (all.empty()) return nullptr;
+  if (entry.empty()) return all.size() == 1 ? &all.front() : nullptr;
+  for (const backend::KernelCensus& c : all) {
+    if (c.entry == entry) return &c;
+  }
+  return nullptr;
 }
 
 const backend::KernelResources* JitCache::resources(

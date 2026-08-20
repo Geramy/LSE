@@ -79,6 +79,13 @@ class JitCache {
       std::size_t member, std::uint64_t signature, Dialect dialect,
       std::string_view entry = {}) const noexcept;
 
+  // What the object's instructions counted up to, on the same terms: persisted
+  // beside it, so a cached kernel is as well described as a freshly compiled
+  // one, and counted from the cached bytes when an older note has no counts.
+  [[nodiscard]] const backend::KernelCensus* census(
+      std::size_t member, std::uint64_t signature, Dialect dialect,
+      std::string_view entry = {}) const noexcept;
+
   struct Stats {
     std::uint64_t memory_hits = 0;
     std::uint64_t disk_hits = 0;

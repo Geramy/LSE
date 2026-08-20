@@ -15,8 +15,10 @@
 #include <vector>
 
 #include "lse/backend/backend.hpp"
+#include "lse/backend/census.hpp"
 #include "lse/core/status.hpp"
 #include "lse/graph/dialect_source.hpp"
+#include "lse/opt/traffic.hpp"
 #include "lse/ir/spell.hpp"
 
 namespace lse::graph {
@@ -46,6 +48,10 @@ struct ConstantsLayout {
 
 struct EmittedKernel {
   std::string source;
+  // What one workgroup of this launch means to move, by operand class. Unstated
+  // where no stage of the run could say — never a zero, which would read as a
+  // kernel that touches nothing.
+  opt::TrafficModel traffic;
   // Which language `source` is in, so the text carries its dialect instead of
   // the caller remembering which emitter produced it. Must equal the emitting
   // IKernelEmitter::dialect(); the default is the dialect of the only emitter
@@ -195,11 +201,17 @@ struct CompiledKernel {
   // One entry per kernel symbol the object defines. Empty when the toolchain
   // reports nothing measurable, which is a real answer and not a failure.
   std::vector<backend::KernelResources> resources;
+  // What the emitted body counts up to, one entry per kernel symbol, read off
+  // the object the same way and at the same moment. A compiler that cannot
+  // disassemble its own output leaves this empty.
+  std::vector<backend::KernelCensus> census;
 
   // Resources for `entry`, or nullptr. When the object defines exactly one
   // kernel an empty name matches it, so a caller that never named its entry
   // still gets the numbers.
   [[nodiscard]] const backend::KernelResources* resources_for(
+      std::string_view entry) const noexcept;
+  [[nodiscard]] const backend::KernelCensus* census_for(
       std::string_view entry) const noexcept;
 };
 
@@ -211,6 +223,16 @@ class IKernelCompiler {
   // no metadata to offer returns an empty `resources` — never a row of zeros.
   virtual Result<CompiledKernel> compile(std::string_view source,
                                          std::string_view arch) const = 0;
+
+  // What the instructions in an object this compiler produced add up to.
+  //
+  // Separate from compile() because the object outlives the compile: a warm
+  // cache hands back bytes nobody compiled this run, and the counts have to be
+  // recoverable from those bytes alone or a cached kernel would be a kernel the
+  // engine knows nothing about. Empty when this compiler cannot read back what
+  // it wrote.
+  [[nodiscard]] virtual std::vector<backend::KernelCensus> census(
+      std::span<const std::byte> object) const;
 
   [[nodiscard]] virtual bool available() const = 0;
 

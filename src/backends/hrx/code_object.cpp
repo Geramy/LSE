@@ -195,6 +195,28 @@ std::vector<KernelResources> read_code_object_resources(
   return out;
 }
 
+std::string read_code_object_target(std::span<const std::byte> object) {
+  if (object.empty()) return {};
+  amd_comgr_data_t data{};
+  if (amd_comgr_create_data(AMD_COMGR_DATA_KIND_EXECUTABLE, &data) !=
+      AMD_COMGR_STATUS_SUCCESS) {
+    return {};
+  }
+  std::string target;
+  if (amd_comgr_set_data(data, object.size(),
+                         reinterpret_cast<const char*>(object.data())) ==
+      AMD_COMGR_STATUS_SUCCESS) {
+    NodeGuard root;
+    if (amd_comgr_get_data_metadata(data, &root.handle) ==
+        AMD_COMGR_STATUS_SUCCESS) {
+      root.live = true;
+      target = read_text(root.handle, "amdhsa.target");
+    }
+  }
+  amd_comgr_release_data(data);
+  return target;
+}
+
 ArchFacts query_isa_facts(std::string_view arch) {
   ArchFacts facts;
   if (arch.empty()) return facts;
@@ -228,6 +250,8 @@ std::vector<KernelResources> read_code_object_resources(
     std::span<const std::byte>) {
   return {};
 }
+
+std::string read_code_object_target(std::span<const std::byte>) { return {}; }
 
 ArchFacts query_isa_facts(std::string_view) { return {}; }
 

@@ -9,6 +9,7 @@
 add_library(lse_backend_hrx
   hrx_backend.cpp
   code_object.cpp
+  code_census.cpp
   hipc/hip_emitter.cpp
   hipc/phase_emit.cpp
   hipc/hip_sources.cpp

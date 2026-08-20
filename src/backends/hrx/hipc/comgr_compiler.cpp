@@ -261,12 +261,18 @@ Result<graph::CompiledKernel> compile_comgr(std::string_view source,
   // handle so both compilers in this backend go through one reader; the walk
   // is microseconds against a ~350 ms compile.
   out.resources = read_code_object_resources(out.code);
+  out.census = read_code_object_census(out.code);
   return out;
 }
 
 #endif  // LSE_HAVE_COMGR
 
 }  // namespace
+
+std::vector<KernelCensus> ComgrCompiler::census(
+    std::span<const std::byte> object) const {
+  return read_code_object_census(object);
+}
 
 bool ComgrCompiler::available() const {
 #if LSE_HAVE_COMGR

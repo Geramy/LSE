@@ -350,6 +350,11 @@ struct LoomcCompiler::State {};
 LoomcCompiler::LoomcCompiler() : state_(std::make_unique<State>()) {}
 LoomcCompiler::~LoomcCompiler() = default;
 
+std::vector<KernelCensus> LoomcCompiler::census(
+    std::span<const std::byte> object) const {
+  return read_code_object_census(object);
+}
+
 bool LoomcCompiler::available() const {
 #if LSE_HAVE_LOOMC
   return true;
@@ -541,6 +546,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
   // counts are absent from every one. They therefore read as unknown, which is
   // what the interface exists to be able to say.
   out.resources = read_code_object_resources(out.code);
+  out.census = read_code_object_census(out.code);
   return out;
 #else
   return LSE_ERROR(kUnimplemented,

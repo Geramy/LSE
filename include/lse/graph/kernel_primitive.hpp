@@ -33,6 +33,7 @@
 #include "lse/core/status.hpp"
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/graph/primitive.hpp"
+#include "lse/opt/traffic.hpp"
 
 namespace lse::graph {
 
@@ -170,6 +171,20 @@ class KernelPrimitiveBase : public Primitive {
     std::uint32_t rows = 0;
   };
   virtual StagedRow staged_row(const KernelShapes&) const { return {}; }
+
+  // What ONE WORKGROUP of this primitive's launch reads and writes, by operand
+  // class. Unstated by default, and unstated is not zero: a primitive that has
+  // not said what it moves must never read as moving nothing.
+  //
+  // It belongs here rather than in the emitter because the split into weight
+  // and activation is a property of the contraction, not of the text: only the
+  // primitive knows that one operand is re-read once per output tile and the
+  // other once per weight tile, and that difference is the whole reason the two
+  // are counted apart. The emitter sums these over the stages of a run.
+  //
+  // Per workgroup because that is the granularity a tile changes; the grid is a
+  // consequence of the tile and is reported alongside rather than multiplied in.
+  virtual opt::TrafficModel traffic(const KernelShapes&) const { return {}; }
 
   // The primitive that should actually run for this invocation.
   //

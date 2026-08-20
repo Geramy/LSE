@@ -376,6 +376,41 @@ std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
   return (budget == 0 || need <= budget) ? need : 0;
 }
 
+// What one workgroup of this contraction reads off the device.
+//
+// The two terms do not divide each other, which is the whole reason they are
+// counted apart: the weight term is set by the COLUMNS a workgroup owns — one
+// per wave — and the activation term by the ROWS it covers, and a row tile
+// leaves the column term untouched. The activation is counted at f32 because
+// that is what crosses the bus: the integer path quantizes it AFTER staging, so
+// the packing saves scratch and instructions, never DRAM.
+opt::TrafficModel quant_traffic(const KernelShapes& s, bool indexed) {
+  const QuantDims d = dims_of(s, indexed);
+  if (!shape_ok(d) || !device_fits(s)) return {};
+  const std::uint32_t wave = wave_of(s.device);
+  const std::uint32_t cols = kBlock / wave;
+  const std::uint32_t rows = dot_rows(s, d, indexed);
+  const auto scale_elem =
+      static_cast<std::uint32_t>(dtype_storage_bytes(s.input_dtypes[2], 1));
+  // One scale and one bias per group, for every column the workgroup owns.
+  const auto scale_bytes = static_cast<std::uint64_t>(cols) *
+                           static_cast<std::uint64_t>(d.groups) * 2 *
+                           scale_elem;
+  opt::TrafficModel m = opt::contraction_traffic(
+      rows, cols, static_cast<std::uint64_t>(d.k),
+      static_cast<std::uint32_t>(d.spec.bits), sizeof(float), scale_bytes,
+      static_cast<std::uint64_t>(rows) * cols * sizeof(float));
+  if (indexed) {
+    m.add_read(opt::OperandClass::kIndex,
+               static_cast<std::uint64_t>(rows) * d.keep * sizeof(float));
+  }
+  const ThreadPlan plan =
+      gemv_plan(d, wave, body_lds_bytes(s, d, indexed), rows);
+  m.workgroups = plan.workgroup_count[0] * plan.workgroup_count[1];
+  m.workgroup_threads = plan.workgroup_size[0];
+  return m;
+}
+
 // x -> int8, one scale per group of `group_size`, staged for the whole
 // workgroup. `xs` is the float panel a fused run already staged, or null when
 // the row is read from global.
@@ -860,6 +895,10 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
     return DType::kF32;
   }
 
+  opt::TrafficModel traffic(const KernelShapes& s) const override {
+    return quant_traffic(s, false);
+  }
+
   static ThreadPlan plan_impl(const KernelShapes& s) {
     const QuantDims d = dims_of(s, false);
     return gemv_plan(d, wave_of(s.device), body_lds_bytes(s, d, false),
@@ -913,6 +952,10 @@ struct QuantLinearIndexedKernel final
 
   DType infer_dtype(std::span<const DType>) const override {
     return DType::kF32;
+  }
+
+  opt::TrafficModel traffic(const KernelShapes& s) const override {
+    return quant_traffic(s, true);
   }
 
   static ThreadPlan plan_impl(const KernelShapes& s) {

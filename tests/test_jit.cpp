@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -23,6 +24,7 @@
 #include "lse/opt/occupancy.hpp"
 #include "lse/opt/fusion.hpp"
 #include "lse/opt/measurements.hpp"
+#include "lse/opt/traffic.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/code_object.hpp"
 #include "lse/backends/hrx/hrx_backend.hpp"
@@ -1265,6 +1267,220 @@ LSE_TEST(a_compiled_hip_kernel_carries_what_the_compiler_measured) {
   std::printf("       %s", r->describe().c_str());
 }
 
+// The census reader, on a kernel whose traffic is known by construction: one
+// 16-byte load and one 16-byte store per thread, staged through workgroup
+// scratch. Nothing loops and nothing is conditional, so the static count is the
+// whole body and every number below is arithmetic anyone can redo by hand.
+LSE_TEST(an_object_census_counts_what_the_kernel_was_told_to_move) {
+  if (!kCompiler.available()) return;
+
+  const std::string entry = "lse_census_probe";
+  const std::string source =
+      "#include <hip/hip_runtime.h>\n"
+      "extern \"C\" __global__ void " + entry +
+      "(float4* __restrict__ out, const float4* __restrict__ in) {\n"
+      "  __shared__ float4 tile[256];\n"
+      "  const unsigned i = threadIdx.x;\n"
+      "  tile[i] = in[i];\n"
+      "  __syncthreads();\n"
+      "  out[i] = tile[255u - i];\n"
+      "}\n";
+  auto built = kCompiler.compile(source, "gfx1151");
+  LSE_EXPECT_OK(built.status());
+  if (!built.ok()) return;
+
+  const backend::KernelCensus* c = built->census_for(entry);
+  LSE_EXPECT(c != nullptr);
+  if (c == nullptr) return;
+  LSE_EXPECT(c->any());
+  LSE_EXPECT(c->instructions.value > 0u);
+  // Every instruction in this body is one the classifier knows. A census that
+  // cannot name what it read is not evidence about what it did not find.
+  LSE_EXPECT_EQ(c->unclassified.value, 0u);
+  LSE_EXPECT(c->straight_line());
+
+  LSE_EXPECT_EQ(c->global_loads.bytes(), 16u);
+  LSE_EXPECT_EQ(c->global_stores.bytes(), 16u);
+  LSE_EXPECT_EQ(c->shared_loads.bytes(), 16u);
+  LSE_EXPECT_EQ(c->shared_stores.bytes(), 16u);
+  // The load is 16 bytes wide because the source asked for a float4; a reader
+  // that split it into four dwords would report the same bytes and four times
+  // the instructions.
+  LSE_EXPECT_EQ(c->global_loads.count(), 1u);
+  // One load, and one wait that retires it: with a single load in flight the
+  // batch depth is 1 by construction, which is what pins the wait accounting.
+  LSE_EXPECT_EQ(c->memory_waits.value, 1u);
+  LSE_EXPECT_EQ(c->deepest_load_batch.value, 1u);
+  LSE_EXPECT_EQ(c->serializing_waits.value, 1u);
+  // The kernarg pointers arrive through the scalar path, once per wave.
+  LSE_EXPECT(c->scalar_loads.count() > 0u);
+
+  // And the engine reads it as bytes for a whole workgroup without knowing a
+  // single instruction name.
+  const opt::EmittedTraffic t = opt::emitted_traffic(*c, 256);
+  LSE_EXPECT(t.known);
+  LSE_EXPECT(t.exact);
+  LSE_EXPECT_EQ(t.global_read, 16u * 256u);
+  LSE_EXPECT_EQ(t.global_written, 16u * 256u);
+  std::printf("       %s", c->describe().c_str());
+}
+
+// A loop is the difference between a count and a measurement, so the census has
+// to say which one it produced. The body below reads one dword per iteration of
+// a loop whose length the kernel is told at runtime: the static count is one
+// load and the launch's traffic is not.
+LSE_TEST(a_census_says_which_of_its_counts_can_repeat) {
+  if (!kCompiler.available()) return;
+
+  const std::string entry = "lse_census_loop_probe";
+  const std::string source =
+      "#include <hip/hip_runtime.h>\n"
+      "extern \"C\" __global__ void " + entry +
+      "(float* __restrict__ out, const float* __restrict__ in, unsigned n) {\n"
+      "  float acc = 0.0f;\n"
+      "  for (unsigned j = threadIdx.x; j < n; j += 256u) acc += in[j];\n"
+      "  out[threadIdx.x] = acc;\n"
+      "}\n";
+  auto built = kCompiler.compile(source, "gfx1151");
+  LSE_EXPECT_OK(built.status());
+  if (!built.ok()) return;
+  const backend::KernelCensus* c = built->census_for(entry);
+  LSE_EXPECT(c != nullptr);
+  if (c == nullptr) return;
+
+  LSE_EXPECT(!c->straight_line());
+  LSE_EXPECT(c->backward_branches.value > 0u);
+  LSE_EXPECT(c->global_loads.loops());
+  // The store is outside the loop, so it is the whole of the floor.
+  LSE_EXPECT_EQ(c->global_loads.straight_line_bytes(), 0u);
+  LSE_EXPECT_EQ(c->global_stores.straight_line_bytes(), 4u);
+  const opt::EmittedTraffic t = opt::emitted_traffic(*c, 256);
+  LSE_EXPECT(!t.exact);
+  LSE_EXPECT_EQ(t.global_floor, 4u * 256u);
+  std::printf("       %s", c->describe().c_str());
+}
+
+// The engine's own arithmetic, at the two shapes that decide the 27B: the hidden
+// contraction at K=5120 and the projection at K=17408. The point of the split is
+// that a ROW tile divides only the activation term and a COLUMN tile only the
+// weight term, so the balance says which axis is worth moving — and the balance
+// is shape dependent, which is why it is computed and not tabulated.
+LSE_TEST(the_traffic_split_prices_both_terms_of_a_contraction) {
+  struct Site {
+    const char* what;
+    std::uint64_t k;
+    std::uint32_t rows;
+  };
+  const Site sites[] = {{"hidden K=5120", 5120, 8}, {"proj K=17408", 17408, 8}};
+  for (const Site& site : sites) {
+    const std::uint64_t groups = site.k / 64;
+    const opt::TrafficModel m = opt::contraction_traffic(
+        site.rows, 8, site.k, 4, 4, 8 * groups * 2 * 2,
+        static_cast<std::uint64_t>(site.rows) * 8 * 4);
+    LSE_EXPECT(m.stated);
+    const std::uint64_t w = m.bytes_read(opt::OperandClass::kWeight);
+    const std::uint64_t a = m.bytes_read(opt::OperandClass::kActivation);
+    // Both derivable by hand: 8 columns of K half-bytes against R rows of K
+    // floats. The weight term is the smaller one at every reachable tile, which
+    // is the whole finding.
+    LSE_EXPECT_EQ(w, 8u * site.k / 2u);
+    LSE_EXPECT_EQ(a, site.rows * site.k * 4u);
+    LSE_EXPECT(a > w);
+    std::printf("       %s R=%u: weight %llu B, activation %llu B, "
+                "activation %.0f%% of reads, %.3f B/mac\n",
+                site.what, site.rows, static_cast<unsigned long long>(w),
+                static_cast<unsigned long long>(a),
+                m.read_share(opt::OperandClass::kActivation) * 100.0,
+                m.bytes_per_work());
+  }
+
+  // The row tile only ever divides the smaller term, so its whole reach is the
+  // ratio below — the same ratio at both widths, which is what makes it a rule
+  // about the schedule rather than a fact about one matrix.
+  for (const std::uint64_t k : {std::uint64_t{5120}, std::uint64_t{17408}}) {
+    const opt::TrafficModel r1 = opt::contraction_traffic(1, 8, k, 4, 4, 0, 0);
+    const opt::TrafficModel r8 = opt::contraction_traffic(8, 8, k, 4, 4, 0, 0);
+    LSE_EXPECT(r8.bytes_per_work() < r1.bytes_per_work());
+    // And the column axis, which nothing has ever moved: it divides the term
+    // that dominates, so it reaches further than the row axis ever could.
+    const opt::TrafficModel c16 = opt::contraction_traffic(8, 16, k, 4, 4, 0, 0);
+    LSE_EXPECT(c16.bytes_per_work() < r8.bytes_per_work());
+    std::printf("       K=%llu B/mac: R=1 %.3f, R=8 %.3f, R=8 c=16 %.3f\n",
+                static_cast<unsigned long long>(k), r1.bytes_per_work(),
+                r8.bytes_per_work(), c16.bytes_per_work());
+  }
+}
+
+// THE DISAGREEMENT CHECK, on kernels this engine really emits.
+//
+// The failure it exists to catch is on record: a traffic model that priced the
+// weight and forgot the activation, which made a row tile look like a 26.6% win
+// that was never available. Here the same model is built both ways against the
+// same compiled object — correctly, and weight-only — and the object has to
+// contradict the second one.
+LSE_TEST(a_traffic_model_that_forgets_a_term_disagrees_with_the_object) {
+  if (!kCompiler.available()) return;
+  constexpr std::int64_t kGroup = 64;
+  constexpr std::int64_t kN = 16;
+  constexpr std::int64_t kRows = 8;
+
+  for (const std::int64_t k : {std::int64_t{5120}, std::int64_t{17408}}) {
+    const std::int64_t lanes = k * 4 / 32;
+    const std::int64_t groups = k / kGroup;
+    Array x = Array::zeros(Shape{kRows, k}, DType::kF32);
+    Array packed = Array::zeros(Shape{kN, lanes}, DType::kU32);
+    Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
+    Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
+    Array y = quant_linear(x, packed, scales, biases, 4, kGroup);
+    auto e = emit_anchor(y, OpKind::kQuantMatMul);
+    LSE_EXPECT(e.ok());
+    if (!e.ok()) continue;
+
+    // The emitter states what the run means to move, split by class.
+    const opt::TrafficModel& intended = e->traffic;
+    LSE_EXPECT(intended.stated);
+    if (!intended.stated) continue;
+    LSE_EXPECT(intended.workgroup_threads > 0u);
+    const std::uint64_t weight =
+        intended.bytes_read(opt::OperandClass::kWeight);
+    const std::uint64_t activation =
+        intended.bytes_read(opt::OperandClass::kActivation);
+    LSE_EXPECT(weight > 0u);
+    LSE_EXPECT(activation > weight);
+
+    auto built = kCompiler.compile(e->source, "gfx1151");
+    LSE_EXPECT_OK(built.status());
+    if (!built.ok()) continue;
+    const backend::KernelCensus* c = built->census_for(e->entry_name);
+    LSE_EXPECT(c != nullptr);
+    if (c == nullptr) continue;
+    LSE_EXPECT_EQ(c->unclassified.value, 0u);
+    // The integer inner loop is the reason this shape is interesting at all.
+    LSE_EXPECT(c->dot_products.value > 0u);
+
+    const opt::TrafficCheck honest =
+        opt::check_traffic(intended, *c, intended.workgroup_threads);
+    LSE_EXPECT(!honest.disagrees());
+
+    // Now the model as it was when the row tile was mispriced: weights only.
+    opt::TrafficModel weights_only;
+    weights_only.add_read(opt::OperandClass::kWeight, weight);
+    weights_only.work = intended.work;
+    const opt::TrafficCheck wrong =
+        opt::check_traffic(weights_only, *c, intended.workgroup_threads);
+    LSE_EXPECT(wrong.verdict == opt::TrafficVerdict::kEmitsMore);
+
+    std::printf("       K=%lld weight %llu B activation %llu B "
+                "(activation %.0f%% of reads)\n",
+                static_cast<long long>(k),
+                static_cast<unsigned long long>(weight),
+                static_cast<unsigned long long>(activation),
+                intended.read_share(opt::OperandClass::kActivation) * 100.0);
+    std::printf("       honest %s", honest.describe().c_str());
+    std::printf("       weight-only %s", wrong.describe().c_str());
+  }
+}
+
 LSE_TEST(a_compiled_loom_kernel_reports_registers_and_declines_spills) {
   if (!kLoom.available() || !kCompiler.available()) return;
 
@@ -1623,7 +1839,7 @@ struct CountingCompiler final : IKernelCompiler {
   Result<CompiledKernel> compile(std::string_view,
                                  std::string_view) const override {
     ++n;
-    return CompiledKernel{std::vector<std::byte>(16, std::byte{1}), {}};
+    return CompiledKernel{std::vector<std::byte>(16, std::byte{1}), {}, {}};
   }
   bool available() const override { return true; }
   std::string identity() const override { return "counting-compiler"; }
@@ -1634,7 +1850,7 @@ struct NamedCompiler final : IKernelCompiler {
   explicit NamedCompiler(std::string s) : id(std::move(s)) {}
   Result<CompiledKernel> compile(std::string_view,
                                  std::string_view) const override {
-    return CompiledKernel{std::vector<std::byte>(16, std::byte{2}), {}};
+    return CompiledKernel{std::vector<std::byte>(16, std::byte{2}), {}, {}};
   }
   bool available() const override { return true; }
   std::string identity() const override { return id; }
@@ -1718,6 +1934,7 @@ struct EchoCompiler final : IKernelCompiler {
     return CompiledKernel{
         std::vector<std::byte>{
             static_cast<std::byte>(src.empty() ? 0 : src.front())},
+        {},
         {}};
   }
   bool available() const override { return true; }
@@ -1743,7 +1960,28 @@ struct MeasuringCompiler final : IKernelCompiler {
     r.required_workgroup_size =
         backend::DeviceFact<std::array<std::uint32_t, 3>>::queried({256, 1, 1});
     out.resources.push_back(std::move(r));
+    out.census = census(out.code);
     return out;
+  }
+  std::vector<backend::KernelCensus> census(
+      std::span<const std::byte>) const override {
+    backend::KernelCensus c;
+    c.entry = "lse_measured";
+    c.instructions = backend::DeviceFact<std::uint32_t>::queried(1453);
+    c.vector_alu = backend::DeviceFact<std::uint32_t>::queried(1031);
+    c.dot_products = backend::DeviceFact<std::uint32_t>::queried(160);
+    c.multiply_accumulates =
+        backend::DeviceFact<std::uint32_t>::queried(640);
+    c.backward_branches = backend::DeviceFact<std::uint32_t>::queried(10);
+    c.memory_waits = backend::DeviceFact<std::uint32_t>::queried(26);
+    c.deepest_load_batch = backend::DeviceFact<std::uint32_t>::queried(3);
+    // scalar_alu and the rest deliberately left unanswered, the same hole the
+    // resource half carries.
+    c.global_loads.add(16, false);
+    c.global_loads.add(16, true);
+    c.global_loads.add(2, false);
+    c.shared_stores.add(4, true);
+    return {c};
   }
   bool available() const override { return true; }
   std::string identity() const override { return "measuring-compiler"; }
@@ -2060,6 +2298,127 @@ LSE_TEST(measured_resources_survive_a_warm_start_holes_included) {
     check(warm, "after a warm start");
   }
   fs::remove_all(dir);
+}
+
+// The census travels with the object the same way the register counts do, and
+// an object cached before anything counted instructions gets counted from its
+// own bytes rather than staying undescribed forever.
+LSE_TEST(an_emitted_census_survives_a_warm_start_and_an_older_note) {
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() /
+                       ("lse-jit-census-" + std::to_string(::getpid()));
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+
+  MeasuringCompiler cc;
+  EchoBackend be(cc, cc);
+  StubSet set;
+  set.members.push_back(&be);
+  DialectPair k;
+
+  const auto check = [&](const JitCache& cache, const char* when) {
+    const backend::KernelCensus* c =
+        cache.census(0, k.signature, Dialect::kHip);
+    LSE_EXPECT(c != nullptr);
+    if (c == nullptr) {
+      std::printf("       no census %s\n", when);
+      return;
+    }
+    LSE_EXPECT(c->entry == "lse_measured");
+    LSE_EXPECT_EQ(c->instructions.value, 1453u);
+    LSE_EXPECT_EQ(c->dot_products.value, 160u);
+    LSE_EXPECT_EQ(c->multiply_accumulates.value, 640u);
+    // Widths and their loop split are the part a scalar line cannot carry.
+    LSE_EXPECT_EQ(c->global_loads.count(), 3u);
+    LSE_EXPECT_EQ(c->global_loads.bytes(), 34u);
+    LSE_EXPECT_EQ(c->global_loads.straight_line_bytes(), 18u);
+    LSE_EXPECT_EQ(c->shared_stores.bytes(), 4u);
+    LSE_EXPECT(!c->straight_line());
+    // A hole stays a hole: nothing counted the scalar arithmetic, and a round
+    // trip must not answer zero for it.
+    LSE_EXPECT(!c->scalar_alu.known());
+  };
+
+  {
+    JitCache cache(set, dir.string());
+    LSE_EXPECT_OK(cache.get_or_compile(0, k.signature, k.hip).status());
+    LSE_EXPECT_EQ(cache.stats().compiles, 1u);
+    check(cache, "after compiling");
+  }
+  {
+    JitCache warm(set, dir.string());
+    LSE_EXPECT_OK(warm.get_or_compile(0, k.signature, k.hip).status());
+    LSE_EXPECT_EQ(warm.stats().compiles, 0u);
+    LSE_EXPECT_EQ(warm.stats().disk_hits, 1u);
+    check(warm, "after a warm start");
+  }
+
+  // Now the note as an older build wrote it: resources, no counts. The bytes
+  // are still there, so the counts have to come back without a compile.
+  for (const fs::directory_entry& e : fs::directory_iterator(dir)) {
+    if (e.path().extension() != ".meta") continue;
+    std::ifstream in(e.path());
+    std::string kept;
+    for (std::string line; std::getline(in, line);) {
+      if (line.rfind("cen ", 0) == 0 || line.rfind("acc ", 0) == 0) continue;
+      kept += line;
+      kept += '\n';
+    }
+    in.close();
+    std::ofstream out(e.path(), std::ios::trunc);
+    out << kept;
+  }
+  {
+    JitCache older(set, dir.string());
+    LSE_EXPECT_OK(older.get_or_compile(0, k.signature, k.hip).status());
+    LSE_EXPECT_EQ(older.stats().compiles, 0u);
+    check(older, "from an older note");
+  }
+
+  // And the counts reach the optimizer's own store under the entry name, which
+  // is the identity a decision site can spell before the next kernel exists.
+  const backend::KernelCensus stored =
+      opt::KernelMeasurements::instance().census("lse_measured");
+  LSE_EXPECT(stored.any());
+  LSE_EXPECT_EQ(stored.multiply_accumulates.value, 640u);
+  fs::remove_all(dir);
+}
+
+// The store is what carries a fact from one compile to the next decision, so
+// both halves of the comparison have to survive it: the counts the object
+// yielded, and the traffic the emitter meant. Nothing here touches a device —
+// this is the seam, not the measurement.
+LSE_TEST(the_measurement_store_carries_both_halves_of_the_comparison) {
+  opt::KernelMeasurements& store = opt::KernelMeasurements::instance();
+  const std::string entry = "lse_traffic_store_probe";
+  LSE_EXPECT(!store.census_known(entry));
+  LSE_EXPECT(!store.traffic(entry).stated);
+
+  backend::KernelCensus c;
+  c.entry = entry;
+  c.instructions = backend::DeviceFact<std::uint32_t>::queried(64);
+  c.multiply_accumulates = backend::DeviceFact<std::uint32_t>::queried(256);
+  c.backward_branches = backend::DeviceFact<std::uint32_t>::queried(0);
+  c.global_loads.add(16, false);
+  store.record(entry, c);
+
+  opt::TrafficModel m = opt::contraction_traffic(1, 8, 64, 4, 4, 0, 0);
+  m.workgroup_threads = 64;
+  store.record(entry, m);
+
+  LSE_EXPECT(store.census_known(entry));
+  const opt::TrafficModel back = store.traffic(entry);
+  LSE_EXPECT(back.stated);
+  LSE_EXPECT_EQ(back.bytes_read(opt::OperandClass::kWeight), 8u * 64u / 2u);
+  LSE_EXPECT_EQ(back.bytes_read(opt::OperandClass::kActivation), 64u * 4u);
+
+  // The whole point of keeping them together: the comparison composes out of
+  // the store, with nothing held over from the compile that produced them.
+  const opt::TrafficCheck check = opt::check_traffic(
+      back, store.census(entry), back.workgroup_threads);
+  LSE_EXPECT(check.verdict != opt::TrafficVerdict::kUnknown);
+  LSE_EXPECT(check.emitted_bytes == 16u * 64u);
+  LSE_EXPECT(check.emitted_exact);
 }
 
 // The case the compiler identity cannot separate: one compiler declared for
