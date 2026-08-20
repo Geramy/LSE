@@ -107,6 +107,47 @@ inline const LdsGranule* lds_granule(std::string_view arch) noexcept {
   return nullptr;
 }
 
+// What share of its saturated read rate the memory system delivers at each
+// residency. Same discipline as the granule above: measured on the part, one
+// row per part measured, and unknown for every part that was not.
+//
+// MEASURED ON THE THING BEING PRICED, not on a proxy. Each point is one 4-bit
+// contraction launch whose traffic was held fixed while only the scratch it
+// asked for changed, so the rate is the rate that kind of launch collects:
+// gfx1151, 256 threads, k=17408 over a 5120-wide plane, weight and scale bytes
+// over wall time — 241.4 and 236.1 GB/s where residency stopped binding
+// (eight workgroups per pool), 208.5 at four, 155.7 at two. Against a 238 GB/s
+// reference that is 100, 88 and 65 percent. Two is the thinnest a 256-thread
+// workgroup can be seated at on this part, since one request cannot exceed the
+// 65536-byte addressable cap.
+//
+// A GRID-STRIDE MICROBENCHMARK REPRODUCES THE SHAPE but not the depth, and the
+// difference is the point: with two single-dword loads per lane outstanding it
+// measured 98, 84 and 57 percent, and with eight wide loads outstanding it
+// measured 100, 98 and 101 — flat. Residency costs bandwidth only where a wave
+// does not already have enough loads in flight to cover the latency, so a curve
+// taken from a deeply pipelined stream says residency is free and is wrong for
+// every kernel that is not one. The unmeasured points are left unmeasured
+// rather than filled in from the microbenchmark: two instruments in one table
+// with no way to tell which cell came from which is worse than a gap, and
+// ResidencyBandwidth::share already says what a gap reads as.
+struct ResidencyCurve {
+  std::string_view arch;
+  std::array<std::uint8_t, ResidencyBandwidth::kPoints> percent;
+};
+
+inline constexpr ResidencyCurve kResidencyCurve[] = {
+    // workgroups per pool:  0  1   2  3   4  5  6  7    8
+    {"gfx1151",            {{ 0, 0, 65, 0, 88, 0, 0, 0, 100}}},
+};
+
+inline const ResidencyCurve* residency_curve(std::string_view arch) noexcept {
+  for (const ResidencyCurve& c : kResidencyCurve) {
+    if (arch.rfind(c.arch, 0) == 0) return &c;
+  }
+  return nullptr;
+}
+
 inline constexpr BoardFallback kBoardFallback[] = {
     {"gfx1151", 40, 2u << 20, true},
     {"gfx1100", 96, 4u << 20, false},
@@ -161,6 +202,10 @@ inline void apply_residency_facts(DeviceInfo& info) {
   if (const LdsGranule* g = lds_granule(info.arch); g != nullptr) {
     info.arch_facts.lds_alloc_granule_bytes =
         DeviceFact<std::uint32_t>::declared(g->bytes);
+  }
+  if (const ResidencyCurve* c = residency_curve(info.arch); c != nullptr) {
+    info.residency_bandwidth.percent = c->percent;
+    info.residency_bandwidth.source = FactSource::kDeclared;
   }
 }
 

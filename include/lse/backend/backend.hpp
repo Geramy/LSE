@@ -450,6 +450,13 @@ struct DeviceInfo {
   // than zeros a model would spend.
   ArchFacts arch_facts;
 
+  // What share of its streaming rate the memory system gives a launch at a
+  // given residency. The other half of the pair an arrangement is priced on:
+  // arch_facts says how many workgroups fit, this says what fitting fewer
+  // costs. Unknown where nothing measured it, and a decision then prices the
+  // traffic alone rather than scaling it by an invented number.
+  ResidencyBandwidth residency_bandwidth;
+
   [[nodiscard]] std::string describe() const;
 };
 
@@ -460,8 +467,15 @@ struct DeviceInfo {
 // the occupancy model needs.
 static_assert(sizeof(ArchFacts) == 13 * sizeof(DeviceFact<std::uint32_t>),
               "ArchFacts gained or lost a fact — say which and why");
+// ResidencyBandwidth is a byte array, so it lands in no existing padding and
+// its own tail is rounded to the struct's alignment; the round is spelled out
+// rather than folded into a literal so the next field to be added has to say
+// which of the two it is doing.
 static_assert(sizeof(DeviceInfo) ==
-                  2 * sizeof(std::string) + 48 + sizeof(ArchFacts),
+                  2 * sizeof(std::string) + 48 + sizeof(ArchFacts) +
+                      ((sizeof(ResidencyBandwidth) + alignof(DeviceInfo) - 1) /
+                       alignof(DeviceInfo)) *
+                          alignof(DeviceInfo),
               "DeviceInfo scalar budget changed — justify the field, then "
               "update this assert");
 

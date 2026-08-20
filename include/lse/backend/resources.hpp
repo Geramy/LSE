@@ -194,4 +194,55 @@ struct ArchFacts {
   [[nodiscard]] std::string describe() const;
 };
 
+// What share of its streaming rate this device's memory system delivers to a
+// launch at a given residency.
+//
+// WHY IT IS A SEPARATE FACT AND NOT A SLOPE. Residency buys memory-level
+// parallelism, and parallelism buys bandwidth only until the memory system is
+// saturated. Neither end of that is a slope: measured on gfx1151 the rate falls
+// 27% between eight resident workgroups per pool and two, and almost none of
+// that fall happens in the top half of the range. No law reproduces the shape,
+// so it is measured and tabulated, exactly as the scratch allocation granule is,
+// and a part nobody measured leaves it unknown rather than getting a curve
+// derived from another part's.
+//
+// DIMENSIONLESS ON PURPOSE. An absolute rate would let a caller compute a time,
+// but a comparison between two arrangements OF ONE LAUNCH divides by the same
+// rate on both sides, so the rate cancels and only the share does not. Carrying
+// the share alone is what lets residency and traffic be compared without
+// anybody having to measure a bandwidth first.
+struct ResidencyBandwidth {
+  // Indexed by whole workgroups resident on one scratch pool. Percent of the
+  // rate the same kernel reaches where residency stops binding; 0 means that
+  // point was not measured. Index 0 is unused — no workgroups move no bytes.
+  static constexpr std::size_t kPoints = 9;
+  std::array<std::uint8_t, kPoints> percent{};
+  FactSource source = FactSource::kUnknown;
+
+  [[nodiscard]] bool known() const noexcept {
+    return source == FactSource::kQueried || source == FactSource::kDeclared;
+  }
+
+  // The share at `workgroups`, or 0 when nothing was measured at all.
+  //
+  // Past the last point the curve is read flat: it saturates, and reading a
+  // saturated curve flat is what it says rather than an extrapolation. Between
+  // points the answer is the nearest measured one BELOW, which understates what
+  // the launch collects — the direction that charges a thin arrangement more
+  // rather than less, so an unmeasured point can only make the model keep
+  // residency it might not have needed, never spend residency it did need.
+  // BELOW the lowest measured point there is nothing to fall back to and the
+  // scan turns around, so a residency thinner than anything measured is priced
+  // at the thinnest that was. That is the one direction this cannot be
+  // conservative in, and the answer is to measure that point, not to invent it.
+  [[nodiscard]] double share(std::uint32_t workgroups) const noexcept {
+    if (!known() || workgroups == 0) return 0.0;
+    std::size_t at = workgroups < kPoints ? workgroups : kPoints - 1;
+    while (at > 0 && percent[at] == 0) --at;
+    while (at < kPoints && percent[at] == 0) ++at;
+    if (at >= kPoints || percent[at] == 0) return 0.0;
+    return static_cast<double>(percent[at]) / 100.0;
+  }
+};
+
 }  // namespace lse::backend

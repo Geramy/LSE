@@ -21,6 +21,7 @@
 #include "lse/core/debug.hpp"
 #include "lse/backends/cpu/cpu_backend.hpp"
 #include "lse/backend/resources.hpp"
+#include "lse/opt/arrangement.hpp"
 #include "lse/opt/occupancy.hpp"
 #include "lse/opt/fusion.hpp"
 #include "lse/opt/measurements.hpp"
@@ -340,7 +341,7 @@ LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
   // bits, so that side is 32 of them; the integer side keeps only the group
   // scale, the group bias and the per-chunk activation step, and it keeps one
   // of each for every row the workgroup covers. This x is two rows, so the
-  // bound is per row -- what the claim rests on is that neither side of it
+  // bound is per row — what the claim rests on is that neither side of it
   // grows with K.
   constexpr std::size_t kRows = 2;
   LSE_EXPECT(count(eight, "fmaf(") >= 32);
@@ -1418,11 +1419,22 @@ LSE_TEST(the_traffic_split_prices_both_terms_of_a_contraction) {
 // that was never available. Here the same model is built both ways against the
 // same compiled object — correctly, and weight-only — and the object has to
 // contradict the second one.
+//
+// HOW BADLY IT CONTRADICTS IS THE ROW TILE'S OWN FACTOR, so which K clears the
+// instrument's measured 3x spread moves when the tile does. Weight-only
+// understates by the ratio of the whole workgroup's reads to its weight reads,
+// which is set by the rows the tile covers; at K=17408 the tile is two rows and
+// the object reads 4.1x the model, decidably more, while at K=5120 it is four
+// and the 2.5x sits inside the spread. So the assertion is in two parts: the
+// weight-only model must read high at EVERY shape — that part is a property of
+// the model and holds whatever the tile is — and it must be called a
+// disagreement wherever the gap clears what the instrument can resolve.
 LSE_TEST(a_traffic_model_that_forgets_a_term_disagrees_with_the_object) {
   if (!kCompiler.available()) return;
   constexpr std::int64_t kGroup = 64;
   constexpr std::int64_t kN = 16;
   constexpr std::int64_t kRows = 8;
+  int caught = 0;
 
   for (const std::int64_t k : {std::int64_t{5120}, std::int64_t{17408}}) {
     const std::int64_t lanes = k * 4 / 32;
@@ -1468,7 +1480,6 @@ LSE_TEST(a_traffic_model_that_forgets_a_term_disagrees_with_the_object) {
     weights_only.work = intended.work;
     const opt::TrafficCheck wrong =
         opt::check_traffic(weights_only, *c, intended.workgroup_threads);
-    LSE_EXPECT(wrong.verdict == opt::TrafficVerdict::kEmitsMore);
 
     std::printf("       K=%lld weight %llu B activation %llu B "
                 "(activation %.0f%% of reads)\n",
@@ -1478,7 +1489,18 @@ LSE_TEST(a_traffic_model_that_forgets_a_term_disagrees_with_the_object) {
                 intended.read_share(opt::OperandClass::kActivation) * 100.0);
     std::printf("       honest %s", honest.describe().c_str());
     std::printf("       weight-only %s", wrong.describe().c_str());
+    // Reads high at every shape, and is never mistaken for agreement.
+    LSE_EXPECT(wrong.intensity_ratio() > honest.intensity_ratio());
+    LSE_EXPECT(wrong.verdict != opt::TrafficVerdict::kAgrees);
+    // And is caught outright wherever the gap clears the instrument's spread.
+    if (wrong.intensity_ratio() > opt::kTrafficDisagreementFactor) {
+      LSE_EXPECT(wrong.verdict == opt::TrafficVerdict::kEmitsMore);
+      ++caught;
+    }
   }
+  // A check that could never fire would pass on a tree with no instrument at
+  // all, so at least one of the shapes has to have been decided.
+  LSE_EXPECT(caught > 0);
 }
 
 LSE_TEST(a_compiled_loom_kernel_reports_registers_and_declines_spills) {
@@ -3743,6 +3765,170 @@ LSE_TEST(an_unknown_capacity_degrades_rather_than_guessing) {
   const opt::DeviceCapacity nothing;
   LSE_EXPECT(!nothing.usable());
   LSE_EXPECT(!opt::occupancy(nothing, ask(40000)).seated());
+}
+
+// ---------------------------------------------------------------------------
+// Pricing an arrangement: the traffic it moves and the residency it achieves,
+// in one figure.
+//
+// Every case below is a RULE, not a number. Each one makes exactly one of the
+// two terms decisive and checks that the other cannot overturn it, so a change
+// to the measured curve moves the figures without moving any of these answers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One row tile of a 4-bit contraction: `rows` activation rows against `cols`
+// weight columns over `depth`, and the grid such a tile dispatches.
+opt::Arrangement tile(std::uint32_t rows, std::uint64_t depth,
+                      std::uint64_t n, std::uint64_t m,
+                      std::uint32_t lds_bytes) {
+  constexpr std::uint32_t kCols = 8;   // one column per wave of a 256-thread group
+  constexpr std::uint32_t kThreads = 256;
+  opt::Arrangement a;
+  a.traffic = opt::contraction_traffic(
+      rows, kCols, depth, /*weight_bits=*/4, /*activation_bytes=*/4,
+      /*scale_bytes=*/kCols * (depth / 64) * 2 * 2,
+      /*output_bytes=*/rows * kCols * 4);
+  const auto blocks = static_cast<std::uint32_t>((m + rows - 1) / rows);
+  a.traffic.workgroups =
+      static_cast<std::uint32_t>((n + kCols - 1) / kCols) * blocks;
+  a.traffic.workgroup_threads = kThreads;
+  a.demand = opt::KernelDemand::counted(kThreads, lds_bytes);
+  return a;
+}
+
+}  // namespace
+
+// THE RULE, both halves at once: an arrangement that seats one workgroup on a
+// pool loses to one that seats more when the traffic is comparable, and a
+// two-row tile survives at two rows because the traffic it saves outweighs the
+// residency it costs.
+//
+// The second half is the one that matters most in this tree. Multi-token
+// prediction verifies two tokens per step, and its measured 1.96x rests on
+// those two tokens costing ONE token of weight traffic — which is a two-row
+// tile at m=2. A rule that scored residency alone would answer one row at every
+// shape and take that speedup away; this test is what stops it.
+LSE_TEST(an_arrangement_is_priced_on_both_traffic_and_residency) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  LSE_EXPECT(cap.residency_bandwidth.known());
+
+  // Same traffic, different residency: more workgroups on the pool wins, and
+  // it wins because the bytes are charged at a lower share, not by fiat.
+  {
+    opt::Arrangement roomy = tile(2, 5120, 17408, 128, 16000);
+    opt::Arrangement tight = roomy;
+    tight.demand = opt::KernelDemand::counted(256, 64000);
+    const opt::ArrangementCost a = opt::arrangement_cost(cap, roomy);
+    const opt::ArrangementCost b = opt::arrangement_cost(cap, tight);
+    LSE_EXPECT_EQ(a.launch_bytes, b.launch_bytes);
+    LSE_EXPECT(a.residency.workgroups_per_pool >
+               b.residency.workgroups_per_pool);
+    LSE_EXPECT(a.charged_bytes < b.charged_bytes);
+    LSE_EXPECT(opt::prefer(a, b));
+    LSE_EXPECT(!opt::prefer(b, a));
+  }
+
+  // Two rows at m=2 over the widest projection in the 27B: the tile halves the
+  // weight traffic and costs a halving of residency, and the traffic wins.
+  {
+    const opt::Arrangement one = tile(1, 17408, 5120, 2, 27200);
+    const opt::Arrangement two = tile(2, 17408, 5120, 2, 54400);
+    const opt::ArrangementCost a = opt::arrangement_cost(cap, one);
+    const opt::ArrangementCost b = opt::arrangement_cost(cap, two);
+    // The residency really does fall — this is not a case where the tile was
+    // free — and the arrangement is taken anyway.
+    LSE_EXPECT(b.residency.workgroups_per_pool <
+               a.residency.workgroups_per_pool);
+    LSE_EXPECT(b.launch_bytes < a.launch_bytes);
+    LSE_EXPECT(b.charged_bytes < a.charged_bytes);
+    const opt::Arrangement ladder[] = {one, two};
+    LSE_EXPECT_EQ(opt::best_arrangement(cap, ladder), std::size_t{1});
+  }
+
+  // And the converse, at the same shape and a row count further up the ladder:
+  // a tile whose traffic saving no longer covers what it gives up in residency
+  // is refused. Nothing here is a cap — eight rows FIT the part's addressable
+  // scratch, and the model declines them anyway.
+  {
+    const opt::Arrangement ladder[] = {
+        tile(1, 5120, 17408, 128, 8000), tile(2, 5120, 17408, 128, 16000),
+        tile(4, 5120, 17408, 128, 32000), tile(8, 5120, 17408, 128, 64000)};
+    const std::size_t best = opt::best_arrangement(cap, ladder);
+    LSE_EXPECT(best < 4);
+    // The largest rung moves the fewest bytes and is still not the answer.
+    const opt::ArrangementCost widest = opt::arrangement_cost(cap, ladder[3]);
+    const opt::ArrangementCost chosen = opt::arrangement_cost(cap, ladder[best]);
+    LSE_EXPECT(widest.launch_bytes < chosen.launch_bytes);
+    LSE_EXPECT(chosen.charged_bytes < widest.charged_bytes);
+    LSE_EXPECT(chosen.residency.workgroups_per_pool >
+               widest.residency.workgroups_per_pool);
+  }
+}
+
+// An unmeasured fact degrades rather than guessing, here as everywhere else.
+//
+// With no residency curve the arm drops out, the comparison runs on traffic
+// alone, and the answer is the largest tile — which is what a rule that only
+// asked whether the tile FIT already gave. A part nobody measured keeps the
+// behaviour it had instead of inheriting a curve measured on another part.
+LSE_TEST(an_unmeasured_residency_curve_degrades_to_traffic_alone) {
+  opt::DeviceCapacity blind = opt::DeviceCapacity::of(gfx1151());
+  blind.residency_bandwidth = {};
+  LSE_EXPECT(!blind.residency_bandwidth.known());
+
+  const opt::Arrangement ladder[] = {
+      tile(1, 5120, 17408, 128, 8000), tile(2, 5120, 17408, 128, 16000),
+      tile(4, 5120, 17408, 128, 32000), tile(8, 5120, 17408, 128, 64000)};
+  const opt::ArrangementCost c = opt::arrangement_cost(blind, ladder[3]);
+  LSE_EXPECT(!c.charged);
+  LSE_EXPECT_EQ(static_cast<std::uint64_t>(c.charged_bytes), c.launch_bytes);
+  LSE_EXPECT_EQ(opt::best_arrangement(blind, ladder), std::size_t{3});
+
+  // The same ladder on the same part WITH the curve answers differently, so the
+  // difference is the measurement and nothing else.
+  const opt::DeviceCapacity seeing = opt::DeviceCapacity::of(gfx1151());
+  LSE_EXPECT(opt::best_arrangement(seeing, ladder) != std::size_t{3});
+
+  // An arrangement that never said what it moves is not a free one: it is not
+  // priced and never wins, however little scratch it asks for.
+  opt::Arrangement silent;
+  silent.demand = opt::KernelDemand::counted(256, 0);
+  const opt::ArrangementCost none = opt::arrangement_cost(seeing, silent);
+  LSE_EXPECT(!none.stated);
+  LSE_EXPECT(!opt::prefer(none, opt::arrangement_cost(seeing, ladder[0])));
+}
+
+// A real tie is settled, and settled in an order that says why.
+//
+// Two arrangements moving the same bytes at the same share are separated by
+// residency; two that also seat the same are separated by what they ask the
+// pool for, because the room one leaves is what the next fusion decision has to
+// spend. And a spilling arrangement loses whatever it moves — that is a
+// different regime, not a smaller number.
+LSE_TEST(a_tie_between_arrangements_is_settled_by_residency_then_by_the_ask) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+
+  opt::Arrangement lean = tile(2, 5120, 17408, 128, 12000);
+  opt::Arrangement fat = lean;
+  fat.demand = opt::KernelDemand::counted(256, 16000);
+  const opt::ArrangementCost a = opt::arrangement_cost(cap, lean);
+  const opt::ArrangementCost b = opt::arrangement_cost(cap, fat);
+  // Both are held by the wave slots, so residency cannot separate them.
+  LSE_EXPECT_EQ(a.residency.workgroups_per_pool,
+                b.residency.workgroups_per_pool);
+  LSE_EXPECT_EQ(a.charged_bytes, b.charged_bytes);
+  LSE_EXPECT(opt::prefer(a, b));
+  LSE_EXPECT(!opt::prefer(b, a));
+
+  // Spilling decides first and outright, in both directions.
+  opt::ArrangementCost spilling = a;
+  spilling.residency.spill = backend::SpillState::kSpilled;
+  opt::ArrangementCost clean = b;
+  clean.residency.spill = backend::SpillState::kNone;
+  LSE_EXPECT(!opt::prefer(spilling, clean));
+  LSE_EXPECT(opt::prefer(clean, spilling));
 }
 
 // The mirror of the test above, and the one that was missing: an unanswered

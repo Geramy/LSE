@@ -112,6 +112,7 @@ lse_apply_common_flags(lse_communication)
 # (device facts, kernel resources) and on nothing that lowers or emits.
 # ---------------------------------------------------------------------------
 add_library(lse_opt
+  src/opt/arrangement.cpp
   src/opt/occupancy.cpp
   src/opt/fusion.cpp
   src/opt/measurements.cpp

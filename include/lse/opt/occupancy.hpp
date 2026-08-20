@@ -55,6 +55,11 @@ struct DeviceCapacity {
   backend::DeviceFact<std::uint32_t> max_flat_workgroup_size;
   backend::DeviceFact<std::uint32_t> wavefront_size;
 
+  // What seating fewer workgroups costs in delivered bandwidth. Not part of the
+  // occupancy answer — occupancy counts what fits — but part of pricing an
+  // arrangement, which is what opt/arrangement.hpp does with it.
+  backend::ResidencyBandwidth residency_bandwidth;
+
   // Enough answered to seat anything at all: the wave arithmetic needs the
   // wavefront size, the slot count and the pool's SIMD count. Everything else
   // may be unknown, and a limit whose facts are unknown drops out of the min

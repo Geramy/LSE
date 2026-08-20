@@ -58,6 +58,7 @@ DeviceCapacity DeviceCapacity::of(const backend::DeviceInfo& info) {
   c.lds_alloc_granule_bytes = f.lds_alloc_granule_bytes;
   c.lds_bytes_addressable_per_workgroup = f.lds_bytes_addressable_per_workgroup;
   c.max_flat_workgroup_size = f.max_flat_workgroup_size;
+  c.residency_bandwidth = info.residency_bandwidth;
   // The runtime's own answers, where the ISA table had nothing to say. These
   // are queried from the device rather than declared for the part number.
   if (!c.lds_bytes_addressable_per_workgroup.known() &&

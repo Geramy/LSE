@@ -20,6 +20,7 @@
 // or the bias at all. quant/group_affine_codec.hpp carries the algebra, and
 // `dot_ok` below carries what a device must have for it.
 #include <array>
+#include <span>
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
@@ -29,6 +30,7 @@
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
+#include "lse/opt/arrangement.hpp"
 #include "lse/quant/group_affine_codec.hpp"
 
 namespace lse::kernels {
@@ -260,65 +262,6 @@ bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
   return cpl <= cpg && cpg % cpl == 0 && cpg <= wave && kBlock % cpg == 0;
 }
 
-// LDS the body will reserve, which is not the float panel's size once the
-// integer path is on. The plan and the body have to agree, or occupancy is
-// computed against a launch that never happens.
-// Rows one workgroup covers, so the weight tile it reads is spent on more than
-// one of them.
-//
-// The weight index does not depend on the row, so a grid of one workgroup per
-// row streams the whole matrix once per row: a 128 token prefill pass moved 128
-// times the weight bytes of a single token and cost exactly 128 times as much,
-// which is the whole of the prefill gap. R rows in one workgroup cut that to
-// m/R passes over the matrix.
-//
-// Only on the integer path: it is the one that stages activations small enough
-// for several rows to share the scratch, at about an eighth of the float
-// panel. The ladder is powers of two so the JIT sees a bounded set of shapes,
-// the same reason the prefill chunk ladder exists.
-constexpr std::uint32_t kMaxRowsPerGroup = 8;
-
-// Rows one workgroup covers, so the weight tile it reads is spent on more than
-// one of them.
-//
-// R rows cut the passes over the weight matrix from m to m/R — real DRAM
-// traffic — and cost R times the workgroup scratch, which past a point seats
-// fewer workgroups on the pool. The gate below reads only the second half: it
-// asks whether R rows FIT the per-workgroup cap.
-//
-// LANDMINE, measured rather than argued, before anyone replaces this with the
-// residency rule the rest of the engine now uses. A residency-only rule (climb
-// while workgroups-per-pool is unchanged) was built and run here. It chooses
-// R=2 where this chooses 8 for the 5120-wide hidden, which is the right answer
-// — R=8 asks 64000 bytes and seats 2 workgroups per pool where R=2 seats 8,
-// and a 761-token prefill of Qwen3.8-27B-4bit measured R=1 40.71 s, R=2
-// 38.66 s, R=4 48.72 s, R=8 52.64 s, median of five. But it also drops the
-// 17408-wide projection from R=2 to R=1, because at 27200 bytes per row even
-// one doubling costs residency — and that matrix is the largest in the model,
-// so doubling its traffic cost more than the hidden's residency saved: net
-// 52.72 s -> 57.00 s on prefill and 16.45 -> 13.49 tok/s on decode.
-//
-// Both terms are real and the missing one is a FACT nobody has measured here:
-// achieved bandwidth as a function of resident workgroups. The engine's probe
-// reports DRAM bandwidth at one point only. Until it reports the curve, a rule
-// that weighs traffic against residency would be a tuned constant wearing a
-// derivation, so this site keeps the gate it had.
-//
-// `indexed` rows route to their own expert, so the weight matrix a row reads
-// is chosen by that row and there is no shared tile to spend twice. Reuse is
-// only available where the rows agree on the matrix.
-std::uint32_t rows_per_group(const QuantDims& d, bool dot, bool indexed,
-                             std::uint32_t lds_budget) {
-  if (!dot || indexed || d.m <= 1) return 1;
-  const auto m = static_cast<std::uint32_t>(d.m);
-  std::uint32_t r = 1;
-  while (r * 2 <= kMaxRowsPerGroup && r * 2 <= m) r <<= 1;
-  // Every row it covers has to fit its staged codes beside the others.
-  const std::uint32_t per_row = dot_lds_bytes(d);
-  while (r > 1 && lds_budget != 0 && r * per_row > lds_budget) r >>= 1;
-  return r;
-}
-
 // Whether this body takes the integer path. Not the same question as
 // dot_ok(): reading a run's hoisted int8 panel costs this body no scratch at
 // all, so a shape whose own staging would not fit still takes the path when
@@ -333,20 +276,11 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
   return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
 }
 
-// R for this shape, or 1 when the integer path does not apply. The plan and
-// the body must agree on it exactly: it sets the grid and the scratch.
-std::uint32_t dot_rows(const KernelShapes& s, const QuantDims& d,
-                       bool indexed) {
-  if (!d.valid) return 1;
-  return rows_per_group(d, body_dot(s, d), indexed,
-                        workgroup_lds_bytes(s.device));
-}
-
-// Exactly the workgroup-shared arrays emit_body declares, under exactly the
-// same conditions and in the same order of decision. The plan and the body
-// cannot be allowed to disagree: this is the number a fusion's residency is
-// counted from, so a body that declares more than this is admitted against a
-// launch that never happens.
+// Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
+// rows, under exactly the same conditions and in the same order of decision.
+// The plan and the body cannot be allowed to disagree: this is the number a
+// fusion's residency is counted from, so a body that declares more than this is
+// admitted against a launch that never happens.
 //
 // A run that hoists the activation row — or the row's int8 form — ahead of
 // every sibling leaves this body nothing of its own to declare. `s.staged` and
@@ -354,16 +288,14 @@ std::uint32_t dot_rows(const KernelShapes& s, const QuantDims& d,
 // asking this with them set the way that arrangement would set them, and
 // pricing the same stage ALONE is asking with them clear. One quantity, two
 // arrangements.
-std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
-                             bool indexed) {
-  if (!d.valid) return 0;
+std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
+                                std::uint32_t rows) {
+  if (!d.valid || rows == 0) return 0;
   const auto k = static_cast<std::uint32_t>(d.k);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
   const bool quant_hoisted =
       s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
-  const bool dot = body_dot(s, d);
-  const std::uint32_t rows = rows_per_group(d, dot, indexed, budget);
-  if (dot) {
+  if (body_dot(s, d)) {
     // A hoisted int8 panel holds ONE row; a workgroup covering several reads
     // its siblings' activations from global and stages them itself.
     if (quant_hoisted && rows == 1) return 0;
@@ -376,7 +308,8 @@ std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
   return (budget == 0 || need <= budget) ? need : 0;
 }
 
-// What one workgroup of this contraction reads off the device.
+// What one workgroup of this contraction reads off the device when it covers
+// `rows` rows, and how many workgroups the launch would then dispatch.
 //
 // The two terms do not divide each other, which is the whole reason they are
 // counted apart: the weight term is set by the COLUMNS a workgroup owns — one
@@ -384,12 +317,11 @@ std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
 // leaves the column term untouched. The activation is counted at f32 because
 // that is what crosses the bus: the integer path quantizes it AFTER staging, so
 // the packing saves scratch and instructions, never DRAM.
-opt::TrafficModel quant_traffic(const KernelShapes& s, bool indexed) {
-  const QuantDims d = dims_of(s, indexed);
-  if (!shape_ok(d) || !device_fits(s)) return {};
+opt::TrafficModel traffic_at(const KernelShapes& s, const QuantDims& d,
+                             bool indexed, std::uint32_t rows) {
+  if (!shape_ok(d) || !device_fits(s) || rows == 0) return {};
   const std::uint32_t wave = wave_of(s.device);
   const std::uint32_t cols = kBlock / wave;
-  const std::uint32_t rows = dot_rows(s, d, indexed);
   const auto scale_elem =
       static_cast<std::uint32_t>(dtype_storage_bytes(s.input_dtypes[2], 1));
   // One scale and one bias per group, for every column the workgroup owns.
@@ -405,10 +337,108 @@ opt::TrafficModel quant_traffic(const KernelShapes& s, bool indexed) {
                static_cast<std::uint64_t>(rows) * d.keep * sizeof(float));
   }
   const ThreadPlan plan =
-      gemv_plan(d, wave, body_lds_bytes(s, d, indexed), rows);
+      gemv_plan(d, wave, body_lds_bytes_at(s, d, rows), rows);
   m.workgroups = plan.workgroup_count[0] * plan.workgroup_count[1];
   m.workgroup_threads = plan.workgroup_size[0];
   return m;
+}
+
+// Rows one workgroup covers, so the weight tile it reads is spent on more than
+// one of them.
+//
+// The weight index does not depend on the row, so a grid of one workgroup per
+// row streams the whole matrix once per row: a 128 token prefill pass moved 128
+// times the weight bytes of a single token and cost exactly 128 times as much,
+// which is the whole of the prefill gap. R rows in one workgroup cut that to
+// m/R passes over the matrix.
+//
+// Only on the integer path: it is the one that stages activations small enough
+// for several rows to share the scratch, at about an eighth of the float panel.
+// The ladder is powers of two so the JIT sees a bounded set of shapes, the same
+// reason the prefill chunk ladder exists.
+constexpr std::uint32_t kMaxRowsPerGroup = 8;
+
+// THE RULE: the rung of that ladder whose launch traffic, charged at the share
+// of the memory system its own residency collects, is least.
+// opt/arrangement.hpp owns the arithmetic; this enumerates the rungs and states
+// what each one would move and ask for.
+//
+// It is not a fit test, which is what stood here before and which asked only
+// whether R rows fit the per-workgroup cap. Fitting is not the question: eight
+// rows fit 64000 bytes under a 65536-byte cap and seat two workgroups per pool
+// where two rows seat eight. Nor is it a residency test, which answers one row
+// at every shape and would undo multi-token prediction, whose speedup is
+// exactly two rows at m=2 verifying two tokens for one token of weight traffic.
+// Both terms are counted, and the arithmetic that combines them is engine
+// policy, not this file's.
+//
+// WHY IT TERMINATES, and why nothing here reads a measurement. Every rung is
+// priced from the shape and the device's own facts: the scratch is what
+// body_lds_bytes_at says the body will declare, which is a count and not a
+// prediction, and the register arm drops out of the occupancy answer because no
+// kernel has been compiled — identically for every rung, so it cannot order
+// them. A measured register count WOULD order them, and it is deliberately not
+// consulted: a measurement is filed under the entry name of the fused group,
+// which does not carry the row tile, so the only measurement reachable here is
+// the one belonging to the kernel this decision is about to replace. Reading it
+// would let a decision change the measurement that justified it. See the note
+// on identity in opt/measurements.hpp.
+//
+// `indexed` rows route to their own expert, so the weight matrix a row reads is
+// chosen by that row and there is no shared tile to spend twice. Reuse is only
+// available where the rows agree on the matrix.
+std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
+                             bool indexed) {
+  if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
+  if (s.device == nullptr) return 1;
+  const auto m = static_cast<std::uint32_t>(d.m);
+  const std::uint32_t budget = workgroup_lds_bytes(s.device);
+  const std::uint32_t per_row = dot_lds_bytes(d);
+
+  std::array<opt::Arrangement, 4> priced{};
+  std::array<std::uint32_t, 4> rung{};
+  std::size_t n = 0;
+  for (std::uint32_t r = 1; r <= kMaxRowsPerGroup && r <= m; r <<= 1) {
+    // A workgroup cannot ask the pool for more than one workgroup may address,
+    // so a rung past that is not an arrangement to be priced against the
+    // others — it is one the device would refuse to launch.
+    if (r > 1 && budget != 0 && r * per_row > budget) break;
+    priced[n].traffic = traffic_at(s, d, indexed, r);
+    // COUNTED, not measured, and counted as the plan will report it: a panel a
+    // fused run hoists belongs to the run and is priced by the fusion gate.
+    priced[n].demand =
+        opt::KernelDemand::counted(kBlock, body_lds_bytes_at(s, d, r));
+    rung[n] = r;
+    ++n;
+  }
+  if (n == 0) return 1;
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(*s.device);
+  const std::size_t best = opt::best_arrangement(
+      cap, std::span<const opt::Arrangement>(priced.data(), n));
+  return best < n ? rung[best] : 1;
+}
+
+// R for this shape, or 1 when the integer path does not apply. The plan and
+// the body must agree on it exactly: it sets the grid and the scratch.
+std::uint32_t dot_rows(const KernelShapes& s, const QuantDims& d,
+                       bool indexed) {
+  if (!d.valid) return 1;
+  return rows_per_group(s, d, indexed);
+}
+
+// The scratch and the traffic of the arrangement this shape actually gets. Both
+// are the parametrized forms above asked at the chosen row tile, so the plan,
+// the body and the price cannot drift apart.
+std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
+                             bool indexed) {
+  if (!d.valid) return 0;
+  return body_lds_bytes_at(s, d, dot_rows(s, d, indexed));
+}
+
+opt::TrafficModel quant_traffic(const KernelShapes& s, bool indexed) {
+  const QuantDims d = dims_of(s, indexed);
+  if (!shape_ok(d) || !device_fits(s)) return {};
+  return traffic_at(s, d, indexed, dot_rows(s, d, indexed));
 }
 
 // x -> int8, one scale per group of `group_size`, staged for the whole
@@ -434,7 +464,7 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
     // The step is the chunk's own amax and needs no reduction. The int8 range
     // is spent per 8 activations rather than per group, because one activation
     // far above its neighbours otherwise takes most of the range and the rest
-    // of the group quantizes into the noise -- measured at 3.7x the error, and
+    // of the group quantizes into the noise — measured at 3.7x the error, and
     // enough to change generated text on Qwen3.5-0.8B-4bit.
     //
     // The group's activation sum still is a reduction: it multiplies the
@@ -626,8 +656,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   // depend on anything plan_impl does not see. Deciding it from the hoisted
   // panel instead left the grid covering m/R rows while each workgroup wrote
   // one, so most rows were never computed at all.
-  const std::uint32_t rows =
-      rows_per_group(d, dot, Indexed<A>, workgroup_lds_bytes(s.device));
+  const std::uint32_t rows = dot_rows(s, d, Indexed<A>);
   // A hoisted panel, of either kind, holds the one row its workgroup owned. A
   // workgroup covering several cannot read its siblings' activations out of
   // it, so it reads them from global and stages its own.
