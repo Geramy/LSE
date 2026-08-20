@@ -45,6 +45,7 @@ jobs:
       # artifact is CPU only, which the build step says out loud.
       HRX_ROOT: ${{ vars.LSE_HRX_ROOT }}
       FASTOKENS_REF: ${{ vars.LSE_FASTOKENS_REF || '7973014e4f3a6028ac48f305704eacd64d0b4ef6' }}
+      LSE_SMOKE_MODEL: ${{ vars.LSE_SMOKE_MODEL || 'mlx-community/Qwen3.5-0.8B-4bit' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +136,22 @@ jobs:
           ctest --test-dir build --output-on-failure | tee ctest.log
           echo "summary=$(grep -oE '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' ctest.log | tail -1)" >> "$GITHUB_OUTPUT"
 
+      - name: Smoke test the engine and the HTTP API
+        id: smoke
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          # Skipped rather than failed when the model is not cached on this
+          # runner: a missing checkpoint is a runner fact, not a defect, and
+          # asserting on generated text needs the weights that produced it.
+          if ! ./build/lse --list-cache 2>/dev/null | grep -q "$LSE_SMOKE_MODEL"; then
+            echo "::warning::$LSE_SMOKE_MODEL is not in this runner's HF cache; skipping the end-to-end smoke test."
+            echo "ran=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          .github/scripts/smoke.sh build
+          echo "ran=yes" >> "$GITHUB_OUTPUT"
+
       - name: Package
         id: package
         run: |
@@ -170,6 +187,7 @@ jobs:
             --cmake      "${{ steps.toolchain.outputs.cmake }}" \
             --rocm       "${{ steps.toolchain.outputs.rocm }}" \
             --tests      "${{ steps.test.outputs.summary }}" \
+            --smoke      "${{ steps.smoke.outputs.ran }}" \
             --artifact   "dist/${{ steps.package.outputs.name }}.tar.gz" \
             --out        dist/RELEASE_NOTES.md
           cat dist/RELEASE_NOTES.md

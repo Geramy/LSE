@@ -85,6 +85,7 @@ def main():
     p.add_argument("--cmake", default="")
     p.add_argument("--rocm", default="")
     p.add_argument("--tests", default="")
+    p.add_argument("--smoke", default="")
     p.add_argument("--artifact", default="")
     p.add_argument("--out", default="-")
     a = p.parse_args()
@@ -143,6 +144,12 @@ def main():
     L.append("")
     if a.tests:
         L.append(f"- **Test suite:** {a.tests}")
+    if a.smoke == "yes":
+        L.append("- **End to end:** greedy decode and the `/v1` HTTP surface "
+                 "were exercised against a real model on the build machine")
+    elif a.smoke == "no":
+        L.append("- **End to end:** not run on this build (no cached model on "
+                 "the build machine)")
     built = [x for x in ((f"g++ {a.gcc}" if a.gcc else ""),
                          (f"CMake {a.cmake}" if a.cmake else ""),
                          (f"ROCm {a.rocm}" if a.rocm else "")) if x]

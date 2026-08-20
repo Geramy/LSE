@@ -102,6 +102,13 @@ array. `n` must be 1. Prompts are framed as ChatML, which is what the models
 this engine targets are trained on, rather than evaluated from the
 checkpoint's own Jinja template.
 
+Two places the wire format and this engine disagree, both resolved toward the
+wire so a client gets what the API promises:
+
+- `temperature` defaults to **1.0**, as the API specifies, not to the CLI's 0.8.
+- `frequency_penalty` is additive in the API and multiplicative here, so it is
+  mapped rather than passed through. 0 is off on both sides.
+
 Endpoints outside that set — `/v1/embeddings`, `/v1/responses`,
 `/v1/audio/*`, `/v1/images/*`, `/v1/moderations` — answer `501` naming
 themselves rather than `404`.
