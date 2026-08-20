@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
+#include <cstdlib>
 #include <string>
 #include <thread>
 
@@ -170,6 +171,16 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr, "lse-server: %s on http://%s:%d\n", opt.model_id.c_str(),
                opt.host.c_str(), opt.port);
-  if (const Status s = http.listen(); !s.ok()) return fail(s, "listening");
-  return 0;
+  const Status served = http.listen();
+  if (!served.ok()) return fail(served, "listening");
+
+  // Leave without running the static destructors. Tearing the device down
+  // while the runtime still holds threads has been seen to wedge: the device
+  // closes, one worker spins and the main thread waits on a futex that never
+  // fires, leaving a process that answers nothing and still holds the model's
+  // memory. Nothing here owns state that outlives the process, so the kernel
+  // reclaiming it is both correct and the only exit that cannot hang.
+  std::fflush(nullptr);
+  std::fprintf(stderr, "lse-server: stopped\n");
+  std::_Exit(0);
 }

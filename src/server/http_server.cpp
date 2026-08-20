@@ -171,6 +171,14 @@ struct Outcome {
   int prompt_tokens = 0;
   int completion_tokens = 0;
   bool hit_limit = false;
+  // Prefill and decode are different rates and a single figure hides which one
+  // is the problem, so both are reported. Speculation moves the decode rate
+  // without moving the pass count, which is why acceptance rides along.
+  double prompt_per_second = 0.0;
+  double decode_per_second = 0.0;
+  std::uint64_t prefill_ns = 0;
+  std::uint64_t decode_ns = 0;
+  double acceptance = -1.0;  // negative when nothing was speculated
 };
 
 }  // namespace
@@ -219,6 +227,27 @@ struct HttpServer::Run {
     out.completion_tokens = static_cast<int>(ids->size());
     out.hit_limit = !stopped_by_string &&
                     out.completion_tokens >= r.limits.max_tokens;
+
+    const runtime::GenerationStats& st = gen.stats();
+    out.prefill_ns = st.prefill_ns;
+    out.decode_ns = st.decode_ns;
+    out.decode_per_second = st.decode_tokens_per_second();
+    if (st.prefill_ns != 0 && st.prompt_tokens > 0) {
+      out.prompt_per_second = static_cast<double>(st.prompt_tokens) * 1e9 /
+                              static_cast<double>(st.prefill_ns);
+    }
+    if (st.spec_steps != 0) out.acceptance = st.acceptance_rate();
+
+    std::fprintf(stderr,
+                 "lse-server: prompt %d in %.2fs (%.1f tok/s) | decode %d in "
+                 "%.2fs (%.1f tok/s)%s\n",
+                 out.prompt_tokens, out.prefill_ns / 1e9, out.prompt_per_second,
+                 out.completion_tokens, out.decode_ns / 1e9,
+                 out.decode_per_second,
+                 out.acceptance >= 0.0
+                     ? (" | accepted " + std::to_string(
+                            static_cast<int>(out.acceptance * 100.0)) + "%").c_str()
+                     : "");
     return out;
   }
 };
@@ -229,6 +258,20 @@ json usage_of(const Outcome& o) {
   return json{{"prompt_tokens", o.prompt_tokens},
               {"completion_tokens", o.completion_tokens},
               {"total_tokens", o.prompt_tokens + o.completion_tokens}};
+}
+
+// Not part of the OpenAI schema. It rides beside `usage` under its own key so
+// a client that does not know it ignores it, which is what llama.cpp does with
+// the same information.
+json timings_of(const Outcome& o) {
+  json t{{"prompt_n", o.prompt_tokens},
+         {"prompt_ms", o.prefill_ns / 1e6},
+         {"prompt_per_second", o.prompt_per_second},
+         {"predicted_n", o.completion_tokens},
+         {"predicted_ms", o.decode_ns / 1e6},
+         {"predicted_per_second", o.decode_per_second}};
+  if (o.acceptance >= 0.0) t["acceptance_rate"] = o.acceptance;
+  return t;
 }
 
 // text_completion and chat.completion differ only in the shape of a choice.
@@ -400,7 +443,8 @@ Status HttpServer::listen() {
                   {"model", impl.opt.model_id},
                   {"choices", json::array({chat ? chat_choice(out->text, out->hit_limit)
                                                 : text_choice(out->text, out->hit_limit)})},
-                  {"usage", usage_of(*out)}};
+                  {"usage", usage_of(*out)},
+                  {"timings", timings_of(*out)}};
         res.set_content(resp.dump(), "application/json");
         return;
       }
@@ -459,7 +503,8 @@ Status HttpServer::listen() {
                       {"created", created},
                       {"model", impl.opt.model_id},
                       {"choices", json::array({last})},
-                      {"usage", usage_of(*out)}});
+                      {"usage", usage_of(*out)},
+                      {"timings", timings_of(*out)}});
             const std::string done = "data: [DONE]\n\n";
             sink.write(done.data(), done.size());
             sink.done();
