@@ -26,6 +26,7 @@
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
 #include "lse/kernels/vec_mem.hpp"
+#include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -894,6 +895,14 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
     if (!shape_ok(d) || !device_fits(s)) return {};
     return {0, static_cast<std::uint32_t>(d.k),
             static_cast<std::uint32_t>(d.m)};
+  }
+
+  // Prefill has full tiles and is compute bound; the scalar loop spends two
+  // thirds of its vector instructions unpacking nibbles. Decode is one row and
+  // bandwidth bound, and the gate below leaves it here.
+  const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
+    return this;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {

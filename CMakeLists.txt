@@ -221,6 +221,7 @@ add_library(lse_kernels
   src/kernels/topk.cpp
   src/kernels/transpose.cpp
   src/kernels/wmma_linear.cpp
+  src/kernels/wmma_quant_linear.cpp
 )
 add_library(lse::kernels ALIAS lse_kernels)
 target_link_libraries(lse_kernels PUBLIC lse_core lse_ir lse_graph)

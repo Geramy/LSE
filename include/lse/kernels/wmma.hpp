@@ -23,6 +23,7 @@
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
+#include "lse/quant/group_affine_codec.hpp"
 
 namespace lse::kernels {
 
@@ -38,6 +39,10 @@ using backend::ArchFamily;
 // device, the shapes or the opt-in switch rule it out and the scalar loop
 // should stand.
 const graph::KernelPrimitiveBase* wmma_linear_for(const graph::KernelShapes& s);
+
+// The same, for the group-affine quantized contraction.
+const graph::KernelPrimitiveBase* wmma_quant_linear_for(
+    const graph::KernelShapes& s);
 
 // Which family of matrix instructions this device speaks. Not "does it have a
 // matrix core" — the families are different instructions with different
@@ -132,6 +137,61 @@ template <class R, class F>
       return R{};
   }
 }
+
+// A stored weight that is narrower than the matrix core's operand.
+//
+// The core has no 4-bit operand a float activation can meet, so a 4-bit
+// checkpoint feeds the 8-bit row and the codes are widened on the way into the
+// fragment. That widening belongs here, beside the arm that chose the row, and
+// not in a kernel: a kernel that spells `(word >> 4 * nib) & 15` has hardcoded
+// one checkpoint's storage into the one place this header exists to keep it
+// out of.
+//
+// `Bits` is the stored width. 8 is the identity — the buffer already holds
+// what the fragment wants — and is written as the same loop so the two cannot
+// drift.
+template <int Bits>
+struct PackedCodes {
+  static_assert(Bits == 4 || Bits == 8, "no widening arm for this width");
+
+  // Stored codes in one 32-bit buffer element.
+  static constexpr std::uint32_t kPerWord = 32u / static_cast<std::uint32_t>(Bits);
+  // Codes in one fragment register, which the 8-bit row fixes at four.
+  static constexpr std::uint32_t kPerFrag = 4u;
+  // Buffer elements one fragment register is built from.
+  static constexpr std::uint32_t kWordsPerFrag = kPerFrag / kPerWord ? kPerFrag / kPerWord : 1u;
+
+  // Fragment register `f` of a row starting at buffer element `base`, for a
+  // K slice `k0` counted in codes.
+  static graph::kir::Val<graph::kir::u32> word(
+      graph::env::Emit& e,
+      const graph::env::In<std::uint32_t, graph::env::Emit>& buf,
+      const graph::kir::Val<graph::kir::u32>& base,
+      std::uint32_t f) {
+    namespace kir = graph::kir;
+    if constexpr (Bits == 8) {
+      return e.let(buf[e.let(base + f)]);
+    } else {
+      // Two fragment registers come out of one stored word. The codes are not
+      // laid down in order: element e of the word sits at nibble
+      // (e % 4) * 2 + e / 4, which is what quant::dot4_operand_slot spells for
+      // the scalar path. Reading them in order instead pairs every code with
+      // the wrong activation and the test that catches it is
+      // quant_linear_matches_the_weights_it_encodes.
+      const auto src = e.let(buf[e.let(base + f / 2u)]);
+      const std::uint32_t half = f % 2u;
+      auto out = e.let(e.u32(0));
+      for (std::uint32_t b = 0; b < kPerFrag; ++b) {
+        const std::uint32_t nib =
+            static_cast<std::uint32_t>(lse::quant::dot4_operand_slot(
+                static_cast<int>(half), static_cast<int>(b)));
+        const auto code = e.let((src / (1u << (4 * nib))) % 16u);
+        out = e.let(out + code * (1u << (8 * b)));
+      }
+      return out;
+    }
+  }
+};
 
 // ---------------------------------------------------------------------------
 // The shared algorithm
