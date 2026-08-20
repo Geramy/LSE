@@ -16,6 +16,58 @@ object, cached on disk, and dispatched through the native HRX ABI
 transport, quantization scheme, layer, sampler) is a CRTP base that owns the
 shared algorithms and calls into the derived type for the primitives.
 
+## Install a release
+
+Releases are built by the **Build & Release** workflow in the Actions tab and
+carry ahead-of-time kernels for the architectures selected for that build,
+which the release notes list.
+
+```bash
+# Pick the asset from https://github.com/Geramy/LSE/releases
+curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz
+curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz.sha256
+sha256sum -c lse-<tag>-linux-x86_64.tar.gz.sha256
+
+tar -xzf lse-<tag>-linux-x86_64.tar.gz
+cd lse-<tag>-linux-x86_64
+```
+
+The binary loads the ROCm and HRX runtimes at start-up, so both have to be on
+the library path:
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:/path/to/hrx-install/lib:$LD_LIBRARY_PATH
+./lse --devices        # what this build can see, and what it will not answer
+```
+
+`--devices` is the first thing to run: if it reports no HRX device, the library
+path is wrong and the engine will fall back to the CPU backend, which runs the
+same models far slower rather than failing.
+
+## Run
+
+```bash
+# a repo id, a checkpoint directory, or a .safetensors file
+./lse -m mlx-community/Qwen3.8-27B-4bit -n 256 "The capital of France is"
+
+./lse --list-cache                 # models in the HF cache, and whether this build loads each
+./lse -m <model> --stats           # timings, launch counts and the device cost model
+./lse -m <model> -b 4 -p "..." -p "..."   # decode several sequences as one batch
+```
+
+Speculative decoding is on whenever the checkpoint ships a multi-token
+prediction module, or point at one:
+
+```bash
+./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
+```
+
+`./lse --help` lists every option.
+
+**There is no HTTP server yet.** The engine is a library and a CLI; an
+OpenAI-compatible endpoint is listed under Upcoming and no binary serves one
+today.
+
 ## Requirements
 
 | | Version | Why |
@@ -144,6 +196,9 @@ CPU backend, which runs the same models roughly two hundred times slower.
   share proportional to its measured throughput.
 - **Communication layer** — one asynchronous client/server API over TCP and
   RDMA, with the transport hidden from callers.
+- **OpenAI-compatible HTTP server** — `/v1/chat/completions` and
+  `/v1/completions` with streaming, served over the communication layer, so a
+  release ships a binary that can be pointed at by an existing client.
 - **Multi-machine** — a control plane that ships IR rather than code objects, so
   each peer compiles for its own architecture.
 - **Runtime-adaptive optimization** — variant tournaments judged on measured
