@@ -16,10 +16,33 @@ object, cached on disk, and dispatched through the native HRX ABI
 transport, quantization scheme, layer, sampler) is a CRTP base that owns the
 shared algorithms and calls into the derived type for the primitives.
 
+## Requirements
+
+| | Version | Why |
+|---|---|---|
+| **g++** | **16 or newer** | The host sources are C++26 and use P2996 static reflection. Kernel argument structs are reflected over to derive their ABI layout, so the tree does not compile without it. |
+| CMake | 3.24 or newer | |
+| Ninja | any | Generator used by the commands below |
+| cargo | any | Builds the `fastokens` FFI shim the tokenizer links |
+| ROCm | 7.x, with `amd_comgr` | HRX backend only. Supplies the compiler the JIT calls at runtime |
+| hrx-system | built and installed | HRX backend only |
+
+**clang cannot build this tree.** P2996 reflection is enabled by `-freflection`,
+which the build applies only for GNU 16 and newer; on any other compiler the
+reflection headers stop with `no member named 'meta' in namespace 'std'`.
+CMake picks up `g++-16` from `PATH` on a fresh configure, but it does not
+override a compiler already cached in an existing build directory — pass
+`-DCMAKE_CXX_COMPILER=g++-16` if you are reconfiguring one, or check
+`build/CMakeCache.txt` if the reflection headers fail.
+
+Host code is C++26. Device code stays at C++20 so generated kernels do not
+depend on host-only language features.
+
 ## Build
 
 ```bash
-cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_CXX_COMPILER=g++-16
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
@@ -29,8 +52,18 @@ The core library and CPU backend build with no GPU and no external packages.
 To enable the HRX backend, build `hrx-system` and point at its install:
 
 ```bash
-cmake -S . -B build -GNinja -DLSE_HRX_ROOT=/path/to/hrx-install
+cmake -S . -B build -GNinja -DCMAKE_CXX_COMPILER=g++-16 \
+      -DLSE_HRX_ROOT=/path/to/hrx-install
 ```
+
+The HRX runtime is loaded at run time, so its libraries have to be findable:
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:/path/to/hrx-install/lib:$LD_LIBRARY_PATH
+```
+
+Without it the HRX backend fails to initialize and the engine falls back to the
+CPU backend, which runs the same models roughly two hundred times slower.
 
 ### Options
 
