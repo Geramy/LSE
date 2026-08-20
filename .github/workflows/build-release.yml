@@ -38,8 +38,12 @@ jobs:
     runs-on: [self-hosted, lse]
     timeout-minutes: 180
     env:
-      ROCM_PATH: /opt/rocm
-      HRX_ROOT: ${{ github.workspace }}/reference/hrx-system/build/hrx-install
+      ROCM_PATH: ${{ vars.LSE_ROCM_PATH || '/opt/rocm' }}
+      # hrx-system is not vendored -- reference/ is ignored -- so a fresh
+      # checkout does not contain it. The runner keeps a built install and
+      # names it here; without one the HRX backend is left out and the
+      # artifact is CPU only, which the build step says out loud.
+      HRX_ROOT: ${{ vars.LSE_HRX_ROOT }}
 
     steps:
       - uses: actions/checkout@v4
@@ -87,14 +91,23 @@ jobs:
           fi
 
       - name: Configure
+        id: configure
         run: |
           set -euo pipefail
+          hrx_arg=""
+          if [ -n "${HRX_ROOT:-}" ] && [ -d "$HRX_ROOT" ]; then
+            hrx_arg="-DLSE_HRX_ROOT=$HRX_ROOT"
+            echo "hrx=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "hrx=no" >> "$GITHUB_OUTPUT"
+            echo "::warning::No HRX install at '${HRX_ROOT:-<unset>}'. Building the core and CPU backend only; this artifact will not run on a GPU. Set the repository variable LSE_HRX_ROOT to a built hrx-install."
+          fi
           cmake -S . -B build -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-16 \
             -DLSE_GPU_TARGETS="${{ steps.targets.outputs.gpu_targets }}" \
             -DLSE_ROCM_PATH="$ROCM_PATH" \
-            $( [ -d "$HRX_ROOT" ] && echo -DLSE_HRX_ROOT="$HRX_ROOT" )
+            $hrx_arg
 
       - name: Build
         run: cmake --build build
@@ -153,6 +166,12 @@ jobs:
             dist/${{ steps.package.outputs.name }}.tar.gz.sha256
             dist/RELEASE_NOTES.md
           retention-days: 30
+
+      - name: Refuse to release without the GPU backend
+        if: ${{ inputs.release && steps.configure.outputs.hrx != 'yes' }}
+        run: |
+          echo "::error::Release requested but this build has no HRX backend, so it runs on no GPU. Set the repository variable LSE_HRX_ROOT and run again."
+          exit 1
 
       - name: Publish the release
         if: ${{ inputs.release }}
