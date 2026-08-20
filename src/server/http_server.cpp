@@ -7,6 +7,12 @@
 #include <sstream>
 #include <vector>
 
+// httplib falls back to select() without this, and select() refuses any
+// socket whose descriptor is >= FD_SETSIZE (1024). A loaded model holds
+// well over a thousand descriptors, so the listening socket and every
+// connection land above that line and are closed without a reply. poll()
+// has no such ceiling.
+#define CPPHTTPLIB_USE_POLL
 #include "httplib.h"
 #include "lse/runtime/generator.hpp"
 #include "lse/server/chat.hpp"
