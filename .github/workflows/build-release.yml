@@ -44,6 +44,7 @@ jobs:
       # names it here; without one the HRX backend is left out and the
       # artifact is CPU only, which the build step says out loud.
       HRX_ROOT: ${{ vars.LSE_HRX_ROOT }}
+      FASTOKENS_REF: ${{ vars.LSE_FASTOKENS_REF || '7973014e4f3a6028ac48f305704eacd64d0b4ef6' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +67,20 @@ jobs:
           echo "gpu_targets=$(IFS=';'; echo "${targets[*]}")" >> "$GITHUB_OUTPUT"
           echo "families=$(IFS=', '; echo "${families[*]}")"  >> "$GITHUB_OUTPUT"
           echo "Building for ${targets[*]}"
+
+      - name: Provision the reference dependencies
+        run: |
+          set -euo pipefail
+          # reference/ is ignored, so a fresh checkout has none of it. The
+          # tokenizer's Rust shim takes fastokens as a path dependency and the
+          # build cannot start without it. Pinned, so a release is reproducible
+          # rather than tracking whatever the default branch is that day.
+          mkdir -p reference
+          if [ ! -f reference/fastokens/Cargo.toml ]; then
+            git clone --quiet https://github.com/crusoecloud/fastokens.git reference/fastokens
+            git -C reference/fastokens checkout --quiet "$FASTOKENS_REF"
+          fi
+          echo "fastokens at $(git -C reference/fastokens rev-parse --short HEAD)"
 
       - name: Check the toolchain
         id: toolchain
