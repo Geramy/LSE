@@ -27,6 +27,16 @@ else
   fail "greedy decode: expected Paris, got: $(head -c 120 <<<"$out")"
 fi
 
+# Recall and arithmetic fail differently. A model whose weights are bound to
+# the wrong tensors still recites a fact it saw a thousand times; getting a sum
+# right needs the whole forward pass to be correct.
+out=$("$BUILD/lse" -m "$MODEL" -n 40 -t 0 "What is 4 + 4? Answer with just the number." 2>/dev/null || true)
+if grep -q '8' <<<"$out"; then
+  pass "greedy decode does arithmetic"
+else
+  fail "greedy decode: expected 8, got: $(head -c 120 <<<"$out")"
+fi
+
 echo "== server =="
 "$BUILD/lse-server" -m "$MODEL" --host "$HOST" --port "$PORT" >/tmp/lse-smoke-server.log 2>&1 &
 server_pid=$!
@@ -63,6 +73,16 @@ assert u["prompt_tokens"] > 0 and u["completion_tokens"] > 0
 assert u["total_tokens"] == u["prompt_tokens"] + u["completion_tokens"]
 PY
 then pass "POST /v1/chat/completions"; else fail "POST /v1/chat/completions: $(head -c 200 <<<"$body")"; fi
+
+body=$(curl -sf -m 300 "http://$HOST:$PORT/v1/chat/completions" \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 4 + 4? Answer with just the number."}],"max_tokens":48,"temperature":0}' || true)
+if python3 - "$body" <<'ARITH'
+import json, sys
+c = json.loads(sys.argv[1])["choices"][0]["message"]["content"]
+assert "8" in c, c
+ARITH
+then pass "chat completions does arithmetic"; else fail "chat arithmetic: $(head -c 200 <<<\"$body\")"; fi
 
 stream=$(curl -sN -m 300 "http://$HOST:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
