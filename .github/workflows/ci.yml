@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# One GPU. Stacked runs would contend and time out rather than queue cleanly,
+# and an obsolete run of an amended branch is worth nothing.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # This repository is public and this runner is somebody's workstation. A
+    # pull request from a fork must never execute on it, so the job runs for
+    # branches of this repository only. A fork's pull request leaves this
+    # check unreported, which a branch rule then blocks on until a maintainer
+    # brings the change onto a branch here.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, lse]
+    timeout-minutes: 90
+    env:
+      ROCM_PATH: ${{ vars.LSE_ROCM_PATH || '/opt/rocm' }}
+      HRX_ROOT: ${{ vars.LSE_HRX_ROOT }}
+      FASTOKENS_REF: ${{ vars.LSE_FASTOKENS_REF || '7973014e4f3a6028ac48f305704eacd64d0b4ef6' }}
+      LSE_SMOKE_MODEL: ${{ vars.LSE_SMOKE_MODEL || 'mlx-community/Qwen3.5-0.8B-4bit' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision the reference dependencies
+        run: |
+          set -euo pipefail
+          # reference/ is ignored, so a fresh checkout has none of it and the
+          # tokenizer's Rust shim cannot resolve its path dependency.
+          mkdir -p reference
+          if [ ! -f reference/fastokens/Cargo.toml ]; then
+            git clone --quiet https://github.com/crusoecloud/fastokens.git reference/fastokens
+            git -C reference/fastokens checkout --quiet "$FASTOKENS_REF"
+          fi
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          # g++-16 is not optional: the host sources are C++26 and reflect over
+          # kernel argument structs. Say so here rather than in the headers.
+          command -v g++-16 >/dev/null || {
+            echo "::error::g++-16 not found; the host sources need P2996 reflection."
+            exit 1
+          }
+          hrx_arg=""
+          if [ -n "${HRX_ROOT:-}" ] && [ -d "$HRX_ROOT" ]; then
+            hrx_arg="-DLSE_HRX_ROOT=$HRX_ROOT"
+          else
+            echo "::warning::No HRX install at '${HRX_ROOT:-<unset>}'; the GPU backend and every kernel test that needs a device will be skipped."
+          fi
+          cmake -S . -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-16 \
+            -DLSE_ROCM_PATH="$ROCM_PATH" \
+            $hrx_arg
+
+      # Not -Werror: g++ 16 reports a -Wnonnull from inside libstdc++'s own
+      # <string>, so requiring it would fail every pull request on a header
+      # nobody here wrote. Our own sources build clean and the release build
+      # would show it if that stopped being true.
+      - name: Build
+        run: cmake --build build
+
+      # Kernel emission and numerics against the CPU reference live here:
+      # test_graph, test_jit and test_model are what catch a changed kernel
+      # that no longer computes what it did.
+      - name: Test
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          ctest --test-dir build --output-on-failure
+
+      - name: Smoke test the engine and the HTTP API
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          if ! ./build/lse --list-cache 2>/dev/null | grep -q "$LSE_SMOKE_MODEL"; then
+            echo "::warning::$LSE_SMOKE_MODEL is not cached on this runner; skipping the end-to-end check."
+            exit 0
+          fi
+          .github/scripts/smoke.sh build
