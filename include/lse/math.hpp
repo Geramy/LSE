@@ -398,6 +398,12 @@ enum class OperandLayout : std::uint8_t {
   // Lane L supplies row L of the operand and holds the whole k step
   // contiguously, so a[frag] = a[row * K + k0 + frag]. Measured on gfx1151.
   kLaneRowContiguousK,
+  // Lane L supplies row L % n, and the halves of the wave split the k step
+  // between them: the lane holds k / (wave / n) values starting at
+  // (L / n) * k / (wave / n). Half the operand registers of the contiguous
+  // form for the same instruction shape, which is why a row carrying this has
+  // half the a_len of its RDNA3 counterpart.
+  kLaneRowSplitK,
 };
 
 // Where lane L's accumulator element e lands in the output tile.

@@ -117,12 +117,17 @@ struct Args {
 
 // The weight fragment comes from the operand layer, which owns the stored
 // width. This kernel names a column and a K slice and nothing about nibbles.
+// `k_lane` is where this lane's own slice of the instruction's K starts. It is
+// zero when a lane holds the whole step, and (lane / n) * k / halves when the
+// wave splits the step between its halves -- the difference between the two
+// generations, taken from the row rather than assumed.
 template <int Frag, class A>
 void fill_weights(env::Emit& e, const A& a, const kir::Val<kir::u32>& col,
-                  const kir::Val<kir::u32>& k0, std::uint32_t lanes, int bits,
-                  const kir::Local<kir::u32, Frag>& frag) {
+                  const kir::Val<kir::u32>& k0,
+                  const kir::Val<kir::u32>& k_lane, std::uint32_t lanes,
+                  int bits, const kir::Local<kir::u32, Frag>& frag) {
   const std::uint32_t per_word = 32u / static_cast<std::uint32_t>(bits);
-  const auto base = e.let(col * lanes + k0 / per_word);
+  const auto base = e.let(col * lanes + (k0 + k_lane) / per_word);
   for (std::uint32_t f = 0; f < static_cast<std::uint32_t>(Frag); ++f) {
     frag[f] = bits == 4 ? PackedCodes<4>::word(e, a.packed, base, f)
                         : PackedCodes<8>::word(e, a.packed, base, f);
@@ -147,6 +152,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   constexpr auto kFrag =
       static_cast<std::uint32_t>(kRow.a_len / kRow.chained);
   constexpr int kFragI = kRow.a_len / kRow.chained;
+  // Operand values one lane holds, and where in the step they start.
+  constexpr bool kSplitK =
+      kRow.operands == math::OperandLayout::kLaneRowSplitK;
+  constexpr std::uint32_t kLaneK =
+      kSplitK ? static_cast<std::uint32_t>(kRow.k) / kStride
+              : static_cast<std::uint32_t>(kRow.k);
   const auto n = static_cast<std::uint32_t>(d.n);
   const auto m = static_cast<std::uint32_t>(d.m);
   const auto k = static_cast<std::uint32_t>(d.k);
@@ -231,6 +242,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // the end of the plane: n only has to miss a multiple of waves * kTileN for
   // the last workgroup to carry lanes that are not columns at all.
   const auto safe_col = e.let(select(bcol < n, bcol, e.u32(0)));
+  // Zero on a generation whose lane holds the whole step; on one that splits
+  // it, the offset of this lane's half, in operand values and in packed words.
+  const auto lane_k =
+      kSplitK ? e.let(lane_hi * kLaneK) : e.let(e.u32(0));
+  const auto lane_word =
+      kSplitK ? e.let(lane_hi * (kLaneK / 4u)) : e.let(e.u32(0));
   const auto col_scales = e.let(safe_col * groups);
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
@@ -346,7 +363,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         const auto bf = e.local<kir::u32, kFragI>();
         for (std::uint32_t c = 0; c < kFrag; ++c) bf[c] = e.u32(0);
         if (auto gd = e.when(live && bcol < n)) {
-          fill_weights(e, a, bcol, k0, lanes, d.spec.bits, bf);
+          fill_weights(e, a, bcol, k0, lane_k, lanes, d.spec.bits, bf);
         }
         // The unpacked fragment feeds every row block before it is discarded,
         // which is what the blocking buys.
@@ -354,7 +371,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
           const auto af = e.local<kir::u32, kFragI>();
           for (std::uint32_t c = 0; c < kFrag; ++c) {
-            af[c] = xq[e.let(lane_words[i] + (slot * kFrag + c))].read();
+            // Four words hold a whole sixteen-value step; a split-K lane takes
+            // the half of them its own half of the wave is responsible for.
+            af[c] = xq[e.let(lane_words[i] + lane_word +
+                             (slot * (static_cast<std::uint32_t>(kRow.k) / 4u) +
+                              c))]
+                        .read();
           }
           // One issue takes the whole K slice: the row declares A and B four
           // registers wide and chained=1, so a lane hands over its sixteen
