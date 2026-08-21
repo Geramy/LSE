@@ -711,6 +711,7 @@ int main(int argc, char** argv) {
                  "device=%u host=%u views=%u fallbacks=%u\n"
                  "streams %u of %u | cross-stream waits %u | chain %u of %u "
                  "groups (%.0f%% spread)\n"
+                 "split %s | peer migrations %u | %.1f MiB fetched\n"
                  "sched partition=%.3f s emit=%.3f s launch=%.3f s sync=%.3f s\n"
                  "jit mem=%llu disk=%llu compile=%llu (%.3f s)\n",
                  s.prompt_tokens, static_cast<double>(s.prefill_ns) / 1e9,
@@ -731,6 +732,9 @@ int main(int argc, char** argv) {
                  s.host_fallbacks,
                  s.streams_used, s.streams_available, s.stream_waits,
                  s.stream_chain, s.device_groups, s.spread() * 100.0,
+                 std::string(lse::graph::to_string(lse::graph::split_scheme())).c_str(),
+                 s.peer_migrations,
+                 static_cast<double>(s.peer_bytes) / (1024.0 * 1024.0),
                  static_cast<double>(s.partition_ns) / 1e9,
                  static_cast<double>(s.emit_ns) / 1e9,
                  static_cast<double>(s.launch_ns) / 1e9,

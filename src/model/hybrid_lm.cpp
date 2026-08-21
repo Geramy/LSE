@@ -77,13 +77,67 @@ Result<std::int32_t> batch_bucket(std::int32_t rows) {
                    " rows, so split the batch");
 }
 
+std::size_t HybridLM::state_shards() const noexcept {
+  if (graph::split_scheme() != graph::SplitScheme::kTensor) return 1;
+  const graph::Scheduler* s = graph::default_scheduler();
+  return s != nullptr && s->devices().size() > 0 ? s->devices().size() : 1;
+}
+
+std::size_t HybridLM::member_for_layer(std::int32_t i) const noexcept {
+  const graph::Scheduler* s = graph::default_scheduler();
+  const std::size_t members =
+      s != nullptr && s->devices().size() > 0 ? s->devices().size() : 1;
+  const auto layers = static_cast<std::size_t>(config_.num_layers);
+  if (members <= 1 || layers == 0 || i < 0) return 0;
+  // A tensor split puts a piece of every layer on every member, so no layer
+  // belongs anywhere: the shards name their own member and what is left --
+  // the norms, the residual -- stays with the primary.
+  if (graph::split_scheme() == graph::SplitScheme::kTensor) return 0;
+  return std::min(members - 1,
+                  static_cast<std::size_t>(i) * members / layers);
+}
+
 Status HybridLM::load(WeightBinder& binder) {
+  // The scheme is settled before a single weight is read, because it decides
+  // how they are read. Tensor split whenever the pool has more than one member
+  // and the projections divide into whole quantization groups on each of them;
+  // a run of layers each otherwise, which needs nothing of the shapes.
+  //
+  // Tensor first because it is the only one of the two that makes the members'
+  // memory bandwidth add: a layer split hands layer n+1 what layer n produced,
+  // so the devices take turns and the pool runs at one device's speed.
+  {
+    const graph::Scheduler* s = graph::default_scheduler();
+    const std::size_t members =
+        s != nullptr ? s->devices().size() : std::size_t{1};
+    graph::SplitScheme scheme = graph::SplitScheme::kNone;
+    if (members > 1) {
+      const auto inter = static_cast<std::int64_t>(config_.mlp_intermediate);
+      const auto n = static_cast<std::int64_t>(members);
+      const bool divides = inter % n == 0 && (inter / n) % 64 == 0;
+      // Asked of the blocks themselves, built for the question and thrown
+      // away: every layer has to shard, and on a hybrid model the layer that
+      // cannot is not the one at index 0.
+      bool mixers_shard = config_.num_layers > 0;
+      for (std::int32_t i = 0; i < config_.num_layers && mixers_shard; ++i) {
+        auto probe = factory_(i);
+        if (!probe.ok() || *probe == nullptr || !(*probe)->mixer_shards()) {
+          mixers_shard = false;
+        }
+      }
+      scheme = divides && mixers_shard ? graph::SplitScheme::kTensor
+                                       : graph::SplitScheme::kLayer;
+    }
+    graph::set_split_scheme(scheme);
+  }
   LSE_ASSIGN_OR(embed_weight_, binder.require(spec_.embed_name));
   LSE_ASSIGN_OR(final_norm_weight_, binder.require(spec_.final_norm_name));
   if (!spec_.lm_head_name.empty()) {
     LSE_ASSIGN_OR(lm_head_weight_, binder.require(spec_.lm_head_name));
   }
 
+  // Which member holds layer `i`. One member is every layer; more than one
+  // splits them into contiguous blocks of as equal a size as the count allows.
   blocks_.clear();
   blocks_.reserve(static_cast<std::size_t>(config_.num_layers));
   for (std::int32_t i = 0; i < config_.num_layers; ++i) {
@@ -96,7 +150,13 @@ Status HybridLM::load(WeightBinder& binder) {
     ctx.config = &config_;
     ctx.layer_index = i;
     const std::string prefix = spec_.block_prefix + "." + std::to_string(i);
-    LSE_RETURN_IF_ERROR(block->load(binder, prefix, ctx));
+    // Contiguous blocks, not round robin. A layer reads what the one before it
+    // wrote, so the boundaries are what cost: blocks of layers cross the link
+    // once per member, where interleaving would cross it once per layer.
+    {
+      const graph::ScopedMember on(member_for_layer(i));
+      LSE_RETURN_IF_ERROR(block->load(binder, prefix, ctx));
+    }
     blocks_.push_back(std::move(block));
   }
   return audit_unclaimed(binder, spec_.refused);
@@ -209,10 +269,13 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
-  if (states != nullptr && states->size() != blocks_.size()) {
+  if (states != nullptr &&
+      states->size() != blocks_.size() * state_shards()) {
     return LSE_ERROR(kInvalidArgument, "expected ",
-                     std::to_string(blocks_.size()), " mixer states, got ",
-                     std::to_string(states->size()));
+                     std::to_string(blocks_.size() * state_shards()),
+                     " mixer states (", std::to_string(blocks_.size()),
+                     " layers x ", std::to_string(state_shards()),
+                     " shards), got ", std::to_string(states->size()));
   }
 
   const std::int64_t t_now =
@@ -227,13 +290,26 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     const auto tail = config_.gdn_conv_kernel > 1
                           ? static_cast<std::int64_t>(config_.gdn_conv_kernel - 1)
                           : 0;
-    const auto fused = static_cast<std::int64_t>(spec_.gdn_conv_width);
-    const auto width = vh * vd;
+    const std::size_t shards = state_shards();
+    const auto n = static_cast<std::int64_t>(shards);
+    // A tensor split cuts the recurrence along its head axis with the weights
+    // that drive it, so each member carries only its own heads' state and its
+    // own channels of the convolution tail.
+    const std::int64_t vh_m = shards > 1 && vh % n == 0 ? vh / n : vh;
+    const auto fused_full = static_cast<std::int64_t>(spec_.gdn_conv_width);
+    const std::int64_t fused =
+        shards > 1 && fused_full % n == 0 ? fused_full / n : fused_full;
+    const auto width = vh_m * vd;
     for (std::size_t i = 0; i < states->size(); ++i) {
-      if (config_.is_attention_layer(static_cast<std::int32_t>(i))) continue;
+      // Flat over (layer, member), so the layer is the quotient -- an
+      // attention layer's shards must not be given a recurrent state.
+      if (config_.is_attention_layer(static_cast<std::int32_t>(i / shards))) {
+        continue;
+      }
       MixerState& st = (*states)[i];
+      const graph::ScopedMember on(shards > 1 ? i % shards : 0);
       if (!st.gdn_state.valid()) {
-        st.gdn_state = Array::zeros(Shape{batch, vh, vd, vd}, DType::kF32);
+        st.gdn_state = Array::zeros(Shape{batch, vh_m, vd, vd}, DType::kF32);
       }
       if (tail <= 0) continue;
       // The tail is not an optimization: causal_conv1d zero-pads, so a decode
@@ -449,7 +525,11 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     LayerContext ctx;
     ctx.config = &config_;
     ctx.layer_index = static_cast<std::int32_t>(i);
-    MixerState* state = states != nullptr ? &(*states)[i] : nullptr;
+    ctx.shards = static_cast<std::int32_t>(state_shards());
+    MixerState* state =
+        states != nullptr ? &(*states)[i * state_shards()] : nullptr;
+    const graph::ScopedMember on(
+        member_for_layer(static_cast<std::int32_t>(i)));
     LSE_ASSIGN_OR(x, blocks_[i]->forward(x, state, aux_loss, ctx));
     if (trace != nullptr) trace->push_back(x);
   }

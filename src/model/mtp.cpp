@@ -190,6 +190,9 @@ Status MtpModule::build(WeightBinder& binder) {
   LayerContext ctx;
   ctx.config = &config_;
   ctx.layer_index = 0;
+  // The draft head is one block with one mixer state, so it stays whole even
+  // when the model it drafts for is split across the pool.
+  const graph::ScopedSplitScheme unsplit(graph::SplitScheme::kNone);
   return block_->load(binder, "layers.0", ctx);
 }
 

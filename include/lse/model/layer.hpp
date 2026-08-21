@@ -55,10 +55,24 @@ struct LayerContext {
   const Config* config = nullptr;
   std::int32_t layer_index = 0;
   bool training = false;
+  // How many ways this layer's weights are split across the pool, and so how
+  // many MixerStates the `state` pointer addresses: one per member, laid out
+  // consecutively. One under every scheme but a tensor split.
+  std::int32_t shards = 1;
 };
 
 // Names bound so far, used to report anything the checkpoint had that no layer
 // claimed — the most likely silent failure when adding a second architecture.
+// A half-open window over a tensor's last axis, in elements of that axis.
+// Namespace scope rather than nested: a nested type's default member
+// initializers are not usable in a default argument of its own enclosing class.
+struct TensorWindow {
+  std::int64_t first = 0;
+  std::int64_t count = 0;
+
+  [[nodiscard]] bool empty() const noexcept { return count <= 0; }
+};
+
 class WeightBinder {
  public:
   // `quantization` says which tensors are group-affine and at what geometry.
@@ -92,6 +106,26 @@ class WeightBinder {
                              const std::vector<std::int64_t>& order,
                              Shape shape);
 
+  // Reads `name` keeping only input features [first, first + count) of every
+  // row, reporting the result as `shape`.
+  //
+  // The other half of a tensor split. A weight whose OUTPUT features are split
+  // is a row selection -- require_rows above -- and each member then holds a
+  // slice of the result. A weight whose INPUT features are split is this: every
+  // member holds every output row but only its own span of the contraction, so
+  // each computes a partial sum and the members add. Down-projections and
+  // attention output projections are the second kind, which is why a tensor
+  // split needs both and why one of them cannot be spelled as a permutation.
+  //
+  // On a group-affine tensor the window has to fall on a group boundary and on
+  // a whole number of packed lanes: the codes of one group share a scale and
+  // several input features share a u32, so a window that split either would
+  // have to re-quantize rather than slice. Both hold when `first` and `count`
+  // are multiples of the group size, which is what a pool of any size gives on
+  // these models.
+  Result<Array> require_columns(std::string_view name, std::int64_t first,
+                                std::int64_t count, Shape shape);
+
   // The same tensor under a different shape of the same elements. MLX writes a
   // depthwise conv weight as [channels, kernel, 1]; the graph wants
   // [channels, kernel]. Nothing moves — only the reported shape differs.
@@ -113,7 +147,7 @@ class WeightBinder {
                                const TensorView& scales,
                                const TensorView& biases,
                                const std::vector<std::int64_t>* order,
-                               Shape logical);
+                               Shape logical, TensorWindow window = {});
 
   const SafeTensors* weights_;
   const quant::GroupAffineMap* quantization_ = nullptr;
@@ -151,6 +185,18 @@ class IMixer {
   virtual Result<Array> forward(const Array& x, MixerState* state,
                                 const LayerContext&) = 0;
   virtual std::string_view name() const noexcept = 0;
+
+  // Whether this mixer splits its own weights across the pool.
+  //
+  // A tensor split is only worth taking when the whole block takes it. Sharding
+  // the feed-forward alone leaves every mixer on one member, so the other one
+  // holds half of one operation per layer and idles through the rest -- 13.4
+  // tok/s measured against 24.4 for a plain layer split. So the scheme is
+  // chosen on this, and a mixer that has not been taught to shard keeps the
+  // pool on layers rather than quietly making it slower.
+  [[nodiscard]] virtual bool shards_across_pool() const noexcept {
+    return false;
+  }
 };
 
 class IFeedForward {
@@ -207,6 +253,11 @@ struct HybridBlockSpec {
 // IFeedForward::ungated returns is added afterwards.
 class HybridBlock {
  public:
+  // Whether this block's mixer shards across the pool; see IMixer.
+  [[nodiscard]] bool mixer_shards() const noexcept {
+    return mixer_ != nullptr && mixer_->shards_across_pool();
+  }
+
   HybridBlock(std::unique_ptr<IMixer> mixer, std::unique_ptr<IFeedForward> ffn,
               bool zero_centered_norm,
               std::unique_ptr<IModGate> mod = nullptr,

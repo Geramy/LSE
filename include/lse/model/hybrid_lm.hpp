@@ -158,7 +158,7 @@ class HybridLM {
   [[nodiscard]] Result<Array> lm_head(const Array& hidden_states) const;
 
   [[nodiscard]] std::vector<MixerState> make_states() const {
-    return std::vector<MixerState>(blocks_.size());
+    return std::vector<MixerState>(blocks_.size() * state_shards());
   }
 
   // The program the last hidden() built or replayed. Exposed so a test can
@@ -170,6 +170,23 @@ class HybridLM {
 
   [[nodiscard]] const Config& config() const noexcept { return config_; }
   [[nodiscard]] std::size_t num_layers() const noexcept { return blocks_.size(); }
+
+  // How many states each layer keeps. A tensor split shards the KV pool and the
+  // recurrent state along the head axis with the weights that produce them, so
+  // each member carries its own; every other scheme keeps one.
+  [[nodiscard]] std::size_t state_shards() const noexcept;
+
+  // How many MixerStates a session has to carry: one per layer per shard.
+  [[nodiscard]] std::size_t state_slots() const noexcept {
+    return blocks_.size() * state_shards();
+  }
+
+  // Which device holds layer `i`. Contiguous blocks, so a run of layers stays
+  // put and the activation crosses once at each boundary instead of at every
+  // layer. Load and forward both ask this, and they have to agree: weights
+  // placed one way and a KV pool placed another means every attention group
+  // is pulled back to whoever holds the pool.
+  [[nodiscard]] std::size_t member_for_layer(std::int32_t i) const noexcept;
   [[nodiscard]] HybridBlock& block(std::size_t i) noexcept { return *blocks_[i]; }
 
  private:

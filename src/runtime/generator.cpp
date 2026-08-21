@@ -92,6 +92,8 @@ void snapshot_trace(GenerationStats* stats, std::vector<std::string>* reasons) {
   stats->host_fallbacks = t.host_fallbacks;
   stats->streams_used = t.streams_used;
   stats->stream_waits = t.stream_waits;
+  stats->peer_migrations = t.peer_migrations;
+  stats->peer_bytes = t.peer_bytes;
   stats->stream_chain = t.stream_chain;
   stats->streams_available =
       sched->backend().stream_capabilities().stream_count;
@@ -474,7 +476,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     const std::vector<std::uint32_t>& prompt, const GenerationLimits& limits,
     const TokenCallback& on_token) {
   if (owned_ == nullptr) {
-    owned_ = std::make_unique<Session>("", model_.num_layers());
+    owned_ = std::make_unique<Session>("", model_.state_slots());
   }
   owned_->clear();
   return generate(*owned_, prompt, limits, on_token);

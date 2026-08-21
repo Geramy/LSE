@@ -52,14 +52,24 @@ DType device_storage(DType checkpoint) noexcept {
 // at a time — for the tied head that is a quarter of a billion pointless
 // writes on each side, and it dominated model load. Allocate the buffer and
 // read the tensor straight into it instead.
+// `window`, when non-empty, keeps only that span of every row's last axis.
+// Staged whole and copied span by span for the same reason the row path is:
+// one sequential pass over the mapping beats a scattered read per row.
 Result<Array> upload(const TensorView& v, Shape shape,
-                     const std::vector<std::int64_t>* order) {
+                     const std::vector<std::int64_t>* order,
+                     std::int64_t win_first = 0, std::int64_t win_count = 0) {
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
     return LSE_ERROR(kInternal, "no usable backend to load '", v.name,
                      "' into");
   }
-  backend::IBackend& be = sched->backend();
+  // Where this tensor lives. Weight loading names a member per layer so a
+  // model spans the pool; everything else leaves it unset and gets the
+  // primary, which is what a single-device run has always done.
+  backend::IDeviceSet& set = sched->devices();
+  const std::size_t member = graph::preferred_member();
+  backend::IBackend& be =
+      member < set.size() ? set.device(member) : sched->backend();
 
   const DType dt = device_storage(v.dtype);
   Array a = Array::zeros(shape, dt);
@@ -67,7 +77,7 @@ Result<Array> upload(const TensorView& v, Shape shape,
   LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be));
   const bool native = dt == v.dtype;
 
-  if (order == nullptr) {
+  if (order == nullptr && win_count <= 0) {
     if (native) {
       LSE_RETURN_IF_ERROR(
           v.read_native(graph::interpreter::host_bytes(n),
@@ -76,6 +86,26 @@ Result<Array> upload(const TensorView& v, Shape shape,
       LSE_RETURN_IF_ERROR(v.read_f32(
           static_cast<float*>(graph::interpreter::host_bytes(n)),
           n.element_count()));
+    }
+  } else if (order == nullptr) {
+    const std::size_t rank = v.shape.rank();
+    const auto width =
+        static_cast<std::size_t>(rank >= 2 ? v.shape.dim(rank - 1) : 1);
+    const std::size_t elem = dtype_storage_bytes(dt, 1);
+    const std::size_t rows = width > 0 ? v.element_count() / width : 0;
+    std::vector<std::byte> staged(dtype_storage_bytes(dt, v.element_count()));
+    if (native) {
+      LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
+    } else {
+      LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
+                                     v.element_count()));
+    }
+    auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
+    const auto first = static_cast<std::size_t>(win_first);
+    const auto count = static_cast<std::size_t>(win_count);
+    for (std::size_t r = 0; r < rows; ++r) {
+      std::memcpy(dst + r * count * elem,
+                  staged.data() + (r * width + first) * elem, count * elem);
     }
   } else {
     // Staged whole rather than read row by row: TensorView reads the mapping,
@@ -217,7 +247,7 @@ Result<Array> WeightBinder::require_as(std::string_view name, Shape shape) {
 Result<Array> WeightBinder::bind_quantized(
     std::string_view name, const TensorView& packed, const TensorView& scales,
     const TensorView& biases, const std::vector<std::int64_t>* order,
-    Shape logical) {
+    Shape logical, TensorWindow window) {
   if (quantization_ == nullptr) {
     return LSE_ERROR(kInvalidArgument, "'", std::string(name),
                      "' is stored with .scales/.biases planes but the config "
@@ -286,21 +316,91 @@ Result<Array> WeightBinder::bind_quantized(
     group_shape = Shape{rows, last_dim(scales.shape)};
   }
 
-  LSE_ASSIGN_OR(Array a, upload(packed, packed_shape, order));
-  LSE_ASSIGN_OR(Array s, upload(scales, group_shape, order));
-  LSE_ASSIGN_OR(Array b, upload(biases, group_shape, order));
+  // An input-feature window becomes two different windows: one over packed
+  // lanes and one over groups. Both are exact only on a boundary, which is
+  // checked in require_columns before we get here.
+  std::int64_t lane_first = 0, lane_count = 0;
+  std::int64_t grp_first = 0, grp_count = 0;
+  std::int64_t sliced_in = in_features;
+  if (!window.empty()) {
+    lane_first = window.first * spec.bits / 32;
+    lane_count = window.count * spec.bits / 32;
+    grp_first = window.first / spec.group_size;
+    grp_count = window.count / spec.group_size;
+    sliced_in = window.count;
+    packed_shape = Shape{packed_shape.dim(0), lane_count};
+    group_shape = Shape{group_shape.dim(0), grp_count};
+  }
+
+  LSE_ASSIGN_OR(Array a,
+                upload(packed, packed_shape, order, lane_first, lane_count));
+  LSE_ASSIGN_OR(Array s,
+                upload(scales, group_shape, order, grp_first, grp_count));
+  LSE_ASSIGN_OR(Array b,
+                upload(biases, group_shape, order, grp_first, grp_count));
 
   auto planes = std::make_shared<graph::QuantPlanes>();
   planes->scales = s.node();
   planes->biases = b.node();
   planes->bits = spec.bits;
   planes->group_size = spec.group_size;
-  planes->in_features = in_features;
+  planes->in_features = sliced_in;
   a.node()->quant = std::move(planes);
 
   claimed_.emplace_back(name);
   claimed_.emplace_back(scales.name);
   claimed_.emplace_back(biases.name);
+  return a;
+}
+
+Result<Array> WeightBinder::require_columns(std::string_view name,
+                                            std::int64_t first,
+                                            std::int64_t count, Shape shape) {
+  const TensorView* v = weights_->find(name);
+  if (v == nullptr) {
+    return LSE_ERROR(kNotFound, "checkpoint has no tensor '", std::string(name),
+                     "'");
+  }
+  if (first < 0 || count <= 0) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                     "' asked for an empty column window");
+  }
+  LSE_ASSIGN_OR(const auto planes, quant_planes(name));
+  if (planes[0] != nullptr) {
+    if (quantization_ == nullptr) {
+      return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                       "' is group-affine but no quantization was declared");
+    }
+    LSE_ASSIGN_OR(const quant::GroupAffine spec,
+                  quantization_->resolve_checked(name, last_dim(v->shape),
+                                                 last_dim(planes[0]->shape)));
+    const std::int64_t per_lane = 32 / spec.bits;
+    if (first % spec.group_size != 0 || count % spec.group_size != 0 ||
+        first % per_lane != 0 || count % per_lane != 0) {
+      return LSE_ERROR(kInvalidArgument, "'", std::string(name),
+                       "' is quantized in groups of ",
+                       std::to_string(spec.group_size), " with ",
+                       std::to_string(per_lane),
+                       " weights to a lane; input features [",
+                       std::to_string(first), ", ",
+                       std::to_string(first + count),
+                       ") would split a group or a lane, and slicing one would "
+                       "mean re-quantizing rather than reading");
+    }
+    return bind_quantized(name, *v, *planes[0], *planes[1], nullptr, shape,
+                          TensorWindow{first, count});
+  }
+
+  const std::size_t rank = v->shape.rank();
+  const auto width =
+      static_cast<std::size_t>(rank >= 2 ? v->shape.dim(rank - 1) : 1);
+  if (static_cast<std::size_t>(first + count) > width) {
+    return LSE_ERROR(kOutOfRange, "'", std::string(name), "' rows are ",
+                     std::to_string(width), " wide; [", std::to_string(first),
+                     ", ", std::to_string(first + count), ") runs past that");
+  }
+  LSE_ASSIGN_OR(Array a, upload(*v, shape, nullptr, first, count));
+  claimed_.emplace_back(name);
   return a;
 }
 

@@ -50,6 +50,8 @@ struct GenerationStats {
   std::uint32_t streams_available = 1;
   std::uint32_t streams_used = 1;
   std::uint32_t stream_waits = 0;
+  std::uint32_t peer_migrations = 0;
+  std::uint64_t peer_bytes = 0;
   std::uint32_t stream_chain = 0;
 
   // Share of dispatched groups that did not have to wait for the one before
