@@ -1,10 +1,26 @@
 # Lemon Seed Engine (LSE)
 
-A modular C++ training and inference engine for the
-[lemonseed](https://github.com/Geramy/lemonseed) hybrid LLM architecture
-(Gated DeltaNet + gated GQA + sparse MoE with Mixture-of-Depths), running on the
-[HRX](https://github.com/ROCm/hrx-system) native runtime. Weights:
-[lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base).
+A modular C++ inference engine for hybrid LLMs -- Gated DeltaNet
+interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
+[HRX](https://github.com/ROCm/hrx-system) native runtime on AMD GPUs. Kernels
+are generated at run time from the model's own shapes rather than selected from
+a library.
+
+## Models
+
+The architecture is what a checkpoint is loaded as, not its name, so a family
+shares one kernel. `--list-models` prints what a build registers.
+
+| Kernel | Checkpoints | Notes |
+|---|---|---|
+| `qwen3.5` | Qwen3.5, Qwen3.6, Qwen3.8 dense | Hybrid: three Gated DeltaNet layers to each full-attention one. Verified on Qwen3.5-0.8B and Qwen3.8-27B |
+| `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
+| `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
+
+Weights are read in MLX group-affine form at 4 or 8 bits, or bf16/f16/f32. A
+multi-token-prediction module is used when the checkpoint has one, which is
+what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
+where a checkpoint also ships a vision tower, which this build does not run.
 
 ## Design in one paragraph
 
@@ -364,16 +380,25 @@ way past, with the reason the backend gave.
 - Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
   Mixture-of-Depths, chunked prefill, and device-side argmax.
 
-**Measured** — [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base)
-(bf16) at 102.3 tok/s median decode on one gfx1151 APU (Strix Halo,
-227–233 GB/s), 17 test suites green, zero warnings under the full warning set.
+**Measured** — warm cache, GPU otherwise idle, best of several runs.
+
+| | gfx1151 (Strix Halo APU, 220 GB/s) | gfx1201 (Radeon AI PRO R9700, 1090 GB/s) |
+|---|---|---|
+| Qwen3.5-0.8B-4bit prefill, 1601 tok | 1703 tok/s | — |
+| Qwen3.8-27B-4bit prefill, 401 tok | 28.7 tok/s | 112 tok/s |
+| Qwen3.8-27B-4bit decode | 11.9 tok/s, 15.0 with MTP | 20.9 tok/s, 27.9 with MTP |
+| lemonseed-1.5b-base (bf16) decode | 102.3 tok/s | — |
+
+Decode on the APU is bandwidth-bound at 82% of the measured DRAM rate; on the
+R9700 it is not, which is where the headroom is. 19 test suites green, zero
+warnings under the full warning set.
 
 ## Upcoming
 
-- **Multi-device** — device enumeration, buffer residency, and per-group
-  placement chosen from the measured cost model rather than configuration.
-- **Paged KV cache** with runtime batch extents, replacing contiguous
-  per-session state.
+- **Multi-device execution** — a pool opens, probes and reports every member
+  today, and a model still loads onto one of them. Splitting the work across
+  them, and choosing which split from the measured cost model rather than from
+  configuration, is the open half.
 - **Continuous batching** across sessions, which hides link latency behind queue
   depth.
 - **Device-resident collectives** over a real peer path.
