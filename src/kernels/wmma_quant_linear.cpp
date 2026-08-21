@@ -205,7 +205,13 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     slot_g.push_back(e.let((rb + lane_hi) * round_groups));
     slot_out.push_back(e.let(m0 + rb + lane_hi));
   }
-  const auto col_scales = e.let(bcol * groups);
+  // A column past the end still indexes the scales, because the group loop
+  // reads them before it knows whether the lane will store anything. Its
+  // result is discarded either way, so it reads column zero rather than off
+  // the end of the plane: n only has to miss a multiple of waves * kTileN for
+  // the last workgroup to carry lanes that are not columns at all.
+  const auto safe_col = e.let(select(bcol < n, bcol, e.u32(0)));
+  const auto col_scales = e.let(safe_col * groups);
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
   const std::uint32_t chunks = (items + kBlock - 1u) / kBlock;
