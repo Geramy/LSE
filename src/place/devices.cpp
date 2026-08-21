@@ -2,6 +2,9 @@
 
 #include <dlfcn.h>
 
+#include <cctype>
+#include <optional>
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -45,6 +48,88 @@ backend::DeviceDescriptor describe(
 
 }  // namespace
 
+// A pool entry that names the device by something stable instead of by
+// position. Ordinals are not an identity: on an eight-GPU box this engine's
+// hrx:4, the KFD's node 6 and rocm-smi's GPU[6] are three different numbers for
+// three different cards, and picking the wrong one is silent -- it runs, on
+// somebody else's GPU. A PCI address or a UUID says which card and cannot be
+// read as any other.
+//
+//   hrx:pci:0000:87:00.0     hrx:uuid:eabd6af237d499cb
+//
+// The address keeps its own colons, so only the two prefixes are split on.
+struct StableRef {
+  std::string backend;
+  std::string pci;   // empty unless this entry named one
+  std::string uuid;  // ditto
+};
+
+std::optional<StableRef> parse_stable_ref(std::string_view entry) {
+  const std::size_t first = entry.find(':');
+  if (first == std::string_view::npos) return std::nullopt;
+  const std::string_view rest = entry.substr(first + 1);
+  StableRef out;
+  out.backend = std::string(entry.substr(0, first));
+  if (rest.rfind("pci:", 0) == 0) {
+    out.pci = std::string(rest.substr(4));
+  } else if (rest.rfind("uuid:", 0) == 0) {
+    out.uuid = std::string(rest.substr(5));
+  } else {
+    return std::nullopt;
+  }
+  if (out.backend.empty() || (out.pci.empty() && out.uuid.empty())) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+bool ieq(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const auto la = static_cast<char>(std::tolower(static_cast<unsigned char>(a[i])));
+    const auto lb = static_cast<char>(std::tolower(static_cast<unsigned char>(b[i])));
+    if (la != lb) return false;
+  }
+  return true;
+}
+
+// A UUID is quoted in several shapes -- GPU-<hex>, 0x<hex>, bare hex -- so the
+// comparison is on the hex, not on the decoration around it.
+std::string uuid_digits(std::string_view text) {
+  std::string out;
+  for (const char c : text) {
+    if (std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+      out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  if (out.rfind("0", 0) == 0 && text.size() > 1 &&
+      (text[1] == 'x' || text[1] == 'X')) {
+    out.erase(0, 1);
+  }
+  return out;
+}
+
+Result<int> ordinal_for(const StableRef& ref) {
+  auto found = backend::enumerate_devices(ref.backend);
+  if (!found.ok()) return found.status();
+  const std::vector<backend::DeviceDescriptor> devices = found.release();
+  std::string seen;
+  for (const backend::DeviceDescriptor& d : devices) {
+    const std::string pci = d.pci_path.value_or("");
+    const std::string uuid = d.uuid.value_or("");
+    if (!seen.empty()) seen += ", ";
+    seen += pci.empty() ? "?" : pci;
+    if (!ref.pci.empty() && ieq(pci, ref.pci)) return d.ordinal;
+    if (!ref.uuid.empty() && !uuid.empty() &&
+        uuid_digits(uuid) == uuid_digits(ref.uuid)) {
+      return d.ordinal;
+    }
+  }
+  return LSE_ERROR(kNotFound, "no ", ref.backend, " device at ",
+                   ref.pci.empty() ? ref.uuid : ref.pci,
+                   "; this build sees ", seen.empty() ? "none" : seen);
+}
+
 Result<std::vector<probe::DeviceId>> parse_selector(std::string_view text) {
   std::vector<probe::DeviceId> out;
   std::string_view rest = trim(text);
@@ -53,7 +138,14 @@ Result<std::vector<probe::DeviceId>> parse_selector(std::string_view text) {
     const std::string_view entry =
         trim(comma == std::string_view::npos ? rest : rest.substr(0, comma));
     if (!entry.empty()) {
-      LSE_ASSIGN_OR(probe::DeviceId id, probe::parse_device_id(entry));
+      probe::DeviceId id;
+      if (const std::optional<StableRef> ref = parse_stable_ref(entry)) {
+        LSE_ASSIGN_OR(const int ordinal, ordinal_for(*ref));
+        id.backend = ref->backend;
+        id.ordinal = ordinal;
+      } else {
+        LSE_ASSIGN_OR(id, probe::parse_device_id(entry));
+      }
       for (const probe::DeviceId& seen : out) {
         if (seen == id) {
           return LSE_ERROR(kInvalidArgument, "device ", id.str(),
