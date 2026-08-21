@@ -53,8 +53,24 @@ if [[ -n "$ref" ]]; then
   git -C "$dir" submodule update --init --recursive
 fi
 
+# The AMDGPU driver is built with clang targeting amdgcn, and it will not take
+# gcc: IREE_ROCM_PATH supplies device libraries, not a host compiler. ROCm ships
+# a clang beside the runtime, which is the one that matches it.
+cc="${CC:-}"; cxx="${CXX:-}"
+if [[ -z "$cc" ]]; then
+  for cand in "$rocm/llvm/bin/clang" "$(command -v clang || true)"; do
+    [[ -x "$cand" ]] && { cc="$cand"; cxx="${cand}++"; break; }
+  done
+fi
+if [[ -z "$cc" ]]; then
+  echo "no clang found for the AMDGPU driver; install clang or set CC/CXX" >&2
+  exit 1
+fi
+echo "host compiler: $cc"
+
 cd "$dir"
-"$py" dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH="$rocm"
+"$py" dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH="$rocm" \
+  -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx"
 "$py" dev.py cmake build
 
 install="$dir/build/hrx-install"
