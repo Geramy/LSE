@@ -10,6 +10,13 @@ set -euo pipefail
 repo="${LSE_HRX_REPO:-https://github.com/ROCm/hrx-system.git}"
 ref="${LSE_HRX_REF:-}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `python` is not a command on a stock Ubuntu 26.04; dev.py wants an interpreter
+# by name, so pick one that exists rather than the one its docs happen to spell.
+py="${PYTHON:-}"
+if [[ -z "$py" ]]; then
+  for c in python3 python; do command -v "$c" >/dev/null && { py="$c"; break; }; done
+fi
+if [[ -z "$py" ]]; then echo "no python interpreter found; set PYTHON" >&2; exit 1; fi
 dir="$root/reference/hrx-system"
 rocm="${ROCM_PATH:-/opt/rocm}"
 
@@ -28,8 +35,8 @@ if [[ -n "$ref" ]]; then
 fi
 
 cd "$dir"
-python dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH="$rocm"
-python dev.py cmake build
+"$py" dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH="$rocm"
+"$py" dev.py cmake build
 
 install="$dir/build/hrx-install"
 echo
