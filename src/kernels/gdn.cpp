@@ -60,8 +60,11 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
 
   const std::uint32_t wave = wave_of(s.device);
   const std::uint32_t tile = (D + wave - 1) / wave;
-  const std::uint32_t rows =
-      write_state ? batch * heads * D : batch * seq * heads * D;
+  // One scan per (sequence, head, state row), never one per output element.
+  // The recurrence has to be walked from the start to reach any timestep, so a
+  // thread per timestep replays the whole thing and writes one value of it:
+  // seq times the work, and seq here is the prompt.
+  const std::uint32_t rows = batch * heads * D;
 
   kir::KernelBody k(s.types, *s.intrinsics);
   k.set_store(s.store);
@@ -76,14 +79,7 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
 
   const auto row = e.let(wid % D);
   const auto h = e.let((wid / D) % heads);
-  kir::Val<kir::u32> b, t_out;
-  if (write_state) {
-    b = e.let(wid / (D * heads));
-    t_out = e.let(e.u32(seq - 1));
-  } else {
-    t_out = e.let((wid / (D * heads)) % seq);
-    b = e.let(wid / (D * heads * seq));
-  }
+  const auto b = e.let(wid / (D * heads));
 
   k.statement("float s[" + std::to_string(tile) + "];");
   kir::Tile<kir::f32> srow(&k, &k.types(), "s", tile);
@@ -101,7 +97,6 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     return acc;
   };
 
-  auto result = e.var(0.0f);
   for (auto t : e.range(seq)) {
     const auto sc = (b * seq + t) * heads + h;
     const auto vec = sc * D;
@@ -125,14 +120,12 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
         accp = math::fma(srow[ei].read(), a.q[vec + j], accp);
       }
     }
-    const auto acc = reduce(accp);
-    if (mode == GdnWrite::kBoth) {
+    if (write_out) {
+      // The scan passes every timestep on its way to the end, so it publishes
+      // each one as it goes rather than being restarted to reach it.
+      const auto acc = reduce(accp);
       if (auto in = e.when(lane == 0)) {
         e.store(((b * seq + t) * heads + h) * D + row, acc);
-      }
-    } else {
-      if (auto in = e.when(t == t_out)) {
-        result = acc;
       }
     }
   }
@@ -145,10 +138,6 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
         if (mode == GdnWrite::kBoth) a.sout[idx] = srow[ei].read();
         else e.store(idx, srow[ei].read());
       }
-    }
-  } else {
-    if (auto in = e.when(lane == 0)) {
-      e.store(((b * seq + t_out) * heads + h) * D + row, result);
     }
   }
   return k.str();
@@ -167,8 +156,8 @@ ThreadPlan gdn_plan(const KernelShapes& s, bool write_state) {
   const auto heads = static_cast<std::uint32_t>(q.dim(2));
   const auto D = static_cast<std::uint32_t>(q.dim(3));
   const std::uint32_t wave = wave_of(s.device);
-  const std::uint32_t rows =
-      write_state ? batch * heads * D : batch * seq * heads * D;
+  (void)write_state;
+  const std::uint32_t rows = batch * heads * D;
   const std::uint32_t threads = rows * wave;
   tp.workgroup_count[0] = threads == 0 ? 1u : (threads + kBlock - 1) / kBlock;
   return tp;
