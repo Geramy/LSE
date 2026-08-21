@@ -68,6 +68,22 @@ if [[ -z "$cc" ]]; then
 fi
 echo "host compiler: $cc"
 
+# Patches this tree carries against hrx-system. Each one is a fix we need and
+# have sent upstream; applying is idempotent, so a checkout that already has
+# them (or an upstream that has taken them) is left alone.
+shopt -s nullglob
+for patch in "$root"/patches/*.patch; do
+  if git -C "$dir" apply --check --reverse "$patch" 2>/dev/null; then
+    echo "already applied: $(basename "$patch")"
+  elif git -C "$dir" apply "$patch" 2>/dev/null; then
+    echo "applied: $(basename "$patch")"
+  else
+    echo "could not apply $(basename "$patch") -- hrx-system has moved under it" >&2
+    exit 1
+  fi
+done
+shopt -u nullglob
+
 cd "$dir"
 "$py" dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH="$rocm" \
   -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx"

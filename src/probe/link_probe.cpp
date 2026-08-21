@@ -355,7 +355,16 @@ Result<std::vector<LinkProfile>> probe_local_links(
       backend::DeviceBuffer dst_buf = dst.release();
 
       LinkProfile& l = out[i * n + j];
-      l.path = PathKind::kHostStaged;
+      // Ask the destination to pull the bytes straight out of the peer.
+      // Nobody declares whether that works: a device pool is unreachable until
+      // its memory has been granted to the other agent, and the honest test is
+      // one copy. What comes back decides both the path this pair reports and
+      // the transfer the timings below measure.
+      const bool direct =
+          dst_be.copy_peer(src_buf, dst_buf,
+                           cfg.sizes.empty() ? 0 : cfg.sizes.front(), 0, 0)
+              .ok();
+      l.path = direct ? PathKind::kPeerDirect : PathKind::kHostStaged;
       Status failed;
       for (const std::size_t bytes : cfg.sizes) {
         const int reps = reps_for(bytes, cfg.byte_budget);
@@ -365,9 +374,13 @@ Result<std::vector<LinkProfile>> probe_local_links(
         double best = 0.0;
         for (int r = 0; r < reps && failed.ok(); ++r) {
           const auto t0 = Clock::now();
-          failed = src_be.copy_d2h(src_buf, host_ptr, bytes, 0);
-          if (failed.ok()) {
-            failed = dst_be.copy_h2d(host_ptr, dst_buf, bytes, 0);
+          if (direct) {
+            failed = dst_be.copy_peer(src_buf, dst_buf, bytes, 0, 0);
+          } else {
+            failed = src_be.copy_d2h(src_buf, host_ptr, bytes, 0);
+            if (failed.ok()) {
+              failed = dst_be.copy_h2d(host_ptr, dst_buf, bytes, 0);
+            }
           }
           const double one = ns_since(t0);
           if (best == 0.0 || one < best) best = one;

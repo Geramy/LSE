@@ -83,6 +83,11 @@ using HsaStatus = int;
 constexpr HsaStatus kHsaSuccess = 0;
 constexpr int kInfoDevice = 17;
 constexpr int kDeviceTypeGpu = 1;
+constexpr int kDeviceTypeCpu = 0;
+
+struct HsaSignal {
+  std::uint64_t handle = 0;
+};
 
 struct HsaAgent {
   std::uint64_t handle = 0;
@@ -110,6 +115,16 @@ class HsaRuntime {
         dlsym(lib_, "hsa_amd_agent_memory_pool_get_info"));
     allow_access_ = reinterpret_cast<AllowAccessFn>(
         dlsym(lib_, "hsa_amd_agents_allow_access"));
+    async_copy_ = reinterpret_cast<AsyncCopyFn>(
+        dlsym(lib_, "hsa_amd_memory_async_copy"));
+    lock_ = reinterpret_cast<LockFn>(dlsym(lib_, "hsa_amd_memory_lock"));
+    unlock_ = reinterpret_cast<UnlockFn>(dlsym(lib_, "hsa_amd_memory_unlock"));
+    signal_create_ = reinterpret_cast<SignalCreateFn>(
+        dlsym(lib_, "hsa_signal_create"));
+    signal_destroy_ = reinterpret_cast<SignalDestroyFn>(
+        dlsym(lib_, "hsa_signal_destroy"));
+    signal_wait_ = reinterpret_cast<SignalWaitFn>(
+        dlsym(lib_, "hsa_signal_wait_scacquire"));
   }
   ~HsaRuntime() {
     if (lib_ != nullptr) dlclose(lib_);
@@ -143,6 +158,68 @@ class HsaRuntime {
     }
     return allow_access_(static_cast<std::uint32_t>(agents.size()),
                          agents.data(), nullptr, ptr) == kHsaSuccess;
+  }
+
+  // The first CPU agent, which is the one host memory belongs to when a
+  // transfer names where its source lives.
+  [[nodiscard]] HsaAgent cpu_agent() const noexcept {
+    HsaAgent found{};
+    if (!reachable()) return found;
+    struct Visit {
+      const HsaRuntime* self;
+      HsaAgent* out;
+    } visit{this, &found};
+    iterate_(
+        [](HsaAgent agent, void* data) -> HsaStatus {
+          auto* v = static_cast<Visit*>(data);
+          if (v->out->handle != 0) return kHsaSuccess;
+          int type = 0;
+          if (!v->self->attribute(agent, kInfoDevice, &type)) return kHsaSuccess;
+          if (type == kDeviceTypeCpu) *v->out = agent;
+          return kHsaSuccess;
+        },
+        &visit);
+    return found;
+  }
+
+  [[nodiscard]] bool can_dma() const noexcept {
+    return async_copy_ != nullptr && signal_create_ != nullptr &&
+           signal_destroy_ != nullptr && signal_wait_ != nullptr;
+  }
+
+  // One DMA, waited on. This is the copy engine: the blit kernels the HAL uses
+  // for buffer copies move the bytes with the shader cores instead, which on
+  // this link measures about 8 GB/s against the DMA's forty-odd.
+  [[nodiscard]] bool dma_copy(void* dst, HsaAgent dst_agent, const void* src,
+                              HsaAgent src_agent, std::size_t bytes) const noexcept {
+    if (!can_dma()) return false;
+    HsaSignal signal{};
+    if (signal_create_(1, 0, nullptr, &signal) != kHsaSuccess) return false;
+    const bool issued =
+        async_copy_(dst, dst_agent, src, src_agent, bytes, 0, nullptr,
+                    signal) == kHsaSuccess;
+    if (issued) {
+      // Blocking acquire on the completion signal reaching zero.
+      constexpr int kConditionLt = 2;
+      constexpr int kWaitBlocked = 1;
+      (void)signal_wait_(signal, kConditionLt, 1, UINT64_MAX, kWaitBlocked);
+    }
+    signal_destroy_(signal);
+    return issued;
+  }
+
+  // Pins a host range so the copy engine can reach it, returning the address
+  // the agent should be given. Plain heap memory is pageable and no DMA engine
+  // may touch it.
+  [[nodiscard]] void* lock_host(void* ptr, std::size_t bytes,
+                                HsaAgent* agents, int count) const noexcept {
+    if (lock_ == nullptr) return nullptr;
+    void* locked = nullptr;
+    if (lock_(ptr, bytes, agents, count, &locked) != kHsaSuccess) return nullptr;
+    return locked;
+  }
+  void unlock_host(void* ptr) const noexcept {
+    if (unlock_ != nullptr) (void)unlock_(ptr);
   }
 
   // GPU agents only, in hsa_iterate_agents order. The CPU and any accelerator
@@ -233,6 +310,16 @@ class HsaRuntime {
   using AgentPoolInfoFn = HsaStatus (*)(HsaAgent, HsaPool, int, void*);
   using AllowAccessFn = HsaStatus (*)(std::uint32_t, const HsaAgent*,
                                       const std::uint32_t*, const void*);
+  using AsyncCopyFn = HsaStatus (*)(void*, HsaAgent, const void*, HsaAgent,
+                                    std::size_t, std::uint32_t,
+                                    const HsaSignal*, HsaSignal);
+  using LockFn = HsaStatus (*)(void*, std::size_t, HsaAgent*, int, void**);
+  using UnlockFn = HsaStatus (*)(void*);
+  using SignalCreateFn = HsaStatus (*)(std::int64_t, std::uint32_t,
+                                       const HsaAgent*, HsaSignal*);
+  using SignalDestroyFn = HsaStatus (*)(HsaSignal);
+  using SignalWaitFn = std::int64_t (*)(HsaSignal, int, std::int64_t,
+                                        std::uint64_t, int);
 
   void* lib_ = nullptr;
   IterateFn iterate_ = nullptr;
@@ -241,6 +328,12 @@ class HsaRuntime {
   PoolInfoFn pool_info_ = nullptr;
   AgentPoolInfoFn agent_pool_info_ = nullptr;
   AllowAccessFn allow_access_ = nullptr;
+  AsyncCopyFn async_copy_ = nullptr;
+  LockFn lock_ = nullptr;
+  UnlockFn unlock_ = nullptr;
+  SignalCreateFn signal_create_ = nullptr;
+  SignalDestroyFn signal_destroy_ = nullptr;
+  SignalWaitFn signal_wait_ = nullptr;
 };
 
 // The runtime and its GPU agents, resolved once. Every device allocation grants
@@ -763,6 +856,10 @@ Status HrxBackend::init_impl(int device_ordinal) {
                    "not linked; build hrx-system and reconfigure with "
                    "-DLSE_HRX_ROOT=<install prefix>");
 #else
+  // Which GPU this is in hsa_iterate_agents order, which is the order
+  // peer_agents() uses and therefore how the copy engine is told which device
+  // it is talking to.
+  gpu_ordinal_ = device_ordinal;
   LSE_RETURN_IF_ERROR(accelerator_up());
 
   int count = 0;
@@ -1181,6 +1278,57 @@ Status HrxBackend::ensure_staging(std::size_t bytes) {
 // becomes a buffer this device can read, and the copy engine does the rest.
 // Declines when the runtime will not take the range, which is the caller's cue
 // to stage instead.
+// A host<->device transfer on the DMA engine.
+//
+// Three things have to line up: the host range must be pinned, both ends must
+// be named by the agent that owns them, and the device address has to come
+// from the buffer rather than being assumed. Any of them failing is a decline,
+// and the caller falls back to the HAL's own path.
+Status HrxBackend::dma_host_transfer(void* host, const DeviceBuffer& device,
+                                     std::size_t bytes,
+                                     std::size_t device_offset,
+                                     bool to_device) {
+#if !LSE_HRX_LINKED
+  (void)host; (void)device; (void)bytes; (void)device_offset; (void)to_device;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  const HsaRuntime& hsa = shared_hsa();
+  if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
+  const std::vector<HsaAgent>& agents = peer_agents();
+  const auto here = static_cast<std::size_t>(gpu_ordinal_);
+  if (here >= agents.size()) {
+    return LSE_ERROR(kUnimplemented, "no agent for this device");
+  }
+  const HsaAgent gpu = agents[here];
+  const HsaAgent cpu = hsa.cpu_agent();
+  if (cpu.handle == 0) return LSE_ERROR(kUnimplemented, "no host agent");
+
+  void* device_ptr = nullptr;
+  if (!hrx_status_is_ok(hrx_buffer_get_device_ptr(
+          reinterpret_cast<hrx_buffer_t>(device.handle), &device_ptr)) ||
+      device_ptr == nullptr) {
+    return LSE_ERROR(kUnimplemented, "this buffer has no device address");
+  }
+  auto* dev = static_cast<std::byte*>(device_ptr) + device.offset + device_offset;
+
+  HsaAgent lock_agents[1] = {gpu};
+  void* locked = hsa.lock_host(host, bytes, lock_agents, 1);
+  if (locked == nullptr) return LSE_ERROR(kUnimplemented, "cannot pin the host range");
+
+  // The transfer must not overtake work already queued on this device.
+  const Status ordered = synchronize_impl();
+  bool moved = false;
+  if (ordered.ok()) {
+    moved = to_device ? hsa.dma_copy(dev, gpu, locked, cpu, bytes)
+                      : hsa.dma_copy(locked, cpu, dev, gpu, bytes);
+  }
+  hsa.unlock_host(host);
+  if (!ordered.ok()) return ordered;
+  if (!moved) return LSE_ERROR(kUnimplemented, "the DMA engine declined");
+  return OkStatus();
+#endif
+}
+
 Status HrxBackend::copy_h2d_imported(const void* src, DeviceBuffer& dst,
                                      std::size_t bytes,
                                      std::size_t dst_offset) {
@@ -1253,6 +1401,12 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   // about 200 us against 85 for the DMA itself -- and the import exists
   // precisely so that pass is not needed. It can decline, and then the staging
   // path below still gets the transfer done.
+  // The copy engine first, then the HAL's blit path if it will not take it.
+  if (const Status dma = dma_host_transfer(const_cast<void*>(src), dst, bytes,
+                                           dst_offset, /*to_device=*/true);
+      dma.ok()) {
+    return dma;
+  }
   if (const Status direct = copy_h2d_imported(src, dst, bytes, dst_offset);
       direct.ok()) {
     return direct;
@@ -1356,6 +1510,12 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
   LSE_RETURN_IF_ERROR(synchronize_impl());
+  if (const Status dma = dma_host_transfer(dst, src, bytes, src_offset,
+                                           /*to_device=*/false);
+      dma.ok()) {
+    return dma;
+  }
+
   // The mirror of copy_h2d: the copy engine into staging, then a host memcpy.
   auto stream = stream_at(0);
   if (!stream.ok()) return stream.status();

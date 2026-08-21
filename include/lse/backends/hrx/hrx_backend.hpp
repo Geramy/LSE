@@ -130,6 +130,12 @@ class HrxBackend : public Backend<HrxBackend> {
   void* staging_host_ = nullptr;    // mapped host address of the above
   std::size_t staging_bytes_ = 0;
   Status ensure_staging(std::size_t bytes);
+  Status dma_host_transfer(void* host, const DeviceBuffer& device,
+                           std::size_t bytes, std::size_t device_offset,
+                           bool to_device);
+  // GPU index within hsa_iterate_agents order, which is what names this device
+  // to the copy engine. Stamped at init.
+  int gpu_ordinal_ = 0;
   Status copy_h2d_imported(const void* src, DeviceBuffer& dst,
                            std::size_t bytes, std::size_t dst_offset);
   // Queue affinity bit per stream. hrx_stream_dispatch submits its command
