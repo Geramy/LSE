@@ -7,7 +7,6 @@
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
-#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -126,8 +125,13 @@ class HsaRuntime {
         dlsym(lib_, "hsa_signal_destroy"));
     signal_wait_ = reinterpret_cast<SignalWaitFn>(
         dlsym(lib_, "hsa_signal_wait_scacquire"));
+    signal_store_ = reinterpret_cast<SignalStoreFn>(
+        dlsym(lib_, "hsa_signal_store_screlease"));
   }
   ~HsaRuntime() {
+    if (shared_signal_ready_ && signal_destroy_ != nullptr) {
+      signal_destroy_(shared_signal_);
+    }
     if (lib_ != nullptr) dlclose(lib_);
   }
   HsaRuntime(const HsaRuntime&) = delete;
@@ -185,7 +189,8 @@ class HsaRuntime {
 
   [[nodiscard]] bool can_dma() const noexcept {
     return async_copy_ != nullptr && signal_create_ != nullptr &&
-           signal_destroy_ != nullptr && signal_wait_ != nullptr;
+           signal_destroy_ != nullptr && signal_wait_ != nullptr &&
+           signal_store_ != nullptr;
   }
 
   // One DMA, waited on. This is the copy engine: the blit kernels the HAL uses
@@ -194,18 +199,26 @@ class HsaRuntime {
   [[nodiscard]] bool dma_copy(void* dst, HsaAgent dst_agent, const void* src,
                               HsaAgent src_agent, std::size_t bytes) const noexcept {
     if (!can_dma()) return false;
-    HsaSignal signal{};
-    if (signal_create_(1, 0, nullptr, &signal) != kHsaSuccess) return false;
+    if (!shared_signal_ready_) {
+      if (signal_create_(1, 0, nullptr, &shared_signal_) != kHsaSuccess) {
+        return false;
+      }
+      shared_signal_ready_ = true;
+    } else {
+      // Arm the signal again rather than making a new one.
+      signal_store_(shared_signal_, 1);
+    }
     const bool issued =
         async_copy_(dst, dst_agent, src, src_agent, bytes, 0, nullptr,
-                    signal) == kHsaSuccess;
+                    shared_signal_) == kHsaSuccess;
     if (issued) {
-      // Blocking acquire on the completion signal reaching zero.
+      // Spin rather than sleep: these completions are tens of microseconds and
+      // an interrupt round trip is the same order as the transfer.
       constexpr int kConditionLt = 2;
-      constexpr int kWaitBlocked = 1;
-      (void)signal_wait_(signal, kConditionLt, 1, UINT64_MAX, kWaitBlocked);
+      constexpr int kWaitActive = 1;
+      (void)signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
+                         kWaitActive);
     }
-    signal_destroy_(signal);
     return issued;
   }
 
@@ -319,6 +332,7 @@ class HsaRuntime {
   using SignalCreateFn = HsaStatus (*)(std::int64_t, std::uint32_t,
                                        const HsaAgent*, HsaSignal*);
   using SignalDestroyFn = HsaStatus (*)(HsaSignal);
+  using SignalStoreFn = void (*)(HsaSignal, std::int64_t);
   using SignalWaitFn = std::int64_t (*)(HsaSignal, int, std::int64_t,
                                         std::uint64_t, int);
 
@@ -334,6 +348,12 @@ class HsaRuntime {
   UnlockFn unlock_ = nullptr;
   SignalCreateFn signal_create_ = nullptr;
   SignalDestroyFn signal_destroy_ = nullptr;
+  SignalStoreFn signal_store_ = nullptr;
+  // One completion signal, reused. Creating one is a driver object and costs
+  // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
+  // per copy, so a model load pays it per tensor.
+  mutable HsaSignal shared_signal_{};
+  mutable bool shared_signal_ready_ = false;
   SignalWaitFn signal_wait_ = nullptr;
 };
 
