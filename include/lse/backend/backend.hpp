@@ -602,6 +602,27 @@ class Backend {
     return derived().copy_d2h_impl(src, dst, bytes, src_offset);
   }
 
+  // One device's memory to another's, without the bytes touching host memory.
+  //
+  // Issued on this backend, which is the destination's; `src` belongs to the
+  // peer. Whether the peer's memory is reachable is settled when it is
+  // allocated -- a device pool is DISALLOWED_BY_DEFAULT until somebody grants
+  // access -- so a backend that cannot reach it says so here rather than
+  // bouncing through the host quietly, which is a thousandfold difference
+  // nobody would see in a result.
+  Status copy_peer(const DeviceBuffer& src, DeviceBuffer& dst,
+                   std::size_t bytes, std::size_t src_offset = 0,
+                   std::size_t dst_offset = 0) {
+    if constexpr (requires(Derived& d) {
+                    d.copy_peer_impl(src, dst, bytes, src_offset, dst_offset);
+                  }) {
+      return derived().copy_peer_impl(src, dst, bytes, src_offset, dst_offset);
+    } else {
+      return LSE_ERROR(kUnimplemented, "backend '", std::string(Derived::kName),
+                       "' has no device-to-device copy");
+    }
+  }
+
   Result<KernelHandle> load_executable(std::string_view name,
                                        std::span<const std::byte> code_object) {
     return derived().load_executable_impl(name, code_object);
@@ -796,6 +817,14 @@ class IBackend {
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,
                           std::size_t src_offset) = 0;
+  // Not pure: a backend with no peer of its own is the common case, and the
+  // caller's answer to "can these two talk directly" is this declining.
+  virtual Status copy_peer(const DeviceBuffer& src, DeviceBuffer& dst,
+                           std::size_t bytes, std::size_t src_offset,
+                           std::size_t dst_offset) {
+    (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
+    return LSE_ERROR(kUnimplemented, "this backend has no peer copy");
+  }
   virtual Result<KernelHandle> load_executable(
       std::string_view name, std::span<const std::byte> code_object) = 0;
   virtual Status launch(const KernelHandle& kernel, const LaunchDims& dims,
@@ -902,6 +931,10 @@ class BackendAdapter final : public IBackend {
   Status copy_d2h(const DeviceBuffer& s, void* d, std::size_t n,
                   std::size_t off) override {
     return impl_.copy_d2h(s, d, n, off);
+  }
+  Status copy_peer(const DeviceBuffer& s, DeviceBuffer& d, std::size_t n,
+                   std::size_t soff, std::size_t doff) override {
+    return impl_.copy_peer(s, d, n, soff, doff);
   }
   Result<KernelHandle> load_executable(
       std::string_view n, std::span<const std::byte> code) override {

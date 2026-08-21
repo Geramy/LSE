@@ -108,6 +108,8 @@ class HsaRuntime {
         dlsym(lib_, "hsa_amd_memory_pool_get_info"));
     agent_pool_info_ = reinterpret_cast<AgentPoolInfoFn>(
         dlsym(lib_, "hsa_amd_agent_memory_pool_get_info"));
+    allow_access_ = reinterpret_cast<AllowAccessFn>(
+        dlsym(lib_, "hsa_amd_agents_allow_access"));
   }
   ~HsaRuntime() {
     if (lib_ != nullptr) dlclose(lib_);
@@ -121,6 +123,26 @@ class HsaRuntime {
 
   [[nodiscard]] bool attribute(HsaAgent agent, int attr, void* out) const noexcept {
     return reachable() && get_info_(agent, attr, out) == kHsaSuccess;
+  }
+
+  // Hand every GPU on the box access to one allocation.
+  //
+  // A device pool answers DISALLOWED_BY_DEFAULT -- kOnRequest -- which the
+  // probe reports faithfully and nothing ever acted on, so a peer read fell
+  // back to a bounce through host memory: measured on this box at 0.71 GB/s
+  // against about a thousand local. The grant is per allocation and there is
+  // no way to ask for it once, which is why it lives on the allocation path.
+  //
+  // Granting to every GPU rather than to a pool's members keeps this from
+  // depending on a device set that does not exist yet when a buffer is made.
+  // An agent that never touches the buffer costs a page table entry.
+  [[nodiscard]] bool allow_peers(const std::vector<HsaAgent>& agents,
+                                 void* ptr) const noexcept {
+    if (allow_access_ == nullptr || ptr == nullptr || agents.size() < 2) {
+      return false;
+    }
+    return allow_access_(static_cast<std::uint32_t>(agents.size()),
+                         agents.data(), nullptr, ptr) == kHsaSuccess;
   }
 
   // GPU agents only, in hsa_iterate_agents order. The CPU and any accelerator
@@ -209,6 +231,8 @@ class HsaRuntime {
                                        HsaStatus (*)(HsaPool, void*), void*);
   using PoolInfoFn = HsaStatus (*)(HsaPool, int, void*);
   using AgentPoolInfoFn = HsaStatus (*)(HsaAgent, HsaPool, int, void*);
+  using AllowAccessFn = HsaStatus (*)(std::uint32_t, const HsaAgent*,
+                                      const std::uint32_t*, const void*);
 
   void* lib_ = nullptr;
   IterateFn iterate_ = nullptr;
@@ -216,7 +240,22 @@ class HsaRuntime {
   IteratePoolsFn iterate_pools_ = nullptr;
   PoolInfoFn pool_info_ = nullptr;
   AgentPoolInfoFn agent_pool_info_ = nullptr;
+  AllowAccessFn allow_access_ = nullptr;
 };
+
+// The runtime and its GPU agents, resolved once. Every device allocation grants
+// its memory to the peers, and neither the runtime handle nor the agent list
+// changes after the process starts, so paying dlopen and an agent walk per
+// buffer would be waste.
+const HsaRuntime& shared_hsa() noexcept {
+  static const HsaRuntime hsa;
+  return hsa;
+}
+
+const std::vector<HsaAgent>& peer_agents() noexcept {
+  static const std::vector<HsaAgent> agents = shared_hsa().gpu_agents();
+  return agents;
+}
 
 // One attribute of the `ordinal`-th GPU agent. False when the runtime is not
 // reachable, the index is past the agents it lists, or the agent will not
@@ -944,6 +983,17 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
   const auto handle = reinterpret_cast<std::uint64_t>(buffer);
   out.size_bytes = bytes;
 
+  // Device-local memory is granted to the other GPUs now, while the pointer is
+  // in hand. Without it a peer read is not refused, it is quietly serviced
+  // through host memory, and the only sign is a transfer rate three orders
+  // below the local one.
+  if (!staging) {
+    void* device_ptr = nullptr;
+    if (hrx_status_is_ok(hrx_buffer_get_device_ptr(buffer, &device_ptr))) {
+      (void)shared_hsa().allow_peers(peer_agents(), device_ptr);
+    }
+  }
+
   // A staging buffer stays mapped for its whole lifetime; a device-local one
   // has no host address at all, and reaching it means copy_h2d/copy_d2h.
   if (staging) {
@@ -1082,6 +1132,51 @@ Result<DeviceTimestamp> HrxBackend::sample_device_time_impl() const {
 #endif
 }
 
+// Grows the transfer staging buffer to at least `bytes`, in powers of two so a
+// run of increasing transfers reallocates a handful of times rather than every
+// call.
+Status HrxBackend::ensure_staging(std::size_t bytes) {
+#if !LSE_HRX_LINKED
+  (void)bytes;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (staging_bytes_ >= bytes && staging_buffer_ != nullptr) return OkStatus();
+  std::size_t want = staging_bytes_ != 0 ? staging_bytes_ : (1u << 20);
+  while (want < bytes) want *= 2;
+
+  hrx_buffer_params_t params = {};
+  params.type = HRX_MEMORY_TYPE_HOST_VISIBLE | HRX_MEMORY_TYPE_HOST_COHERENT |
+                HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+  params.access = HRX_MEMORY_ACCESS_ALL;
+  params.usage = HRX_BUFFER_USAGE_TRANSFER | HRX_BUFFER_USAGE_MAPPING_SCOPED |
+                 HRX_BUFFER_USAGE_MAPPING_PERSISTENT;
+  params.queue_affinity = 0;
+  hrx_buffer_t fresh = nullptr;
+  LSE_RETURN_IF_ERROR(
+      from_hrx(hrx_allocator_allocate_buffer(
+                   static_cast<hrx_allocator_t>(allocator_), params, want,
+                   &fresh),
+               "hrx_allocator_allocate_buffer (staging)"));
+  void* mapped = nullptr;
+  const Status mapped_ok = from_hrx(
+      hrx_buffer_map(fresh, HRX_MAP_READ | HRX_MAP_WRITE, 0, want,
+                     &mapped),
+      "hrx_buffer_map (staging)");
+  if (!mapped_ok.ok() || mapped == nullptr) {
+    hrx_buffer_release(fresh);
+    return mapped_ok.ok() ? LSE_ERROR(kInternal, "staging buffer did not map")
+                          : mapped_ok;
+  }
+  if (staging_buffer_ != nullptr) {
+    hrx_buffer_release(static_cast<hrx_buffer_t>(staging_buffer_));
+  }
+  staging_buffer_ = fresh;
+  staging_host_ = mapped;
+  staging_bytes_ = want;
+  return OkStatus();
+#endif
+}
+
 Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
                                  std::size_t bytes, std::size_t dst_offset) {
 #if !LSE_HRX_LINKED
@@ -1101,10 +1196,97 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   // still hold on this buffer. With one stream that race was invisible; with
   // two it is not, and it is the same race either way.
   LSE_RETURN_IF_ERROR(synchronize_impl());
-  return from_hrx(hrx_synchronous_h2d(static_cast<hrx_device_t>(device_), src,
-                                      reinterpret_cast<hrx_buffer_t>(dst.handle),
-                                      dst.offset + dst_offset, bytes),
-                  "hrx_synchronous_h2d");
+  // On the stream, not through hrx_synchronous_*. The blocking form moves the
+  // bytes with the CPU across the PCIe aperture: measured on gfx1201 at
+  // 0.64 GB/s for the part of the cost that scales with size, against 48 GB/s
+  // for the same link when the copy engine does it. The stream form enqueues
+  // the transfer for the device, which is what makes it a DMA rather than a
+  // memcpy through a window.
+  // Two halves, both fast: a host memcpy into memory the device already owns,
+  // then the copy engine. IREE's helper would allocate a staging buffer for
+  // this transfer and free it again, which is where the time went.
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  constexpr std::size_t kChunk = 32u << 20;
+  const auto* in = static_cast<const std::byte*>(src);
+  for (std::size_t done = 0; done < bytes;) {
+    const std::size_t n = std::min(kChunk, bytes - done);
+    LSE_RETURN_IF_ERROR(ensure_staging(n));
+    std::memcpy(staging_host_, in + done, n);
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                               static_cast<hrx_buffer_t>(staging_buffer_), 0,
+                               reinterpret_cast<hrx_buffer_t>(dst.handle),
+                               dst.offset + dst_offset + done, n),
+        "hrx_stream_copy_buffer (h2d)"));
+    unflushed_launches_[0] = 0;
+    LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{0}));
+    done += n;
+  }
+  return OkStatus();
+#endif
+}
+
+Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                                  std::size_t bytes, std::size_t src_offset,
+                                  std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (src.handle == 0 || dst.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer in copy_peer");
+  }
+  if (src_offset + bytes > src.size_bytes ||
+      dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "copy_peer runs past the end of a buffer");
+  }
+  if (bytes == 0) return OkStatus();
+
+  // The peer's memory has to become something this device owns before its
+  // queue will touch it. Handing a queue the other device's buffer object
+  // instead does not fail -- it faults the GPU and takes the process with it.
+  //
+  // Two steps and either may decline; a decline is the answer "these two
+  // cannot talk directly", which the caller turns into a bounce through host
+  // memory. Nothing here is allowed to be fatal.
+  void* peer_ptr = nullptr;
+  if (!hrx_status_is_ok(hrx_buffer_get_device_ptr(
+          reinterpret_cast<hrx_buffer_t>(src.handle), &peer_ptr)) ||
+      peer_ptr == nullptr) {
+    return LSE_ERROR(kUnimplemented, "the peer buffer has no device address");
+  }
+
+  hrx_buffer_params_t params = {};
+  params.type = HRX_MEMORY_TYPE_DEVICE_LOCAL;
+  params.access = HRX_MEMORY_ACCESS_ALL;
+  params.usage = HRX_BUFFER_USAGE_TRANSFER;
+  params.queue_affinity = 0;
+  hrx_buffer_t imported = nullptr;
+  auto* base = static_cast<std::byte*>(peer_ptr) + src.offset + src_offset;
+  if (!hrx_status_is_ok(hrx_allocator_import_buffer(
+          static_cast<hrx_allocator_t>(allocator_), params, base, bytes,
+          &imported)) ||
+      imported == nullptr) {
+    return LSE_ERROR(kUnimplemented,
+                     "this device cannot map the peer's memory");
+  }
+
+  auto stream = stream_at(0);
+  if (!stream.ok()) {
+    hrx_buffer_release(imported);
+    return stream.status();
+  }
+  const Status moved =
+      from_hrx(hrx_stream_copy_buffer(
+                   static_cast<hrx_stream_t>(*stream), imported, 0,
+                   reinterpret_cast<hrx_buffer_t>(dst.handle),
+                   dst.offset + dst_offset, bytes),
+               "hrx_stream_copy_buffer (peer)");
+  unflushed_launches_[0] = 0;
+  const Status drained = moved.ok() ? synchronize_stream_impl(Stream{0}) : moved;
+  hrx_buffer_release(imported);
+  return drained;
 #endif
 }
 
@@ -1123,10 +1305,26 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
   LSE_RETURN_IF_ERROR(synchronize_impl());
-  return from_hrx(hrx_synchronous_d2h(static_cast<hrx_device_t>(device_),
-                                      reinterpret_cast<hrx_buffer_t>(src.handle),
-                                      src.offset + src_offset, dst, bytes),
-                  "hrx_synchronous_d2h");
+  // The mirror of copy_h2d: the copy engine into staging, then a host memcpy.
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  constexpr std::size_t kChunk = 32u << 20;
+  auto* out = static_cast<std::byte*>(dst);
+  for (std::size_t done = 0; done < bytes;) {
+    const std::size_t n = std::min(kChunk, bytes - done);
+    LSE_RETURN_IF_ERROR(ensure_staging(n));
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                               reinterpret_cast<hrx_buffer_t>(src.handle),
+                               src.offset + src_offset + done,
+                               static_cast<hrx_buffer_t>(staging_buffer_), 0, n),
+        "hrx_stream_copy_buffer (d2h)"));
+    unflushed_launches_[0] = 0;
+    LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{0}));
+    std::memcpy(out + done, staging_host_, n);
+    done += n;
+  }
+  return OkStatus();
 #endif
 }
 

@@ -55,6 +55,12 @@ class HrxBackend : public Backend<HrxBackend> {
 
   Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
                        std::size_t dst_offset);
+  // Peer to this device, no host bounce. Declines when the runtime refuses the
+  // copy, which is what it does when the source's memory was never granted to
+  // this agent.
+  Status copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                        std::size_t bytes, std::size_t src_offset,
+                        std::size_t dst_offset);
   Status copy_d2h_impl(const DeviceBuffer& src, void* dst, std::size_t bytes,
                        std::size_t src_offset);
 
@@ -113,6 +119,17 @@ class HrxBackend : public Backend<HrxBackend> {
   // filled on first use — an unused stream costs nothing, so the count can be
   // the device's ceiling rather than a guess at what the scheduler will want.
   std::vector<void*> streams_;
+  // A staging buffer kept for the life of the backend, grown as needed.
+  //
+  // IREE's transfer helper allocates one of these per call for anything over
+  // 64 KB and frees it again, which costs more than the transfer: measured at
+  // 4 MB, that path runs about 1.3 GB/s where the copy engine does 42. Holding
+  // one and driving the two halves -- a host memcpy and a queued copy -- keeps
+  // the DMA and drops the allocation.
+  void* staging_buffer_ = nullptr;  // hrx_buffer_t
+  void* staging_host_ = nullptr;    // mapped host address of the above
+  std::size_t staging_bytes_ = 0;
+  Status ensure_staging(std::size_t bytes);
   // Queue affinity bit per stream. hrx_stream_dispatch submits its command
   // buffer with IREE_HAL_QUEUE_AFFINITY_ANY, which this HAL resolves by
   // first-set-bit to logical queue 0, so a batched stream cannot name a queue;

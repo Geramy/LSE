@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -304,7 +305,37 @@ Result<std::vector<LinkProfile>> probe_local_links(
 
   const std::size_t widest =
       *std::max_element(cfg.sizes.begin(), cfg.sizes.end());
-  std::vector<std::byte> host(widest, std::byte{0x5A});
+  // The bounce goes through memory the device can reach, not through whatever
+  // the allocator hands back. A plain vector is pageable, and a transfer out
+  // of pageable memory is copied into a driver-owned staging buffer first --
+  // which is what made a bounce across PCIe 5.0 x16 measure 0.71 GB/s, two
+  // orders under the bus, and made the link look like the problem when the
+  // host buffer was.
+  std::vector<std::byte> paged;
+  void* host_ptr = nullptr;
+  backend::DeviceBuffer pinned;
+  bool have_pinned = false;
+  if (members[0].backend != nullptr) {
+    auto staged =
+        members[0].backend->allocate(widest, backend::MemoryClass::kStaging);
+    if (staged.ok()) {
+      pinned = staged.release();
+      if (pinned.ptr != nullptr) {
+        host_ptr = pinned.ptr;
+        have_pinned = true;
+      }
+    }
+  }
+  if (!have_pinned) {
+    paged.assign(widest, std::byte{0x5A});
+    host_ptr = paged.data();
+  }
+  struct PinnedGuard {
+    backend::IBackend* be;
+    backend::DeviceBuffer* buf;
+    bool live;
+    ~PinnedGuard() { if (live && be != nullptr) be->deallocate(*buf); }
+  } pinned_guard{members[0].backend, &pinned, have_pinned};
 
   for (std::size_t i = 0; i < n; ++i) {
     if (members[i].backend == nullptr) continue;
@@ -334,9 +365,9 @@ Result<std::vector<LinkProfile>> probe_local_links(
         double best = 0.0;
         for (int r = 0; r < reps && failed.ok(); ++r) {
           const auto t0 = Clock::now();
-          failed = src_be.copy_d2h(src_buf, host.data(), bytes, 0);
+          failed = src_be.copy_d2h(src_buf, host_ptr, bytes, 0);
           if (failed.ok()) {
-            failed = dst_be.copy_h2d(host.data(), dst_buf, bytes, 0);
+            failed = dst_be.copy_h2d(host_ptr, dst_buf, bytes, 0);
           }
           const double one = ns_since(t0);
           if (best == 0.0 || one < best) best = one;
@@ -350,6 +381,11 @@ Result<std::vector<LinkProfile>> probe_local_links(
         return failed;
       }
       fit_link(l);
+      for (const TransferPoint& pt : l.points) {
+        std::fprintf(stderr, "[LINKPT] %zu -> %zu  %8zu B  %9.1f us  %6.2f GB/s\n",
+                     i, j, pt.bytes, pt.ns / 1e3,
+                     pt.bytes / 1e9 / (pt.ns / 1e9));
+      }
     }
     src_be.deallocate(src_buf);
   }
