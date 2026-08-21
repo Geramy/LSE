@@ -32,17 +32,22 @@ tar -xzf lse-<tag>-linux-x86_64.tar.gz
 cd lse-<tag>-linux-x86_64
 ```
 
-The binary loads the ROCm and HRX runtimes at start-up, so both have to be on
-the library path:
+The binary finds the ROCm runtime itself, searching `$ROCM_PATH`, `/opt/rocm`
+and the versioned installs beside it and taking the first that carries the
+symbols the backend needs. A machine with a distro ROCm sitting beside a newer
+one needs nothing exported:
 
 ```bash
-export LD_LIBRARY_PATH=/opt/rocm/lib:/path/to/hrx-install/lib:$LD_LIBRARY_PATH
 ./lse --devices        # what this build can see, and what it will not answer
 ```
 
-`--devices` is the first thing to run: if it reports no HRX device, the library
-path is wrong and the engine will fall back to the CPU backend, which runs the
-same models far slower rather than failing.
+Set `$ROCM_PATH` if the install is somewhere else. `LD_LIBRARY_PATH` still wins
+where it is set, which is what you want when pinning a particular runtime.
+
+`--devices` is the first thing to run. If it reports no HRX device the engine
+falls back to the CPU backend, which runs the same models far slower rather
+than failing, and it will name the backend that declined and why -- a missing
+runtime symbol reads very differently from a machine with no GPU in it.
 
 ## Run
 
@@ -202,14 +207,18 @@ cmake -S . -B build -GNinja -DCMAKE_CXX_COMPILER=g++-16 \
       -DLSE_HRX_ROOT=/path/to/hrx-install
 ```
 
-The HRX runtime is loaded at run time, so its libraries have to be findable:
+The build records where `hrx-install` was, so its libraries are found without
+help; the ROCm runtime is searched for at start-up. Point `$ROCM_PATH` at a
+ROCm the search would not find, or set `LD_LIBRARY_PATH` to pin a particular
+one:
 
 ```bash
-export LD_LIBRARY_PATH=/opt/rocm/lib:/path/to/hrx-install/lib:$LD_LIBRARY_PATH
+export ROCM_PATH=/opt/rocm-7.2.1
 ```
 
-Without it the HRX backend fails to initialize and the engine falls back to the
-CPU backend, which runs the same models roughly two hundred times slower.
+If the HRX backend cannot initialize the engine falls back to the CPU backend,
+which runs the same models roughly two hundred times slower. It says so on the
+way past, with the reason the backend gave.
 
 ### Options
 

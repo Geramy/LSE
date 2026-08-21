@@ -336,6 +336,11 @@ void preload_gpu_runtime() {
   if (const char* env = std::getenv("ROCM_PATH"); env != nullptr && *env != 0) {
     roots.emplace_back(env);
   }
+#ifdef LSE_CONFIGURED_ROCM_PATH
+  // Where this build was configured to find ROCm. A machine that needed
+  // -DLSE_ROCM_PATH to compile needs the same answer to run.
+  roots.emplace_back(LSE_CONFIGURED_ROCM_PATH);
+#endif
   roots.emplace_back("/opt/rocm");
   // A versioned or componentised install beside the unversioned link, newest
   // first so a machine carrying several picks the one most likely to have the

@@ -325,6 +325,10 @@ add_library(lse_place
 add_library(lse::place ALIAS lse_place)
 target_link_libraries(lse_place PUBLIC lse_core lse_probe lse_graph
                                        lse_backend_registry)
+# The ROCm this was configured against, so a build pointed at a non-default one
+# still finds its runtime when nobody exported anything.
+target_compile_definitions(lse_place PRIVATE
+  LSE_CONFIGURED_ROCM_PATH="${LSE_ROCM_PATH}")
 # The set registers itself as graph's device-set factory from a TU with no
 # referenced symbols, the same way transports and backends register.
 target_link_options(lse_place INTERFACE
