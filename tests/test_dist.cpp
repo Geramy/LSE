@@ -20,6 +20,7 @@
 #include "lse/dist/collective.hpp"
 #include "lse/dist/collectives.hpp"
 #include "lse/dist/loopback.hpp"
+#include "lse/dist/peer.hpp"
 #include "lse/dist/quick_reduce.hpp"
 #include "lse/dist/transport.hpp"
 #include "lse/quant/block_codec.hpp"
@@ -225,6 +226,102 @@ LSE_TEST(codec_round_trip_holds_against_a_double_reference) {
 // ---------------------------------------------------------------------------
 // Device codec
 // ---------------------------------------------------------------------------
+
+// Two live devices and a set over them. Built here rather than taken from a
+// scheduler because this file sits below the layer that opens pools, and
+// because a peer transport has to be exercised on real separate devices --
+// two ranks on one device would pass without ever crossing a link.
+struct TwoDevices : backend::IDeviceSet {
+  std::vector<std::unique_ptr<backend::IBackend>> owned;
+
+  std::size_t size() const noexcept override { return owned.size(); }
+  backend::IBackend& device(std::size_t i) const override { return *owned[i]; }
+  std::size_t primary() const noexcept override { return 0; }
+  std::size_t member_of(backend::DeviceIndex d) const noexcept override {
+    for (std::size_t i = 0; i < owned.size(); ++i) {
+      if (owned[i]->device_index() == d) return i;
+    }
+    return owned.size();
+  }
+  Status may_read(backend::DeviceIndex held, std::size_t) const override {
+    if (!held.bound() || member_of(held) < owned.size()) return OkStatus();
+    return LSE_ERROR(kInvalidArgument, "residency outside this set");
+  }
+};
+
+TwoDevices* two_devices() {
+  static TwoDevices set = [] {
+    TwoDevices s;
+    for (int i = 0; i < 2; ++i) {
+      auto b = backend::create_backend("hrx");
+      if (!b.ok()) return TwoDevices{};
+      auto owned = b.release();
+      if (!owned->init(i).ok()) return TwoDevices{};
+      s.owned.push_back(std::move(owned));
+    }
+    return s;
+  }();
+  return set.owned.size() == 2 ? &set : nullptr;
+}
+
+LSE_TEST(peer_transport_moves_device_memory_between_two_gpus) {
+  TwoDevices* set = two_devices();
+  if (set == nullptr) {
+    std::printf("       skipped: fewer than two live devices\n");
+    return;
+  }
+  constexpr std::size_t kN = 32 * 512;
+  constexpr std::size_t kBytes = kN * sizeof(float);
+  const std::vector<float> src = make_signal(kN, 7);
+
+  auto a = set->device(0).allocate(kBytes, backend::MemoryClass::kDevice);
+  auto b = set->device(1).allocate(kBytes, backend::MemoryClass::kDevice);
+  LSE_EXPECT(a.ok() && b.ok());
+  if (!a.ok() || !b.ok()) return;
+  backend::DeviceBuffer from = a.release();
+  backend::DeviceBuffer to = b.release();
+  LSE_EXPECT_OK(set->device(0).copy_h2d(src.data(), from, kBytes, 0));
+
+  PeerTransport t0, t1;
+  t0.bind(*set, 0);
+  t1.bind(*set, 1);
+  TransportConfig c0;
+  c0.rank = 0;
+  c0.world_size = 2;
+  c0.group_id = "peer-move";
+  TransportConfig c1 = c0;
+  c1.rank = 1;
+  LSE_EXPECT_OK(t0.connect(c0));
+  LSE_EXPECT_OK(t1.connect(c1));
+
+  // The link the transport measured, not one anybody declared. A pool that
+  // reached peer-direct reports tens of GB/s here; one that fell back to host
+  // staging reports an order of magnitude less, and the collective selector
+  // reads exactly this number.
+  std::printf("       peer link: %.1f GB/s, %llu ns latency\n",
+              static_cast<double>(t0.capabilities().bandwidth_bytes_per_s) / 1e9,
+              static_cast<unsigned long long>(t0.capabilities().latency_ns));
+  LSE_EXPECT(t0.capabilities().bandwidth_bytes_per_s > 1);
+
+  CommBuffer send{};
+  send.device = &from;
+  send.bytes = kBytes;
+  CommBuffer recv{};
+  recv.device = &to;
+  recv.bytes = kBytes;
+
+  std::thread sender([&] {
+    auto h = t0.send(send, 1, 0);
+    if (h.ok()) (void)t0.wait(h.release());
+  });
+  auto got = t1.recv(recv, 0, 0);
+  sender.join();
+  LSE_EXPECT_OK(got.status());
+
+  std::vector<float> back(kN, 0.0f);
+  LSE_EXPECT_OK(set->device(1).copy_d2h(to, back.data(), kBytes, 0));
+  LSE_EXPECT(std::memcmp(back.data(), src.data(), kBytes) == 0);
+}
 
 LSE_TEST(device_codec_is_bit_identical_to_the_host_codec) {
   backend::IBackend* be = device_backend();

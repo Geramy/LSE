@@ -130,6 +130,7 @@ lse_apply_common_flags(lse_opt)
 add_library(lse_dist
   src/dist/transport.cpp
   src/dist/loopback.cpp
+  src/dist/peer.cpp
   src/dist/codec.cpp
   src/dist/collective.cpp
 )
