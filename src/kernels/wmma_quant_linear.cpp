@@ -45,12 +45,14 @@ constexpr int kTileN = 16;
 constexpr int kTileK = 16;
 constexpr std::uint32_t kBlock = 256;
 
-// Row blocks a workgroup owns. More of them would let one unpacked weight
-// fragment feed several row blocks, which is the reuse this tile still wants.
-// Measured on gfx1151 it does not pay yet: at 401 prompt tokens 1 block is
-// 1.65 s, 2 is 1.65 s and 4 is 1.81 s, because the extra accumulators push the
-// kernel to 256 VGPRs and it spills. Raise this only together with whatever
-// buys the registers back.
+// Row blocks a workgroup owns. More of them let one unpacked weight fragment
+// feed several row blocks, and the registers are now there to afford it -- but
+// it still does not pay, because the traffic it saves is not traffic anyone
+// waits on: at 1601 prompt tokens a 1024x1024 plane is re-read about a hundred
+// times, which is 5 GB a prefill, ~21 ms against 10.4 s, and it is resident in
+// the 32 MB MALL anyway. What blocking does cost is LDS -- 5.8 KB per
+// workgroup at 1, 11.5 KB at 2, 23 KB at 4 -- and that occupancy is real:
+// measured 10.37 s, 10.50 s, 10.62 s at 1601 tokens. Stay at one.
 constexpr std::uint32_t kRowBlocks = 1u;
 constexpr std::uint32_t kRowsPerGroup = kTileM * kRowBlocks;
 
@@ -159,8 +161,17 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // tile, which is what made the correct kernel three hundred times slower
   // than the loop it replaces.
   const auto xq = e.lds<kir::u32>(kRowsPerGroup * words);
-  const auto xs = e.lds<kir::f32>(kRowsPerGroup * round_slices);
-  const auto xsum = e.lds<kir::f32>(kRowsPerGroup * round_slices);
+  // The raw activations of the round, kept so the quantize pass can revisit
+  // them once the group's amax is known without loading them from memory a
+  // second time.
+  const auto xraw = e.lds<kir::f32>(kRowsPerGroup * round_slices *
+                                    static_cast<std::uint32_t>(kTileK));
+  const auto xamax = e.lds<kir::f32>(kRowsPerGroup * round_slices);
+  const auto xssum = e.lds<kir::f32>(kRowsPerGroup * round_slices);
+  // Per group, not per slice: one step for the whole group is what lets a
+  // single accumulator span every slice in it.
+  const auto xstep = e.lds<kir::f32>(kRowsPerGroup * round_groups);
+  const auto xtot = e.lds<kir::f32>(kRowsPerGroup * round_groups);
 
   const auto lid = e.let(math::local_id());
   const auto wave_id = e.let(lid / 32u);
@@ -179,53 +190,48 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   out.reserve(kRowBlocks * 8u);
   for (std::uint32_t i = 0; i < kRowBlocks * 8u; ++i) out.push_back(e.var(0.0f));
 
-  // Where each row block's accumulator slot reads its step and lands its
-  // result. Neither depends on the group, so both are formed once here: left
-  // inside the loop they are loop invariant, and cse hoists them above the
-  // definitions they are built from, which is the body the verifier rejects.
-  // One base per row block, not one per accumulator slot: the slot's own
-  // offset is a constant, so folding it in at the use costs an add the
-  // scheduler hides, where hoisting all of them costs a live register each and
-  // spills the whole tile to scratch.
-  std::vector<kir::Val<kir::u32>> slot_step;
+  // One base per row block: the accumulator slot's own offset is a constant,
+  // so folding it in at the use costs an add the scheduler hides, where
+  // hoisting all of them costs a live register each.
+  std::vector<kir::Val<kir::u32>> slot_g;
   std::vector<kir::Val<kir::u32>> slot_out;
   std::vector<kir::Val<kir::u32>> lane_words;
-  slot_step.reserve(kRowBlocks);
+  slot_g.reserve(kRowBlocks);
   slot_out.reserve(kRowBlocks);
   lane_words.reserve(kRowBlocks);
   for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
     const std::uint32_t rb = i * static_cast<std::uint32_t>(kTileM);
     lane_words.push_back(e.let((lane_lo + rb) * words));
-    slot_step.push_back(e.let((rb + lane_hi) * round_slices));
+    slot_g.push_back(e.let((rb + lane_hi) * round_groups));
     slot_out.push_back(e.let(m0 + rb + lane_hi));
   }
   const auto col_scales = e.let(bcol * groups);
 
-  // Staging is one thread per (row, slice). There are more of those than there
-  // are threads once a workgroup owns several row blocks, so each thread takes
-  // a fixed stride of them.
   const std::uint32_t items = kRowsPerGroup * round_slices;
   const std::uint32_t chunks = (items + kBlock - 1u) / kBlock;
   std::vector<kir::Val<kir::u32>> st_t, st_row, st_xbase, st_qbase, st_sbase;
+  std::vector<kir::Val<kir::u32>> st_slice0, st_gbase, st_rawbase;
   std::vector<kir::Val<kir::boolean>> st_in;
   for (std::uint32_t c = 0; c < chunks; ++c) {
     const auto si = e.let(lid + c * kBlock);
     const auto sr = e.let(si / round_slices);
-    st_t.push_back(e.let(si % round_slices));
+    const auto stt = e.let(si % round_slices);
+    const auto gl = e.let(stt / slices);
+    st_t.push_back(stt);
     st_row.push_back(e.let(m0 + sr));
     st_xbase.push_back(e.let(st_row[c] * k));
-    st_qbase.push_back(e.let(sr * words + st_t[c] * 4u));
-    st_sbase.push_back(e.let(sr * round_slices + st_t[c]));
+    st_qbase.push_back(e.let(sr * words + stt * 4u));
+    st_sbase.push_back(e.let(sr * round_slices + stt));
+    st_slice0.push_back(e.let(sr * round_slices + gl * slices));
+    st_gbase.push_back(e.let(sr * round_groups + gl));
+    st_rawbase.push_back(
+        e.let(st_sbase[c] * static_cast<std::uint32_t>(kTileK)));
     st_in.push_back(e.let(si < items));
   }
 
   for (auto rnd : e.range(0u, groups / round_groups, 1u)) {
     for (std::uint32_t c = 0; c < chunks; ++c) {
       if (auto stager = e.when(st_in[c])) {
-        // Everything that reads the loaded values lives where they are
-        // defined. A value produced inside this guard and used after it is a
-        // body the verifier rejects, and the first pass to run is the one that
-        // reports it, which is why this looked like a cse bug.
         if (auto in_rows = e.when(st_row[c] < m)) {
           const auto base = e.let(st_xbase[c] +
                                   (rnd * (gsize * round_groups) +
@@ -245,38 +251,69 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
             amax = e.let(math::max(amax, math::abs(v[j])));
             total = e.let(total + v[j]);
           }
-          xs[st_sbase[c]] = amax * (1.0f / 127.0f);
-          xsum[st_sbase[c]] = total;
-          const auto inv = e.let(127.0f / math::max(amax, e.f32(kAmaxFloor)));
-          for (std::uint32_t w = 0; w < 4u; ++w) {
-            auto word = e.let(e.u32(0));
-            for (std::uint32_t b = 0; b < 4u; ++b) {
-              const auto code = e.let(math::rint(v[w * 4u + b] * inv));
-              const auto byte =
-                  e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
-              word = e.let(word + byte * (1u << (8 * b)));
-            }
-            xq[e.let(st_qbase[c] + w)] = word;
+          for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(kTileK); ++j) {
+            xraw[e.let(st_rawbase[c] + j)] = v[j];
           }
+          xamax[st_sbase[c]] = amax;
+          xssum[st_sbase[c]] = total;
         } else {
-          // A row past the end still publishes a step and a sum, or the lanes
-          // that read them take whatever the previous round left behind.
-          xs[st_sbase[c]] = e.f32(0.0f);
-          xsum[st_sbase[c]] = e.f32(0.0f);
-          for (std::uint32_t w = 0; w < 4u; ++w) {
-            xq[e.let(st_qbase[c] + w)] = e.u32(0);
+          // A row past the end still publishes an amax and a sum, or the group
+          // reduction below takes whatever the previous round left behind.
+          xamax[st_sbase[c]] = e.f32(0.0f);
+          xssum[st_sbase[c]] = e.f32(0.0f);
+          for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(kTileK); ++j) {
+            xraw[e.let(st_rawbase[c] + j)] = e.f32(0.0f);
           }
         }
       }
     }
     e.barrier();
 
-    // One staged round holds several groups, and each keeps its own scales.
+    // The group's own step, reduced from the slice amaxes the pass above left.
+    // Every slice of a group computes it and writes the same value, which is
+    // cheaper than electing one thread to.
+    for (std::uint32_t c = 0; c < chunks; ++c) {
+      if (auto stager = e.when(st_in[c])) {
+        auto gmax = e.let(xamax[st_slice0[c]].read());
+        auto gsum = e.let(xssum[st_slice0[c]].read());
+        for (std::uint32_t j = 1; j < slices; ++j) {
+          gmax = e.let(math::max(gmax, xamax[e.let(st_slice0[c] + j)].read()));
+          gsum = e.let(gsum + xssum[e.let(st_slice0[c] + j)].read());
+        }
+        xstep[st_gbase[c]] = gmax * (1.0f / 127.0f);
+        xtot[st_gbase[c]] = gsum;
+        const auto inv = e.let(127.0f / math::max(gmax, e.f32(kAmaxFloor)));
+        for (std::uint32_t w = 0; w < 4u; ++w) {
+          auto word = e.let(e.u32(0));
+          for (std::uint32_t b = 0; b < 4u; ++b) {
+            const auto raw = e.let(xraw[e.let(st_rawbase[c] + (w * 4u + b))].read());
+            const auto code = e.let(math::rint(raw * inv));
+            const auto byte =
+                e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
+            word = e.let(word + byte * (1u << (8 * b)));
+          }
+          xq[e.let(st_qbase[c] + w)] = word;
+        }
+      }
+    }
+    e.barrier();
+
     for (std::uint32_t gi = 0; gi < round_groups; ++gi) {
       const auto g = e.let(rnd * round_groups + gi);
       const auto at = e.let(col_scales + g);
       const auto gscale = e.let(math::widen(a.scales[at]));
       const auto gbias = e.let(math::widen(a.biases[at]));
+
+      // One accumulator per row block, spanning every slice of the group: the
+      // step is constant across it, so the integer sum can run to the end
+      // before anything is scaled.
+      std::vector<kir::Local<kir::i32, 8>> acc;
+      acc.reserve(kRowBlocks);
+      for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
+        acc.push_back(e.local<kir::i32, 8>());
+        for (auto z : e.unroll(8u)) acc[i][z] = kir::cast<kir::i32>(e.u32(0));
+      }
+
       for (std::uint32_t t = 0; t < slices; ++t) {
         const auto k0 =
             e.let(g * gsize + t * static_cast<std::uint32_t>(kTileK));
@@ -285,32 +322,29 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         if (auto gd = e.when(live && bcol < n)) {
           fill_weights(e, a, bcol, k0, lanes, d.spec.bits, bf);
         }
-        // The unpacked fragment now feeds every row block before it is
-        // discarded, which is the whole point of the blocking.
+        // The unpacked fragment feeds every row block before it is discarded,
+        // which is what the blocking buys.
         const std::uint32_t slot = gi * slices + t;
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
           const auto af = e.local<kir::u32, 4>();
           for (std::uint32_t c = 0; c < 4u; ++c) {
             af[c] = xq[e.let(lane_words[i] + (slot * 4u + c))].read();
           }
-          auto acc = e.local<kir::i32, 8>();
-          for (auto z : e.unroll(8u)) acc[z] = kir::cast<kir::i32>(e.u32(0));
           // One issue takes the whole K slice: the row declares A and B four
           // registers wide and chained=1, so a lane hands over its sixteen
           // contiguous K values at once.
-          acc = math::mma<MmaRdna3>(af.value(), bf.value(), acc.value());
-          // Drained here rather than carried per slice: the step is per slice,
-          // so folding it in now costs eight fma and saves an accumulator for
-          // every slice a group holds.
-          for (std::uint32_t z = 0; z < 8u; ++z) {
-            const auto at_s =
-                e.let(slot_step[i] + (z * 2u * round_slices + slot));
-            const auto term = e.let(gscale * xs[at_s].read());
-            out[i * 8u + z] =
-                math::fma(term, kir::cast<kir::f32>(acc[z].read()),
-                          out[i * 8u + z].read()) +
-                gbias * xsum[at_s].read();
-          }
+          acc[i] = math::mma<MmaRdna3>(af.value(), bf.value(), acc[i].value());
+        }
+      }
+
+      for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
+        for (std::uint32_t z = 0; z < 8u; ++z) {
+          const auto at_g = e.let(slot_g[i] + (z * 2u * round_groups + gi));
+          const auto term = e.let(gscale * xstep[at_g].read());
+          out[i * 8u + z] =
+              math::fma(term, kir::cast<kir::f32>(acc[i][z].read()),
+                        out[i * 8u + z].read()) +
+              gbias * xtot[at_g].read();
         }
       }
     }
