@@ -141,23 +141,15 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // Lanes that cooperate on one tile, and how many accumulator slots a lane
   // holds -- wave32 with eight is RDNA, wave64 with four is CDNA, and neither
   // is spelled here.
-  constexpr auto kWave = static_cast<std::uint32_t>(kRow.wave);
-  constexpr auto kSlots = static_cast<std::uint32_t>(kRow.c_len);
+  // Every width and every index rule comes from the row, through the one place
+  // that reads a layout. Nothing below names a generation.
+  constexpr TileGeometry kGeo = geometry_of(kRow);
+  constexpr std::uint32_t kWave = kGeo.wave;
+  constexpr std::uint32_t kSlots = kGeo.slots;
   constexpr int kSlotsI = kRow.c_len;
-  // Rows a slot steps by: the accumulator covers kTileM rows with kWave / n
-  // lanes to a column, which is 2 on wave32 and 4 on wave64.
-  constexpr std::uint32_t kStride = kWave / static_cast<std::uint32_t>(kRow.n);
-  // Fragment registers one instruction takes. RDNA3 hands a lane its whole K
-  // slice in four; RDNA4 splits K across the half-waves and takes two.
-  constexpr auto kFrag =
-      static_cast<std::uint32_t>(kRow.a_len / kRow.chained);
+  constexpr std::uint32_t kFrag = kGeo.frag;
   constexpr int kFragI = kRow.a_len / kRow.chained;
-  // Operand values one lane holds, and where in the step they start.
-  constexpr bool kSplitK =
-      kRow.operands == math::OperandLayout::kLaneRowSplitK;
-  constexpr std::uint32_t kLaneK =
-      kSplitK ? static_cast<std::uint32_t>(kRow.k) / kStride
-              : static_cast<std::uint32_t>(kRow.k);
+  constexpr std::uint32_t kSlotStep = kGeo.slot_step;
   const auto n = static_cast<std::uint32_t>(d.n);
   const auto m = static_cast<std::uint32_t>(d.m);
   const auto k = static_cast<std::uint32_t>(d.k);
@@ -233,8 +225,9 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
     const std::uint32_t rb = i * static_cast<std::uint32_t>(kTileM);
     lane_words.push_back(e.let((lane_lo + rb) * words));
-    slot_g.push_back(e.let((rb + lane_hi) * round_groups));
-    slot_out.push_back(e.let(m0 + rb + lane_hi));
+    const auto half = e.let(lane_hi * kGeo.half_rows);
+    slot_g.push_back(e.let((rb + half) * round_groups));
+    slot_out.push_back(e.let(m0 + rb + half));
   }
   // A column past the end still indexes the scales, because the group loop
   // reads them before it knows whether the lane will store anything. Its
@@ -244,10 +237,9 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto safe_col = e.let(select(bcol < n, bcol, e.u32(0)));
   // Zero on a generation whose lane holds the whole step; on one that splits
   // it, the offset of this lane's half, in operand values and in packed words.
-  const auto lane_k =
-      kSplitK ? e.let(lane_hi * kLaneK) : e.let(e.u32(0));
+  const auto lane_k = e.let(lane_hi * (kGeo.split_k ? kGeo.lane_k : 0u));
   const auto lane_word =
-      kSplitK ? e.let(lane_hi * (kLaneK / 4u)) : e.let(e.u32(0));
+      e.let(lane_hi * (kGeo.split_k ? kGeo.lane_k / 4u : 0u));
   const auto col_scales = e.let(safe_col * groups);
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
@@ -388,7 +380,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
         for (std::uint32_t z = 0; z < kSlots; ++z) {
           const auto at_g =
-              e.let(slot_g[i] + (z * kStride * round_groups + gi));
+              e.let(slot_g[i] + (z * kSlotStep * round_groups + gi));
           const auto term = e.let(gscale * xstep[at_g].read());
           out[i * kSlots + z] =
               math::fma(term, kir::cast<kir::f32>(acc[i][z].read()),
@@ -402,7 +394,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
   for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
     for (std::uint32_t z = 0; z < kSlots; ++z) {
-      const auto row = e.let(slot_out[i] + z * kStride);
+      const auto row = e.let(slot_out[i] + z * kSlotStep);
       if (auto gr = e.when(live && row < m && bcol < n)) {
         e.store(row * n + bcol, out[i * kSlots + z].read());
       }

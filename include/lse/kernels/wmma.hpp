@@ -157,6 +157,46 @@ template <class R, class F>
   return R{};
 }
 
+// What a row's measured layouts mean in indices, worked out once here so that
+// no kernel repeats it and none of them names a generation.
+//
+// A tile written against this asks where its lane's operand slice begins and
+// where an accumulator slot lands; it never asks which layout the row carries.
+// Adding a generation is then a row plus, at most, an arm below -- not an edit
+// to every kernel that multiplies.
+struct TileGeometry {
+  std::uint32_t wave = 0;      // lanes cooperating on one tile
+  std::uint32_t slots = 0;     // accumulator registers a lane holds
+  std::uint32_t frag = 0;      // operand registers one instruction takes
+  std::uint32_t halves = 0;    // lanes per column: wave / n
+  // Operand values a lane holds of the instruction's k step, and whether the
+  // halves of the wave divide that step between them.
+  std::uint32_t lane_k = 0;
+  bool split_k = false;
+  // Rows between one accumulator slot and the next. The pair form interleaves
+  // the halves of the wave and steps by `halves`; the block form gives each
+  // half a contiguous run and steps by one.
+  std::uint32_t slot_step = 0;
+  // Rows this lane's slot zero sits above the tile's origin.
+  std::uint32_t half_rows = 0;
+};
+
+[[nodiscard]] consteval TileGeometry geometry_of(
+    const lse::math::MatrixCoreRow& r) {
+  TileGeometry g;
+  g.wave = static_cast<std::uint32_t>(r.wave);
+  g.slots = static_cast<std::uint32_t>(r.c_len);
+  g.frag = static_cast<std::uint32_t>(r.a_len / r.chained);
+  g.halves = g.wave / static_cast<std::uint32_t>(r.n);
+  g.split_k = r.operands == lse::math::OperandLayout::kLaneRowSplitK;
+  g.lane_k = g.split_k ? static_cast<std::uint32_t>(r.k) / g.halves
+                       : static_cast<std::uint32_t>(r.k);
+  const bool pair = r.acc_layout == lse::math::AccLayout::kPairRowHalfWave;
+  g.slot_step = pair ? g.halves : 1u;
+  g.half_rows = pair ? 1u : g.slots;
+  return g;
+}
+
 // A stored weight that is narrower than the matrix core's operand.
 //
 // The core has no 4-bit operand a float activation can meet, so a 4-bit

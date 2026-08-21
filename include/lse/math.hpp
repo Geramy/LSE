@@ -411,6 +411,11 @@ enum class AccLayout : std::uint8_t {
   kUnmeasured = 0,
   // D[2*e + lane/N][lane%N]. Measured on gfx1151, 256/256 slots, max err 5e-7.
   kPairRowHalfWave,
+  // D[e + c_len*(lane/N)][lane%N]: the register index is the row and the half
+  // of the wave picks the block of rows, where the pair form interleaves them.
+  // RDNA4's arrangement, from AMD's matrix instruction calculator for
+  // v_wmma_i32_16x16x16_iu8 -- D[m][n] = v{m%8}{n + 16*(m/8)}.
+  kRowBlockHalfWave,
 };
 
 // A row of the matrix-core table. Everything a kernel would otherwise have
@@ -547,7 +552,7 @@ inline constexpr std::array<MatrixCoreRow, 25> kMatrixCore{{
     {"wmma12.i32.16x16x16.su8", MatrixTarget::kRdna4, MatrixElem::kI32,
      MatrixElem::kSU8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 4, 16,
      16, 16, 32, MatrixCap::kWmma12Int8, 1, 16, 400,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
+     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
     {"wmma12.i32.16x16x32.iu4", MatrixTarget::kRdna4, MatrixElem::kI32,
      MatrixElem::kI4, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 8, 16,
      16, 32, 32, MatrixCap::kWmma12Int4, 1, 32, 400,
