@@ -1449,51 +1449,42 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   }
   if (bytes == 0) return OkStatus();
 
-  // The peer's memory has to become something this device owns before its
-  // queue will touch it. Handing a queue the other device's buffer object
-  // instead does not fail -- it faults the GPU and takes the process with it.
+  // Straight to the copy engine, around the HAL rather than through it.
   //
-  // Two steps and either may decline; a decline is the answer "these two
-  // cannot talk directly", which the caller turns into a bounce through host
-  // memory. Nothing here is allowed to be fatal.
-  void* peer_ptr = nullptr;
+  // Importing the peer's allocation into this device's allocator is refused --
+  // one hrx_device_t per GPU means one logical device per GPU, and the AMDGPU
+  // HAL will not take an allocation owned by an agent outside its own
+  // topology. HSA has no such notion: given two addresses, two agents and an
+  // access grant, it moves the bytes. The grant is done when the memory is
+  // allocated, which is why every device-local allocation offers itself to the
+  // other GPUs.
+  const HsaRuntime& hsa = shared_hsa();
+  if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
+  const std::vector<HsaAgent>& agents = peer_agents();
+  const auto here = static_cast<std::size_t>(gpu_ordinal_);
+  if (here >= agents.size()) {
+    return LSE_ERROR(kUnimplemented, "no agent for this device");
+  }
+
+  void* src_ptr = nullptr;
+  void* dst_ptr = nullptr;
   if (!hrx_status_is_ok(hrx_buffer_get_device_ptr(
-          reinterpret_cast<hrx_buffer_t>(src.handle), &peer_ptr)) ||
-      peer_ptr == nullptr) {
-    return LSE_ERROR(kUnimplemented, "the peer buffer has no device address");
+          reinterpret_cast<hrx_buffer_t>(src.handle), &src_ptr)) ||
+      !hrx_status_is_ok(hrx_buffer_get_device_ptr(
+          reinterpret_cast<hrx_buffer_t>(dst.handle), &dst_ptr)) ||
+      src_ptr == nullptr || dst_ptr == nullptr) {
+    return LSE_ERROR(kUnimplemented, "a buffer in this pair has no address");
   }
+  auto* from = static_cast<std::byte*>(src_ptr) + src.offset + src_offset;
+  auto* to = static_cast<std::byte*>(dst_ptr) + dst.offset + dst_offset;
 
-  hrx_buffer_params_t params = {};
-  params.type = HRX_MEMORY_TYPE_DEVICE_LOCAL;
-  params.access = HRX_MEMORY_ACCESS_ALL;
-  params.usage = HRX_BUFFER_USAGE_TRANSFER;
-  params.queue_affinity = 0;
-  hrx_buffer_t imported = nullptr;
-  auto* base = static_cast<std::byte*>(peer_ptr) + src.offset + src_offset;
-
-  if (!hrx_status_is_ok(hrx_allocator_import_buffer(
-          static_cast<hrx_allocator_t>(allocator_), params, base, bytes,
-          &imported)) ||
-      imported == nullptr) {
-    return LSE_ERROR(kUnimplemented,
-                     "this device cannot map the peer's memory");
+  // Both ends are named by the agent doing the copy. The source belongs to
+  // another GPU, and reaching it is what the grant at allocation bought.
+  LSE_RETURN_IF_ERROR(synchronize_impl());
+  if (!hsa.dma_copy(to, agents[here], from, agents[here], bytes)) {
+    return LSE_ERROR(kUnimplemented, "the peer copy was refused");
   }
-
-  auto stream = stream_at(0);
-  if (!stream.ok()) {
-    hrx_buffer_release(imported);
-    return stream.status();
-  }
-  const Status moved =
-      from_hrx(hrx_stream_copy_buffer(
-                   static_cast<hrx_stream_t>(*stream), imported, 0,
-                   reinterpret_cast<hrx_buffer_t>(dst.handle),
-                   dst.offset + dst_offset, bytes),
-               "hrx_stream_copy_buffer (peer)");
-  unflushed_launches_[0] = 0;
-  const Status drained = moved.ok() ? synchronize_stream_impl(Stream{0}) : moved;
-  hrx_buffer_release(imported);
-  return drained;
+  return OkStatus();
 #endif
 }
 
