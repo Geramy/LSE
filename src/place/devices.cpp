@@ -1,9 +1,15 @@
 #include "lse/place/devices.hpp"
 
+#include <dlfcn.h>
+
+#include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "lse/graph/graph.hpp"
 
@@ -304,9 +310,66 @@ DefaultSet& default_set() {
   return d;
 }
 
+// The GPU runtime is dlopened by soname from inside the backend, and a soname
+// lookup does not see this executable's RUNPATH -- that only covers an object's
+// own direct dependencies. So the loader takes whichever libhsa-runtime64 the
+// default search finds, which on a machine with a distro ROCm beside a newer
+// one is the old one, and the backend then declines for a missing symbol and
+// the whole model quietly runs on the host interpreter.
+//
+// Loading it here by absolute path first settles it: the object is in the
+// process under its own soname before anything asks for that soname, so the
+// backend's dlopen returns this one instead of searching. Requiring the caller
+// to have exported LD_LIBRARY_PATH is not a working answer -- nobody launching
+// the server knows to.
+void preload_gpu_runtime() {
+  namespace fs = std::filesystem;
+  // Already in the process, and new enough: nothing to do. A build linked
+  // directly against a good one lands here.
+  if (void* self = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL); self != nullptr) {
+    const bool ok = dlsym(self, "hsa_amd_vmem_address_reserve_align") != nullptr;
+    dlclose(self);
+    if (ok) return;
+  }
+
+  std::vector<std::string> roots;
+  if (const char* env = std::getenv("ROCM_PATH"); env != nullptr && *env != 0) {
+    roots.emplace_back(env);
+  }
+  roots.emplace_back("/opt/rocm");
+  // A versioned or componentised install beside the unversioned link, newest
+  // first so a machine carrying several picks the one most likely to have the
+  // symbol rather than the first it trips over.
+  std::vector<std::string> globbed;
+  for (const char* base : {"/opt", "/opt/rocm"}) {
+    std::error_code ec;
+    for (const fs::directory_entry& e : fs::directory_iterator(base, ec)) {
+      const std::string name = e.path().filename().string();
+      if (name.rfind("rocm-", 0) == 0 || name.rfind("core-", 0) == 0) {
+        globbed.push_back(e.path().string());
+      }
+    }
+  }
+  std::sort(globbed.rbegin(), globbed.rend());
+  roots.insert(roots.end(), globbed.begin(), globbed.end());
+
+  for (const std::string& root : roots) {
+    const std::string path = root + "/lib/libhsa-runtime64.so.1";
+    std::error_code ec;
+    if (!fs::exists(path, ec)) continue;
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (h == nullptr) continue;
+    if (dlsym(h, "hsa_amd_vmem_address_reserve_align") != nullptr) return;
+    // Held open on purpose when it is wrong: closing it can unload something
+    // a later candidate already pulled in. The process keeps one either way.
+  }
+}
+
 }  // namespace
 
 Status open_default_devices(std::string_view selector) {
+  static const bool preloaded = [] { preload_gpu_runtime(); return true; }();
+  (void)preloaded;
   DefaultSet& d = default_set();
   std::lock_guard lock(d.mu);
   if (d.built) {
