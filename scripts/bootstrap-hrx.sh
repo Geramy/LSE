@@ -73,7 +73,15 @@ cd "$dir"
   -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx"
 "$py" dev.py cmake build
 
+# dev.py builds; it does not install, and the tree LSE links against is the
+# installed one. Without this the script printed a -DLSE_HRX_ROOT for a
+# directory it never created.
 install="$dir/build/hrx-install"
+cmake --install "$dir/build/cmake" --prefix "$install" > /dev/null
+if [[ ! -e "$install/lib/libhrx.so" ]]; then
+  echo "install produced no libhrx.so under $install" >&2
+  exit 1
+fi
 echo
 echo "HRX built. Configure this tree with:"
 echo "  cmake -S . -B build -GNinja -DCMAKE_CXX_COMPILER=g++-16 \\"
