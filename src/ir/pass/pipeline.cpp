@@ -15,6 +15,15 @@ PassPipeline& PassPipeline::add(std::unique_ptr<Pass> pass) {
 }
 
 Status PassPipeline::run(Body& body, std::vector<PassStat>* stats) const {
+  // Before any pass runs, so a body that arrived malformed is reported against
+  // whoever wrote it. Verifying only after each pass named the first pass in
+  // the pipeline as the culprit for a defect it inherited, which sent a day
+  // into reading that pass instead of the kernel that emitted the body.
+  if (Status s = verify(body); !s.ok()) {
+    return LSE_ERROR(kInternal,
+                     "the emitted kernel body is malformed before any pass "
+                     "ran: ", s.message());
+  }
   for (const std::unique_ptr<Pass>& p : passes_) {
     const std::size_t fired = p->run(body);
     if (stats != nullptr) stats->push_back(PassStat{p->name(), fired});

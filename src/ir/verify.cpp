@@ -165,8 +165,25 @@ struct Checker {
           return fail(std::string(op_name(o.kind)) + ": operand is not a value");
         }
         if (!live[v]) {
-          return fail(std::string(op_name(o.kind)) +
-                      ": operand is not in scope at its use");
+          // Name the value and what produced it. "operand is not in scope"
+          // alone does not say which of an op's operands, nor where it came
+          // from, and finding that by hand costs hours.
+          std::string d = std::string(op_name(o.kind));
+          if (!o.key.empty()) d += " '" + o.key + "'";
+          d += ": operand v" + std::to_string(v) +
+               " is not in scope at its use";
+          if (v < b.value_count() && !b.value(v).name.empty()) {
+            d += " (" + b.value(v).name + ")";
+          }
+          for (std::size_t oi = 0; oi < b.op_count(); ++oi) {
+            const Operation& po = b.op(static_cast<OpId>(oi));
+            if (!po.erased && po.result == v) {
+              d += ", produced by " + std::string(op_name(po.kind)) +
+                   " in a region that does not enclose this use";
+              break;
+            }
+          }
+          return fail(d);
         }
       }
       if (!check_extent_use(o, loop_depth)) return false;
