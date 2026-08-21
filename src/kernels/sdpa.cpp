@@ -2,6 +2,7 @@
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/kv/block.hpp"
+#include "lse/kernels/sdpa.hpp"
 #include "lse/math.hpp"
 
 #include <string>
@@ -68,6 +69,13 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return 3; }
+
+  // A prefill pass has query rows to share a key across; this one does not,
+  // and recomputing the score per output channel is what it costs.
+  const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    if (const KernelPrimitiveBase* f = flash_sdpa_for(s)) return f;
+    return this;
+  }
 
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() < 3 || s.inputs.size() > 5 ||
