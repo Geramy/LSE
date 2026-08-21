@@ -25,6 +25,25 @@ if [[ ! -d "$rocm" ]]; then
   exit 1
 fi
 
+# TheRock splits an install into components, so /opt/rocm holds core-*/ and
+# extras-*/ and no include/ or lib/ of its own. hrx-system wants a flat root and
+# stops with "HSA runtime headers were not found" against the outer directory.
+# Descend to the component that actually carries them, newest first.
+if [[ ! -e "$rocm/include/hsa/hsa.h" ]]; then
+  for cand in $(ls -d "$rocm"/core-* 2>/dev/null | sort -r); do
+    if [[ -e "$cand/include/hsa/hsa.h" ]]; then
+      echo "componentised ROCm: using $cand"
+      rocm="$cand"
+      break
+    fi
+  done
+fi
+if [[ ! -e "$rocm/include/hsa/hsa.h" ]]; then
+  echo "no hsa/hsa.h under $rocm -- install the ROCm runtime dev package" >&2
+  echo "  (TheRock: amdrocm-runtime-dev<ver>, classic: hsa-rocr-dev)" >&2
+  exit 1
+fi
+
 if [[ ! -d "$dir/.git" ]]; then
   echo "cloning $repo"
   git clone --recursive "$repo" "$dir"
