@@ -56,8 +56,12 @@ constexpr std::uint32_t kBlock = 256;
 constexpr std::uint32_t kRowBlocks = 1u;
 constexpr std::uint32_t kRowsPerGroup = kTileM * kRowBlocks;
 
-using MmaRdna3 = math::op::Mma<math::MatrixTarget::kRdna3, math::MatrixElem::kI32,
-                               math::MatrixElem::kSU8, kTileM, kTileN, kTileK>;
+// The instruction this invocation gets. `G` is the generation the device
+// reported; every width below is read off the row that selects, so nothing
+// here names a generation or a register count of its own.
+template <math::MatrixTarget G>
+using MmaFor = math::op::Mma<G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
+                             kTileM, kTileN, kTileK>;
 
 // 127 and not 128 so -x and x quantize to the same magnitude, which is what
 // keeps the bias term unbiased. The floor stops an all-zero slice dividing.
@@ -113,20 +117,36 @@ struct Args {
 
 // The weight fragment comes from the operand layer, which owns the stored
 // width. This kernel names a column and a K slice and nothing about nibbles.
-template <class A>
+template <int Frag, class A>
 void fill_weights(env::Emit& e, const A& a, const kir::Val<kir::u32>& col,
                   const kir::Val<kir::u32>& k0, std::uint32_t lanes, int bits,
-                  const kir::Local<kir::u32, 4>& frag) {
+                  const kir::Local<kir::u32, Frag>& frag) {
   const std::uint32_t per_word = 32u / static_cast<std::uint32_t>(bits);
   const auto base = e.let(col * lanes + k0 / per_word);
-  for (std::uint32_t f = 0; f < 4u; ++f) {
+  for (std::uint32_t f = 0; f < static_cast<std::uint32_t>(Frag); ++f) {
     frag[f] = bits == 4 ? PackedCodes<4>::word(e, a.packed, base, f)
                         : PackedCodes<8>::word(e, a.packed, base, f);
   }
 }
 
-template <class A>
+template <class A, math::MatrixTarget G>
 std::string emit_body(const KernelShapes& s, const Dims& d) {
+  using Mma = MmaFor<G>;
+  constexpr math::MatrixCoreRow kRow = Mma::kRow;
+  // Lanes that cooperate on one tile, and how many accumulator slots a lane
+  // holds -- wave32 with eight is RDNA, wave64 with four is CDNA, and neither
+  // is spelled here.
+  constexpr auto kWave = static_cast<std::uint32_t>(kRow.wave);
+  constexpr auto kSlots = static_cast<std::uint32_t>(kRow.c_len);
+  constexpr int kSlotsI = kRow.c_len;
+  // Rows a slot steps by: the accumulator covers kTileM rows with kWave / n
+  // lanes to a column, which is 2 on wave32 and 4 on wave64.
+  constexpr std::uint32_t kStride = kWave / static_cast<std::uint32_t>(kRow.n);
+  // Fragment registers one instruction takes. RDNA3 hands a lane its whole K
+  // slice in four; RDNA4 splits K across the half-waves and takes two.
+  constexpr auto kFrag =
+      static_cast<std::uint32_t>(kRow.a_len / kRow.chained);
+  constexpr int kFragI = kRow.a_len / kRow.chained;
   const auto n = static_cast<std::uint32_t>(d.n);
   const auto m = static_cast<std::uint32_t>(d.m);
   const auto k = static_cast<std::uint32_t>(d.k);
@@ -144,7 +164,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       groups < kGroupsPerRound ? groups : kGroupsPerRound;
   const std::uint32_t round_slices = slices * round_groups;
   const std::uint32_t words = gsize * round_groups / 4u;
-  const std::uint32_t waves = kBlock / 32u;
+  const std::uint32_t waves = kBlock / kWave;
   const std::uint32_t tiles_n = (n + kTileN - 1u) / kTileN;
   const std::uint32_t nblocks = (tiles_n + waves - 1u) / waves;
   const std::uint32_t load_bytes = device_load_bytes(s.device);
@@ -174,8 +194,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto xtot = e.lds<kir::f32>(kRowsPerGroup * round_groups);
 
   const auto lid = e.let(math::local_id());
-  const auto wave_id = e.let(lid / 32u);
-  const auto lane = e.let(lid % 32u);
+  const auto wave_id = e.let(lid / kWave);
+  const auto lane = e.let(lid % kWave);
   const auto lane_lo = e.let(lane % static_cast<std::uint32_t>(kTileN));
   const auto lane_hi = e.let(lane / static_cast<std::uint32_t>(kTileN));
 
@@ -187,8 +207,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto live = e.let(ntile < tiles_n);
 
   std::vector<kir::LValue<kir::f32>> out;
-  out.reserve(kRowBlocks * 8u);
-  for (std::uint32_t i = 0; i < kRowBlocks * 8u; ++i) out.push_back(e.var(0.0f));
+  out.reserve(kRowBlocks * kSlots);
+  for (std::uint32_t i = 0; i < kRowBlocks * kSlots; ++i) out.push_back(e.var(0.0f));
 
   // One base per row block: the accumulator slot's own offset is a constant,
   // so folding it in at the use costs an add the scheduler hides, where
@@ -316,15 +336,15 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       std::vector<kir::Local<kir::i32, 8>> acc;
       acc.reserve(kRowBlocks);
       for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
-        acc.push_back(e.local<kir::i32, 8>());
-        for (auto z : e.unroll(8u)) acc[i][z] = kir::cast<kir::i32>(e.u32(0));
+        acc.push_back(e.local<kir::i32, kSlotsI>());
+        for (auto z : e.unroll(kSlots)) acc[i][z] = kir::cast<kir::i32>(e.u32(0));
       }
 
       for (std::uint32_t t = 0; t < slices; ++t) {
         const auto k0 =
             e.let(g * gsize + t * static_cast<std::uint32_t>(kTileK));
-        const auto bf = e.local<kir::u32, 4>();
-        for (std::uint32_t c = 0; c < 4u; ++c) bf[c] = e.u32(0);
+        const auto bf = e.local<kir::u32, kFragI>();
+        for (std::uint32_t c = 0; c < kFrag; ++c) bf[c] = e.u32(0);
         if (auto gd = e.when(live && bcol < n)) {
           fill_weights(e, a, bcol, k0, lanes, d.spec.bits, bf);
         }
@@ -332,24 +352,25 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         // which is what the blocking buys.
         const std::uint32_t slot = gi * slices + t;
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
-          const auto af = e.local<kir::u32, 4>();
-          for (std::uint32_t c = 0; c < 4u; ++c) {
-            af[c] = xq[e.let(lane_words[i] + (slot * 4u + c))].read();
+          const auto af = e.local<kir::u32, kFragI>();
+          for (std::uint32_t c = 0; c < kFrag; ++c) {
+            af[c] = xq[e.let(lane_words[i] + (slot * kFrag + c))].read();
           }
           // One issue takes the whole K slice: the row declares A and B four
           // registers wide and chained=1, so a lane hands over its sixteen
           // contiguous K values at once.
-          acc[i] = math::mma<MmaRdna3>(af.value(), bf.value(), acc[i].value());
+          acc[i] = math::mma<Mma>(af.value(), bf.value(), acc[i].value());
         }
       }
 
       for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
-        for (std::uint32_t z = 0; z < 8u; ++z) {
-          const auto at_g = e.let(slot_g[i] + (z * 2u * round_groups + gi));
+        for (std::uint32_t z = 0; z < kSlots; ++z) {
+          const auto at_g =
+              e.let(slot_g[i] + (z * kStride * round_groups + gi));
           const auto term = e.let(gscale * xstep[at_g].read());
-          out[i * 8u + z] =
+          out[i * kSlots + z] =
               math::fma(term, kir::cast<kir::f32>(acc[i][z].read()),
-                        out[i * 8u + z].read()) +
+                        out[i * kSlots + z].read()) +
               gbias * xtot[at_g].read();
         }
       }
@@ -358,10 +379,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   }
 
   for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
-    for (std::uint32_t z = 0; z < 8u; ++z) {
-      const auto row = e.let(slot_out[i] + z * 2u);
+    for (std::uint32_t z = 0; z < kSlots; ++z) {
+      const auto row = e.let(slot_out[i] + z * kStride);
       if (auto gr = e.when(live && row < m && bcol < n)) {
-        e.store(row * n + bcol, out[i * 8u + z].read());
+        e.store(row * n + bcol, out[i * kSlots + z].read());
       }
     }
   }
@@ -400,9 +421,20 @@ struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel> {
         s.intrinsics == nullptr) {
       return {};
     }
-    return with_elem(s.input_dtypes[2], [&]<class S>() -> std::string {
-      return emit_body<Args<S>>(s, d);
-    });
+    const std::optional<math::MatrixTarget> target = matrix_target(*s.device);
+    if (!target.has_value()) return {};
+    return with_matrix_target<std::string>(
+        *target, [&]<math::MatrixTarget G>() -> std::string {
+          if constexpr (!math::has_matrix_core_row(
+                            G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
+                            kTileM, kTileN, kTileK)) {
+            return {};
+          } else {
+            return with_elem(s.input_dtypes[2], [&]<class S>() -> std::string {
+              return emit_body<Args<S>, G>(s, d);
+            });
+          }
+        });
   }
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
@@ -441,12 +473,42 @@ const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
   if (d.m < kTileM) return nullptr;
 
   const std::optional<math::MatrixTarget> target = matrix_target(*s.device);
-  if (!target.has_value() || *target != math::MatrixTarget::kRdna3) return nullptr;
-  if (!math::has_cap(device_matrix_caps(*s.device), math::MatrixCap::kWmmaInt8)) {
-    return nullptr;
-  }
-  if (s.intrinsics->find(MmaRdna3::kRow.key).empty()) return nullptr;
-  return &kQuantWmma;
+  if (!target.has_value()) return nullptr;
+
+  // The row the device's generation selects, and whether it may be emitted at
+  // all. A row whose lane mapping was never measured on the part is not a
+  // slower path, it is a wrong answer that looks right, so the table declines
+  // it and so does this. Nothing here names a generation: a part joins by
+  // having its layout measured into the table.
+  return with_matrix_target<const graph::KernelPrimitiveBase*>(
+      *target, [&]<math::MatrixTarget G>() -> const graph::KernelPrimitiveBase* {
+        // CDNA's MFMA int8 has no signedness immediates, so there is no mixed
+        // row to name: unsigned codes there need the algebra shifted, not a
+        // different spelling. It declines here rather than pretending.
+        if constexpr (!math::has_matrix_core_row(
+                          G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
+                          kTileM, kTileN, kTileK)) {
+          return nullptr;
+        } else {
+        constexpr math::MatrixCoreRow kRow = MmaFor<G>::kRow;
+        if constexpr (!kRow.emittable()) {
+          return nullptr;
+        } else {
+          if (!math::has_cap(device_matrix_caps(*s.device), kRow.cap)) {
+            return nullptr;
+          }
+          if (s.intrinsics->find(kRow.key).empty()) return nullptr;
+          // The tile stages one K slice per lane and drains kTileM rows, so a
+          // row whose instruction does not have that shape needs the staging
+          // rewritten, not just a different spelling.
+          if (kRow.m != kTileM || kRow.n != kTileN || kRow.k != kTileK) {
+            return nullptr;
+          }
+          if (kRow.chained != 1) return nullptr;
+          return &kQuantWmma;
+        }
+        }
+      });
 }
 
 }  // namespace lse::kernels

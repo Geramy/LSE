@@ -469,7 +469,7 @@ using ir::Scalar;
 // NOT verified on hardware is the per-lane layout, and that is exactly what
 // `operands` / `acc_layout` record — the gfx11 rows were measured on gfx1151,
 // everything else says so and declines.
-inline constexpr std::array<MatrixCoreRow, 24> kMatrixCore{{
+inline constexpr std::array<MatrixCoreRow, 25> kMatrixCore{{
     // -- RDNA3 / 3.5, wave32. A/B 16 elements per lane, whole K in each lane.
     {"wmma.f32.16x16x16.f16", MatrixTarget::kRdna3, MatrixElem::kF32,
      MatrixElem::kF16, Scalar::kF16, 16, Scalar::kF16, 16, Scalar::kF32, 8, 1,
@@ -534,6 +534,14 @@ inline constexpr std::array<MatrixCoreRow, 24> kMatrixCore{{
      MatrixElem::kI8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kI32, 8, 4, 16,
      16, 16, 32, MatrixCap::kWmma12Int8, 2, 32, 400,
      OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
+    // The mixed form, as on RDNA3: a group-affine code is unsigned and the
+    // activation signed. gfx12 spells the same two signedness immediates, so
+    // this is one row, not a different instruction. Its lane mapping is not
+    // measured, so it does not emit -- see the note above.
+    {"wmma12.i32.16x16x16.su8", MatrixTarget::kRdna4, MatrixElem::kI32,
+     MatrixElem::kSU8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 4, 16,
+     16, 16, 32, MatrixCap::kWmma12Int8, 1, 16, 400,
+     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
     {"wmma12.i32.16x16x32.iu4", MatrixTarget::kRdna4, MatrixElem::kI32,
      MatrixElem::kI4, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 8, 16,
      16, 32, 32, MatrixCap::kWmma12Int4, 1, 32, 400,
@@ -597,6 +605,23 @@ inline constexpr std::array<MatrixCoreRow, 24> kMatrixCore{{
 // produce a value at all — the author asked for something that does not exist
 // and the compiler says so, rather than falling through to whichever variant
 // happened to be there first.
+// Whether the table holds such a row at all. `matrix_core_row` throws when it
+// does not, which is the right answer for a kernel that named one it must have
+// and the wrong one for a kernel asking whether this part has it -- a thrown
+// consteval is a compile error, not something an `if constexpr` can decline.
+[[nodiscard]] consteval bool has_matrix_core_row(MatrixTarget target,
+                                                 MatrixElem acc,
+                                                 MatrixElem operand, int M,
+                                                 int N, int K) {
+  for (const MatrixCoreRow& r : detail::kMatrixCore) {
+    if (r.target == target && r.acc == acc && r.operand == operand &&
+        r.m == M && r.n == N && r.k_step == K) {
+      return true;
+    }
+  }
+  return false;
+}
+
 [[nodiscard]] consteval MatrixCoreRow matrix_core_row(MatrixTarget target,
                                                       MatrixElem acc,
                                                       MatrixElem operand, int M,

@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 60> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 61> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -131,6 +131,9 @@ constexpr std::array<graph::PrimitiveSource, 60> kHipSources{{
      "__builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12($0, $1, $2)"},
     {"wmma12.i32.16x16x16.iu8",
      "__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, $0, true, $1, $2, false)"},
+    // Second operand unsigned: the mixed form a group-affine contraction takes.
+    {"wmma12.i32.16x16x16.su8",
+     "__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, $0, false, $1, $2, false)"},
     {"wmma12.i32.16x16x32.iu4",
      "__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(true, $0, true, $1, $2, false)"},
     {"wmma12.f32.16x16x16.fp8_fp8",

@@ -138,6 +138,25 @@ template <class R, class F>
   }
 }
 
+// Which generation's instructions this invocation gets, as a compile-time
+// parameter. The target is a device fact discovered at run time, and every
+// width the tile needs hangs off the row that target selects, so a kernel that
+// wants to serve more than one generation has to cross from one to the other
+// exactly once. This is that crossing; nothing downstream names a generation.
+template <class R, class F>
+[[nodiscard]] R with_matrix_target(lse::math::MatrixTarget target, F&& fn) {
+  using lse::math::MatrixTarget;
+  switch (target) {
+    case MatrixTarget::kRdna3:
+      return fn.template operator()<MatrixTarget::kRdna3>();
+    case MatrixTarget::kRdna4:
+      return fn.template operator()<MatrixTarget::kRdna4>();
+    case MatrixTarget::kCdna3:
+      return fn.template operator()<MatrixTarget::kCdna3>();
+  }
+  return R{};
+}
+
 // A stored weight that is narrower than the matrix core's operand.
 //
 // The core has no 4-bit operand a float activation can meet, so a 4-bit
