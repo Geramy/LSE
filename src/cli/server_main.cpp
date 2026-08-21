@@ -38,6 +38,8 @@ void usage() {
       "      --max-tokens N   refuse requests asking for more (default 4096)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
       "                       beside the model, when the checkpoint has one)\n"
+      "      --no-mtp         decode one token per pass, ignoring any\n"
+      "                       multi-token-prediction module\n"
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
       "      --kv-len N       allocate the KV cache for N tokens\n"
@@ -59,6 +61,7 @@ int main(int argc, char** argv) {
   server::ServerOptions opt;
   std::string model = std::getenv("LSE_MODEL") ? std::getenv("LSE_MODEL") : "";
   std::string mtp_path;
+  bool no_mtp = false;
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   std::string served_name;
   std::string pool;
@@ -81,6 +84,7 @@ int main(int argc, char** argv) {
     else if (a == "--served-name") served_name = value("--served-name");
     else if (a == "--max-tokens") opt.max_tokens_cap = std::atoi(value("--max-tokens").c_str());
     else if (a == "--mtp") mtp_path = value("--mtp");
+    else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
     else if (a == "--pool") pool = value("--pool");
@@ -150,7 +154,9 @@ int main(int argc, char** argv) {
   // CLI resolves it.
   std::unique_ptr<model::MtpModule> mtp;
   const std::string mtp_where =
-      mtp_path.empty() ? model::MtpModule::find_beside(model) : mtp_path;
+      no_mtp ? std::string()
+             : (mtp_path.empty() ? model::MtpModule::find_beside(model)
+                                 : mtp_path);
   if (!mtp_where.empty()) {
     auto opened = model::MtpModule::open(mtp_where, *cfg, *lm);
     if (opened.ok()) {

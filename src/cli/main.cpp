@@ -44,6 +44,7 @@ struct Options {
   // Multi-token-prediction module. Empty looks for one beside the model, which
   // is where a release that has one puts it.
   std::string mtp;
+  bool no_mtp = false;
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
   // Which source dialect this run would rather its kernels were written in.
@@ -87,6 +88,8 @@ void usage() {
       "      --mtp PATH         multi-token-prediction module: a directory, a\n"
       "                         .safetensors or an HF repo id. Default: the one\n"
       "                         beside the model, when the checkpoint has one\n"
+      "      --no-mtp           decode one token per pass, ignoring any\n"
+      "                         multi-token-prediction module\n"
       "      --list-models      print the registered model kernels and exit\n"
       "      --list-cache       list the models in the HF cache and whether\n"
       "                         this build can load each one, and exit\n"
@@ -180,6 +183,8 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->sampling.repetition_penalty = std::strtof(v.c_str(), nullptr);
     } else if (a == "--mtp") {
       if (!take_value(argc, argv, i, "--mtp", &opt->mtp)) return false;
+    } else if (a == "--no-mtp") {
+      opt->no_mtp = true;
     } else if (a == "--arch") {
       if (!take_value(argc, argv, i, "--arch", &opt->arch)) return false;
     } else if (a == "--list-models") {
@@ -657,10 +662,13 @@ int main(int argc, char** argv) {
 
   // The module is used when there is one, and there is one when the checkpoint
   // says so and the files are where --mtp or the model's own directory put
-  // them. Nothing turns it on or off: what it changes is how many decoder
-  // passes the same text costs.
+  // them. What it changes is how many decoder passes the same text costs, so
+  // --no-mtp exists to measure that: the two paths must answer the same text,
+  // and a run cannot be compared against itself.
   std::unique_ptr<model::MtpModule> mtp;
-  if (opt.mtp.empty() && cfg->mtp_layers > 0) {
+  if (opt.no_mtp) {
+    opt.mtp.clear();
+  } else if (opt.mtp.empty() && cfg->mtp_layers > 0) {
     opt.mtp = model::MtpModule::find_beside(opt.model);
   }
   if (!opt.mtp.empty()) {
@@ -668,7 +676,7 @@ int main(int argc, char** argv) {
     if (!opened.ok()) return fail(opened.status(), "loading the MTP module");
     mtp = opened.release();
     std::fprintf(stderr, "mtp: %s\n", mtp->path().c_str());
-  } else if (cfg->mtp_layers > 0) {
+  } else if (cfg->mtp_layers > 0 && !opt.no_mtp) {
     std::fputs("lse: this checkpoint declares an MTP module but none was found "
                "beside it; pass --mtp to name one\n", stderr);
   }

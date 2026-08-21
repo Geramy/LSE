@@ -74,6 +74,7 @@ prediction module, or point at one:
 | `--repeat-penalty F` | 1.0 | Above 1 discourages repeats |
 | `-s, --seed N` | 0 | Sampler seed |
 | `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
+| `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
 | `--arch NAME` | detected | Force a model kernel instead of detecting one |
 | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json`, used only when the model directory has none |
 | `--kv-len N` | `max(2*train_seq, 2048)` | Allocate the KV cache for N tokens and keep that shape |
@@ -108,6 +109,7 @@ works by changing the base URL.
 | `--served-name ID` | the model argument | Model id reported by `/v1/models` |
 | `--max-tokens N` | 4096 | Refuse requests asking for more |
 | `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
+| `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
 | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
 | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
 
