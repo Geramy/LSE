@@ -177,6 +177,74 @@ the server is future work and does not change the wire format.
 | cargo | any | Builds the `fastokens` FFI shim the tokenizer links |
 | ROCm | 7.x, with `amd_comgr` | HRX backend only. Supplies the compiler the JIT calls at runtime |
 | hrx-system | built and installed | HRX backend only |
+| fastokens | checked out beside the tree | Tokenizer only. A path dependency, see below |
+
+Developed on Ubuntu 25.10 with g++ 16.2, CMake 3.31, Ninja 1.12, cargo 1.93 and
+ROCm 7.2.1. Older ROCm 7.x should work; ROCm 6 does not, because the backend
+needs `hsa_amd_vmem_address_reserve_align`.
+
+### Installing the toolchain
+
+Ubuntu 25.10 carries g++-16 directly. On 24.04 it comes from the toolchain PPA:
+
+```bash
+# Ubuntu 25.10 and newer
+sudo apt install g++-16 cmake ninja-build git curl pkg-config
+
+# Ubuntu 24.04
+sudo add-apt-repository ppa:ubuntu-toolchain-r/test
+sudo apt update && sudo apt install g++-16 cmake ninja-build git curl pkg-config
+```
+
+`cargo` from the distro is usually old enough to matter; rustup is the reliable
+route:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+ROCm comes from AMD's repository, not the distro's:
+
+```bash
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/amdrocm.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] \
+https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 noble main" \
+  | sudo tee /etc/apt/sources.list.d/rocm.list
+sudo apt update && sudo apt install rocm
+sudo usermod -aG render,video "$USER"   # log out and back in
+```
+
+Check it took with `rocminfo | grep gfx` -- the name it prints is the target
+this engine will compile kernels for.
+
+### The two checkouts that are not in this repo
+
+Both live under `reference/`, which is deliberately not tracked.
+
+**fastokens** is a path dependency of `third_party/fastokens-ffi`, so the
+tokenizer does not build without it. Use the revision CI pins:
+
+```bash
+git clone https://github.com/crusoecloud/fastokens.git reference/fastokens
+git -C reference/fastokens checkout 7973014e4f3a6028ac48f305704eacd64d0b4ef6
+```
+
+**hrx-system** is the GPU backend. It builds itself; follow its `BUILDING.md`,
+and give it the AMDGPU driver:
+
+```bash
+git clone https://github.com/ROCm/hrx-system.git reference/hrx-system
+cd reference/hrx-system
+python dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH=/opt/rocm
+python dev.py cmake build
+```
+
+Point `-DLSE_HRX_ROOT` at the install it produces. Without it the tree still
+builds and the tests still pass -- on the CPU backend, which is two orders of
+magnitude slower and is not what you want to measure anything on.
 
 **clang cannot build this tree.** P2996 reflection is enabled by `-freflection`,
 which the build applies only for GNU 16 and newer; on any other compiler the
@@ -199,6 +267,16 @@ ctest --test-dir build --output-on-failure
 ```
 
 The core library and CPU backend build with no GPU and no external packages.
+`RelWithDebInfo` is what the numbers in this README were taken on; a `Debug`
+build is perhaps twenty times slower and will mislead you about everything.
+
+If ROCm sits somewhere other than `/opt/rocm`, say so once and both the build
+and the run-time search follow it:
+
+```bash
+cmake -S . -B build -GNinja -DCMAKE_CXX_COMPILER=g++-16 \
+      -DLSE_ROCM_PATH=/opt/rocm-7.2.1
+```
 
 To enable the HRX backend, build `hrx-system` and point at its install:
 
