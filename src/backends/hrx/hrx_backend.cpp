@@ -1177,6 +1177,47 @@ Status HrxBackend::ensure_staging(std::size_t bytes) {
 #endif
 }
 
+// A host->device copy with no host-side pass over the data: the caller's range
+// becomes a buffer this device can read, and the copy engine does the rest.
+// Declines when the runtime will not take the range, which is the caller's cue
+// to stage instead.
+Status HrxBackend::copy_h2d_imported(const void* src, DeviceBuffer& dst,
+                                     std::size_t bytes,
+                                     std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  hrx_buffer_params_t params = {};
+  params.type = HRX_MEMORY_TYPE_HOST_VISIBLE | HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+  params.access = HRX_MEMORY_ACCESS_ALL;
+  params.usage = HRX_BUFFER_USAGE_TRANSFER;
+  params.queue_affinity = 0;
+  hrx_buffer_t imported = nullptr;
+  if (!hrx_status_is_ok(hrx_allocator_import_buffer(
+          static_cast<hrx_allocator_t>(allocator_), params,
+          const_cast<void*>(src), bytes, &imported)) ||
+      imported == nullptr) {
+    return LSE_ERROR(kUnimplemented, "this range cannot be imported");
+  }
+  auto stream = stream_at(0);
+  if (!stream.ok()) {
+    hrx_buffer_release(imported);
+    return stream.status();
+  }
+  const Status moved =
+      from_hrx(hrx_stream_copy_buffer(
+                   static_cast<hrx_stream_t>(*stream), imported, 0,
+                   reinterpret_cast<hrx_buffer_t>(dst.handle),
+                   dst.offset + dst_offset, bytes),
+               "hrx_stream_copy_buffer (h2d imported)");
+  unflushed_launches_[0] = 0;
+  const Status drained = moved.ok() ? synchronize_stream_impl(Stream{0}) : moved;
+  hrx_buffer_release(imported);
+  return drained;
+#endif
+}
+
 Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
                                  std::size_t bytes, std::size_t dst_offset) {
 #if !LSE_HRX_LINKED
@@ -1207,6 +1248,16 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   // this transfer and free it again, which is where the time went.
   auto stream = stream_at(0);
   if (!stream.ok()) return stream.status();
+  // Import the caller's memory and let the copy engine read it where it lies.
+  // Staging costs a second pass over the data -- at 4 MB the host memcpy was
+  // about 200 us against 85 for the DMA itself -- and the import exists
+  // precisely so that pass is not needed. It can decline, and then the staging
+  // path below still gets the transfer done.
+  if (const Status direct = copy_h2d_imported(src, dst, bytes, dst_offset);
+      direct.ok()) {
+    return direct;
+  }
+
   constexpr std::size_t kChunk = 32u << 20;
   const auto* in = static_cast<const std::byte*>(src);
   for (std::size_t done = 0; done < bytes;) {

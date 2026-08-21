@@ -381,11 +381,6 @@ Result<std::vector<LinkProfile>> probe_local_links(
         return failed;
       }
       fit_link(l);
-      for (const TransferPoint& pt : l.points) {
-        std::fprintf(stderr, "[LINKPT] %zu -> %zu  %8zu B  %9.1f us  %6.2f GB/s\n",
-                     i, j, pt.bytes, pt.ns / 1e3,
-                     pt.bytes / 1e9 / (pt.ns / 1e9));
-      }
     }
     src_be.deallocate(src_buf);
   }
