@@ -1,6 +1,7 @@
 #include "lse/place/devices.hpp"
 
 #include <dlfcn.h>
+#include <sys/resource.h>
 
 #include <cctype>
 #include <optional>
@@ -414,6 +415,25 @@ DefaultSet& default_set() {
 // backend's dlopen returns this one instead of searching. Requiring the caller
 // to have exported LD_LIBRARY_PATH is not a working answer -- nobody launching
 // the server knows to.
+// The device runtime takes a file descriptor per outstanding notification, and
+// a loaded model has thousands in flight -- the 27B needs about 3500. A distro
+// default of 1024 soft is nowhere near it, and the failure is
+// `eventfd creation failed (24)` while binding weights, which names neither the
+// limit nor the fix. The hard limit is usually a million, so the soft one is
+// paperwork the process can do for itself.
+void raise_fd_limit() {
+  ::rlimit lim{};
+  if (::getrlimit(RLIMIT_NOFILE, &lim) != 0) return;
+  if (lim.rlim_cur == lim.rlim_max) return;
+  ::rlimit next = lim;
+  next.rlim_cur = lim.rlim_max;
+  if (::setrlimit(RLIMIT_NOFILE, &next) == 0) return;
+  // Some kernels refuse the unlimited form; ask for a concrete ceiling that is
+  // still far past what a model needs.
+  next.rlim_cur = lim.rlim_max < 65536 ? lim.rlim_max : 65536;
+  if (next.rlim_cur > lim.rlim_cur) (void)::setrlimit(RLIMIT_NOFILE, &next);
+}
+
 void preload_gpu_runtime() {
   namespace fs = std::filesystem;
   constexpr const char* kHsaSoname = "libhsa-runtime64.so.1";
@@ -481,7 +501,11 @@ void preload_gpu_runtime() {
 }  // namespace
 
 Status open_default_devices(std::string_view selector) {
-  static const bool preloaded = [] { preload_gpu_runtime(); return true; }();
+  static const bool preloaded = [] {
+    raise_fd_limit();
+    preload_gpu_runtime();
+    return true;
+  }();
   (void)preloaded;
   DefaultSet& d = default_set();
   std::lock_guard lock(d.mu);
