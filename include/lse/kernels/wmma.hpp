@@ -172,20 +172,19 @@ struct PackedCodes {
     if constexpr (Bits == 8) {
       return e.let(buf[e.let(base + f)]);
     } else {
-      // Two fragment registers come out of one stored word. The codes are not
-      // laid down in order: element e of the word sits at nibble
-      // (e % 4) * 2 + e / 4, which is what quant::dot4_operand_slot spells for
-      // the scalar path. Reading them in order instead pairs every code with
-      // the wrong activation and the test that catches it is
-      // quant_linear_matches_the_weights_it_encodes.
+      // Two fragment registers come out of one stored word, and a nibble's
+      // position in that word is its own code index. This is NOT the plane
+      // split quant::dot4_operand_slot spells: dot4 pairs byte b of a plane
+      // with code 2b+p because it consumes a chunk as two interleaved
+      // operands, whereas this row is kLaneRowContiguousK -- register f holds
+      // codes 4f..4f+3 in order, against sixteen contiguous activations.
+      // Borrowing the plane order here pairs every code with the wrong
+      // activation; quant_linear_matches_the_weights_it_encodes catches it.
       const auto src = e.let(buf[e.let(base + f / 2u)]);
-      const std::uint32_t half = f % 2u;
+      const std::uint32_t first = (f % 2u) * kPerFrag;
       auto out = e.let(e.u32(0));
       for (std::uint32_t b = 0; b < kPerFrag; ++b) {
-        const std::uint32_t nib =
-            static_cast<std::uint32_t>(lse::quant::dot4_operand_slot(
-                static_cast<int>(half), static_cast<int>(b)));
-        const auto code = e.let((src / (1u << (4 * nib))) % 16u);
+        const auto code = e.let((src / (1u << (4 * (first + b)))) % 16u);
         out = e.let(out + code * (1u << (8 * b)));
       }
       return out;

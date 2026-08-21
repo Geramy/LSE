@@ -351,6 +351,10 @@ inline void store(const ir::Buffer<T>& buf,
 // packed inside an i32 lane — so keying on Scalar would make them unnameable.
 enum class MatrixElem : std::uint8_t {
   kF32, kF16, kBF16, kI32, kI8, kI4, kFp8, kBf8,
+  // Signed activation against unsigned codes. The same widths as kI8, a
+  // different instruction immediate: a group-affine code is unsigned, and
+  // reading it as signed turns every code past half range negative.
+  kSU8,
 };
 
 // The ISA generation a row belongs to. The same (accumulator, operand, shape)
@@ -465,7 +469,7 @@ using ir::Scalar;
 // NOT verified on hardware is the per-lane layout, and that is exactly what
 // `operands` / `acc_layout` record — the gfx11 rows were measured on gfx1151,
 // everything else says so and declines.
-inline constexpr std::array<MatrixCoreRow, 23> kMatrixCore{{
+inline constexpr std::array<MatrixCoreRow, 24> kMatrixCore{{
     // -- RDNA3 / 3.5, wave32. A/B 16 elements per lane, whole K in each lane.
     {"wmma.f32.16x16x16.f16", MatrixTarget::kRdna3, MatrixElem::kF32,
      MatrixElem::kF16, Scalar::kF16, 16, Scalar::kF16, 16, Scalar::kF32, 8, 1,
@@ -490,6 +494,10 @@ inline constexpr std::array<MatrixCoreRow, 23> kMatrixCore{{
     // measured, see tests/test_jit.cpp matrix_core_int8_*.
     {"wmma.i32.16x16x16.iu8", MatrixTarget::kRdna3, MatrixElem::kI32,
      MatrixElem::kI8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kI32, 8, 4, 16,
+     16, 16, 32, MatrixCap::kWmmaInt8, 1, 16, 200,
+     OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
+    {"wmma.i32.16x16x16.su8", MatrixTarget::kRdna3, MatrixElem::kI32,
+     MatrixElem::kSU8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kI32, 8, 4, 16,
      16, 16, 32, MatrixCap::kWmmaInt8, 1, 16, 200,
      OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
     {"wmma.i32.16x16x16.iu4", MatrixTarget::kRdna3, MatrixElem::kI32,

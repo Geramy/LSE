@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 59> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 60> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -109,6 +109,12 @@ constexpr std::array<graph::PrimitiveSource, 59> kHipSources{{
     // never sees those, which is the point of the row carrying the spelling.
     {"wmma.i32.16x16x16.iu8",
      "__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, $0, true, $1, $2, false)"},
+    // The same instruction as the row above, with the second operand declared
+    // unsigned: group-affine codes are unsigned and the activation is signed,
+    // which is the mixed form `dot4.i32.iu8` above already takes.
+    {"wmma.i32.16x16x16.su8",
+     "__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, $0, false, $1, $2, false)"},
+
     {"wmma.i32.16x16x16.iu4",
      "__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, $0, true, $1, $2, false)"},
 
