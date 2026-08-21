@@ -69,6 +69,25 @@ class SpanTimer {
 
 }  // namespace
 
+// A node's value mirrored onto a member that does not own it. Keyed by the
+// node so the allocation survives between steps: the bytes change every step,
+// the buffer does not.
+struct PeerMirrorKey {
+  const Node* node = nullptr;
+  std::size_t member = 0;
+
+  friend bool operator==(const PeerMirrorKey& a,
+                         const PeerMirrorKey& b) noexcept {
+    return a.node == b.node && a.member == b.member;
+  }
+};
+
+struct PeerMirrorHash {
+  std::size_t operator()(const PeerMirrorKey& k) const noexcept {
+    return std::hash<const void*>{}(k.node) ^ (k.member * 0x9E3779B97F4A7C15ull);
+  }
+};
+
 struct Scheduler::Impl {
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
@@ -101,6 +120,8 @@ struct Scheduler::Impl {
     jit = std::make_unique<JitCache>(devices);
     return OkStatus();
   }
+  std::unordered_map<PeerMirrorKey, backend::DeviceBuffer, PeerMirrorHash>
+      peer_mirrors;
 };
 
 Scheduler::Scheduler(backend::IDeviceSet& devices)
@@ -139,16 +160,52 @@ std::string Scheduler::device_gap(const Node& node,
 
 std::size_t Scheduler::member_for(const FusionGroup& group) const noexcept {
   if (devices_.size() == 1) return devices_.primary();
-  // The first input that names a device decides. Operands cannot be read from
-  // anywhere else until something moves them, so this is forced rather than
-  // chosen — what a Planner decides is whether moving them is worth it, and it
-  // decides that before the group reaches here.
-  for (const NodePtr& n : group.inputs) {
-    if (!n) continue;
-    const std::size_t m = devices_.member_of(n->buffer.residency);
-    if (m < devices_.size()) return m;
+  // Whoever already holds the most bytes runs it. Every operand is readable
+  // from every member here, so this is a choice about what crosses the link,
+  // and the two candidates are wildly different sizes: a decode step's
+  // activation is one row, its weights are a slice of the model. Picking by
+  // input order instead lands a layer wherever its activation came from --
+  // that is the previous layer's device -- and streams the whole weight slice
+  // across the link once per token. Measured on a 27B split over two GPUs:
+  // 7.8 tok/s that way, 26 the other.
+  //
+  // Ties, including the all-unplaced case, fall to the primary.
+  // A stamped node settles it outright. Placement was decided where the model
+  // was built, and the byte-weighing below is only the answer for work nobody
+  // placed -- reconstructing the decision from operand sizes put a layer's
+  // groups on different devices and fetched the activation back and forth
+  // several times per layer per token.
+  for (const NodePtr& n : group.nodes) {
+    if (n && n->member != Node::kAnyMember && n->member < devices_.size()) {
+      return n->member;
+    }
   }
-  return devices_.primary();
+
+  // Everything the group will bind, not just what it takes from outside it.
+  // A fused matmul holds its weights as nodes *inside* the group, so weighing
+  // group.inputs alone compares one activation against another and never sees
+  // the operand that actually decides where the work belongs -- which made a
+  // layer bounce between devices group by group instead of staying put.
+  std::size_t best = devices_.primary();
+  std::size_t best_bytes = 0;
+  for (std::size_t m = 0; m < devices_.size(); ++m) {
+    std::size_t bytes = 0;
+    const auto weigh = [&](const NodePtr& n) {
+      if (n && devices_.member_of(n->buffer.residency) == m) {
+        bytes += n->buffer.size_bytes;
+      }
+    };
+    for (const NodePtr& n : group.inputs) weigh(n);
+    for (const NodePtr& n : group.nodes) {
+      if (!n) continue;
+      for (const NodePtr& in : n->inputs) weigh(in);
+    }
+    if (bytes > best_bytes) {
+      best_bytes = bytes;
+      best = m;
+    }
+  }
+  return best;
 }
 
 void Scheduler::release(backend::DeviceBuffer& buf) const noexcept {
@@ -159,6 +216,55 @@ void Scheduler::release(backend::DeviceBuffer& buf) const noexcept {
   const std::size_t owner = devices_.member_of(buf.residency);
   devices_.device(owner < devices_.size() ? owner : devices_.primary())
       .deallocate(buf);
+}
+
+Status Scheduler::make_local(Node& n, std::size_t member) {
+  if (devices_.size() == 1 || !n.buffer.valid()) return OkStatus();
+  const backend::DeviceIndex mine = devices_.residency(member);
+  const backend::DeviceIndex held = n.buffer.residency;
+  if (!held.bound() || held == mine) return OkStatus();
+
+  // A buffer is a handle its owning device resolves, not an address every
+  // device can follow, so an operand that lives elsewhere is fetched rather
+  // than read in place. Granting peer access is what makes the fetch a direct
+  // link transfer instead of a trip through host memory; it is not what makes
+  // a foreign handle dispatchable.
+  //
+  // Which side moves is settled before we get here: the group runs where the
+  // most bytes already are, so what crosses is the activation and never the
+  // weights. Keeping the copy -- rather than binding it and dropping it --
+  // means a run of layers on one device migrates once at its boundary, not
+  // once per layer.
+  // A MIRROR, not a move. Replacing n.buffer sends the node's home somewhere
+  // it does not belong: next step the producer -- still on the owning device --
+  // writes into a buffer that now lives across the link, which makes the value
+  // foreign again, and the fetch sustains itself forever. That loop cost ~200
+  // copies per token and was invariant to every placement policy, because
+  // placement was never what caused it.
+  //
+  // The mirror is kept per (node, member) so the allocation happens once and
+  // only the bytes are re-fetched, and the node keeps its own buffer.
+  const std::size_t owner = devices_.member_of(held);
+  backend::DeviceBuffer& mirror = impl_->peer_mirrors[{&n, member}];
+  if (!mirror.valid() || mirror.size_bytes != n.buffer.size_bytes) {
+    auto fresh = devices_.device(member).allocate(n.buffer.size_bytes,
+                                                  backend::MemoryClass::kDevice);
+    if (!fresh.ok()) return fresh.status();
+    mirror = fresh.release();
+  }
+  // The transfer runs on its own DMA engine, which knows nothing about the
+  // compute queue that is still writing these bytes. Draining the owner first
+  // is what makes the copy see a finished value rather than a partial one.
+  backend::IBackend& from = devices_.device(owner);
+  // The producing work is queued on the default stream, so draining that is
+  // enough. A whole-device synchronize here costs a tensor split one drain per
+  // layer per token, which is most of what the split was meant to save.
+  LSE_RETURN_IF_ERROR(from.synchronize_stream(backend::kDefaultStream));
+  LSE_RETURN_IF_ERROR(
+      from.copy_peer(n.buffer, mirror, n.buffer.size_bytes, 0, 0));
+  trace_.peer_migrations += 1;
+  trace_.peer_bytes += n.buffer.size_bytes;
+  return OkStatus();
 }
 
 Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
@@ -255,6 +361,12 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     n->buffer = src->buffer;
   }
 
+  // Which nodes this group writes, as opposed to reads from outside it.
+  std::unordered_set<const Node*> produced;
+  for (const NodePtr& n : group.nodes) {
+    if (n) produced.insert(n.get());
+  }
+
   // Inputs must already be materialized; outputs need a buffer to write into.
   std::vector<backend::BufferRef> bindings;
   bindings.reserve(emitted->binding_order.size());
@@ -276,7 +388,26 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // Weights and any host-computed input have to reach device memory before
     // the kernel reads them.
     LSE_RETURN_IF_ERROR(interpreter::sync_to_device(*n, be));
-    bindings.push_back(backend::BufferRef{&n->buffer, 0, n->buffer.size_bytes});
+    // Reads may be mirrored; writes may not. A node this group produces is
+    // about to be overwritten, so a foreign buffer is re-homed here rather
+     // than copied -- binding a mirror for it would send the kernel's result
+    // to the mirror and leave the node holding last step's value, which reads
+    // as a model that runs at the right speed and emits nothing.
+    const bool written = produced.contains(n.get());
+    const backend::DeviceBuffer* bind = &n->buffer;
+    if (devices_.size() > 1 && n->buffer.residency.bound() &&
+        n->buffer.residency != devices_.residency(member)) {
+      if (written) {
+        auto fresh = be.allocate(n->buffer.size_bytes,
+                                 backend::MemoryClass::kDevice);
+        if (!fresh.ok()) return fresh.status();
+        n->buffer = fresh.release();
+      } else {
+        LSE_RETURN_IF_ERROR(make_local(*n, member));
+        bind = &impl_->peer_mirrors[{n.get(), member}];
+      }
+    }
+    bindings.push_back(backend::BufferRef{bind, 0, bind->size_bytes});
   }
 
   std::size_t elements = 0;
@@ -829,8 +960,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       replayed ? rec.groups() : phase_groups;
   if (device_first && !staged_groups.empty()) {
       // Placement for the whole step, decided before any of it is issued.
+      // Placement first, because it is what the plan's ordering depends on:
+      // two groups on one stream index are ordered only if they also share a
+      // device. Decided once here and read back at dispatch, so the plan and
+      // the launch cannot disagree about where a group ran.
+      std::vector<std::size_t> group_members(staged_groups.size(), 0);
+      if (devices_.size() > 1) {
+        for (std::size_t i = 0; i < staged_groups.size(); ++i) {
+          group_members[i] = member_for(staged_groups[i]);
+        }
+      }
       impl_->plan = plan_streams(staged_groups, backend().stream_capabilities(),
-                                 backend().device_info());
+                                 backend().device_info(), group_members);
       impl_->events.assign(staged_groups.size(), backend::StreamEvent{});
       trace_.streams_used = impl_->plan.streams_used;
       trace_.stream_waits = impl_->plan.waits_total;
@@ -883,20 +1024,34 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           continue;
         }
         const backend::Stream on{impl_->plan.stream[gi]};
+        const std::size_t gm = impl_->plan.member[gi];
+        backend::IBackend& gbe = devices_.device(gm);
         Status st = OkStatus();
         if (on.index < stream_count && entered[on.index] == 0) {
           entered[on.index] = 1;
           for (std::uint32_t s = 0; s < stream_count && st.ok(); ++s) {
             if (s == on.index) continue;
-            st = backend().wait_event(on, impl_->entry_events[s]);
+            st = gbe.wait_event(on, impl_->entry_events[s]);
           }
+        }
+        // A dependency on another device is settled by draining that device's
+        // stream rather than by an event: an event belongs to the queue that
+        // recorded it, and nothing here promises one member can wait on
+        // another's. Draining costs a round trip, and a model split into
+        // contiguous blocks of layers pays it once per boundary per token --
+        // against a boundary that otherwise reads a slice of the model across
+        // the link, or reads it before it is written.
+        for (std::uint32_t j : impl_->plan.cross[gi]) {
+          if (!st.ok()) break;
+          st = devices_.device(impl_->plan.member[j])
+                   .synchronize_stream(backend::Stream{impl_->plan.stream[j]});
         }
         for (std::uint32_t j : impl_->plan.waits[gi]) {
           if (!st.ok()) break;
-          st = backend().wait_event(on, impl_->events[j]);
+          st = gbe.wait_event(on, impl_->events[j]);
           if (!st.ok()) break;
         }
-        if (st.ok()) st = try_dispatch_group(g, on, member_for(g));
+        if (st.ok()) st = try_dispatch_group(g, on, gm);
         // A joined run the emitter cannot express is not a reason to abandon
         // the phase: its members are independent by construction, so each one
         // still dispatches alone. Splitting costs one launch per member;
@@ -912,7 +1067,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
             one.inputs = n->inputs;
             one.anchor = n->kind;
             one.anchor_class = n->fclass;
-            each = try_dispatch_group(one, on, member_for(one));
+            each = try_dispatch_group(one, on, gm);
             if (!each.ok()) break;
             ++trace_.device_groups;
             ++trace_.kernels_launched;
@@ -927,7 +1082,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           }
         }
         if (st.ok() && impl_->plan.record_after[gi] != 0) {
-          auto ev = backend().record_event(on);
+          auto ev = gbe.record_event(on);
           if (ev.ok()) {
             impl_->events[gi] = ev.release();
           } else {
@@ -1005,6 +1160,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // step after that reaches them again through the state carry chain and
   // re-runs a stale KV write against a regrown pool.
   bool launched = false;
+  // This arm issues in dependency order on one stream, which orders it for
+  // free -- but only per device. Each member's default stream is its own
+  // command buffer, so a group reading what the previous one wrote on another
+  // member has nothing holding it back. Draining on the change is enough:
+  // work already behind us on this member is ordered by its own queue.
+  std::size_t issued_on = devices_.primary();
   for (const FusionGroup& g : groups) {
     std::string desc(to_string(g.anchor));
     desc += " [";
@@ -1022,8 +1183,16 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
+      const std::size_t gm = member_for(g);
+      if (gm != issued_on) {
+        const Status drained =
+            devices_.device(issued_on).synchronize_stream(
+                backend::kDefaultStream);
+        if (!drained.ok()) return drained;
+        issued_on = gm;
+      }
       Status dispatched =
-          try_dispatch_group(g, backend::kDefaultStream, member_for(g));
+          try_dispatch_group(g, backend::kDefaultStream, gm);
       if (dispatched.ok()) {
         ++trace_.device_groups;
         ++trace_.kernels_launched;
@@ -1174,6 +1343,55 @@ struct DefaultScheduler {
 void register_device_set_factory(DeviceSetFactory factory) {
   if (g_device_set_factory == nullptr) g_device_set_factory = factory;
 }
+
+namespace {
+// Not thread-local: a model loads on one thread and the value must be visible
+// to whatever allocates underneath it. Nothing else writes it.
+std::size_t g_preferred_member = static_cast<std::size_t>(-1);
+}  // namespace
+
+std::uint16_t stamped_member() noexcept {
+  return g_preferred_member == static_cast<std::size_t>(-1)
+             ? Node::kAnyMember
+             : static_cast<std::uint16_t>(g_preferred_member);
+}
+
+namespace {
+SplitScheme g_split = SplitScheme::kNone;
+}  // namespace
+
+std::string_view to_string(SplitScheme s) noexcept {
+  switch (s) {
+    case SplitScheme::kLayer: return "layer";
+    case SplitScheme::kTensor: return "tensor";
+    case SplitScheme::kNone: break;
+  }
+  return "none";
+}
+
+SplitScheme split_scheme() noexcept { return g_split; }
+void set_split_scheme(SplitScheme s) noexcept { g_split = s; }
+
+ScopedSplitScheme::ScopedSplitScheme(SplitScheme s) noexcept
+    : previous_(g_split) {
+  g_split = s;
+}
+
+ScopedSplitScheme::~ScopedSplitScheme() { g_split = previous_; }
+
+std::size_t preferred_member() noexcept {
+  const Scheduler* s = default_scheduler();
+  if (s == nullptr) return 0;
+  const backend::IDeviceSet& d = s->devices();
+  return g_preferred_member < d.size() ? g_preferred_member : d.primary();
+}
+
+ScopedMember::ScopedMember(std::size_t member) noexcept
+    : previous_(g_preferred_member) {
+  g_preferred_member = member;
+}
+
+ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
 
 Scheduler* default_scheduler() {
   static DefaultScheduler d;

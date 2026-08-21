@@ -14,6 +14,7 @@ NodePtr make(OpKind kind, Shape shape, DType dtype, std::vector<NodePtr> inputs)
   n->set_kind(kind);
   n->shape = shape;
   n->dtype = dtype;
+  n->member = stamped_member();
   // Distinct consumers, not edges: `y * y` reads y twice but is one consumer,
   // and counting it as two makes the partitioner split a chain that could
   // have stayed in one kernel.

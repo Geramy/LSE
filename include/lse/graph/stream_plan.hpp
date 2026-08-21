@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <span>
 #include <vector>
 
@@ -36,6 +37,14 @@ struct StreamPlan {
   std::vector<std::uint32_t> stream;        // per group
   std::vector<std::uint8_t> record_after;   // snapshot this stream after group i
   std::vector<std::vector<std::uint32_t>> waits;  // groups i must wait on
+  // Which device each group runs on, and the dependencies that sit on a
+  // different one. Sharing a stream index only orders two groups when they
+  // share a queue, and two members do not: the same index on each is two
+  // command buffers that know nothing about each other. Those edges are held
+  // apart from `waits` because they are settled differently -- see the
+  // scheduler -- and because an event belongs to the device that recorded it.
+  std::vector<std::size_t> member;
+  std::vector<std::vector<std::uint32_t>> cross;
   std::uint32_t streams_used = 1;
   std::uint32_t waits_total = 0;
   // Longest chain of dependent groups. The step cannot finish in fewer than
@@ -51,8 +60,11 @@ struct StreamPlan {
 [[nodiscard]] bool views_only(const FusionGroup& group) noexcept;
 
 // Groups are placed in the order given; index i of every vector is groups[i].
+// `members` is which device each group was placed on, parallel to `groups`;
+// an empty span means one device holds everything.
 [[nodiscard]] StreamPlan plan_streams(std::span<const FusionGroup> groups,
                                       const backend::StreamCapabilities& caps,
-                                      const backend::DeviceInfo& info);
+                                      const backend::DeviceInfo& info,
+                                      std::span<const std::size_t> members = {});
 
 }  // namespace lse::graph

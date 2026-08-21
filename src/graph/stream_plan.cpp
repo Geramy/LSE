@@ -62,12 +62,19 @@ struct Region {
 
 StreamPlan plan_streams(std::span<const FusionGroup> groups,
                         const backend::StreamCapabilities& caps,
-                        const backend::DeviceInfo& info) {
+                        const backend::DeviceInfo& info,
+                        std::span<const std::size_t> members) {
   const auto n = groups.size();
   StreamPlan plan;
   plan.stream.assign(n, 0);
   plan.record_after.assign(n, 0);
   plan.waits.resize(n);
+  plan.cross.resize(n);
+  plan.member.assign(n, 0);
+  for (std::size_t i = 0; i < n && i < members.size(); ++i) {
+    plan.member[i] = members[i];
+  }
+  const auto member_of = [&plan](std::uint32_t g) { return plan.member[g]; };
   if (n == 0) return plan;
   plan.chain = 0;
 
@@ -254,6 +261,10 @@ StreamPlan plan_streams(std::span<const FusionGroup> groups,
     // Everything on `target` is ordered before us already; every other stream
     // holding a dependency needs one wait, on its latest such group.
     for (std::uint32_t j : deps) {
+      if (member_of(j) != member_of(g)) {
+        plan.cross[g].push_back(j);
+        continue;
+      }
       if (plan.stream[j] == target) continue;
       bool superseded = false;
       for (std::uint32_t& queued : plan.waits[g]) {

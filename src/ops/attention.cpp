@@ -62,14 +62,22 @@ Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
   if (bytes == 0) {
     return LSE_ERROR(kInvalidArgument, "empty KV allocation");
   }
-  auto buf = sched->backend().allocate(bytes, backend::MemoryClass::kDevice);
+  // The pool belongs to the layer that reads it. Left on whoever is primary,
+  // every attention group on every other device fetches the whole pool across
+  // the link once per layer per token -- which is what it cost before the
+  // layer's own member was asked here.
+  backend::IDeviceSet& set = sched->devices();
+  const std::size_t member = graph::preferred_member();
+  backend::IBackend& be =
+      member < set.size() ? set.device(member) : sched->backend();
+  auto buf = be.allocate(bytes, backend::MemoryClass::kDevice);
   if (!buf.ok()) return buf.status();
   backend::DeviceBuffer owned = buf.release();
   // Zeroed, not just allocated. A partially filled block is read by the attention
   // kernel's last iteration and multiplied by a zero weight; with garbage bytes
   // a NaN would survive `fma(0, NaN, acc)` and poison the whole row.
   const std::vector<std::byte> zeros(bytes, std::byte{0});
-  LSE_RETURN_IF_ERROR(sched->backend().copy_h2d(zeros.data(), owned, bytes, 0));
+  LSE_RETURN_IF_ERROR(be.copy_h2d(zeros.data(), owned, bytes, 0));
   return Array::from_buffer(std::move(owned), shape, dtype);
 }
 

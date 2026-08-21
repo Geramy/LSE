@@ -98,6 +98,13 @@ LSE_DECLARE_ENUM(OpKind, std::uint16_t, LSE_OPKIND_LIST)
 class Node;
 using NodePtr = std::shared_ptr<Node>;
 
+// The member the enclosing ScopedMember named, or Node::kAnyMember when none
+// is active. Distinct from preferred_member(), which resolves "nothing placed
+// this" to the primary: a node has to keep the difference, because "belongs to
+// member 0" and "belongs wherever its operands lead" are not the same claim
+// and only the first one pins a tensor-split branch.
+[[nodiscard]] std::uint16_t stamped_member() noexcept;
+
 // A group-affine weight is three tensors, but every op that consumes a weight
 // takes one Array. The packed plane carries the other two and its geometry
 // here, so linear() and embedding() can dispatch on the storage format without
@@ -151,6 +158,18 @@ class Node {
   bool device_dirty = false;  // device holds writes the mirror has not seen
 
   std::uint32_t consumer_count = 0;
+
+  // Which pool member this node's work belongs to, or kAnyMember when nothing
+  // placed it. Stamped at construction from the enclosing ScopedMember, so the
+  // decision is made where the model is built -- where the layer, the shard and
+  // the branch are all still known -- rather than reconstructed at dispatch
+  // from which operand happens to be biggest.
+  //
+  // A tensor-split layer is several branches whose nodes differ ONLY in this
+  // field and in which shard of the weights they read, so it has to travel on
+  // the node: two branches of one layer are otherwise indistinguishable.
+  static constexpr std::uint16_t kAnyMember = 0xFFFF;
+  std::uint16_t member = kAnyMember;
 
   // Keeps kind and fclass in sync; setting kind alone silently makes a node
   // look like a leaf to the partitioner.
@@ -318,6 +337,8 @@ class Scheduler {
   // device has nowhere else to run until something moves them, and moving them
   // is what a Planner decides. With one member this is that member.
   [[nodiscard]] std::size_t member_for(const FusionGroup& group) const noexcept;
+  // Bring one operand onto `member`, copying it there if it is held elsewhere.
+  Status make_local(Node& n, std::size_t member);
   // Refuses when a binding's bytes are held by a device the target cannot read.
   Status check_residency(std::span<const backend::BufferRef> bindings,
                          std::size_t member) const;
@@ -359,6 +380,11 @@ class Scheduler {
     // the spread that was actually available, not the one that was hoped for.
     std::uint32_t streams_used = 1;
     std::uint32_t stream_waits = 0;
+    // Operands fetched from another device, and what they cost. A layer split
+    // should show one migration per block boundary per step; more than that
+    // means groups are landing away from their weights.
+    std::uint32_t peer_migrations = 0;
+    std::uint64_t peer_bytes = 0;
     std::uint32_t stream_chain = 0;
     // Compute time that overlapped an in-flight collective.
     std::uint64_t overlap_ns = 0;
@@ -499,5 +525,65 @@ void register_device_set_factory(DeviceSetFactory factory);
 
 // null when no backend could be created or initialized.
 Scheduler* default_scheduler();
+
+// Which member of that scheduler's device set new allocations should land on.
+//
+// A model spanning a pool is a placement decision made where the layers are
+// known, not where the bytes are allocated: weight loading walks the blocks in
+// order and names the member each belongs to, and the tensors built underneath
+// land there without every constructor in between learning about devices.
+// Unset -- everything except that walk -- means the primary, so a single-device
+// run behaves exactly as it did.
+//
+// Scoped rather than set-and-forget: an early return part-way through a layer
+// must not leave the next one loading onto the wrong GPU.
+[[nodiscard]] std::size_t preferred_member() noexcept;
+
+// How a model spans a pool of more than one device.
+//
+// kLayer gives each member a contiguous run of layers. The members take turns
+// -- layer n+1 needs layer n's output -- so it buys capacity and not latency,
+// and it is what a pool falls back to when a layer's weights will not divide.
+//
+// kTensor gives every member a slice of EVERY layer: the output features of
+// the projections that start a block, the input features of the ones that end
+// it. Both members then run the same layer at the same time on their own half
+// of the weights, and the partial sums are added. That is the one that makes
+// two devices' memory bandwidth add rather than alternate.
+enum class SplitScheme : std::uint8_t { kNone, kLayer, kTensor };
+
+[[nodiscard]] std::string_view to_string(SplitScheme s) noexcept;
+
+// What the pool settled on, and the setter the model calls once it knows
+// whether the shapes divide. Nothing reads a flag: kTensor is chosen when it
+// can be, and the fallback reports itself.
+[[nodiscard]] SplitScheme split_scheme() noexcept;
+void set_split_scheme(SplitScheme s) noexcept;
+
+// Holds a different scheme for a nested submodel. Not a switch for turning a
+// split off: it states that a submodel is not part of the split at all, which
+// is what a speculative draft head is. Its single block would otherwise be
+// sharded while it carries one mixer state, and the shards would index past it.
+class ScopedSplitScheme {
+ public:
+  explicit ScopedSplitScheme(SplitScheme s) noexcept;
+  ~ScopedSplitScheme();
+  ScopedSplitScheme(const ScopedSplitScheme&) = delete;
+  ScopedSplitScheme& operator=(const ScopedSplitScheme&) = delete;
+
+ private:
+  SplitScheme previous_;
+};
+
+class ScopedMember {
+ public:
+  explicit ScopedMember(std::size_t member) noexcept;
+  ~ScopedMember();
+  ScopedMember(const ScopedMember&) = delete;
+  ScopedMember& operator=(const ScopedMember&) = delete;
+
+ private:
+  std::size_t previous_;
+};
 
 }  // namespace lse::graph
