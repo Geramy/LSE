@@ -7,7 +7,7 @@
 
 #include "harness.hpp"
 
-#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202603L
+#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L
 
 LSE_TEST(reflection_counts_match_declared_enums) {
   LSE_EXPECT_EQ(lse::reflected_enum_count<lse::StatusCode>(),

@@ -15,7 +15,12 @@
 // initializes from host pointers and the body runs directly.
 #pragma once
 
-#if !defined(__cpp_impl_reflection) || __cpp_impl_reflection < 202603L
+// The floor is what this tree has actually been compiled against, not the
+// newest P2996 revision: gcc trunk r16-8246 reports 202506 and builds every
+// reflection site here unchanged, while Ubuntu 26.04 ships no g++-16 newer
+// than that. Requiring 202603 turned a compiler that works into one that
+// stops at the first header, which is a worse answer than trying.
+#if !defined(__cpp_impl_reflection) || __cpp_impl_reflection < 202506L
 #error "kernel_args.hpp needs P2996 reflection (g++-16 -std=c++26 -freflection)"
 #endif
 

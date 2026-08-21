@@ -44,7 +44,7 @@ constexpr bool table_is_ordered() {
 static_assert(table_is_ordered(),
               "kTypes must be indexed by Scalar: add the new element type's "
               "HIP spelling at its enumerator's position");
-#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202603L
+#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L
 static_assert(lse::reflected_enum_count<Scalar>() == kTypes.size(),
               "kTypes is missing a Scalar enumerator");
 #endif

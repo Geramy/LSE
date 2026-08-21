@@ -2,7 +2,7 @@
 // (GCC 16+). clangd without that flag never sees <meta> or ^^.
 #pragma once
 
-#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202603L
+#if defined(__cpp_impl_reflection) && __cpp_impl_reflection >= 202506L
 
 #include <cstddef>
 #include <meta>
