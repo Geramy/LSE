@@ -1,6 +1,7 @@
 // lse-server — the /v1 HTTP surface over one loaded model.
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <string>
@@ -19,9 +20,31 @@ namespace {
 using namespace lse;
 
 server::HttpServer* g_server = nullptr;
+volatile std::sig_atomic_t g_stopping = 0;
 
+// Sets a flag and nothing else. Closing sockets and taking locks from a signal
+// handler is what turned one ^C into four and then a kill: the handler ran on
+// whichever thread took the signal, and a decode already in flight kept the
+// worker pool -- and so listen() -- open behind it. A second signal is a user
+// saying they are done waiting, so that one leaves immediately.
 void on_signal(int) {
+  if (g_stopping != 0) std::_Exit(130);
+  g_stopping = 1;
+}
+
+// Does the stopping, off the signal handler, where locks are allowed. If the
+// listen loop has not unwound shortly after, this leaves anyway: a server owns
+// nothing that outlives the process, and the kernel reclaims the model's
+// memory and the device faster than a wedged teardown does.
+void shutdown_watch() {
+  while (g_stopping == 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
   if (g_server != nullptr) g_server->stop();
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  std::fputs("lse-server: stopped\n", stderr);
+  std::fflush(nullptr);
+  std::_Exit(0);
 }
 
 void usage() {
@@ -114,8 +137,12 @@ int main(int argc, char** argv) {
   }
   backend::IBackend& first_device = devices->device(devices->primary());
   if (first_device.emitter() == nullptr) {
+    // Say which backend declined and why. Without the reason this reads as the
+    // server choosing the host interpreter, when what happened is that every
+    // code-generating backend refused and only the fallback was left.
     std::fprintf(stderr,
-                 "lse-server: no code-generating backend came up; running on '%s' through the host interpreter, which is far slower\n",
+                 "lse-server: no code-generating backend came up (%s); running on '%s' through the host interpreter, which is far slower\n",
+                 std::string(devices->declined()).c_str(),
                  std::string(first_device.name()).c_str());
   } else {
     std::fprintf(stderr, "lse-server: device %s\n",
@@ -174,6 +201,7 @@ int main(int argc, char** argv) {
   g_server = &http;
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+  std::thread(shutdown_watch).detach();
 
   std::fprintf(stderr, "lse-server: %s on http://%s:%d\n", opt.model_id.c_str(),
                opt.host.c_str(), opt.port);

@@ -104,6 +104,11 @@ struct HttpServer::Impl {
   // KV pool, so requests queue here instead.
   std::mutex generate_lock;
   std::vector<std::uint32_t> stop_ids;
+  // Set once the process is shutting down. A decode in flight does not watch
+  // the listening socket, so without this it holds the worker pool open for as
+  // long as its completion takes and the server outlives the ^C that asked it
+  // to stop.
+  std::atomic<bool> stopping{false};
 
   Impl(model::HybridLM& m, tokenizer::Tokenizer& t, ServerOptions o)
       : model(m), tok(t), opt(std::move(o)) {
@@ -200,6 +205,7 @@ struct HttpServer::Run {
     bool stopped_by_string = false;
 
     auto on_token = [&](std::uint32_t id) -> bool {
+      if (impl.stopping.load(std::memory_order_relaxed)) return false;
       auto piece = stream.push(id);
       if (!piece.ok()) return false;
       if (piece->empty()) return true;   // mid-character, not a boundary yet
@@ -299,7 +305,10 @@ HttpServer::~HttpServer() = default;
 
 void HttpServer::use_mtp(model::MtpModule& mtp) noexcept { impl_->mtp = &mtp; }
 
-void HttpServer::stop() { impl_->http.stop(); }
+void HttpServer::stop() {
+  impl_->stopping.store(true, std::memory_order_relaxed);
+  impl_->http.stop();
+}
 
 Status HttpServer::listen() {
   Impl& impl = *impl_;
