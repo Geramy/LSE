@@ -244,6 +244,7 @@ lse_apply_common_flags(lse_graph)
 target_compile_definitions(lse_graph PRIVATE
   "LSE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\"")
 
+lse_provide_fastokens("${CMAKE_CURRENT_SOURCE_DIR}/reference/fastokens")
 lse_add_rust_staticlib(fastokens_ffi
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fastokens-ffi" fastokens_ffi)
 

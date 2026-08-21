@@ -225,24 +225,34 @@ this engine will compile kernels for.
 Both live under `reference/`, which is deliberately not tracked.
 
 **fastokens** is a path dependency of `third_party/fastokens-ffi`, so the
-tokenizer does not build without it. Use the revision CI pins:
+tokenizer does not build without it. **Configure fetches it for you** at the
+revision CI pins, into `reference/fastokens`; an existing checkout is left
+alone, whatever it is sitting on. Override with `-DLSE_FASTOKENS_REF` or
+`-DLSE_FASTOKENS_REPO`, or clone it yourself:
 
 ```bash
 git clone https://github.com/crusoecloud/fastokens.git reference/fastokens
 git -C reference/fastokens checkout 7973014e4f3a6028ac48f305704eacd64d0b4ef6
 ```
 
-**hrx-system** is the GPU backend. It builds itself; follow its `BUILDING.md`,
-and give it the AMDGPU driver:
+**hrx-system** is the GPU backend, and there is a script for it:
+
+```bash
+./scripts/bootstrap-hrx.sh          # ROCM_PATH, LSE_HRX_REPO, LSE_HRX_REF
+```
+
+It clones and builds, then prints the `-DLSE_HRX_ROOT` to configure with. This
+one is not folded into `configure` on purpose: it is an IREE-derived tree with
+its own build driver and it takes tens of minutes, which is not something a
+configure step should start on its own. To drive it by hand instead, follow its
+`BUILDING.md`:
 
 ```bash
 git clone https://github.com/ROCm/hrx-system.git reference/hrx-system
 cd reference/hrx-system
 python dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH=/opt/rocm
 python dev.py cmake build
-```
-
-Point `-DLSE_HRX_ROOT` at the install it produces. Without it the tree still
+``` Without it the tree still
 builds and the tests still pass -- on the CPU backend, which is two orders of
 magnitude slower and is not what you want to measure anything on.
 

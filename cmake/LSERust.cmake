@@ -2,6 +2,40 @@
 
 find_program(LSE_CARGO cargo)
 
+# fastokens is a path dependency of the shim and lives outside this repo, so a
+# fresh clone has nothing to build against and cargo fails with a missing
+# directory rather than anything naming the cause. Fetch it at the revision CI
+# pins. Nothing here is a fallback: the checkout is the dependency, and a build
+# that skipped it would silently drop the tokenizer.
+set(LSE_FASTOKENS_REPO "https://github.com/crusoecloud/fastokens.git"
+    CACHE STRING "Where to fetch fastokens from")
+set(LSE_FASTOKENS_REF "7973014e4f3a6028ac48f305704eacd64d0b4ef6"
+    CACHE STRING "fastokens revision to build against")
+
+function(lse_provide_fastokens dir)
+  if(EXISTS "${dir}/Cargo.toml")
+    return()   # a working copy is already there; leave whatever is checked out
+  endif()
+  find_package(Git QUIET REQUIRED)
+  message(STATUS "fetching fastokens ${LSE_FASTOKENS_REF} into ${dir}")
+  get_filename_component(_parent "${dir}" DIRECTORY)
+  file(MAKE_DIRECTORY "${_parent}")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" clone --quiet "${LSE_FASTOKENS_REPO}" "${dir}"
+    RESULT_VARIABLE _rc)
+  if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR
+      "could not clone ${LSE_FASTOKENS_REPO} into ${dir}. Clone it by hand, or "
+      "point -DLSE_FASTOKENS_REPO at a mirror.")
+  endif()
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${dir}" checkout --quiet "${LSE_FASTOKENS_REF}"
+    RESULT_VARIABLE _rc)
+  if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR "fastokens has no revision ${LSE_FASTOKENS_REF}")
+  endif()
+endfunction()
+
 # A Rust staticlib does not carry the native C libraries its crates link
 # against (pcre2, ring, ...), so the consumer must link them. Ask rustc for the
 # list instead of hardcoding it — the set changes with fastokens' dependencies.
