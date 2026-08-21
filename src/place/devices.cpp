@@ -416,8 +416,24 @@ DefaultSet& default_set() {
 // the server knows to.
 void preload_gpu_runtime() {
   namespace fs = std::filesystem;
-  // Already in the process, and new enough: nothing to do. A build linked
-  // directly against a good one lands here.
+  constexpr const char* kHsaSoname = "libhsa-runtime64.so.1";
+
+  // Somebody already put it in the process. That somebody may be a profiler
+  // that intends to intercept every HSA call, and loading a second copy beside
+  // an interposer takes the calls out from under it: the backend then fails to
+  // come up and the whole model runs on the host interpreter, which reads as
+  // the profiler showing no GPU work at all. RTLD_NOLOAD asks without loading.
+  //
+  // In an ordinary run this finds nothing, because the backend dlopens the
+  // runtime lazily during init and init has not happened yet.
+  if (void* already = dlopen(kHsaSoname, RTLD_NOLOAD | RTLD_NOW);
+      already != nullptr) {
+    dlclose(already);
+    return;
+  }
+
+  // Already in the process under some other name, and new enough: nothing to
+  // do. A build linked directly against a good one lands here.
   if (void* self = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL); self != nullptr) {
     const bool ok = dlsym(self, "hsa_amd_vmem_address_reserve_align") != nullptr;
     dlclose(self);
@@ -451,7 +467,7 @@ void preload_gpu_runtime() {
   roots.insert(roots.end(), globbed.begin(), globbed.end());
 
   for (const std::string& root : roots) {
-    const std::string path = root + "/lib/libhsa-runtime64.so.1";
+    const std::string path = root + "/lib/" + kHsaSoname;
     std::error_code ec;
     if (!fs::exists(path, ec)) continue;
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
