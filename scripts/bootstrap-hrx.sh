@@ -8,7 +8,12 @@
 set -euo pipefail
 
 repo="${LSE_HRX_REPO:-https://github.com/ROCm/hrx-system.git}"
-ref="${LSE_HRX_REF:-}"
+# The hrx-system revision this tree is built and tested against. Pinned for the
+# same reason fastokens is: upstream moves fast -- it was 819 commits ahead of
+# this within a fortnight -- and the patches below are cut against this base.
+# Raise it deliberately, with a build and a test run, not by cloning whatever
+# main happens to be.
+ref="${LSE_HRX_REF:-5927b0e0}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # `python` is not a command on a stock Ubuntu 26.04; dev.py wants an interpreter
 # by name, so pick one that exists rather than the one its docs happen to spell.
@@ -49,8 +54,11 @@ if [[ ! -d "$dir/.git" ]]; then
   git clone --recursive "$repo" "$dir"
 fi
 if [[ -n "$ref" ]]; then
-  git -C "$dir" checkout "$ref"
-  git -C "$dir" submodule update --init --recursive
+  if ! git -C "$dir" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+    git -C "$dir" fetch --quiet origin
+  fi
+  git -C "$dir" checkout --quiet "$ref"
+  git -C "$dir" submodule update --init --recursive --quiet
 fi
 
 # The AMDGPU driver is built with clang targeting amdgcn, and it will not take

@@ -257,6 +257,12 @@ git -C reference/fastokens checkout 7973014e4f3a6028ac48f305704eacd64d0b4ef6
 ./scripts/bootstrap-hrx.sh          # ROCM_PATH, LSE_HRX_REPO, LSE_HRX_REF
 ```
 
+It checks out the revision this tree is tested against rather than whatever
+`main` is -- upstream moved 819 commits inside a fortnight -- and applies the
+patches in `patches/`, which are fixes we need and have sent upstream. Applying
+is idempotent, so a checkout that already carries them, or an upstream that has
+taken them, is left alone.
+
 It clones and builds, then prints the `-DLSE_HRX_ROOT` to configure with. This
 one is not folded into `configure` on purpose: it is an IREE-derived tree with
 its own build driver and it takes tens of minutes, which is not something a
