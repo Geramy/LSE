@@ -1470,6 +1470,7 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   params.queue_affinity = 0;
   hrx_buffer_t imported = nullptr;
   auto* base = static_cast<std::byte*>(peer_ptr) + src.offset + src_offset;
+
   if (!hrx_status_is_ok(hrx_allocator_import_buffer(
           static_cast<hrx_allocator_t>(allocator_), params, base, bytes,
           &imported)) ||
