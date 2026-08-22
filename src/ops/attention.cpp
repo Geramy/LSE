@@ -70,7 +70,11 @@ Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
   const std::size_t member = graph::preferred_member();
   backend::IBackend& be =
       member < set.size() ? set.device(member) : sched->backend();
-  auto buf = be.allocate(bytes, backend::MemoryClass::kDevice);
+  const backend::Stream at =
+      member < set.size()
+          ? set.stream_for(member).value_or(backend::kDefaultStream)
+          : backend::kDefaultStream;
+  auto buf = be.allocate(bytes, backend::MemoryClass::kDevice, at);
   if (!buf.ok()) return buf.status();
   backend::DeviceBuffer owned = buf.release();
   // Zeroed, not just allocated. A partially filled block is read by the attention

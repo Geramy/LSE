@@ -1753,8 +1753,8 @@ struct CacheStubBackend final : backend::IBackend {
   const backend::DeviceInfo& device_info() const noexcept override {
     return info;
   }
-  Result<backend::DeviceBuffer> allocate(std::size_t,
-                                         backend::MemoryClass) override {
+  Result<backend::DeviceBuffer> allocate(std::size_t, backend::MemoryClass,
+                                         backend::Stream) override {
     return LSE_ERROR(kUnimplemented, "stub");
   }
   void deallocate(backend::DeviceBuffer&) noexcept override {}
@@ -1809,8 +1809,8 @@ struct SetStubBackend final : backend::IBackend {
   const backend::DeviceInfo& device_info() const noexcept override {
     return info;
   }
-  Result<backend::DeviceBuffer> allocate(std::size_t,
-                                         backend::MemoryClass) override {
+  Result<backend::DeviceBuffer> allocate(std::size_t, backend::MemoryClass,
+                                         backend::Stream) override {
     return LSE_ERROR(kUnimplemented, "stub");
   }
   void deallocate(backend::DeviceBuffer&) noexcept override {}
@@ -1915,8 +1915,8 @@ struct TwoDialectBackend final : backend::IBackend {
   const backend::DeviceInfo& device_info() const noexcept override {
     return info;
   }
-  Result<backend::DeviceBuffer> allocate(std::size_t,
-                                         backend::MemoryClass) override {
+  Result<backend::DeviceBuffer> allocate(std::size_t, backend::MemoryClass,
+                                         backend::Stream) override {
     return LSE_ERROR(kUnimplemented, "stub");
   }
   void deallocate(backend::DeviceBuffer&) noexcept override {}
@@ -2024,8 +2024,8 @@ struct EchoBackend final : backend::IBackend {
   const backend::DeviceInfo& device_info() const noexcept override {
     return info;
   }
-  Result<backend::DeviceBuffer> allocate(std::size_t,
-                                         backend::MemoryClass) override {
+  Result<backend::DeviceBuffer> allocate(std::size_t, backend::MemoryClass,
+                                         backend::Stream) override {
     return LSE_ERROR(kUnimplemented, "stub");
   }
   void deallocate(backend::DeviceBuffer&) noexcept override {}

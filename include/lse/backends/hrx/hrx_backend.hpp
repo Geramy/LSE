@@ -43,7 +43,8 @@ class HrxBackend : public Backend<HrxBackend> {
   // it) and is idempotent, so enumerating first does not stop a later bind.
   static Result<std::vector<DeviceDescriptor>> enumerate_devices();
 
-  Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls);
+  Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls,
+                                     Stream stream);
   void deallocate_impl(DeviceBuffer& buf) noexcept;
   Result<std::size_t> sample_free_memory_impl() const;
   // The agent counter this device's dispatches run against — named and rated

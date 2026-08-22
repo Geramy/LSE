@@ -400,7 +400,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // nothing — so the value has to be written whenever we allocate here.
     const bool fresh = !n->buffer.valid();
     if (fresh) {
-      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, be));
+      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, be, stream));
     }
     if (fresh && n->kind == OpKind::kConstant) {
       for (std::size_t e = 0; e < n->element_count(); ++e) {
@@ -422,7 +422,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
         n->buffer.residency != devices_.residency(member)) {
       if (written) {
         auto fresh = be.allocate(n->buffer.size_bytes,
-                                 backend::MemoryClass::kDevice);
+                                 backend::MemoryClass::kDevice, stream);
         if (!fresh.ok()) return fresh.status();
         n->buffer = fresh.release();
       } else {

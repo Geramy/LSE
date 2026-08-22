@@ -14,7 +14,8 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend);
 // Allocates the node's output buffer if it has none. The scheduler calls this
 // before handing a node to a fallback handler, so handlers can write straight
 // into it.
-Status ensure_output_buffer(Node& node, backend::IBackend& backend);
+Status ensure_output_buffer(Node& node, backend::IBackend& backend,
+                            backend::Stream stream = backend::kDefaultStream);
 
 Result<float> read_scalar(const Node& node);
 Status read_raw(const Node& node, void* dst, std::size_t bytes);

@@ -70,11 +70,17 @@ Result<Array> upload(const TensorView& v, Shape shape,
   const std::size_t member = graph::preferred_member();
   backend::IBackend& be =
       member < set.size() ? set.device(member) : sched->backend();
+  // On a set that places by stream, the stream IS the member -- this is what
+  // puts a shard's weights in its own card's VRAM.
+  const backend::Stream at =
+      member < set.size()
+          ? set.stream_for(member).value_or(backend::kDefaultStream)
+          : backend::kDefaultStream;
 
   const DType dt = device_storage(v.dtype);
   Array a = Array::zeros(shape, dt);
   graph::Node& n = *a.node();
-  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be));
+  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be, at));
   const bool native = dt == v.dtype;
 
   if (order == nullptr && win_count <= 0) {

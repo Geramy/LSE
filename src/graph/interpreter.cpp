@@ -22,7 +22,8 @@ std::size_t broadcast_index(const Shape& src, const Shape& out,
   return BroadcastMap::build(src, out).apply(out_index);
 }
 
-Status ensure_buffer(Node& n, backend::IBackend& backend) {
+Status ensure_buffer(Node& n, backend::IBackend& backend,
+                     backend::Stream stream = backend::kDefaultStream) {
   if (n.buffer.valid()) return OkStatus();
   const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
   if (bytes == 0) {
@@ -31,7 +32,7 @@ Status ensure_buffer(Node& n, backend::IBackend& backend) {
   }
   // Device-local: only kernels are expected to touch it. The host reaches it
   // through the mirror, and only when a node actually falls back to the host.
-  auto buf = backend.allocate(bytes, backend::MemoryClass::kDevice);
+  auto buf = backend.allocate(bytes, backend::MemoryClass::kDevice, stream);
   if (!buf.ok()) return buf.status();
   n.buffer = buf.release();
   return OkStatus();
@@ -1261,8 +1262,9 @@ void store_element(Node& node, std::size_t index, float value) noexcept {
   }
 }
 
-Status ensure_output_buffer(Node& node, backend::IBackend& backend) {
-  return ensure_buffer(node, backend);
+Status ensure_output_buffer(Node& node, backend::IBackend& backend,
+                            backend::Stream stream) {
+  return ensure_buffer(node, backend, stream);
 }
 
 Status evaluate(const NodePtr& node, backend::IBackend& backend) {

@@ -1090,7 +1090,7 @@ void HrxBackend::shutdown_impl() noexcept {
 }
 
 Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
-                                               MemoryClass cls) {
+                                               MemoryClass cls, Stream stream) {
 #if !LSE_HRX_LINKED
   (void)bytes;
   (void)cls;
@@ -1107,7 +1107,30 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
                : 0);
 
   hrx_buffer_t buffer = nullptr;
-  if (!staging) {
+  if (!staging && physical_count_ > 1) {
+    // Placement, through the allocator that takes one. The stream names the
+    // member whose card these bytes belong on; the stream-ordered path below
+    // carries no affinity at all, and a spanning device resolves "anywhere"
+    // to host memory every GPU can reach -- a 27B "loaded" into system RAM
+    // with every card's VRAM untouched, which amdgpu_top showed and the KFD
+    // per-process counter did not.
+    if (stream.index >= stream_affinity_.size()) {
+      return LSE_ERROR(kOutOfRange, "allocation names stream ",
+                       std::to_string(stream.index), " of ",
+                       std::to_string(stream_affinity_.size()));
+    }
+    hrx_buffer_params_t params = {};
+    params.type = HRX_MEMORY_TYPE_DEVICE_LOCAL;
+    params.access = HRX_MEMORY_ACCESS_ALL;
+    params.usage = usage;
+    params.queue_affinity =
+        static_cast<hrx_queue_affinity_t>(stream_affinity_[stream.index]);
+    LSE_RETURN_IF_ERROR(
+        from_hrx(hrx_allocator_allocate_buffer(
+                     static_cast<hrx_allocator_t>(allocator_), params, bytes,
+                     &buffer),
+                 "hrx_allocator_allocate_buffer (device)"));
+  } else if (!staging) {
     // hipMallocAsync: ordered against work already on this stream.
     // hrx_buffer_allocate flushes the stream internally (libhrx buffer.c), so
     // an allocation mid-batch submits the open command buffer for us.
@@ -1474,6 +1497,18 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   // precisely so that pass is not needed. It can decline, and then the staging
   // path below still gets the transfer done.
   // The copy engine first, then the HAL's blit path if it will not take it.
+  // A spanning device takes the runtime's own blocking transfer. It moves the
+  // bytes with the CPU across the aperture at about 0.6 GB/s -- a 14 GB load
+  // in half a minute -- where the batched stream path, with its per-call drain
+  // of every stream, decayed toward a standstill and never finished a load at
+  // all. The raw DMA paths below are single-device machinery.
+  if (physical_count_ > 1) {
+    return from_hrx(
+        hrx_synchronous_h2d(static_cast<hrx_device_t>(device_), src,
+                            reinterpret_cast<hrx_buffer_t>(dst.handle),
+                            dst.offset + dst_offset, bytes),
+        "hrx_synchronous_h2d");
+  }
   if (const Status dma = dma_host_transfer(const_cast<void*>(src), dst, bytes,
                                            dst_offset, /*to_device=*/true);
       dma.ok()) {
@@ -1574,6 +1609,15 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
   LSE_RETURN_IF_ERROR(synchronize_impl());
+  // Same choice as copy_h2d, same reason: the runtime's own blocking transfer
+  // on a spanning device, the raw single-device machinery otherwise.
+  if (physical_count_ > 1) {
+    return from_hrx(
+        hrx_synchronous_d2h(static_cast<hrx_device_t>(device_),
+                            reinterpret_cast<hrx_buffer_t>(src.handle),
+                            src.offset + src_offset, dst, bytes),
+        "hrx_synchronous_d2h");
+  }
   if (const Status dma = dma_host_transfer(dst, src, bytes, src_offset,
                                            /*to_device=*/false);
       dma.ok()) {

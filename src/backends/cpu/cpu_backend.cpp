@@ -67,7 +67,8 @@ Result<std::vector<DeviceDescriptor>> CpuBackend::enumerate_devices() {
 }
 
 Result<DeviceBuffer> CpuBackend::allocate_impl(std::size_t bytes,
-                                              MemoryClass cls) {
+                                               MemoryClass cls, Stream stream) {
+  (void)stream;  // host memory has one place to be
   // Host and device are the same memory here, so the class changes nothing.
   (void)cls;
   if (bytes == 0) return LSE_ERROR(kInvalidArgument, "zero-size allocation");

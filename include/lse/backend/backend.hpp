@@ -532,12 +532,19 @@ class Backend {
     return device_info().arch;
   }
 
+  // `stream` is a placement, not an ordering: the allocation lands where that
+  // stream's work runs. On a device spanning several GPUs the stream IS the
+  // member, so this is how a shard's weights end up in ITS card's VRAM --
+  // with no placement, a spanning device resolves "anywhere" to host memory
+  // every GPU can reach, and the model loads into RAM instead of onto a card.
+  // A single-GPU device has one place, and the default changes nothing there.
   Result<DeviceBuffer> allocate(std::size_t bytes,
-                                MemoryClass cls = MemoryClass::kDevice) {
+                                MemoryClass cls = MemoryClass::kDevice,
+                                Stream stream = kDefaultStream) {
     // The one funnel every allocation goes through, which is why residency is
     // stamped here rather than in each backend's allocate_impl: a backend
     // author cannot forget to do it.
-    auto buf = derived().allocate_impl(bytes, cls);
+    auto buf = derived().allocate_impl(bytes, cls, stream);
     if (buf.ok()) buf->residency = device_;
     return buf;
   }
@@ -800,8 +807,8 @@ class IBackend {
   // from an implementation that does not track one — so the default is honest
   // rather than merely permissive.
   virtual DeviceIndex device_index() const noexcept { return kNoDevice; }
-  virtual Result<DeviceBuffer> allocate(std::size_t bytes,
-                                        MemoryClass cls) = 0;
+  virtual Result<DeviceBuffer> allocate(std::size_t bytes, MemoryClass cls,
+                                        Stream stream = kDefaultStream) = 0;
   virtual void deallocate(DeviceBuffer& buf) noexcept = 0;
   // Bytes free on this device right now — a sample that moves under the
   // caller, never the declared total in DeviceInfo. A backend whose runtime
@@ -923,8 +930,9 @@ class BackendAdapter final : public IBackend {
   DeviceIndex device_index() const noexcept override {
     return impl_.device_index();
   }
-  Result<DeviceBuffer> allocate(std::size_t b, MemoryClass c) override {
-    return impl_.allocate(b, c);
+  Result<DeviceBuffer> allocate(std::size_t b, MemoryClass c,
+                                Stream stream) override {
+    return impl_.allocate(b, c, stream);
   }
   void deallocate(DeviceBuffer& b) noexcept override { impl_.deallocate(b); }
   Result<std::size_t> sample_free_memory() const override {

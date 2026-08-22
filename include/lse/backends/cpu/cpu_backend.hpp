@@ -30,7 +30,8 @@ class CpuBackend : public Backend<CpuBackend> {
 
   const DeviceInfo& device_info_impl() const noexcept { return info_; }
 
-  Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls);
+  Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls,
+                                     Stream stream);
   void deallocate_impl(DeviceBuffer& buf) noexcept;
 
   Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
