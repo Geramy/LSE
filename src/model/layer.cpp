@@ -419,6 +419,21 @@ Status HybridBlock::load(WeightBinder& binder, std::string_view prefix,
   const std::string p(prefix);
   LSE_ASSIGN_OR(norm1_weight_, binder.require(p + spec_.norm1_name));
   LSE_ASSIGN_OR(norm2_weight_, binder.require(p + spec_.norm2_name));
+  if (graph::split_scheme() == graph::SplitScheme::kTensor) {
+    const graph::Scheduler* sched = graph::default_scheduler();
+    const std::size_t members =
+        sched != nullptr ? sched->devices().size() : std::size_t{1};
+    norm1_shards_.resize(members);
+    norm2_shards_.resize(members);
+    for (std::size_t m = 0; m < members; ++m) {
+      const graph::ScopedMember on(m);
+      LSE_ASSIGN_OR(norm1_shards_[m], binder.require(p + spec_.norm1_name));
+      LSE_ASSIGN_OR(norm2_shards_[m], binder.require(p + spec_.norm2_name));
+    }
+  } else {
+    norm1_shards_.assign(1, norm1_weight_);
+    norm2_shards_.assign(1, norm2_weight_);
+  }
   LSE_RETURN_IF_ERROR(mixer_->load(binder, prefix, ctx));
   LSE_RETURN_IF_ERROR(ffn_->load(binder, prefix, ctx));
   if (mod_) LSE_RETURN_IF_ERROR(mod_->load(binder, prefix));
@@ -448,6 +463,62 @@ Result<Array> HybridBlock::forward(const Array& x, MixerState* state,
   LSE_ASSIGN_OR(Array dense, ffn_->ungated(h2));
   if (dense.valid()) ff = ff + dense;
   return h + ff;
+}
+
+Result<std::vector<Array>> HybridBlock::forward_shards(
+    const std::vector<Array>& xs, MixerState* state, Array* aux_loss,
+    const LayerContext& ctx) {
+  if (ctx.config == nullptr) {
+    return LSE_ERROR(kInvalidArgument, "HybridBlock::forward needs a config");
+  }
+  const std::size_t n = xs.size();
+  const float eps = ctx.config->rms_eps;
+  auto norm = [&](const Array& v, const Array& w) {
+    return zero_centered_norm_ ? ops::rms_norm_zero_centered(v, w, eps)
+                               : ops::rms_norm(v, w, eps);
+  };
+  // Every member adds every partial, so each ends up with the same total and
+  // the work after it is local. What crosses is one partial per member per
+  // reduce, in opposite directions, instead of the activation on the way in
+  // AND the sum on the way out.
+  auto reduce = [&](const std::vector<Array>& parts) {
+    std::vector<Array> out(n);
+    for (std::size_t m = 0; m < n; ++m) {
+      const graph::ScopedMember on(m);
+      Array acc = parts[m];
+      for (std::size_t j = 0; j < parts.size(); ++j) {
+        if (j != m) acc = graph::add(acc, parts[j]);
+      }
+      out[m] = acc;
+    }
+    return out;
+  };
+
+  std::vector<Array> normed(n);
+  for (std::size_t m = 0; m < n; ++m) {
+    const graph::ScopedMember on(m);
+    normed[m] = norm(xs[m], norm1_shards_[m]);
+  }
+  LSE_ASSIGN_OR(std::vector<Array> mixed,
+                mixer_->forward_shards(normed, state, ctx));
+  const std::vector<Array> mix_sum = reduce(mixed);
+
+  std::vector<Array> h(n), h2(n);
+  for (std::size_t m = 0; m < n; ++m) {
+    const graph::ScopedMember on(m);
+    h[m] = xs[m] + mix_sum[m];
+    h2[m] = norm(h[m], norm2_shards_[m]);
+  }
+
+  LSE_ASSIGN_OR(std::vector<Array> ff, ffn_->forward_shards(h2, aux_loss, ctx));
+  const std::vector<Array> ff_sum = reduce(ff);
+
+  std::vector<Array> out(n);
+  for (std::size_t m = 0; m < n; ++m) {
+    const graph::ScopedMember on(m);
+    out[m] = h[m] + ff_sum[m];
+  }
+  return out;
 }
 
 }  // namespace lse::model

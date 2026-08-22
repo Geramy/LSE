@@ -120,6 +120,8 @@ struct Scheduler::Impl {
     jit = std::make_unique<JitCache>(devices);
     return OkStatus();
   }
+  // Whether each member has queued work we have not waited on. See make_local.
+  std::vector<std::uint8_t> member_dirty;
   std::unordered_map<PeerMirrorKey, backend::DeviceBuffer, PeerMirrorHash>
       peer_mirrors;
 };
@@ -256,10 +258,19 @@ Status Scheduler::make_local(Node& n, std::size_t member) {
   // compute queue that is still writing these bytes. Draining the owner first
   // is what makes the copy see a finished value rather than a partial one.
   backend::IBackend& from = devices_.device(owner);
-  // The producing work is queued on the default stream, so draining that is
-  // enough. A whole-device synchronize here costs a tensor split one drain per
-  // layer per token, which is most of what the split was meant to save.
-  LSE_RETURN_IF_ERROR(from.synchronize_stream(backend::kDefaultStream));
+  // Drain the owner only when it has issued something since we last did. The
+  // transfer runs on a DMA engine that knows nothing about the compute queue
+  // still writing these bytes, so a drain has to happen -- but a group with
+  // several operands from one member needs one, not one apiece, and a member
+  // that has not run since the last drain needs none. Every crossing paid for
+  // its own before this, which on a tensor split is most of the step.
+  if (impl_->member_dirty.size() <= owner) {
+    impl_->member_dirty.resize(owner + 1, 1);
+  }
+  if (impl_->member_dirty[owner] != 0) {
+    LSE_RETURN_IF_ERROR(from.synchronize_stream(backend::kDefaultStream));
+    impl_->member_dirty[owner] = 0;
+  }
   LSE_RETURN_IF_ERROR(
       from.copy_peer(n.buffer, mirror, n.buffer.size_bytes, 0, 0));
   trace_.peer_migrations += 1;
@@ -488,6 +499,10 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   LSE_RETURN_IF_ERROR(check_residency(bindings, member));
 
   const auto t_launch = bind_span.close();
+  if (impl_->member_dirty.size() <= member) {
+    impl_->member_dirty.resize(member + 1, 0);
+  }
+  impl_->member_dirty[member] = 1;
   const Status submitted = be.launch(
       launched, emitted->dims, args,
       backend::DispatchTarget{stream, devices_.residency(member), {}});

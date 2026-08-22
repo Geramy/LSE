@@ -197,6 +197,20 @@ class IMixer {
   [[nodiscard]] virtual bool shards_across_pool() const noexcept {
     return false;
   }
+
+  // One partial per member, un-summed, given one input per member.
+  //
+  // The block adds them, because the block is what knows where the sum has to
+  // end up: on EVERY member, so the residual and the norms that follow are
+  // local work rather than a fetch. Summing here and handing back one array
+  // would put the whole residual stream on one device and make every branch of
+  // the next layer reach across the link for its input.
+  virtual Result<std::vector<Array>> forward_shards(
+      const std::vector<Array>& xs, MixerState* state,
+      const LayerContext& ctx) {
+    LSE_ASSIGN_OR(Array y, forward(xs.front(), state, ctx));
+    return std::vector<Array>{std::move(y)};
+  }
 };
 
 class IFeedForward {
@@ -204,6 +218,13 @@ class IFeedForward {
   virtual ~IFeedForward() = default;
   virtual Status load(WeightBinder&, std::string_view prefix,
                       const LayerContext&) = 0;
+  // One partial per member; see IMixer::forward_shards.
+  virtual Result<std::vector<Array>> forward_shards(
+      const std::vector<Array>& xs, Array* aux_loss,
+      const LayerContext& ctx) {
+    LSE_ASSIGN_OR(Array y, forward(xs.front(), aux_loss, ctx));
+    return std::vector<Array>{std::move(y)};
+  }
   // aux_loss accumulates router/MoD regularizers; null outside training.
   virtual Result<Array> forward(const Array& x, Array* aux_loss,
                                 const LayerContext&) = 0;
@@ -273,6 +294,13 @@ class HybridBlock {
   Result<Array> forward(const Array& x, MixerState* state, Array* aux_loss,
                         const LayerContext& ctx);
 
+  // The same block with the activation held on every member at once. Returns
+  // one array per member, each holding the whole layer output: the partials
+  // are summed once per member so the residual stream never has to be fetched.
+  Result<std::vector<Array>> forward_shards(const std::vector<Array>& xs,
+                                            MixerState* state, Array* aux_loss,
+                                            const LayerContext& ctx);
+
   [[nodiscard]] const IMixer& mixer() const noexcept { return *mixer_; }
   [[nodiscard]] IMixer& mixer() noexcept { return *mixer_; }
   [[nodiscard]] const IFeedForward& ffn() const noexcept { return *ffn_; }
@@ -284,6 +312,10 @@ class HybridBlock {
   HybridBlockSpec spec_;
   Array norm1_weight_;
   Array norm2_weight_;
+  // A copy per member when the block is split: the norms are elementwise and
+  // cheap, so running them redundantly on each device costs less than moving
+  // their input across the link.
+  std::vector<Array> norm1_shards_, norm2_shards_;
   bool zero_centered_norm_ = false;
 };
 

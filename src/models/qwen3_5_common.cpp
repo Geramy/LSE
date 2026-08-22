@@ -209,6 +209,18 @@ class Qwen35Attention final : public IMixer {
     return true;
   }
 
+  Result<std::vector<Array>> forward_shards(const std::vector<Array>& xs,
+                                            MixerState* state,
+                                            const LayerContext& ctx) override {
+    (void)ctx;
+    std::vector<Array> parts(w_.size());
+    for (std::size_t m = 0; m < w_.size(); ++m) {
+      const graph::ScopedMember on(m);
+      LSE_ASSIGN_OR(parts[m], shard_forward(xs[m], state, m));
+    }
+    return parts;
+  }
+
   Result<Array> forward(const Array& x, MixerState* state,
                         const LayerContext& ctx) override {
     (void)ctx;
@@ -217,28 +229,35 @@ class Qwen35Attention final : public IMixer {
       const std::optional<graph::ScopedMember> on =
           w_.size() > 1 ? std::optional<graph::ScopedMember>(std::in_place, m)
                         : std::nullopt;
-      Array part;
-      if (state == nullptr) {
-        LSE_ASSIGN_OR(part, ops::gated_attention(x, w_[m], spec_[m], rope_, 0));
-      } else {
-        MixerState& st = state[m];
-        ops::AttentionCache cache;
-        cache.keys = st.key_cache;
-        cache.values = st.value_cache;
-        cache.table = st.paged.table;
-        cache.meta = st.kv_meta;
-        cache.paged = &st.paged;
-        cache.capacity = spec_[m].kv_length;
-        cache.used = st.position;
-        LSE_ASSIGN_OR(part, ops::gated_attention(x, w_[m], spec_[m], rope_,
-                                                 st.position, &cache));
-        st.key_cache = cache.keys;
-        st.value_cache = cache.values;
-      }
+      LSE_ASSIGN_OR(Array part, shard_forward(x, state, m));
       sum = m == 0 ? part : graph::add(sum, part);
     }
     return sum;
   }
+
+ private:
+  Result<Array> shard_forward(const Array& x, MixerState* state,
+                              std::size_t m) {
+    if (state == nullptr) {
+      return ops::gated_attention(x, w_[m], spec_[m], rope_, 0);
+    }
+    MixerState& st = state[m];
+    ops::AttentionCache cache;
+    cache.keys = st.key_cache;
+    cache.values = st.value_cache;
+    cache.table = st.paged.table;
+    cache.meta = st.kv_meta;
+    cache.paged = &st.paged;
+    cache.capacity = spec_[m].kv_length;
+    cache.used = st.position;
+    LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_[m], spec_[m], rope_,
+                                                st.position, &cache));
+    st.key_cache = cache.keys;
+    st.value_cache = cache.values;
+    return y;
+  }
+
+ public:
 
  private:
   std::vector<ops::GatedAttentionWeights> w_;
@@ -374,6 +393,18 @@ class Qwen35GatedDeltaNet final : public IMixer {
     return true;
   }
 
+  Result<std::vector<Array>> forward_shards(const std::vector<Array>& xs,
+                                            MixerState* state,
+                                            const LayerContext& ctx) override {
+    (void)ctx;
+    std::vector<Array> parts(w_.size());
+    for (std::size_t m = 0; m < w_.size(); ++m) {
+      const graph::ScopedMember on(m);
+      LSE_ASSIGN_OR(parts[m], shard_forward(xs[m], state, m));
+    }
+    return parts;
+  }
+
   Result<Array> forward(const Array& x, MixerState* state,
                         const LayerContext& ctx) override {
     (void)ctx;
@@ -382,6 +413,15 @@ class Qwen35GatedDeltaNet final : public IMixer {
       const std::optional<graph::ScopedMember> on =
           w_.size() > 1 ? std::optional<graph::ScopedMember>(std::in_place, m)
                         : std::nullopt;
+      LSE_ASSIGN_OR(Array part, shard_forward(x, state, m));
+      sum = m == 0 ? part : graph::add(sum, part);
+    }
+    return sum;
+  }
+
+ private:
+  Result<Array> shard_forward(const Array& x, MixerState* state,
+                              std::size_t m) {
       ops::GatedDeltaNetState carried;
       MixerState* st = state != nullptr ? &state[m] : nullptr;
       if (st != nullptr) {
@@ -395,10 +435,10 @@ class Qwen35GatedDeltaNet final : public IMixer {
         st->gdn_state = carried.recurrent;
         st->gdn_conv_qkv = carried.conv_qkv;
       }
-      sum = m == 0 ? part : graph::add(sum, part);
-    }
-    return sum;
+      return part;
   }
+
+ public:
 
  private:
   std::vector<ops::GatedDeltaNetWeights> w_;
@@ -481,6 +521,19 @@ class Qwen35MLP final : public IFeedForward {
       sum = graph::add(sum, partial[m]);
     }
     return sum;
+  }
+
+  Result<std::vector<Array>> forward_shards(const std::vector<Array>& xs,
+                                            Array* aux_loss,
+                                            const LayerContext& ctx) override {
+    (void)aux_loss;
+    (void)ctx;
+    std::vector<Array> parts(gate_.size());
+    for (std::size_t m = 0; m < gate_.size(); ++m) {
+      const graph::ScopedMember on(m);
+      parts[m] = ops::swiglu(xs[m], gate_[m], up_[m], down_[m]);
+    }
+    return parts;
   }
 
  private:

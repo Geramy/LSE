@@ -521,6 +521,27 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   LSE_ASSIGN_OR(Array x, embed(tokens));
   if (trace != nullptr) trace->reserve(blocks_.size());
 
+  const std::size_t shards = state_shards();
+  if (shards > 1) {
+    // The activation is carried on every member from the embedding to the
+    // head, so a layer's branches read their input locally and only the
+    // partial sums cross. Collapsing to one member between layers would put
+    // the whole residual stream on one device and make the crossing the step.
+    // Every member starts from the one embedding; each fetches it once, and
+    // from the first layer on each is producing its own.
+    std::vector<Array> xs(shards, x);
+    for (std::size_t i = 0; i < blocks_.size(); ++i) {
+      LayerContext ctx;
+      ctx.config = &config_;
+      ctx.layer_index = static_cast<std::int32_t>(i);
+      ctx.shards = static_cast<std::int32_t>(shards);
+      MixerState* state =
+          states != nullptr ? &(*states)[i * shards] : nullptr;
+      LSE_ASSIGN_OR(xs, blocks_[i]->forward_shards(xs, state, aux_loss, ctx));
+      if (trace != nullptr) trace->push_back(xs[0]);
+    }
+    x = xs[0];
+  } else {
   for (std::size_t i = 0; i < blocks_.size(); ++i) {
     LayerContext ctx;
     ctx.config = &config_;
@@ -532,6 +553,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
         member_for_layer(static_cast<std::int32_t>(i)));
     LSE_ASSIGN_OR(x, blocks_[i]->forward(x, state, aux_loss, ctx));
     if (trace != nullptr) trace->push_back(x);
+  }
   }
 
   // One eval for the residual and every mixer cache, so the 20 blocks stay
