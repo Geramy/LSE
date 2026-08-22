@@ -159,10 +159,33 @@ Result<std::vector<probe::DeviceId>> parse_selector(std::string_view text) {
     if (comma == std::string_view::npos) break;
     rest = rest.substr(comma + 1);
   }
+
+  // A pool whose members all sit on one backend can ask that backend to present
+  // them as a single device. Where it can, they share an allocator and an
+  // address space, and work placed on one member reads what another wrote
+  // without a copy; where it cannot, the request is ignored and the members are
+  // opened one device each as before. Said here because it has to be said
+  // before any of them is opened.
+  if (out.size() > 1) {
+    bool one_backend = true;
+    for (const probe::DeviceId& id : out) {
+      if (id.backend != out.front().backend) one_backend = false;
+    }
+    if (one_backend) {
+      std::string group;
+      for (const probe::DeviceId& id : out) {
+        if (!group.empty()) group += ',';
+        group += std::to_string(id.ordinal);
+      }
+      backend::request_device_group(out.front().backend, group);
+    }
+  }
   return out;
 }
 
 struct Devices::Impl {
+  // One device holding every member; see Devices::open.
+  bool spanning = false;
   // Owns the backends. Every buffer stamped with a member's DeviceIndex is
   // released by the instance held here, so this vector outliving those buffers
   // is the invariant the whole layer rests on.
@@ -182,6 +205,13 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
 
   LSE_ASSIGN_OR(const std::vector<probe::DeviceId> named,
                 parse_selector(selector));
+
+  // A pool of several members on one backend is opened as one spanning device
+  // when that backend agreed to present it that way; parse_selector is what
+  // asked, and an empty answer means it declined or was never asked.
+  const bool spanning =
+      named.size() > 1 &&
+      !backend::requested_device_group(named.front().backend).empty();
 
   std::map<std::string, std::vector<backend::DeviceDescriptor>, std::less<>>
       enumerated;
@@ -231,6 +261,33 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
                      impl.declined, impl.declined.empty() ? "" : ")");
   }
 
+  // One backend for a device that spans the pool. Its members differ by the
+  // stream they run on -- which is the GPU's queues -- not by which device they
+  // are, so there is one instance, one allocator, and one address space.
+  if (spanning) {
+    auto be = backend::create_backend(named.front().backend);
+    if (!be.ok()) return be.status();
+    auto candidate = be.release();
+    if (const Status init = candidate->init(0); !init.ok()) {
+      return LSE_ERROR(kDeviceError, "the device spanning ",
+                       std::to_string(named.size()),
+                       " GPUs will not come up: ", init.to_string());
+    }
+    backend::IBackend* shared = candidate.get();
+    impl.owned.push_back(std::move(candidate));
+    for (std::size_t m = 0; m < named.size(); ++m) {
+      enumerate_once(named[m].backend);
+      Member mem;
+      mem.id = named[m];
+      mem.index = shared->device_index();
+      mem.backend = shared;
+      mem.descriptor = describe(enumerated, named[m]);
+      impl.members.push_back(std::move(mem));
+    }
+    impl.spanning = true;
+    return set;
+  }
+
   for (const probe::DeviceId& id : named) {
     auto be = backend::create_backend(id.backend);
     if (!be.ok()) return be.status();
@@ -246,6 +303,12 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
 }
 
 std::size_t Devices::size() const noexcept { return impl_->members.size(); }
+
+std::optional<backend::Stream> Devices::stream_for(
+    std::size_t member) const noexcept {
+  if (!impl_->spanning || member >= impl_->members.size()) return std::nullopt;
+  return backend::Stream{static_cast<std::uint32_t>(member)};
+}
 
 backend::IBackend& Devices::device(std::size_t i) const {
   return *impl_->members[i].backend;

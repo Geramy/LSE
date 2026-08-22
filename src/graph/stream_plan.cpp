@@ -63,7 +63,8 @@ struct Region {
 StreamPlan plan_streams(std::span<const FusionGroup> groups,
                         const backend::StreamCapabilities& caps,
                         const backend::DeviceInfo& info,
-                        std::span<const std::size_t> members) {
+                        std::span<const std::size_t> members,
+                        std::span<const std::uint32_t> forced) {
   const auto n = groups.size();
   StreamPlan plan;
   plan.stream.assign(n, 0);
@@ -75,6 +76,7 @@ StreamPlan plan_streams(std::span<const FusionGroup> groups,
     plan.member[i] = members[i];
   }
   const auto member_of = [&plan](std::uint32_t g) { return plan.member[g]; };
+  const bool pinned = forced.size() == n;
   if (n == 0) return plan;
   plan.chain = 0;
 
@@ -221,7 +223,11 @@ StreamPlan plan_streams(std::span<const FusionGroup> groups,
     // is free — the command buffer is in order — so that is always the first
     // choice, and it is what keeps a dependency chain on one stream.
     std::uint32_t target = 0;
-    if (deps.empty()) {
+    if (pinned) {
+      // Already decided: the caller places by stream, so every dependency on
+      // another one is stated as a wait below rather than avoided by moving.
+      target = forced[g];
+    } else if (deps.empty()) {
       // Free of every event, but not free: the same cost model decides here as
       // below, because a backend whose other streams cost more per launch loses
       // on an unconstrained group exactly as it loses on a moved one. Without
@@ -261,7 +267,10 @@ StreamPlan plan_streams(std::span<const FusionGroup> groups,
     // Everything on `target` is ordered before us already; every other stream
     // holding a dependency needs one wait, on its latest such group.
     for (std::uint32_t j : deps) {
-      if (member_of(j) != member_of(g)) {
+      // A pinned plan is one device whose streams are its members, and two
+      // streams of one device are ordered by an event like any other pair --
+      // there is no second queue family to reach across.
+      if (!pinned && member_of(j) != member_of(g)) {
         plan.cross[g].push_back(j);
         continue;
       }

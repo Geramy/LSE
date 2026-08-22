@@ -1030,6 +1030,10 @@ void HrxBackend::release_buffer(std::uint64_t handle) noexcept {
 
 void HrxBackend::shutdown_impl() noexcept {
 #if LSE_HRX_LINKED
+  for (void* e : recorded_events_) hrx_event_release(static_cast<hrx_event_t>(e));
+#endif
+  recorded_events_.clear();
+#if LSE_HRX_LINKED
   for (void*& s : streams_) {
     if (s == nullptr) continue;
     hrx_stream_release(static_cast<hrx_stream_t>(s));
@@ -1453,66 +1457,6 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
 #endif
 }
 
-Result<DeviceBuffer> HrxBackend::import_peer_impl(const DeviceBuffer& src) {
-#if !LSE_HRX_LINKED
-  (void)src;
-  return LSE_ERROR(kUnimplemented, "libhrx not linked");
-#else
-  if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
-  if (src.handle == 0) {
-    return LSE_ERROR(kInvalidArgument, "no buffer to import");
-  }
-  // The address the owner's allocation actually sits at. Peer access was
-  // granted to it when it was allocated, so this device may follow it; what it
-  // may not do is resolve the owner's handle, which is what this replaces.
-  void* device_ptr = nullptr;
-  LSE_RETURN_IF_ERROR(
-      from_hrx(hrx_buffer_get_device_ptr(
-                   reinterpret_cast<hrx_buffer_t>(src.handle), &device_ptr),
-               "hrx_buffer_get_device_ptr"));
-  if (device_ptr == nullptr) {
-    return LSE_ERROR(kUnimplemented, "the peer buffer has no address to import");
-  }
-
-  // get_device_ptr names the allocation, not the window onto it that this
-  // buffer may be. Importing the base while claiming the window's length maps
-  // the wrong bytes -- and, past the end of a short view, unmapped ones: the
-  // dispatch faulted on a page that was never part of the import.
-  auto* base = static_cast<std::byte*>(device_ptr) + src.offset;
-
-  hrx_buffer_params_t params = {};
-  params.type = HRX_MEMORY_TYPE_DEVICE_LOCAL;
-  params.access = HRX_MEMORY_ACCESS_ALL;
-  params.usage = HRX_BUFFER_USAGE_DISPATCH_STORAGE | HRX_BUFFER_USAGE_TRANSFER;
-  params.queue_affinity = 0;
-  hrx_buffer_t imported = nullptr;
-  LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_allocator_import_buffer(static_cast<hrx_allocator_t>(allocator_),
-                                  params, base, src.size_bytes, &imported),
-      "hrx_allocator_import_buffer"));
-
-  DeviceBuffer out;
-  out.size_bytes = src.size_bytes;
-  // The window is already folded into the imported base, so this view starts
-  // at zero; carrying the original offset as well would apply it twice.
-  out.offset = 0;
-  out.handle = reinterpret_cast<std::uint64_t>(imported);
-  out.residency = device_index();
-  // The import is a view of someone else's allocation: releasing it must not
-  // free those bytes, only this device's mapping of them. It must, however,
-  // keep them alive -- the view is a raw address, and this engine recycles
-  // buffer slots, so an import that let its source be reused would leave a
-  // kernel reading an unmapped page.
-  auto source = src.storage;
-  out.storage = std::shared_ptr<void>(
-      imported, [source](void* p) mutable {
-        hrx_buffer_release(reinterpret_cast<hrx_buffer_t>(p));
-        source.reset();
-      });
-  return out;
-#endif
-}
-
 Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                                   std::size_t bytes, std::size_t src_offset,
                                   std::size_t dst_offset) {
@@ -1807,20 +1751,33 @@ Result<StreamEvent> HrxBackend::record_event_impl(Stream stream) {
     return none;
   }
 
-  // The timeline only advances on submit, so the batch has to go now — this
-  // is the one place batching yields, and it yields because a consumer is
-  // about to depend on the result.
-  LSE_RETURN_IF_ERROR(flush_stream(stream.index));
-
-  hrx_timeline_point_t point = {};
+  // The runtime's own synchronization point, not one assembled out of queue
+  // barriers and timeline arithmetic here. hrx_event_record carries its own
+  // semaphore signalled when the stream reaches this point, so a consumer waits
+  // on THAT rather than on the producing stream's latest reservation -- which
+  // may itself be a barrier waiting back, and with two streams ordering against
+  // each other is a deadlock. hrx_stream_advance_timeline, which the previous
+  // implementation used here, is documented for out-of-band work that will
+  // signal the returned point later, which is not this.
+  hrx_event_t event = nullptr;
   LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_stream_get_timeline_position(
-          static_cast<hrx_stream_t>(streams_[stream.index]), &point),
-      "hrx_stream_get_timeline_position"));
+      hrx_event_create(static_cast<hrx_device_t>(device_),
+                       HRX_EVENT_FLAG_DISABLE_TIMING, &event),
+      "hrx_event_create"));
+  const hrx_status_t recorded = hrx_event_record(
+      event, static_cast<hrx_stream_t>(streams_[stream.index]));
+  if (!hrx_status_is_ok(recorded)) {
+    hrx_event_release(event);
+    return from_hrx(recorded, "hrx_event_record");
+  }
+  // Held until the step that recorded it is done with it; released together, so
+  // an event is never freed while a queued wait still names it.
+  recorded_events_.push_back(event);
+
   StreamEvent ev;
   ev.stream = stream;
-  ev.timeline = point.value;
-  ev.semaphore = point.semaphore;
+  ev.timeline = static_cast<std::uint64_t>(recorded_events_.size());
+  ev.handle = event;
   ev.device = device_index();
   return ev;
 #endif
@@ -1831,82 +1788,13 @@ Status HrxBackend::wait_event_impl(Stream stream, const StreamEvent& event) {
   (void)stream; (void)event;
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
-  if (!event.valid()) return OkStatus();
-  const bool foreign = event.device.bound() && event.device != device_index();
-  // Work on one stream is already ordered against itself -- but only when it
-  // IS one stream. The same index on another device is a different queue.
-  if (event.stream == stream && !foreign) return OkStatus();
+  if (!event.valid() || event.handle == nullptr) return OkStatus();
   auto waiter = stream_at(stream.index);
   if (!waiter.ok()) return waiter.status();
-  auto* waiting = static_cast<hrx_stream_t>(*waiter);
-
-  hrx_semaphore_t produced = nullptr;
-  if (foreign) {
-    // The recorder handed us the object itself, because we cannot look up a
-    // stream we do not own. A semaphore is process-scoped, so the barrier
-    // below can wait on another device's timeline without the host blocking.
-    produced = static_cast<hrx_semaphore_t>(event.semaphore);
-    if (produced == nullptr) {
-      return LSE_ERROR(kInvalidArgument,
-                       "a foreign event carries no semaphore to wait on");
-    }
-  } else {
-    if (event.stream.index >= streams_.size() ||
-        streams_[event.stream.index] == nullptr) {
-      return LSE_ERROR(kInvalidArgument,
-                       "event names a stream that has no work");
-    }
-    LSE_RETURN_IF_ERROR(from_hrx(
-        hrx_stream_get_semaphore(
-            static_cast<hrx_stream_t>(streams_[event.stream.index]), &produced),
-        "hrx_stream_get_semaphore"));
-  }
-
-  // Everything already recorded here has to be submitted before the barrier
-  // that follows it, or the barrier would be ordered ahead of it.
-  LSE_RETURN_IF_ERROR(flush_stream(stream.index));
-
-  hrx_timeline_point_t self = {};
-  LSE_RETURN_IF_ERROR(
-      from_hrx(hrx_stream_get_timeline_position(waiting, &self),
-               "hrx_stream_get_timeline_position"));
-
-  std::uint64_t next = 0;
-  LSE_RETURN_IF_ERROR(from_hrx(hrx_stream_advance_timeline(waiting, &next),
-                               "hrx_stream_advance_timeline"));
-
-  // The barrier waits on the producer AND on this stream's own current
-  // position before signalling the position everything after it will wait on.
-  //
-  // hrx_stream_wait_on() would be the obvious call and is wrong here: it omits
-  // the second wait, so on a stream with work still in flight the barrier can
-  // signal position+1 while position itself is unreached. A timeline that
-  // jumps ahead of its own work releases every later wait early — including
-  // the one inside hrx_stream_synchronize — and the stream silently stops
-  // being ordered against itself.
-  hrx_semaphore_t wait_semaphores[2] = {produced, self.semaphore};
-  std::uint64_t wait_values[2] = {event.timeline, self.value};
-  hrx_semaphore_list_t waits = {};
-  waits.semaphores = wait_semaphores;
-  waits.values = wait_values;
-  waits.count = self.value > 0 ? 2 : 1;
-
-  hrx_semaphore_t signal_semaphore = self.semaphore;
-  std::uint64_t signal_value = next;
-  hrx_semaphore_list_t signals = {};
-  signals.semaphores = &signal_semaphore;
-  signals.values = &signal_value;
-  signals.count = 1;
-
-  // On the waiting stream's own queue: a barrier submitted anywhere else would
-  // order that queue instead of this one.
-  LSE_RETURN_IF_ERROR(
-      from_hrx(hrx_queue_barrier(static_cast<hrx_device_t>(device_),
-                                 stream_affinity_[stream.index], &waits,
-                                 &signals),
-               "hrx_queue_barrier"));
-  unflushed_launches_[stream.index] = 0;
-  return OkStatus();
+  return from_hrx(
+      hrx_stream_wait_event(static_cast<hrx_stream_t>(*waiter),
+                            static_cast<hrx_event_t>(event.handle)),
+      "hrx_stream_wait_event");
 #endif
 }
 

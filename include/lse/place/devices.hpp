@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -66,6 +67,8 @@ class Devices final : public backend::IDeviceSet {
   Devices& operator=(const Devices&) = delete;
 
   std::size_t size() const noexcept override;
+  std::optional<backend::Stream> stream_for(
+      std::size_t member) const noexcept override;
   backend::IBackend& device(std::size_t i) const override;
   std::size_t primary() const noexcept override;
   std::size_t member_of(backend::DeviceIndex d) const noexcept override;

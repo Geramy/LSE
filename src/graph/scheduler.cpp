@@ -997,8 +997,20 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           group_members[i] = member_for(staged_groups[i]);
         }
       }
+      // When the set places by stream, the plan is told where each group runs
+      // rather than choosing: its waits have to name the streams the work is
+      // actually on.
+      std::vector<std::uint32_t> pinned;
+      if (devices_.stream_for(devices_.primary()).has_value()) {
+        pinned.resize(staged_groups.size());
+        for (std::size_t i = 0; i < staged_groups.size(); ++i) {
+          pinned[i] = devices_.stream_for(group_members[i])
+                          .value_or(backend::kDefaultStream)
+                          .index;
+        }
+      }
       impl_->plan = plan_streams(staged_groups, backend().stream_capabilities(),
-                                 backend().device_info(), group_members);
+                                 backend().device_info(), group_members, pinned);
       impl_->events.assign(staged_groups.size(), backend::StreamEvent{});
       trace_.streams_used = impl_->plan.streams_used;
       trace_.stream_waits = impl_->plan.waits_total;
@@ -1050,8 +1062,13 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           ++done;
           continue;
         }
-        const backend::Stream on{impl_->plan.stream[gi]};
         const std::size_t gm = impl_->plan.member[gi];
+        // A set that spans several GPUs on one device places by stream: the
+        // member says which GPU, and the stream is how the runtime is told.
+        // Everything else keeps the stream the plan chose.
+        const backend::Stream on =
+            devices_.stream_for(gm).value_or(
+                backend::Stream{impl_->plan.stream[gi]});
         backend::IBackend& gbe = devices_.device(gm);
         Status st = OkStatus();
         if (on.index < stream_count && entered[on.index] == 0) {
@@ -1068,10 +1085,26 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         // contiguous blocks of layers pays it once per boundary per token --
         // against a boundary that otherwise reads a slice of the model across
         // the link, or reads it before it is written.
+        // A dependency on another member is ordered the same way one on
+        // another stream is: the producer records where it has got to, and we
+        // wait for that point. Across members the event carries the semaphore
+        // it counts on, because the waiting device cannot resolve a stream it
+        // does not own. Draining the producer instead -- which is what this
+        // did while members were separate devices and a copy sat between them
+        // -- blocks the host once per edge and stops the two from overlapping
+        // at all.
         for (std::uint32_t j : impl_->plan.cross[gi]) {
           if (!st.ok()) break;
-          st = devices_.device(impl_->plan.member[j])
-                   .synchronize_stream(backend::Stream{impl_->plan.stream[j]});
+          const std::size_t owner = impl_->plan.member[j];
+          auto ev = devices_.device(owner).record_event(
+              devices_.stream_for(owner).value_or(
+                  backend::Stream{impl_->plan.stream[j]}));
+          if (!ev.ok()) {
+            st = ev.status();
+            break;
+          }
+          const backend::StreamEvent produced = ev.release();
+          if (produced.valid()) st = gbe.wait_event(on, produced);
         }
         for (std::uint32_t j : impl_->plan.waits[gi]) {
           if (!st.ok()) break;
@@ -1193,6 +1226,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // member has nothing holding it back. Draining on the change is enough:
   // work already behind us on this member is ordered by its own queue.
   std::size_t issued_on = devices_.primary();
+  // Where each member had got to when we last issued work on it. Taken right
+  // after the dispatch, so it names that work and nothing queued behind it.
+  std::vector<backend::StreamEvent> last_issue(devices_.size());
   for (const FusionGroup& g : groups) {
     std::string desc(to_string(g.anchor));
     desc += " [";
@@ -1210,16 +1246,40 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
-      const std::size_t gm = member_for(g);
+      std::size_t gm = member_for(g);
+      // This arm carries no dependency information -- it issues in order and
+      // relies on one stream to order it. Across members that needs a barrier
+      // per switch, and a barrier per switch is a cycle: each stream ends up
+      // waiting on the other's latest point, which is itself a barrier waiting
+      // back. Measured as a 0-1-0-1 ping-pong that deadlocks on the first pair.
+      //
+      // When the set places by stream there is one address space, so WHICH GPU
+      // runs a kernel is a performance choice and never a correctness one --
+      // and the safe answer for a path that cannot see its dependencies is to
+      // keep them all on one stream, where submission order is the ordering.
+      if (devices_.stream_for(gm).has_value()) gm = devices_.primary();
       if (gm != issued_on) {
-        const Status drained =
-            devices_.device(issued_on).synchronize_stream(
-                backend::kDefaultStream);
-        if (!drained.ok()) return drained;
+        // Wait on the point the producer had reached when it was ISSUED, not
+        // on wherever it has got to now. Recording lazily here would flush the
+        // producer's stream first -- and that stream may already carry its own
+        // barrier waiting on us, so the point we captured could only be reached
+        // after we release it, and neither side ever does. That deadlock is
+        // what the recorded-at-dispatch events below exist to avoid.
+        if (last_issue.size() > issued_on && last_issue[issued_on].valid()) {
+          const backend::Stream to =
+              devices_.stream_for(gm).value_or(backend::kDefaultStream);
+          LSE_RETURN_IF_ERROR(
+              devices_.device(gm).wait_event(to, last_issue[issued_on]));
+        }
         issued_on = gm;
       }
-      Status dispatched =
-          try_dispatch_group(g, backend::kDefaultStream, gm);
+      const backend::Stream on =
+          devices_.stream_for(gm).value_or(backend::kDefaultStream);
+      Status dispatched = try_dispatch_group(g, on, gm);
+      if (dispatched.ok() && devices_.size() > 1) {
+        auto ev = devices_.device(gm).record_event(on);
+        if (ev.ok()) last_issue[gm] = ev.release();
+      }
       if (dispatched.ok()) {
         ++trace_.device_groups;
         ++trace_.kernels_launched;

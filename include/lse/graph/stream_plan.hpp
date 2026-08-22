@@ -62,9 +62,13 @@ struct StreamPlan {
 // Groups are placed in the order given; index i of every vector is groups[i].
 // `members` is which device each group was placed on, parallel to `groups`;
 // an empty span means one device holds everything.
+// `forced` pins a group to a stream the caller has already chosen -- what a
+// device set that places by stream does, where the stream IS the member and the
+// planner has no freedom to move it. Empty means the planner places.
 [[nodiscard]] StreamPlan plan_streams(std::span<const FusionGroup> groups,
                                       const backend::StreamCapabilities& caps,
                                       const backend::DeviceInfo& info,
-                                      std::span<const std::size_t> members = {});
+                                      std::span<const std::size_t> members = {},
+                                      std::span<const std::uint32_t> forced = {});
 
 }  // namespace lse::graph

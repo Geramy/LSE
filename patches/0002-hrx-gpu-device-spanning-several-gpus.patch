@@ -1,0 +1,97 @@
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+index 2fada922..bfccab86 100644
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -486,6 +486,26 @@ hrx_runtime_set_device_event_sink(hrx_device_event_sink_t sink);
+ //===----------------------------------------------------------------------===//
+ 
+ HRX_API hrx_status_t hrx_gpu_initialize(uint32_t flags);
++
++// Initializes the GPU accelerator as ONE device spanning the GPUs named by
++// |topology_path|, rather than one device per GPU.
++//
++// The HAL has always allowed a logical device to be composed of several
++// physical ones, with a unified address space across them: a buffer allocated
++// from such a device is reachable by any of its GPUs, dispatches are placed on
++// one of them by queue affinity, and semaphores order work between them. What
++// was missing was a way to ask for one -- enumerating ordinals gives a separate
++// logical device per GPU, and two of those share no allocator, so a buffer one
++// allocates cannot be bound by the other and everything crossing between them
++// becomes a copy the hardware did not need.
++//
++// |topology_path| takes the driver's device-path syntax: a comma separated list
++// of GPU ordinals or `GPU-...` UUIDs, or `*` for every visible GPU. On success
++// hrx_gpu_device_count() is 1 and hrx_gpu_device_get(0) is the spanning device.
++//
++// Passing NULL or an empty path is exactly hrx_gpu_initialize().
++HRX_API hrx_status_t hrx_gpu_initialize_over(const char* topology_path,
++                                             uint32_t flags);
+ HRX_API hrx_status_t hrx_gpu_shutdown(void);
+ HRX_API hrx_status_t hrx_gpu_device_count(int* count);
+ HRX_API hrx_status_t hrx_gpu_device_get(int index, hrx_device_t* device);
+diff --git a/libhrx/src/libhrx/runtime.c b/libhrx/src/libhrx/runtime.c
+index 396c75cf..91a52fb2 100644
+--- a/libhrx/src/libhrx/runtime.c
++++ b/libhrx/src/libhrx/runtime.c
+@@ -723,6 +723,10 @@ hrx_status_t hrx_cpu_device_get(int index, hrx_device_t* device) {
+ // GPU accelerator
+ //===----------------------------------------------------------------------===//
+ 
++// Set by hrx_gpu_initialize_over for the duration of initialization; NULL when
++// the caller wants the usual device-per-GPU enumeration.
++static const char* g_gpu_topology_path = NULL;
++
+ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+     uint32_t flags,
+     const iree_hal_device_create_params_extension_t* device_extensions) {
+@@ -829,10 +833,21 @@ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+     if (device_infos[info_index].path.size == 0) continue;
+ 
+     iree_hal_device_t* hal_device = NULL;
+-    iree_status = iree_hal_driver_create_device_by_ordinal(
+-        driver, info_index, /*param_count=*/0, /*params=*/NULL, &create_params,
+-        alloc, &hal_device);
+-    hrx_debug_print_iree_status("create device by ordinal", iree_status);
++    if (g_gpu_topology_path && g_gpu_topology_path[0]) {
++      // One logical device over the named GPUs. The driver resolves the path
++      // into the topology the device is built on, so its allocator spans them
++      // and its queues address them individually.
++      iree_status = iree_hal_driver_create_device_by_path(
++          driver, iree_make_cstring_view("amdgpu"),
++          iree_make_cstring_view(g_gpu_topology_path), /*param_count=*/0,
++          /*params=*/NULL, &create_params, alloc, &hal_device);
++      hrx_debug_print_iree_status("create device by path", iree_status);
++    } else {
++      iree_status = iree_hal_driver_create_device_by_ordinal(
++          driver, info_index, /*param_count=*/0, /*params=*/NULL,
++          &create_params, alloc, &hal_device);
++      hrx_debug_print_iree_status("create device by ordinal", iree_status);
++    }
+     if (!iree_status_is_ok(iree_status)) {
+       hrx_gpu_release_created_devices(created_count);
+       iree_hal_profile_sink_release(profile_sink);
+@@ -899,6 +914,8 @@ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+     }
+ 
+     created_count++;
++    // A spanning device IS the accelerator; there is no second one to make.
++    if (g_gpu_topology_path && g_gpu_topology_path[0]) break;
+   }
+ 
+   iree_hal_profile_sink_release(profile_sink);
+@@ -910,6 +927,15 @@ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+ #endif  // HRX_HAS_IREE_AMDGPU_DRIVER
+ }
+ 
++hrx_status_t hrx_gpu_initialize_over(const char* topology_path,
++                                     uint32_t flags) {
++  g_gpu_topology_path = topology_path;
++  hrx_status_t status = hrx_gpu_initialize_with_device_extensions(
++      flags, /*device_extensions=*/NULL);
++  g_gpu_topology_path = NULL;
++  return status;
++}
++
+ hrx_status_t hrx_gpu_initialize(uint32_t flags) {
+   return hrx_gpu_initialize_with_device_extensions(flags,
+                                                    /*device_extensions=*/NULL);

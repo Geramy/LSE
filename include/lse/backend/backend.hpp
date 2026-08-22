@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -150,17 +151,17 @@ inline constexpr Stream kDefaultStream{0};
 struct StreamEvent {
   Stream stream{};
   std::uint64_t timeline = 0;
-  // The backend object the timeline counts on, carried so another device can
-  // wait on it. Without it an event can only be resolved by the backend that
-  // recorded it -- which makes "wait until THAT device's stream reaches here"
-  // inexpressible, and leaves draining from the host as the only way to order
-  // two devices. Opaque here; only the backend that set it may interpret it.
-  void* semaphore = nullptr;
-  // Which device recorded it, so a waiter can tell its own event from a
-  // foreign one.
+  // The backend's own synchronization object for this point, when it has one.
+  // Opaque here; only the backend that set it may interpret it. Carried so a
+  // consumer can wait on the exact point rather than on wherever the producing
+  // stream has since got to.
+  void* handle = nullptr;
+  // Which device recorded it.
   DeviceIndex device{};
 
-  [[nodiscard]] bool valid() const noexcept { return timeline != 0; }
+  [[nodiscard]] bool valid() const noexcept {
+    return timeline != 0 || handle != nullptr;
+  }
 };
 
 // Which clock a tick was read from.
@@ -632,12 +633,7 @@ class Backend {
     }
   }
 
-  Result<DeviceBuffer> import_peer(const DeviceBuffer& src) {
-    if constexpr (requires { derived().import_peer_impl(src); }) {
-      return derived().import_peer_impl(src);
-    }
-    return LSE_ERROR(kUnimplemented, "this backend cannot import a peer buffer");
-  }
+
 
   Result<KernelHandle> load_executable(std::string_view name,
                                        std::span<const std::byte> code_object) {
@@ -841,21 +837,6 @@ class IBackend {
     (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
     return LSE_ERROR(kUnimplemented, "this backend has no peer copy");
   }
-  // A buffer another device owns, made bindable here.
-  //
-  // Peer access grants the hardware permission to follow the address; it does
-  // not make a foreign handle resolvable, and a kernel binds handles. Importing
-  // the peer's address into this device's allocator closes that gap, and it is
-  // what lets a kernel read across the link instead of waiting for a copy to
-  // land -- which is the difference between ordering two devices on the GPU and
-  // draining one from the host before every read.
-  //
-  // Not pure: a backend with no peers declines, and the caller falls back to
-  // copying.
-  virtual Result<DeviceBuffer> import_peer(const DeviceBuffer& src) {
-    (void)src;
-    return LSE_ERROR(kUnimplemented, "this backend cannot import a peer buffer");
-  }
   virtual Result<KernelHandle> load_executable(
       std::string_view name, std::span<const std::byte> code_object) = 0;
   virtual Status launch(const KernelHandle& kernel, const LaunchDims& dims,
@@ -967,9 +948,6 @@ class BackendAdapter final : public IBackend {
                    std::size_t soff, std::size_t doff) override {
     return impl_.copy_peer(s, d, n, soff, doff);
   }
-  Result<DeviceBuffer> import_peer(const DeviceBuffer& s) override {
-    return impl_.import_peer(s);
-  }
   Result<KernelHandle> load_executable(
       std::string_view n, std::span<const std::byte> code) override {
     return impl_.load_executable(n, code);
@@ -1040,6 +1018,20 @@ class IDeviceSet {
   // unanswerable question about two devices refuses rather than passes, because
   // the alternative is a kernel reading another device's memory and returning
   // numbers that look right.
+  // The stream a member's work must run on, when the set places by stream
+  // rather than by device.
+  //
+  // A pool opened as one device spanning several GPUs has one backend and one
+  // address space; what distinguishes its members is which of that device's
+  // streams -- and so which GPU's queues -- the work is issued on. Returning
+  // nothing means members are separate devices and the scheduler picks the
+  // stream itself, which is every other set.
+  [[nodiscard]] virtual std::optional<Stream> stream_for(
+      std::size_t member) const noexcept {
+    (void)member;
+    return std::nullopt;
+  }
+
   [[nodiscard]] virtual Status may_read(DeviceIndex held,
                                         std::size_t target) const = 0;
 
@@ -1157,6 +1149,24 @@ using BackendFactory = std::unique_ptr<IBackend> (*)();
 void register_backend(std::string_view name, BackendFactory factory,
                       DeviceEnumerator enumerator = nullptr);
 Result<std::unique_ptr<IBackend>> create_backend(std::string_view name);
+
+// Ask `name` to bring its accelerator up as ONE device spanning the physical
+// devices in `group`, rather than one device per physical device.
+//
+// A pool knows which devices it wants before any of them is opened, and some
+// backends can present several as a single device with one address space --
+// which is what lets a kernel on one read a buffer another allocated, with no
+// copy and no import. The backend decides whether it can honour this; declining
+// is silent and yields the usual device-per-device view.
+//
+// Must be called before the first init() of that backend: bringing an
+// accelerator up is once per process, and the topology is fixed at that moment.
+// `group` is in whatever form the backend's device paths take -- for HRX, the
+// comma-separated ordinals or UUIDs its driver already accepts.
+void request_device_group(std::string_view name, std::string_view group);
+
+// What a pool asked for, or empty. Read by a backend as it comes up.
+[[nodiscard]] std::string requested_device_group(std::string_view name);
 Result<std::vector<DeviceDescriptor>> enumerate_devices(std::string_view name);
 std::vector<std::string> available_backends();
 

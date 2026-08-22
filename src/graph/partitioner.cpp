@@ -207,6 +207,20 @@ void group_sibling_linears(std::vector<NodePtr>& order) {
 bool Partitioner::can_fuse(const Node& producer, const Node& consumer) noexcept {
   if (producer.materialized) return false;
 
+  // Two devices' work never lands in one kernel. A group runs in one place, so
+  // fusing across a placement boundary produces a group belonging to both: it
+  // is issued on one member's stream while depending on the other's, and the
+  // dependency that should have been one ordered edge between two groups
+  // becomes a knot the plan cannot order at all.
+  //
+  // Unplaced nodes fuse with anything -- most of the graph is unplaced, and
+  // only work a model deliberately split carries a member.
+  if (producer.member != Node::kAnyMember &&
+      consumer.member != Node::kAnyMember &&
+      producer.member != consumer.member) {
+    return false;
+  }
+
   const FusionClass pc = producer.fclass;
   const FusionClass cc = consumer.fclass;
 
@@ -287,9 +301,37 @@ std::vector<Workgroup> Partitioner::phases(
   for (const NodePtr& r : roots) topo_visit(r, seen, order);
   group_sibling_linears(order);
 
+  // Whether a node reads a value another member produced. Such a node is a
+  // join, and a join cannot live inside a phase: a phase is one kernel, so
+  // burying the join would make that kernel depend on one the other member is
+  // running -- and since every layer joins both ways, the two kernels end up
+  // waiting on each other with no order between them. Splitting here is what
+  // turns that knot back into ordinary edges between phases.
+  const auto joins_another_member = [](const Node& n) {
+    if (n.member == Node::kAnyMember) return false;
+    for (const NodePtr& in : n.inputs) {
+      if (in && in->member != Node::kAnyMember && in->member != n.member) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   std::vector<Workgroup> out;
+  std::vector<std::uint16_t> phase_member;
   for (const NodePtr& n : order) {
-    if (!out.empty() && out.back().try_add(n)) continue;
+    const bool breaks_placement =
+        !out.empty() &&
+        ((n->member != Node::kAnyMember &&
+          phase_member.back() != Node::kAnyMember &&
+          n->member != phase_member.back()) ||
+         joins_another_member(*n));
+    if (!breaks_placement && !out.empty() && out.back().try_add(n)) {
+      if (phase_member.back() == Node::kAnyMember) {
+        phase_member.back() = n->member;
+      }
+      continue;
+    }
     if (std::getenv("LSE_DEBUG_PHASES") != nullptr && !out.empty()) {
       std::fprintf(stderr, "phase split after %zu members at %s%s\n",
                    out.back().members().size(),
@@ -299,6 +341,7 @@ std::vector<Workgroup> Partitioner::phases(
     Workgroup wg(dev);
     (void)wg.try_add(n);
     out.push_back(std::move(wg));
+    phase_member.push_back(n->member);
   }
   return out;
 }

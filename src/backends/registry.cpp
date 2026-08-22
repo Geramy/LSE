@@ -57,6 +57,22 @@ void register_backend(std::string_view name, BackendFactory factory,
   r.factories.emplace(std::string(name), Entry{factory, enumerator});
 }
 
+namespace {
+std::map<std::string, std::string, std::less<>>& device_groups() {
+  static std::map<std::string, std::string, std::less<>> groups;
+  return groups;
+}
+}  // namespace
+
+void request_device_group(std::string_view name, std::string_view group) {
+  device_groups()[std::string(name)] = std::string(group);
+}
+
+std::string requested_device_group(std::string_view name) {
+  const auto it = device_groups().find(name);
+  return it == device_groups().end() ? std::string{} : it->second;
+}
+
 Result<std::unique_ptr<IBackend>> create_backend(std::string_view name) {
   Registry& r = registry();
   std::lock_guard lock(r.mu);

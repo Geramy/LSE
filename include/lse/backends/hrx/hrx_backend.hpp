@@ -58,7 +58,8 @@ class HrxBackend : public Backend<HrxBackend> {
   // Peer to this device, no host bounce. Declines when the runtime refuses the
   // copy, which is what it does when the source's memory was never granted to
   // this agent.
-  Result<DeviceBuffer> import_peer_impl(const DeviceBuffer& src);
+  // The token every member of a spanning device stamps, or kNoDevice when this
+  // instance holds a GPU of its own.
   Status copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                         std::size_t bytes, std::size_t src_offset,
                         std::size_t dst_offset);
@@ -145,6 +146,14 @@ class HrxBackend : public Backend<HrxBackend> {
   // hrx_queue_dispatch can. One bit per stream is what puts two streams on two
   // AQL rings.
   std::vector<std::uint64_t> stream_affinity_;
+  // Events recorded on this device, freed at shutdown: a queued wait names the
+  // event object, so releasing one while a wait is still pending would pull the
+  // point out from under it.
+  std::vector<void*> recorded_events_;
+  // How many physical GPUs this device spans. 1 for an ordinary device; more
+  // when a pool asked for one device over several, in which case stream i
+  // drives GPU i.
+  std::uint32_t physical_count_ = 1;
   // Logical queues this device's submission path can actually address, probed
   // at init rather than read off a header (see probe_queue_count).
   std::uint32_t queue_count_ = 1;
