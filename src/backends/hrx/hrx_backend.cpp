@@ -1350,6 +1350,16 @@ Status HrxBackend::dma_host_transfer(void* host, const DeviceBuffer& device,
                                      std::size_t bytes,
                                      std::size_t device_offset,
                                      bool to_device) {
+  // Raw HSA against memory a spanning device manages is off the runtime's
+  // supported path: the copy waits on a fence its bookkeeping never signals,
+  // and a 27B load hung on the third gigabyte. One physical device is where
+  // this path was measured and proven; a spanning device takes the runtime's
+  // own stream transfers below instead.
+  if (physical_count_ > 1) {
+    return LSE_ERROR(kUnimplemented,
+                     "raw DMA declines on a device spanning several GPUs");
+  }
+
 #if !LSE_HRX_LINKED
   (void)host; (void)device; (void)bytes; (void)device_offset; (void)to_device;
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
