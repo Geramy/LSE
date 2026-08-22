@@ -268,7 +268,15 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
     auto be = backend::create_backend(named.front().backend);
     if (!be.ok()) return be.status();
     auto candidate = be.release();
-    if (const Status init = candidate->init(0); !init.ok()) {
+    // Initialized AS the first member, not as ordinal zero. The backend keeps
+    // two identities: which hrx device it drives -- the spanning one, ordinal
+    // zero once the group collapses the list -- and which HSA agent its copy
+    // engine speaks for, which must be a GPU this pool actually names. Handing
+    // it 0 aimed every weight upload's DMA at whatever card enumerates first
+    // on the box, a card someone else may be using, and the load hung on a
+    // fence that engine never signalled.
+    if (const Status init = candidate->init(named.front().ordinal);
+        !init.ok()) {
       return LSE_ERROR(kDeviceError, "the device spanning ",
                        std::to_string(named.size()),
                        " GPUs will not come up: ", init.to_string());

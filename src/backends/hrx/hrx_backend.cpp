@@ -626,7 +626,15 @@ Status accelerator_up() {
   static std::mutex mu;
   const std::lock_guard lock(mu);
   if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
-  const hrx_status_t status = hrx_gpu_initialize(0);
+  // A pool that named several GPUs gets one device spanning them, which is
+  // what gives them a single allocator and therefore one address space: a
+  // buffer any of them allocates is bindable by a dispatch on any other. Asked
+  // for here because bringing the accelerator up is once per process and the
+  // topology is fixed at that moment.
+  const std::string group = backend::requested_device_group("hrx");
+  const hrx_status_t status =
+      group.empty() ? hrx_gpu_initialize(0)
+                    : hrx_gpu_initialize_over(group.c_str(), 0);
   if (hrx_status_is_ok(status)) {
     g_accelerator_up.store(true, std::memory_order_release);
     return OkStatus();
@@ -883,6 +891,20 @@ Status HrxBackend::init_impl(int device_ordinal) {
   gpu_ordinal_ = device_ordinal;
   LSE_RETURN_IF_ERROR(accelerator_up());
 
+  // A pool that asked for a spanning device gets ONE hrx device holding every
+  // GPU it named. The ordinal arriving here names a member of that group; it
+  // stays as this instance's HSA agent -- the copy engine must speak for a GPU
+  // the pool actually holds, and aiming it at whatever card enumerates first
+  // hung every weight upload on a fence a foreign engine never signalled --
+  // while the hrx device index collapses to zero, because the group IS device
+  // zero once the accelerator comes up spanning.
+  const std::string group = backend::requested_device_group("hrx");
+  if (!group.empty()) {
+    physical_count_ = 1;
+    for (char c : group) physical_count_ += (c == ',') ? 1 : 0;
+    device_ordinal = 0;
+  }
+
   int count = 0;
   LSE_RETURN_IF_ERROR(from_hrx(hrx_gpu_device_count(&count), "hrx_gpu_device_count"));
   if (device_ordinal < 0 || device_ordinal >= count) {
@@ -955,11 +977,25 @@ Status HrxBackend::init_impl(int device_ordinal) {
 
   queue_count_ = probe_queue_count(device);
   stream_caps_ = derive_stream_capabilities(info_, queue_count_);
+  if (physical_count_ > 1 && stream_caps_.stream_count < physical_count_) {
+    // Placement is by stream on a spanning device, so there has to be one
+    // per GPU.
+    stream_caps_.stream_count = physical_count_;
+  }
   streams_.assign(stream_caps_.stream_count, nullptr);
   unflushed_launches_.assign(stream_caps_.stream_count, 0);
   stream_affinity_.resize(stream_caps_.stream_count);
+  // The logical device's queues are flattened over its physical devices in
+  // order, so slot s owns [s*per, (s+1)*per). Outside a spanning device there
+  // is one slot and this is the whole queue set, as before.
+  const std::uint32_t per =
+      physical_count_ > 1 ? std::max(1u, queue_count_ / physical_count_)
+                          : queue_count_;
   for (std::uint32_t i = 0; i < stream_caps_.stream_count; ++i) {
-    stream_affinity_[i] = static_cast<std::uint64_t>(1) << (i % queue_count_);
+    const std::uint32_t slot =
+        physical_count_ > 1 ? (i % physical_count_) : 0;
+    const std::uint32_t within = physical_count_ > 1 ? 0 : (i % per);
+    stream_affinity_[i] = static_cast<std::uint64_t>(1) << (slot * per + within);
   }
   // Stream 0 exists from the start: every path that does not name a stream
   // uses it, including the stream-ordered allocator.
@@ -982,9 +1018,10 @@ Result<void*> HrxBackend::stream_at(std::uint32_t index) {
   }
   if (streams_[index] != nullptr) return streams_[index];
   hrx_stream_t stream = nullptr;
-  LSE_RETURN_IF_ERROR(
-      from_hrx(hrx_stream_create(static_cast<hrx_device_t>(device_), 0, &stream),
-               "hrx_stream_create"));
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_create_on_queue(static_cast<hrx_device_t>(device_), 0,
+                                 stream_affinity_[index], &stream),
+      "hrx_stream_create_on_queue"));
   streams_[index] = stream;
   return streams_[index];
 #endif
