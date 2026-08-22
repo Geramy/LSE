@@ -16,6 +16,10 @@
 #include "lse/graph/interpreter.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/layer.hpp"
+#include "lse/model/qwen3_5_common.hpp"
+#include "lse/graph/graph.hpp"
+#include "lse/ops/attention.hpp"
+#include "lse/kv/block.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/ops/rope.hpp"
@@ -1892,3 +1896,370 @@ LSE_TEST(long_prefill_reuse_matches_a_forced_rebuild) {
 }
 
 LSE_TEST_MAIN()
+
+namespace {
+
+// A mixer's own weights, loaded whole and loaded split, run on the same input.
+//
+// The two have to agree: a tensor split cuts a layer into pieces whose partial
+// sums rebuild the whole, so any difference beyond rounding is the split being
+// wrong -- not the devices, not the ordering, not the collective. Comparing
+// them here rather than through a two-GPU run is what separates a sharding bug
+// from everything else a split model does at once, and it needs no GPU pool at
+// all: which member owns a piece is a placement decision and cannot change the
+// arithmetic.
+struct ShardCheck {
+  double max_abs = 0.0;
+  double max_rel = 0.0;
+  std::size_t count = 0;
+  bool finite = true;
+};
+
+std::vector<float> drain_all(graph::Array& a) {
+  if (!a.eval().ok()) return {};
+  std::vector<float> out(a.shape().elem_count());
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    out[i] = graph::interpreter::load_element(*a.node(), i);
+  }
+  return out;
+}
+
+graph::Array filled(Shape shape, unsigned seed) {
+  graph::Array a = graph::Array::zeros(shape, DType::kF32);
+  (void)a.eval();
+  unsigned x = seed * 1664525u + 1013904223u;
+  for (std::size_t i = 0; i < shape.elem_count(); ++i) {
+    x = x * 1664525u + 1013904223u;
+    const float v = static_cast<float>((x >> 9) & 0xFFFFu) / 32768.0f - 1.0f;
+    graph::interpreter::store_element(*a.node(), i, v * 0.05f);
+  }
+  return a;
+}
+
+ShardCheck compare_shards(std::unique_ptr<IMixer> whole,
+                          std::unique_ptr<IMixer> split, const Config& cfg,
+                          const SafeTensors& ckpt,
+                          const quant::GroupAffineMap* quant,
+                          const std::string& prefix, std::int32_t layer) {
+  ShardCheck out;
+  WeightBinder b_whole(ckpt, quant);
+  LayerContext c_whole{&cfg, layer, false, 1};
+  if (!whole->load(b_whole, prefix, c_whole).ok()) return out;
+
+  WeightBinder b_split(ckpt, quant);
+  LayerContext c_split{&cfg, layer, false, 2};
+  if (!split->load(b_split, prefix, c_split).ok()) return out;
+
+  const auto hidden = static_cast<std::int64_t>(cfg.hidden_size);
+  graph::Array x = filled(Shape{1, 4, hidden}, 7u);
+
+  auto ref = whole->forward(x, nullptr, c_whole);
+  if (!ref.ok()) return out;
+  auto parts = split->forward_shards({x, x}, nullptr, c_split);
+  if (!parts.ok() || parts->empty()) return out;
+
+  graph::Array sum = (*parts)[0];
+  for (std::size_t i = 1; i < parts->size(); ++i) {
+    sum = graph::add(sum, (*parts)[i]);
+  }
+
+  const std::vector<float> a = drain_all(*ref);
+  const std::vector<float> b = drain_all(sum);
+  if (a.empty() || a.size() != b.size()) return out;
+  out.count = a.size();
+  // Scaled by the tensor's own magnitude, not element by element: dividing a
+  // rounding-sized difference by a near-zero element reports a huge relative
+  // error for a result that is right, which is how a correct split first looked
+  // wrong here.
+  double absmax = 0.0;
+  for (float v : a) absmax = std::max(absmax, std::abs(static_cast<double>(v)));
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (!std::isfinite(a[i]) || !std::isfinite(b[i])) out.finite = false;
+    const double d = std::abs(static_cast<double>(a[i]) - b[i]);
+    out.max_abs = std::max(out.max_abs, d);
+  }
+  out.max_rel = absmax > 0.0 ? out.max_abs / absmax : 0.0;
+  return out;
+}
+
+}  // namespace
+
+LSE_TEST(a_split_mixer_rebuilds_what_the_whole_one_computes) {
+  // Needs a Qwen checkpoint: LSE_TEST_MODEL, or the 0.8B in the HF cache.
+  const char* env = std::getenv("LSE_TEST_MODEL");
+  auto paths = resolve_model(env != nullptr && *env != 0
+                                 ? env
+                                 : "mlx-community/Qwen3.5-0.8B-4bit");
+  if (!paths.ok()) {
+    std::printf("       skipped: no Qwen checkpoint\n");
+    return;
+  }
+  // A sharded checkpoint names an index, not a file of tensors.
+  const bool sharded =
+      paths->weights.size() > 5 &&
+      paths->weights.compare(paths->weights.size() - 5, 5, ".json") == 0;
+  auto ckpt = sharded ? SafeTensors::open_sharded(paths->weights)
+                      : SafeTensors::open(paths->weights);
+  auto cfg = Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) {
+    std::printf("       skipped: %s (weights=%s)\n",
+                !ckpt.ok() ? ckpt.status().to_string().c_str()
+                           : cfg.status().to_string().c_str(),
+                paths->weights.c_str());
+    return;
+  }
+  const quant::GroupAffineMap* quant = &cfg->quantization;
+
+  struct Case {
+    const char* label;
+    std::unique_ptr<IMixer> (*whole)();
+    std::int32_t layer;
+  };
+  const Case cases[] = {
+      {"attention", &qwen3_5::make_attention, -1},
+      {"gdn", &qwen3_5::make_gdn, -1},
+  };
+  for (const Case& c : cases) {
+    // The first layer of that kind; a hybrid model interleaves them.
+    std::int32_t layer = c.layer;
+    for (std::int32_t i = 0; layer < 0 && i < cfg->num_layers; ++i) {
+      const bool attn = cfg->is_attention_layer(i);
+      if ((std::string(c.label) == "attention") == attn) layer = i;
+    }
+    if (layer < 0) continue;
+    const std::string prefix =
+        "language_model.model.layers." + std::to_string(layer);
+    const ShardCheck d =
+        compare_shards(c.whole(), c.whole(), *cfg, *ckpt, quant, prefix, layer);
+    if (d.count == 0) {
+      std::printf("       %-10s skipped: layer %d would not load\n", c.label,
+                  layer);
+      continue;
+    }
+    std::printf("       %-10s layer %d  max_abs=%.3e max_rel=%.3e over %zu\n",
+                c.label, layer, d.max_abs, d.max_rel, d.count);
+    LSE_EXPECT(d.finite);
+    LSE_EXPECT(d.max_rel < 1e-3);
+  }
+}
+
+LSE_TEST(a_split_block_rebuilds_what_the_whole_one_computes) {
+  const char* env = std::getenv("LSE_TEST_MODEL");
+  auto paths = resolve_model(env != nullptr && *env != 0
+                                 ? env
+                                 : "mlx-community/Qwen3.5-0.8B-4bit");
+  if (!paths.ok()) {
+    std::printf("       skipped: no Qwen checkpoint\n");
+    return;
+  }
+  const bool sharded =
+      paths->weights.size() > 5 &&
+      paths->weights.compare(paths->weights.size() - 5, 5, ".json") == 0;
+  auto ckpt = sharded ? SafeTensors::open_sharded(paths->weights)
+                      : SafeTensors::open(paths->weights);
+  auto cfg = Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) {
+    std::printf("       skipped: checkpoint would not open\n");
+    return;
+  }
+  const quant::GroupAffineMap* quant = &cfg->quantization;
+
+  // A whole block: norms, mixer, feed-forward and both residuals. The mixers
+  // already reconstruct on their own, so what this adds is the composition --
+  // the reduce, and the work either side of it that a split runs per member.
+  for (std::int32_t layer : {0, 3}) {
+    const std::string prefix =
+        "language_model.model.layers." + std::to_string(layer);
+    const bool attn = cfg->is_attention_layer(layer);
+    auto make = [&] {
+      return std::make_unique<HybridBlock>(
+          attn ? qwen3_5::make_attention() : qwen3_5::make_gdn(),
+          qwen3_5::make_mlp(), false, nullptr, qwen3_5::block_spec());
+    };
+
+    auto whole = make();
+    WeightBinder b_whole(*ckpt, quant);
+    LayerContext c_whole{&*cfg, layer, false, 1};
+    if (!whole->load(b_whole, prefix, c_whole).ok()) {
+      std::printf("       block %d skipped: would not load\n", layer);
+      continue;
+    }
+    auto split = make();
+    WeightBinder b_split(*ckpt, quant);
+    LayerContext c_split{&*cfg, layer, false, 2};
+    if (!split->load(b_split, prefix, c_split).ok()) {
+      std::printf("       block %d skipped: split would not load\n", layer);
+      continue;
+    }
+
+    const auto hidden = static_cast<std::int64_t>(cfg->hidden_size);
+    graph::Array x = filled(Shape{1, 4, hidden}, 11u);
+    auto ref = whole->forward(x, nullptr, nullptr, c_whole);
+    auto got = split->forward_shards({x, x}, nullptr, nullptr, c_split);
+    if (!ref.ok() || !got.ok() || got->empty()) {
+      std::printf("       block %d skipped: forward refused\n", layer);
+      continue;
+    }
+    // Every member holds the whole answer after the reduce, so member 0's is
+    // the block's output -- and every other member must agree with it.
+    std::vector<float> a = drain_all(*ref);
+    std::vector<float> b = drain_all((*got)[0]);
+    if (a.empty() || a.size() != b.size()) continue;
+    double absmax = 0.0, worst = 0.0;
+    bool finite = true;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (!std::isfinite(a[i]) || !std::isfinite(b[i])) finite = false;
+      absmax = std::max(absmax, std::abs(static_cast<double>(a[i])));
+      worst = std::max(worst, std::abs(static_cast<double>(a[i]) - b[i]));
+    }
+    const double rel = absmax > 0.0 ? worst / absmax : 0.0;
+    std::printf("       block %d (%s)  max_abs=%.3e max_rel=%.3e over %zu\n",
+                layer, attn ? "attn" : "gdn", worst, rel, a.size());
+    LSE_EXPECT(finite);
+    LSE_EXPECT(rel < 1e-4);
+  }
+}
+
+namespace {
+
+// The per-step descriptor the paged kernels read; one row. Layout is
+// kv/block.hpp's: {kv_pos, kv_len, live_rows, then per row {first, after}}.
+graph::Array step_meta(std::int32_t first, std::int32_t after) {
+  const auto elems = static_cast<std::int64_t>(kv::step_meta_elems(1));
+  graph::Array m = graph::Array::zeros(Shape{elems}, DType::kF32);
+  (void)m.eval();
+  graph::interpreter::store_element(*m.node(), 0, static_cast<float>(first));
+  graph::interpreter::store_element(*m.node(), 1, static_cast<float>(after));
+  graph::interpreter::store_element(*m.node(), 2, 1.0f);
+  graph::interpreter::store_element(*m.node(), 3, static_cast<float>(first));
+  graph::interpreter::store_element(*m.node(), 4, static_cast<float>(after));
+  return m;
+}
+
+// What HybridLM::forward does to a state before a pass, for one row of
+// `shards`-way split geometry. Kept in step with that code deliberately: this
+// is the state the 27B run carries and the stateless tests never touch.
+void prep_state(MixerState& st, const Config& cfg, bool attn,
+                std::int64_t shards, std::int32_t first, std::int32_t after) {
+  st.kv_meta = step_meta(first, after);
+  st.paged.row_tokens.assign(1, after);
+  st.position = first;
+  if (attn) return;
+  const auto vh = static_cast<std::int64_t>(cfg.gdn_v_heads) / shards;
+  const auto vd = static_cast<std::int64_t>(cfg.gdn_head_dim);
+  const auto tail =
+      cfg.gdn_conv_kernel > 1
+          ? static_cast<std::int64_t>(cfg.gdn_conv_kernel - 1)
+          : 0;
+  const std::int64_t fused =
+      (2 * cfg.gdn_qk_heads + cfg.gdn_v_heads) * cfg.gdn_head_dim / shards;
+  if (!st.gdn_state.valid()) {
+    st.gdn_state = graph::Array::zeros(Shape{1, vh, vd, vd}, DType::kF32);
+  }
+  if (tail > 0 && !st.gdn_conv_qkv.valid()) {
+    st.gdn_conv_qkv = graph::Array::zeros(Shape{1, tail, fused}, DType::kF32);
+  }
+}
+
+double shard_state_step(std::unique_ptr<IMixer> whole,
+                        std::unique_ptr<IMixer> split, const Config& cfg,
+                        const SafeTensors& ckpt,
+                        const quant::GroupAffineMap* quant,
+                        const std::string& prefix, std::int32_t layer,
+                        bool attn, double* out_decode) {
+  WeightBinder bw(ckpt, quant);
+  LayerContext cw{&cfg, layer, false, 1};
+  if (!whole->load(bw, prefix, cw).ok()) return -1.0;
+  WeightBinder bs(ckpt, quant);
+  LayerContext cs{&cfg, layer, false, 2};
+  if (!split->load(bs, prefix, cs).ok()) return -1.0;
+
+  MixerState w_st;
+  std::vector<MixerState> s_st(2);
+  prep_state(w_st, cfg, attn, 1, 0, 4);
+  for (auto& st : s_st) prep_state(st, cfg, attn, 2, 0, 4);
+
+  const auto hidden = static_cast<std::int64_t>(cfg.hidden_size);
+  graph::Array x = filled(Shape{1, 4, hidden}, 3u);
+
+  auto yw = whole->forward(x, &w_st, cw);
+  auto ps = split->forward_shards({x, x}, s_st.data(), cs);
+  if (!yw.ok() || !ps.ok() || ps->empty()) return -1.0;
+  graph::Array sum = (*ps)[0];
+  for (std::size_t i = 1; i < ps->size(); ++i) sum = graph::add(sum, (*ps)[i]);
+  const auto a = drain_all(*yw);
+  const auto b = drain_all(sum);
+  if (a.empty() || a.size() != b.size()) return -1.0;
+  double absmax = 0.0, worst = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    absmax = std::max(absmax, std::abs(static_cast<double>(a[i])));
+    worst = std::max(worst, std::abs(static_cast<double>(a[i]) - b[i]));
+  }
+  const double prefill = absmax > 0.0 ? worst / absmax : 0.0;
+
+  // One decode token against the carried state -- the recurrence and the KV
+  // pool the prefill just wrote, which is the whole point of this test.
+  prep_state(w_st, cfg, attn, 1, 4, 5);
+  for (auto& st : s_st) prep_state(st, cfg, attn, 2, 4, 5);
+  graph::Array x2 = filled(Shape{1, 1, hidden}, 5u);
+  auto yw2 = whole->forward(x2, &w_st, cw);
+  auto ps2 = split->forward_shards({x2, x2}, s_st.data(), cs);
+  if (!yw2.ok() || !ps2.ok() || ps2->empty()) return -1.0;
+  graph::Array sum2 = (*ps2)[0];
+  for (std::size_t i = 1; i < ps2->size(); ++i) {
+    sum2 = graph::add(sum2, (*ps2)[i]);
+  }
+  const auto a2 = drain_all(*yw2);
+  const auto b2 = drain_all(sum2);
+  if (a2.empty() || a2.size() != b2.size()) return -1.0;
+  double absmax2 = 0.0, worst2 = 0.0;
+  for (std::size_t i = 0; i < a2.size(); ++i) {
+    absmax2 = std::max(absmax2, std::abs(static_cast<double>(a2[i])));
+    worst2 = std::max(worst2, std::abs(static_cast<double>(a2[i]) - b2[i]));
+  }
+  *out_decode = absmax2 > 0.0 ? worst2 / absmax2 : 0.0;
+  return prefill;
+}
+
+}  // namespace
+
+LSE_TEST(a_split_mixer_carries_state_the_way_the_whole_one_does) {
+  const char* env = std::getenv("LSE_TEST_MODEL");
+  auto paths = resolve_model(env != nullptr && *env != 0
+                                 ? env
+                                 : "mlx-community/Qwen3.5-0.8B-4bit");
+  if (!paths.ok()) {
+    std::printf("       skipped: no Qwen checkpoint\n");
+    return;
+  }
+  const bool sharded =
+      paths->weights.size() > 5 &&
+      paths->weights.compare(paths->weights.size() - 5, 5, ".json") == 0;
+  auto ckpt = sharded ? SafeTensors::open_sharded(paths->weights)
+                      : SafeTensors::open(paths->weights);
+  auto cfg = Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) {
+    std::printf("       skipped: checkpoint would not open\n");
+    return;
+  }
+  const quant::GroupAffineMap* quant = &cfg->quantization;
+  for (std::int32_t layer : {0, 3}) {
+    const bool attn = cfg->is_attention_layer(layer);
+    const std::string prefix =
+        "language_model.model.layers." + std::to_string(layer);
+    double decode = -1.0;
+    const double prefill = shard_state_step(
+        attn ? qwen3_5::make_attention() : qwen3_5::make_gdn(),
+        attn ? qwen3_5::make_attention() : qwen3_5::make_gdn(), *cfg, *ckpt,
+        quant, prefix, layer, attn, &decode);
+    if (prefill < 0.0) {
+      std::printf("       layer %d (%s) skipped: would not run\n", layer,
+                  attn ? "attn" : "gdn");
+      continue;
+    }
+    std::printf("       layer %d (%s)  prefill max_rel=%.3e decode max_rel=%.3e\n",
+                layer, attn ? "attn" : "gdn", prefill, decode);
+    LSE_EXPECT(prefill < 1e-4);
+    LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
+  }
+}

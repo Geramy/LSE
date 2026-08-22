@@ -419,20 +419,26 @@ Status HybridBlock::load(WeightBinder& binder, std::string_view prefix,
   const std::string p(prefix);
   LSE_ASSIGN_OR(norm1_weight_, binder.require(p + spec_.norm1_name));
   LSE_ASSIGN_OR(norm2_weight_, binder.require(p + spec_.norm2_name));
-  if (graph::split_scheme() == graph::SplitScheme::kTensor) {
-    const graph::Scheduler* sched = graph::default_scheduler();
-    const std::size_t members =
-        sched != nullptr ? sched->devices().size() : std::size_t{1};
-    norm1_shards_.resize(members);
-    norm2_shards_.resize(members);
-    for (std::size_t m = 0; m < members; ++m) {
-      const graph::ScopedMember on(m);
-      LSE_ASSIGN_OR(norm1_shards_[m], binder.require(p + spec_.norm1_name));
-      LSE_ASSIGN_OR(norm2_shards_[m], binder.require(p + spec_.norm2_name));
+  // From the context, the same place the mixers take it. Reading the scheme
+  // and the device set here instead made the block's idea of how many ways it
+  // was split disagree with its own mixer's, which is only invisible while
+  // both happen to be derived from the same run -- a block asked to split two
+  // ways with one copy of its norms indexes past what it has.
+  const auto shards =
+      static_cast<std::size_t>(ctx.shards > 0 ? ctx.shards : 1);
+  norm1_shards_.resize(shards);
+  norm2_shards_.resize(shards);
+  for (std::size_t m = 0; m < shards; ++m) {
+    if (m == 0) {
+      norm1_shards_[0] = norm1_weight_;
+      norm2_shards_[0] = norm2_weight_;
+      continue;
     }
-  } else {
-    norm1_shards_.assign(1, norm1_weight_);
-    norm2_shards_.assign(1, norm2_weight_);
+    // A norm is elementwise over the hidden width and is not cut; each member
+    // keeps its own copy so the work either side of a reduce stays local.
+    const graph::ScopedMember on(m);
+    LSE_ASSIGN_OR(norm1_shards_[m], binder.require(p + spec_.norm1_name));
+    LSE_ASSIGN_OR(norm2_shards_[m], binder.require(p + spec_.norm2_name));
   }
   LSE_RETURN_IF_ERROR(mixer_->load(binder, prefix, ctx));
   LSE_RETURN_IF_ERROR(ffn_->load(binder, prefix, ctx));
@@ -482,7 +488,16 @@ Result<std::vector<Array>> HybridBlock::forward_shards(
   // reduce, in opposite directions, instead of the activation on the way in
   // AND the sum on the way out.
   auto reduce = [&](const std::vector<Array>& parts) {
+    // An op that did not shard hands back ONE value, and that value is already
+    // the whole answer: every member takes it as it is. Summing it per member
+    // would add it to itself, and indexing parts[m] past what it returned is
+    // how a block that shards its feed-forward but not its mixer -- or the
+    // other way round -- reads off the end of the vector.
     std::vector<Array> out(n);
+    if (parts.size() < n) {
+      for (std::size_t m = 0; m < n; ++m) out[m] = parts.front();
+      return out;
+    }
     for (std::size_t m = 0; m < n; ++m) {
       const graph::ScopedMember on(m);
       Array acc = parts[m];

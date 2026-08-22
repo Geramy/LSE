@@ -149,6 +149,7 @@ Status HybridLM::load(WeightBinder& binder) {
     LayerContext ctx;
     ctx.config = &config_;
     ctx.layer_index = i;
+    ctx.shards = static_cast<std::int32_t>(state_shards());
     const std::string prefix = spec_.block_prefix + "." + std::to_string(i);
     // Contiguous blocks, not round robin. A layer reads what the one before it
     // wrote, so the boundaries are what cost: blocks of layers cross the link

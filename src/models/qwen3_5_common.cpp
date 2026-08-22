@@ -70,28 +70,26 @@ std::int64_t rope_source(std::int64_t d, std::int64_t rope_dim) {
 // not a tensor split, or the axis will not divide evenly into whole
 // quantization groups on every member. A weight that cannot be cut cleanly is
 // left whole rather than padded: padding changes what the kernel contracts.
-std::size_t tensor_shards(std::int64_t extent) {
-  if (graph::split_scheme() != graph::SplitScheme::kTensor) return 1;
-  const graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) return 1;
-  const std::size_t members = sched->devices().size();
-  if (members <= 1) return 1;
+std::size_t tensor_shards(const LayerContext& ctx, std::int64_t extent) {
+  // Asked of the context, not of the device set. How many ways a layer is cut
+  // is a property of the load, which is what makes it testable without the
+  // devices: a test can load the same layer whole and split and compare the
+  // two, which is the only way to see a sharding bug apart from every other
+  // thing a multi-device run does at once.
+  const auto n = static_cast<std::int64_t>(ctx.shards);
+  if (n <= 1) return 1;
   constexpr std::int64_t kGroup = 64;
-  const auto n = static_cast<std::int64_t>(members);
   if (extent % n != 0 || (extent / n) % kGroup != 0) return 1;
-  return members;
+  return static_cast<std::size_t>(ctx.shards);
 }
 
 // Heads split only if every member gets whole heads of both kinds.
-std::size_t head_shards(std::int64_t q_heads, std::int64_t kv_heads) {
-  if (graph::split_scheme() != graph::SplitScheme::kTensor) return 1;
-  const graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) return 1;
-  const std::size_t members = sched->devices().size();
-  if (members <= 1) return 1;
-  const auto n = static_cast<std::int64_t>(members);
+std::size_t head_shards(const LayerContext& ctx, std::int64_t q_heads,
+                       std::int64_t kv_heads) {
+  const auto n = static_cast<std::int64_t>(ctx.shards);
+  if (n <= 1) return 1;
   if (q_heads % n != 0 || kv_heads % n != 0) return 1;
-  return members;
+  return static_cast<std::size_t>(ctx.shards);
 }
 
 class Qwen35Attention final : public IMixer {
@@ -119,7 +117,7 @@ class Qwen35Attention final : public IMixer {
     // output projection's contraction, and its pages of the KV pool all carry
     // the same index, so cutting there needs no communication until the output
     // projections' partial sums are added.
-    const std::size_t shards = head_shards(qh, kvh);
+    const std::size_t shards = head_shards(ctx, qh, kvh);
     const auto n = static_cast<std::int64_t>(shards);
     const std::int64_t qh_m = qh / n;
     const std::int64_t kvh_m = kvh / n;
@@ -281,7 +279,7 @@ class Qwen35GatedDeltaNet final : public IMixer {
     const std::int64_t conv_dim = 2 * kh * hd + vh * hd;
 
     const auto kernel = static_cast<std::int64_t>(c.gdn_conv_kernel);
-    const std::size_t shards = head_shards(kh, vh);
+    const std::size_t shards = head_shards(ctx, kh, vh);
     const auto n = static_cast<std::int64_t>(shards);
     const std::int64_t kh_m = kh / n;
     const std::int64_t vh_m = vh / n;
@@ -456,7 +454,7 @@ class Qwen35MLP final : public IFeedForward {
     const auto hidden = static_cast<std::int64_t>(c.hidden_size);
     const auto inter = static_cast<std::int64_t>(c.mlp_intermediate);
 
-    const std::size_t shards = tensor_shards(inter);
+    const std::size_t shards = tensor_shards(ctx, inter);
     const std::int64_t span = inter / static_cast<std::int64_t>(shards);
     gate_.resize(shards);
     up_.resize(shards);
