@@ -323,6 +323,41 @@ LSE_TEST(peer_transport_moves_device_memory_between_two_gpus) {
   LSE_EXPECT(std::memcmp(back.data(), src.data(), kBytes) == 0);
 }
 
+LSE_TEST(a_peer_allocation_can_be_imported_and_read_where_it_is_not_owned) {
+  TwoDevices* set = two_devices();
+  if (set == nullptr) {
+    std::printf("       skipped: fewer than two live devices\n");
+    return;
+  }
+  constexpr std::size_t kN = 1024;
+  constexpr std::size_t kBytes = kN * sizeof(float);
+  const std::vector<float> src = make_signal(kN, 11);
+
+  auto owned = set->device(0).allocate(kBytes, backend::MemoryClass::kDevice);
+  LSE_EXPECT(owned.ok());
+  if (!owned.ok()) return;
+  backend::DeviceBuffer theirs = owned.release();
+  LSE_EXPECT_OK(set->device(0).copy_h2d(src.data(), theirs, kBytes, 0));
+
+  // Device 1 importing device 0's allocation. Peer access alone does not make
+  // a foreign handle bindable; this is what does, and before the AMDGPU HAL
+  // learned to accept an allocation it can reach but does not own, it refused
+  // with PERMISSION_DENIED.
+  auto view = set->device(1).import_peer(theirs);
+  if (!view.ok()) {
+    std::printf("       skipped: %s\n", view.status().to_string().c_str());
+    return;
+  }
+  backend::DeviceBuffer imported = view.release();
+  LSE_EXPECT(imported.size_bytes == kBytes);
+
+  // Read it back through the importing device, which is the claim that
+  // matters: these bytes live on the other GPU.
+  std::vector<float> back(kN, 0.0f);
+  LSE_EXPECT_OK(set->device(1).copy_d2h(imported, back.data(), kBytes, 0));
+  LSE_EXPECT(std::memcmp(back.data(), src.data(), kBytes) == 0);
+}
+
 LSE_TEST(device_codec_is_bit_identical_to_the_host_codec) {
   backend::IBackend* be = device_backend();
   if (be == nullptr) {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -258,16 +259,27 @@ Status Scheduler::make_local(Node& n, std::size_t member) {
   // compute queue that is still writing these bytes. Draining the owner first
   // is what makes the copy see a finished value rather than a partial one.
   backend::IBackend& from = devices_.device(owner);
-  // Drain the owner only when it has issued something since we last did. The
-  // transfer runs on a DMA engine that knows nothing about the compute queue
-  // still writing these bytes, so a drain has to happen -- but a group with
-  // several operands from one member needs one, not one apiece, and a member
-  // that has not run since the last drain needs none. Every crossing paid for
-  // its own before this, which on a tensor split is most of the step.
+  // The bytes are still being written by the owner's queue, so the copy has to
+  // be ordered after it -- on the GPU, not by the host. Blocking here drains
+  // the producer before every crossing, which is what kept the two branches of
+  // a tensor split from ever overlapping: both devices measured about 47% busy,
+  // taking turns, and the wait was 123 us of a 10 KB transfer that the link
+  // does in single digits.
+  //
+  // Recorded once per member per dispatch: a group reading several operands
+  // from one member needs one barrier, and a member that has issued nothing
+  // since the last one needs none.
   if (impl_->member_dirty.size() <= owner) {
     impl_->member_dirty.resize(owner + 1, 1);
   }
   if (impl_->member_dirty[owner] != 0) {
+    // Blocking, and deliberately so for now. A GPU-side barrier orders the
+    // read after the write that produced it, but nothing then orders the
+    // owner's NEXT write after the read: binding a peer's live buffer removes
+    // the snapshot a copy used to take, and draining from the host is what
+    // currently keeps the producer from running ahead into it. Making this
+    // asynchronous needs the reverse edge as well -- an event the owner waits
+    // on before reusing the buffer -- and without it the model emits garbage.
     LSE_RETURN_IF_ERROR(from.synchronize_stream(backend::kDefaultStream));
     impl_->member_dirty[owner] = 0;
   }

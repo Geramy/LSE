@@ -58,6 +58,7 @@ class HrxBackend : public Backend<HrxBackend> {
   // Peer to this device, no host bounce. Declines when the runtime refuses the
   // copy, which is what it does when the source's memory was never granted to
   // this agent.
+  Result<DeviceBuffer> import_peer_impl(const DeviceBuffer& src);
   Status copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                         std::size_t bytes, std::size_t src_offset,
                         std::size_t dst_offset);

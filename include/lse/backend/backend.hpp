@@ -150,6 +150,15 @@ inline constexpr Stream kDefaultStream{0};
 struct StreamEvent {
   Stream stream{};
   std::uint64_t timeline = 0;
+  // The backend object the timeline counts on, carried so another device can
+  // wait on it. Without it an event can only be resolved by the backend that
+  // recorded it -- which makes "wait until THAT device's stream reaches here"
+  // inexpressible, and leaves draining from the host as the only way to order
+  // two devices. Opaque here; only the backend that set it may interpret it.
+  void* semaphore = nullptr;
+  // Which device recorded it, so a waiter can tell its own event from a
+  // foreign one.
+  DeviceIndex device{};
 
   [[nodiscard]] bool valid() const noexcept { return timeline != 0; }
 };
@@ -623,6 +632,13 @@ class Backend {
     }
   }
 
+  Result<DeviceBuffer> import_peer(const DeviceBuffer& src) {
+    if constexpr (requires { derived().import_peer_impl(src); }) {
+      return derived().import_peer_impl(src);
+    }
+    return LSE_ERROR(kUnimplemented, "this backend cannot import a peer buffer");
+  }
+
   Result<KernelHandle> load_executable(std::string_view name,
                                        std::span<const std::byte> code_object) {
     return derived().load_executable_impl(name, code_object);
@@ -825,6 +841,21 @@ class IBackend {
     (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
     return LSE_ERROR(kUnimplemented, "this backend has no peer copy");
   }
+  // A buffer another device owns, made bindable here.
+  //
+  // Peer access grants the hardware permission to follow the address; it does
+  // not make a foreign handle resolvable, and a kernel binds handles. Importing
+  // the peer's address into this device's allocator closes that gap, and it is
+  // what lets a kernel read across the link instead of waiting for a copy to
+  // land -- which is the difference between ordering two devices on the GPU and
+  // draining one from the host before every read.
+  //
+  // Not pure: a backend with no peers declines, and the caller falls back to
+  // copying.
+  virtual Result<DeviceBuffer> import_peer(const DeviceBuffer& src) {
+    (void)src;
+    return LSE_ERROR(kUnimplemented, "this backend cannot import a peer buffer");
+  }
   virtual Result<KernelHandle> load_executable(
       std::string_view name, std::span<const std::byte> code_object) = 0;
   virtual Status launch(const KernelHandle& kernel, const LaunchDims& dims,
@@ -935,6 +966,9 @@ class BackendAdapter final : public IBackend {
   Status copy_peer(const DeviceBuffer& s, DeviceBuffer& d, std::size_t n,
                    std::size_t soff, std::size_t doff) override {
     return impl_.copy_peer(s, d, n, soff, doff);
+  }
+  Result<DeviceBuffer> import_peer(const DeviceBuffer& s) override {
+    return impl_.import_peer(s);
   }
   Result<KernelHandle> load_executable(
       std::string_view n, std::span<const std::byte> code) override {
