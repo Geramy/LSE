@@ -49,7 +49,9 @@ if [ "${host_groups:-0}" = "0" ]; then
   pass "every group ran on the device"
 else
   fail "$host_groups group(s) fell back to the host:"
-  grep -oE "host x[0-9]+ +[^\"]+" <<<"$out" | head -5
+  # The whole reason, not a fragment: a compiler diagnostic runs several
+  # lines and carries quotes, and a truncated one names nothing to fix.
+  grep -n -A40 -m1 -E "host x[0-9]+" <<<"$out" | cut -c1-400
 fi
 
 # Recall and arithmetic fail differently. A model whose weights are bound to
