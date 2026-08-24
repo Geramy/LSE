@@ -2,6 +2,9 @@
 #include "lse/model/layer.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -405,6 +408,17 @@ Result<Array> WeightBinder::require_columns(std::string_view name,
                      std::to_string(width), " wide; [", std::to_string(first),
                      ", ", std::to_string(first + count), ") runs past that");
   }
+  // The invariant the row path checks and this one has to as well: upload's
+  // windowed copy writes `rows` spans of `count` derived from the SOURCE, so
+  // a destination shape that disagrees is a heap overrun, not a wrong answer.
+  const std::size_t rows = width > 0 ? v->element_count() / width : 0;
+  if (shape.elem_count() != rows * static_cast<std::size_t>(count)) {
+    return LSE_ERROR(kInvalidArgument, "'", std::string(name), "' has ",
+                     std::to_string(rows), " rows; a window of ",
+                     std::to_string(count),
+                     " columns cannot fill the requested ",
+                     std::to_string(shape.elem_count()), " elements");
+  }
   LSE_ASSIGN_OR(Array a, upload(*v, shape, nullptr, first, count));
   claimed_.emplace_back(name);
   return a;
@@ -452,6 +466,38 @@ Status HybridBlock::load(WeightBinder& binder, std::string_view prefix,
   return OkStatus();
 }
 
+
+namespace {
+// LSE_TRACE_BLOCK=1: drain and checksum a stage of the block, whole and split
+// paths alike, so a whole-vs-split divergence names its stage. Diagnostic
+// only: the drain forces evaluation and changes phase structure.
+void trace_stage(const char* path, const char* stage, const Array& a) {
+  static const bool on = std::getenv("LSE_TRACE_BLOCK") != nullptr;
+  if (!on || !a.valid()) return;
+  Array& mut = const_cast<Array&>(a);
+  if (!mut.eval().ok()) return;
+  const std::size_t n = mut.shape().elem_count();
+  // Per-token checksums, so a divergence names its position instead of
+  // cancelling into a whole-tensor sum. Assumes [1, tokens, hidden].
+  const std::size_t rank = mut.shape().rank();
+  const std::size_t hid = rank >= 1
+      ? static_cast<std::size_t>(mut.shape().dim(
+            static_cast<std::int64_t>(rank) - 1))
+      : n;
+  const std::size_t toks = hid != 0 ? n / hid : 1;
+  std::fprintf(stderr, "[block] %s %-8s", path, stage);
+  for (std::size_t t = 0; t < toks; ++t) {
+    double chk = 0.0;
+    for (std::size_t i = t * hid; i < (t + 1) * hid; ++i) {
+      const double v = graph::interpreter::load_element(*mut.node(), i);
+      chk += v * static_cast<double>((i % 97) + 1);
+    }
+    std::fprintf(stderr, " t%zu=%.9e", t, chk);
+  }
+  std::fprintf(stderr, "\n");
+}
+}  // namespace
+
 Result<Array> HybridBlock::forward(const Array& x, MixerState* state,
                                    Array* aux_loss, const LayerContext& ctx) {
   if (ctx.config == nullptr) {
@@ -463,12 +509,16 @@ Result<Array> HybridBlock::forward(const Array& x, MixerState* state,
                                : ops::rms_norm(v, w, eps);
   };
 
-  LSE_ASSIGN_OR(Array mixed,
-                mixer_->forward(norm(x, norm1_weight_), state, ctx));
+  Array normed1 = norm(x, norm1_weight_);
+  trace_stage("whole", "norm1", normed1);
+  LSE_ASSIGN_OR(Array mixed, mixer_->forward(normed1, state, ctx));
+  trace_stage("whole", "mix", mixed);
   Array h = x + mixed;
 
   Array h2 = norm(h, norm2_weight_);
+  trace_stage("whole", "norm2", h2);
   LSE_ASSIGN_OR(Array ff, ffn_->forward(h2, aux_loss, ctx));
+  trace_stage("whole", "ffn", ff);
   if (mod_) {
     LSE_ASSIGN_OR(ff, mod_->gate_all(h2, ff));
   }
@@ -493,24 +543,41 @@ Result<std::vector<Array>> HybridBlock::forward_shards(
   // the work after it is local. What crosses is one partial per member per
   // reduce, in opposite directions, instead of the activation on the way in
   // AND the sum on the way out.
-  auto reduce = [&](const std::vector<Array>& parts) {
+  auto reduce = [&](const std::vector<Array>& parts) -> std::vector<Array> {
     // An op that did not shard hands back ONE value, and that value is already
     // the whole answer: every member takes it as it is. Summing it per member
     // would add it to itself, and indexing parts[m] past what it returned is
     // how a block that shards its feed-forward but not its mixer -- or the
-    // other way round -- reads off the end of the vector.
+    // other way round -- reads off the end of the vector. Nothing today
+    // returns zero partials, but the contract does not forbid it, and the
+    // deref below must not be the thing that finds out.
     std::vector<Array> out(n);
+    if (parts.empty()) return out;
     if (parts.size() < n) {
       for (std::size_t m = 0; m < n; ++m) out[m] = parts.front();
       return out;
     }
     for (std::size_t m = 0; m < n; ++m) {
       const graph::ScopedMember on(m);
-      Array acc = parts[m];
+      // The sum runs in f32 whatever the partials are stored as. Each partial
+      // already paid one rounding when its half-width matmul left its f32
+      // accumulator; adding them at storage precision pays another per member
+      // and the block lands ~2e-4 off the unsplit answer — measured by
+      // a_split_block_rebuilds_what_the_whole_one_computes, and compounded
+      // over 64 blocks' residual streams it flips greedy tokens. Summing in
+      // f32 keeps the join's error at the one rounding the cast back costs.
+      const DType kept = parts[m].dtype();
+      Array acc = kept == DType::kF32 ? parts[m]
+                                      : graph::cast(parts[m], DType::kF32);
       for (std::size_t j = 0; j < parts.size(); ++j) {
-        if (j != m) acc = graph::add(acc, parts[j]);
+        if (j != m) {
+          const Array& p = parts[j];
+          acc = graph::add(acc, p.dtype() == DType::kF32
+                                    ? p
+                                    : graph::cast(p, DType::kF32));
+        }
       }
-      out[m] = acc;
+      out[m] = kept == DType::kF32 ? acc : graph::cast(acc, kept);
     }
     return out;
   };
@@ -520,9 +587,11 @@ Result<std::vector<Array>> HybridBlock::forward_shards(
     const graph::ScopedMember on(m);
     normed[m] = norm(xs[m], norm1_shards_[m]);
   }
+  trace_stage("split", "norm1", normed[0]);
   LSE_ASSIGN_OR(std::vector<Array> mixed,
                 mixer_->forward_shards(normed, state, ctx));
   const std::vector<Array> mix_sum = reduce(mixed);
+  trace_stage("split", "mix", mix_sum[0]);
 
   std::vector<Array> h(n), h2(n);
   for (std::size_t m = 0; m < n; ++m) {
@@ -531,13 +600,26 @@ Result<std::vector<Array>> HybridBlock::forward_shards(
     h2[m] = norm(h[m], norm2_shards_[m]);
   }
 
+  trace_stage("split", "norm2", h2[0]);
   LSE_ASSIGN_OR(std::vector<Array> ff, ffn_->forward_shards(h2, aux_loss, ctx));
   const std::vector<Array> ff_sum = reduce(ff);
+  trace_stage("split", "ffn", ff_sum[0]);
 
+  // The whole path's tail, per member: the MoD gate scales the routed output,
+  // and whatever the FFN keeps outside the gate (a shared expert) is added
+  // after it. Each member holds the full h2 and the full ff_sum, so both are
+  // local work — dropping them here silently ran a split model without a
+  // whole branch of its feed-forward.
   std::vector<Array> out(n);
   for (std::size_t m = 0; m < n; ++m) {
     const graph::ScopedMember on(m);
-    out[m] = h[m] + ff_sum[m];
+    Array ff_m = ff_sum[m];
+    if (mod_) {
+      LSE_ASSIGN_OR(ff_m, mod_->gate_all(h2[m], ff_m));
+    }
+    LSE_ASSIGN_OR(Array dense, ffn_->ungated(h2[m]));
+    if (dense.valid()) ff_m = ff_m + dense;
+    out[m] = h[m] + ff_m;
   }
   return out;
 }

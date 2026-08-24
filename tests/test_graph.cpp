@@ -1277,6 +1277,37 @@ LSE_TEST(a_backend_whose_other_streams_cost_more_per_launch_keeps_the_order) {
   LSE_EXPECT_EQ(p.streams_used, 1u);
 }
 
+LSE_TEST(a_pinned_plan_on_a_costly_stream_backend_still_orders_its_members) {
+  // The spanning-device case: the caller has already placed every group,
+  // group i on member i's stream (forced = {0, 1, 0}), so the planner has no
+  // freedom to move anything. may_spread() is false — the position the HRX
+  // backend held while its batched path could only address ring 0; it declares
+  // uniform cost now, but a pinned plan must order correctly under either
+  // answer — and the ordering is still the planner's to emit: the join
+  // (group 2) reads both halves' outputs, and on one shared address space the
+  // wait IS the synchronization. Before the fix the !may_spread() early return
+  // fired for pinned plans too, every group came back on stream 0 with zero
+  // waits, and the tensor split's reduce read a half before the other GPU had
+  // written it.
+  std::vector<FusionGroup> gs{placed(10, 256, {}),   // member 0's half
+                              placed(11, 256, {}),   // member 1's half
+                              placed(12, 256, {10, 11})};  // the join
+  const std::vector<std::size_t> members{0, 1, 0};
+  const std::vector<std::uint32_t> forced{0, 1, 0};
+  backend::StreamCapabilities caps = four_streams();
+  caps.uniform_launch_cost = false;  // may_spread() == false, the hard case
+  const StreamPlan p = plan_streams(gs, caps, wide_device(), members, forced);
+  LSE_EXPECT_EQ(p.stream[0], 0u);
+  LSE_EXPECT_EQ(p.stream[1], 1u);
+  LSE_EXPECT_EQ(p.stream[2], 0u);
+  LSE_EXPECT_EQ(p.streams_used, 2u);
+  LSE_EXPECT_EQ(p.waits[2].size(), 1u);
+  LSE_EXPECT_EQ(p.waits[2][0], 1u);
+  LSE_EXPECT_EQ(p.waits_total, 1u);
+  LSE_EXPECT_EQ(p.record_after[1], 1);
+  LSE_EXPECT_EQ(p.chain, 2u);
+}
+
 LSE_TEST(a_group_whose_buffers_are_unknown_is_ordered_after_everything) {
   // Nothing is known about the third group's bytes, so it may not be placed
   // beside anything: it waits for the tail of every stream in flight.

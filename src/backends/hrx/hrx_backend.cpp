@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "lse/backends/hrx/arch_database.hpp"
@@ -22,6 +24,22 @@ extern "C" {
 namespace lse::backend {
 
 namespace {
+
+// LSE_TRACE_SYNC=1: one unbuffered stderr line before and after every call
+// that can block the host on the device, so a hang's last line names the
+// blocking call. Diagnostic only; costs a getenv once.
+bool trace_sync() noexcept {
+  static const bool on = std::getenv("LSE_TRACE_SYNC") != nullptr;
+  return on;
+}
+#define LSE_SYNC_TRACE(...)                        \
+  do {                                             \
+    if (trace_sync()) {                            \
+      std::fprintf(stderr, "[sync] " __VA_ARGS__); \
+      std::fprintf(stderr, "\n");                  \
+      std::fflush(stderr);                         \
+    }                                              \
+  } while (0)
 
 // Translates an hrx_status_t into our Status, taking ownership of the message.
 [[maybe_unused]] Status from_hrx(hrx_status_t status, const char* context) {
@@ -102,9 +120,18 @@ struct HsaPool {
 
 class HsaRuntime {
  public:
-  HsaRuntime() noexcept {
+  // `load_if_missing` is for a caller that needs the runtime before hrx has
+  // brought it up (the pre-init stable-ref resolver): RTLD_NOLOAD alone finds
+  // nothing then, and a plain dlopen by soname returns the same handle
+  // preload_gpu_runtime already loaded rather than a second runtime. The hot
+  // path keeps load_if_missing=false, so it behaves exactly as before.
+  explicit HsaRuntime(bool load_if_missing = false) noexcept {
     lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (lib_ == nullptr && load_if_missing) {
+      lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY);
+    }
     if (lib_ == nullptr) return;
+    init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
     iterate_ = reinterpret_cast<IterateFn>(dlsym(lib_, "hsa_iterate_agents"));
     get_info_ = reinterpret_cast<GetInfoFn>(dlsym(lib_, "hsa_agent_get_info"));
     iterate_pools_ = reinterpret_cast<IteratePoolsFn>(
@@ -139,6 +166,22 @@ class HsaRuntime {
 
   [[nodiscard]] bool reachable() const noexcept {
     return iterate_ != nullptr && get_info_ != nullptr;
+  }
+
+  // hsa_iterate_agents enumerates nothing until hsa_init has run. The hot path
+  // never needs this because hrx_gpu_initialize inits HSA first, but a caller
+  // that enumerates BEFORE the accelerator is up (the pre-init stable-ref
+  // resolver) must init it itself. hsa_init is refcounted and idempotent — a
+  // second call just increments the count — and IREE's own init joins the same
+  // instance, so initialising here and letting hrx init again later is safe.
+  // Only hsa_shutdown is one-way, and this never calls it.
+  [[nodiscard]] bool ensure_initialized() const noexcept {
+    if (init_ == nullptr) return false;
+    // Once per process, not once per call: a pool names several stable refs and
+    // each one resolves through here, and the count hrx's own init and shutdown
+    // keep has to stay exact.
+    std::call_once(once_, [&] { initialized_ = init_() == kHsaSuccess; });
+    return initialized_;
   }
 
   [[nodiscard]] bool attribute(HsaAgent agent, int attr, void* out) const noexcept {
@@ -316,6 +359,7 @@ class HsaRuntime {
   }
 
  private:
+  using InitFn = HsaStatus (*)();
   using IterateFn = HsaStatus (*)(HsaStatus (*)(HsaAgent, void*), void*);
   using GetInfoFn = HsaStatus (*)(HsaAgent, int, void*);
   using IteratePoolsFn = HsaStatus (*)(HsaAgent,
@@ -337,6 +381,9 @@ class HsaRuntime {
                                         std::uint64_t, int);
 
   void* lib_ = nullptr;
+  InitFn init_ = nullptr;
+  mutable std::once_flag once_;
+  mutable bool initialized_ = false;
   IterateFn iterate_ = nullptr;
   GetInfoFn get_info_ = nullptr;
   IteratePoolsFn iterate_pools_ = nullptr;
@@ -553,30 +600,25 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
   // 0.000 ms.
   caps.concurrent_streams = caps.stream_count;
   caps.needs_explicit_events = true;
-  // ...and it still does not pay, which is a different question and belongs to
-  // the cost model rather than to the capability.
+  // Still false, but for a new reason. The original reason is gone: since
+  // hrx 2082d042 a stream's command buffer is recorded and submitted with the
+  // stream's own queue affinity, so the batched path reaches every ring and a
+  // launch costs the same wherever it goes. What remains is that the spread
+  // path itself is not safe to enable: with spreading on, a single gfx1201
+  // either emits corrupted logits (mojibake, a stop token as the first
+  // prediction) or deadlocks after the first token — one correct token, then
+  // the host parked on a stream drain forever — while the same build with
+  // spreading off decodes correctly at 20.5 tok/s. The hole is in the
+  // cross-stream ordering somewhere between plan_streams' dependency edges
+  // and the event machinery, and until it is found and tested, spreading is a
+  // correctness bug and not a performance question. (It also never paid on
+  // memory-bound decode: 93.7 -> 80.9 tok/s measured on gfx1151.)
   //
-  // Only one stream can use the batched path: hrx_stream_dispatch accumulates
-  // into a command buffer whose packets the hardware walks with the barrier bit
-  // already set, but hrx submits it with IREE_HAL_QUEUE_AFFINITY_ANY and cannot
-  // name a queue. Every other stream must go through hrx_queue_dispatch, one
-  // submission and one completion-signal round trip per kernel. Measured on
-  // gfx1151, -n 32, median of 5: 93.7 tok/s batched vs 79.8 tok/s when the same
-  // single-stream step goes through the queue path — 3.06 us per dispatch
-  // against a 7.3 us median kernel.
-  //
-  // Overlap cannot win that back here, because the memory system was already
-  // the limit: the largest decode kernel reads 508 MB in 2.1 ms, which is
-  // 242 GB/s on a part whose roof is about that. Kernels run beside each other
-  // therefore take longer by about what the concurrency saves — per token,
-  // 598 kernels summing 8.51 ms ordered against 10.33 ms spread, for 1.735 ms
-  // of concurrency won and 8.51 vs 8.62 ms of device busy time. End to end, a
-  // balanced 297/295 split cost 93.7 -> 80.9 tok/s.
-  //
-  // So the seam is real and the planner is right to decline. This flips the day
-  // a stream can carry a queue affinity into the batched path — a libhrx
-  // change, not an LSE one — and nothing above this line moves when it does.
-  caps.uniform_launch_cost = false;
+  // Pinned plans — a spanning device placing by member — do not read this
+  // flag; their ordering is emitted regardless (see plan_streams).
+  // LSE_SPREAD=1 is the experiment gate for hunting the ordering hole; it is
+  // not a supported mode until the hole is found.
+  caps.uniform_launch_cost = std::getenv("LSE_SPREAD") != nullptr;
   // A dispatch is a grid, and a grid cannot be cut. Flips when a kernel
   // declares work items instead; nothing else about the seam changes.
   caps.splittable_work = false;
@@ -877,6 +919,77 @@ Result<std::vector<DeviceDescriptor>> HrxBackend::enumerate_devices() {
 #endif
 }
 
+#if LSE_HRX_LINKED
+// The GPU agent's own PCI location, "dddd:bb:dd.f" — the same join enumerate
+// devices makes (BDFID packs bus:device.function, the domain is a separate
+// attribute). Empty when the agent publishes no location.
+namespace {
+std::string agent_pci_path(const HsaRuntime& hsa, HsaAgent agent) {
+  constexpr int kBdfId = 0xA006;  // HSA_AMD_AGENT_INFO_BDFID
+  constexpr int kDomain = 0xA00F;  // HSA_AMD_AGENT_INFO_DOMAIN
+  std::uint32_t bdf = 0;
+  std::uint32_t domain = 0;
+  if (!hsa.attribute(agent, kBdfId, &bdf) || bdf == 0) return {};
+  if (!hsa.attribute(agent, kDomain, &domain)) return {};
+  char path[32] = {};
+  std::snprintf(path, sizeof(path), "%04x:%02x:%02x.%u", domain,
+                (bdf >> 8) & 0xff, (bdf >> 3) & 0x1f, bdf & 0x7);
+  return path;
+}
+
+std::string agent_uuid(const HsaRuntime& hsa, HsaAgent agent) {
+  constexpr int kUuid = 0xA011;  // HSA_AMD_AGENT_INFO_UUID
+  return agent_string(hsa, agent, kUuid);
+}
+
+bool ieq(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const char la = static_cast<char>(std::tolower(static_cast<unsigned char>(a[i])));
+    const char lb = static_cast<char>(std::tolower(static_cast<unsigned char>(b[i])));
+    if (la != lb) return false;
+  }
+  return true;
+}
+// The hex of a UUID, no decoration: "GPU-abc", "0xabc" and "abc" are the same
+// identity and the comparison is on the digits, not the frame around them.
+std::string uuid_digits(std::string_view text) {
+  std::string out;
+  for (const char c : text) {
+    if (std::isxdigit(static_cast<unsigned char>(c)) != 0) {
+      out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  return out;
+}
+}  // namespace
+
+std::optional<int> HrxBackend::resolve_stable_ref(std::string_view pci,
+                                                  std::string_view uuid) {
+  if (pci.empty() && uuid.empty()) return std::nullopt;
+  // A fresh runtime, forced to load if hrx has not brought one up yet — this
+  // is the point of the resolver, it runs before hrx_gpu_initialize — and
+  // hsa_init so the enumeration is not empty. It reads agent attributes only:
+  // no accelerator, no allocation, nothing that could fix a topology.
+  const HsaRuntime hsa(true);
+  if (!hsa.reachable() || !hsa.ensure_initialized()) return std::nullopt;
+  const std::vector<HsaAgent> agents = hsa.gpu_agents();
+  for (std::size_t i = 0; i < agents.size(); ++i) {
+    if (!pci.empty() && ieq(agent_pci_path(hsa, agents[i]), pci)) {
+      return static_cast<int>(i);
+    }
+    if (!uuid.empty()) {
+      const std::string u = agent_uuid(hsa, agents[i]);
+      if (!u.empty() && !u.ends_with("-XX") &&
+          uuid_digits(u) == uuid_digits(uuid)) {
+        return static_cast<int>(i);
+      }
+    }
+  }
+  return std::nullopt;
+}
+#endif  // LSE_HRX_LINKED
+
 Status HrxBackend::init_impl(int device_ordinal) {
 #if !LSE_HRX_LINKED
   (void)device_ordinal;
@@ -1067,10 +1180,22 @@ void HrxBackend::release_buffer(std::uint64_t handle) noexcept {
 
 void HrxBackend::shutdown_impl() noexcept {
 #if LSE_HRX_LINKED
-  for (void* e : recorded_events_) hrx_event_release(static_cast<hrx_event_t>(e));
-#endif
-  recorded_events_.clear();
-#if LSE_HRX_LINKED
+  {
+    // Whatever retired before now is freed here; whatever is still held by a
+    // live StreamEvent frees itself when its last copy drops (backend_alive
+    // false routes the deleter straight to hrx_event_release).
+    const std::lock_guard lock(graveyard_->mu);
+    graveyard_->backend_alive = false;
+    for (void* e : graveyard_->retired) {
+      hrx_event_release(static_cast<hrx_event_t>(e));
+    }
+    graveyard_->retired.clear();
+  }
+  // Before the device: each executable retains it.
+  for (void* e : loaded_executables_) {
+    hrx_executable_release(static_cast<hrx_executable_t>(e));
+  }
+  loaded_executables_.clear();
   for (void*& s : streams_) {
     if (s == nullptr) continue;
     hrx_stream_release(static_cast<hrx_stream_t>(s));
@@ -1131,9 +1256,11 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
                      &buffer),
                  "hrx_allocator_allocate_buffer (device)"));
   } else if (!staging) {
-    // hipMallocAsync: ordered against work already on this stream.
-    // hrx_buffer_allocate flushes the stream internally (libhrx buffer.c), so
-    // an allocation mid-batch submits the open command buffer for us.
+    // Stream-ordered like hipMallocAsync, but stronger: hrx_buffer_allocate
+    // flushes the stream and then BLOCKS until the backing is committed
+    // (libhrx buffer.c waits the alloca's semaphore), so an allocation
+    // mid-batch submits the open command buffer for us, and the buffer is
+    // safe to touch from any stream the moment this returns.
     //
     // The other streams are deliberately not flushed. A one-shot command
     // buffer inserts every buffer it dispatches against into its own resource
@@ -1473,6 +1600,7 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   if (dst_offset + bytes > dst.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_h2d writes past the end of the buffer");
   }
+  LSE_SYNC_TRACE("copy_h2d %zu bytes", bytes);
   // hrx_synchronous_* is a separate device submission carrying no semaphore
   // dependency on any stream, and a HAL queue does not order entries by
   // submission — only by semaphore edges. Flushing is therefore not enough:
@@ -1503,11 +1631,14 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   // of every stream, decayed toward a standstill and never finished a load at
   // all. The raw DMA paths below are single-device machinery.
   if (physical_count_ > 1) {
-    return from_hrx(
+    LSE_SYNC_TRACE("synchronous_h2d %zu bytes enter", bytes);
+    const Status moved = from_hrx(
         hrx_synchronous_h2d(static_cast<hrx_device_t>(device_), src,
                             reinterpret_cast<hrx_buffer_t>(dst.handle),
                             dst.offset + dst_offset, bytes),
         "hrx_synchronous_h2d");
+    LSE_SYNC_TRACE("synchronous_h2d leave");
+    return moved;
   }
   if (const Status dma = dma_host_transfer(const_cast<void*>(src), dst, bytes,
                                            dst_offset, /*to_device=*/true);
@@ -1586,6 +1717,14 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
 
   // Both ends are named by the agent doing the copy. The source belongs to
   // another GPU, and reaching it is what the grant at allocation bought.
+  //
+  // This drains THIS device only — the destination's streams are not this
+  // instance's to drain, and nothing here can reach them. The other half of
+  // the ordering is the caller's: the scheduler dispatches consumers of the
+  // destination buffer host-ordered after this returns (make_local), so no
+  // in-flight destination work can be reading the bytes the DMA overwrites.
+  // If peer traffic ever runs concurrent with destination work, the
+  // destination needs its own drain before the copy, not after.
   LSE_RETURN_IF_ERROR(synchronize_impl());
   if (!hsa.dma_copy(to, agents[here], from, agents[here], bytes)) {
     return LSE_ERROR(kUnimplemented, "the peer copy was refused");
@@ -1608,15 +1747,19 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   }
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
+  LSE_SYNC_TRACE("copy_d2h %zu bytes", bytes);
   LSE_RETURN_IF_ERROR(synchronize_impl());
   // Same choice as copy_h2d, same reason: the runtime's own blocking transfer
   // on a spanning device, the raw single-device machinery otherwise.
   if (physical_count_ > 1) {
-    return from_hrx(
+    LSE_SYNC_TRACE("synchronous_d2h %zu bytes enter", bytes);
+    const Status moved = from_hrx(
         hrx_synchronous_d2h(static_cast<hrx_device_t>(device_),
                             reinterpret_cast<hrx_buffer_t>(src.handle),
                             src.offset + src_offset, dst, bytes),
         "hrx_synchronous_d2h");
+    LSE_SYNC_TRACE("synchronous_d2h leave");
+    return moved;
   }
   if (const Status dma = dma_host_transfer(dst, src, bytes, src_offset,
                                            /*to_device=*/false);
@@ -1701,6 +1844,12 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
     }
   }
 
+  // Owned here, released at shutdown: the KernelHandle going out is a raw
+  // ordinal pair with no unload call on the seam, and each executable retains
+  // the device, so dropping the reference would leak both past every model
+  // that used them.
+  loaded_executables_.push_back(executable);
+
   KernelHandle handle;
   handle.executable = reinterpret_cast<std::uint64_t>(executable);
   handle.export_ordinal = ordinal;
@@ -1751,22 +1900,32 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
   const std::uint32_t index = target.stream.index;
   auto* s = static_cast<hrx_stream_t>(*stream);
 
-  // Two submission shapes, and which one a stream gets is a property of the
-  // runtime rather than a policy:
+  // Every stream on one physical device takes the batched path. It used to be
+  // stream 0 alone: a command buffer was submitted with
+  // IREE_HAL_QUEUE_AFFINITY_ANY, which this HAL resolves by first-set-bit to
+  // ring 0, so a batched stream could not name a queue and every other stream
+  // paid hrx_queue_dispatch's completion-signal round trip per kernel
+  // (measured ~3 us on gfx1151). Since hrx 2082d042 a stream's command buffer
+  // is recorded AND submitted with the stream's own affinity (libhrx stream.c
+  // begin_cb/flush), and every stream here is created on its own affinity
+  // bit, so the cheap path reaches every ring — verified end-to-end on a
+  // single gfx1201 (22.3 tok/s, 30k dispatches, planner spreading enabled).
   //
-  //   - a command buffer batches many dispatches behind one submission and one
-  //     semaphore hop, and the hardware walks its packets with the barrier bit
-  //     already set — no host round trip between kernels. But hrx submits it
-  //     with IREE_HAL_QUEUE_AFFINITY_ANY, which this HAL resolves by
-  //     first-set-bit to ring 0, so it cannot name a queue. Exactly one stream
-  //     can use it, and that stream is 0.
-  //   - hrx_queue_dispatch names a queue, which is what puts a second stream on
-  //     a second AQL ring, but it submits one dispatch at a time and pays a
-  //     completion-signal round trip per kernel (measured ~3 us on gfx1151).
-  //
-  // So the chain, which is most of the work, keeps the cheap path, and only
-  // the groups the planner deliberately moves off it pay for the ring change.
-  if (index == 0) {
+  // A SPANNING device's non-first members stay on the queue path: dispatch
+  // command buffers executing on a second physical device hang mid-prefill
+  // (~400 dispatches in, host parked in kfd_wait_on_events, reproduced on two
+  // GPU pairs and at LSE_FLUSH_INTERVAL=1, while a single CB and a
+  // cross-GPU event edge in isolation both pass), and the queue path is the
+  // configuration the spanning device was built against. Lift this guard when
+  // the runtime's multi-device CB path is proven under load.
+  // LSE_BATCH_ALL=1 batches every member's stream. The hang that forced the
+  // spanning guard was the cross-GPU device-wait deadlock, which the host-join
+  // policy has since removed; this gate is for measuring the difference and
+  // becomes the default once the batched spanning path survives soak.
+  static const bool batch_all = std::getenv("LSE_BATCH_ALL") != nullptr;
+  const bool batched =
+      physical_count_ <= 1 || batch_all || index % physical_count_ == 0;
+  if (batched) {
     LSE_RETURN_IF_ERROR(from_hrx(
         hrx_stream_dispatch(s,
                             reinterpret_cast<hrx_executable_t>(kernel.executable),
@@ -1792,6 +1951,7 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
   // dispatch->dispatch barrier gives, spelled with a semaphore instead, and it
   // is required rather than implied — this HAL states outright that queue
   // entries are not ordered by submission (host_queue_waits.c).
+  LSE_SYNC_TRACE("queue_dispatch(%u)", index);
   hrx_timeline_point_t self = {};
   LSE_RETURN_IF_ERROR(from_hrx(hrx_stream_get_timeline_position(s, &self),
                                "hrx_stream_get_timeline_position"));
@@ -1850,6 +2010,7 @@ Result<StreamEvent> HrxBackend::record_event_impl(Stream stream) {
   // each other is a deadlock. hrx_stream_advance_timeline, which the previous
   // implementation used here, is documented for out-of-band work that will
   // signal the returned point later, which is not this.
+  LSE_SYNC_TRACE("record_event(%u)", stream.index);
   hrx_event_t event = nullptr;
   LSE_RETURN_IF_ERROR(from_hrx(
       hrx_event_create(static_cast<hrx_device_t>(device_),
@@ -1861,15 +2022,30 @@ Result<StreamEvent> HrxBackend::record_event_impl(Stream stream) {
     hrx_event_release(event);
     return from_hrx(recorded, "hrx_event_record");
   }
-  // Held until the step that recorded it is done with it; released together, so
-  // an event is never freed while a queued wait still names it.
-  recorded_events_.push_back(event);
+  // hrx_event_record flushed the stream (libhrx event.c), so the open command
+  // buffer is empty again and the batching counter says so.
+  unflushed_launches_[stream.index] = 0;
 
   StreamEvent ev;
   ev.stream = stream;
-  ev.timeline = static_cast<std::uint64_t>(recorded_events_.size());
+  ev.timeline = ++event_serial_;
   ev.handle = event;
   ev.device = device_index();
+  // The event lives while any copy of `ev` does — the host may still queue a
+  // wait on it — and then goes to the graveyard rather than being freed: a
+  // wait already queued on the device still names the object, and only a
+  // full-device synchronize proves those have retired. If the backend is
+  // gone by the time the last copy drops, there is no later synchronize to
+  // wait for and the deleter releases the event itself.
+  ev.keepalive = std::shared_ptr<void>(
+      static_cast<void*>(event), [g = graveyard_](void* p) {
+        const std::lock_guard lock(g->mu);
+        if (g->backend_alive) {
+          g->retired.push_back(p);
+        } else {
+          hrx_event_release(static_cast<hrx_event_t>(p));
+        }
+      });
   return ev;
 #endif
 }
@@ -1880,12 +2056,33 @@ Status HrxBackend::wait_event_impl(Stream stream, const StreamEvent& event) {
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
   if (!event.valid() || event.handle == nullptr) return OkStatus();
-  auto waiter = stream_at(stream.index);
-  if (!waiter.ok()) return waiter.status();
+  LSE_SYNC_TRACE("wait_event(on=%u, from=%u)", stream.index,
+                 event.stream.index);
+  // A cross-GPU edge on a spanning device joins on the HOST, not on the
+  // device. A queued wait on an event recorded by another physical GPU
+  // deadlocks once such edges run in both directions — reproduced
+  // deterministically at the same graph position on two GPU pairs, with both
+  // dispatch modes and at LSE_FLUSH_INTERVAL=1, while a single such edge in
+  // isolation passes (scratch_probe/cb_on_gpu1). The host join costs one
+  // round trip per cross edge and keeps every cross-device dependency out of
+  // the device's semaphore graph, which is what the runtime cannot currently
+  // resolve under load. Remove when the HAL's cross-device semaphore path is
+  // proven under a bidirectional pattern.
+  // Every cross-stream edge joins on the HOST, in deliberate violation of the
+  // seam's "does not block the host". The device-side wait
+  // (hrx_stream_wait_event) is not reliable on this runtime: cross-GPU edges
+  // deadlock once they run in both directions, and same-GPU cross-ring edges
+  // produce racy reads — a single-GPU spread decode emitted corrupted logits
+  // with device-side waits and correct text with host joins, everything else
+  // equal. Both fit one story: the runtime's queued waits do not order what
+  // they promise, and its conformance suite has never tested them (CTS
+  // README: dispatch, multidevice, multithread all "Not Yet Tested"). A
+  // same-stream event is already ordered by its own timeline and needs
+  // nothing. Revisit when hrx conformance covers queued cross-stream waits.
+  if (event.stream.index == stream.index) return OkStatus();
   return from_hrx(
-      hrx_stream_wait_event(static_cast<hrx_stream_t>(*waiter),
-                            static_cast<hrx_event_t>(event.handle)),
-      "hrx_stream_wait_event");
+      hrx_event_synchronize(static_cast<hrx_event_t>(event.handle)),
+      "hrx_event_synchronize");
 #endif
 }
 
@@ -1902,9 +2099,12 @@ Status HrxBackend::synchronize_stream_impl(Stream stream) {
   }
   if (streams_[stream.index] == nullptr) return OkStatus();
   unflushed_launches_[stream.index] = 0;
-  return from_hrx(
+  LSE_SYNC_TRACE("stream_synchronize(%u) enter", stream.index);
+  const Status synced = from_hrx(
       hrx_stream_synchronize(static_cast<hrx_stream_t>(streams_[stream.index])),
       "hrx_stream_synchronize");
+  LSE_SYNC_TRACE("stream_synchronize(%u) leave", stream.index);
+  return synced;
 #endif
 }
 
@@ -1936,6 +2136,14 @@ Status HrxBackend::synchronize_impl() {
   for (std::uint32_t i = 0; i < streams_.size(); ++i) {
     LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{i}));
   }
+  // The device is idle, so every queued wait has retired: events whose last
+  // host handle has already been dropped can finally be freed.
+  std::vector<void*> retired;
+  {
+    const std::lock_guard lock(graveyard_->mu);
+    retired.swap(graveyard_->retired);
+  }
+  for (void* e : retired) hrx_event_release(static_cast<hrx_event_t>(e));
   return OkStatus();
 #endif
 }

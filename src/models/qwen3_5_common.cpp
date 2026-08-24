@@ -507,18 +507,24 @@ class Qwen35MLP final : public IFeedForward {
     if (gate_.size() == 1) return ops::swiglu(x, gate_[0], up_[0], down_[0]);
 
     // One branch per member, each on its own device, each reading its own
-    // shard. The branches are independent until the add, which is what lets
-    // both GPUs run this layer at once instead of taking turns.
-    std::vector<Array> partial(gate_.size());
+    // shard. The branches are independent until the add, and each add is
+    // stamped with the member doing it — an unstamped node that reads two
+    // members does not trip joins_another_member, so the join could be buried
+    // inside a phase (the mixer's forward above stamps its adds for the same
+    // reason).
+    Array sum;
     for (std::size_t m = 0; m < gate_.size(); ++m) {
       const graph::ScopedMember on(m);
-      partial[m] = ops::swiglu(x, gate_[m], up_[m], down_[m]);
-    }
-    Array sum = partial[0];
-    for (std::size_t m = 1; m < partial.size(); ++m) {
-      sum = graph::add(sum, partial[m]);
+      Array part = ops::swiglu(x, gate_[m], up_[m], down_[m]);
+      sum = m == 0 ? part : graph::add(sum, part);
     }
     return sum;
+  }
+
+  // Row-cut gate/up, column-cut down: this MLP genuinely splits, which is
+  // half of what a tensor split is chosen on (the mixer is the other half).
+  [[nodiscard]] bool shards_across_pool() const noexcept override {
+    return true;
   }
 
   Result<std::vector<Array>> forward_shards(const std::vector<Array>& xs,

@@ -534,15 +534,33 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots) {
   for (const NodePtr& r : roots) {
     if (r) root_set.insert(r.get());
   }
+  // Keep-alive: a value with readers outside this workgroup must hold its
+  // slot past the last internal use. consumer_count counts DIRECT consumers,
+  // so the internal count it is compared against has to be direct too — the
+  // old count looked through reshapes, so a value read internally through a
+  // view tallied more readers than its consumer_count and an EXTERNAL reader
+  // of the same view was invisible. A member split pushes exactly such
+  // readers into a later workgroup, the slot was recycled under them, and the
+  // clobber was deterministic. An escaping reshape pins the node whose bytes
+  // it aliases, because that is what the outside reader reads.
+  std::unordered_map<const Node*, std::uint32_t> direct_readers;
+  for (const NodePtr& m : members_) {
+    for (const NodePtr& in : m->inputs) {
+      if (in && member.count(in.get())) ++direct_readers[in.get()];
+    }
+  }
   for (const NodePtr& n : members_) {
-    if (n->fclass == FusionClass::kLeaf) continue;
-    std::uint32_t readers = 0;
-    for (const NodePtr& m : members_) {
-      for (const NodePtr& in : m->inputs) {
-        if (skip_reshape(in.get()) == n.get()) ++readers;
+    const auto it = direct_readers.find(n.get());
+    const std::uint32_t direct = it == direct_readers.end() ? 0 : it->second;
+    if (root_set.count(n.get()) == 0 && n->consumer_count <= direct) continue;
+    if (n->kind == OpKind::kReshape && !n->inputs.empty()) {
+      const Node* owner = skip_reshape(n->inputs[0].get());
+      if (owner != nullptr && member.count(owner) != 0 &&
+          owner->fclass != FusionClass::kLeaf) {
+        last_cut[owner] = static_cast<std::uint32_t>(groups.size());
       }
     }
-    if (root_set.count(n.get()) || n->consumer_count > readers) {
+    if (n->fclass != FusionClass::kLeaf) {
       last_cut[n.get()] = static_cast<std::uint32_t>(groups.size());
     }
   }
@@ -586,11 +604,15 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots) {
   }
 }
 
-Status Workgroup::bind_slots(backend::IBackend& backend) {
+Status Workgroup::bind_slots(backend::IBackend& backend,
+                             backend::Stream stream) {
   if (slot_of_.empty()) return OkStatus();
   for (Slot& s : slots_) {
     if (s.buffer.valid()) continue;
-    auto buf = backend.allocate(s.bytes, backend::MemoryClass::kDevice);
+    // Through the caller's stream: on a device spanning several GPUs the
+    // stream is what places the bytes, and the default stream put every
+    // member's phase activations in the primary's VRAM.
+    auto buf = backend.allocate(s.bytes, backend::MemoryClass::kDevice, stream);
     if (!buf.ok()) return buf.status();
     s.buffer = buf.release();
   }

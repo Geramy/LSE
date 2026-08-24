@@ -218,6 +218,16 @@ class IFeedForward {
   virtual ~IFeedForward() = default;
   virtual Status load(WeightBinder&, std::string_view prefix,
                       const LayerContext&) = 0;
+  // Whether this feed-forward splits its own weights across the pool. The
+  // same question shards_across_pool answers for a mixer, asked of the other
+  // half of the block for the same reason: a tensor split chosen on the mixer
+  // alone leaves an FFN that cannot shard whole on one member — the dominant
+  // cost of the layer running at one device's speed while the split pays its
+  // reduces anyway, which is the regression the mixer gate was measured to
+  // prevent (13.4 vs 24.4 tok/s).
+  [[nodiscard]] virtual bool shards_across_pool() const noexcept {
+    return false;
+  }
   // One partial per member; see IMixer::forward_shards.
   virtual Result<std::vector<Array>> forward_shards(
       const std::vector<Array>& xs, Array* aux_loss,
@@ -277,6 +287,12 @@ class HybridBlock {
   // Whether this block's mixer shards across the pool; see IMixer.
   [[nodiscard]] bool mixer_shards() const noexcept {
     return mixer_ != nullptr && mixer_->shards_across_pool();
+  }
+
+  // Whether this block's feed-forward does; see IFeedForward. A tensor split
+  // is chosen only when both halves of every block take it.
+  [[nodiscard]] bool ffn_shards() const noexcept {
+    return ffn_ != nullptr && ffn_->shards_across_pool();
   }
 
   HybridBlock(std::unique_ptr<IMixer> mixer, std::unique_ptr<IFeedForward> ffn,

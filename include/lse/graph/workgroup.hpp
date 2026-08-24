@@ -162,7 +162,8 @@ class Workgroup {
   // Leftovers: a slot of N bytes is reused by the next cut that needs
   // N bytes after the last reader of the previous tenant.
   void plan_slots(std::span<const NodePtr> roots);
-  Status bind_slots(backend::IBackend& backend);
+  Status bind_slots(backend::IBackend& backend,
+                    backend::Stream stream = backend::kDefaultStream);
   [[nodiscard]] std::uint32_t slot_count() const noexcept {
     return static_cast<std::uint32_t>(slots_.size());
   }

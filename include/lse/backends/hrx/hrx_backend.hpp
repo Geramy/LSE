@@ -13,6 +13,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -42,6 +44,20 @@ class HrxBackend : public Backend<HrxBackend> {
   // accelerator up is unavoidable (hrx_gpu_device_count is UNAVAILABLE before
   // it) and is idempotent, so enumerating first does not stop a later bind.
   static Result<std::vector<DeviceDescriptor>> enumerate_devices();
+
+  // What a PCI path or UUID names, as an ordinal, WITHOUT bringing the
+  // accelerator up. A pool named by a stable reference must register as a
+  // spanning group before the first init() fixes the topology, and
+  // enumerate_devices above is exactly what fixes it (it brings the
+  // accelerator up with whatever group is registered at that moment — empty,
+  // if this has not run yet, which is every GPU on the box). So a reference is
+  // resolved the cheap way: the HSA runtime publishes each GPU agent's PCI and
+  // UUID to a plain enumeration, no accelerator needed. The ordinal is the
+  // GPU agent's index in hsa_iterate_agents order, the same join enumerate
+  // devices makes and then checks by node. nullopt when the runtime is not
+  // reachable or no agent answers for the reference.
+  static std::optional<int> resolve_stable_ref(std::string_view pci,
+                                               std::string_view uuid);
 
   Result<DeviceBuffer> allocate_impl(std::size_t bytes, MemoryClass cls,
                                      Stream stream);
@@ -147,10 +163,26 @@ class HrxBackend : public Backend<HrxBackend> {
   // hrx_queue_dispatch can. One bit per stream is what puts two streams on two
   // AQL rings.
   std::vector<std::uint64_t> stream_affinity_;
-  // Events recorded on this device, freed at shutdown: a queued wait names the
-  // event object, so releasing one while a wait is still pending would pull the
-  // point out from under it.
-  std::vector<void*> recorded_events_;
+  // Where an event goes when the last StreamEvent naming it is dropped. A
+  // queued wait names the event object, so a drop alone cannot free it — the
+  // wait may not have executed yet. It is freed at the next full-device
+  // synchronize, the first point every queued wait has provably retired, or at
+  // shutdown. Shared with the StreamEvent deleters so an event dropped after
+  // this backend is gone releases itself instead of writing into a dead list.
+  struct EventGraveyard {
+    std::mutex mu;
+    std::vector<void*> retired;
+    bool backend_alive = true;
+  };
+  std::shared_ptr<EventGraveyard> graveyard_ =
+      std::make_shared<EventGraveyard>();
+  // Monotonic stamp for StreamEvent::timeline; identification only.
+  std::uint64_t event_serial_ = 0;
+  // Executables loaded on this device, released at shutdown. The seam hands
+  // out KernelHandle as a raw ordinal pair with no unload call, so the load
+  // path is where ownership has to be kept or the objects — each of which
+  // retains the device — outlive every model that used them.
+  std::vector<void*> loaded_executables_;
   // How many physical GPUs this device spans. 1 for an ordinary device; more
   // when a pool asked for one device over several, in which case stream i
   // drives GPU i.

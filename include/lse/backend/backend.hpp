@@ -158,6 +158,12 @@ struct StreamEvent {
   void* handle = nullptr;
   // Which device recorded it.
   DeviceIndex device{};
+  // Keeps `handle` alive while any copy of this event can still be waited on.
+  // Set by backends whose handle is an owned object; when the last copy drops,
+  // the backend learns the host is done with the point — the object itself is
+  // freed only once the device has also passed every queued wait naming it,
+  // which is the backend's side of the bargain, not this struct's.
+  std::shared_ptr<void> keepalive;
 
   [[nodiscard]] bool valid() const noexcept {
     return timeline != 0 || handle != nullptr;
@@ -696,7 +702,10 @@ class Backend {
       return derived().record_event_impl(stream);
     } else {
       // Nothing can be issued out of order, so every point is already past.
-      return StreamEvent{stream, 1};
+      StreamEvent past;
+      past.stream = stream;
+      past.timeline = 1;
+      return past;
     }
   }
 
@@ -867,7 +876,10 @@ class IBackend {
     return ordered_single_stream();
   }
   virtual Result<StreamEvent> record_event(Stream stream) {
-    return StreamEvent{stream, 1};
+    StreamEvent past;
+    past.stream = stream;
+    past.timeline = 1;
+    return past;
   }
   virtual Status wait_event(Stream, const StreamEvent&) { return OkStatus(); }
   virtual Status synchronize_stream(Stream) { return synchronize(); }
@@ -1150,13 +1162,32 @@ struct DeviceDescriptor {
 // A backend with no enumerator of its own refuses.
 using DeviceEnumerator = Result<std::vector<DeviceDescriptor>> (*)();
 
+// Resolve a stable reference -- a PCI path or a UUID, one of them empty -- to
+// an ordinal WITHOUT bringing the accelerator up. A pool named by a stable
+// reference must register as a spanning device group before the first init()
+// fixes the topology, and the full enumeration (DeviceEnumerator above) brings
+// the accelerator up, which is exactly the moment the topology is fixed. So a
+// reference is resolved the cheap way first: the vendor runtime publishes each
+// agent's PCI and UUID to a plain enumeration, and no accelerator is needed to
+// read them. nullopt means "cannot say without binding", and the caller falls
+// back to the full enumeration.
+using StableRefResolver =
+    std::optional<int> (*)(std::string_view pci, std::string_view uuid);
+
 // Backends self-register from their own TU: linking one in is all that makes
 // it selectable by name.
 using BackendFactory = std::unique_ptr<IBackend> (*)();
 
 void register_backend(std::string_view name, BackendFactory factory,
-                      DeviceEnumerator enumerator = nullptr);
+                      DeviceEnumerator enumerator = nullptr,
+                      StableRefResolver stable_ref_resolver = nullptr);
 Result<std::unique_ptr<IBackend>> create_backend(std::string_view name);
+
+// What a stable reference names, before any of it is opened. nullopt when the
+// backend has no such resolver or cannot resolve without binding.
+[[nodiscard]] std::optional<int> resolve_stable_ref(std::string_view name,
+                                                    std::string_view pci,
+                                                    std::string_view uuid);
 
 // Ask `name` to bring its accelerator up as ONE device spanning the physical
 // devices in `group`, rather than one device per physical device.
@@ -1187,8 +1218,9 @@ std::vector<std::string> default_backend_order();
 
 struct BackendRegistrar {
   BackendRegistrar(std::string_view name, BackendFactory factory,
-                   DeviceEnumerator enumerator) {
-    register_backend(name, factory, enumerator);
+                   DeviceEnumerator enumerator,
+                   StableRefResolver stable_ref = nullptr) {
+    register_backend(name, factory, enumerator, stable_ref);
   }
 };
 
@@ -1204,6 +1236,20 @@ template <typename Derived>
   }
 }
 
+// The stable-ref resolver a backend supplies, or null. Same detection as the
+// enumerator: a backend that can say what a PCI path or UUID names before the
+// accelerator is up provides one static function, and the macro picks it up.
+template <typename Derived>
+[[nodiscard]] constexpr StableRefResolver stable_ref_resolver_for() noexcept {
+  if constexpr (requires {
+                  StableRefResolver{&Derived::resolve_stable_ref};
+                }) {
+    return &Derived::resolve_stable_ref;
+  } else {
+    return nullptr;
+  }
+}
+
 // No token pasting: Type may be a qualified name. One registration per TU.
 #define LSE_REGISTER_BACKEND(name, Type)                                  \
   namespace {                                                             \
@@ -1211,7 +1257,8 @@ template <typename Derived>
       name, []() -> std::unique_ptr<::lse::backend::IBackend> {           \
         return std::make_unique<::lse::backend::BackendAdapter<Type>>();  \
       },                                                                  \
-      ::lse::backend::device_enumerator_for<Type>()};                     \
+      ::lse::backend::device_enumerator_for<Type>(),                      \
+      ::lse::backend::stable_ref_resolver_for<Type>()};                   \
   }  // namespace
 
 }  // namespace lse::backend

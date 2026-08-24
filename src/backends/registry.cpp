@@ -7,6 +7,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <type_traits>
 
@@ -17,6 +18,7 @@ namespace {
 struct Entry {
   BackendFactory factory = nullptr;
   DeviceEnumerator enumerator = nullptr;
+  StableRefResolver stable_ref_resolver = nullptr;
 };
 
 struct Registry {
@@ -51,10 +53,12 @@ DeviceIndex next_device_index() noexcept {
 }
 
 void register_backend(std::string_view name, BackendFactory factory,
-                      DeviceEnumerator enumerator) {
+                      DeviceEnumerator enumerator,
+                      StableRefResolver stable_ref_resolver) {
   Registry& r = registry();
   std::lock_guard lock(r.mu);
-  r.factories.emplace(std::string(name), Entry{factory, enumerator});
+  r.factories.emplace(std::string(name),
+                      Entry{factory, enumerator, stable_ref_resolver});
 }
 
 namespace {
@@ -82,6 +86,22 @@ Result<std::unique_ptr<IBackend>> create_backend(std::string_view name) {
                      "'; available: ", known_names(r));
   }
   return it->second.factory();
+}
+
+std::optional<int> resolve_stable_ref(std::string_view name,
+                                      std::string_view pci,
+                                      std::string_view uuid) {
+  StableRefResolver resolver = nullptr;
+  {
+    Registry& r = registry();
+    std::lock_guard lock(r.mu);
+    auto it = r.factories.find(name);
+    if (it != r.factories.end()) resolver = it->second.stable_ref_resolver;
+  }
+  if (resolver == nullptr) return std::nullopt;
+  // Outside the lock, for the same reason enumerate_devices is: the resolver
+  // may dlopen a vendor runtime and register things of its own while it does.
+  return resolver(pci, uuid);
 }
 
 Result<std::vector<DeviceDescriptor>> enumerate_devices(std::string_view name) {

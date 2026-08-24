@@ -1,5 +1,11 @@
 # libhrx: stream-carried queue affinity
 #
+# SUPERSEDED: this work was committed to hrx-system as 2082d042 ("Stream queue
+# affinity and a narrower dispatch barrier") and is contained in the ref
+# scripts/bootstrap-hrx.sh pins (5927b0e0). The file is kept as a record only;
+# do not apply it. The one change it does NOT carry — the allocator.c
+# device-allocation import — lives in patches/0003 and is applied by bootstrap.
+#
 # Backup of uncommitted work in reference/hrx-system, which is gitignored in
 # this repo. Apply from the root of an hrx-system checkout:
 #     git apply /path/to/hrx-queue-affinity.patch

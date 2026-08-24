@@ -343,6 +343,13 @@ lse_apply_common_flags(lse_place)
 if(TARGET lse_tokenizer)
   add_executable(lse src/cli/main.cpp)
 
+  # Diagnostic: per-block hidden-state comparison across pool shapes.
+  # Not installed; lives beside the other scratch probes.
+  add_executable(layer_diff scratch_probe/layer_diff.cpp)
+  target_link_libraries(layer_diff PRIVATE lse_runtime lse_model lse_tokenizer
+                                           lse_place lse_probe lse_backends)
+  lse_apply_common_flags(layer_diff)
+
   # The OpenAI-shaped HTTP surface. httplib and nlohmann/json are vendored
   # headers, so this adds no package to find.
   add_library(lse_server src/server/http_server.cpp src/server/chat.cpp)

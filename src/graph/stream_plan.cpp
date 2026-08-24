@@ -80,17 +80,38 @@ StreamPlan plan_streams(std::span<const FusionGroup> groups,
   if (n == 0) return plan;
   plan.chain = 0;
 
+  // How many streams the pass may use. For a pinned plan the caller already
+  // fixed each group's stream (a spanning device whose streams are its
+  // members), so `usable` must cover the largest forced stream even when it
+  // exceeds concurrent_streams or the group count — the last-on bookkeeping
+  // below indexes it, and an undersized one reads out of range.
+  std::uint32_t usable = std::min<std::uint32_t>(
+      caps.concurrent_streams, static_cast<std::uint32_t>(n));
+  if (pinned) {
+    for (std::uint32_t g = 0; g < n; ++g) {
+      usable = std::max(usable, forced[g] + 1);
+    }
+  }
+
   // One stream, a device that cannot run two at once, or a backend on which
   // moving a group could never pay: the plan is the order it is already in,
   // and no event is worth recording. Leaving early is not just the answer, it
   // is the whole answer — the dependency pass below exists to decide
   // placement, and there is no placement to decide.
-  if (!caps.may_spread()) {
+  //
+  // A pinned plan is the one exception, and the exception is load-bearing.
+  // There is no placement to decide, but there is still ordering to emit: the
+  // waits that keep a tensor split's join from reading a member's output
+  // before that member wrote it. may_spread() is false on the GPU backend
+  // (uniform launch cost), so without this guard a spanning (stream-placed)
+  // run returns with every group on stream 0 and zero waits, and the two
+  // halves race their reduce. The dependency pass below already handles pinned
+  // groups correctly — target = forced[g], and a cross-member dependency
+  // becomes a wait rather than a cross-device edge — so let it run.
+  if (!caps.may_spread() && !pinned) {
     plan.chain = static_cast<std::uint32_t>(n);
     return plan;
   }
-  const std::uint32_t usable = std::min<std::uint32_t>(
-      caps.concurrent_streams, static_cast<std::uint32_t>(n));
   const std::uint64_t width = device_width(info);
   struct Access {
     Region region;

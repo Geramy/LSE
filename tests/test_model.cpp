@@ -2043,6 +2043,195 @@ LSE_TEST(a_split_mixer_rebuilds_what_the_whole_one_computes) {
   }
 }
 
+LSE_TEST(a_split_mlp_rebuilds_what_the_whole_one_computes) {
+  // The MLP alone, whole vs split, from BIT-IDENTICAL inputs. The block-level
+  // comparison showed the FFN stage turning e-6 input divergence into e-4
+  // output divergence; this separates "the split MLP is wrong on its own"
+  // from "the MLP amplifies its input differences a hundredfold".
+  const char* env = std::getenv("LSE_TEST_MODEL");
+  auto paths = resolve_model(env != nullptr && *env != 0
+                                 ? env
+                                 : "mlx-community/Qwen3.5-0.8B-4bit");
+  if (!paths.ok()) {
+    std::printf("       skipped: no Qwen checkpoint\n");
+    return;
+  }
+  const bool sharded =
+      paths->weights.size() > 5 &&
+      paths->weights.compare(paths->weights.size() - 5, 5, ".json") == 0;
+  auto ckpt = sharded ? SafeTensors::open_sharded(paths->weights)
+                      : SafeTensors::open(paths->weights);
+  auto cfg = Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) {
+    std::printf("       skipped: checkpoint would not open\n");
+    return;
+  }
+  const quant::GroupAffineMap* quant = &cfg->quantization;
+  const std::string prefix = "language_model.model.layers.0";
+
+  auto whole = qwen3_5::make_mlp();
+  auto split = qwen3_5::make_mlp();
+  WeightBinder b_whole(*ckpt, quant);
+  LayerContext c_whole{&*cfg, 0, false, 1};
+  WeightBinder b_split(*ckpt, quant);
+  LayerContext c_split{&*cfg, 0, false, 2};
+  if (!whole->load(b_whole, prefix, c_whole).ok() ||
+      !split->load(b_split, prefix, c_split).ok()) {
+    std::printf("       skipped: mlp would not load\n");
+    return;
+  }
+
+  const auto hidden = static_cast<std::int64_t>(cfg->hidden_size);
+  // Unit-scale input, the magnitude a post-norm activation actually has —
+  // the mixer tests' ±0.05 inputs sit far from every nonlinearity.
+  graph::Array x = filled(Shape{1, 4, hidden}, 23u);
+  {
+    graph::Array big = graph::mul(
+        x, graph::Array::full(Shape{1}, DType::kF32, 20.0f));
+    x = big;
+  }
+
+  auto ref = whole->forward(x, nullptr, c_whole);
+  auto parts = split->forward_shards({x, x}, nullptr, c_split);
+  if (!ref.ok() || !parts.ok() || parts->empty()) {
+    std::printf("       skipped: forward refused\n");
+    return;
+  }
+  graph::Array sum = (*parts)[0];
+  for (std::size_t i = 1; i < parts->size(); ++i) {
+    sum = graph::add(sum, (*parts)[i]);
+  }
+  const std::vector<float> a = drain_all(*ref);
+  const std::vector<float> b = drain_all(sum);
+  if (a.empty() || a.size() != b.size()) {
+    std::printf("       skipped: no comparable output\n");
+    return;
+  }
+  double absmax = 0.0, worst = 0.0;
+  bool finite = true;
+  std::size_t argmax = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (!std::isfinite(a[i]) || !std::isfinite(b[i])) finite = false;
+    absmax = std::max(absmax, std::abs(static_cast<double>(a[i])));
+    const double d = std::abs(static_cast<double>(a[i]) - b[i]);
+    if (d > worst) {
+      worst = d;
+      argmax = i;
+    }
+  }
+  const double rel = absmax > 0.0 ? worst / absmax : 0.0;
+  const auto hid = static_cast<std::size_t>(hidden);
+  std::printf(
+      "       mlp  max_abs=%.3e max_rel=%.3e at token %zu dim %zu over %zu\n",
+      worst, rel, argmax / hid, argmax % hid, a.size());
+  LSE_EXPECT(finite);
+  LSE_EXPECT(rel < 1e-4);
+}
+
+LSE_TEST(a_split_gdn_carrying_state_rebuilds_what_the_whole_one_computes) {
+  // The gap the stateless shard tests leave: both pass state = nullptr, so
+  // the recurrence, the conv tail and their carry across steps were never
+  // compared split-vs-whole — and a 2-GPU tensor-split decode emits a correct
+  // FIRST token and then drifts, which is the signature of exactly that
+  // carry going wrong. Two steps: a 4-token prefill, then a 1-token decode.
+  const char* env = std::getenv("LSE_TEST_MODEL");
+  auto paths = resolve_model(env != nullptr && *env != 0
+                                 ? env
+                                 : "mlx-community/Qwen3.5-0.8B-4bit");
+  if (!paths.ok()) {
+    std::printf("       skipped: no Qwen checkpoint\n");
+    return;
+  }
+  const bool sharded =
+      paths->weights.size() > 5 &&
+      paths->weights.compare(paths->weights.size() - 5, 5, ".json") == 0;
+  auto ckpt = sharded ? SafeTensors::open_sharded(paths->weights)
+                      : SafeTensors::open(paths->weights);
+  auto cfg = Config::from_json_file(paths->config);
+  if (!ckpt.ok() || !cfg.ok()) {
+    std::printf("       skipped: checkpoint would not open\n");
+    return;
+  }
+  const quant::GroupAffineMap* quant = &cfg->quantization;
+
+  std::int32_t layer = -1;
+  for (std::int32_t i = 0; layer < 0 && i < cfg->num_layers; ++i) {
+    if (!cfg->is_attention_layer(i)) layer = i;
+  }
+  if (layer < 0) {
+    std::printf("       skipped: no gdn layer\n");
+    return;
+  }
+  const std::string prefix =
+      "language_model.model.layers." + std::to_string(layer);
+
+  auto whole = qwen3_5::make_gdn();
+  auto split = qwen3_5::make_gdn();
+  WeightBinder b_whole(*ckpt, quant);
+  LayerContext c_whole{&*cfg, layer, false, 1};
+  if (!whole->load(b_whole, prefix, c_whole).ok()) {
+    std::printf("       skipped: layer %d would not load whole\n", layer);
+    return;
+  }
+  WeightBinder b_split(*ckpt, quant);
+  LayerContext c_split{&*cfg, layer, false, 2};
+  if (!split->load(b_split, prefix, c_split).ok()) {
+    std::printf("       skipped: layer %d would not load split\n", layer);
+    return;
+  }
+
+  const auto hidden = static_cast<std::int64_t>(cfg->hidden_size);
+  // One whole-path state, two shard states. Left invalid on purpose:
+  // gated_delta_net zero-fills a missing recurrent at the shard's own shape,
+  // which is exactly what the first step of a real run does.
+  MixerState ws[1] = {};
+  MixerState ss[2] = {};
+
+  double step_rel[2] = {0.0, 0.0};
+  bool finite = true;
+  for (int step = 0; step < 2; ++step) {
+    graph::Array x = filled(Shape{1, step == 0 ? 4 : 1, hidden},
+                            static_cast<unsigned>(11 + step));
+    auto ref = whole->forward(x, ws, c_whole);
+    if (!ref.ok()) {
+      std::printf("       skipped: whole forward failed step %d\n", step);
+      return;
+    }
+    auto parts = split->forward_shards({x, x}, ss, c_split);
+    if (!parts.ok() || parts->empty()) {
+      std::printf("       skipped: split forward failed step %d\n", step);
+      return;
+    }
+    graph::Array sum = (*parts)[0];
+    for (std::size_t i = 1; i < parts->size(); ++i) {
+      sum = graph::add(sum, (*parts)[i]);
+    }
+    const std::vector<float> a = drain_all(*ref);
+    const std::vector<float> b = drain_all(sum);
+    if (a.empty() || a.size() != b.size()) {
+      std::printf("       skipped: no comparable output step %d\n", step);
+      return;
+    }
+    double absmax = 0.0, max_abs = 0.0;
+    for (float v : a) {
+      absmax = std::max(absmax, std::abs(static_cast<double>(v)));
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (!std::isfinite(a[i]) || !std::isfinite(b[i])) finite = false;
+      max_abs = std::max(
+          max_abs, std::abs(static_cast<double>(a[i]) - b[i]));
+    }
+    step_rel[step] = absmax > 0.0 ? max_abs / absmax : 0.0;
+  }
+  std::printf(
+      "       gdn+state layer %d  step0 max_rel=%.3e  step1 max_rel=%.3e\n",
+      layer, step_rel[0], step_rel[1]);
+  LSE_EXPECT(finite);
+  LSE_EXPECT(step_rel[0] < 1e-3);
+  // The carried step is the one the stateless tests never saw.
+  LSE_EXPECT(step_rel[1] < 1e-3);
+}
+
 LSE_TEST(a_split_block_rebuilds_what_the_whole_one_computes) {
   const char* env = std::getenv("LSE_TEST_MODEL");
   auto paths = resolve_model(env != nullptr && *env != 0
@@ -2115,6 +2304,30 @@ LSE_TEST(a_split_block_rebuilds_what_the_whole_one_computes) {
     const double rel = absmax > 0.0 ? worst / absmax : 0.0;
     std::printf("       block %d (%s)  max_abs=%.3e max_rel=%.3e over %zu\n",
                 layer, attn ? "attn" : "gdn", worst, rel, a.size());
+    // Where the error lives, not just how big it is: per-token worst and the
+    // count of elements past a tenth of the worst, so a divergence names its
+    // rows. A block output is [1, tokens, hidden].
+    {
+      const std::size_t hid = static_cast<std::size_t>(cfg->hidden_size);
+      const std::size_t toks = hid != 0 ? a.size() / hid : 0;
+      std::size_t argmax = 0;
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::abs(static_cast<double>(a[i]) - b[i]) == worst) argmax = i;
+      }
+      std::printf("       block %d worst at token %zu dim %zu;", layer,
+                  hid != 0 ? argmax / hid : 0, hid != 0 ? argmax % hid : 0);
+      for (std::size_t t = 0; t < toks; ++t) {
+        double w = 0.0;
+        std::size_t big = 0;
+        for (std::size_t i = t * hid; i < (t + 1) * hid; ++i) {
+          const double d = std::abs(static_cast<double>(a[i]) - b[i]);
+          w = std::max(w, d);
+          if (d > worst * 0.1) ++big;
+        }
+        std::printf("  t%zu w=%.2e n>10%%=%zu", t, w, big);
+      }
+      std::printf("\n");
+    }
     LSE_EXPECT(finite);
     LSE_EXPECT(rel < 1e-4);
   }

@@ -111,6 +111,22 @@ std::string uuid_digits(std::string_view text) {
 }
 
 Result<int> ordinal_for(const StableRef& ref) {
+  // Resolve the cheap way first: a stable reference is exactly what the
+  // pre-init resolver exists for, and it does NOT bring the accelerator up.
+  // That is load-bearing, not an optimization. A pool named by stable
+  // reference has to register as a spanning group before the first init()
+  // fixes the topology, and the full enumeration below is precisely the call
+  // that fixes it — it brings the accelerator up with whatever group is
+  // registered at that moment. Here, that is nothing: the group is registered
+  // only after this whole parse, so resolving a PCI address through
+  // enumerate_devices initialised every GPU on the box and the later spanning
+  // request was silently ignored. nullopt means the backend cannot say
+  // without binding, and only then does the full enumeration run.
+  if (const std::optional<int> cheap =
+          backend::resolve_stable_ref(ref.backend, ref.pci, ref.uuid);
+      cheap.has_value()) {
+    return *cheap;
+  }
   auto found = backend::enumerate_devices(ref.backend);
   if (!found.ok()) return found.status();
   const std::vector<backend::DeviceDescriptor> devices = found.release();
