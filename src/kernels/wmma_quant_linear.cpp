@@ -196,11 +196,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // tile, which is what made the correct kernel three hundred times slower
   // than the loop it replaces.
   const auto xq = e.lds<kir::u32>(kRowsPerGroup * words);
-  // The raw activations of the round, kept so the quantize pass can revisit
-  // them once the group's amax is known without loading them from memory a
-  // second time.
-  const auto xraw = e.lds<kir::f32>(kRowsPerGroup * round_slices *
-                                    static_cast<std::uint32_t>(kTileK));
   const auto xamax = e.lds<kir::f32>(kRowsPerGroup * round_slices);
   const auto xssum = e.lds<kir::f32>(kRowsPerGroup * round_slices);
   // Per group, not per slice: one step for the whole group is what lets a
@@ -271,8 +266,21 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
   const std::uint32_t chunks = (items + kBlock - 1u) / kBlock;
+  // The raw activations of the round stay in the stager thread's own
+  // registers across the amax barrier: the same thread quantizes the slice it
+  // loaded, so nothing else ever reads them, and the 16 KB of LDS the old
+  // staging plane cost was the difference between two workgroups per CU and
+  // several. Declared outside the guards so the values scope across them.
+  std::vector<std::vector<kir::LValue<kir::f32>>> vraw;
+  vraw.reserve(chunks);
+  for (std::uint32_t c = 0; c < chunks; ++c) {
+    std::vector<kir::LValue<kir::f32>> row;
+    row.reserve(static_cast<std::size_t>(kTileK));
+    for (int j = 0; j < kTileK; ++j) row.push_back(e.var(0.0f));
+    vraw.push_back(std::move(row));
+  }
   std::vector<kir::Val<kir::u32>> st_t, st_row, st_xbase, st_qbase, st_sbase;
-  std::vector<kir::Val<kir::u32>> st_slice0, st_gbase, st_rawbase;
+  std::vector<kir::Val<kir::u32>> st_slice0, st_gbase;
   std::vector<kir::Val<kir::boolean>> st_in;
   for (std::uint32_t c = 0; c < chunks; ++c) {
     const auto si = e.let(lid + c * kBlock);
@@ -286,8 +294,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     st_sbase.push_back(e.let(sr * round_slices + stt));
     st_slice0.push_back(e.let(sr * round_slices + gl * slices));
     st_gbase.push_back(e.let(sr * round_groups + gl));
-    st_rawbase.push_back(
-        e.let(st_sbase[c] * static_cast<std::uint32_t>(kTileK)));
     st_in.push_back(e.let(si < items));
   }
 
@@ -299,22 +305,19 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
                                   (rnd * (gsize * round_groups) +
                                    st_t[c] * static_cast<std::uint32_t>(kTileK)));
           const std::uint32_t wide = row_pack(kTileK, load_bytes, 4);
-          std::array<kir::Val<kir::f32>, kTileK> v;
           for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(kTileK);
                j += wide) {
             const auto pack = e.load(a.x, e.let(base + j), load_bytes);
             for (std::uint32_t u = 0; u < wide; ++u) {
-              v[j + u] = e.let(pack[static_cast<int>(u)]);
+              vraw[c][j + u] = e.let(pack[static_cast<int>(u)]);
             }
           }
-          auto amax = e.let(math::abs(v[0]));
-          auto total = v[0];
+          auto amax = e.let(math::abs(vraw[c][0].read()));
+          auto total = e.let(vraw[c][0].read());
           for (int j = 1; j < kTileK; ++j) {
-            amax = e.let(math::max(amax, math::abs(v[j])));
-            total = e.let(total + v[j]);
-          }
-          for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(kTileK); ++j) {
-            xraw[e.let(st_rawbase[c] + j)] = v[j];
+            const auto vj = e.let(vraw[c][static_cast<std::size_t>(j)].read());
+            amax = e.let(math::max(amax, math::abs(vj)));
+            total = e.let(total + vj);
           }
           xamax[st_sbase[c]] = amax;
           xssum[st_sbase[c]] = total;
@@ -324,7 +327,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
           xamax[st_sbase[c]] = e.f32(0.0f);
           xssum[st_sbase[c]] = e.f32(0.0f);
           for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(kTileK); ++j) {
-            xraw[e.let(st_rawbase[c] + j)] = e.f32(0.0f);
+            vraw[c][j] = e.f32(0.0f);
           }
         }
       }
@@ -348,7 +351,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         for (std::uint32_t w = 0; w < 4u; ++w) {
           auto word = e.let(e.u32(0));
           for (std::uint32_t b = 0; b < 4u; ++b) {
-            const auto raw = e.let(xraw[e.let(st_rawbase[c] + (w * 4u + b))].read());
+            const auto raw = e.let(vraw[c][w * 4u + b].read());
             const auto code = e.let(math::rint(raw * inv));
             const auto byte =
                 e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
