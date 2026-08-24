@@ -111,13 +111,22 @@ jobs:
       - name: Test
         run: |
           set -euo pipefail
-          export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          # The engine dlopens comgr at run time and comgr loads the bitcode
+          # beside it, so the JIT must find the SAME ROCm runtime the build was
+          # configured against — first on the path, ahead of any distro comgr
+          # the linker cache would otherwise offer (a clang-21 comgr next to
+          # clang-23 bitcode failed every kernel here once). cmake already
+          # resolved that directory; read it back rather than guess it.
+          RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
+          echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
+          export LD_LIBRARY_PATH="${RT:+$RT:}$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           ctest --test-dir build --output-on-failure
 
       - name: Smoke test the engine and the HTTP API
         run: |
           set -euo pipefail
-          export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
+          export LD_LIBRARY_PATH="${RT:+$RT:}$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           if ! ./build/lse --list-cache 2>/dev/null | grep -q "$LSE_SMOKE_MODEL"; then
             echo "::error::$LSE_SMOKE_MODEL is not cached on this runner. The end-to-end check asserts on generated text and on the work running on the device, and neither can be checked without the weights."
             exit 1
