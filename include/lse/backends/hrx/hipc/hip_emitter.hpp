@@ -98,6 +98,10 @@ class HipEmitter final : public graph::IKernelEmitter,
     std::uint32_t lds_bytes = 0;
     std::size_t scratch_bytes = 0;
     bool persist_grid = false;
+    // Whether the cached text's signature takes a pointer table. Restored on
+    // a hit — a table-mode kernel served with direct bindings launches
+    // against the wrong signature and reads garbage addresses.
+    bool pointer_table = false;
   };
   mutable std::unordered_map<std::uint64_t, CachedEmit> emit_cache_;
   // Priced runs, keyed on the arrangement's own signature. run_scratch is a

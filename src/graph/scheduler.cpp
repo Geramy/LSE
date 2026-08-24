@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -782,7 +783,11 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       bool staged_fused = false;
       auto flush_staged = [&] {
         if (staged.nodes.empty()) return;
-        auto chunks = Partitioner::phase_chunks(staged, 480);
+        // 4096, not the old 480: a phase past ~64 bindings is emitted with a
+        // pointer table (one kernarg instead of one per buffer), so the
+        // kernarg ceiling that forced 480 no longer binds. What still cuts a
+        // launch is geometry (Workgroup::cuts), not this.
+        auto chunks = Partitioner::phase_chunks(staged, 4096);
         for (FusionGroup& c : chunks) phase_groups.push_back(std::move(c));
         staged = FusionGroup{};
         staged.is_phase = true;
@@ -970,7 +975,22 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       }
       flush_staged();
       wg.plan_slots(roots);
-      if (wg.bind_slots(backend()).ok()) {
+      // A workgroup is member-homogeneous by construction (the partitioner
+      // splits phases where a value changes members), so its slots belong on
+      // that member — allocated through the member's backend and stream, or
+      // every member's phase activations land on the primary and each launch
+      // reads them across the link.
+      std::size_t wg_member = devices_.primary();
+      for (const NodePtr& n : wg.members()) {
+        if (n && n->member != Node::kAnyMember &&
+            static_cast<std::size_t>(n->member) < devices_.size()) {
+          wg_member = static_cast<std::size_t>(n->member);
+          break;
+        }
+      }
+      const backend::Stream wg_stream =
+          devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
+      if (wg.bind_slots(devices_.device(wg_member), wg_stream).ok()) {
         trace_.slots_reused += wg.reused_slots();
         trace_.slots_allocated += wg.slot_count();
       }
@@ -1015,6 +1035,45 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       trace_.streams_used = impl_->plan.streams_used;
       trace_.stream_waits = impl_->plan.waits_total;
       trace_.stream_chain = impl_->plan.chain;
+      if (std::getenv("LSE_DEBUG_PLACEMENT") != nullptr) {
+        static int dbg_steps = 0;
+        if (dbg_steps < 4) {
+          ++dbg_steps;
+          const auto caps = backend().stream_capabilities();
+          std::fprintf(stderr,
+              "\n[placement step %d] groups=%zu pinned=%zu "
+              "caps{count=%u conc=%u uniform=%d may_spread=%d}\n",
+              dbg_steps, staged_groups.size(), pinned.size(),
+              caps.stream_count, caps.concurrent_streams,
+              (int)caps.uniform_launch_cost, (int)caps.may_spread());
+          std::map<std::uint64_t, int> member_hist, stream_hist;
+          for (std::size_t i = 0; i < staged_groups.size(); ++i) {
+            member_hist[group_members[i]]++;
+            stream_hist[impl_->plan.stream[i]]++;
+          }
+          auto render = [&](const char* what,
+                            const std::map<std::uint64_t, int>& h) {
+            std::fprintf(stderr, "  %s:", what);
+            for (const auto& [k, v] : h) std::fprintf(stderr, " %llu=%d",
+                                                      (unsigned long long)k, v);
+            std::fprintf(stderr, "\n");
+          };
+          render("member", member_hist);
+          render("stream", stream_hist);
+          for (std::size_t i = 0; i < staged_groups.size() && i < 24; ++i) {
+            const FusionGroup& g = staged_groups[i];
+            int stamp = -1;
+            for (const NodePtr& n : g.nodes) {
+              if (n) { stamp = n->member; break; }
+            }
+            std::fprintf(stderr,
+                "  g%zu stamp=%d member=%zu stream=%u cross=%zu nodes=%zu %s\n",
+                i, stamp, group_members[i], impl_->plan.stream[i],
+                impl_->plan.cross[i].size(), g.nodes.size(),
+                g.is_phase ? "phase" : "fused");
+          }
+        }
+      }
 
       // The step inherits whatever earlier steps left running. Snapshot each
       // such stream *before* issuing anything, so a group that later joins a
@@ -1158,6 +1217,16 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           break;
         }
         alias_ready_reshapes(g);
+        // LSE_SERIAL_STREAMS=1: drain the device after every group — the
+        // bluntest possible ordering, for separating a cross-stream ordering
+        // hole from everything else. Diagnostic only.
+        static const bool serial_streams =
+            std::getenv("LSE_SERIAL_STREAMS") != nullptr;
+        if (serial_streams) {
+          if (const Status drained = backend().synchronize(); !drained.ok()) {
+            return drained;
+          }
+        }
         if (on.index < stream_count) impl_->outstanding[on.index] = 1;
         if (split.empty()) {
           ++trace_.device_groups;

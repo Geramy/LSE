@@ -638,7 +638,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.source = it->second.source;
       out.entry_name = it->second.entry_name;
       out.dims = it->second.dims;
-      out.pointer_table = false;
+      out.pointer_table = it->second.pointer_table;
       out.constants.add("count", 4);
       out.lds_bytes = it->second.lds_bytes;
       out.scratch_bytes = it->second.scratch_bytes;
@@ -651,7 +651,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       emit_cache_[key] =
           CachedEmit{emitted->source,        emitted->entry_name,
                      emitted->dims,          emitted->lds_bytes,
-                     emitted->scratch_bytes, emitted->persist_grid};
+                     emitted->scratch_bytes, emitted->persist_grid,
+                     emitted->pointer_table};
     }
     return emitted;
   }

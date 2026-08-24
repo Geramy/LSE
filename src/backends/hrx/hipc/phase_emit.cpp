@@ -2,6 +2,8 @@
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
+#include <cstdlib>
+
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
@@ -341,6 +343,30 @@ bool node_can_stage(const Node& n) noexcept {
     return true;
   }
   if (is_elementwise(n.kind)) return true;
+  // A reduction staged into a phase is re-derived per output element — the
+  // whole reduced row is walked again for every lane, width× the loads the
+  // answer needs. L1 absorbs that for a head-width row (the gdn q/k norms at
+  // 128); a hidden-width row pays it from L2 thousands of times over —
+  // profiled at ~200× the bandwidth floor for a 5120-wide rms_norm, 150 ms of
+  // a 1.07 s prefill. Wide rows keep their own cooperative kernel, and the
+  // launch that costs is bought back fifty-fold.
+  // Excluding wide reductions from phases is measured BOTH ways: the naive
+  // per-element form wastes ~150 ms of a single-GPU prefill re-walking rows,
+  // but peeling reductions out shatters the member-split phase structure
+  // (20,827 phases against 3,467 ideal on two members, 9,472 host joins, a
+  // 30.7 s prefill) and costs more than it saves everywhere it was tried. The
+  // real fix is a cooperative in-phase reduction — one LDS row sum per
+  // workgroup — not exclusion; until that lands the gate stays opt-in.
+  static const bool split_wide =
+      std::getenv("LSE_SPLIT_WIDE_REDUCTIONS") != nullptr;
+  if (is_reduction(n.kind) && split_wide) {
+    const Node* in = n.inputs.empty() ? nullptr : n.inputs[0].get();
+    const std::int64_t width =
+        in != nullptr && in->shape.rank() > 0
+            ? in->shape.dim(in->shape.rank() - 1)
+            : 0;
+    if (width > 512) return false;
+  }
   if (n.prim == nullptr) return false;
   const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
   if (kp == nullptr) return false;
@@ -960,16 +986,41 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   // one number, stated once here and once there. Without it the object reports
   // the AMDGPU default of 1024, which means "unknown" and leaves the register
   // allocator with no occupancy target.
+  // Past ~64 buffers the bindings move into a pointer table: one device
+  // buffer of addresses replaces hundreds of kernarg pointers, which is what
+  // lets a phase hold a whole step instead of being diced at the kernarg
+  // ceiling (the old 480-binding chunk cap). The scheduler builds and
+  // uploads the table when the kernel declares it (pointer_table below);
+  // the b<i> locals keep their names and their restrict promise, so every
+  // stage body is unchanged. A persistent kernel stays on direct bindings —
+  // its grid barrier rides the binding list the table path replaces.
+  //
+  // Lifetime: buffers reached through the table are not in the command
+  // buffer's resource set. Weights, slots and carried states all outlive the
+  // step, and the step's end synchronizes before any of them is recycled,
+  // which is the invariant this leans on.
+  const bool table_mode = !persist && out.binding_order.size() > 64;
   src << "extern \"C\" __global__ __launch_bounds__(" << kPhaseBlock
       << ") void " << out.entry_name << "(\n";
-  for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
-    src << "    float* __restrict__ b" << i << ",\n";
+  if (table_mode) {
+    src << "    const unsigned long long* __restrict__ btab,\n";
+  } else {
+    for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
+      src << "    float* __restrict__ b" << i << ",\n";
+    }
   }
   if (persist) src << "    unsigned* gbar,\n";
   src << "    LseConstants k) {\n"
-      << "  (void)k;\n"
-      << stages.str() << "}\n";
+      << "  (void)k;\n";
+  if (table_mode) {
+    for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
+      src << "  float* __restrict__ b" << i << " = (float*)(btab[" << i
+          << "]);\n";
+    }
+  }
+  src << stages.str() << "}\n";
   out.source = src.str();
+  out.pointer_table = table_mode;
   out.persist_grid = persist;
   out.dims.workgroup_size[0] = kPhaseBlock;
   if (persist) {
