@@ -344,11 +344,15 @@ if(TARGET lse_tokenizer)
   add_executable(lse src/cli/main.cpp)
 
   # Diagnostic: per-block hidden-state comparison across pool shapes.
-  # Not installed; lives beside the other scratch probes.
-  add_executable(layer_diff scratch_probe/layer_diff.cpp)
-  target_link_libraries(layer_diff PRIVATE lse_runtime lse_model lse_tokenizer
-                                           lse_place lse_probe lse_backends)
-  lse_apply_common_flags(layer_diff)
+  # scratch_probe/ is untracked working material, so the target exists only
+  # where the file does — a clean clone (CI) has neither.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/scratch_probe/layer_diff.cpp)
+    add_executable(layer_diff scratch_probe/layer_diff.cpp)
+    target_link_libraries(layer_diff PRIVATE lse_runtime lse_model
+                                             lse_tokenizer lse_place lse_probe
+                                             lse_backends)
+    lse_apply_common_flags(layer_diff)
+  endif()
 
   # The OpenAI-shaped HTTP surface. httplib and nlohmann/json are vendored
   # headers, so this adds no package to find.
