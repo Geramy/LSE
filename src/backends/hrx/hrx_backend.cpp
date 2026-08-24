@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <optional>
 #include <vector>
 
@@ -24,6 +25,33 @@ extern "C" {
 namespace lse::backend {
 
 namespace {
+
+// Residencies stamped by live hrx backends. copy_peer receives whatever
+// buffer the link probe offers — including another backend family's — and an
+// hrx_buffer_t reinterpreted from a foreign handle walks libhrx off a cliff.
+// A buffer reaches copy_peer only after its backend allocated it, so
+// registering at allocate and unregistering at shutdown brackets every
+// legitimate residency.
+std::mutex g_hrx_residency_mu;
+std::unordered_set<std::uint16_t> g_hrx_residencies;
+
+void register_hrx_residency(DeviceIndex d) {
+  if (!d.bound()) return;
+  const std::lock_guard lock(g_hrx_residency_mu);
+  g_hrx_residencies.insert(d.value);
+}
+
+void unregister_hrx_residency(DeviceIndex d) {
+  if (!d.bound()) return;
+  const std::lock_guard lock(g_hrx_residency_mu);
+  g_hrx_residencies.erase(d.value);
+}
+
+bool hrx_owns_residency(DeviceIndex d) {
+  if (!d.bound()) return false;
+  const std::lock_guard lock(g_hrx_residency_mu);
+  return g_hrx_residencies.count(d.value) != 0;
+}
 
 // LSE_TRACE_SYNC=1: one unbuffered stderr line before and after every call
 // that can block the host on the device, so a hang's last line names the
@@ -1180,6 +1208,7 @@ void HrxBackend::release_buffer(std::uint64_t handle) noexcept {
 
 void HrxBackend::shutdown_impl() noexcept {
 #if LSE_HRX_LINKED
+  unregister_hrx_residency(device_index());
   {
     // Whatever retired before now is freed here; whatever is still held by a
     // live StreamEvent frees itself when its last copy drops (backend_alive
@@ -1223,6 +1252,7 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
 #else
   if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
   if (bytes == 0) return LSE_ERROR(kInvalidArgument, "zero-size allocation");
+  register_hrx_residency(device_index());
 
   const bool staging = cls == MemoryClass::kStaging;
   const hrx_buffer_usage_t usage =
@@ -1695,6 +1725,14 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   // access grant, it moves the bytes. The grant is done when the memory is
   // allocated, which is why every device-local allocation offers itself to the
   // other GPUs.
+  //
+  // Both ends must be hrx allocations before either handle is dereferenced:
+  // the link probe's contract is one honest try per pair, and a foreign
+  // backend's buffer must come back "unimplemented", not crash inside libhrx.
+  if (!hrx_owns_residency(src.residency) ||
+      !hrx_owns_residency(dst.residency)) {
+    return LSE_ERROR(kUnimplemented, "copy_peer needs two hrx-owned buffers");
+  }
   const HsaRuntime& hsa = shared_hsa();
   if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
   const std::vector<HsaAgent>& agents = peer_agents();
