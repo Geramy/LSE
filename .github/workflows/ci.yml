@@ -120,6 +120,16 @@ jobs:
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
           echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
           export LD_LIBRARY_PATH="${RT:+$RT:}$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          # WORKAROUND for this runner: the versioned component the build binds
+          # to carries a comgr one LLVM major behind its own bitcode (a half
+          # upgraded package set), so every JIT compile there fails. The
+          # top-level install's comgr matches the bitcode; preloading it pins
+          # the compiler without moving hsa-runtime, which HRX still takes from
+          # the component. Remove once the runner's comgr package is upgraded;
+          # a box whose ROCM_PATH has no lib/ (this container's layout) is
+          # untouched.
+          COMGR="$(readlink -f "$ROCM_PATH/lib/libamd_comgr.so.3" 2>/dev/null || true)"
+          [ -n "$COMGR" ] && export LD_PRELOAD="$COMGR" && echo "JIT comgr pinned: $COMGR"
           ctest --test-dir build --output-on-failure
 
       - name: Smoke test the engine and the HTTP API
@@ -127,6 +137,8 @@ jobs:
           set -euo pipefail
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
           export LD_LIBRARY_PATH="${RT:+$RT:}$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          COMGR="$(readlink -f "$ROCM_PATH/lib/libamd_comgr.so.3" 2>/dev/null || true)"
+          [ -n "$COMGR" ] && export LD_PRELOAD="$COMGR"
           if ! ./build/lse --list-cache 2>/dev/null | grep -q "$LSE_SMOKE_MODEL"; then
             echo "::error::$LSE_SMOKE_MODEL is not cached on this runner. The end-to-end check asserts on generated text and on the work running on the device, and neither can be checked without the weights."
             exit 1
