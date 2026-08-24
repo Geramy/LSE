@@ -80,6 +80,13 @@ jobs:
       # Kernel emission and numerics against the CPU reference live here:
       # test_graph, test_jit and test_model are what catch a changed kernel
       # that no longer computes what it did.
+      - name: Clear the JIT kernel cache
+        # A cached binary passes a test without exercising the toolchain that
+        # would have to rebuild it. One run compiled every kernel against a
+        # runner whose comgr and device libraries had drifted apart; ctest
+        # stayed green on cache hits while the smoke step, needing fresh
+        # kernels, fell to the host. Every run compiles from nothing.
+        run: rm -rf ~/.cache/lse/kernels
       - name: Test
         run: |
           set -euo pipefail
