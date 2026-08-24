@@ -1,5 +1,8 @@
 #include "lse/runtime/session.hpp"
 
+#include "lse/graph/graph.hpp"
+#include "lse/ops/attention.hpp"
+
 #include <algorithm>
 
 namespace lse::runtime {
@@ -17,6 +20,52 @@ void Session::clear() {
   for (model::MixerState& s : states_) s = model::MixerState{};
   history_.clear();
   position_ = 0;
+}
+
+namespace {
+
+// Whole-array device zero: the sibling of BatchScheduler's zero_device_row,
+// for a state that is being restarted rather than one row of a batch.
+Status zero_device_array(graph::Array& a) {
+  if (!a.valid() || !a.node()) return OkStatus();
+  graph::Node& n = *a.node();
+  if (!n.buffer.valid()) return OkStatus();  // never written: still zeros
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no backend to clear a state");
+  }
+  const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
+  if (bytes == 0) return OkStatus();
+  const std::vector<std::byte> zeros(bytes, std::byte{0});
+  LSE_RETURN_IF_ERROR(
+      sched->backend().copy_h2d(zeros.data(), n.buffer, bytes, 0));
+  n.materialized = true;
+  n.device_dirty = true;
+  n.host_dirty = false;
+  return OkStatus();
+}
+
+}  // namespace
+
+Status Session::restart() {
+  for (model::MixerState& s : states_) {
+    LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_state));
+    LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_conv_q));
+    LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_conv_k));
+    LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_conv_v));
+    LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_conv_qkv));
+    // Releasing every row makes the stale KV unreachable — the bytes stay,
+    // the table stops naming them — and position zero is what makes the next
+    // pass a prefill.
+    for (std::size_t r = 0; r < s.paged.tables.size(); ++r) {
+      LSE_RETURN_IF_ERROR(
+          ops::release_row(s.paged, static_cast<std::int32_t>(r)));
+    }
+    s.position = 0;
+  }
+  history_.clear();
+  position_ = 0;
+  return OkStatus();
 }
 
 std::size_t Session::cache_bytes() const noexcept {

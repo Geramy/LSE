@@ -466,7 +466,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   // a re-prefill and nothing else.
   if (static_cast<std::size_t>(session.position()) + 1 !=
       session.history().size()) {
-    session.clear();
+    if (!session.restart().ok()) session.clear();
     mtp_->reset();
   }
   return generated;
@@ -504,7 +504,11 @@ Result<std::vector<std::uint32_t>> Generator::generate(
                  session.history().begin() + static_cast<std::ptrdiff_t>(covered),
                  prompt.begin());
   if (!continues) {
-    session.clear();
+    // A cold start on a session that already owns arrays keeps them: restart()
+    // zeroes the recurrence and releases the KV rows in place, so a program
+    // retained against those arrays can still replay. clear() would drop the
+    // arrays and orphan every retained program's leaves.
+    if (!session.restart().ok()) session.clear();
     if (mtp_ != nullptr) mtp_->reset();
   }
   const std::size_t start = continues ? covered : 0;

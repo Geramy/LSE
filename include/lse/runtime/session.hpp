@@ -49,6 +49,14 @@ class Session {
   // Drops the cache but keeps the id, so the next turn is a fresh prefill.
   void clear();
 
+  // A fresh sequence on the SAME arrays: the state tensors keep their nodes
+  // and buffers — zeroed on device — the paged rows are released, and every
+  // position returns to zero. clear() drops the arrays and forces the next
+  // pass to rebuild the graph; this keeps the graph replayable, which is what
+  // lets a server reuse one retained program across requests instead of
+  // paying partition and emit per request.
+  Status restart();
+
   // What the cache currently costs: the block pools actually allocated plus the
   // GDN state and its conv tails. Attention pools sit at a rung above the blocks
   // in use, not at the engine capacity.

@@ -6,6 +6,8 @@
 // else.
 #pragma once
 
+#include <array>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -165,7 +167,11 @@ class HybridLM {
   // assert the carry-ownership invariant: a state the next pass reads must not
   // share bytes with anything this pass writes.
   [[nodiscard]] const graph::Program& retained_program() const noexcept {
-    return cache_.program;
+    for (const ForwardCache& c : caches_) {
+      if (c.t_key == 1) return c.program;
+    }
+    static const graph::Program kNone;
+    return kNone;
   }
 
   [[nodiscard]] const Config& config() const noexcept { return config_; }
@@ -206,8 +212,52 @@ class HybridLM {
     const void* states = nullptr;
     std::int64_t seq = -1;
     std::vector<graph::Node*> kv_leaves;
+    // The pass shape this slot serves: the token count of its retained
+    // program. -1 is an empty slot.
+    std::int64_t t_key = -1;
+    // Chain identity. pass_id names the build that retained this slot;
+    // prev_pass names the pass that ran immediately before it. A replay whose
+    // carry-ins are another pass's out-nodes is only coherent when that exact
+    // pass has just run again.
+    std::uint64_t pass_id = 0;
+    std::uint64_t prev_pass = 0;
+    // The state arrays as this pass's retain stamped them. A replay leaves the
+    // MixerStates pointing at whatever the last BUILD stamped, and a later
+    // rebuild would read that other chain's nodes; restoring these on every
+    // replay keeps the handoff coherent for whichever pass comes next.
+    struct StateStamp {
+      Array gdn, cq, ck, cv, cqkv, keys, values, meta;
+    };
+    std::vector<StateStamp> state_stamp;
   };
-  ForwardCache cache_;
+  // One slot per pass shape, so decode retention (T=1) stops evicting the
+  // prefill program (T=N) — with one slot every server request rebuilt its
+  // prefill graph because the first decode had overwritten it. Four covers
+  // decode, an MTP verify width, and two prompt shapes; eviction is
+  // round-robin among full slots.
+  std::array<ForwardCache, 8> caches_;
+  // Chain bookkeeping across passes, build or replay. Folding a slot's
+  // carries is only correct when that same pass ran immediately before; at a
+  // ladder handoff the in-node IS the previous chunk's out node and already
+  // holds the fresh state, so a fold would swap stale bytes in.
+  std::uint64_t pass_counter_ = 0;
+  std::uint64_t last_pass_id_ = 0;
+  std::size_t next_cache_ = 0;
+  [[nodiscard]] ForwardCache& cache_slot(std::int64_t t) {
+    for (ForwardCache& c : caches_) {
+      if (c.t_key == t) return c;
+    }
+    for (ForwardCache& c : caches_) {
+      if (c.t_key < 0) {
+        c.t_key = t;
+        return c;
+      }
+    }
+    ForwardCache& c = caches_[next_cache_++ % caches_.size()];
+    c = ForwardCache{};
+    c.t_key = t;
+    return c;
+  }
   // Groups the last pass could not put on the device. A pass that ran anywhere
   // else cannot be replaced: the carried state travels differently there, and
   // the pass replacing it would start from what it is meant to discard.

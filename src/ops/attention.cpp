@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -36,6 +37,12 @@ std::size_t PagedKvLayer::pool_bytes() const noexcept {
 
 std::int32_t paged_pool_blocks(std::span<const std::int32_t> row_tokens,
                                std::int32_t ceiling) noexcept {
+  // A resident session that wants program replay across requests cannot
+  // tolerate a regrow: regrow_pool swaps the pool arrays, which orphans the
+  // KV leaves every retained program was bound against. Pre-sizing at the
+  // ceiling keeps the arrays (and so the leaves) stable for the process
+  // lifetime, at the cost of committing the full pool up front.
+  if (std::getenv("LSE_KV_PREALLOC") != nullptr) return ceiling;
   std::int32_t want = 0;
   for (std::int32_t t : row_tokens) want += kv::blocks_for(t, kv::kBlockSize);
   return kv::pool_rung(want, ceiling);
@@ -47,6 +54,7 @@ std::int32_t paged_pool_blocks(std::int32_t tokens, std::int32_t rows,
   const std::int32_t per_row = kv::blocks_for(tokens, kv::kBlockSize);
   const std::int32_t ceiling =
       kv::blocks_for(capacity, kv::kBlockSize) * rows;
+  if (std::getenv("LSE_KV_PREALLOC") != nullptr) return ceiling;
   return kv::pool_rung(per_row * rows, ceiling);
 }
 

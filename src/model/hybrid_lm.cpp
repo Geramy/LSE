@@ -114,19 +114,37 @@ Status HybridLM::load(WeightBinder& binder) {
     if (members > 1) {
       const auto inter = static_cast<std::int64_t>(config_.mlp_intermediate);
       const auto n = static_cast<std::int64_t>(members);
-      const bool divides = inter % n == 0 && (inter / n) % 64 == 0;
+      // inter > 0 is load-bearing: an MoE config stores its widths in
+      // expert_intermediate and sets mlp_intermediate to 0, and 0 divides
+      // everything — this test used to read a zero as "divides" and pick a
+      // tensor split for a model whose FFN cannot take one.
+      const bool divides =
+          inter > 0 && inter % n == 0 && (inter / n) % 64 == 0;
       // Asked of the blocks themselves, built for the question and thrown
-      // away: every layer has to shard, and on a hybrid model the layer that
-      // cannot is not the one at index 0.
-      bool mixers_shard = config_.num_layers > 0;
-      for (std::int32_t i = 0; i < config_.num_layers && mixers_shard; ++i) {
+      // away: every layer has to shard — BOTH halves of it. A block whose
+      // mixer shards but whose feed-forward does not (an MoE block today)
+      // would run the dominant cost of the layer on one member while paying
+      // the split's reduces anyway, and on a hybrid model the layer that
+      // cannot shard is not the one at index 0.
+      bool blocks_shard = config_.num_layers > 0;
+      for (std::int32_t i = 0; i < config_.num_layers && blocks_shard; ++i) {
         auto probe = factory_(i);
-        if (!probe.ok() || *probe == nullptr || !(*probe)->mixer_shards()) {
-          mixers_shard = false;
+        if (!probe.ok() || *probe == nullptr || !(*probe)->mixer_shards() ||
+            !(*probe)->ffn_shards()) {
+          blocks_shard = false;
         }
       }
-      scheme = divides && mixers_shard ? graph::SplitScheme::kTensor
+      scheme = divides && blocks_shard ? graph::SplitScheme::kTensor
                                        : graph::SplitScheme::kLayer;
+      // LSE_SPLIT=layer|tensor overrides the choice — diagnostic, for
+      // isolating one scheme's bugs from the other's on the same pool.
+      if (const char* forced = std::getenv("LSE_SPLIT")) {
+        if (std::string_view(forced) == "layer") {
+          scheme = graph::SplitScheme::kLayer;
+        } else if (std::string_view(forced) == "tensor") {
+          scheme = graph::SplitScheme::kTensor;
+        }
+      }
     }
     graph::set_split_scheme(scheme);
   }
@@ -281,6 +299,9 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   const std::int64_t t_now =
       tokens.valid() ? tokens.shape().dim(tokens.shape().rank() - 1) : 0;
+  // The retention slot for THIS pass shape. Named cache_ so the thirty uses
+  // below read as they always did; the member is caches_ now.
+  ForwardCache& cache_ = cache_slot(t_now);
 
   if (states != nullptr && tokens.valid()) {
     const auto batch = tokens.shape().dim(0);
@@ -296,19 +317,37 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     // A tensor split cuts the recurrence along its head axis with the weights
     // that drive it, so each member carries only its own heads' state and its
     // own channels of the convolution tail.
-    const std::int64_t vh_m = shards > 1 && vh % n == 0 ? vh / n : vh;
+    //
+    // Sharded on the SAME gate the mixer's load uses (head_shards): every
+    // member must get whole heads of both kinds, or the mixer declines and
+    // keeps its heads whole. Testing one axis here while the mixer tests two
+    // allocated a state n× too small for the scan that reads it whenever the
+    // v-heads divided and the qk-heads did not.
+    const auto kh = static_cast<std::int64_t>(config_.gdn_qk_heads);
+    const auto vheads = static_cast<std::int64_t>(config_.gdn_v_heads);
+    const bool heads_divide = shards > 1 && kh > 0 && vheads > 0 &&
+                              kh % n == 0 && vheads % n == 0;
+    const std::int64_t vh_m = heads_divide && vh % n == 0 ? vh / n : vh;
     const auto fused_full = static_cast<std::int64_t>(spec_.gdn_conv_width);
     const std::int64_t fused =
-        shards > 1 && fused_full % n == 0 ? fused_full / n : fused_full;
+        heads_divide && fused_full % n == 0 ? fused_full / n : fused_full;
     const auto width = vh_m * vd;
     for (std::size_t i = 0; i < states->size(); ++i) {
       // Flat over (layer, member), so the layer is the quotient -- an
       // attention layer's shards must not be given a recurrent state.
-      if (config_.is_attention_layer(static_cast<std::int32_t>(i / shards))) {
+      const auto layer = static_cast<std::int32_t>(i / shards);
+      if (config_.is_attention_layer(layer)) {
         continue;
       }
       MixerState& st = (*states)[i];
-      const graph::ScopedMember on(shards > 1 ? i % shards : 0);
+      // A tensor split stamps the shard's member; a layer split stamps the
+      // member the layer actually runs on. Member 0 unconditionally put every
+      // layer's state on the primary while the layer ran elsewhere, which
+      // cost a peer fetch per state per rebuild and undid the point of
+      // splitting by layers.
+      const graph::ScopedMember on(shards > 1
+                                       ? i % shards
+                                       : member_for_layer(layer));
       if (!st.gdn_state.valid()) {
         st.gdn_state = Array::zeros(Shape{batch, vh_m, vd, vd}, DType::kF32);
       }
@@ -418,6 +457,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     }
   }
 
+  const std::uint64_t prev_pass_run = last_pass_id_;
   auto kv_leaves_match = [&]() -> bool {
     if (states == nullptr) return cache_.kv_leaves.empty();
     if (cache_.kv_leaves.size() != states->size() * 2) return false;
@@ -429,6 +469,16 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                            ? (*states)[i].value_cache.node().get()
                            : nullptr;
       if (cache_.kv_leaves[2 * i] != k || cache_.kv_leaves[2 * i + 1] != v) {
+        if (std::getenv("LSE_DEBUG_REUSE") != nullptr) {
+          std::fprintf(stderr,
+                       "[reuse] kv mismatch i=%zu cachedK=%p curK=%p "
+                       "cachedV=%p curV=%p poolK=%p\n",
+                       i, (void*)cache_.kv_leaves[2 * i], (void*)k,
+                       (void*)cache_.kv_leaves[2 * i + 1], (void*)v,
+                       (void*)((*states)[i].paged.keys.valid()
+                                   ? (*states)[i].paged.keys.node().get()
+                                   : nullptr));
+        }
         return false;
       }
     }
@@ -443,12 +493,51 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       !cache_.meta.valid() ||
       static_cast<std::int64_t>(cache_.meta.shape().elem_count()) != meta_elems;
 
+  // LSE_NO_REPLAY=1: rebuild the graph every pass instead of replaying the
+  // retained program. Diagnostic only — it converts a wrong-replay bug into a
+  // slow-but-correct run, which is what isolates one.
+  static const bool no_replay = std::getenv("LSE_NO_REPLAY") != nullptr;
+  bool at_sequence_start = true;
+  if (states != nullptr) {
+    for (const MixerState& st : *states) {
+      if (st.position > 0) {
+        at_sequence_start = false;
+        break;
+      }
+    }
+  }
+  // A slot's carry-ins are the out-nodes of the pass that preceded it when it
+  // was retained. Replaying it after any OTHER pass reads that stale chain:
+  // valid only at a sequence start (the ins are zeroed), when the same chain
+  // predecessor just ran, or when the slot repeats itself (decode; the fold
+  // advances its state).
+  const bool chain_ok = at_sequence_start ||
+                        (cache_.prev_pass != 0 &&
+                         cache_.prev_pass == prev_pass_run) ||
+                        (cache_.pass_id != 0 &&
+                         cache_.pass_id == prev_pass_run);
   const bool can_reuse =
+      !no_replay && chain_ok &&
       aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
       cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
       cache_.states == states && !cache_.program.empty() &&
       !cache_.program.groups().empty() && kv_leaves_match();
+  if (std::getenv("LSE_DEBUG_REUSE") != nullptr) {
+    std::fprintf(
+        stderr,
+        "[reuse] t=%lld can=%d aux=%d tr=%d pool=%d meta=%d hid=%d ctok=%d "
+        "tok=%d shp=%d st=%d prog=%d grp=%d kv=%d\n",
+        static_cast<long long>(t_now), (int)can_reuse,
+        (int)(aux_loss == nullptr), (int)(trace == nullptr),
+        (int)!pool_moved, (int)!meta_moved, (int)cache_.hidden.valid(),
+        (int)cache_.tokens.valid(), (int)tokens.valid(),
+        (int)(cache_.tokens.valid() && tokens.valid() &&
+              tokens.shape().elem_count() ==
+                  cache_.tokens.shape().elem_count()),
+        (int)(cache_.states == states), (int)!cache_.program.empty(),
+        (int)!cache_.program.groups().empty(), (int)kv_leaves_match());
+  }
   if (replaces_previous && last_pass_host_groups_ != 0) {
     return LSE_ERROR(kUnimplemented, "the pass being replaced put ",
                      std::to_string(last_pass_host_groups_),
@@ -460,11 +549,41 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   const std::uint32_t host_before = host_groups_so_far();
   if (can_reuse) {
     cache_.program.reset_compute();
-    if (replaces_previous) {
+    // A whole-prompt prefill replay is a FRESH sequence: its carried states
+    // must start from zero, not from wherever the previous conversation's
+    // folds left the in-buffers. Folding here handed request 2 the tail of
+    // request 1's state. A batch resumption arrives with row metadata and
+    // keeps the fold. Decode (t_now == 1) always folds: it genuinely carries.
+    // Only the FIRST chunk of a prefill ladder starts the sequence; the later
+    // chunks' carry-ins hold the state the chunk before them just produced,
+    // and zeroing those mid-ladder replays the rest of the prompt against a
+    // blank recurrence.
+    const bool fresh_sequence =
+        t_now > 1 && rows == nullptr && !replaces_previous &&
+        at_sequence_start;
+    if (fresh_sequence) {
+      graph::Scheduler* sched = graph::default_scheduler();
+      if (sched == nullptr) return LSE_ERROR(kInternal, "no backend");
+      for (const graph::Program::Carry& c : cache_.program.carries()) {
+        if (!c.in || !c.in->buffer.valid()) continue;
+        const std::size_t bytes =
+            dtype_storage_bytes(c.in->dtype, c.in->element_count());
+        if (bytes == 0) continue;
+        const std::vector<std::byte> zeros(bytes, std::byte{0});
+        LSE_RETURN_IF_ERROR(
+            sched->backend().copy_h2d(zeros.data(), c.in->buffer, bytes, 0));
+        c.in->materialized = true;
+        c.in->device_dirty = true;
+        c.in->host_dirty = false;
+      }
+    } else if (replaces_previous) {
       cache_.program.hold_carries();
-    } else {
+    } else if (cache_.pass_id == prev_pass_run) {
+      // Same program again: its outs are the freshest state, move them in.
       cache_.program.fold_carries();
     }
+    // Different program ran last: this slot's in-nodes are that program's out
+    // nodes and were just written by its eval — nothing to fold.
     LSE_RETURN_IF_ERROR(poke_tokens(cache_.tokens, tokens));
     LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
     if (graph::Scheduler* sched = graph::default_scheduler()) {
@@ -472,6 +591,21 @@ Result<Array> HybridLM::hidden(const Array& tokens,
           sched->eval(cache_.program.roots(), false, &cache_.program));
     }
     last_pass_host_groups_ = host_groups_so_far() - host_before;
+    if (states != nullptr &&
+        cache_.state_stamp.size() == states->size()) {
+      for (std::size_t i = 0; i < states->size(); ++i) {
+        MixerState& s = (*states)[i];
+        const ForwardCache::StateStamp& ss = cache_.state_stamp[i];
+        s.gdn_state = ss.gdn;
+        s.gdn_conv_q = ss.cq;
+        s.gdn_conv_k = ss.ck;
+        s.gdn_conv_v = ss.cv;
+        s.gdn_conv_qkv = ss.cqkv;
+        s.key_cache = ss.keys;
+        s.value_cache = ss.values;
+        s.kv_meta = ss.meta;
+      }
+    }
     if (states != nullptr) {
       for (MixerState& s : *states) {
         if (s.key_cache.valid()) {
@@ -479,6 +613,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
         }
       }
     }
+    last_pass_id_ = cache_.pass_id;
     return cache_.hidden;
   }
 
@@ -613,12 +748,26 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     // buffer out of its free list. The skips mirror the planner's own: a
     // reshape, a leaf and an in-place primitive all take their bytes from
     // somewhere else by design.
+    backend::IDeviceSet& set = sched->devices();
     for (const graph::NodePtr& n : carried) {
       if (n->buffer.valid() || n->kind == graph::OpKind::kReshape) continue;
       if (n->fclass == graph::FusionClass::kLeaf) continue;
       if (n->prim != nullptr && n->prim->inplace_input() >= 0) continue;
+      // On the member the state was stamped with when it was made, through
+      // that member's stream — on a set that places by stream, the stream IS
+      // the member. The primary's backend with no stream put every shard's
+      // recurrence in the primary's VRAM, and the other members' scans read
+      // and wrote it across the link every token.
+      const std::size_t member =
+          n->member != graph::Node::kAnyMember &&
+                  static_cast<std::size_t>(n->member) < set.size()
+              ? static_cast<std::size_t>(n->member)
+              : set.primary();
+      backend::IBackend& on = set.device(member);
+      const backend::Stream at =
+          set.stream_for(member).value_or(backend::kDefaultStream);
       LSE_RETURN_IF_ERROR(
-          graph::interpreter::ensure_output_buffer(*n, sched->backend()));
+          graph::interpreter::ensure_output_buffer(*n, on, at));
     }
     LSE_RETURN_IF_ERROR(sched->eval(roots, false, &cache_.program));
   }
@@ -628,6 +777,9 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.hidden = y;
   cache_.states = states;
   cache_.seq = t_now;
+  cache_.pass_id = ++pass_counter_;
+  cache_.prev_pass = prev_pass_run;
+  last_pass_id_ = cache_.pass_id;
   cache_.kv_leaves.clear();
   if (states != nullptr) {
     cache_.kv_leaves.reserve(states->size() * 2);
@@ -639,6 +791,16 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       if (st.key_cache.valid()) {
         st.position = kv_len;
       }
+    }
+  }
+  cache_.state_stamp.clear();
+  if (states != nullptr) {
+    cache_.state_stamp.reserve(states->size());
+    for (const MixerState& st : *states) {
+      cache_.state_stamp.push_back({st.gdn_state, st.gdn_conv_q,
+                                    st.gdn_conv_k, st.gdn_conv_v,
+                                    st.gdn_conv_qkv, st.key_cache,
+                                    st.value_cache, st.kv_meta});
     }
   }
   if (states != nullptr && before.size() == states->size()) {

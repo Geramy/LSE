@@ -109,6 +109,12 @@ struct HttpServer::Impl {
   // long as its completion takes and the server outlives the ^C that asked it
   // to stop.
   std::atomic<bool> stopping{false};
+  // One resident session, restarted between requests instead of rebuilt: the
+  // state arrays keep their nodes, so the model's retained program replays
+  // and a warm request skips the per-request partition and emit entirely.
+  // Guarded by generate_lock like everything else that touches the device.
+  runtime::Session session{"resident", 0};
+  bool session_live = false;
 
   Impl(model::HybridLM& m, tokenizer::Tokenizer& t, ServerOptions o)
       : model(m), tok(t), opt(std::move(o)) {
@@ -199,6 +205,19 @@ struct HttpServer::Run {
     runtime::Generator gen(impl.model, r.sampling);
     if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
 
+    // The resident session: same state arrays every request, so the model's
+    // shape checks see the graph it already retained. restart() zeroes the
+    // recurrence and releases the KV rows; a failure falls back to a fresh
+    // session for this request rather than refusing it.
+    bool resident = false;
+    if (!impl.session_live) {
+      impl.session = runtime::Session{"resident", impl.model.state_slots()};
+      impl.session_live = true;
+      resident = true;
+    } else if (impl.session.restart().ok()) {
+      resident = true;
+    }
+
     tokenizer::DecodeStream stream(impl.tok);
     Outcome out;
     out.prompt_tokens = static_cast<int>(r.prompt.size());
@@ -228,7 +247,9 @@ struct HttpServer::Run {
       return true;
     };
 
-    auto ids = gen.generate(r.prompt, r.limits, on_token);
+    auto ids = resident
+                   ? gen.generate(impl.session, r.prompt, r.limits, on_token)
+                   : gen.generate(r.prompt, r.limits, on_token);
     if (!ids.ok()) return ids.status();
     out.completion_tokens = static_cast<int>(ids->size());
     out.hit_limit = !stopped_by_string &&
