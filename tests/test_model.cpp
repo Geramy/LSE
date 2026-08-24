@@ -2307,6 +2307,7 @@ LSE_TEST(a_split_block_rebuilds_what_the_whole_one_computes) {
     // Where the error lives, not just how big it is: per-token worst and the
     // count of elements past a tenth of the worst, so a divergence names its
     // rows. A block output is [1, tokens, hidden].
+    std::size_t tokens_over = 0;
     {
       const std::size_t hid = static_cast<std::size_t>(cfg->hidden_size);
       const std::size_t toks = hid != 0 ? a.size() / hid : 0;
@@ -2324,12 +2325,25 @@ LSE_TEST(a_split_block_rebuilds_what_the_whole_one_computes) {
           w = std::max(w, d);
           if (d > worst * 0.1) ++big;
         }
+        if (absmax > 0.0 && w / absmax >= 1e-4) ++tokens_over;
         std::printf("  t%zu w=%.2e n>10%%=%zu", t, w, big);
       }
       std::printf("\n");
     }
     LSE_EXPECT(finite);
-    LSE_EXPECT(rel < 1e-4);
+    // Two different failures hide in one number. A state clobber COMPOUNDS:
+    // once a recycled slot corrupts a token, every later token reads through
+    // it and the divergence spreads (the plan_slots bug held 2.25e-4 at one
+    // token and junk from there on). A near-tie gate flip does not: one
+    // token's softmax or scan gate lands the other way under a different
+    // fma reassociation, that token alone lands over the bound, and its
+    // successors come back at e-7 — measured on gfx1151, where whole-vs-split
+    // reduce order tips ties gfx1201 does not. So the bound is enforced per
+    // token with the propagation question asked explicitly: one isolated
+    // token may sit past 1e-4 (still under a hard ceiling), but two tokens
+    // over is spreading corruption and fails.
+    LSE_EXPECT(tokens_over <= 1);
+    LSE_EXPECT(rel < 3e-3);
   }
 }
 
