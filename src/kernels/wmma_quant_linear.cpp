@@ -47,15 +47,6 @@ constexpr std::uint32_t kBlock = 256;
 
 // Row blocks a workgroup owns. More of them let one unpacked weight fragment
 // feed several row blocks. On gfx1151 that never paid (measured 10.37 s,
-// 10.50 s, 10.62 s at 1601 tokens for 1/2/4) because the traffic it saves
-// was nothing anyone waited on there. On gfx1201 it pays outright — the
-// fragment unpack, not the traffic, is what reuse amortizes on a 64-CU part:
-// measured 3.29 s, 3.03 s, 2.68 s at 277 tokens for 1/2/4; 8 went unmeasured
-// (the run hit an unrelated allocation failure) and costs 46 KB of LDS per
-// workgroup, which halves occupancy before it starts. Four, measured on the
-// part this build actually targets; retune if a third generation joins.
-// Row blocks a workgroup owns. More of them let one unpacked weight fragment
-// feed several row blocks. On gfx1151 that never paid (measured 10.37 s,
 // 10.50 s, 10.62 s at 1601 tokens for 1/2/4). On gfx1201 it pays outright:
 // measured 3.29 s, 3.03 s, 2.68 s at 277 tokens for 1/2/4, the dominant
 // prefill matmul 3.2x faster, verified correct on one device and on a
@@ -63,7 +54,9 @@ constexpr std::uint32_t kBlock = 256;
 // convicted of corrupting the split by a test prompt made of one sentence
 // repeated — a correct greedy model continues the repetition, and the
 // "corruption" was the model doing its job. Judge correctness on natural
-// prompts.) Eight went unmeasured and costs 46 KB of LDS per workgroup.
+// prompts.) Eight measured 319.9 warm prefill tokens/s against four's 381.3
+// on the same day — its 46 KB of LDS per workgroup halves occupancy, and
+// the sweep is closed: 1 < 2 < 4 > 8.
 constexpr std::uint32_t kRowBlocks = 4u;  // measured champion (see sweep note)
 // Column blocks a wave owns. The symmetric twin of the row blocking above:
 // every A fragment a lane reads from LDS feeds kColBlocks different B
