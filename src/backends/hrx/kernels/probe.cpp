@@ -481,7 +481,9 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
       }
       if (row == nullptr) continue;
 
+      std::fprintf(stderr, "[probe] measuring %s\n", rate.key.c_str());
       const Status s = measure_one_row(info, *row, *storage, rate);
+      std::fprintf(stderr, "[probe] done %s\n", rate.key.c_str());
       if (!s.ok() && first.ok()) first = s;
     }
     return first;
@@ -580,6 +582,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     // at the register boundary and multiplies in whatever this device does
     // have. That is the fastest measured row, and the f32 accumulator is
     // preferred because it is the one an activation's range survives.
+    std::fprintf(stderr, "[probe] deriving paths\n");
     const probe::MatrixRowRate* fallback = nullptr;
     for (const probe::MatrixRowRate& r : out.rows) {
       if (r.support != probe::RowSupport::kMeasured || !r.flops.positive()) {

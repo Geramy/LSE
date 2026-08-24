@@ -1350,7 +1350,9 @@ LSE_TEST(the_device_probe_measures_the_roofline_and_the_matrix_rows) {
     return;
   }
   std::printf("       probe took %.0f ms\n", probe_ms);
+  std::fprintf(stderr, "[t] before invented\n");
   expect_no_invented_numbers(*profiled);
+  std::fprintf(stderr, "[t] after invented\n");
   std::printf("       %s: %.1f GB/s stream, %.2f us dispatch, %.1f/%.1f GB/s h2d/d2h\n",
               profiled->arch.c_str(), profiled->dram_bytes_per_s.value / 1e9,
               profiled->launch_overhead_ns.value / 1e3,
@@ -1370,10 +1372,13 @@ LSE_TEST(the_device_probe_measures_the_roofline_and_the_matrix_rows) {
   // correct answer, not a fault.
   LSE_EXPECT(sample_free_memory(*be).known());
   for (const MatrixRowRate& r : profiled->rows) {
+    std::fprintf(stderr, "[t] row %s sup=%d\n", r.key.c_str(), (int)r.support);
     std::printf("         %-32s %-10s %8.2f TFLOP/s (table ratio %d)\n",
                 r.key.c_str(), std::string(to_string(r.support)).c_str(),
                 r.flops.value / 1e12, r.relative);
   }
+  std::fprintf(stderr, "[probe] rows printed, %zu paths\n",
+               profiled->paths.size());
   for (const ComputePath& p : profiled->paths) {
     std::printf("         %-5s -> %-5s %-9s %8.2f TFLOP/s (%s)\n",
                 std::string(to_string(p.operand)).c_str(),

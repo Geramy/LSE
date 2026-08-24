@@ -820,6 +820,82 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       continue;
     }
 
+    // A wide rms_norm re-derives its row sum per output element — width x the
+    // loads the answer needs, ~200x the bandwidth floor at hidden width. When
+    // the workgroup's 256 lanes provably share one row (width and count both
+    // multiples of 256), the sum is computed once cooperatively: each lane
+    // strides a 1/256 slice, an LDS tree folds it, and every lane scales its
+    // own element. Head-width rows (128) keep the per-element form, which L1
+    // absorbs; the measured verdicts on the alternatives live in
+    // node_can_stage above.
+    if (n->kind == OpKind::kRMS && n->inputs.size() == 2 &&
+        n->inputs[0] != nullptr && n->inputs[0]->dtype == DType::kF32 &&
+        n->inputs[0]->shape.rank() > 0) {
+      const auto D = static_cast<std::uint32_t>(
+          n->inputs[0]->shape.dim(n->inputs[0]->shape.rank() - 1));
+      const auto count = static_cast<std::uint32_t>(n->element_count());
+      if (D >= 256u && D % 256u == 0u && count % 256u == 0u) {
+        const std::string xb = bname(n->inputs[0].get());
+        const std::string gb = bname(n->inputs[1].get());
+        const std::string ob = bname(n.get());
+        if (xb.empty() || gb.empty() || ob.empty()) {
+          return LSE_ERROR(kInternal, "rms_norm stage is not bound");
+        }
+        const bool zero_centered = n->iattrs[0] != 0;
+        std::ostringstream eps;
+        eps.precision(9);
+        eps << std::scientific << n->attrs[0];
+        std::ostringstream st;
+        st << "    {\n"
+           << "      __shared__ float lse_red[256];\n"
+           << "      const float* __restrict__ xr = (const float*)" << xb
+           << ";\n"
+           << "      const " << device_scalar(n->inputs[1]->dtype)
+           << "* __restrict__ gr = (const " << device_scalar(n->inputs[1]->dtype)
+           << "*)" << gb << ";\n"
+           << "      const unsigned n = " << count << "u;\n";
+        if (persist) {
+          st << "      const unsigned stride = " << persist_wgs
+             << "u * 256u;\n"
+             << "      for (unsigned base = blockIdx.x * 256u; base < n; "
+                "base += stride) {\n";
+        } else if (grid_elem) {
+          st << "      for (unsigned base = blockIdx.x * 256u; base < n; "
+                "base += "
+             << (grid_wgs * 256u) << "u) {\n";
+        } else {
+          st << "      for (unsigned base = 0u; base < n; base += 256u) {\n";
+        }
+        st << "        const unsigned i = base + threadIdx.x;\n"
+           << "        const unsigned row = (i / " << D << "u) * " << D
+           << "u;\n"
+           << "        float part = 0.0f;\n"
+           << "        for (unsigned j = threadIdx.x; j < " << D
+           << "u; j += 256u) {\n"
+           << "          const float xv = xr[row + j];\n"
+           << "          part = fmaf(xv, xv, part);\n"
+           << "        }\n"
+           << "        lse_red[threadIdx.x] = part;\n"
+           << "        __syncthreads();\n"
+           << "        for (unsigned s = 128u; s > 0u; s >>= 1u) {\n"
+           << "          if (threadIdx.x < s) lse_red[threadIdx.x] += "
+              "lse_red[threadIdx.x + s];\n"
+           << "          __syncthreads();\n"
+           << "        }\n"
+           << "        const float scale = rsqrtf(lse_red[0] / (float)" << D
+           << "u + " << eps.str() << "f);\n"
+           << "        __syncthreads();\n"
+           << "        const float gain = (float)(gr[i % " << D << "u]);\n"
+           << "        const float v = xr[i] * scale * "
+           << (zero_centered ? "(1.0f + gain)" : "gain") << ";\n"
+           << "        " << store_elem(ob, "i", n->dtype, "v") << "\n"
+           << "      }\n    }\n";
+        stages << st.str();
+        record_write();
+        continue;
+      }
+    }
+
     if (spec != nullptr && spec->owns_indexing()) {
       KernelShapes sh = shapes_for(n);
       const std::string ob = bname(n.get());
