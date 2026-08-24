@@ -47,13 +47,17 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 //
 // Measured on this box: a fresh cache pays ~35-48 compiles at ~54 ms for each
 // new pass width, and the ladder below makes the reachable widths exactly
-// {1,2,4,8,16,32,64,128} — so the whole engine costs ~290 compiles once and a
-// novel prompt length costs zero. Without it every length is its own set.
+// {1,2,4,8,16,32,64,128,256} — so the whole engine costs ~340 compiles once
+// and a novel prompt length costs zero. Without it every length is its own
+// set. 256 and not 128: every chunk pays the phase ladder's fixed launch cost
+// again, and with programs retained across requests the one-time compiles for
+// the extra width amortize to nothing while the halved chunk count is paid
+// back on every long prompt.
 //
 // The row axis is bucketed the same way (model::kBatchRungs) and for the same
 // reason, and the two share the ladder: a decode pass of B sequences and a
 // prefill pass of B tokens present the same row count to every GEMM.
-constexpr std::size_t kPrefillChunk = 128;
+constexpr std::size_t kPrefillChunk = 256;
 
 std::size_t prefill_chunk() { return kPrefillChunk; }
 

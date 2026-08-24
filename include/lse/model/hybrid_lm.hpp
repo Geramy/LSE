@@ -235,7 +235,9 @@ class HybridLM {
   // prefill graph because the first decode had overwritten it. Four covers
   // decode, an MTP verify width, and two prompt shapes; eviction is
   // round-robin among full slots.
-  std::array<ForwardCache, 8> caches_;
+  // Wide enough for the deepest prefill ladder a 256-chunk plan can produce
+  // (a 511-token prompt uses widths 1..256 = nine passes) plus decode.
+  std::array<ForwardCache, 12> caches_;
   // Chain bookkeeping across passes, build or replay. Folding a slot's
   // carries is only correct when that same pass ran immediately before; at a
   // ladder handoff the in-node IS the previous chunk's out node and already
