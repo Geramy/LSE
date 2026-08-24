@@ -297,6 +297,13 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     st_in.push_back(e.let(si < items));
   }
 
+  // Measured and reverted: software-pipelining this loop two rounds deep
+  // (staging round r+1 into a second LDS plane while round r's matrix work
+  // runs) emitted correctly and lost — 369.8 warm prefill tokens/s against
+  // 475.4 for this sequential order. Overlapping the stages keeps the staged
+  // raws, the amax sums and the accumulators live at once, and the spills
+  // cost more than the hidden load latency saved: this kernel is bound by
+  // occupancy, not by memory latency.
   for (auto rnd : e.range(0u, groups / round_groups, 1u)) {
     for (std::uint32_t c = 0; c < chunks; ++c) {
       if (auto stager = e.when(st_in[c])) {
