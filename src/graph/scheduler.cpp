@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -521,6 +522,40 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       backend::DispatchTarget{stream, devices_.residency(member), {}});
   trace_.spans.submit.add(elapsed_ns(t_launch, SpanClock::now()));
   LSE_RETURN_IF_ERROR(submitted);
+  // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
+  // this dispatch and prints a checksum and the first values of every bound
+  // buffer, so a kernel's inputs and outputs can be compared across builds.
+  if (const char* want = std::getenv("LSE_DUMP_BUFFERS")) {
+    if (emitted->entry_name.find(want) != std::string::npos) {
+      (void)be.synchronize();
+      std::size_t bi = 0;
+      for (const backend::BufferRef& ref : bindings) {
+        if (ref.buffer == nullptr) { ++bi; continue; }
+        const std::size_t bytes = ref.length != 0 ? ref.length : ref.buffer->size_bytes;
+        std::vector<float> h(bytes / sizeof(float));
+        if (be.copy_d2h(*ref.buffer, h.data(), h.size() * sizeof(float), ref.offset).ok()) {
+          if (const char* dir = std::getenv("LSE_DUMP_BUFFERS_DIR")) {
+            static std::size_t seq = 0;
+            const std::string path = std::string(dir) + "/" + emitted->entry_name +
+                                     "_" + std::to_string(seq / bindings.size()) +
+                                     "_b" + std::to_string(bi) + ".bin";
+            ++seq;
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+              std::fwrite(h.data(), sizeof(float), h.size(), f);
+              std::fclose(f);
+            }
+          }
+          double sum = 0.0, asum = 0.0;
+          for (float v : h) { sum += v; asum += std::abs(static_cast<double>(v)); }
+          std::fprintf(stderr, "[buf] %s b%zu n=%zu sum=%.9g abs=%.9g first=%.6g,%.6g,%.6g,%.6g\n",
+                       emitted->entry_name.c_str(), bi, h.size(), sum, asum,
+                       h.size() > 0 ? h[0] : 0.f, h.size() > 1 ? h[1] : 0.f,
+                       h.size() > 2 ? h[2] : 0.f, h.size() > 3 ? h[3] : 0.f);
+        }
+        ++bi;
+      }
+    }
+  }
 
   for (const NodePtr& n : group.nodes) {
     n->materialized = true;
@@ -675,6 +710,23 @@ Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
 
 }  // namespace
 
+// A pointer table is read by the kernel it was recorded for, and under
+// batched dispatch that kernel may still be executing when the next pass is
+// scheduled. Freeing the tables at the top of the next eval therefore has to
+// wait for the device: every member is drained first, and only when there is
+// something to free — a pass without table phases pays nothing. The decode
+// loop already syncs per token to read its logits, so this costs a prefill
+// chunk one drain it was about to pay at its end anyway.
+Status Scheduler::release_phase_tables() {
+  if (impl_->phase_tables.empty()) return OkStatus();
+  for (std::size_t m = 0; m < devices_.size(); ++m) {
+    LSE_RETURN_IF_ERROR(devices_.device(m).synchronize());
+  }
+  for (auto& t : impl_->phase_tables) release(t);
+  impl_->phase_tables.clear();
+  return OkStatus();
+}
+
 Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host) {
   return eval(roots, pull_host, nullptr);
 }
@@ -720,8 +772,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // Opened here rather than in eval() so that the trace reset and the step
   // bookkeeping around it land in the remainder instead of in a span.
   SpanTimer setup_span(trace_.spans.schedule);
-  for (auto& t : impl_->phase_tables) release(t);
-  impl_->phase_tables.clear();
+  LSE_RETURN_IF_ERROR(release_phase_tables());
 
   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
 
@@ -1262,8 +1313,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
             }
           }
         }
-        for (auto& t : impl_->phase_tables) release(t);
-        impl_->phase_tables.clear();
+        LSE_RETURN_IF_ERROR(release_phase_tables());
         return OkStatus();
       }
     // Prefix in `ran` already launched. Partition only the rest; retain

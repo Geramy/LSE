@@ -828,13 +828,26 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     // own element. Head-width rows (128) keep the per-element form, which L1
     // absorbs; the measured verdicts on the alternatives live in
     // node_can_stage above.
-    if (n->kind == OpKind::kRMS && n->inputs.size() == 2 &&
+    // LSE_COOP_NORM=0 is the kill switch for bisects; LSE_COOP_NORM_MIN raises
+    // the width floor. Verified exact against the definition at every shipped
+    // row shape and against the serial form inside the model (identical
+    // inputs, 1.4e-6 worst delta) — a greedy token that flips between the two
+    // on a 0.8B 4-bit model is that model's sensitivity, not this kernel.
+    static const bool coop_norm = [] {
+      const char* v = std::getenv("LSE_COOP_NORM");
+      return v == nullptr || std::string_view(v) != "0";
+    }();
+    if (coop_norm && n->kind == OpKind::kRMS && n->inputs.size() == 2 &&
         n->inputs[0] != nullptr && n->inputs[0]->dtype == DType::kF32 &&
         n->inputs[0]->shape.rank() > 0) {
       const auto D = static_cast<std::uint32_t>(
           n->inputs[0]->shape.dim(n->inputs[0]->shape.rank() - 1));
       const auto count = static_cast<std::uint32_t>(n->element_count());
-      if (D >= 256u && D % 256u == 0u && count % 256u == 0u) {
+      static const std::uint32_t coop_min = [] {
+        const char* v = std::getenv("LSE_COOP_NORM_MIN");
+        return v != nullptr ? static_cast<std::uint32_t>(std::atoi(v)) : 256u;
+      }();
+      if (D >= coop_min && D % 256u == 0u && count % 256u == 0u) {
         const std::string xb = bname(n->inputs[0].get());
         const std::string gb = bname(n->inputs[1].get());
         const std::string ob = bname(n.get());

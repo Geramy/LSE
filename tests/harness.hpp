@@ -41,6 +41,9 @@ inline int run_all() {
   Registry& r = Registry::get();
   int passed = 0;
   for (const auto& c : r.cases) {
+    if (std::getenv("LSE_TEST_TRACE") != nullptr) {
+      std::fprintf(stderr, "[test] start %s\n", c.name.c_str());
+    }
     r.current = c.name;
     const int before = r.failures;
     c.fn();

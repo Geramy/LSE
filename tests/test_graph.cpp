@@ -132,6 +132,147 @@ LSE_TEST(rms_norm_matches_definition) {
   }
 }
 
+// The cooperative row form the phase emitter uses once a row is a multiple of
+// 256 lanes: every row shape the shipped models put through it, against the
+// definition. (8, 256) is a head norm with one workgroup per row, (3, 1024)
+// a hidden norm with four workgroups sharing a row, (1, 1024) the decode
+// width. Random data, so a wrong row start or a wrong lane share cannot hide
+// behind symmetry.
+LSE_TEST(rms_norm_cooperative_rows_match_definition) {
+  const struct { std::int64_t rows, d; } shapes[] = {{8, 256}, {3, 1024},
+                                                      {1, 1024}, {2, 512}};
+  for (const auto& sh : shapes) {
+    std::vector<float> xs(static_cast<std::size_t>(sh.rows * sh.d));
+    std::vector<float> ws(static_cast<std::size_t>(sh.d));
+    std::uint32_t seed = 0x9E3779B9u ^ static_cast<std::uint32_t>(sh.d);
+    auto rnd = [&]() {
+      seed = seed * 1664525u + 1013904223u;
+      return static_cast<float>((seed >> 8) & 0xFFFF) / 65536.0f - 0.5f;
+    };
+    for (float& v : xs) v = rnd() * 4.0f;
+    for (float& v : ws) v = 1.0f + rnd();
+    Array x = host_array(xs, Shape{sh.rows, sh.d});
+    Array w = host_array(ws, Shape{sh.d});
+    Array y = rms_norm(x, w, 1e-6f);
+    const auto out = drain(y);
+    LSE_EXPECT_EQ(out.size(), xs.size());
+    double worst = 0.0;
+    for (std::int64_t r = 0; r < sh.rows; ++r) {
+      double ss = 0.0;
+      for (std::int64_t c = 0; c < sh.d; ++c) {
+        const double v = xs[static_cast<std::size_t>(r * sh.d + c)];
+        ss += v * v;
+      }
+      const double scale = 1.0 / std::sqrt(ss / static_cast<double>(sh.d) + 1e-6);
+      for (std::int64_t c = 0; c < sh.d; ++c) {
+        const std::size_t i = static_cast<std::size_t>(r * sh.d + c);
+        const double want = xs[i] * scale * ws[static_cast<std::size_t>(c)];
+        worst = std::max(worst, std::abs(out[i] - want));
+      }
+    }
+    std::printf("       rms_norm (%lld, %lld): worst |abs| %.3e\n",
+                static_cast<long long>(sh.rows), static_cast<long long>(sh.d),
+                worst);
+    LSE_EXPECT(worst < 1e-4);
+  }
+}
+
+// The same rows as the model presents them: a rank-4 head layout, and the
+// norm fused between an elementwise producer and an elementwise consumer so
+// it sits mid-kernel with lanes on both sides of it.
+LSE_TEST(rms_norm_cooperative_rows_survive_fusion_and_head_layout) {
+  const std::int64_t t = 2, H = 4, d = 256;
+  std::vector<float> xs(static_cast<std::size_t>(t * H * d));
+  std::vector<float> ws(static_cast<std::size_t>(d));
+  std::uint32_t seed = 0xC0FFEEu;
+  auto rnd = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<float>((seed >> 8) & 0xFFFF) / 65536.0f - 0.5f;
+  };
+  for (float& v : xs) v = rnd() * 4.0f;
+  for (float& v : ws) v = 1.0f + rnd();
+  Array x = host_array(xs, Shape{1, t, H, d});
+  Array w = host_array(ws, Shape{d});
+  // producer: silu(x) + x; norm; consumer: * 2 + producer
+  Array pre = silu(x) + x;
+  Array nrm = rms_norm(pre, w, 1e-6f);
+  Array y = (nrm + nrm) + pre;
+  const auto out = drain(y);
+  LSE_EXPECT_EQ(out.size(), xs.size());
+  double worst = 0.0;
+  const std::int64_t rows = t * H;
+  std::vector<double> prev(xs.size());
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    const double v = xs[i];
+    prev[i] = v / (1.0 + std::exp(-v)) + v;
+  }
+  for (std::int64_t r = 0; r < rows; ++r) {
+    double ss = 0.0;
+    for (std::int64_t c = 0; c < d; ++c) {
+      const double v = prev[static_cast<std::size_t>(r * d + c)];
+      ss += v * v;
+    }
+    const double scale = 1.0 / std::sqrt(ss / static_cast<double>(d) + 1e-6);
+    for (std::int64_t c = 0; c < d; ++c) {
+      const std::size_t i = static_cast<std::size_t>(r * d + c);
+      const double want =
+          prev[i] * scale * ws[static_cast<std::size_t>(c)] * 2.0 + prev[i];
+      worst = std::max(worst, std::abs(out[i] - want));
+    }
+  }
+  std::printf("       fused rank-4 rms_norm: worst |abs| %.3e\n", worst);
+  LSE_EXPECT(worst < 1e-3);
+}
+
+// The model's own head norms read a transpose: q arrives as (1, H, t, d) and
+// is normalized as (1, t, H, d). The row a workgroup sums is then a row of
+// the transposed layout, and whatever the transpose is at the seam — a view
+// or bytes — the norm has to see the right 256.
+LSE_TEST(rms_norm_cooperative_rows_read_a_transposed_input) {
+  // H=2, t=4: the k-norm of a 2-KV-head model at a 4-token chunk, which is
+  // the instance that first went wrong.
+  const std::int64_t t = 4, H = 2, d = 256;
+  std::vector<float> xs(static_cast<std::size_t>(t * H * d));
+  std::vector<float> ws(static_cast<std::size_t>(d));
+  std::uint32_t seed = 0xBADF00Du;
+  auto rnd = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<float>((seed >> 8) & 0xFFFF) / 65536.0f - 0.5f;
+  };
+  for (float& v : xs) v = rnd() * 4.0f;
+  for (float& v : ws) v = 1.0f + rnd();
+  // Source laid out (1, t, H, d) as a projection leaves it; split_heads
+  // transposes to (1, H, t, d) and the norm runs on that.
+  Array src = host_array(xs, Shape{1, t, H, d});
+  Array w = host_array(ws, Shape{d});
+  Array x = transpose(src, {0, 2, 1, 3});
+  Array y = rms_norm(x, w, 1e-6f);
+  const auto out = drain(y);
+  LSE_EXPECT_EQ(out.size(), xs.size());
+  double worst = 0.0;
+  for (std::int64_t ti = 0; ti < t; ++ti) {
+    for (std::int64_t h = 0; h < H; ++h) {
+      // Row (h, ti) of the transposed tensor is row (ti, h) of the source.
+      const std::size_t sbase = static_cast<std::size_t>((ti * H + h) * d);
+      const std::size_t obase = static_cast<std::size_t>((h * t + ti) * d);
+      double ss = 0.0;
+      for (std::int64_t c = 0; c < d; ++c) {
+        const double v = xs[sbase + static_cast<std::size_t>(c)];
+        ss += v * v;
+      }
+      const double scale = 1.0 / std::sqrt(ss / static_cast<double>(d) + 1e-6);
+      for (std::int64_t c = 0; c < d; ++c) {
+        const double want = xs[sbase + static_cast<std::size_t>(c)] * scale *
+                            ws[static_cast<std::size_t>(c)];
+        worst = std::max(worst,
+                         std::abs(out[obase + static_cast<std::size_t>(c)] - want));
+      }
+    }
+  }
+  std::printf("       transposed-input rms_norm: worst |abs| %.3e\n", worst);
+  LSE_EXPECT(worst < 1e-3);
+}
+
 LSE_TEST(matmul_2x3_by_3x2) {
   Array a = host_array({1, 2, 3, 4, 5, 6}, Shape{2, 3});
   Array b = host_array({7, 8, 9, 10, 11, 12}, Shape{3, 2});

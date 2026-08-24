@@ -197,6 +197,8 @@ class Array {
   [[nodiscard]] const NodePtr& node() const noexcept { return node_; }
   [[nodiscard]] bool valid() const noexcept { return node_ != nullptr; }
 
+  // Frees the pointer tables of finished passes; drains the devices first.
+
   Status eval();
   // Same as eval() but leaves the value on the device. Use this at an internal
   // barrier (one block's output feeding the next) so a host-visible read does
@@ -285,6 +287,8 @@ class Scheduler {
   explicit Scheduler(backend::IBackend& backend);
   ~Scheduler();
 
+  // Frees the pointer tables of finished passes; drains the devices first.
+  Status release_phase_tables();
   Status eval(std::span<const NodePtr> roots, bool pull_host = true);
   // When `plan` is set, replay and retain write that Program instead of the
   // scheduler's leftover one. Same-root reuse is how decode avoids rebuild.
