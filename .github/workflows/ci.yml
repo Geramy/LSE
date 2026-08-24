@@ -37,6 +37,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Describe the toolchain this runner will JIT with
+        # The device compiler is picked up at run time, not at build time: the
+        # engine loads libamd_comgr and comgr loads the device-library bitcode
+        # beside it. When those two come from different LLVM majors every
+        # kernel fails to compile and the engine runs on the host. Printed
+        # every run so a drift on the runner names itself in the log.
+        run: |
+          set +e
+          echo "ROCM_PATH=$ROCM_PATH -> $(readlink -f "$ROCM_PATH")"
+          ls -d /opt/rocm* 2>/dev/null
+          for r in $(ls -d /opt/rocm* 2>/dev/null | xargs -n1 readlink -f | sort -u); do
+            echo "== $r"
+            ls -la "$r"/lib/libamd_comgr.so* 2>/dev/null | head -3
+            [ -x "$r/llvm/bin/clang" ] && "$r/llvm/bin/clang" --version | head -1
+            [ -f "$r/amdgcn/bitcode/ocml.bc" ] && echo "ocml.bc: $(head -c 24 "$r/amdgcn/bitcode/ocml.bc" | od -An -c | head -1)"
+            ls "$r"/.info/version* 2>/dev/null | head -2; cat "$r"/.info/version 2>/dev/null
+          done
+          env | grep -iE "^(ROCM|HIP|HSA|COMGR|LD_LIBRARY)" | sort
+          ldconfig -p | grep -E "amd_comgr|hsa-runtime" | head -6
+          command -v hipcc && hipcc --version | head -3
+
       - name: Provision the reference dependencies
         run: |
           set -euo pipefail
