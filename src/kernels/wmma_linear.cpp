@@ -22,6 +22,7 @@
 // which is what the lemonseed differential in test_reference compares against.
 #include "lse/kernels/wmma.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -172,9 +173,16 @@ struct MatrixLinearKernel final : KernelPrimitive<MatrixLinearKernel> {
     const math::MatrixCoreRow* row = row_for(s);
     if (!d.valid || row == nullptr || s.types.scalar == nullptr ||
         s.intrinsics == nullptr || !s.store) {
+      if (std::getenv("LSE_DEBUG_WMMA") != nullptr) {
+        std::fprintf(stderr, "[wmma] decline: d=%d row=%d scalar=%d intr=%d store=%d\n",
+                     (int)d.valid, (int)(row != nullptr),
+                     (int)(s.types.scalar != nullptr),
+                     (int)(s.intrinsics != nullptr), (int)(bool)s.store);
+      }
       return {};
     }
-    return for_live_target<math::MatrixTarget::kRdna3>(
+    return for_live_target<math::MatrixTarget::kRdna3,
+                                   math::MatrixTarget::kRdna4>(
         row->target, [&]<math::MatrixTarget G>() -> std::string {
           return with_matrix_operand<std::string>(
               s.input_dtypes[1],
@@ -196,7 +204,12 @@ struct MatrixLinearKernel final : KernelPrimitive<MatrixLinearKernel> {
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
     MatrixLinearArgs<env::Emit, X, W> a;
-    if (!env::bind(k, a, s)) return {};
+    if (!env::bind(k, a, s)) {
+      if (std::getenv("LSE_DEBUG_WMMA") != nullptr) {
+        std::fprintf(stderr, "[wmma] decline: bind failed\n");
+      }
+      return {};
+    }
     env::Emit e{&k};
 
     LinearTile<G, A, T> tile;

@@ -4680,9 +4680,10 @@ LSE_TEST(matrix_core_table_is_the_only_place_a_variant_is_written_down) {
                             MatrixElem::kBF16, 32, 32, 8));
 }
 
-// A row exists for gfx12 and for MFMA, with the right names and widths — and
-// the gate refuses to emit any of them, because no layout has been measured on
-// that hardware. An unverified row that declines is correct; one that emits is
+// A row exists for gfx12 and for MFMA, with the right names and widths. The
+// RDNA4 rows carry layouts verified on a live gfx1201 (split-K operands,
+// block accumulator) and emit; MFMA still has no measured layout and the gate
+// refuses it. An unverified row that declines is correct; one that emits is
 // a silent wrong answer.
 LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   using lmath::MatrixElem;
@@ -4693,7 +4694,9 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
   static_assert(rdna4.key == "wmma12.f32.16x16x16.bf16");
   // Half the RDNA3 operand width: K splits across the half-waves.
   static_assert(rdna4.a_len == 8 && rdna4.c_len == 8 && rdna4.wave == 32);
-  static_assert(!rdna4.emittable());
+  static_assert(rdna4.emittable());
+  static_assert(rdna4.operands == lmath::OperandLayout::kLaneRowSplitK);
+  static_assert(rdna4.acc_layout == lmath::AccLayout::kRowBlockHalfWave);
 
   constexpr auto cdna3 = lmath::matrix_core_row(
       MatrixTarget::kCdna3, MatrixElem::kF32, MatrixElem::kF16, 16, 16, 16);
@@ -4744,7 +4747,10 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
              MatrixTarget::kCdna3);
 
   const Shape shapes[] = {Shape{32, 64}, Shape{48, 64}};
-  const DType dts[] = {DType::kBF16, DType::kBF16};
+  // Activations are f32 by the operand contract (with_matrix_operand maps a
+  // bf16 WEIGHT to <x=f32, w=bf16>); bf16 x would be a bind decline, not a
+  // matrix-core emit.
+  const DType dts[] = {DType::kF32, DType::kBF16};
   const auto tbl = backend::hip_sources();
   for (const backend::DeviceInfo* d : {&d12, &d942}) {
     KernelShapes s;
@@ -4758,7 +4764,20 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
     s.store = [](std::string_view i, std::string_view v) {
       return "out[" + std::string(i) + "] = " + std::string(v) + ";";
     };
-    LSE_EXPECT(kernels::wmma_linear_for(s) == nullptr);
+    if (d == &d12) {
+      // gfx12's layouts are measured now (verified on a live gfx1201 by the
+      // int8 oracle below), so the linear EMITS here — with the family's own
+      // spelling, not RDNA3's.
+      const KernelPrimitiveBase* prim = kernels::wmma_linear_for(s);
+      LSE_EXPECT(prim != nullptr);
+      if (prim != nullptr) {
+        const std::string body = prim->emit_kernel(s);
+        LSE_EXPECT(body.find("_w32_gfx12") != std::string::npos);
+      }
+    } else {
+      // MFMA still has no measured layout; the linear declines.
+      LSE_EXPECT(kernels::wmma_linear_for(s) == nullptr);
+    }
   }
 }
 
@@ -4777,8 +4796,11 @@ LSE_TEST(matrix_core_int8_linear_matches_a_host_integer_reference) {
   backend::IBackend* be = live_hrx();
   if (be == nullptr || !kCompiler.available()) return;
   const backend::DeviceInfo& dev = be->device_info();
-  if (backend::arch_family(dev.arch) != backend::ArchFamily::kRdna3 &&
-      backend::arch_family(dev.arch) != backend::ArchFamily::kRdna35) {
+  const backend::ArchFamily fam = backend::arch_family(dev.arch);
+  const bool rdna3 = fam == backend::ArchFamily::kRdna3 ||
+                     fam == backend::ArchFamily::kRdna35;
+  const bool rdna4 = fam == backend::ArchFamily::kRdna4;
+  if (!rdna3 && !rdna4) {
     return;  // no measured int8 layout for this device; the gate declines
   }
 
@@ -4804,11 +4826,14 @@ LSE_TEST(matrix_core_int8_linear_matches_a_host_integer_reference) {
   LSE_EXPECT(!body.empty());
   if (body.empty()) return;
 
-  // The row's widths, in the generated text: v4i32 operands, v8i32
-  // accumulator, and the integer builtin from the HIP table.
-  LSE_EXPECT(body.find("__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32") !=
+  // The row's widths, in the generated text: the operand fragment is v4i32
+  // on RDNA3 and v2i32 on RDNA4 (K splits across the half-waves), the
+  // accumulator v8i32 on both, and the builtin is the family's own spelling.
+  LSE_EXPECT(body.find(rdna4 ? "__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12"
+                             : "__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32") !=
              std::string::npos);
-  LSE_EXPECT(body.find("typedef int lse_v4_i32") != std::string::npos);
+  LSE_EXPECT(body.find(rdna4 ? "typedef int lse_v2_i32"
+                             : "typedef int lse_v4_i32") != std::string::npos);
   LSE_EXPECT(body.find("typedef int lse_v8_i32") != std::string::npos);
 
   constexpr std::size_t kMs = kM, kNs = kN, kKs = kK, kLs = kLanes;

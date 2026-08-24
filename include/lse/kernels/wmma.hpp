@@ -366,10 +366,22 @@ struct MatrixTile {
       const auto m0 = e.let((wave / tiles_n) * kM);
       const auto n0 = e.let((wave % tiles_n) * kN);
 
-      // Lane L supplies row L of x and row L of w — both contiguous in k, so
-      // the fragment load is the checkpoint's own layout.
+      // Lane L supplies row L % n of x and of w. On the contiguous layout the
+      // two halves of the wave carry the same rows over the whole k step; on
+      // the split layout each half carries its own half of the k step instead,
+      // which is the RDNA4 fill (see OperandLayout::kLaneRowSplitK). Either
+      // way the fragment load is the checkpoint's own layout — what moves is
+      // where a lane's k window starts, below.
       const auto arow = e.let(m0 + lane_lo);
       const auto bcol = e.let(n0 + lane_lo);
+      // This lane's k origin within one instruction's k step, in buffer
+      // elements. Zero on the contiguous layout; the half-wave's share on the
+      // split one.
+      constexpr auto kG = geometry_of(kRow);
+      static_assert(!kG.split_k || (kG.lane_k % kRow.pack) == 0,
+                    "a lane's k share must be whole buffer elements");
+      constexpr std::uint32_t kLaneKBuf =
+          kG.split_k ? kG.lane_k / static_cast<std::uint32_t>(kRow.pack) : 0u;
 
       const auto acc = e.local<CFrag, kRow.c_len>();
       for (auto z : e.unroll(static_cast<std::uint32_t>(kRow.c_len))) {
@@ -401,7 +413,11 @@ struct MatrixTile {
           }
         }
         for (std::uint32_t c = 0; c < kChain; ++c) {
-          const auto kc = c == 0 ? k0 : e.let(k0 + c * kAPer);
+          const auto kc0 = c == 0 ? k0 : e.let(k0 + c * kAPer);
+          // The lane's own window: on the split layout the upper half-wave
+          // reads the second half of the k step.
+          const auto kc =
+              kLaneKBuf == 0 ? kc0 : e.let(kc0 + lane_hi * kLaneKBuf);
           fill(e, x, arow, kc, arow < m, kb, af[c], xstep);
           fill(e, w, bcol, kc, bcol < n, kb, bf[c], wstep);
           acc = math::mma<Op>(af[c].value(), bf[c].value(), acc.value());
@@ -409,12 +425,16 @@ struct MatrixTile {
       }
 
       // Where lane L's accumulator element z lands. Measured on the device,
-      // carried by the row, not rediscovered here.
-      static_assert(kRow.acc_layout == lse::math::AccLayout::kPairRowHalfWave,
-                    "this tile only knows the measured accumulator mapping");
+      // carried by the row through its geometry, not rediscovered here: the
+      // pair form interleaves the wave halves (row = z*halves + lane_hi), the
+      // block form gives each half a contiguous run (row = z + c_len*lane_hi)
+      // — both are z*slot_step + lane_hi*half_rows.
+      static_assert(kG.slot_step * 1u + kG.half_rows > 0,
+                    "the accumulator geometry must be measured to emit");
       const auto col = e.let(n0 + lane_lo);
       for (auto z : e.unroll(static_cast<std::uint32_t>(kRow.c_len))) {
-        const auto row = e.let(m0 + z * kHalves + lane_hi);
+        const auto row =
+            e.let(m0 + z * kG.slot_step + lane_hi * kG.half_rows);
         if (auto gr = e.when(row < m && col < n)) {
           static_cast<const Derived*>(this)->emit_element(
               e, row, col, math::widen(acc[z].read()));

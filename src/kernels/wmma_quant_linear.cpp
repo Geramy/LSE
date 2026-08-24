@@ -46,14 +46,32 @@ constexpr int kTileK = 16;
 constexpr std::uint32_t kBlock = 256;
 
 // Row blocks a workgroup owns. More of them let one unpacked weight fragment
-// feed several row blocks, and the registers are now there to afford it -- but
-// it still does not pay, because the traffic it saves is not traffic anyone
-// waits on: at 1601 prompt tokens a 1024x1024 plane is re-read about a hundred
-// times, which is 5 GB a prefill, ~21 ms against 10.4 s, and it is resident in
-// the 32 MB MALL anyway. What blocking does cost is LDS -- 5.8 KB per
-// workgroup at 1, 11.5 KB at 2, 23 KB at 4 -- and that occupancy is real:
-// measured 10.37 s, 10.50 s, 10.62 s at 1601 tokens. Stay at one.
-constexpr std::uint32_t kRowBlocks = 1u;
+// feed several row blocks. On gfx1151 that never paid (measured 10.37 s,
+// 10.50 s, 10.62 s at 1601 tokens for 1/2/4) because the traffic it saves
+// was nothing anyone waited on there. On gfx1201 it pays outright — the
+// fragment unpack, not the traffic, is what reuse amortizes on a 64-CU part:
+// measured 3.29 s, 3.03 s, 2.68 s at 277 tokens for 1/2/4; 8 went unmeasured
+// (the run hit an unrelated allocation failure) and costs 46 KB of LDS per
+// workgroup, which halves occupancy before it starts. Four, measured on the
+// part this build actually targets; retune if a third generation joins.
+// Row blocks a workgroup owns. More of them let one unpacked weight fragment
+// feed several row blocks. On gfx1151 that never paid (measured 10.37 s,
+// 10.50 s, 10.62 s at 1601 tokens for 1/2/4). On gfx1201 it pays outright:
+// measured 3.29 s, 3.03 s, 2.68 s at 277 tokens for 1/2/4, the dominant
+// prefill matmul 3.2x faster, verified correct on one device and on a
+// two-member tensor split, short and long context. (Four was once falsely
+// convicted of corrupting the split by a test prompt made of one sentence
+// repeated — a correct greedy model continues the repetition, and the
+// "corruption" was the model doing its job. Judge correctness on natural
+// prompts.) Eight went unmeasured and costs 46 KB of LDS per workgroup.
+constexpr std::uint32_t kRowBlocks = 4u;  // measured champion (see sweep note)
+// Column blocks a wave owns. The symmetric twin of the row blocking above:
+// every A fragment a lane reads from LDS feeds kColBlocks different B
+// columns before it is discarded. Measured on gfx1201 at 124 prompt tokens:
+// 2.32 s at rb4/cb1, 2.44 s at rb4/cb2, 2.47 s at rb2/cb2 — the A reuse does
+// not buy back the doubled B fills and register pressure, so one. The
+// machinery stays because double-buffering may change the balance.
+constexpr std::uint32_t kColBlocks = 1u;
 constexpr std::uint32_t kRowsPerGroup = kTileM * kRowBlocks;
 
 // The instruction this invocation gets. `G` is the generation the device
@@ -169,7 +187,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const std::uint32_t words = gsize * round_groups / 4u;
   const std::uint32_t waves = kBlock / kWave;
   const std::uint32_t tiles_n = (n + kTileN - 1u) / kTileN;
-  const std::uint32_t nblocks = (tiles_n + waves - 1u) / waves;
+  const std::uint32_t wg_tiles = waves * kColBlocks;
+  const std::uint32_t nblocks = (tiles_n + wg_tiles - 1u) / wg_tiles;
   const std::uint32_t load_bytes = device_load_bytes(s.device);
 
   kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
@@ -204,14 +223,23 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
   const auto wg = e.let(math::workgroup_id_x());
   const auto m0 = e.let((wg / nblocks) * kRowsPerGroup);
-  const auto ntile = e.let((wg % nblocks) * waves + wave_id);
-  const auto n0 = e.let(ntile * static_cast<std::uint32_t>(kTileN));
-  const auto bcol = e.let(n0 + lane_lo);
-  const auto live = e.let(ntile < tiles_n);
+  // Column tile j of this wave: the workgroup's tiles are laid out so the
+  // waves stay adjacent within each block, keeping their weight reads beside
+  // each other, and a wave's own j-tiles stride by `waves`.
+  std::vector<kir::Val<kir::u32>> ntile, n0, bcol;
+  std::vector<kir::Val<kir::boolean>> live;
+  for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+    ntile.push_back(e.let((wg % nblocks) * wg_tiles + j * waves + wave_id));
+    n0.push_back(e.let(ntile[j] * static_cast<std::uint32_t>(kTileN)));
+    bcol.push_back(e.let(n0[j] + lane_lo));
+    live.push_back(e.let(ntile[j] < tiles_n));
+  }
 
   std::vector<kir::LValue<kir::f32>> out;
-  out.reserve(kRowBlocks * kSlots);
-  for (std::uint32_t i = 0; i < kRowBlocks * kSlots; ++i) out.push_back(e.var(0.0f));
+  out.reserve(kRowBlocks * kColBlocks * kSlots);
+  for (std::uint32_t i = 0; i < kRowBlocks * kColBlocks * kSlots; ++i) {
+    out.push_back(e.var(0.0f));
+  }
 
   // One base per row block: the accumulator slot's own offset is a constant,
   // so folding it in at the use costs an add the scheduler hides, where
@@ -234,13 +262,19 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // result is discarded either way, so it reads column zero rather than off
   // the end of the plane: n only has to miss a multiple of waves * kTileN for
   // the last workgroup to carry lanes that are not columns at all.
-  const auto safe_col = e.let(select(bcol < n, bcol, e.u32(0)));
+  std::vector<kir::Val<kir::u32>> safe_col;
+  for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+    safe_col.push_back(e.let(select(bcol[j] < n, bcol[j], e.u32(0))));
+  }
   // Zero on a generation whose lane holds the whole step; on one that splits
   // it, the offset of this lane's half, in operand values and in packed words.
   const auto lane_k = e.let(lane_hi * (kGeo.split_k ? kGeo.lane_k : 0u));
   const auto lane_word =
       e.let(lane_hi * (kGeo.split_k ? kGeo.lane_k / 4u : 0u));
-  const auto col_scales = e.let(safe_col * groups);
+  std::vector<kir::Val<kir::u32>> col_scales;
+  for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+    col_scales.push_back(e.let(safe_col[j] * groups));
+  }
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
   const std::uint32_t chunks = (items + kBlock - 1u) / kBlock;
@@ -335,16 +369,19 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
     for (std::uint32_t gi = 0; gi < round_groups; ++gi) {
       const auto g = e.let(rnd * round_groups + gi);
-      const auto at = e.let(col_scales + g);
-      const auto gscale = e.let(math::widen(a.scales[at]));
-      const auto gbias = e.let(math::widen(a.biases[at]));
+      std::vector<kir::Val<kir::f32>> gscale, gbias;
+      for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+        const auto at = e.let(col_scales[j] + g);
+        gscale.push_back(e.let(math::widen(a.scales[at])));
+        gbias.push_back(e.let(math::widen(a.biases[at])));
+      }
 
       // One accumulator per row block, spanning every slice of the group: the
       // step is constant across it, so the integer sum can run to the end
       // before anything is scaled.
       std::vector<kir::Local<kir::i32, 8>> acc;
-      acc.reserve(kRowBlocks);
-      for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
+      acc.reserve(kRowBlocks * kColBlocks);
+      for (std::uint32_t i = 0; i < kRowBlocks * kColBlocks; ++i) {
         acc.push_back(e.local<kir::i32, kSlotsI>());
         for (auto z : e.unroll(kSlots)) acc[i][z] = kir::cast<kir::i32>(e.u32(0));
       }
@@ -352,13 +389,18 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       for (std::uint32_t t = 0; t < slices; ++t) {
         const auto k0 =
             e.let(g * gsize + t * static_cast<std::uint32_t>(kTileK));
-        const auto bf = e.local<kir::u32, kFragI>();
-        for (std::uint32_t c = 0; c < kFrag; ++c) bf[c] = e.u32(0);
-        if (auto gd = e.when(live && bcol < n)) {
-          fill_weights(e, a, bcol, k0, lane_k, lanes, d.spec.bits, bf);
+        std::vector<kir::Local<kir::u32, kFragI>> bf;
+        bf.reserve(kColBlocks);
+        for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+          bf.push_back(e.local<kir::u32, kFragI>());
+          for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][c] = e.u32(0);
+          if (auto gd = e.when(live[j] && bcol[j] < n)) {
+            fill_weights(e, a, bcol[j], k0, lane_k, lanes, d.spec.bits, bf[j]);
+          }
         }
-        // The unpacked fragment feeds every row block before it is discarded,
-        // which is what the blocking buys.
+        // The unpacked fragments feed every row block, and each row block's A
+        // fragment feeds every column block, before either is discarded —
+        // that is what both blockings buy.
         const std::uint32_t slot = gi * slices + t;
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
           const auto af = e.local<kir::u32, kFragI>();
@@ -373,7 +415,11 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
           // One issue takes the whole K slice: the row declares A and B four
           // registers wide and chained=1, so a lane hands over its sixteen
           // contiguous K values at once.
-          acc[i] = math::mma<Mma>(af.value(), bf.value(), acc[i].value());
+          for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+            const std::uint32_t ij = i * kColBlocks + j;
+            acc[ij] = math::mma<Mma>(af.value(), bf[j].value(),
+                                     acc[ij].value());
+          }
         }
       }
 
@@ -381,11 +427,16 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         for (std::uint32_t z = 0; z < kSlots; ++z) {
           const auto at_g =
               e.let(slot_g[i] + (z * kSlotStep * round_groups + gi));
-          const auto term = e.let(gscale * xstep[at_g].read());
-          out[i * kSlots + z] =
-              math::fma(term, kir::cast<kir::f32>(acc[i][z].read()),
-                        out[i * kSlots + z].read()) +
-              gbias * xtot[at_g].read();
+          const auto step_v = e.let(xstep[at_g].read());
+          const auto tot_v = e.let(xtot[at_g].read());
+          for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+            const std::uint32_t ij = i * kColBlocks + j;
+            const auto term = e.let(gscale[j] * step_v);
+            out[ij * kSlots + z] =
+                math::fma(term, kir::cast<kir::f32>(acc[ij][z].read()),
+                          out[ij * kSlots + z].read()) +
+                gbias[j] * tot_v;
+          }
         }
       }
     }
@@ -395,8 +446,11 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
     for (std::uint32_t z = 0; z < kSlots; ++z) {
       const auto row = e.let(slot_out[i] + z * kSlotStep);
-      if (auto gr = e.when(live && row < m && bcol < n)) {
-        e.store(row * n + bcol, out[i * kSlots + z].read());
+      for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+        const std::uint32_t ij = i * kColBlocks + j;
+        if (auto gr = e.when(live[j] && row < m && bcol[j] < n)) {
+          e.store(row * n + bcol[j], out[ij * kSlots + z].read());
+        }
       }
     }
   }

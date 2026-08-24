@@ -519,14 +519,18 @@ inline constexpr std::array<MatrixCoreRow, 25> kMatrixCore{{
     // -- RDNA4, wave32. Half the RDNA3 operand width: K splits across the
     // half-waves, which is a different fill, not just a narrower one. gfx1201
     // is offline here, so nothing below has a measured layout.
+    // Layouts hypothesized from the su8 row's ISA-calculator derivation and
+    // VERIFIED ON DEVICE (gfx1201): the split-K operand fill and block
+    // accumulator mapping are what the generalized tile emits, and the
+    // device-vs-oracle suite is the measurement.
     {"wmma12.f32.16x16x16.f16", MatrixTarget::kRdna4, MatrixElem::kF32,
      MatrixElem::kF16, Scalar::kF16, 8, Scalar::kF16, 8, Scalar::kF32, 8, 1, 16,
-     16, 16, 32, MatrixCap::kWmma12F16, 1, 16, 200, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
+     16, 16, 32, MatrixCap::kWmma12F16, 1, 16, 200,
+     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
     {"wmma12.f32.16x16x16.bf16", MatrixTarget::kRdna4, MatrixElem::kF32,
      MatrixElem::kBF16, Scalar::kBF16, 8, Scalar::kBF16, 8, Scalar::kF32, 8, 1,
      16, 16, 16, 32, MatrixCap::kWmma12Bf16, 1, 16, 200,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
+     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
     {"wmma12.f16.16x16x16.f16", MatrixTarget::kRdna4, MatrixElem::kF16,
      MatrixElem::kF16, Scalar::kF16, 8, Scalar::kF16, 8, Scalar::kF16, 8, 1, 16,
      16, 16, 32, MatrixCap::kWmma12F16, 1, 16, 200, OperandLayout::kUnmeasured,
@@ -538,7 +542,7 @@ inline constexpr std::array<MatrixCoreRow, 25> kMatrixCore{{
     {"wmma12.i32.16x16x16.iu8", MatrixTarget::kRdna4, MatrixElem::kI32,
      MatrixElem::kI8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 4, 16,
      16, 16, 32, MatrixCap::kWmma12Int8, 1, 16, 400,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
+     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
     // The double-K form of the same instruction: 8 int8 per lane is a 64-bit
     // read on a 128-bit path, so two chained steps fill the load.
     {"wmma12.i32.16x16x16.iu8", MatrixTarget::kRdna4, MatrixElem::kI32,
@@ -559,12 +563,12 @@ inline constexpr std::array<MatrixCoreRow, 25> kMatrixCore{{
      OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
     {"wmma12.f32.16x16x16.fp8_fp8", MatrixTarget::kRdna4, MatrixElem::kF32,
      MatrixElem::kFp8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kF32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Fp8, 1, 16, 400, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
+     16, 16, 32, MatrixCap::kWmma12Fp8, 1, 16, 400,
+     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
     {"wmma12.f32.16x16x16.bf8_bf8", MatrixTarget::kRdna4, MatrixElem::kF32,
      MatrixElem::kBf8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kF32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Fp8, 1, 16, 400, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
+     16, 16, 32, MatrixCap::kWmma12Fp8, 1, 16, 400,
+     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
     {"wmma12.f32.16x16x16.fp8_fp8", MatrixTarget::kRdna4, MatrixElem::kF32,
      MatrixElem::kFp8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kF32, 8, 4, 16,
      16, 16, 32, MatrixCap::kWmma12Fp8, 2, 32, 400, OperandLayout::kUnmeasured,

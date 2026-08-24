@@ -218,7 +218,8 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
   const std::uint32_t kb = static_cast<std::uint32_t>(
       kRateK / static_cast<std::uint32_t>(row.pack));
 
-  const std::string body = for_live_target<math::MatrixTarget::kRdna3>(
+  const std::string body = for_live_target<math::MatrixTarget::kRdna3,
+                                   math::MatrixTarget::kRdna4>(
       row.target, [&]<math::MatrixTarget G>() -> std::string {
         return with_matrix_operand<std::string>(
             storage,
