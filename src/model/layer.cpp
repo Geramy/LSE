@@ -21,16 +21,24 @@ namespace lse::model {
 double g_load_total_ms = 0.0;
 double g_load_host_ms = 0.0;
 double g_load_dev_ms = 0.0;
+double g_load_read_ms = 0.0;
+double g_load_gather_ms = 0.0;
+double g_load_alloc_ms = 0.0;
+double g_load_zeros_ms = 0.0;
+double g_load_buf_ms = 0.0;
+double g_load_direct_ms = 0.0;
 std::size_t g_load_tensors = 0;
 namespace {
 struct LoadReport {
   ~LoadReport() {
     if (std::getenv("LSE_TIME_LOAD") == nullptr) return;
     std::fprintf(stderr,
-                 "[load] %zu tensors, total %.0f ms = host read/gather %.0f ms"
-                 " + device upload %.0f ms\n",
-                 g_load_tensors, g_load_total_ms, g_load_host_ms,
-                 g_load_dev_ms);
+                 "[load] %zu tensors, total %.0f ms = zeros %.0f + devbuf %.0f"
+                 " + direct-read %.0f + stage-alloc %.0f + stage-read %.0f"
+                 " + gather %.0f + upload %.0f\n",
+                 g_load_tensors, g_load_total_ms, g_load_zeros_ms,
+                 g_load_buf_ms, g_load_direct_ms, g_load_alloc_ms,
+                 g_load_read_ms, g_load_gather_ms, g_load_dev_ms);
   }
 };
 const LoadReport g_load_report{};
@@ -116,16 +124,32 @@ Result<Array> upload(const TensorView& v, Shape shape,
           : backend::kDefaultStream;
 
   const DType dt = device_storage(v.dtype);
-  Array a = Array::zeros(shape, dt);
+  double* zsink = &g_load_zeros_ms;
+  Array a = [&]{ Phase z{zsink}; return Array::zeros(shape, dt); }();
   graph::Node& n = *a.node();
-  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be, at));
+  { Phase b{&g_load_buf_ms};
+    LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be, at)); }
   const bool native = dt == v.dtype;
 
   if (order == nullptr && win_count <= 0) {
+    Phase d{&g_load_direct_ms};
+    const std::size_t want = dtype_storage_bytes(dt, n.element_count());
+    if (native && v.data.size() >= want) {
+      // Straight from the mapping to the card. The checkpoint is already
+      // mapped, so a host copy would only be this same read plus a write into
+      // a mirror nobody reads: 16 GB of first-touch page faults, at 3 GB/s
+      // where the mapping itself reads at thirty-odd. The device holds the
+      // truth from here; anything that wants these bytes on the host pulls
+      // them back the way it would for any other device-resident value.
+      LSE_RETURN_IF_ERROR(be.copy({n.buffer}, v.data.data(), want));
+      n.materialized = true;
+      n.device_dirty = true;
+      n.host_dirty = false;
+      return a;
+    }
     if (native) {
       LSE_RETURN_IF_ERROR(
-          v.read_native(graph::interpreter::host_bytes(n),
-                        dtype_storage_bytes(dt, n.element_count())));
+          v.read_native(graph::interpreter::host_bytes(n), want));
     } else {
       LSE_RETURN_IF_ERROR(v.read_f32(
           static_cast<float*>(graph::interpreter::host_bytes(n)),
@@ -137,19 +161,33 @@ Result<Array> upload(const TensorView& v, Shape shape,
         static_cast<std::size_t>(rank >= 2 ? v.shape.dim(rank - 1) : 1);
     const std::size_t elem = dtype_storage_bytes(dt, 1);
     const std::size_t rows = width > 0 ? v.element_count() / width : 0;
-    std::vector<std::byte> staged(dtype_storage_bytes(dt, v.element_count()));
-    if (native) {
-      LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
+    // The mapping IS the bytes when no conversion is needed, so the span this
+    // gathers from is the file itself and nothing is staged. Only a checkpoint
+    // whose dtype has to be widened needs a buffer of its own.
+    const std::size_t whole = dtype_storage_bytes(dt, v.element_count());
+    std::vector<std::byte> staged;
+    const std::byte* from = nullptr;
+    if (native && v.data.size() >= whole) {
+      from = v.data.data();
     } else {
-      LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
-                                     v.element_count()));
+      Phase al{&g_load_alloc_ms};
+      staged.resize(whole);
+      from = staged.data();
+      Phase rd{&g_load_read_ms};
+      if (native) {
+        LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
+      } else {
+        LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
+                                       v.element_count()));
+      }
     }
     auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
     const auto first = static_cast<std::size_t>(win_first);
     const auto count = static_cast<std::size_t>(win_count);
+    Phase gv{&g_load_gather_ms};
     for (std::size_t r = 0; r < rows; ++r) {
       std::memcpy(dst + r * count * elem,
-                  staged.data() + (r * width + first) * elem, count * elem);
+                  from + (r * width + first) * elem, count * elem);
     }
   } else {
     // Staged whole rather than read row by row: TensorView reads the mapping,
@@ -158,19 +196,30 @@ Result<Array> upload(const TensorView& v, Shape shape,
     const auto width =
         static_cast<std::size_t>(rank >= 2 ? v.shape.dim(rank - 1) : 1);
     const std::size_t elem = dtype_storage_bytes(dt, 1);
-    std::vector<std::byte> staged(dtype_storage_bytes(dt, v.element_count()));
-    if (native) {
-      LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
+    const std::size_t whole = dtype_storage_bytes(dt, v.element_count());
+    std::vector<std::byte> staged;
+    const std::byte* from = nullptr;
+    if (native && v.data.size() >= whole) {
+      from = v.data.data();
     } else {
-      LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
-                                     v.element_count()));
+      Phase al{&g_load_alloc_ms};
+      staged.resize(whole);
+      from = staged.data();
+      Phase rd{&g_load_read_ms};
+      if (native) {
+        LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
+      } else {
+        LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
+                                       v.element_count()));
+      }
     }
     auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
     const std::size_t row_bytes = width * elem;
+    Phase gr{&g_load_gather_ms};
     for (std::size_t i = 0; i < order->size(); ++i) {
       std::memcpy(
           dst + i * row_bytes,
-          staged.data() + static_cast<std::size_t>((*order)[i]) * row_bytes,
+          from + static_cast<std::size_t>((*order)[i]) * row_bytes,
           row_bytes);
     }
   }
