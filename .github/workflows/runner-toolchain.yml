@@ -1,0 +1,49 @@
+name: Runner toolchain
+
+# Maintenance for the self-hosted runner: the engine JIT-compiles kernels
+# through the ROCm comgr found beside the device-library bitcode, and the two
+# must come from the same LLVM. `inspect` reports what the runner has and what
+# apt would install; `repair` brings the comgr package level with the bitcode.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "inspect | repair"
+        required: true
+        default: inspect
+
+jobs:
+  toolchain:
+    runs-on: [self-hosted, lse]
+    timeout-minutes: 30
+    steps:
+      - name: Inspect the ROCm packages the JIT depends on
+        run: |
+          set +e
+          echo "== who owns the pieces"
+          for f in /opt/rocm/core-7.13/lib/libamd_comgr.so.3.0.0 /opt/rocm/core-7.13/amdgcn/bitcode/ocml.bc /opt/rocm/lib/libamd_comgr.so.3.0.0 /opt/rocm/amdgcn/bitcode/ocml.bc; do
+            [ -e "$f" ] && echo "$f -> $(dpkg -S "$f" 2>/dev/null | cut -d: -f1) ($(strings "$f" | grep -oE 'clang version [0-9.]+[a-z]*' | head -1))"
+          done
+          echo "== installed rocm-ish packages"
+          dpkg -l | awk '/comgr|device-libs|rocm-llvm|amdrocm|rocm-core|hip-dev|hip-runtime/ {print $2, $3}' | head -30
+          echo "== apt policy for comgr"
+          for p in $(dpkg -l | awk '/comgr/ {print $2}'); do apt-cache policy "$p" 2>/dev/null | head -4; done
+          echo "== sudo"
+          sudo -n true 2>/dev/null && echo "passwordless sudo: yes" || echo "passwordless sudo: NO"
+      - name: Repair
+        if: ${{ inputs.action == 'repair' }}
+        run: |
+          set -euo pipefail
+          comgr_pkg=$(dpkg -S /opt/rocm/core-7.13/lib/libamd_comgr.so.3.0.0 | cut -d: -f1)
+          bitcode_pkg=$(dpkg -S /opt/rocm/core-7.13/amdgcn/bitcode/ocml.bc | cut -d: -f1)
+          echo "comgr package: $comgr_pkg  bitcode package: $bitcode_pkg"
+          sudo -n apt-get update
+          # Bring comgr level with the bitcode; if the repo has no newer comgr,
+          # reinstall both from the same index so they at least agree.
+          sudo -n apt-get install -y --only-upgrade "$comgr_pkg" || true
+          sudo -n apt-get install -y --reinstall "$comgr_pkg" "$bitcode_pkg"
+          echo "== after"
+          for f in /opt/rocm/core-7.13/lib/libamd_comgr.so.3.0.0 /opt/rocm/core-7.13/amdgcn/bitcode/ocml.bc; do
+            echo "$f ($(strings "$f" | grep -oE 'clang version [0-9.]+[a-z]*' | head -1))"
+          done
+          rm -rf ~/.cache/lse/kernels
