@@ -287,6 +287,11 @@ class Scheduler {
   explicit Scheduler(backend::IBackend& backend);
   ~Scheduler();
 
+  // Whether the members share one backend, and so one residency value.
+  [[nodiscard]] bool one_address_space() const noexcept;
+  // Whether `member` would have to fetch these bytes rather than read them.
+  [[nodiscard]] bool foreign_to(const backend::DeviceBuffer& b,
+                                std::size_t member) const noexcept;
   // Waits until every member is idle: the ordering a host write into device
   // memory needs before it can touch bytes a pending pass may still read.
   Status drain();
