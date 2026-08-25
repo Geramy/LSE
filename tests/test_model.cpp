@@ -1841,7 +1841,10 @@ LSE_TEST(long_prefill_reuse_matches_a_forced_rebuild) {
   constexpr std::int64_t kWidth = 128;
   constexpr int kPasses = 8;
 
+  std::vector<std::vector<float>> per_pass_replay, per_pass_rebuild;
   auto run = [&](bool reuse, std::vector<float>& out, int& replays) {
+    std::vector<std::vector<float>>& per_pass =
+        reuse ? per_pass_replay : per_pass_rebuild;
     auto lm = build_model(*cfg, *ckpt);
     LSE_EXPECT_OK(lm.status());
     if (!lm.ok()) return;
@@ -1863,6 +1866,15 @@ LSE_TEST(long_prefill_reuse_matches_a_forced_rebuild) {
       if (h->node().get() == previous) ++replays;
       previous = h->node().get();
       if (reuse) LSE_EXPECT_EQ(carry_aliases((*lm)->retained_program()), 0u);
+      // Every pass, not only the last: the first pass whose hidden differs
+      // between the two runs is the pass whose replay went wrong.
+      {
+        std::vector<float> pass_out(
+            static_cast<std::size_t>(h->shape().elem_count()));
+        LSE_EXPECT_OK(h->to_host(pass_out.data(),
+                                 pass_out.size() * sizeof(float)));
+        per_pass.push_back(std::move(pass_out));
+      }
       if (p + 1 < kPasses) continue;
       out.resize(static_cast<std::size_t>(h->shape().elem_count()));
       LSE_EXPECT_OK(h->to_host(out.data(), out.size() * sizeof(float)));
@@ -1888,6 +1900,28 @@ LSE_TEST(long_prefill_reuse_matches_a_forced_rebuild) {
   }
   std::printf("       last-pass hidden: max |replay - rebuild| = %g over a "
               "range of %g\n", worst, scale);
+  for (std::size_t p = 0;
+       p < per_pass_replay.size() && p < per_pass_rebuild.size(); ++p) {
+    const auto& a = per_pass_replay[p];
+    const auto& b = per_pass_rebuild[p];
+    double w = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      w = std::max(w, (double)std::fabs(a[i] - b[i]));
+    }
+    std::printf("       pass %zu: max |replay - rebuild| = %g\n", p, w);
+  }
+  // A group the device could not run is executed on the host from the node's
+  // host mirror, which a replay's pokes never touch. Named here so a machine
+  // whose LDS budget declines a phase the other accepts explains its own
+  // divergence.
+  if (const graph::Scheduler* sched = graph::default_scheduler()) {
+    const auto& tr = sched->accumulated_trace();
+    std::printf("       groups: device=%u host=%u fallbacks=%u\n",
+                tr.device_groups, tr.host_groups, tr.host_fallbacks);
+    for (std::size_t i = 0; i < tr.fallback_reasons.size() && i < 4; ++i) {
+      std::printf("         host: %s\n", tr.fallback_reasons[i].c_str());
+    }
+  }
   // Measured at exactly 0 on gfx1151: the replay runs the same kernels on the
   // same bytes. The tolerance is there only so a different reduction split on
   // another device is not a failure — a carried state read out of clobbered

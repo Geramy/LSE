@@ -1,3 +1,4 @@
+#include <string_view>
 // Attention with the score computed once.
 //
 // The thread-per-output kernel beside this one gives every one of the Dv
@@ -12,6 +13,7 @@
 // the arithmetic is the 2*S*Dh the algebra actually calls for. The softmax is
 // the running form: one pass over the keys carrying a max and a denominator,
 // rescaling the accumulator when a window raises the max.
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -382,6 +384,14 @@ const FlashSdpaKernel kFlash{};
 const KernelPrimitiveBase* flash_sdpa_for(const KernelShapes& s) {
   const Dims d = dims_of(s);
   if (!d.valid) return nullptr;
+  // LSE_FLASH_SDPA=0: take the base kernel on a device that would have run
+  // flash — the path a smaller LDS budget takes for free, so a difference
+  // between the two is reproducible on the bigger part.
+  static const bool enabled = [] {
+    const char* v = std::getenv("LSE_FLASH_SDPA");
+    return v == nullptr || std::string_view(v) != "0";
+  }();
+  if (!enabled) return nullptr;
   if (d.tq < kQTile) return nullptr;
   if (s.device == nullptr) return nullptr;
   if (s.device->max_threads_per_workgroup < kThreads) return nullptr;

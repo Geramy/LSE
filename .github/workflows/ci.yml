@@ -126,6 +126,8 @@ jobs:
           # untouched.
           COMGR="$(readlink -f "$ROCM_PATH/lib/libamd_comgr.so.3" 2>/dev/null || true)"
           [ -n "$COMGR" ] && export LD_PRELOAD="$COMGR" && echo "JIT comgr pinned: $COMGR"
+          # Names the reuse gate a replay tripped, and which pass replayed.
+          export LSE_DEBUG_REUSE=1
           ctest --test-dir build --output-on-failure
 
       - name: Smoke test the engine and the HTTP API

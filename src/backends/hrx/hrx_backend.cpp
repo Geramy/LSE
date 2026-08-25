@@ -1090,6 +1090,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_MAX_SHARED_MEMORY, &u32).ok()) {
     info_.lds_bytes_per_workgroup = u32;
+    // LSE_LDS_BUDGET=<bytes>: cap the budget the emitters plan against, so a
+    // smaller part's phase declines (and their host fallbacks) reproduce on a
+    // bigger one. Diagnostic; never raises the real limit.
+    if (const char* cap = std::getenv("LSE_LDS_BUDGET")) {
+      const auto want = static_cast<std::uint32_t>(std::atoi(cap));
+      if (want != 0 && want < info_.lds_bytes_per_workgroup) {
+        info_.lds_bytes_per_workgroup = want;
+      }
+    }
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_CLOCK_RATE, &u32).ok()) {
     amd_.clock_khz = u32;
