@@ -35,22 +35,35 @@ using graph::Array;
 
 namespace {
 
-Result<ops::RopeTables> shared_rope(const Config& c) {
+// One set of tables PER MEMBER, not one for the pool. They are constants every
+// attention layer reads, so a member reading another's copy fetches them over
+// the link at every such layer of every token -- a megabyte a time, measured
+// at 64 crossings and 64 MB per token on a two-member split, which is more
+// traffic than the tensor split's actual partial sums by an order of
+// magnitude. Replicating costs one buffer per GPU and removes the crossing.
+// Cached so the layers that share a member share its copy.
+Result<ops::RopeTables> shared_rope(const Config& c, std::size_t member) {
   const std::int32_t max_seq = c.kv_capacity();
   struct Key {
     std::int32_t dim = 0;
     std::int32_t max_seq = 0;
     float theta = 0.0f;
   };
-  static Key have;
-  static ops::RopeTables tables;
-  if (tables.cos.valid() && have.dim == c.rope_dim && have.max_seq == max_seq &&
-      have.theta == c.rope_theta) {
-    return tables;
+  static std::vector<Key> have;
+  static std::vector<ops::RopeTables> tables;
+  if (tables.size() <= member) {
+    tables.resize(member + 1);
+    have.resize(member + 1);
   }
-  LSE_ASSIGN_OR(tables, ops::build_rope(c.rope_dim, max_seq, c.rope_theta));
-  have = {c.rope_dim, max_seq, c.rope_theta};
-  return tables;
+  if (tables[member].cos.valid() && have[member].dim == c.rope_dim &&
+      have[member].max_seq == max_seq && have[member].theta == c.rope_theta) {
+    return tables[member];
+  }
+  const graph::ScopedMember on(member);
+  LSE_ASSIGN_OR(tables[member],
+                ops::build_rope(c.rope_dim, max_seq, c.rope_theta));
+  have[member] = {c.rope_dim, max_seq, c.rope_theta};
+  return tables[member];
 }
 
 // Where channel `d` of an engine-convention head vector comes from in an HF
@@ -199,7 +212,10 @@ class Qwen35Attention final : public IMixer {
       sp.zero_centered_norm = false;
       sp.kv_length = c.kv_capacity();
     }
-    LSE_ASSIGN_OR(rope_, shared_rope(c));
+    rope_.resize(spec_.size());
+    for (std::size_t m = 0; m < spec_.size(); ++m) {
+      LSE_ASSIGN_OR(rope_[m], shared_rope(c, m));
+    }
     return OkStatus();
   }
 
@@ -237,7 +253,7 @@ class Qwen35Attention final : public IMixer {
   Result<Array> shard_forward(const Array& x, MixerState* state,
                               std::size_t m) {
     if (state == nullptr) {
-      return ops::gated_attention(x, w_[m], spec_[m], rope_, 0);
+      return ops::gated_attention(x, w_[m], spec_[m], rope_[m], 0);
     }
     MixerState& st = state[m];
     ops::AttentionCache cache;
@@ -248,7 +264,7 @@ class Qwen35Attention final : public IMixer {
     cache.paged = &st.paged;
     cache.capacity = spec_[m].kv_length;
     cache.used = st.position;
-    LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_[m], spec_[m], rope_,
+    LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_[m], spec_[m], rope_[m],
                                                 st.position, &cache));
     st.key_cache = cache.keys;
     st.value_cache = cache.values;
@@ -260,7 +276,7 @@ class Qwen35Attention final : public IMixer {
  private:
   std::vector<ops::GatedAttentionWeights> w_;
   std::vector<ops::GatedAttentionSpec> spec_;
-  ops::RopeTables rope_;
+  std::vector<ops::RopeTables> rope_;
 };
 
 class Qwen35GatedDeltaNet final : public IMixer {
