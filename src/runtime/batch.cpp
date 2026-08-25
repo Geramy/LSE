@@ -55,7 +55,7 @@ Status zero_device_row(Array& a, std::int32_t row) {
   if (bytes == 0) return OkStatus();
   const std::vector<std::byte> zeros(bytes, std::byte{0});
   LSE_RETURN_IF_ERROR(
-      sched->backend().copy_h2d(zeros.data(), n.buffer, bytes, offset));
+      sched->backend().copy({n.buffer, offset}, zeros.data(), bytes));
   n.materialized = true;
   n.device_dirty = true;
   n.host_dirty = false;

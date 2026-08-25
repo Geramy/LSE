@@ -95,8 +95,8 @@ Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
 
 // Moves a pool to a bigger rung. Block ids keep their meaning — the allocator
 // only appends — so the used prefix is copied verbatim and nothing re-prefills.
-// It goes through the host because backend::IBackend has no device-to-device
-// copy; the crossing happens once per rung, i.e. at 128, 256, 512 ... tokens.
+// The move is one engine call and stays on the device; it happens once per
+// rung, i.e. at 128, 256, 512 ... tokens.
 Result<Array> regrow_pool(const Array& old, const Shape& want, DType dtype) {
   LSE_ASSIGN_OR(Array grown, alloc_zeroed(want, dtype));
   if (!old.valid()) return grown;
@@ -114,11 +114,12 @@ Result<Array> regrow_pool(const Array& old, const Shape& want, DType dtype) {
                      " wants ", std::to_string(bytes), " bytes but its buffer holds ",
                      std::to_string(src.buffer.size_bytes));
   }
-  std::vector<std::byte> staging(bytes);
+  // One statement: move the used prefix into the bigger pool. Both ends are
+  // device memory, so this is the copy engine and the bytes never touch the
+  // host -- it used to stage them down and back up, which is two transfers and
+  // a buffer the size of the pool for a move that never needed either.
   LSE_RETURN_IF_ERROR(
-      sched->backend().copy_d2h(src.buffer, staging.data(), bytes, 0));
-  LSE_RETURN_IF_ERROR(sched->backend().copy_h2d(
-      staging.data(), grown.node()->buffer, bytes, 0));
+      sched->backend().copy({grown.node()->buffer}, {src.buffer}, bytes));
   return grown;
 }
 

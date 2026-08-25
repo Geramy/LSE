@@ -1179,7 +1179,7 @@ Status sync_to_device(Node& node, backend::IBackend& backend) {
       dtype_storage_bytes(node.dtype, node.element_count());
   if (node.host_mirror.size() < bytes) return OkStatus();
   LSE_RETURN_IF_ERROR(
-      backend.copy_h2d(node.host_mirror.data(), node.buffer, bytes, 0));
+      backend.copy({node.buffer}, node.host_mirror.data(), bytes));
   node.host_dirty = false;
   return OkStatus();
 }
@@ -1191,7 +1191,7 @@ Status sync_from_device(Node& node, backend::IBackend& backend) {
       dtype_storage_bytes(node.dtype, node.element_count());
   if (node.host_mirror.size() < bytes) node.host_mirror.resize(bytes);
   LSE_RETURN_IF_ERROR(
-      backend.copy_d2h(node.buffer, node.host_mirror.data(), bytes, 0));
+      backend.copy(node.host_mirror.data(), {node.buffer}, bytes));
   node.device_dirty = false;
   return OkStatus();
 }

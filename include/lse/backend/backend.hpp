@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -85,11 +86,53 @@ struct DeviceBuffer {
   // that a kernel's right to read a buffer becomes a question that can be
   // asked.
   DeviceIndex residency{};
+  // Which member's memory these bytes are in. `residency` names the backend,
+  // which on a spanning device is one value for every member; the stream an
+  // allocation was made on is what distinguishes them.
+  static constexpr std::uint16_t kAnyMember = 0xFFFF;
+  std::uint16_t member = kAnyMember;
   // When set, the allocation is released when the last copy dies. Views
   // share it so a reshape cannot free a buffer the residual still holds.
   std::shared_ptr<void> storage;
 
   [[nodiscard]] bool valid() const noexcept { return ptr != nullptr || handle != 0; }
+};
+
+// Either side of a transfer: host memory, or a window into a device buffer.
+// Built implicitly so a caller writes copy(dst, src, n) with whatever it has.
+struct MemRef {
+  void* host = nullptr;
+  const DeviceBuffer* buffer = nullptr;
+  std::size_t offset = 0;
+
+  MemRef() = default;
+  MemRef(void* p) noexcept : host(p) {}                     // NOLINT
+  MemRef(const void* p) noexcept : host(const_cast<void*>(p)) {}  // NOLINT
+  MemRef(DeviceBuffer& b, std::size_t at = 0) noexcept      // NOLINT
+      : buffer(&b), offset(at) {}
+  MemRef(const DeviceBuffer& b, std::size_t at = 0) noexcept  // NOLINT
+      : buffer(&b), offset(at) {}
+
+  [[nodiscard]] bool on_device() const noexcept { return buffer != nullptr; }
+};
+
+// The result of a read: an address the caller may read `size()` bytes from,
+// plus whether anything had to move to make that true. Owns the staging when
+// it did, so the address stays valid for as long as the result is held.
+class Reading {
+ public:
+  [[nodiscard]] const void* data() const noexcept {
+    return direct_ != nullptr ? direct_ : staged_.data();
+  }
+  [[nodiscard]] std::size_t size() const noexcept { return size_; }
+  // False when the bytes were read where they already were.
+  [[nodiscard]] bool moved() const noexcept { return direct_ == nullptr; }
+
+ private:
+  friend class IBackend;
+  const void* direct_ = nullptr;
+  std::vector<std::byte> staged_;
+  std::size_t size_ = 0;
 };
 
 // Four words of addressing, then residency in the padding its own alignment
@@ -551,7 +594,10 @@ class Backend {
     // stamped here rather than in each backend's allocate_impl: a backend
     // author cannot forget to do it.
     auto buf = derived().allocate_impl(bytes, cls, stream);
-    if (buf.ok()) buf->residency = device_;
+    if (buf.ok()) {
+      buf->residency = device_;
+      buf->member = static_cast<std::uint16_t>(stream.index);
+    }
     return buf;
   }
 
@@ -841,6 +887,90 @@ class IBackend {
   virtual Result<DeviceTimestamp> sample_device_time() const {
     return LSE_ERROR(kUnimplemented, "backend has no device timestamp source");
   }
+  // ONE memory call.
+  //
+  // A caller says what it wants moved and where to, not which transfer that
+  // implies. Host to device, device to host, one member's memory to another's
+  // and same-memory to same-memory are the same statement about bytes; which
+  // one it is depends on where the operands live at that moment, which is
+  // residency the caller usually cannot know and should not have to ask
+  // about. This reads it off the operands and picks the primitive. The
+  // primitives stay virtual: a backend implements them, and nothing outside
+  // one calls them directly except code whose whole point is to name a path
+  // (the link probe measuring one, a transport that has already chosen).
+  Status copy(MemRef dst, MemRef src, std::size_t bytes) {
+    if (bytes == 0) return OkStatus();
+    const bool to_dev = dst.on_device();
+    const bool from_dev = src.on_device();
+    if (!to_dev && !from_dev) {
+      if (dst.host == nullptr || src.host == nullptr) {
+        return LSE_ERROR(kInvalidArgument, "host copy with a null side");
+      }
+      std::memcpy(static_cast<std::byte*>(dst.host) + dst.offset,
+                  static_cast<const std::byte*>(src.host) + src.offset, bytes);
+      return OkStatus();
+    }
+    if (!from_dev) {
+      return copy_h2d(static_cast<const std::byte*>(src.host) + src.offset,
+                      const_cast<DeviceBuffer&>(*dst.buffer), bytes,
+                      dst.offset);
+    }
+    if (!to_dev) {
+      return copy_d2h(*src.buffer,
+                      static_cast<std::byte*>(dst.host) + dst.offset, bytes,
+                      src.offset);
+    }
+    // Both sides on a device. Same memory is this backend's own business;
+    // different memory is the peer path, the only one that needs the link and
+    // the only one a backend may decline.
+    if (src.buffer->residency == dst.buffer->residency &&
+        src.buffer->member == dst.buffer->member) {
+      return copy_d2d(*src.buffer, const_cast<DeviceBuffer&>(*dst.buffer),
+                      bytes, src.offset, dst.offset);
+    }
+    return copy_peer(*src.buffer, const_cast<DeviceBuffer&>(*dst.buffer), bytes,
+                     src.offset, dst.offset);
+  }
+
+  // ONE read.
+  //
+  // "Let me see these bytes" is a different question from "move these bytes",
+  // and its cheapest answer is often nothing at all: host memory is already
+  // readable, and so is device memory that was allocated host-visible. Only
+  // when neither holds does anything move, and then it is one transfer into
+  // storage the result owns. A caller reads `.data()`; whether that address is
+  // the original or a staged copy is this function's business, and `.moved()`
+  // says which so a caller that cares can measure it.
+  Status copy_d2d(const DeviceBuffer& src, DeviceBuffer& dst,
+                  std::size_t bytes, std::size_t src_offset,
+                  std::size_t dst_offset) {
+    return copy_peer(src, dst, bytes, src_offset, dst_offset);
+  }
+
+  Result<Reading> read(MemRef src, std::size_t bytes) {
+    Reading out;
+    out.size_ = bytes;
+    if (bytes == 0) return out;
+    if (!src.on_device()) {
+      if (src.host == nullptr) {
+        return LSE_ERROR(kInvalidArgument, "read from a null host address");
+      }
+      out.direct_ = static_cast<const std::byte*>(src.host) + src.offset;
+      return out;
+    }
+    // Device memory that carries a host address is mapped: the bytes are
+    // already where the caller can read them and no engine has to run.
+    if (src.buffer->ptr != nullptr) {
+      out.direct_ = static_cast<const std::byte*>(src.buffer->ptr) +
+                    src.buffer->offset + src.offset;
+      return out;
+    }
+    out.staged_.resize(bytes);
+    LSE_RETURN_IF_ERROR(
+        copy_d2h(*src.buffer, out.staged_.data(), bytes, src.offset));
+    return out;
+  }
+
   virtual Status copy_h2d(const void* src, DeviceBuffer& dst, std::size_t bytes,
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,

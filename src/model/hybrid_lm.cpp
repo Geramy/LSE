@@ -576,7 +576,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
         if (bytes == 0) continue;
         const std::vector<std::byte> zeros(bytes, std::byte{0});
         LSE_RETURN_IF_ERROR(
-            sched->backend().copy_h2d(zeros.data(), c.in->buffer, bytes, 0));
+            sched->backend().copy({c.in->buffer}, zeros.data(), bytes));
         c.in->materialized = true;
         c.in->device_dirty = true;
         c.in->host_dirty = false;

@@ -223,11 +223,36 @@ void Scheduler::release(backend::DeviceBuffer& buf) const noexcept {
       .deallocate(buf);
 }
 
+// True when the members share one backend, so `residency` is the same value
+// for all of them and cannot say which GPU holds a buffer. The stream an
+// allocation was made on can, and that is what `DeviceBuffer::member` keeps.
+bool Scheduler::one_address_space() const noexcept {
+  if (devices_.size() < 2) return false;
+  const backend::DeviceIndex first = devices_.residency(0);
+  for (std::size_t m = 1; m < devices_.size(); ++m) {
+    if (devices_.residency(m) != first) return false;
+  }
+  return true;
+}
+
+// Whether `member` would have to fetch these bytes rather than read them.
+bool Scheduler::foreign_to(const backend::DeviceBuffer& b,
+                           std::size_t member) const noexcept {
+  if (devices_.size() < 2 || !b.valid()) return false;
+  if (one_address_space()) {
+    // One backend over several boards: the runtime resolves a read of another
+    // member's buffer itself. Staging it here instead -- mirror plus copy --
+    // measured 9.6 tok/s against 15.0 for leaving it alone, because the mirror
+    // comes out of the same allocator the original did.
+    return false;
+  }
+  return b.residency.bound() && b.residency != devices_.residency(member);
+}
+
 Status Scheduler::make_local(Node& n, std::size_t member) {
   if (devices_.size() == 1 || !n.buffer.valid()) return OkStatus();
-  const backend::DeviceIndex mine = devices_.residency(member);
+  if (!foreign_to(n.buffer, member)) return OkStatus();
   const backend::DeviceIndex held = n.buffer.residency;
-  if (!held.bound() || held == mine) return OkStatus();
 
   // A buffer is a handle its owning device resolves, not an address every
   // device can follow, so an operand that lives elsewhere is fetched rather
@@ -249,11 +274,14 @@ Status Scheduler::make_local(Node& n, std::size_t member) {
   //
   // The mirror is kept per (node, member) so the allocation happens once and
   // only the bytes are re-fetched, and the node keeps its own buffer.
-  const std::size_t owner = devices_.member_of(held);
+  const std::size_t owner = one_address_space()
+                                ? static_cast<std::size_t>(n.buffer.member)
+                                : devices_.member_of(held);
   backend::DeviceBuffer& mirror = impl_->peer_mirrors[{&n, member}];
   if (!mirror.valid() || mirror.size_bytes != n.buffer.size_bytes) {
-    auto fresh = devices_.device(member).allocate(n.buffer.size_bytes,
-                                                  backend::MemoryClass::kDevice);
+    auto fresh = devices_.device(member).allocate(
+        n.buffer.size_bytes, backend::MemoryClass::kDevice,
+        devices_.stream_for(member).value_or(backend::kDefaultStream));
     if (!fresh.ok()) return fresh.status();
     mirror = fresh.release();
   }
@@ -282,11 +310,13 @@ Status Scheduler::make_local(Node& n, std::size_t member) {
     // currently keeps the producer from running ahead into it. Making this
     // asynchronous needs the reverse edge as well -- an event the owner waits
     // on before reusing the buffer -- and without it the model emits garbage.
-    LSE_RETURN_IF_ERROR(from.synchronize_stream(backend::kDefaultStream));
+    // copy_peer orders itself against the stream that wrote these bytes, so
+    // the blanket drain that used to sit here -- and that kept the two halves
+    // of a split taking turns at ~47% busy each -- is not needed.
     impl_->member_dirty[owner] = 0;
   }
   LSE_RETURN_IF_ERROR(
-      from.copy_peer(n.buffer, mirror, n.buffer.size_bytes, 0, 0));
+      from.copy({mirror}, {n.buffer}, n.buffer.size_bytes));
   trace_.peer_migrations += 1;
   trace_.peer_bytes += n.buffer.size_bytes;
   return OkStatus();
@@ -420,8 +450,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // as a model that runs at the right speed and emits nothing.
     const bool written = produced.contains(n.get());
     const backend::DeviceBuffer* bind = &n->buffer;
-    if (devices_.size() > 1 && n->buffer.residency.bound() &&
-        n->buffer.residency != devices_.residency(member)) {
+    if (foreign_to(n->buffer, member)) {
       if (written) {
         auto fresh = be.allocate(n->buffer.size_bytes,
                                  backend::MemoryClass::kDevice, stream);
@@ -463,8 +492,8 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                  backend::MemoryClass::kDevice);
     if (!tab.ok()) return tab.status();
     table_buf = tab.release();
-    LSE_RETURN_IF_ERROR(be.copy_h2d(ptrs.data(), table_buf,
-                                           ptrs.size() * sizeof(void*), 0));
+    LSE_RETURN_IF_ERROR(
+        be.copy({table_buf}, ptrs.data(), ptrs.size() * sizeof(void*)));
     table_bindings.push_back(
         backend::BufferRef{&table_buf, 0, table_buf.size_bytes});
     impl_->phase_tables.push_back(std::move(table_buf));
@@ -482,7 +511,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       if (!bar.ok()) return bar.status();
       bar_buf = bar.release();
       const std::uint32_t zero = 0;
-      LSE_RETURN_IF_ERROR(be.copy_h2d(&zero, bar_buf, sizeof(zero), 0));
+      LSE_RETURN_IF_ERROR(be.copy({bar_buf}, &zero, sizeof(zero)));
     }
     bindings.push_back(backend::BufferRef{&bar_buf, 0, bar_buf.size_bytes});
   }
@@ -1167,6 +1196,16 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         if (ev.ok()) impl_->entry_events[s] = ev.release();
       }
       std::vector<std::uint8_t> entered(stream_count, 0);
+      // How far each stream has already been joined to, per waiting stream.
+      // Work on one stream retires in issue order, so once this stream has
+      // waited on that stream's group j, every earlier group of that stream is
+      // finished too and its join is a host round trip that answers a question
+      // already answered. Groups issue in increasing index, so the highest
+      // index joined so far is the whole answer. Cleared per step because the
+      // events are.
+      constexpr std::uint32_t kNoJoin = 0xFFFFFFFFu;
+      std::vector<std::uint32_t> joined_through(
+          static_cast<std::size_t>(stream_count) * stream_count, kNoJoin);
 
       // Nothing has been issued yet, so this is where the pre-dispatch region
       // ends. The old partition_ns closed AFTER the loop below and so contained
@@ -1231,8 +1270,17 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         }
         for (std::uint32_t j : impl_->plan.waits[gi]) {
           if (!st.ok()) break;
+          const std::uint32_t from_stream =
+              j < impl_->plan.stream.size() ? impl_->plan.stream[j] : on.index;
+          std::uint32_t* seen = nullptr;
+          if (on.index < stream_count && from_stream < stream_count) {
+            seen = &joined_through[static_cast<std::size_t>(on.index) *
+                                       stream_count + from_stream];
+            if (*seen != kNoJoin && *seen >= j) continue;
+          }
           st = gbe.wait_event(on, impl_->events[j]);
           if (!st.ok()) break;
+          if (seen != nullptr) *seen = j;
         }
         if (st.ok()) st = try_dispatch_group(g, on, gm);
         // A joined run the emitter cannot express is not a reason to abandon

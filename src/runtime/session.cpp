@@ -38,7 +38,7 @@ Status zero_device_array(graph::Array& a) {
   if (bytes == 0) return OkStatus();
   const std::vector<std::byte> zeros(bytes, std::byte{0});
   LSE_RETURN_IF_ERROR(
-      sched->backend().copy_h2d(zeros.data(), n.buffer, bytes, 0));
+      sched->backend().copy({n.buffer}, zeros.data(), bytes));
   n.materialized = true;
   n.device_dirty = true;
   n.host_dirty = false;
