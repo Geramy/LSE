@@ -1043,6 +1043,19 @@ Status HrxBackend::init_impl(int device_ordinal) {
   if (!group.empty()) {
     physical_count_ = 1;
     for (char c : group) physical_count_ += (c == ',') ? 1 : 0;
+    // Member i of the group is board ordinal member_ordinals_[i]. gpu_ordinal_
+    // is only the FIRST member's, so a peer copy that names it for both ends
+    // aims the copy engine at the wrong card; this is the mapping that fixes
+    // it, and the only place it is stated.
+    member_ordinals_.clear();
+    for (std::size_t at = 0; at <= group.size();) {
+      const std::size_t sep = group.find(',', at);
+      const std::string one = group.substr(
+          at, sep == std::string::npos ? std::string::npos : sep - at);
+      if (!one.empty()) member_ordinals_.push_back(std::atoi(one.c_str()));
+      if (sep == std::string::npos) break;
+      at = sep + 1;
+    }
     device_ordinal = 0;
   }
 
@@ -1544,10 +1557,12 @@ Status HrxBackend::dma_host_transfer(void* host, const DeviceBuffer& device,
   // and a 27B load hung on the third gigabyte. One physical device is where
   // this path was measured and proven; a spanning device takes the runtime's
   // own stream transfers below instead.
-  if (physical_count_ > 1) {
-    return LSE_ERROR(kUnimplemented,
-                     "raw DMA declines on a device spanning several GPUs");
-  }
+  // A transfer names the agent whose memory it touches. The device buffer
+  // carries the member that allocated it, so a spanning group aims at the
+  // right board -- which is what this path used to get wrong, and why it was
+  // once refused here: aimed at the group's first board it waited on a fence
+  // another board would have had to signal, and a 27B load stopped on the
+  // third gigabyte.
 
 #if !LSE_HRX_LINKED
   (void)host; (void)device; (void)bytes; (void)device_offset; (void)to_device;
@@ -1556,7 +1571,12 @@ Status HrxBackend::dma_host_transfer(void* host, const DeviceBuffer& device,
   const HsaRuntime& hsa = shared_hsa();
   if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
   const std::vector<HsaAgent>& agents = peer_agents();
-  const auto here = static_cast<std::size_t>(gpu_ordinal_);
+  // The board this buffer's memory is on, not the group's first board.
+  std::size_t here = static_cast<std::size_t>(gpu_ordinal_);
+  if (device.member != DeviceBuffer::kAnyMember &&
+      static_cast<std::size_t>(device.member) < member_ordinals_.size()) {
+    here = static_cast<std::size_t>(member_ordinals_[device.member]);
+  }
   if (here >= agents.size()) {
     return LSE_ERROR(kUnimplemented, "no agent for this device");
   }
@@ -1669,16 +1689,11 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
   // in half a minute -- where the batched stream path, with its per-call drain
   // of every stream, decayed toward a standstill and never finished a load at
   // all. The raw DMA paths below are single-device machinery.
-  if (physical_count_ > 1) {
-    LSE_SYNC_TRACE("synchronous_h2d %zu bytes enter", bytes);
-    const Status moved = from_hrx(
-        hrx_synchronous_h2d(static_cast<hrx_device_t>(device_), src,
-                            reinterpret_cast<hrx_buffer_t>(dst.handle),
-                            dst.offset + dst_offset, bytes),
-        "hrx_synchronous_h2d");
-    LSE_SYNC_TRACE("synchronous_h2d leave");
-    return moved;
-  }
+  // No special case for a spanning group: the copy engine below takes every
+  // transfer, aimed at the destination's own board. The runtime's own
+  // synchronous copy that used to run here moved the bytes with the CPU
+  // across the aperture at about 0.6 GB/s -- 12.1 s of a two-GPU 16 GB load,
+  // against 1.5 s on the copy engine.
   if (const Status dma = dma_host_transfer(const_cast<void*>(src), dst, bytes,
                                            dst_offset, /*to_device=*/true);
       dma.ok()) {
@@ -1745,8 +1760,19 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   const HsaRuntime& hsa = shared_hsa();
   if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
   const std::vector<HsaAgent>& agents = peer_agents();
-  const auto here = static_cast<std::size_t>(gpu_ordinal_);
-  if (here >= agents.size()) {
+  // Each end names the agent whose memory it actually is, so the transfer runs
+  // on the right copy engine. One agent for both ends is what made a peer copy
+  // fall off the DMA path; the link does ~110 GB/s when both are named.
+  auto agent_for = [&](const DeviceBuffer& b) -> std::size_t {
+    if (b.member != DeviceBuffer::kAnyMember &&
+        static_cast<std::size_t>(b.member) < member_ordinals_.size()) {
+      return static_cast<std::size_t>(member_ordinals_[b.member]);
+    }
+    return static_cast<std::size_t>(gpu_ordinal_);
+  };
+  const std::size_t from_agent = agent_for(src);
+  const std::size_t to_agent = agent_for(dst);
+  if (from_agent >= agents.size() || to_agent >= agents.size()) {
     return LSE_ERROR(kUnimplemented, "no agent for this device");
   }
 
@@ -1772,8 +1798,17 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   // in-flight destination work can be reading the bytes the DMA overwrites.
   // If peer traffic ever runs concurrent with destination work, the
   // destination needs its own drain before the copy, not after.
-  LSE_RETURN_IF_ERROR(synchronize_impl());
-  if (!hsa.dma_copy(to, agents[here], from, agents[here], bytes)) {
+  // Ordered against the stream that WROTE these bytes, not against every
+  // stream this backend owns: draining all of them made a crossing on one
+  // member wait out unrelated work on the other, which is the "taking turns"
+  // a tensor split never recovered from.
+  if (src.member != DeviceBuffer::kAnyMember &&
+      static_cast<std::size_t>(src.member) < streams_.size()) {
+    LSE_RETURN_IF_ERROR(synchronize_stream(Stream{src.member}));
+  } else {
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+  }
+  if (!hsa.dma_copy(to, agents[to_agent], from, agents[from_agent], bytes)) {
     return LSE_ERROR(kUnimplemented, "the peer copy was refused");
   }
   return OkStatus();
@@ -1798,16 +1833,6 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   LSE_RETURN_IF_ERROR(synchronize_impl());
   // Same choice as copy_h2d, same reason: the runtime's own blocking transfer
   // on a spanning device, the raw single-device machinery otherwise.
-  if (physical_count_ > 1) {
-    LSE_SYNC_TRACE("synchronous_d2h %zu bytes enter", bytes);
-    const Status moved = from_hrx(
-        hrx_synchronous_d2h(static_cast<hrx_device_t>(device_),
-                            reinterpret_cast<hrx_buffer_t>(src.handle),
-                            src.offset + src_offset, dst, bytes),
-        "hrx_synchronous_d2h");
-    LSE_SYNC_TRACE("synchronous_d2h leave");
-    return moved;
-  }
   if (const Status dma = dma_host_transfer(dst, src, bytes, src_offset,
                                            /*to_device=*/false);
       dma.ok()) {

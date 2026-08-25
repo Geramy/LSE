@@ -155,6 +155,10 @@ class HrxBackend : public Backend<HrxBackend> {
   // GPU index within hsa_iterate_agents order, which is what names this device
   // to the copy engine. Stamped at init.
   int gpu_ordinal_ = 0;
+  // The board ordinal of each member of a spanning group, in member order.
+  // gpu_ordinal_ is only the FIRST member's, and a peer copy that names it for
+  // both ends aims the copy engine at the wrong card.
+  std::vector<int> member_ordinals_;
   Status copy_h2d_imported(const void* src, DeviceBuffer& dst,
                            std::size_t bytes, std::size_t dst_offset);
   // Queue affinity bit per stream. hrx_stream_dispatch submits its command
