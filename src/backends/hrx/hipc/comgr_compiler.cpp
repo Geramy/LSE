@@ -3,6 +3,9 @@
 #include "lse/backends/hrx/code_object.hpp"
 
 #include <cstdlib>
+#include <dlfcn.h>
+#include <sys/stat.h>
+
 #include <string>
 #include <vector>
 
@@ -282,6 +285,17 @@ bool ComgrCompiler::available() const {
 #endif
 }
 
+
+namespace {
+// path:size:mtime — enough to notice a package upgrade that keeps the name.
+std::string file_identity(const std::string& path) {
+  struct stat st{};
+  if (::stat(path.c_str(), &st) != 0) return path + ":missing";
+  return path + ":" + std::to_string(static_cast<long long>(st.st_size)) +
+         ":" + std::to_string(static_cast<long long>(st.st_mtime));
+}
+}  // namespace
+
 std::string ComgrCompiler::identity() const {
 #if LSE_HAVE_COMGR
   std::size_t major = 0;
@@ -292,6 +306,19 @@ std::string ComgrCompiler::identity() const {
   // What this does NOT see is an in-place ROCm patch that leaves the comgr
   // version and the install paths untouched; purge the cache for those.
   std::string id = "comgr." + std::to_string(major) + "." + std::to_string(minor);
+  // The API version above survives an in-place ROCm upgrade — a comgr one
+  // LLVM major newer keeps reporting 3.0 — and so did every cached binary,
+  // which is how a runner served kernels from a compiler it no longer had
+  // while every fresh compile failed. The loaded library itself and the
+  // device-library bitcode it will read are what actually changed, so their
+  // identities (path, size, mtime) are part of the key.
+  Dl_info where{};
+  if (dladdr(reinterpret_cast<void*>(&amd_comgr_get_version), &where) != 0 &&
+      where.dli_fname != nullptr) {
+    id += " lib=" + file_identity(where.dli_fname);
+  }
+  id += " ocml=" + file_identity(rocm_root(rocm_include_dir()) +
+                                 "/amdgcn/bitcode/ocml.bc");
   for (const std::string& opt : frontend_options()) id += ' ' + opt;
   id += " |";
   for (const char* opt : kBackendOptions) {

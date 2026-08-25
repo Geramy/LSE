@@ -717,11 +717,24 @@ Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
 // something to free — a pass without table phases pays nothing. The decode
 // loop already syncs per token to read its logits, so this costs a prefill
 // chunk one drain it was about to pay at its end anyway.
-Status Scheduler::release_phase_tables() {
-  if (impl_->phase_tables.empty()) return OkStatus();
+// Every member idle. The one ordering primitive a host write into device
+// memory can rely on: a poke into a retained program's token or step buffer,
+// or a zeroing of its carries, lands wherever the backend puts host writes —
+// stream-ordered behind pending dispatches on a discrete GPU, immediately
+// visible on an APU whose device memory is host-coherent. The previous pass
+// may still be reading those bytes. Draining first makes the write correct on
+// both; measured free where it was measured (a decode step already drains to
+// read its logits, a prefill chunk drains once).
+Status Scheduler::drain() {
   for (std::size_t m = 0; m < devices_.size(); ++m) {
     LSE_RETURN_IF_ERROR(devices_.device(m).synchronize());
   }
+  return OkStatus();
+}
+
+Status Scheduler::release_phase_tables() {
+  if (impl_->phase_tables.empty()) return OkStatus();
+  LSE_RETURN_IF_ERROR(drain());
   for (auto& t : impl_->phase_tables) release(t);
   impl_->phase_tables.clear();
   return OkStatus();

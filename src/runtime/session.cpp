@@ -48,6 +48,11 @@ Status zero_device_array(graph::Array& a) {
 }  // namespace
 
 Status Session::restart() {
+  // Zeroing the recurrence is a host write into buffers the previous pass
+  // may still be reading on a host-coherent device; see Scheduler::drain.
+  if (graph::Scheduler* sched = graph::default_scheduler()) {
+    LSE_RETURN_IF_ERROR(sched->drain());
+  }
   for (model::MixerState& s : states_) {
     LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_state));
     LSE_RETURN_IF_ERROR(zero_device_array(s.gdn_conv_q));

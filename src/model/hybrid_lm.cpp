@@ -548,6 +548,11 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   const std::uint32_t host_before = host_groups_so_far();
   if (can_reuse) {
+    // The pokes and the carry zeroing below are host writes into buffers the
+    // previous pass may still be reading; see Scheduler::drain.
+    if (graph::Scheduler* sched = graph::default_scheduler()) {
+      LSE_RETURN_IF_ERROR(sched->drain());
+    }
     cache_.program.reset_compute();
     // A whole-prompt prefill replay is a FRESH sequence: its carried states
     // must start from zero, not from wherever the previous conversation's

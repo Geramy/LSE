@@ -287,6 +287,9 @@ class Scheduler {
   explicit Scheduler(backend::IBackend& backend);
   ~Scheduler();
 
+  // Waits until every member is idle: the ordering a host write into device
+  // memory needs before it can touch bytes a pending pass may still read.
+  Status drain();
   // Frees the pointer tables of finished passes; drains the devices first.
   Status release_phase_tables();
   Status eval(std::span<const NodePtr> roots, bool pull_host = true);
