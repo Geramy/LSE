@@ -77,6 +77,15 @@ class HrxBackend : public Backend<HrxBackend> {
   // this agent.
   // The token every member of a spanning device stamps, or kNoDevice when this
   // instance holds a GPU of its own.
+  // A peer copy the streams order themselves: it waits on everything the
+  // producer has queued and signals a point the consumer's next work waits
+  // for, so neither side needs the host. Recorded as a TRANSFER command
+  // buffer, which is the copy engine -- the stream's own copy records into
+  // its dispatch buffer instead and the bytes move on the shader cores.
+  Status copy_peer_ordered_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                                std::size_t bytes, std::size_t src_offset,
+                                std::size_t dst_offset, Stream producer,
+                                Stream consumer);
   Status copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                         std::size_t bytes, std::size_t src_offset,
                         std::size_t dst_offset);
@@ -159,6 +168,10 @@ class HrxBackend : public Backend<HrxBackend> {
   // gpu_ordinal_ is only the FIRST member's, and a peer copy that names it for
   // both ends aims the copy engine at the wrong card.
   std::vector<int> member_ordinals_;
+  // Four bytes per stream, written by nothing that matters. A cross-stream
+  // ordering edge is submitted as a transfer command buffer, and a command
+  // buffer needs something to do; this is what it does.
+  std::vector<void*> order_scratch_;
   Status copy_h2d_imported(const void* src, DeviceBuffer& dst,
                            std::size_t bytes, std::size_t dst_offset);
   // Queue affinity bit per stream. hrx_stream_dispatch submits its command

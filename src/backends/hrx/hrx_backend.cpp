@@ -1724,6 +1724,61 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
 #endif
 }
 
+Status HrxBackend::copy_peer_ordered_impl(const DeviceBuffer& src,
+                                          DeviceBuffer& dst,
+                                          std::size_t bytes,
+                                          std::size_t src_offset,
+                                          std::size_t dst_offset,
+                                          Stream producer, Stream consumer) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
+  (void)producer; (void)consumer;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (src.handle == 0 || dst.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer in ordered peer copy");
+  }
+  if (bytes == 0) return OkStatus();
+  if (producer.index >= streams_.size() || consumer.index >= streams_.size()) {
+    return LSE_ERROR(kOutOfRange, "ordered peer copy names a stream the device "
+                                  "does not have");
+  }
+  LSE_ASSIGN_OR(void* from_stream, stream_at(producer.index));
+  LSE_ASSIGN_OR(void* to_stream, stream_at(consumer.index));
+
+  // Everything the producer has already queued.
+  hrx_timeline_point_t after{};
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_get_timeline_position(static_cast<hrx_stream_t>(from_stream),
+                                       &after),
+      "hrx_stream_get_timeline_position"));
+  // A point on the consumer that this copy, and nothing else, will signal.
+  hrx_timeline_point_t on{};
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_get_timeline_position(static_cast<hrx_stream_t>(to_stream),
+                                       &on),
+      "hrx_stream_get_timeline_position(consumer)"));
+  std::uint64_t reserved = 0;
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_advance_timeline(static_cast<hrx_stream_t>(to_stream),
+                                  &reserved),
+      "hrx_stream_advance_timeline"));
+
+  hrx_semaphore_list_t waits{&after.semaphore, &after.value, 1};
+  hrx_semaphore_list_t signals{&on.semaphore, &reserved, 1};
+  return from_hrx(
+      hrx_queue_copy(static_cast<hrx_device_t>(device_),
+                     static_cast<hrx_queue_affinity_t>(
+                         stream_affinity_[consumer.index]),
+                     &waits, &signals,
+                     reinterpret_cast<hrx_buffer_t>(src.handle),
+                     src.offset + src_offset,
+                     reinterpret_cast<hrx_buffer_t>(dst.handle),
+                     dst.offset + dst_offset, bytes),
+      "hrx_queue_copy");
+#endif
+}
+
 Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                                   std::size_t bytes, std::size_t src_offset,
                                   std::size_t dst_offset) {
@@ -2103,6 +2158,17 @@ Result<StreamEvent> HrxBackend::record_event_impl(Stream stream) {
   ev.timeline = ++event_serial_;
   ev.handle = event;
   ev.device = device_index();
+  // Where this event sits on the stream's own timeline. A consumer given this
+  // waits on the device; without it the only way to order two streams is to
+  // block the host until the point is reached.
+  {
+    hrx_timeline_point_t at{};
+    if (hrx_status_is_ok(hrx_stream_get_timeline_position(
+            static_cast<hrx_stream_t>(streams_[stream.index]), &at))) {
+      ev.timeline_semaphore = static_cast<void*>(at.semaphore);
+      ev.timeline_point = at.value;
+    }
+  }
   // The event lives while any copy of `ev` does — the host may still queue a
   // wait on it — and then goes to the graveyard rather than being freed: a
   // wait already queued on the device still names the object, and only a
@@ -2152,6 +2218,22 @@ Status HrxBackend::wait_event_impl(Stream stream, const StreamEvent& event) {
   // same-stream event is already ordered by its own timeline and needs
   // nothing. Revisit when hrx conformance covers queued cross-stream waits.
   if (event.stream.index == stream.index) return OkStatus();
+  // This edge stays on the host, and the reason is not the primitive.
+  //
+  // hrx_stream_wait_on and hrx_queue_barrier both reach the HAL's bare
+  // queue barrier; carrying the identical cross-device wait inside a
+  // submitted command buffer (hrx_queue_fill) hangs just the same. What
+  // deadlocks is the shape: a stream orders its own work through its
+  // timeline -- flush waits on timepoint and signals timepoint+1 -- so an
+  // ordering edge inserted here becomes something the consumer's next flush
+  // waits for. A tensor split's reduce has every member read every other
+  // member's partial, i.e. edges in both directions inside one round, and
+  // those close a cycle: neither stream can advance to signal what the other
+  // is waiting for. The peer copies above are free of it because each is a
+  // one-shot submission waiting only on work already queued.
+  //
+  // Removing this join therefore needs the reduce to stop crossing both ways
+  // in a round, not a different way of expressing the wait.
   return from_hrx(
       hrx_event_synchronize(static_cast<hrx_event_t>(event.handle)),
       "hrx_event_synchronize");

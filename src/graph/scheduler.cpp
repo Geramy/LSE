@@ -302,21 +302,15 @@ Status Scheduler::make_local(Node& n, std::size_t member) {
   if (impl_->member_dirty.size() <= owner) {
     impl_->member_dirty.resize(owner + 1, 1);
   }
-  if (impl_->member_dirty[owner] != 0) {
-    // Blocking, and deliberately so for now. A GPU-side barrier orders the
-    // read after the write that produced it, but nothing then orders the
-    // owner's NEXT write after the read: binding a peer's live buffer removes
-    // the snapshot a copy used to take, and draining from the host is what
-    // currently keeps the producer from running ahead into it. Making this
-    // asynchronous needs the reverse edge as well -- an event the owner waits
-    // on before reusing the buffer -- and without it the model emits garbage.
-    // copy_peer orders itself against the stream that wrote these bytes, so
-    // the blanket drain that used to sit here -- and that kept the two halves
-    // of a split taking turns at ~47% busy each -- is not needed.
-    impl_->member_dirty[owner] = 0;
-  }
-  LSE_RETURN_IF_ERROR(
-      from.copy({mirror}, {n.buffer}, n.buffer.size_bytes));
+  impl_->member_dirty[owner] = 0;
+  // The copy runs after everything the owner has queued, and the reader's next
+  // work runs after the copy; the host is in neither edge. Draining the owner
+  // from the host is what kept the two halves of a split taking turns at about
+  // 47% busy each.
+  LSE_RETURN_IF_ERROR(from.copy_peer_ordered(
+      n.buffer, mirror, n.buffer.size_bytes, 0, 0,
+      backend::Stream{static_cast<std::uint32_t>(owner)},
+      backend::Stream{static_cast<std::uint32_t>(member)}));
   trace_.peer_migrations += 1;
   trace_.peer_bytes += n.buffer.size_bytes;
   return OkStatus();

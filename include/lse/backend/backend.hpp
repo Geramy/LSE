@@ -194,6 +194,11 @@ inline constexpr Stream kDefaultStream{0};
 struct StreamEvent {
   Stream stream{};
   std::uint64_t timeline = 0;
+  // The timeline this point belongs to, when the backend keeps one. With it a
+  // consumer can be made to wait on the DEVICE; without it the only way to
+  // order the two is to block the host until the point is reached.
+  void* timeline_semaphore = nullptr;
+  std::uint64_t timeline_point = 0;
   // The backend's own synchronization object for this point, when it has one.
   // Opaque here; only the backend that set it may interpret it. Carried so a
   // consumer can wait on the exact point rather than on wherever the producing
@@ -975,6 +980,18 @@ class IBackend {
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,
                           std::size_t src_offset) = 0;
+  // A peer copy the two streams order between themselves: it runs after what
+  // the producer has queued and the consumer's next work runs after it, with
+  // the host in neither edge. A backend that cannot say that falls back to the
+  // blocking copy, which is correct and slower.
+  virtual Status copy_peer_ordered(const DeviceBuffer& src, DeviceBuffer& dst,
+                                   std::size_t bytes, std::size_t src_offset,
+                                   std::size_t dst_offset, Stream producer,
+                                   Stream consumer) {
+    (void)producer; (void)consumer;
+    return copy_peer(src, dst, bytes, src_offset, dst_offset);
+  }
+
   // Not pure: a backend with no peer of its own is the common case, and the
   // caller's answer to "can these two talk directly" is this declining.
   virtual Status copy_peer(const DeviceBuffer& src, DeviceBuffer& dst,
@@ -1094,6 +1111,19 @@ class BackendAdapter final : public IBackend {
                   std::size_t off) override {
     return impl_.copy_d2h(s, d, n, off);
   }
+  Status copy_peer_ordered(const DeviceBuffer& s, DeviceBuffer& d,
+                           std::size_t n, std::size_t soff, std::size_t doff,
+                           Stream producer, Stream consumer) override {
+    if constexpr (requires(Derived& i) {
+                    i.copy_peer_ordered_impl(s, d, n, soff, doff, producer,
+                                             consumer);
+                  }) {
+      return impl_.copy_peer_ordered_impl(s, d, n, soff, doff, producer,
+                                          consumer);
+    }
+    return impl_.copy_peer(s, d, n, soff, doff);
+  }
+
   Status copy_peer(const DeviceBuffer& s, DeviceBuffer& d, std::size_t n,
                    std::size_t soff, std::size_t doff) override {
     return impl_.copy_peer(s, d, n, soff, doff);
