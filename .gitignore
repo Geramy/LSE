@@ -25,3 +25,6 @@ COST_MODEL.md
 SPECULATION_DEPTH.md
 TRANSFER_PATH.md
 continue.md
+
+# Release packaging (build-release.yml and local packaging write here)
+dist/
