@@ -40,7 +40,8 @@ echo "== engine =="
 # template below, where the margin is decisive; here the raw path has to
 # produce text at all, deterministically, on the device.
 out=$("$BUILD/lse" -m "$MODEL" -n 16 -t 0 --stats "The capital of France is" 2>&1 || true)
-words=$(grep -F "The capital of France is" <<<"$out" | head -1 | sed 's/.*The capital of France is//' | wc -w)
+# The CLI prints the continuation on its own line, then its statistics.
+words=$( { grep -vE '^(lse|hip|launches|model:|prompt |  host|  fused|\s*$)' <<<"$out" || true; } | tail -1 | wc -w)
 if [ "${words:-0}" -ge 4 ]; then
   pass "greedy decode produces text ($words words)"
 else
