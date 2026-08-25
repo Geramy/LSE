@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -15,6 +16,26 @@
 #include "lse/ops/norm.hpp"
 
 namespace lse::model {
+
+// Weight-load accounting, reported at exit under LSE_TIME_LOAD=1.
+double g_load_total_ms = 0.0;
+double g_load_host_ms = 0.0;
+double g_load_dev_ms = 0.0;
+std::size_t g_load_tensors = 0;
+namespace {
+struct LoadReport {
+  ~LoadReport() {
+    if (std::getenv("LSE_TIME_LOAD") == nullptr) return;
+    std::fprintf(stderr,
+                 "[load] %zu tensors, total %.0f ms = host read/gather %.0f ms"
+                 " + device upload %.0f ms\n",
+                 g_load_tensors, g_load_total_ms, g_load_host_ms,
+                 g_load_dev_ms);
+  }
+};
+const LoadReport g_load_report{};
+}  // namespace
+
 
 Result<Array> WeightBinder::require(std::string_view name) {
   auto got = optional(name);
@@ -61,6 +82,20 @@ DType device_storage(DType checkpoint) noexcept {
 Result<Array> upload(const TensorView& v, Shape shape,
                      const std::vector<std::int64_t>* order,
                      std::int64_t win_first = 0, std::int64_t win_count = 0) {
+  // LSE_TIME_LOAD=1: split weight loading into the read/gather on the host and
+  // the upload to the device, so a slow load names its own half.
+  struct Phase {
+    std::chrono::steady_clock::time_point t0;
+    double* sink;
+    explicit Phase(double* into)
+        : t0(std::chrono::steady_clock::now()), sink(into) {}
+    ~Phase() {
+      *sink += std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+    }
+  };
+  Phase whole{&g_load_total_ms};
+  ++g_load_tensors;
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
     return LSE_ERROR(kInternal, "no usable backend to load '", v.name,
@@ -144,7 +179,10 @@ Result<Array> upload(const TensorView& v, Shape shape,
   n.host_dirty = true;
   n.device_dirty = false;
   n.materialized = true;
-  LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
+  {
+    Phase up{&g_load_dev_ms};
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
+  }
   return a;
 }
 

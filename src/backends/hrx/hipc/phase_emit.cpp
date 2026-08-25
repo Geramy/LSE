@@ -1088,6 +1088,10 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   // buffer's resource set. Weights, slots and carried states all outlive the
   // step, and the step's end synchronizes before any of them is recycled,
   // which is the invariant this leans on.
+    // Past this many bindings a phase takes its operands through one address
+  // table instead of one kernarg each. Lowering it to every phase was measured
+  // and lost: the table costs an allocation and an upload per dispatch, and
+  // decode issues ~1765 of those a token (7.8 tok/s against 14.5).
   const bool table_mode = !persist && out.binding_order.size() > 64;
   src << "extern \"C\" __global__ __launch_bounds__(" << kPhaseBlock
       << ") void " << out.entry_name << "(\n";
