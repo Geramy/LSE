@@ -484,8 +484,20 @@ std::vector<KernelCensus> read_code_object_census(
     std::span<const std::byte> object) {
   std::vector<KernelCensus> out;
   if (object.empty()) return out;
-  const std::string target = read_code_object_target(object);
+  std::string target = read_code_object_target(object);
   if (target.empty()) return out;
+
+  // Newer comgr writes the environment slot of the stored target as "unknown"
+  // ("amdgcn-amd-amdhsa-unknown-gfx1151"), and create_disassembly_info
+  // rejects that triple while accepting the empty-environment form older ROCm
+  // emitted ("amdgcn-amd-amdhsa--gfx1151"). The disassembler only needs the
+  // arch and its feature suffix, so fold the environment token away. The
+  // search resumes one character past the match so a second, overlapping
+  // placeholder is folded too rather than skipped by a fixed step.
+  for (std::string::size_type p = target.find("-unknown-");
+       p != std::string::npos; p = target.find("-unknown-", p + 1)) {
+    target.replace(p, std::strlen("-unknown-"), "--");
+  }
 
   Image image;
   if (!map_image(object, &image)) return out;
