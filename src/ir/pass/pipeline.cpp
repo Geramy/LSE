@@ -4,6 +4,7 @@
 
 #include "lse/ir/pass/cse.hpp"
 #include "lse/ir/pass/dce.hpp"
+#include "lse/ir/pass/factor_hoist.hpp"
 #include "lse/ir/pass/lds_fold.hpp"
 #include "lse/ir/verify.hpp"
 
@@ -43,6 +44,11 @@ const PassPipeline& default_pipeline() {
   static const PassPipeline kPipeline = [] {
     PassPipeline p;
     p.add(make_cse());
+    // After CSE so the invariant factor is ONE value at every accumulate --
+    // two spellings of the same scalar would read as two factors and the
+    // uniformity test would refuse the hoist. Before DCE so the multiply it
+    // strips out of the loop can be collected if nothing else wanted it.
+    p.add(make_factor_hoist());
     p.add(make_lds_fold());
     p.add(make_dce());
     return p;

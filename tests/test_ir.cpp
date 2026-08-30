@@ -15,6 +15,8 @@
 #include "lse/ir/lower.hpp"
 #include "lse/ir/pass/cse.hpp"
 #include "lse/ir/pass/dce.hpp"
+#include "lse/ir/alias.hpp"
+#include "lse/ir/pass/factor_hoist.hpp"
 #include "lse/ir/pass/lds_fold.hpp"
 #include "lse/ir/pass/pass.hpp"
 #include "lse/ir/recorder.hpp"
@@ -612,12 +614,289 @@ LSE_TEST(the_default_pipeline_runs_every_pass_and_verifies) {
   build_two_stages(kb, StagedRun{});
   std::vector<ir::PassStat> stats;
   LSE_EXPECT(ir::default_pipeline().run(kb.ir(), &stats).ok());
-  LSE_EXPECT_EQ(stats.size(), 3u);
+  LSE_EXPECT_EQ(stats.size(), 4u);
   LSE_EXPECT(stats[0].name == "cse");
-  LSE_EXPECT(stats[1].name == "lds_fold");
-  LSE_EXPECT(stats[2].name == "dce");
-  LSE_EXPECT(stats[1].fired >= 1);
+  LSE_EXPECT(stats[1].name == "factor_hoist");
+  LSE_EXPECT(stats[2].name == "lds_fold");
+  LSE_EXPECT(stats[3].name == "dce");
+  LSE_EXPECT(stats[2].fired >= 1);
   LSE_EXPECT_EQ(count_of(ir::lower(kb.ir()), "__shared__ float"), 1u);
 }
 
 LSE_TEST_MAIN()
+
+LSE_TEST(factor_hoist_lifts_an_invariant_scale_out_of_a_sum) {
+  // The rms_norm-into-linear shape reduced to its arithmetic: a contraction
+  // whose every term carries the same scalar. The scale belongs outside the
+  // sum, and moving it there is what lets it be computed AFTER the loop
+  // instead of before -- which is what would let a norm and the linear that
+  // consumes it share one k-loop instead of taking one launch each.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> sb(&kb, &kb.types(), "in1");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+
+  auto s = sb[e.thread_id()].read();   // invariant: defined before the loop
+  auto acc = e.var(0.0f);
+  for (auto k : e.range(64u)) {
+    acc = acc.read() + (x[k].read() * s);
+  }
+  out[e.thread_id()] = acc.read();
+
+  const std::size_t fired = run_one(kb.ir(), ir::make_factor_hoist());
+  LSE_EXPECT_EQ(fired, 1u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+
+  const std::string after = ir::lower(kb.ir());
+  const std::size_t open = after.find("for (");
+  LSE_EXPECT(open != std::string::npos);
+  const std::size_t close = after.find('}', open);
+  LSE_EXPECT(close != std::string::npos);
+  const std::string in_loop = after.substr(open, close - open);
+  const std::string after_loop = after.substr(close);
+  // The multiply left the loop body...
+  LSE_EXPECT_EQ(count_of(in_loop, "*"), 0u);
+  // ...and is paid once, after it.
+  LSE_EXPECT(count_of(after_loop, "*") >= 1u);
+}
+
+LSE_TEST(factor_hoist_refuses_an_accumulator_that_does_not_start_at_zero) {
+  // s * (init + SUM) is not init + s * SUM. The rewrite is only valid from a
+  // zero start, and a pass that fired here would be silently wrong.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> sb(&kb, &kb.types(), "in1");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+
+  auto s = sb[e.thread_id()].read();
+  auto acc = e.var(1.0f);              // <- not zero
+  for (auto k : e.range(64u)) {
+    acc = acc.read() + (x[k].read() * s);
+  }
+  out[e.thread_id()] = acc.read();
+
+  LSE_EXPECT_EQ(run_one(kb.ir(), ir::make_factor_hoist()), 0u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+}
+
+LSE_TEST(factor_hoist_refuses_a_factor_that_moves_with_the_loop) {
+  // Both halves of the product vary with k, so nothing distributes out.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> y(&kb, &kb.types(), "in1");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+
+  auto acc = e.var(0.0f);
+  for (auto k : e.range(64u)) {
+    acc = acc.read() + (x[k].read() * y[k].read());
+  }
+  out[e.thread_id()] = acc.read();
+
+  LSE_EXPECT_EQ(run_one(kb.ir(), ir::make_factor_hoist()), 0u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+}
+
+LSE_TEST(factor_hoist_lifts_a_scale_out_of_an_fma_contraction) {
+  // The form a real contraction is actually written in. The emitter spells
+  // its inner loop with the dialect's fma row, so a matcher that only knew
+  // `acc + (a * b)` would never fire on anything the model emits.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> sb(&kb, &kb.types(), "in1");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+
+  auto s = sb[e.thread_id()].read();   // invariant: the norm scale
+  auto acc = e.var(0.0f);
+  for (auto k : e.range(64u)) {
+    acc = lse::math::fma(x[k].read(), s, acc.read());
+  }
+  out[e.thread_id()] = acc.read();
+
+  LSE_EXPECT_EQ(run_one(kb.ir(), ir::make_factor_hoist()), 1u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+
+  const std::string after = ir::lower(kb.ir());
+  const std::size_t open = after.find("for (");
+  const std::size_t close = after.find('}', open);
+  LSE_EXPECT(open != std::string::npos && close != std::string::npos);
+  // The fma is gone from the loop; a plain add took its place.
+  LSE_EXPECT_EQ(count_of(after.substr(open, close - open), "fma"), 0u);
+  LSE_EXPECT(count_of(after.substr(close), "*") >= 1u);
+}
+
+LSE_TEST(factor_hoist_finds_a_scale_the_loop_itself_computed) {
+  // Invariance is a property of the DEPENDENCY CHAIN, not of position. This
+  // scale is written inside the loop body, so a test that asked only "was it
+  // defined outside" would refuse the hoist -- but it is built from two
+  // constants and moves with nothing, so it is invariant and the factor comes
+  // out just the same.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+
+  auto acc = e.var(0.0f);
+  for (auto k : e.range(64u)) {
+    const auto s = e.f32(2.0f) * e.f32(4.0f);   // computed IN the loop
+    acc = acc.read() + (x[k].read() * s);
+  }
+  out[e.thread_id()] = acc.read();
+
+  LSE_EXPECT_EQ(run_one(kb.ir(), ir::make_factor_hoist()), 1u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+}
+
+LSE_TEST(factor_hoist_pulls_a_factor_out_of_a_nested_product) {
+  // The factor is buried in a product tree rather than sitting at the top of
+  // the term. Flattening to sum-of-products finds it wherever it is, which a
+  // shape-matcher keyed on one spelling would not.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> y(&kb, &kb.types(), "in1");
+  const ir::Buffer<ir::f32> sb(&kb, &kb.types(), "in2");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+
+  auto s = sb[e.thread_id()].read();
+  auto acc = e.var(0.0f);
+  for (auto k : e.range(64u)) {
+    acc = acc.read() + ((x[k].read() * s) * y[k].read());
+  }
+  out[e.thread_id()] = acc.read();
+
+  LSE_EXPECT_EQ(run_one(kb.ir(), ir::make_factor_hoist()), 1u);
+  LSE_EXPECT(ir::verify(kb.ir()).ok());
+  const std::string after = ir::lower(kb.ir());
+  const std::size_t open = after.find("for (");
+  const std::size_t close = after.find('}', open);
+  LSE_EXPECT_EQ(count_of(after.substr(open, close - open), "in2"), 0u);
+}
+
+namespace {
+
+// The two memory ops in a body, in order.
+std::vector<ir::OpId> memory_ops(const ir::Body& b, ir::RegionId r) {
+  std::vector<ir::OpId> out;
+  for (ir::OpId id : b.region(r).ops) {
+    const ir::Operation& o = b.op(id);
+    if (o.erased) continue;
+    ir::Access probe;
+    if (ir::access_of(b, id, &probe)) out.push_back(id);
+    for (ir::RegionId sub : o.regions) {
+      for (ir::OpId n : memory_ops(b, sub)) out.push_back(n);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+LSE_TEST(alias_proves_two_offsets_of_one_buffer_are_different_elements) {
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+  const auto i = e.let(e.thread_id());
+  out[e.thread_id()] = x[i].read() + x[i + e.u32(1u)].read();
+
+  const auto ops = memory_ops(kb.ir(), kb.ir().entry());
+  LSE_EXPECT(ops.size() >= 2);
+  ir::Access a, b;
+  LSE_EXPECT(ir::access_of(kb.ir(), ops[0], &a));
+  LSE_EXPECT(ir::access_of(kb.ir(), ops[1], &b));
+  // in0[i] and in0[i+1] are one apart: provably different elements.
+  LSE_EXPECT(ir::alias_of(a, b) == ir::Alias::kNo);
+  LSE_EXPECT(ir::alias_of(a, a) == ir::Alias::kMust);
+}
+
+LSE_TEST(alias_refuses_to_separate_two_different_buffer_symbols) {
+  // THE UNSOUND MOVE THIS EXISTS TO PREVENT. Bindings are __restrict__, but
+  // plan_slots recycles slots, so two symbols can name one allocation. Only a
+  // caller holding the slot map may claim otherwise.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> y(&kb, &kb.types(), "in1");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+  const auto i = e.let(e.thread_id());
+  out[e.thread_id()] = x[i].read() + y[i].read();
+
+  const auto ops = memory_ops(kb.ir(), kb.ir().entry());
+  LSE_EXPECT(ops.size() >= 2);
+  ir::Access a, b;
+  LSE_EXPECT(ir::access_of(kb.ir(), ops[0], &a));
+  LSE_EXPECT(ir::access_of(kb.ir(), ops[1], &b));
+  LSE_EXPECT(ir::alias_of(a, b) == ir::Alias::kMaybe);
+
+  // With an oracle that actually knows they are separate allocations, it can.
+  const ir::DistinctAllocations distinct =
+      [](ir::ValueId p, ir::ValueId q) { return p != q; };
+  LSE_EXPECT(ir::alias_of(a, b, &distinct) == ir::Alias::kNo);
+}
+
+LSE_TEST(alias_keeps_a_variable_index_difference_unknown) {
+  // in0[i] against in0[j]: the difference is not a constant, so nothing is
+  // known and the answer has to be kMaybe rather than a guess.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> x(&kb, &kb.types(), "in0");
+  const ir::Buffer<ir::f32> out(&kb, &kb.types(), "out");
+  const auto i = e.let(e.thread_id());
+  const auto j = e.let(lse::math::workgroup_id_x());
+  out[e.thread_id()] = x[i].read() + x[j].read();
+
+  const auto ops = memory_ops(kb.ir(), kb.ir().entry());
+  LSE_EXPECT(ops.size() >= 2);
+  ir::Access a, b;
+  LSE_EXPECT(ir::access_of(kb.ir(), ops[0], &a));
+  LSE_EXPECT(ir::access_of(kb.ir(), ops[1], &b));
+  LSE_EXPECT(ir::alias_of(a, b) == ir::Alias::kMaybe);
+}
+
+LSE_TEST(may_reorder_lets_two_reads_past_each_other_but_not_a_write) {
+  ir::Access r1, r2, w;
+  r1.buffer = 7; r1.index = ir::AffineExpr::constant(0); r1.is_write = false;
+  r2.buffer = 7; r2.index = ir::AffineExpr::constant(0); r2.is_write = false;
+  w = r1; w.is_write = true;
+  // Same element, both reads: order does not matter.
+  LSE_EXPECT(ir::may_reorder(r1, r2));
+  // Same element, one writes: it does.
+  LSE_EXPECT(!ir::may_reorder(r1, w));
+  // A write to a provably different element may move.
+  ir::Access w2 = w;
+  w2.index = ir::AffineExpr::constant(4);
+  LSE_EXPECT(ir::may_reorder(r1, w2));
+}
+
+LSE_TEST(alias_separates_lds_from_a_global_buffer_without_an_oracle) {
+  // The one case where two distinct symbols ARE provably distinct memory:
+  // they live in different address spaces. Slot recycling can put two global
+  // bindings on one allocation, but it cannot put a global binding and a
+  // __shared__ array on one -- so this needs no slot map to decide, and
+  // without it every staging fold would refuse itself against its own fill.
+  ir::KernelBody kb(kTypes, kTable);
+  env::Emit e{&kb};
+  const ir::Buffer<ir::f32> g(&kb, &kb.types(), "in0");
+  auto lds = kb.shared<ir::f32, 64>("s0");
+  const auto i = e.let(e.thread_id());
+  lds[i] = g[i].read();
+
+  const auto ops = memory_ops(kb.ir(), kb.ir().entry());
+  LSE_EXPECT(ops.size() >= 2);
+  ir::Access w, r;
+  bool got_w = false, got_r = false;
+  for (ir::OpId id : ops) {
+    ir::Access acc;
+    if (!ir::access_of(kb.ir(), id, &acc)) continue;
+    if (acc.is_write && !got_w) { w = acc; got_w = true; }
+    if (!acc.is_write && !got_r) { r = acc; got_r = true; }
+  }
+  LSE_EXPECT(got_w && got_r);
+  LSE_EXPECT(w.space != r.space);
+  LSE_EXPECT(ir::alias_of(w, r) == ir::Alias::kNo);
+  LSE_EXPECT(ir::may_reorder(w, r));
+}

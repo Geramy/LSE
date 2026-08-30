@@ -67,6 +67,8 @@ add_library(lse_ir
   src/ir/verify.cpp
   src/ir/pass/cse.cpp
   src/ir/pass/dce.cpp
+  src/ir/alias.cpp
+  src/ir/pass/factor_hoist.cpp
   src/ir/pass/lds_fold.cpp
   src/ir/pass/pipeline.cpp
 )
