@@ -618,6 +618,15 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   const ScratchCounts bytes =
       count_run_scratch(stages, panels, panel_of, device, threads);
   out.threads = threads;
+  // The widest grid among the members: the merged body still has to cover
+  // every output the separate launches did.
+  std::uint32_t wgs = 0;
+  for (const IndexedStage& st : stages) {
+    std::uint32_t n = st.plan.workgroup_count[0];
+    for (int d = 1; d < 3; ++d) n *= st.plan.workgroup_count[d];
+    wgs = n > wgs ? n : wgs;
+  }
+  out.workgroups = wgs;
   out.fused = bytes.fused;
   out.worst_solo = bytes.worst_solo;
   out.fused_entry = "lse_fused_" + std::to_string(key);

@@ -110,6 +110,23 @@ class IPhaseStaging {
   // is why the splitter breaks the chain there and not here.
   [[nodiscard]] virtual bool lane_aligned(
       const Node& producer, const Node& consumer) const noexcept = 0;
+
+  // Does thread i of this stage STORE element i, into its own binding? Asks
+  // about the store ONLY, and deliberately says nothing about where the stage
+  // read from -- that is a different edge, judged on its own.
+  //
+  // A cooperative reduction is the case that needs the distinction: a coop
+  // rms_norm re-derives its whole row inside each workgroup (see the LDS fold
+  // in phase_emit) precisely so it depends on no other workgroup, then stores
+  // lane-for-lane like any elementwise stage. lane_stage calls it a gather --
+  // true of its READ -- and seeding a chunk's lane state from that let one
+  // norm poison everything after it.
+  //
+  // SAFE ONLY WITHOUT SLOT RECYCLING. Judging a producer by its store alone
+  // admits merges across a cut boundary, and Workgroup::plan_slots recycles
+  // slots at exactly those boundaries; the merged kernel would then carry an
+  // intra-launch write-after-read between workgroups.
+  [[nodiscard]] virtual bool lane_writes(const Node& n) const noexcept = 0;
 };
 
 // Workgroup size and launch count for a group with no primitive of its own.
@@ -175,6 +192,11 @@ class IKernelEmitter {
   // engine keeps the arrangement it had.
   struct RunScratch {
     std::uint32_t threads = 0;
+    // Workgroups the merged launch would actually run, from the primitives'
+    // own ThreadPlan. Not derivable from element counts: a contraction tiles
+    // far wider than outputs/threads, and a caller that guessed the grid from
+    // element counts read 20 workgroups where the emitted kernel launches 640.
+    std::uint32_t workgroups = 0;
     std::uint32_t fused = 0;
     std::uint32_t worst_solo = 0;
     // Entry names the two arrangements would be compiled as, so a decision

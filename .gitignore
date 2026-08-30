@@ -28,3 +28,4 @@ continue.md
 
 # Release packaging (build-release.yml and local packaging write here)
 dist/
+.rocprofv3/

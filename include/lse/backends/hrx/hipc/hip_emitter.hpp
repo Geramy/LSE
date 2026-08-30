@@ -31,6 +31,7 @@ class HipEmitter final : public graph::IKernelEmitter,
   [[nodiscard]] bool lane_aligned(
       const graph::Node& producer,
       const graph::Node& consumer) const noexcept override;
+  [[nodiscard]] bool lane_writes(const graph::Node& n) const noexcept override;
 
   static void bind_phase(const graph::FusionGroup& group,
                          graph::EmittedKernel& out);

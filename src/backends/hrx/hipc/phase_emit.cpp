@@ -330,8 +330,23 @@ bool lane_stage_node(const Node& n) noexcept {
 // grid instead of buying grid-wide ordering they never use with a launch
 // boundary. Anything gathering, reducing or owning its indexing fails here and
 // still pays for the split.
+// Thread i STORES element i, into its own binding. Nothing about the read.
+bool lane_writes_node(const Node& n) noexcept {
+  if (n.kind == OpKind::kReshape) return true;   // metadata: element i IS i
+  const StageUse u = stage_use(n);
+  return u.write == LaneUse::kLane && u.elems != 0 && written_buf(n) == &n;
+}
+
+// Only with slot recycling off -- see IPhaseStaging::lane_writes.
+bool fusion_unlocked() noexcept {
+  static const bool on = std::getenv("LSE_NO_SLOT_REUSE") != nullptr;
+  return on;
+}
+
 bool lane_aligned_edge(const Node& producer, const Node& consumer) noexcept {
-  if (!lane_stage_node(producer) || !lane_stage_node(consumer)) return false;
+  const bool producer_ok = fusion_unlocked() ? lane_writes_node(producer)
+                                             : lane_stage_node(producer);
+  if (!producer_ok || !lane_stage_node(consumer)) return false;
   if (producer.element_count() != consumer.element_count()) return false;
   return BroadcastMap::build(producer.shape, consumer.shape).identity;
 }
@@ -508,6 +523,10 @@ bool HipEmitter::lane_stage(const Node& n) const noexcept {
   return lane_stage_node(n);
 }
 
+bool HipEmitter::lane_writes(const Node& n) const noexcept {
+  return fusion_unlocked() ? lane_writes_node(n) : lane_stage_node(n);
+}
+
 bool HipEmitter::lane_aligned(const Node& producer,
                               const Node& consumer) const noexcept {
   return lane_aligned_edge(producer, consumer);
@@ -640,11 +659,32 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   // width. Every other dependent group shares one workgroup, where
   // __syncthreads is the whole grid. A multi-WG software barrier deadlocks
   // here: this launch path does not keep the whole grid resident.
-  const bool persist = false;
-  const bool grid_gemv =
-      !persist && only_linears && compute > 0 && max_n >= 256;
-  const bool grid_elem = !persist && !grid_gemv &&
-                         (!dependent || lane_chunk) && max_threads >= 512;
+  // PERSISTENT GRID: the alternative to a launch boundary for grid-wide
+  // ordering, and the only one that does not need a new HRX entry point.
+  //
+  // It was off because "a multi-WG software barrier deadlocks here: this
+  // launch path does not keep the whole grid resident" -- true, and the
+  // precondition is now checkable rather than assumed. lse_grid_sync spins on
+  // a ticket, so every workgroup it waits for must ALREADY be resident;
+  // persist_wgs is capped at compute_units below, and the part seats
+  // pools * workgroups_per_pool >= compute_units for any body that fits a
+  // pool at all. Under that cap the barrier cannot deadlock.
+  //
+  // Enabled ONLY where the alternative is the one-workgroup fallback. A
+  // dependent group that is neither a fat GEMV nor a lane chunk runs today on
+  // a SINGLE workgroup -- one CU of sixty-four -- because __syncthreads is
+  // then the whole grid. Profiled: 856 of 4204 dispatches in a two-token run
+  // are single-workgroup. Those are what this is for; everything that already
+  // has a grid keeps it.
+  const bool would_gemv = only_linears && compute > 0 && max_n >= 256;
+  const bool would_elem =
+      !would_gemv && (!dependent || lane_chunk) && max_threads >= 512;
+  static const bool persist_allowed = std::getenv("LSE_PERSIST") != nullptr;
+  const bool persist = persist_allowed && !would_gemv && !would_elem &&
+                       dependent && device.compute_units > 0 &&
+                       max_threads > 256;
+  const bool grid_gemv = !persist && would_gemv;
+  const bool grid_elem = !persist && would_elem;
   // A grid launch orders independent stages by having nothing to order. Only
   // the lane chunk brings a dependence into one, and only its barriers are
   // workgroup-wide facts; grid_gemv keeps the no-barrier form it always had.

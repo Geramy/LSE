@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <map>
 #include <memory>
 #include <span>
@@ -91,16 +92,55 @@ struct PeerMirrorHash {
   }
 };
 
+// Identity of a constant's CONTENTS plus where they have to live. Two
+// constants agreeing on all five hold the same bytes on the same device, so
+// they can share one allocation for the life of the process.
+struct ConstKey {
+  double value = 0.0;
+  DType dtype = DType::kF32;
+  std::size_t count = 0;
+  std::size_t member = 0;
+  std::uint32_t stream = 0;
+
+  friend bool operator==(const ConstKey& a, const ConstKey& b) noexcept {
+    return a.count == b.count && a.dtype == b.dtype && a.member == b.member &&
+           a.stream == b.stream &&
+           std::memcmp(&a.value, &b.value, sizeof(double)) == 0;
+  }
+};
+
+struct ConstKeyHash {
+  std::size_t operator()(const ConstKey& k) const noexcept {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &k.value, sizeof(bits));
+    std::size_t h = std::hash<std::uint64_t>{}(bits);
+    h ^= std::hash<std::size_t>{}(k.count) + 0x9e3779b97f4a7c15ULL + (h << 6) +
+         (h >> 2);
+    h ^= std::hash<std::size_t>{}(k.member) + 0x9e3779b97f4a7c15ULL + (h << 6) +
+         (h >> 2);
+    h ^= std::hash<std::uint32_t>{}(k.stream) + 0x9e3779b97f4a7c15ULL +
+         (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(static_cast<int>(k.dtype)) + 0x9e3779b97f4a7c15ULL +
+         (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
 struct Scheduler::Impl {
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
   // One per stream: a persistent-grid kernel spins on this counter across its
   // whole grid, so two of them running at once must not share one.
-  std::vector<backend::DeviceBuffer> grid_bar;
+  // Grid-sync counters, per stream and per grid width. See the use site.
+  std::vector<std::unordered_map<std::uint32_t, backend::DeviceBuffer>>
+      grid_bars;
 
   Program program;
   StreamPlan plan;
   std::vector<backend::StreamEvent> events;
+  // Device buffers for constants, reused across steps. See the use site.
+  std::unordered_map<ConstKey, backend::DeviceBuffer, ConstKeyHash> constants;
+  std::optional<ConstKey> pending_constant;
   // Streams still holding work from an earlier step. A plan covers one step,
   // so without this the first group a step puts on a stream would be ordered
   // against nothing at all — the previous step's work on every *other* stream
@@ -424,16 +464,78 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // literal, which leaves it "materialized" with no buffer at all. When a
     // later group binds it as a buffer instead, that fresh allocation holds
     // nothing — so the value has to be written whenever we allocate here.
-    const bool fresh = !n->buffer.valid();
-    if (fresh) {
+    bool fresh = !n->buffer.valid();
+    // A CONSTANT IS THE SAME BYTES EVERY STEP, so give it the same buffer.
+    //
+    // Rebuilding the graph each token hands every constant a node with no
+    // buffer, and binding one then allocated a fresh device buffer and refilled
+    // it from scratch. Measured on an 8-token run: 386 of 68,128 bindings were
+    // fresh, ALL of them constants, and they cost 249 ms of allocation (646 us
+    // apiece on this part) plus 81 ms of fill -- a third of the run's host
+    // time, spent reproducing bytes that had not changed.
+    //
+    // Keyed on what actually determines the contents: the value, the type, the
+    // count, and where it has to live. Held for the process, as weights are.
+    if (fresh && n->kind == OpKind::kConstant && !produced.contains(n.get())) {
+      const ConstKey key{n->attrs.empty() ? 0.0 : n->attrs[0], n->dtype,
+                         n->element_count(), member, stream.index};
+      if (const auto it = impl_->constants.find(key);
+          it != impl_->constants.end()) {
+        n->buffer = it->second;
+        n->materialized = true;
+        n->device_dirty = true;
+        n->host_dirty = false;
+        fresh = false;
+      } else {
+        LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, be, stream));
+        impl_->pending_constant = key;
+      }
+    } else if (fresh) {
       LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, be, stream));
     }
     if (fresh && n->kind == OpKind::kConstant) {
-      for (std::size_t e = 0; e < n->element_count(); ++e) {
-        interpreter::store_element(*n, e, n->attrs[0]);
+      // A constant is ONE value in every element, so writing it element by
+      // element does the dtype conversion once per element and nothing else.
+      // Measured on an 8-token run: 386 fills, 41,222,288 scalar stores, and
+      // `bind` -- the span --stats does not print -- was 64 ms of a 51 ms
+      // token. Encode the value once and double the pattern across the rest,
+      // which turns a scalar loop into memcpy at memory bandwidth.
+      const std::size_t count = n->element_count();
+      const std::size_t bytes = dtype_storage_bytes(n->dtype, count);
+      const std::size_t elem = count != 0 ? bytes / count : 0;
+      // Sub-byte storage packs several elements per byte, so a byte pattern is
+      // not one element wide and the doubling would corrupt it. Those keep the
+      // scalar path.
+      const bool byte_addressable = count != 0 && elem != 0 &&
+                                    elem * count == bytes;
+      if (byte_addressable) {
+        interpreter::store_element(*n, 0, n->attrs[0]);
+        auto* const base =
+            static_cast<std::byte*>(interpreter::host_bytes(*n));
+        if (base != nullptr) {
+          std::size_t filled = 1;
+          while (filled < count) {
+            const std::size_t chunk =
+                filled < count - filled ? filled : count - filled;
+            std::memcpy(base + filled * elem, base, chunk * elem);
+            filled += chunk;
+          }
+        }
+      } else {
+        for (std::size_t e = 0; e < count; ++e) {
+          interpreter::store_element(*n, e, n->attrs[0]);
+        }
       }
       n->materialized = true;
+      // The bytes are now correct on this node's buffer, so remember it: the
+      // next step's copy of this constant binds the same allocation and pays
+      // neither the 646 us allocation nor the refill.
+      if (impl_->pending_constant.has_value()) {
+        impl_->constants.emplace(*impl_->pending_constant, n->buffer);
+        impl_->pending_constant.reset();
+      }
     }
+    impl_->pending_constant.reset();
     // Weights and any host-computed input have to reach device memory before
     // the kernel reads them.
     LSE_RETURN_IF_ERROR(interpreter::sync_to_device(*n, be));
@@ -495,10 +597,24 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   }
 
   if (emitted->persist_grid) {
-    if (impl_->grid_bar.size() <= stream.index) {
-      impl_->grid_bar.resize(stream.index + 1);
+    if (impl_->grid_bars.size() <= stream.index) {
+      impl_->grid_bars.resize(stream.index + 1);
     }
-    backend::DeviceBuffer& bar_buf = impl_->grid_bar[stream.index];
+    // ONE COUNTER PER (stream, grid width), zeroed once.
+    //
+    // lse_grid_sync takes a ticket and waits for the round of `persist_wgs`
+    // that ticket falls in, so a running counter is fine -- that is the
+    // design. What is NOT fine is two kernels of DIFFERENT widths sharing one
+    // counter: their rounds are different sizes and each waits for a total the
+    // other will never produce. That, not co-residency, is what deadlocked the
+    // persistent path and kept it behind `const bool persist = false`.
+    //
+    // Keyed by width, so kernels that agree share and kernels that differ do
+    // not. Zeroed once per buffer rather than per dispatch: a host copy before
+    // every persistent launch cost more than the launches it saved.
+    const std::uint32_t width = emitted->dims.workgroup_count[0];
+    auto& bars = impl_->grid_bars[stream.index];
+    backend::DeviceBuffer& bar_buf = bars[width];
     if (!bar_buf.valid()) {
       auto bar = be.allocate(sizeof(std::uint32_t),
                                    backend::MemoryClass::kDevice);
@@ -514,13 +630,18 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   args.bindings = emitted->pointer_table ? table_bindings : bindings;
   args.constants = constants;
 
-  if (const char* want = std::getenv("LSE_DUMP_ENTRY")) {
+  // Read ONCE. getenv walks the environment block, and this sits in the
+  // per-dispatch path: at ~1857 dispatches a token it is pure overhead on
+  // every run, including the runs with no debugging enabled at all.
+  static const char* const dump_entry = std::getenv("LSE_DUMP_ENTRY");
+  if (const char* want = dump_entry) {
     if (emitted->entry_name.find(want) != std::string::npos) {
       std::fprintf(stderr, "--- %s ---\n%s---\n", emitted->entry_name.c_str(),
                    emitted->source.c_str());
     }
   }
-  if (std::getenv("LSE_TRACE_DISPATCH") != nullptr) {
+  static const bool trace_dispatch = std::getenv("LSE_TRACE_DISPATCH") != nullptr;
+  if (trace_dispatch) {
     std::fprintf(stderr, "dispatch %s phase=%d count=%u wg=%u x %u |",
                  emitted->entry_name.c_str(), (int)group.is_phase, count,
                  emitted->dims.workgroup_count[0], emitted->dims.workgroup_size[0]);
@@ -548,7 +669,8 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
   // this dispatch and prints a checksum and the first values of every bound
   // buffer, so a kernel's inputs and outputs can be compared across builds.
-  if (const char* want = std::getenv("LSE_DUMP_BUFFERS")) {
+  static const char* const dump_buffers = std::getenv("LSE_DUMP_BUFFERS");
+  if (const char* want = dump_buffers) {
     if (emitted->entry_name.find(want) != std::string::npos) {
       (void)be.synchronize();
       std::size_t bi = 0;
@@ -778,6 +900,45 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   // Saturating, so an overlap surfaces as a zero remainder rather than as a
   // number that would hide it. The spans are disjoint by construction; this is
   // the check on that, not a correction for it.
+  // LSE_TIME_SPANS=1: every span, summed over the process. --stats prints
+  // four of the twelve, and on the run being chased those four summed to
+  // 0.295 s against a prefill of 8.66 s -- so the time is in one of the eight
+  // it does not print, and `unattributed` is the one that says "nowhere the
+  // engine is looking".
+  if (std::getenv("LSE_TIME_SPANS") != nullptr) {
+    struct Totals {
+      std::uint64_t step = 0, partition = 0, schedule = 0, emit = 0;
+      std::uint64_t jit_lookup = 0, jit_compile = 0, bind = 0, submit = 0;
+      std::uint64_t host_exec = 0, host_wait = 0, readback = 0, unatt = 0;
+      std::uint64_t steps = 0;
+      ~Totals() {
+        const double k = 1e6;
+        std::fprintf(stderr,
+            "[spans] steps=%llu step=%.1f ms | partition=%.1f schedule=%.1f "
+            "emit=%.1f jit_lookup=%.1f jit_compile=%.1f bind=%.1f "
+            "submit=%.1f host_exec=%.1f host_wait=%.1f readback=%.1f "
+            "UNATTRIBUTED=%.1f\n",
+            (unsigned long long)steps, step / k, partition / k, schedule / k,
+            emit / k, jit_lookup / k, jit_compile / k, bind / k, submit / k,
+            host_exec / k, host_wait / k, readback / k, unatt / k);
+      }
+    };
+    static Totals t;
+    ++t.steps;
+    t.step += trace_.spans.step.ns;
+    t.partition += trace_.spans.partition.ns;
+    t.schedule += trace_.spans.schedule.ns;
+    t.emit += trace_.spans.emit.ns;
+    t.jit_lookup += trace_.spans.jit_lookup.ns;
+    t.jit_compile += trace_.spans.jit_compile.ns;
+    t.bind += trace_.spans.bind.ns;
+    t.submit += trace_.spans.submit.ns;
+    t.host_exec += trace_.spans.host_exec.ns;
+    t.host_wait += trace_.spans.host_wait.ns;
+    t.readback += trace_.spans.readback.ns;
+    t.unatt += trace_.spans.step.ns > attributed
+                   ? trace_.spans.step.ns - attributed : 0;
+  }
   trace_.spans.unattributed.add(trace_.spans.step.ns > attributed
                                     ? trace_.spans.step.ns - attributed
                                     : 0);
@@ -967,7 +1128,50 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           cand.solo_entries = cost.solo_entries;
           const opt::DeviceCapacity cap =
               opt::DeviceCapacity::of(backend().device_info());
-          if (!opt::admit_fusion(cap, cand).admit) return false;
+          const opt::FusionVerdict v = opt::admit_fusion(cap, cand);
+          // OCCUPANCY YOU CANNOT REACH IS NOT OCCUPANCY YOU LOSE.
+          //
+          // admit_fusion refuses a merge that seats fewer workgroups per LDS
+          // pool, and for a contraction it is right: profiled, the two big
+          // ones run 640- and 2176-workgroup grids, which fill every seat the
+          // part has several times over, so halving the seats halves the work
+          // in flight. That is the prefill regression the gate was built for.
+          //
+          // It is NOT right for a grid too small to fill the seats once. The
+          // small phase kernels here run 20 workgroups at 4.8-8.2 us, against
+          // a 6.44 us launch -- the launch costs more than the kernel -- and
+          // the seats a merge would give up are seats nothing was ever going
+          // to sit in.
+          //
+          // The grid comes from the emitter's own ThreadPlan, never from
+          // element counts: guessing outputs/threads read 20 workgroups for a
+          // kernel that launches 640, which let exactly the wrong merges
+          // through.
+          // OFF BY DEFAULT, and here is what it costs when it is on.
+          // Measured: 16 merges admitted this way, launches UNCHANGED at
+          // 37141, and throughput 20.8 -> 1.55 tok/s with `jit compile=0` and
+          // host scheduling at 0.295 s -- so the loss is pure execution, about
+          // 13x per merged kernel. Seats are not the only thing the refusal
+          // protects: the emitter may decline to give the merged body a GRID,
+          // and then every stage in the chunk runs on ONE workgroup. That
+          // property is not observable here, so until it is, this stays off.
+          static const bool seat_merge =
+              std::getenv("LSE_SEAT_MERGE") != nullptr;
+          bool admit = v.admit;
+          if (seat_merge && !admit && v.fused.workgroups_per_pool > 0 &&
+              cost.workgroups != 0) {
+            const backend::DeviceInfo& di = backend().device_info();
+            const std::uint32_t pools =
+                di.cus_per_lds_pool > 0
+                    ? static_cast<std::uint32_t>(di.compute_units) /
+                          di.cus_per_lds_pool
+                    : static_cast<std::uint32_t>(di.compute_units);
+            const std::uint64_t seats =
+                static_cast<std::uint64_t>(pools) *
+                v.fused.workgroups_per_pool;
+            if (seats != 0 && cost.workgroups <= seats) admit = true;
+          }
+          if (!admit) return false;
         }
         prev.nodes.push_back(n);
         prev.outputs.push_back(n);
@@ -1052,7 +1256,14 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         }
         if (staged.nodes.empty()) {
           staged_grid = fat;
-          staged_lane = staging->lane_stage(*n);
+          // From the STORE pattern: what the chunk needs to know about its
+          // first stage is whether a later stage can read its output at its
+          // own index, which is a question about the store. Seeding from
+          // lane_stage asked about the LOAD too, so a cooperative reduction
+          // marked the chunk non-lane on arrival and every following stage
+          // then failed lane_fits -- which is what held 59% of launches to a
+          // single node.
+          staged_lane = staging->lane_writes(*n);
           staged_fused = false;
         } else {
           staged_lane = lane_fits;
@@ -1122,7 +1333,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       trace_.streams_used = impl_->plan.streams_used;
       trace_.stream_waits = impl_->plan.waits_total;
       trace_.stream_chain = impl_->plan.chain;
-      if (std::getenv("LSE_DEBUG_PLACEMENT") != nullptr) {
+      static const bool dbg_placement =
+          std::getenv("LSE_DEBUG_PLACEMENT") != nullptr;
+      if (dbg_placement) {
         static int dbg_steps = 0;
         if (dbg_steps < 4) {
           ++dbg_steps;
@@ -1315,7 +1528,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           }
         }
         if (!st.ok()) {
-          if (std::getenv("LSE_DEBUG_PHASES") != nullptr) {
+          static const bool dbg_phases =
+              std::getenv("LSE_DEBUG_PHASES") != nullptr;
+          if (dbg_phases) {
             std::fprintf(stderr, "phase dispatch failed: %s\n",
                          st.to_string().c_str());
           }

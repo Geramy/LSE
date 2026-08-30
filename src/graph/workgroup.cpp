@@ -567,9 +567,21 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots) {
 
   std::unordered_map<std::size_t, std::vector<std::uint32_t>> free;
   std::vector<std::uint32_t> slot_last(0);
+  // Recycling a slot across a cut boundary is safe ONLY because a launch
+  // boundary is a grid-wide barrier. Fuse two cuts into one kernel and the
+  // shared allocation becomes an intra-launch write-after-read between
+  // workgroups, which __syncthreads cannot order -- that is the hazard
+  // `a_stage_that_reads_a_broadcast_operand_is_not_a_lane_stage` pins, and it
+  // is what forces lane_stage to judge a stage by its READ as well as its
+  // store, which in turn is what keeps 59% of launches at one node.
+  //
+  // These slots are ordinary device buffers, not LDS, so declining to reuse
+  // them costs memory rather than occupancy: activations are ~20 KB each.
+  // LSE_NO_SLOT_REUSE=1 buys the fusion freedom with that memory.
+  static const bool no_reuse = std::getenv("LSE_NO_SLOT_REUSE") != nullptr;
   auto take = [&](std::size_t bytes) -> std::uint32_t {
     auto& bin = free[bytes];
-    if (!bin.empty()) {
+    if (!no_reuse && !bin.empty()) {
       const std::uint32_t id = bin.back();
       bin.pop_back();
       ++reused_;

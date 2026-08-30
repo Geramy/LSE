@@ -338,9 +338,26 @@ void write_text(const fs::path& path, std::string_view text) {
 
 void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key) {
   if (emitted.source.empty()) return;
+  // DECIDE CHEAPLY, THEN DO THE WORK. This runs once per dispatch -- ~1857 a
+  // decode token, 9343 in a 201-token prefill -- and every one of those calls
+  // used to getenv for the directory, build a fs::path and a std::string from
+  // it, copy and sanitise the entry name, take a mutex and hash the string,
+  // only to find it had already written that file. The dedup now happens
+  // first, on the key it is already given, so a repeat costs one integer hash.
+  // Dedup FIRST, on the key we are already given: a repeat then costs one
+  // integer hash instead of a getenv, a path, a string copy and a string hash.
+  // The directory is resolved only on the write path, because it comes from
+  // the environment and a caller may point it somewhere new between calls --
+  // caching it broke `debug_writes_generated_hip_for_review`, which does
+  // exactly that.
+  {
+    static std::mutex seen_mu;
+    static std::unordered_set<std::uint64_t> seen;
+    const std::lock_guard<std::mutex> lock(seen_mu);
+    if (!seen.insert(key).second) return;
+  }
   const fs::path dir = hip_dump_directory();
   if (dir.empty()) return;
-
   std::string name = emitted.entry_name.empty()
                          ? ("kernel_" + std::to_string(key))
                          : emitted.entry_name;
@@ -349,13 +366,6 @@ void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key) {
           c == '-' || c == '.')) {
       c = '_';
     }
-  }
-
-  static std::mutex mu;
-  static std::unordered_set<std::string> written;
-  {
-    std::lock_guard<std::mutex> lock(mu);
-    if (!written.insert(name).second) return;
   }
 
   std::error_code ec;
