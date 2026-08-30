@@ -544,12 +544,26 @@ void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
   std::vector<kir::LValue<kir::f32>> facc;
   facc.reserve(acc.size());
   for (std::size_t r = 0; r < acc.size(); ++r) facc.push_back(e.var(e.f32(0.0f)));
-  for (std::uint32_t u = 0; u < count; ++u) {
-    const auto chunk = e.let(chunk0 + u);
+  // ONE WIDE LOAD, not `count` scalar ones.
+  //
+  // `count` is already chunks_per_step(d, device_load_bytes) -- the unroll was
+  // sized to the device's widest load -- but the body then read
+  // packed[row_base + chunk0 + u] once per u, and the emitter has no way to
+  // merge four dword loads after the fact. The addresses are contiguous and
+  // 4-aligned by construction (row_base is a multiple of the row stride and
+  // chunk0 steps by the same count), so this is exactly one dwordx4.
+  //
+  // It matters because these ARE the kernel's global traffic: decode reached
+  // ~219 GB/s of a measured 1147 GB/s part, and scalar dword loads cap around
+  // that fraction of peak on this hardware whatever the occupancy -- an LDS
+  // budget sweep moved nothing, which is what ruled occupancy out.
+  const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
+  for (auto uu : e.unroll(count)) {
+    const auto chunk = e.let(chunk0 + uu);
     // Read once, spend on every row this workgroup owns. This is the whole
     // point of the row tile: the weight word and its two unpacked planes do
     // not depend on the row, and they are the only global traffic in here.
-    const auto word = e.let(a.packed[row_base + chunk]);
+    const auto word = e.let(words[uu]);
     const auto slot = e.let(chunk * 2u);
     std::array<kir::Val<kir::u32>, 2> planes;
     for (std::size_t p = 0; p < 2; ++p) {
