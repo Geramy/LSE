@@ -551,17 +551,50 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     DispatchArgs args;
     args.bindings = refs;
 
+    // WARM THE CLOCKS BEFORE TIMING THEM.
+    //
+    // One rep is 2*256*256*1024 = 134 MFLOP, so eight of them are microseconds
+    // of work. A GPU sitting at its idle DPM state -- 41 MHz on this part
+    // against a 2905 MHz peak -- never leaves it in that window, and the rate
+    // this reported was the rate of a parked card: 6.17 TFLOP/s "measured" for
+    // f16 on a part rated 191 TFLOPS, and 7.02 for i8. Both are provably wrong
+    // rather than merely low: a real prefill sustains 18.2 TFLOP/s, which is
+    // 259% of a "peak" nothing can exceed.
+    //
+    // This matters past the printout. opt::arrangement and opt::admit_fusion
+    // price every fusion and tile decision against these figures, so an
+    // under-measured compute rate tells the whole optimizer that compute is
+    // scarce on a part where it is abundant.
     Status status = be_.launch(kernel, dims, args);
     if (status.ok()) status = be_.synchronize();
     if (status.ok()) {
+      // Sustained load until the governor has had time to ramp, then a timed
+      // window long enough that the ramp is not inside it.
+      constexpr double kWarmNs = 40e6;   // 40 ms
+      constexpr double kMinNs = 20e6;    // 20 ms of timed work
+      const auto warm0 = Clock::now();
+      while (status.ok() && ns_since(warm0) < kWarmNs) {
+        for (int r = 0; r < kRateReps && status.ok(); ++r) {
+          status = be_.launch(kernel, dims, args);
+        }
+        if (status.ok()) status = be_.synchronize();
+      }
+      int reps = 0;
       const auto t0 = Clock::now();
-      for (int r = 0; r < kRateReps && status.ok(); ++r) {
-        status = be_.launch(kernel, dims, args);
+      while (status.ok() && ns_since(t0) < kMinNs) {
+        for (int r = 0; r < kRateReps && status.ok(); ++r) {
+          status = be_.launch(kernel, dims, args);
+          ++reps;
+        }
+        if (status.ok()) status = be_.synchronize();
       }
       if (status.ok()) status = be_.synchronize();
       const double ns = ns_since(t0);
       if (status.ok() && ns > 0.0) {
-        const double flops = 2.0 * kRateM * kRateN * kRateK * kRateReps;
+        // `reps` actually issued, not the batch constant: the timed window
+        // now runs as many batches as it needs to fill 20 ms.
+        const double flops =
+            2.0 * kRateM * kRateN * kRateK * static_cast<double>(reps);
         rate.flops = probe::Measured::measured(flops * 1e9 / ns);
         rate.support = probe::RowSupport::kMeasured;
       }
