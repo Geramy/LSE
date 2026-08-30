@@ -4,9 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 // host_bytes / sync_to_device: a checkpoint tensor is host data and Array has
@@ -42,6 +42,69 @@ struct LoadReport {
   }
 };
 const LoadReport g_load_report{};
+
+// Weights get windows of a few big allocations, not one allocation each.
+//
+// Every device allocation is a driver round trip, and the cost is per CALL,
+// not per byte: on this box it measured 13.7 ms apiece, so 1847 tensors spent
+// 25 s in allocation alone against 2.2 s to read the checkpoint and 0.5 s to
+// upload it. That dominated model load, and on two GPUs -- twice the
+// allocations, both waited on -- it pushed load past any sane timeout and read
+// as a hang. Slabbing makes the count scale with total bytes instead of with
+// how finely the checkpoint is split.
+//
+// Lifetime is unchanged: a weight buffer is written once and read until the
+// process exits, and the per-tensor allocations were never released either.
+// The slabs outlive every window by construction, so a window can never
+// outlive its memory.
+struct WeightSlab {
+  const backend::IBackend* be = nullptr;
+  std::uint32_t stream = 0;
+  backend::DeviceBuffer base;
+  std::size_t used = 0;
+};
+
+Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
+                                          backend::IBackend& be,
+                                          backend::Stream at) {
+  // 4 KiB keeps every window page-aligned, which is the strictest alignment
+  // any kernel here asks of a binding.
+  constexpr std::size_t kAlign = 4096;
+  constexpr std::size_t kSlab = std::size_t{512} << 20;
+  static std::mutex mu;
+  static std::vector<WeightSlab> slabs;
+  const std::size_t need = (bytes + kAlign - 1) & ~(kAlign - 1);
+
+  const std::lock_guard lock(mu);
+  WeightSlab* use = nullptr;
+  for (WeightSlab& s : slabs) {
+    if (s.be == &be && s.stream == at.index &&
+        s.used + need <= s.base.size_bytes) {
+      use = &s;
+      break;
+    }
+  }
+  if (use == nullptr) {
+    // A tensor bigger than the slab gets its own exact-sized one rather than
+    // rounding a single embedding table up to the next slab boundary.
+    const std::size_t want = need > kSlab ? need : kSlab;
+    auto got = be.allocate(want, backend::MemoryClass::kDevice, at);
+    if (!got.ok()) return got.status();
+    WeightSlab made;
+    made.be = &be;
+    made.stream = at.index;
+    made.base = got.release();
+    slabs.push_back(std::move(made));
+    use = &slabs.back();
+  }
+  // A view: same allocation, same residency and member, its own window. This
+  // is the shape DeviceBuffer already documents for a reshape's alias.
+  backend::DeviceBuffer view = use->base;
+  view.offset = use->base.offset + use->used;
+  view.size_bytes = bytes;
+  use->used += need;
+  return view;
+}
 }  // namespace
 
 
@@ -128,7 +191,10 @@ Result<Array> upload(const TensorView& v, Shape shape,
   Array a = [&]{ Phase z{zsink}; return Array::zeros(shape, dt); }();
   graph::Node& n = *a.node();
   { Phase b{&g_load_buf_ms};
-    LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, be, at)); }
+    auto win = slab_window(dtype_storage_bytes(n.dtype, n.element_count()),
+                           be, at);
+    if (!win.ok()) return win.status();
+    n.buffer = win.release(); }
   const bool native = dt == v.dtype;
 
   if (order == nullptr && win_count <= 0) {
