@@ -233,17 +233,24 @@ Result<Array> MtpModule::record(std::int64_t rows) {
   // Only the last row proposes: the earlier rows of a pass are there to put
   // their own positions in the module's KV, and running the 248k-wide head over
   // them would cost more than the module itself.
-  Array last = graph::reshape(graph::slice(x, 1, rows - 1, rows),
-                              Shape{1, hidden});
+  Array last_rows = graph::slice(x, 1, rows - 1, rows);
+  // Kept as a pass output: a CHAIN of drafts feeds this back in as the next
+  // row's hidden, because the decoder has not run at the drafted position and
+  // the module's own representation is the only hidden that exists there.
+  // The SLICE is kept rather than the reshape below: a reshape is a view, and
+  // a view as a root aliases its source instead of materializing, so there is
+  // nothing on it for the host to read back.
+  pass_.last = last_rows;
+  Array last = graph::reshape(last_rows, Shape{1, hidden});
   LSE_ASSIGN_OR(Array logits, model_->lm_head(last));
   Array pick = graph::argmax(logits);
   if (!pick.valid()) return LSE_ERROR(kInternal, "argmax over an empty row");
   return pick;
 }
 
-Result<std::uint32_t> MtpModule::draft(std::span<const float> hidden,
-                                       std::span<const std::uint32_t> tokens,
-                                       std::int32_t first) {
+Result<std::uint32_t> MtpModule::draft_pass(
+    std::span<const float> hidden, std::span<const std::uint32_t> tokens,
+    std::int32_t first) {
   if (tokens.empty()) {
     return LSE_ERROR(kInvalidArgument, "an MTP pass needs at least one row");
   }
@@ -280,6 +287,11 @@ Result<std::uint32_t> MtpModule::draft(std::span<const float> hidden,
     LSE_ASSIGN_OR(pool_moved, ops::extend_paged(state_.paged, after));
   }
 
+  if (pass_.rows != rows && pass_.rows != 0) {
+    Pass parked = std::move(passes_[rows]);
+    passes_[pass_.rows] = std::move(pass_);
+    pass_ = std::move(parked);
+  }
   const bool leaves_match =
       pass_.keys == (state_.key_cache.valid() ? state_.key_cache.node().get()
                                               : nullptr) &&
@@ -320,6 +332,7 @@ Result<std::uint32_t> MtpModule::draft(std::span<const float> hidden,
     LSE_RETURN_IF_ERROR(poke(pass_.tokens, ids));
 
     std::vector<graph::NodePtr> roots{pass_.pick.node()};
+    if (pass_.last.valid()) roots.push_back(pass_.last.node());
     for (const Array& a : {state_.key_cache, state_.value_cache}) {
       if (a.valid() && a.node() && !a.node()->materialized) {
         roots.push_back(a.node());
@@ -336,6 +349,46 @@ Result<std::uint32_t> MtpModule::draft(std::span<const float> hidden,
   position_ = after;
   return static_cast<std::uint32_t>(
       graph::interpreter::load_element(*pass_.pick.node(), 0));
+}
+
+Result<std::uint32_t> MtpModule::draft(std::span<const float> hidden,
+                                       std::span<const std::uint32_t> tokens,
+                                       std::int32_t first) {
+  return draft_pass(hidden, tokens, first);
+}
+
+Result<std::vector<std::uint32_t>> MtpModule::draft_chain(
+    std::span<const float> hidden, std::span<const std::uint32_t> tokens,
+    std::int32_t first, std::uint32_t depth) {
+  std::vector<std::uint32_t> out;
+  if (depth == 0) return out;
+  out.reserve(depth);
+  LSE_ASSIGN_OR(std::uint32_t got, draft_pass(hidden, tokens, first));
+  out.push_back(got);
+  const auto width = static_cast<std::size_t>(config_.hidden_size);
+  std::vector<float> own(width);
+  for (std::uint32_t i = 1; i < depth; ++i) {
+    // The module's hidden for the row it just drafted, read back as the next
+    // row's input. One row per pass from here on, and every pass past the
+    // first reuses the same recorded one-row program.
+    if (!pass_.last.valid()) {
+      return LSE_ERROR(kInternal, "the draft pass kept no hidden to chain on");
+    }
+    graph::Scheduler* sched = graph::default_scheduler();
+    if (sched == nullptr) {
+      return LSE_ERROR(kInternal, "no backend to read the draft hidden");
+    }
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(
+        *pass_.last.node(), sched->backend()));
+    LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
+        *pass_.last.node(), own.data(), own.size() * sizeof(float)));
+    const std::uint32_t tok = out.back();
+    LSE_ASSIGN_OR(got, draft_pass(std::span<const float>(own),
+                                  std::span<const std::uint32_t>(&tok, 1),
+                                  position_));
+    out.push_back(got);
+  }
+  return out;
 }
 
 }  // namespace lse::model

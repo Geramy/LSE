@@ -295,25 +295,32 @@ Result<std::vector<float>> Generator::step(
   return out;
 }
 
-Result<Generator::Verified> Generator::verify(Session& session,
-                                             std::uint32_t a, std::uint32_t b,
-                                             bool replaces_previous) {
+Status Generator::verify(Session& session,
+                         std::span<const std::uint32_t> rows,
+                         bool replaces_previous) {
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
     return LSE_ERROR(kInternal, "no usable backend for the verify pass");
   }
+  const auto m = static_cast<std::int64_t>(rows.size());
+  if (spec_ids_.valid() &&
+      spec_ids_.shape().elem_count() != rows.size()) {
+    spec_ids_ = graph::Array{};
+    spec_ = SpecHead{};
+  }
   if (!spec_ids_.valid()) {
-    const std::size_t bytes = dtype_storage_bytes(DType::kF32, 2);
+    const std::size_t bytes = dtype_storage_bytes(DType::kF32, rows.size());
     auto buf = sched->backend().allocate(bytes, backend::MemoryClass::kDevice);
     if (!buf.ok()) return buf.status();
-    spec_ids_ = Array::from_buffer(buf.release(), Shape{1, 2}, DType::kF32);
+    spec_ids_ = Array::from_buffer(buf.release(), Shape{1, m}, DType::kF32);
   }
   {
     graph::Node& n = *spec_ids_.node();
     const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
     if (n.host_mirror.size() < bytes) n.host_mirror.resize(bytes);
-    graph::interpreter::store_element(n, 0, static_cast<float>(a));
-    graph::interpreter::store_element(n, 1, static_cast<float>(b));
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      graph::interpreter::store_element(n, i, static_cast<float>(rows[i]));
+    }
     n.materialized = true;
   }
 
@@ -331,8 +338,8 @@ Result<Generator::Verified> Generator::verify(Session& session,
     spec_ = SpecHead{};
     spec_.hidden = hidden;
     spec_.greedy = greedy;
-    // [1, 2, D] -> [1, 2, vocab]: both rows go through the head, because the
-    // second row's logits are what a verified proposal buys.
+    // [1, m, D] -> [1, m, vocab]: every row goes through the head, because
+    // each verified proposal buys its own row of logits.
     LSE_ASSIGN_OR(spec_.logits, model_.lm_head(hidden));
     spec_.compute = {spec_.logits.node()};
     if (greedy) {
@@ -352,13 +359,7 @@ Result<Generator::Verified> Generator::verify(Session& session,
   const graph::NodePtr roots[] = {root.node()};
   LSE_RETURN_IF_ERROR(sched->eval(roots, true, &spec_.program));
 
-  Verified out;
-  if (greedy) {
-    out.first = static_cast<std::uint32_t>(
-        graph::interpreter::load_element(*spec_.pick.node(), 0));
-    out.second = static_cast<std::uint32_t>(
-        graph::interpreter::load_element(*spec_.pick.node(), 1));
-  } else {
+  if (!greedy) {
     LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(
         *spec_.logits.node(), sched->backend()));
     spec_logits_.resize(spec_.logits.shape().elem_count());
@@ -369,20 +370,24 @@ Result<Generator::Verified> Generator::verify(Session& session,
   LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
   stats_.spec_verify_ns += now_ns() - started;
   ++stats_.spec_verify_passes;
-  return out;
+  return OkStatus();
 }
 
-// Two tokens per decoder pass: the module proposes the second, the decoder
-// verifies it in the same pass, and a rejected proposal is undone by replaying
-// the pass with the decoder's own token in its place.
+// Up to depth+1 tokens per decoder pass. The module proposes a CHAIN of
+// depth tokens, the decoder answers every row of the pass, and the answers
+// are emitted while they keep agreeing with the chain. The first disagreement
+// ends the pass\'s harvest: the rows past it consumed wrong inputs, so the
+// pass is rewound and re-run with the corrected prefix spliced in and fresh
+// drafts filling the tail -- the redo IS the next speculation round, and its
+// leading rows re-derive tokens already emitted, which the scan skips.
 //
 // The undo is why this is a pass and not a snapshot. After a pass the carried
-// recurrent state still sits where that pass started from — the produced state
-// lives on the other node of the carry pair and is not folded across until the
-// next step — so re-running the pass from the same input with the corrected
-// token reproduces exactly what a non-speculating decode would have carried.
-// The paged KV needs no more than its cursor put back: the redo overwrites the
-// same two slots.
+// recurrent state still sits where that pass started from -- the produced
+// state lives on the other node of the carry pair and is not folded across
+// until the next step -- so re-running from the same input with corrected
+// tokens reproduces exactly what a non-speculating decode would have carried.
+// The paged KV needs no more than its cursor put back: the redo overwrites
+// the same slots.
 Result<std::vector<std::uint32_t>> Generator::speculate(
     Session& session, std::vector<float>& prefill_logits,
     const GenerationLimits& limits, const TokenCallback& on_token) {
@@ -390,13 +395,26 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   generated.reserve(static_cast<std::size_t>(std::max(limits.max_tokens, 0)));
   if (limits.max_tokens <= 0) return generated;
 
+  // How many tokens the module proposes per pass. Depth 1 is the classic
+  // two-row step and the default: a deeper chain harvests more tokens per
+  // pass (3.2 at depth 3 on a high-acceptance prompt, against 1.6), but the
+  // decode GEMVs scale with ROWS -- their cost is the dequant and dot ALU per
+  // row, not the weight stream -- so today the bigger pass gives back exactly
+  // what the harvest gains. The depth becomes profitable the day the m=4
+  // pass costs close to the m=2 one. Keep it a power of two minus one: pass
+  // width is depth+1, and a width off the batch-rung ladder repartitions
+  // every step (measured 2.2 s per pass at width 3).
+  const std::uint32_t depth = [] {
+    const char* v = std::getenv("LSE_SPEC_DEPTH");
+    const long n = v != nullptr ? std::strtol(v, nullptr, 10) : 1;
+    return static_cast<std::uint32_t>(std::clamp(n, 1L, 7L));
+  }();
+  const std::size_t m = depth + 1;
+
   const auto is_stop = [&limits](std::uint32_t id) {
     return std::find(limits.stop_tokens.begin(), limits.stop_tokens.end(), id) !=
            limits.stop_tokens.end();
   };
-  // Emits one token. False means generation is over, either because this one
-  // is a stop token (which is not emitted), the caller cancelled, or the limit
-  // is reached.
   const auto give = [&](std::uint32_t id) {
     if (is_stop(id)) return false;
     generated.push_back(id);
@@ -405,63 +423,112 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     if (on_token && !on_token(id)) return false;
     return static_cast<std::int32_t>(generated.size()) < limits.max_tokens;
   };
+  // The decoder\'s answer for row i of the pass just verified.
+  const auto answer = [&](std::size_t i) -> std::uint32_t {
+    if (spec_.greedy) {
+      return static_cast<std::uint32_t>(
+          graph::interpreter::load_element(*spec_.pick.node(), i));
+    }
+    const std::size_t v = spec_logits_.size() / m;
+    return sampler_.sample(std::span<float>(spec_logits_.data() + i * v, v),
+                           session.history());
+  };
 
   std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
   bool running = give(pending);
-  // The module's first row: the last prompt position's hidden state paired
-  // with the token the decoder just produced there.
-  std::uint32_t draft = 0;
+
+  std::vector<std::uint32_t> row_in;   // the m tokens the next pass consumes
+  std::size_t already = 0;             // leading answers already emitted
   if (running) {
     const std::uint64_t started = now_ns();
-    LSE_ASSIGN_OR(draft,
-                  mtp_->draft(prefill_tail_, std::span(&pending, 1),
-                              static_cast<std::int32_t>(session.position())));
+    LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
+                  mtp_->draft_chain(prefill_tail_, std::span(&pending, 1),
+                                    static_cast<std::int32_t>(session.position()),
+                                    depth));
     stats_.spec_draft_ns += now_ns() - started;
+    row_in.assign(1, pending);
+    row_in.insert(row_in.end(), chain.begin(), chain.end());
   }
 
+  bool replaces = false;
   while (running) {
     const auto at = static_cast<std::int32_t>(session.position());
-    LSE_ASSIGN_OR(Verified v, verify(session, pending, draft, false));
+    LSE_RETURN_IF_ERROR(verify(session, row_in, replaces));
     ++stats_.spec_steps;
 
-    std::uint32_t first = v.first;
-    if (!spec_.greedy) {
-      first = sampler_.sample(
-          std::span<float>(spec_logits_.data(), spec_logits_.size() / 2),
-          session.history());
+    // Harvest: emit answers while the chain keeps being right. Rows below
+    // `already` re-derive tokens a previous harvest emitted; skip them.
+    std::size_t emitted_to = already;   // rows whose answers are now emitted
+    bool mismatch = false;
+    std::vector<std::uint32_t> answers(m, 0);
+    // Rows below `already` re-derive tokens a previous harvest emitted; their
+    // answers are the inputs the splice put in the NEXT rows. Recording them
+    // here keeps every later consumer of `answers` -- a second splice, the
+    // module's catch-up chain -- honest. Leaving them zero corrupted both.
+    for (std::size_t i = 0; i < already; ++i) answers[i] = row_in[i + 1];
+    for (std::size_t i = already; i < m; ++i) {
+      answers[i] = answer(i);
+      running = give(answers[i]);
+      emitted_to = i + 1;
+      if (!running) break;
+      if (i + 1 < m) {
+        if (answers[i] == row_in[i + 1]) {
+          ++stats_.spec_accepted;
+        } else {
+          mismatch = true;
+          break;
+        }
+      }
     }
-    const bool accepted = first == draft;
-    if (accepted) ++stats_.spec_accepted;
-
-    running = give(first);
     if (!running) {
-      session.advance(2);
+      session.advance(static_cast<std::int32_t>(m));
       break;
     }
-    if (!accepted) {
-      // The proposal was wrong, so the pass that consumed it is discarded and
-      // re-run with the decoder's own token. Positions go back first: the pass
-      // must land on the same two KV slots.
-      model_.rewind(session.states(), at);
-      LSE_ASSIGN_OR(v, verify(session, pending, first, true));
+
+    if (!mismatch) {
+      // Every row agreed: the pass stands, and the module catches up on the
+      // decoder\'s hiddens for all of it before chaining the next proposals.
+      session.advance(static_cast<std::int32_t>(m));
+      pending = answers[m - 1];
+      std::vector<std::uint32_t> caught(answers.begin(), answers.end());
+      const std::uint64_t drafted = now_ns();
+      LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
+                    mtp_->draft_chain(spec_hidden_, caught, at + 1, depth));
+      stats_.spec_draft_ns += now_ns() - drafted;
+      row_in.assign(1, pending);
+      row_in.insert(row_in.end(), chain.begin(), chain.end());
+      already = 0;
+      replaces = false;
+      continue;
     }
 
-    std::uint32_t second = v.second;
-    if (!spec_.greedy) {
-      second = sampler_.sample(
-          std::span<float>(spec_logits_.data() + spec_logits_.size() / 2,
-                           spec_logits_.size() / 2),
-          session.history());
+    // Rows past the disagreement consumed wrong inputs. Rewind, splice the
+    // corrected prefix, chain fresh drafts for the tail, and let the redo be
+    // the next round: its leading rows re-derive what was already emitted.
+    model_.rewind(session.states(), at);
+    const std::size_t good = emitted_to;   // answers[0..good-1] are emitted
+    std::vector<std::uint32_t> next;
+    next.reserve(m);
+    next.push_back(row_in[0]);
+    for (std::size_t i = 0; i < good; ++i) next.push_back(answers[i]);
+    const std::uint32_t need =
+        static_cast<std::uint32_t>(m - next.size());
+    if (need > 0) {
+      const auto width = static_cast<std::size_t>(
+          spec_hidden_.size() / m);
+      const std::uint64_t drafted = now_ns();
+      LSE_ASSIGN_OR(
+          std::vector<std::uint32_t> chain,
+          mtp_->draft_chain(
+              std::span<const float>(spec_hidden_.data(), good * width),
+              std::span<const std::uint32_t>(answers.data(), good), at + 1,
+              need));
+      stats_.spec_draft_ns += now_ns() - drafted;
+      next.insert(next.end(), chain.begin(), chain.end());
     }
-    session.advance(2);
-    running = give(second);
-    pending = second;
-    if (!running) break;
-
-    const std::uint32_t pair[] = {first, second};
-    const std::uint64_t drafted = now_ns();
-    LSE_ASSIGN_OR(draft, mtp_->draft(spec_hidden_, pair, at + 1));
-    stats_.spec_draft_ns += now_ns() - drafted;
+    row_in = std::move(next);
+    already = good;
+    replaces = true;
   }
 
   // A step that stopped between its two halves left the decoder holding one

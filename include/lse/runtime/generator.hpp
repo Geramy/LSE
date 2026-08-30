@@ -202,16 +202,15 @@ class Generator {
   // What one verify pass answered: the decoder's own tokens at the two
   // positions it covered. `second` is only the true continuation when the
   // proposal at the first position was accepted or the pass was a redo.
-  struct Verified {
-    std::uint32_t first = 0;
-    std::uint32_t second = 0;
-  };
-  // Runs [a, b] at the session's current position. `replaces_previous` says
-  // this pass stands in for the one that just ran rather than following it,
-  // which is how a rejected proposal is undone: the decoder's carried state is
-  // still the one that pass started from.
-  Result<Verified> verify(Session& session, std::uint32_t a, std::uint32_t b,
-                          bool replaces_previous);
+// Runs the given row tokens at the session's current position and leaves the
+  // per-row answers readable: the greedy picks in spec_, the raw logits in
+  // spec_logits_ otherwise, and every row's hidden in spec_hidden_.
+  // `replaces_previous` says this pass stands in for the one that just ran
+  // rather than following it, which is how a rejected proposal is undone: the
+  // decoder's carried state is re-derived from the same starting point with
+  // the corrected tokens in place.
+  Status verify(Session& session, std::span<const std::uint32_t> rows,
+                bool replaces_previous);
   static Status read_hidden(const graph::Array& hidden,
                             std::vector<float>* out);
   Status mtp_prefill_chunk(const graph::Array& hidden,

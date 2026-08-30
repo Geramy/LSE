@@ -14,7 +14,9 @@
 // quantized per WMMA K slice rather than per group: the step has to be
 // constant across the sixteen values one instruction consumes or it cannot be
 // factored out of the integer accumulator at all.
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -539,9 +541,17 @@ const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
   const Dims d = dims_of(s);
   if (!d.valid || s.device == nullptr || s.intrinsics == nullptr) return nullptr;
 
-  // One row is decode, and decode is bandwidth bound: a 16x16 tile would mask
-  // fifteen of its rows to move the same weights. The scalar path keeps it.
-  if (d.m < kTileM) return nullptr;
+  // One row is decode, and a 16x16 tile would mask fifteen of its rows to
+  // move the same weights -- but the dot4 path's cost is the dequant and dot
+  // ALU per ROW, not the weight stream (measured: its GEMVs double from m=2
+  // to m=4), so the crossover to the matrix core sits well below a full
+  // tile. LSE_WMMA_MIN_M overrides the threshold for measurement.
+  static const std::uint32_t min_m = [] {
+    const char* v = std::getenv("LSE_WMMA_MIN_M");
+    const long n = v != nullptr ? std::strtol(v, nullptr, 10) : kTileM;
+    return static_cast<std::uint32_t>(std::clamp(n, 1L, 1024L));
+  }();
+  if (d.m < min_m) return nullptr;
 
   const std::optional<math::MatrixTarget> target = matrix_target(*s.device);
   if (!target.has_value()) return nullptr;

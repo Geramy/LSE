@@ -21,6 +21,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "lse/core/status.hpp"
@@ -55,6 +56,16 @@ class MtpModule {
                               std::span<const std::uint32_t> tokens,
                               std::int32_t first);
 
+  // A chain of `depth` proposals from one starting context. The first is the
+  // pass above; each later one feeds the module its OWN last-row hidden for
+  // the row it just drafted -- the decoder has not run there, so the module's
+  // representation is the only hidden that exists. Rows land in the module's
+  // KV as they are drafted; a rejected suffix is simply overwritten by the
+  // next chain, exactly as a rejected single draft is today.
+  Result<std::vector<std::uint32_t>> draft_chain(
+      std::span<const float> hidden, std::span<const std::uint32_t> tokens,
+      std::int32_t first, std::uint32_t depth);
+
   // Drops the module's KV. The decoder's session and this must be cleared
   // together or the module drafts against another conversation's prefix.
   void reset();
@@ -66,6 +77,11 @@ class MtpModule {
  private:
   Status build(WeightBinder& binder);
   Result<graph::Array> record(std::int64_t rows);
+  // One draft pass over `tokens.size()` rows; fills pass_ and returns the
+  // proposal. The module's last-row hidden is left readable in pass_.last.
+  Result<std::uint32_t> draft_pass(std::span<const float> hidden,
+                                   std::span<const std::uint32_t> tokens,
+                                   std::int32_t first);
 
   std::string path_;
   // The parent's config with the module's own one-layer stack in it: the
@@ -86,11 +102,16 @@ class MtpModule {
     graph::Array tokens;   // [1, T] leaf, poked
     graph::Array meta;     // kv::step_meta_elems(1) leaf, poked
     graph::Array pick;
+    graph::Array last;     // [1, D]: the block's hidden for the drafted row
     std::int64_t rows = 0;
     graph::Node* keys = nullptr;
     graph::Node* values = nullptr;
   };
   Pass pass_;
+  // Chained drafting alternates a catch-up pass of several rows with one-row
+  // passes; one slot would rebuild the recorded program on every switch, so
+  // parked passes live here keyed by their row count.
+  std::unordered_map<std::int64_t, Pass> passes_;
 };
 
 }  // namespace lse::model
