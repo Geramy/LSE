@@ -512,6 +512,78 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
   e.barrier();
 }
 
+// All rows in ONE loop, loads first. Staging the rows one call each gave the
+// scheduler a fetch immediately consumed by its own quantization, and the ISA
+// showed what that costs: two loads in flight, then a full stop
+// (s_wait_loadcnt 0x0) once per chunk per row. Fetching every row\'s vector
+// before any of the math issues rows-times the loads back to back, which is
+// the latency hiding a DRAM-cold pass actually needs -- the standalone
+// replica\'s fill, written exactly this way, keeps eight loads in flight and
+// costs nothing. One barrier at the end instead of one per row.
+template <class A>
+void stage_dot_acts_all(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
+                        const kir::Val<kir::u32>& row,
+                        std::uint32_t rows, std::uint32_t m_rows,
+                        std::span<const DotActs> q,
+                        const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
+                        std::uint32_t cpg, std::uint32_t max_bytes,
+                        std::uint32_t k, bool staged_row) {
+  constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
+  constexpr float kAmaxFloor = 1e-30f;
+  const std::uint32_t wide = row_pack(kCodes, max_bytes, 4);
+  for (auto c : e.range(lid, e.u32(nchunks), kBlock)) {
+    std::vector<std::array<kir::Val<kir::f32>, kCodes>> v(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      // A row past the end fetches row 0\'s bytes -- in bounds, never stored.
+      const auto x_base =
+          e.let(staged_row ? e.u32(0)
+                           : e.let(math::min(row + r, e.u32(m_rows - 1)) * k));
+      const auto base = e.let(x_base + c * kCodes);
+      if (xs != nullptr) {
+        for (std::uint32_t j = 0; j < kCodes; ++j) {
+          v[r][j] = e.let((*xs)[e.let(base + j)].read());
+        }
+      } else {
+        for (std::uint32_t j = 0; j < kCodes; j += wide) {
+          const auto pack = e.load(a.x, e.let(base + j), max_bytes);
+          for (std::uint32_t t = 0; t < wide; ++t) {
+            v[r][j + t] = e.let(pack[t]);
+          }
+        }
+      }
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      if (auto live = e.when(row + r < m_rows)) {
+        auto amax = e.let(math::abs(v[r][0]));
+        auto sum = v[r][0];
+        for (std::uint32_t j = 1; j < kCodes; ++j) {
+          amax = e.let(math::max(amax, math::abs(v[r][j])));
+          sum = e.let(sum + v[r][j]);
+        }
+        for (std::uint32_t bit = 1; bit < cpg; bit <<= 1) {
+          sum = e.let(sum + math::shfl_xor(sum, e.u32(bit)));
+        }
+        const auto step = e.let(amax * (1.0f / 127.0f));
+        const auto inv = e.let(127.0f / math::max(amax, e.f32(kAmaxFloor)));
+        const auto byte_of = [&](int j) {
+          const auto code =
+              e.let(math::rint(v[r][static_cast<std::size_t>(j)] * inv));
+          return e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
+        };
+        const auto slot = e.let(c * 2u);
+        q[r].codes[swz(e, slot)] = quant::dot4_activation_word(e, byte_of, 0);
+        q[r].codes[swz(e, e.let(slot + 1u))] =
+            quant::dot4_activation_word(e, byte_of, 1);
+        q[r].scale[swz(e, c)] = step;
+        if (auto lead = e.when(c % cpg == 0u)) {
+          q[r].sum[e.let(c / cpg)] = sum;
+        }
+      }
+    }
+  }
+  e.barrier();
+}
+
 // The body's own staging: out of the staged row when a run hoisted one, out of
 // global otherwise. `x_base` carries the row term on the global arm and is
 // zero on the staged one, which is already row-relative.
@@ -757,21 +829,10 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     // Outside the column guard: every thread of the workgroup stages, and the
     // waves that own a column all read what they wrote.
     if (dot && !use_hoisted) {
-      for (std::uint32_t r = 0; r < rows; ++r) {
-        // Zero on the staged arm; the row term otherwise. See the note on
-        // x_base below — it is the same rule, and this is now the only place
-        // the activation is read. A row past the end stages whatever the
-        // clamp lands on; its accumulator is never stored.
-        // Workgroup uniform: `row` comes from the workgroup id and `r` and
-        // `m` are constants, so the barrier inside is taken by all of the
-        // workgroup or none of it.
-        if (auto live = e.when(row + r < m)) {
-          const auto x_base = e.let(stage ? e.u32(0) : (row + r) * k);
-          stage_dot_acts<A>(e, a, stage ? &xs : nullptr, x_base, q[r], lid,
-                            nchunks, chunks_per_group,
-                            device_load_bytes(s.device));
-        }
-      }
+      stage_dot_acts_all<A>(e, a, stage ? &xs : nullptr, row, rows,
+                            static_cast<std::uint32_t>(m), qs, lid, nchunks,
+                            chunks_per_group, device_load_bytes(s.device),
+                            static_cast<std::uint32_t>(d.k), stage);
     }
     if (auto in_cols = e.when(col < n)) {
       // The expert's matrix within the stack. `linear` and `linear_indexed`
