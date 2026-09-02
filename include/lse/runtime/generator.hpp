@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -189,6 +190,12 @@ class Generator {
   };
   SpecHead spec_;
   graph::Array spec_ids_;
+  // Adaptive depth switches the verify width between passes; each width keeps
+  // its own head and id slot here so a switch swaps programs instead of
+  // re-recording one -- rebuilding the head on every width change is what
+  // made the first adaptive cut SLOWER than either fixed depth.
+  std::unordered_map<std::size_t, SpecHead> spec_by_m_;
+  std::unordered_map<std::size_t, graph::Array> spec_ids_by_m_;
   // Host copies the module reads: the pass's two hidden rows, and its logits
   // when the sampler needs more than an argmax.
   std::vector<float> spec_hidden_;

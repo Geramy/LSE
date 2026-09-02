@@ -305,8 +305,12 @@ Status Generator::verify(Session& session,
   const auto m = static_cast<std::int64_t>(rows.size());
   if (spec_ids_.valid() &&
       spec_ids_.shape().elem_count() != rows.size()) {
-    spec_ids_ = graph::Array{};
-    spec_ = SpecHead{};
+    // Park this width's head and ids and take the other width's back out;
+    // each width keeps its recorded programs across switches.
+    spec_by_m_[spec_ids_.shape().elem_count()] = std::move(spec_);
+    spec_ids_by_m_[spec_ids_.shape().elem_count()] = std::move(spec_ids_);
+    spec_ = std::move(spec_by_m_[rows.size()]);
+    spec_ids_ = std::move(spec_ids_by_m_[rows.size()]);
   }
   if (!spec_ids_.valid()) {
     const std::size_t bytes = dtype_storage_bytes(DType::kF32, rows.size());
@@ -376,7 +380,7 @@ Status Generator::verify(Session& session,
 // Up to depth+1 tokens per decoder pass. The module proposes a CHAIN of
 // depth tokens, the decoder answers every row of the pass, and the answers
 // are emitted while they keep agreeing with the chain. The first disagreement
-// ends the pass\'s harvest: the rows past it consumed wrong inputs, so the
+// ends the pass's harvest: the rows past it consumed wrong inputs, so the
 // pass is rewound and re-run with the corrected prefix spliced in and fresh
 // drafts filling the tail -- the redo IS the next speculation round, and its
 // leading rows re-derive tokens already emitted, which the scan skips.
@@ -395,15 +399,16 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   generated.reserve(static_cast<std::size_t>(std::max(limits.max_tokens, 0)));
   if (limits.max_tokens <= 0) return generated;
 
-  // How many tokens the module proposes per pass. Depth 1 is the classic
-  // two-row step and the default: a deeper chain harvests more tokens per
-  // pass (3.2 at depth 3 on a high-acceptance prompt, against 1.6), but the
-  // decode GEMVs scale with ROWS -- their cost is the dequant and dot ALU per
-  // row, not the weight stream -- so today the bigger pass gives back exactly
-  // what the harvest gains. The depth becomes profitable the day the m=4
-  // pass costs close to the m=2 one. Keep it a power of two minus one: pass
-  // width is depth+1, and a width off the batch-rung ladder repartitions
-  // every step (measured 2.2 s per pass at width 3).
+  // How many tokens the module proposes per pass. Since the staging fix a
+  // depth-3 chain wins wherever the drafts land 85%+ (34.6 and 32.9 tok/s
+  // against 30.9 and 30.2 at depth 1) and loses where they land 59% (22.7
+  // against 29.6) -- prompt-dependent, a wash on average, so the safe default
+  // stays 1. An adaptive controller was built and measured TWICE (optimistic
+  // start, then shallow start with hysteresis and per-width head caching):
+  // both lost to the better fixed depth on every prompt, because a 32-60
+  // token generation is over before the width transients amortize. Do not
+  // rebuild it without measuring on long generations. Depth+1 must sit on
+  // the batch-rung ladder: width 3 repartitions every step, 2.2 s per pass.
   const std::uint32_t depth = [] {
     const char* v = std::getenv("LSE_SPEC_DEPTH");
     const long n = v != nullptr ? std::strtol(v, nullptr, 10) : 1;
@@ -423,7 +428,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     if (on_token && !on_token(id)) return false;
     return static_cast<std::int32_t>(generated.size()) < limits.max_tokens;
   };
-  // The decoder\'s answer for row i of the pass just verified.
+  // The decoder's answer for row i of the pass just verified.
   const auto answer = [&](std::size_t i) -> std::uint32_t {
     if (spec_.greedy) {
       return static_cast<std::uint32_t>(
@@ -487,7 +492,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
 
     if (!mismatch) {
       // Every row agreed: the pass stands, and the module catches up on the
-      // decoder\'s hiddens for all of it before chaining the next proposals.
+      // decoder's hiddens for all of it before chaining the next proposals.
       session.advance(static_cast<std::int32_t>(m));
       pending = answers[m - 1];
       std::vector<std::uint32_t> caught(answers.begin(), answers.end());
