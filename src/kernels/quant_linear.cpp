@@ -224,13 +224,28 @@ struct DotActs {
   kir::Tile<kir::f32> sum;
 };
 
+// BANK-SWIZZLED indexing for the staged activation arrays.
+//
+// In the contraction each LANE owns a column and walks its own chunk, so
+// adjacent lanes read code words 8 apart and scale words 4 apart -- 4 and 8
+// of the 32 LDS banks, an 8-way and 4-way conflict on every read, once per
+// ROW. That serialization is the whole reason a 4-row pass cost double a
+// 2-row one (replicated standalone: 86/101/195 us for rows 1/2/4 unswizzled
+// against 86/87/87 swizzled, the weights at 512 GB/s throughout). Spreading
+// index i to i + i/32 staggers the banks; it costs one add per access and
+// one pad word per 32.
+inline std::uint32_t swz_words(std::uint32_t n) { return n + n / 32u + 1u; }
+inline kir::Val<kir::u32> swz(env::Emit& e, const kir::Val<kir::u32>& i) {
+  return e.let(i + i / 32u);
+}
+
 std::uint32_t dot_lds_bytes(const QuantDims& d) {
   const auto nchunks = static_cast<std::uint32_t>(
       d.k / d.spec.values_per_chunk());
   const auto groups = static_cast<std::uint32_t>(d.groups);
   constexpr std::uint32_t w = kir::pack_elem_bytes<kir::u32>();
-  return kir::Lds::align(2 * nchunks * w) + kir::Lds::align(nchunks * w) +
-         kir::Lds::align(groups * w);
+  return kir::Lds::align(swz_words(2 * nchunks) * w) +
+         kir::Lds::align(swz_words(nchunks) * w) + kir::Lds::align(groups * w);
 }
 
 // Whether this device and this shape take the integer path.
@@ -486,9 +501,10 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
       return e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
     };
     const auto slot = e.let(c * 2u);
-    q.codes[slot] = quant::dot4_activation_word(e, byte_of, 0);
-    q.codes[e.let(slot + 1u)] = quant::dot4_activation_word(e, byte_of, 1);
-    q.scale[c] = step;
+    q.codes[swz(e, slot)] = quant::dot4_activation_word(e, byte_of, 0);
+    q.codes[swz(e, e.let(slot + 1u))] =
+        quant::dot4_activation_word(e, byte_of, 1);
+    q.scale[swz(e, c)] = step;
     if (auto lead = e.when(c % cpg == 0u)) {
       q.sum[e.let(c / cpg)] = sum;
     }
@@ -572,12 +588,13 @@ void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
     for (std::size_t r = 0; r < acc.size(); ++r) {
       auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
       for (std::size_t p = 0; p < 2; ++p) {
-        const auto x =
-            e.let(q[r].codes[e.let(slot + static_cast<std::uint32_t>(p))].read());
+        const auto x = e.let(
+            q[r].codes[swz(e, e.let(slot + static_cast<std::uint32_t>(p)))]
+                .read());
         iacc = math::dot4_iu8(kir::cast<kir::i32>(x),
                               kir::cast<kir::i32>(planes[p]), iacc.read());
       }
-      facc[r] = math::fma(q[r].scale[chunk].read(),
+      facc[r] = math::fma(q[r].scale[swz(e, chunk)].read(),
                           kir::cast<kir::f32>(iacc.read()), facc[r].read());
     }
   }
@@ -701,9 +718,9 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     if (use_hoisted) {
       DotActs one;
       one.codes = kir::Tile<kir::u32>(&kb, &kb.types(), std::string(sq.codes),
-                                      2 * nchunks);
-      one.scale =
-          kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.scale), nchunks);
+                                      swz_words(2 * nchunks));
+      one.scale = kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.scale),
+                                      swz_words(nchunks));
       one.sum =
           kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.sum), groups);
       q.push_back(one);
@@ -711,13 +728,14 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
       // One allocation per kind, one view per row. The views share the
       // declaration, so the scratch is what plan_impl sized and the rows sit
       // contiguously rather than in `rows` separate arrays.
-      const auto codes = e.lds<kir::u32>(2 * nchunks * rows);
-      const auto scale = e.lds<kir::f32>(nchunks * rows);
+      const auto codes = e.lds<kir::u32>(swz_words(2 * nchunks) * rows);
+      const auto scale = e.lds<kir::f32>(swz_words(nchunks) * rows);
       const auto sum = e.lds<kir::f32>(groups * rows);
       for (std::uint32_t r = 0; r < rows; ++r) {
         DotActs one;
-        one.codes = codes.slice(2 * nchunks * r, 2 * nchunks);
-        one.scale = scale.slice(nchunks * r, nchunks);
+        one.codes =
+            codes.slice(swz_words(2 * nchunks) * r, swz_words(2 * nchunks));
+        one.scale = scale.slice(swz_words(nchunks) * r, swz_words(nchunks));
         one.sum = sum.slice(groups * r, groups);
         q.push_back(one);
       }
@@ -840,8 +858,8 @@ std::uint32_t staged_dot_bytes(std::uint32_t count, std::int32_t group_size,
   const std::uint32_t nchunks = count / kCodes;
   const std::uint32_t groups = count / gs;
   constexpr std::uint32_t w = kir::pack_elem_bytes<kir::u32>();
-  return kir::Lds::align(2 * nchunks * w) + kir::Lds::align(nchunks * w) +
-         kir::Lds::align(groups * w);
+  return kir::Lds::align(swz_words(2 * nchunks) * w) +
+         kir::Lds::align(swz_words(nchunks) * w) + kir::Lds::align(groups * w);
 }
 
 StagedQuantNames emit_staged_dot_acts(kir::KernelBody& k, std::string_view row,
@@ -861,15 +879,16 @@ StagedQuantNames emit_staged_dot_acts(kir::KernelBody& k, std::string_view row,
   const std::uint32_t groups = count / gs;
 
   env::Emit e{&k};
-  if (!e.lds_fits<kir::u32>(2 * nchunks) || !e.lds_fits<kir::f32>(nchunks) ||
+  if (!e.lds_fits<kir::u32>(swz_words(2 * nchunks)) ||
+      !e.lds_fits<kir::f32>(swz_words(nchunks)) ||
       !e.lds_fits<kir::f32>(groups)) {
     return out;
   }
   const auto xs = kir::Tile<kir::f32>(&k, &k.types(), std::string(row), count);
   if (!xs) return out;
   DotActs q;
-  q.codes = e.lds<kir::u32>(2 * nchunks);
-  q.scale = e.lds<kir::f32>(nchunks);
+  q.codes = e.lds<kir::u32>(swz_words(2 * nchunks));
+  q.scale = e.lds<kir::f32>(swz_words(nchunks));
   q.sum = e.lds<kir::f32>(groups);
   if (!q.codes || !q.scale || !q.sum) return out;
 
