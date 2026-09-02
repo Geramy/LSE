@@ -4224,11 +4224,13 @@ LSE_TEST(a_merged_run_is_priced_by_what_it_declares_not_by_its_panel) {
   const graph::IKernelEmitter::RunScratch cost = kEmitter.run_scratch(run, dev);
   LSE_EXPECT_EQ(cost.threads, 256u);
   // The f32 panel, the int8 panel hoisted beside it, and nothing per stage:
-  // with both hoisted, neither body declares scratch of its own.
-  LSE_EXPECT_EQ(cost.fused, 28480u);
+  // with both hoisted, neither body declares scratch of its own. The counts
+  // carry the bank-swizzle pad on the code and scale arrays -- one word per
+  // 32 plus one, which is why they are not round numbers.
+  LSE_EXPECT_EQ(cost.fused, 28752u);
   // What ONE of them declares launching alone. Not the panel: the solo body
   // has no panel.
-  LSE_EXPECT_EQ(cost.worst_solo, 8000u);
+  LSE_EXPECT_EQ(cost.worst_solo, 8272u);
 
   const opt::DeviceCapacity cap = opt::DeviceCapacity::of(dev);
   const opt::Occupancy fused =
