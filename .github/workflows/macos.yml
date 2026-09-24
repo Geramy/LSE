@@ -1,0 +1,90 @@
+name: macOS ARM64
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Attach the verified macOS archive to an existing release
+        type: boolean
+        default: false
+      tag:
+        description: Existing release tag (required for release upload)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  build:
+    # GitHub's standard macos-15 image is Apple Silicon; no self-hosted Mac.
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select archive name
+        id: package
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          tag="${REQUESTED_TAG:-snapshot-${GITHUB_SHA::12}}"
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || exit 1
+          if [[ "$PUBLISH" == true ]]; then
+            test -n "$REQUESTED_TAG"
+            gh release view "$tag" >/dev/null
+            git fetch --depth 1 origin "refs/tags/$tag"
+            test "$(git rev-parse "FETCH_HEAD^{commit}")" = "$GITHUB_SHA" || {
+              echo 'Release tag must identify exactly the source being built.' >&2; exit 1;
+            }
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=lse-${tag}-macos-arm64" >> "$GITHUB_OUTPUT"
+      - name: Install native build tools
+        run: brew install llvm@21 cmake ninja rust
+      - name: Build, check host behavior, and verify relocated package
+        env:
+          LSE_RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          LSE_BUILD_JOBS: '3'
+        run: bash .github/scripts/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Explain verification boundary
+        run: |
+          echo 'Apple Silicon binaries, bundled HSA/HRX/Loom runtime, host tests, native gfx1201 compilation, and package relocation verified. The runner has no external AMD GPU; GPU execution and DriverKit activation require the installed MacAMDGPU driver on supported hardware.' >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lse-*-macos-arm64
+          merge-multiple: true
+          path: dist
+      - name: Attach macOS archive to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256

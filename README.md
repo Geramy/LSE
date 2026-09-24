@@ -25,7 +25,8 @@ diverges at an exact logit tie. See the
 [measurements and limits](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md)
 and [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
 for reproduction, server, chat and monitor commands.
-Linux release binaries are not macOS builds.
+Use the `macos-arm64` release asset for Apple Silicon. Linux release binaries
+are not macOS builds.
 
 The latest R9700 resident-server test measured **87.28 prompt tokens/s and
 12.61 decode tokens/s**: median of three warm requests, each with 64 input and
@@ -78,6 +79,35 @@ shared algorithms and calls into the derived type for the primitives.
 Releases are built by the **Build & Release** workflow in the Actions tab and
 carry ahead-of-time kernels for the architectures selected for that build,
 which the release notes list.
+
+The **macOS ARM64** workflow builds on GitHub-hosted Apple Silicon runners.
+It packages `lse`, `lse-server`, HRX, Loom and the MacAMDGPU HSA runtime, checks
+host behavior and native kernel compilation, and tests the package after moving
+it to a different directory. These hosted checks do not execute AMD GPU kernels.
+
+For **Apple Silicon macOS 15 or later**:
+
+```bash
+# Pick the macos-arm64 asset from https://github.com/Geramy/LSE/releases
+curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-macos-arm64.tar.gz
+curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-macos-arm64.tar.gz.sha256
+shasum -a 256 -c lse-<tag>-macos-arm64.tar.gz.sha256
+tar -xzf lse-<tag>-macos-arm64.tar.gz
+cd lse-<tag>-macos-arm64
+./bin/lse --devices
+./bin/lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
+./bin/lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
+```
+
+Install, approve and initialize the
+[MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu#hardware-requirements)
+separately before GPU use. Hardware qualification currently covers the R9700
+(`gfx1201`) on Apple Silicon; this is not general support for every AMD GPU.
+The archive does not install a system extension. Use its `bin/` launchers to
+load the bundled runtime libraries. Binaries are ad-hoc signed, not Developer ID
+notarized. The package uses Loom; HIP/comgr is not included on macOS.
+
+For **Linux x86_64**:
 
 ```bash
 # Pick the asset from https://github.com/Geramy/LSE/releases
