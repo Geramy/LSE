@@ -33,23 +33,25 @@ are not macOS builds.
 but its log and exact model, context and MTP settings still need to be recovered
 for a matched comparison. It is not a measured macOS Loom result.
 
-**The current macOS Loom default generates at 16.67 tokens/s**, with prompt
-processing at **88.82 tokens/s**, on the local Qwen3.8-27B-MLX-6bit checkpoint.
-The workload is 512 input / 129 output tokens, KV1024, MTP disabled, flush64 and
-64 µs polling: one measured request after two warmups. All three texts matched,
-the measured request compiled no new shaders, and shutdown completed cleanly.
-An independent run of the same server with the prior HSA library measured
-88.68 PP/s and 16.68 TPS. These are current-default measurements; they do not
-establish matched llama.cpp parity.
+**The qualified macOS Loom build generates at about 17.45 tokens/s**, with
+prompt processing at **88.63 tokens/s**, on Qwen3.8-27B-MLX-6bit. These are medians
+of six measured requests across two runs, each after two warmups: 512 input /
+129 output, KV1024, MTP disabled, flush64 and 64 microsecond polling. Measured
+requests have zero JIT compilations and disk-cache hits, generated text matches
+the control, and shutdown succeeds. This does not establish llama.cpp parity.
 
 Working shared HIP/Loom optimizations include cooperative RMS normalization,
 Q6 activation reuse across four output columns, and buffer-lifetime planning
-based on the final fused kernel groups. Four-column decode preserves each
-output's FP32 arithmetic order. The two M256 feed-forward projections currently
-use FP32: their experimental BF16 profile exceeded the unchanged model accuracy
-limit, and a centered replacement also failed the expanded code-prompt check.
-Faster experimental prefill rates are documented in the linked measurement
-report rather than presented as current-default throughput.
+based on final fused launches and inplace allocation ownership. Four-column
+decode preserves each output's FP32 arithmetic order. The lifetime fix prevents
+premature recycling through aliases without a measurable throughput change.
+The Mac runtime also includes the qualified same-queue dependency path and
+GPU code-cache synchronization when loading executables.
+
+The two-pass centered Q6 prefill experiment now passes all three fixed model
+accuracy contexts, but measures **76.72 PP/s**, slower than the **88.57 PP/s**
+control. The two M256 feed-forward projections therefore continue using FP32.
+See [qualification results and reproduction](docs/R9700_QUALIFICATION.md).
 
 **GPU profiling is working through rocprofmac.** The matched timestamp capture
 preserved all six profile-off/on responses and added about 1.0% prefill time and
@@ -58,9 +60,9 @@ shapes account for 67.3% of summed prefill kernel durations; this guides ongoing
 matrix-kernel optimization. Those sums and the gaps between dispatches are not
 GPU utilization measurements.
 
-The opt-in Q6 INT8 candidate has passed its GPU numerical suite but remains
-experimental: full-shape timing improves one projection and regresses the two
-main feed-forward shapes. It is not part of the released INT8 policy.
+The Q6 INT8 prefetch candidate remains experimental: it passes numerical tests
+but measures **16.32 TPS** versus the **17.46 TPS** control. It is not part of
+the released INT8 policy; the full multi-context decode-logit gate remains open.
 
 KV capacity growth can create additional prefill specializations on the second
 request. Warm up the resident workload twice and check the HTTP JIT timing

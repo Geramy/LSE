@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=7cbbdb59c80be82d5f6e6624a1b15743200176b1
+mac_rev=6dd8c2a74d61c12e7cf5f568296bd9c4b6fe7c45
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
@@ -124,7 +124,7 @@ tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_
   test_pointwise_fusion test_probe_measurement test_probe_policy test_quant_prefill
   test_token_ids test_submission_tuner test_submission_constants test_submission_decode
   test_decode_sample test_loaded_runtime test_hrx_copy_route test_gdn_pair
-  test_gdn_scheduler test_scheduler_epilogue test_loom_matrix test_loom_dot
+  test_gdn_scheduler test_scheduler_epilogue test_inplace_owner test_loom_matrix test_loom_dot
   test_fp8_conversion test_quant_operand_policy test_cooperative_rms)
 cmake --build "$work/lse-build" --target lse lse-server compile_loom_matrix --parallel "$jobs"
 # The host suite must not discover a real GPU on a developer's machine.
