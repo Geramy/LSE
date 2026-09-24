@@ -53,6 +53,18 @@ result is one post-warmup measurement rather than a many-run median. Tests cover
 full projection outputs and guards, and model logits meet the stated acceptance
 budget; the matrix operand path is not a claim of bitwise FP32 equivalence.
 
+**Q6 decode now shares activation loads across four output columns** on the
+qualified gfx1201 layout, preserving each output's FP32 arithmetic order.
+A matched 512-input/129-output comparison improved median decode from
+**15.96 to 16.70 tokens/s**, with prefill unchanged at about **143.4 tokens/s**.
+All ten texts matched, with zero new compilations in all six measured requests.
+The separate three-request 1,024-input/1,024-output gate also passed: all text
+matched the previous implementation, and the warmed final request measured
+**139.36 prompt tokens/s and 14.83 decode tokens/s**, versus 14.23 decode
+tokens/s in the prior long run. The long comparison uses one measured request
+per implementation, not a multi-run median. Broader throughput parity remains
+active work.
+
 KV capacity growth can create additional prefill specializations on the second
 request. Warm up the resident workload twice and check the HTTP JIT timing
 counters before reporting steady-state prompt throughput.
