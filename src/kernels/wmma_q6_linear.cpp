@@ -190,6 +190,7 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
     return {};
   env::Emit e{&body};
   const auto xs = e.lds<F>(64u * 64u), ws = e.lds<F>(64u * 64u);
+  const auto xl = e.lds<F>(64u * 64u);
   const auto row_partials = e.lds<kir::f32>(64u * 4u);
   const auto group_scales = e.lds<kir::f32>(64u);
   const auto group_biases = e.lds<kir::f32>(64u);
@@ -236,9 +237,11 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
       const auto r = e.let(lid / 4u + block * 32u),
                  kc = e.let((lid % 4u) * 16u);
       const auto ar = e.let(mbase + r), bc = e.let(nbase + r);
-      const auto av = e.local<F, 16>(), bv = e.local<F, 16>();
+      const auto av = e.local<F, 16>(), al = e.local<F, 16>(), bv = e.local<F, 16>();
+      auto row_sum = e.var(0.0f);
       for (auto j : e.unroll(16u)) {
         av[j] = math::narrow<F>(e.f32(0));
+        al[j] = math::narrow<F>(e.f32(0));
         bv[j] = math::narrow<F>(e.f32(0));
       }
       if (auto active = e.when(ar < d.m)) {
@@ -249,6 +252,12 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
             mark_unsafe(original);
             x_max = math::max(x_max.read(), math::abs(original));
             av[v * 4 + j] = math::narrow<F>(original);
+            const auto residual=e.let(original-math::widen(av[v * 4 + j].read()));
+            mark_unsafe(residual);
+            al[v * 4 + j] = math::narrow<F>(residual);
+            // Retain the original FP32 activation in the inexpensive bias sum.
+            // The matrix dot receives its rounded high and residual separately.
+            row_sum = row_sum.read() + original;
           }
         }
       }
@@ -294,11 +303,10 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
           bv[j] = math::narrow<F>(math::cast<kir::f32>(e.let(code)) - center);
         }
       }
-      auto row_sum = e.var(0.0f);
       for (auto j : e.unroll(16u)) {
-        row_sum = row_sum.read() + math::widen(av[j].read());
         const auto index = e.let(address(r, kc + j));
         xs[index] = av[j].read();
+        xl[index] = al[j].read();
         ws[index] = bv[j].read();
       }
       row_partials[r * 4u + lid % 4u] = row_sum.read();
@@ -327,30 +335,41 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
       if (auto overflow = e.when(block_x > e.f32(product_headroom) / block_coefficient))
         block_bad=e.f32(1.0f);
     if(auto regular=e.when(block_bad.read()==0.0f)) {
+    // A small group total can hide cancellation inside the matrix dot itself.
+    // Keep a scale for that case even when every group contribution is zero.
+    // The existing overflow guard makes this product finite. This conservative
+    // trigger requests original ordered FP32; it is not an error certificate.
+    largest_group=math::max(largest_group.read(),
+        (block_x*block_coefficient)*64.0f);
     std::vector<kir::Local<kir::f32, 8>> group_acc;
     for (unsigned i=0;i<4;++i) {
       group_acc.push_back(e.local<kir::f32,8>());
       for(auto j:e.unroll(8u)) group_acc.back()[j]=e.f32(0.0f);
     }
     for (auto slice : e.unroll(4u)) {
-      std::vector<kir::Local<F, 8>> af, bf;
+      std::vector<kir::Local<F, 8>> af, alf, bf;
       for (unsigned i = 0; i < 2; ++i) {
         af.push_back(e.local<F, 8>());
+        alf.push_back(e.local<F, 8>());
         bf.push_back(e.local<F, 8>());
         const auto ar = e.let(am + i * 16u + lo), bc = e.let(bn + i * 16u + lo);
         // K-major fragments occupy eight contiguous BF16 elements. The
         // bank rotation preserves the eight-element alignment at each start.
         const auto k = e.let(slice * 16u + hi * 8u);
         const auto ap = xs.load(e.let(address(ar, k)), 16u);
+        const auto alp = xl.load(e.let(address(ar, k)), 16u);
         const auto bp = ws.load(e.let(address(bc, k)), 16u);
         for (auto j : e.unroll(8u)) {
           af.back()[j] = ap[j];
+          alf.back()[j] = alp[j];
           bf.back()[j] = bp[j];
         }
       }
       for (unsigned m = 0; m < 2; ++m)
         for (unsigned n = 0; n < 2; ++n) {
           group_acc[m * 2 + n] = math::mma<Op>(af[m].value(), bf[n].value(),
+                                               group_acc[m * 2 + n].value());
+          group_acc[m * 2 + n] = math::mma<Op>(alf[m].value(), bf[n].value(),
                                                group_acc[m * 2 + n].value());
         }
     }
@@ -470,8 +489,8 @@ const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
 }
 
 struct CenteredAffineKernel final : KernelPrimitive<CenteredAffineKernel> {
-  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_centered_affine_v1";
-  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_centered_affine_v1";
+  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_centered_activation_residual2_v2";
+  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_centered_activation_residual2_v2";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }
@@ -500,7 +519,7 @@ struct CenteredAffineKernel final : KernelPrimitive<CenteredAffineKernel> {
       return p;
     p.workgroup_size[0] = 128;
     p.workgroup_count[0] = ((d.m + 63) / 64) * ((d.n + 63) / 64);
-    p.lds_bytes = 17968;
+    p.lds_bytes = 26160;
     p.workgroup_count[1] = p.workgroup_count[2] = 1;
     return p;
   }
@@ -622,7 +641,7 @@ const KernelPrimitiveBase* select_centered_affine_candidate(
   kernel.matrix_intrinsic = select_centered_affine(s) != nullptr;
   kernel.conversion_intrinsic = true;
   kernel.fp32_exceptional_block_fallback = true;
-  kernel.lds_bytes = 17968;
+  kernel.lds_bytes = 26160;
   QuantOperandProfile profile;
   profile.preferred = QuantOperand::kBF16;
   profile.strategy = QuantOperandStrategy::kNative;
