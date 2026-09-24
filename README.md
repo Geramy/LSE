@@ -33,51 +33,38 @@ are not macOS builds.
 but its log and exact model, context and MTP settings still need to be recovered
 for a matched comparison. It is not a measured macOS Loom result.
 
-**Cooperative RMS normalization is now the default shared HIP/Loom kernel**
-for supported shapes. On macOS, the R9700 resident server completed two identical
-greedy requests with **1,024 input and 1,024 output tokens**, with clean shutdown.
-The second request measured **14.28 decode tokens/s**, versus **11.18** for the
-prior control (about 28% higher): Qwen3.8-27B Q6, 1,023 decode steps, KV2048,
-no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
-not a median across many runs.
+**The current macOS Loom default generates at 16.67 tokens/s**, with prompt
+processing at **88.82 tokens/s**, on the local Qwen3.8-27B-MLX-6bit checkpoint.
+The workload is 512 input / 129 output tokens, KV1024, MTP disabled, flush64 and
+64 µs polling: one measured request after two warmups. All three texts matched,
+the measured request compiled no new shaders, and shutdown completed cleanly.
+An independent run of the same server with the prior HSA library measured
+88.68 PP/s and 16.68 TPS. These are current-default measurements; they do not
+establish matched llama.cpp parity.
 
-**The M256 residual-two-product BF16 prefill profile is quarantined.** A new
-matched comparison with the current cooperative-RMS model measured logit relative
-L2 error **0.005030228**, above the **0.005** acceptance limit. Its earlier
-0.004085221 result used a different RMS context. The profile now remains a
-candidate with failed model quality, and the shared HIP/Loom selector uses the
-FP32 fallback for those M256 shapes until a replacement qualifies.
+Working shared HIP/Loom optimizations include cooperative RMS normalization,
+Q6 activation reuse across four output columns, and buffer-lifetime planning
+based on the final fused kernel groups. Four-column decode preserves each
+output's FP32 arithmetic order. The two M256 feed-forward projections currently
+use FP32: their experimental BF16 profile exceeded the unchanged model accuracy
+limit, and a centered replacement also failed the expanded code-prompt check.
+Faster experimental prefill rates are documented in the linked measurement
+report rather than presented as current-default throughput.
 
-Historical measurements with that withdrawn profile were **143.26 prompt tokens/s
-and 15.84 decode tokens/s** for a matched 512-input/33-output run, and **139.85
-prompt tokens/s and 14.23 decode tokens/s** for the final request of a three-request
-1,024-input/1,024-output run. They document the experiment, not the current default
-prefill rate or an accepted accuracy result.
+**GPU profiling is working through rocprofmac.** The matched timestamp capture
+preserved all six profile-off/on responses and added about 1.0% prefill time and
+3.7% decode time in this sequential comparison. The two feed-forward projection
+shapes account for 67.3% of summed prefill kernel durations; this guides ongoing
+matrix-kernel optimization. Those sums and the gaps between dispatches are not
+GPU utilization measurements.
 
-**Q6 decode now shares activation loads across four output columns** on the
-qualified gfx1201 layout, preserving each output's FP32 arithmetic order.
-A matched 512-input/129-output comparison improved median decode from
-**15.96 to 16.70 tokens/s**, with prefill unchanged at about **143.4 tokens/s**.
-All ten texts matched, with zero new compilations in all six measured requests.
-The separate three-request 1,024-input/1,024-output gate also passed: all text
-matched the previous implementation, and the warmed final request measured
-**139.36 prompt tokens/s and 14.83 decode tokens/s**, versus 14.23 decode
-tokens/s in the prior long run. The long comparison uses one measured request
-per implementation, not a multi-run median. Broader throughput parity remains
-active work. Those four-column performance runs also used the now-quarantined
-M256 prefill profile; their prompt rates are historical, not current-default
-throughput claims. The four-column decode arithmetic is unchanged.
+The opt-in Q6 INT8 candidate has passed its GPU numerical suite but remains
+experimental: full-shape timing improves one projection and regresses the two
+main feed-forward shapes. It is not part of the released INT8 policy.
 
 KV capacity growth can create additional prefill specializations on the second
 request. Warm up the resident workload twice and check the HTTP JIT timing
 counters before reporting steady-state prompt throughput.
-
-The repeatability investigation found a shared activation-slot lifetime bug:
-fused normalization could overwrite an input still read by another wave. The
-planner now uses the final submitted kernel groups. The focused GPU diagnostic
-then matched all 62 captured first-layer operands exactly across requests, and
-the long cooperative-RMS repeat passed. This qualification covers the stated
-model and fixtures; it is not a guarantee of bitwise equality for every model.
 
 HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
 FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
