@@ -24,6 +24,7 @@
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/opt/fusion.hpp"
+#include "dispatch_profile.hpp"
 
 namespace lse::graph {
 namespace {
@@ -656,7 +657,33 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   // ones a wrong-device launch would read.
   LSE_RETURN_IF_ERROR(check_residency(bindings, member));
 
-  const auto t_launch = bind_span.close();
+  // Submit mode preserves normal command-buffer batching. Serial mode is an
+  // intrusive diagnostic: drain prior work, submit one dispatch, then wait for
+  // completion. Its clock includes runtime/queue overhead, not just GPU work.
+  struct ProfileLifetime {
+    detail::DispatchProfileMode mode =
+        detail::dispatch_profile_mode(std::getenv("LSE_PROFILE_DISPATCH"));
+    detail::DispatchProfile profile;
+    ~ProfileLifetime() {
+      profile.print(stderr, mode == detail::DispatchProfileMode::kSerial);
+    }
+  };
+  static ProfileLifetime profiling;
+  if (profiling.mode == detail::DispatchProfileMode::kInvalid) {
+    return LSE_ERROR(kInvalidArgument,
+                     "LSE_PROFILE_DISPATCH must be off, submit, or serial");
+  }
+  const bool serial = profiling.mode == detail::DispatchProfileMode::kSerial;
+  auto t_launch = bind_span.close();
+  std::uint64_t predrain_ns = 0;
+  if (serial) {
+    const Status drained = be.synchronize();
+    const auto after_drain = SpanClock::now();
+    predrain_ns = elapsed_ns(t_launch, after_drain);
+    trace_.spans.host_wait.add(predrain_ns);
+    LSE_RETURN_IF_ERROR(drained);
+    t_launch = after_drain;
+  }
   if (impl_->member_dirty.size() <= member) {
     impl_->member_dirty.resize(member + 1, 0);
   }
@@ -664,8 +691,37 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   const Status submitted = be.launch(
       launched, emitted->dims, args,
       backend::DispatchTarget{stream, devices_.residency(member), {}});
-  trace_.spans.submit.add(elapsed_ns(t_launch, SpanClock::now()));
-  LSE_RETURN_IF_ERROR(submitted);
+  const auto after_submit = SpanClock::now();
+  const std::uint64_t submit_ns = elapsed_ns(t_launch, after_submit);
+  trace_.spans.submit.add(submit_ns);
+  Status completed = submitted;
+  std::uint64_t completion_ns = 0;
+  if (serial && submitted.ok()) {
+    completed = be.synchronize();
+    const auto after_completion = SpanClock::now();
+    completion_ns = elapsed_ns(t_launch, after_completion);
+    trace_.spans.host_wait.add(elapsed_ns(after_submit, after_completion));
+  }
+  if (profiling.mode != detail::DispatchProfileMode::kOff) {
+    std::string key = emitted->entry_name + " anchor=" +
+        std::string(to_string(group.anchor)) + " phase=" +
+        std::to_string(group.is_phase) + " member=" + std::to_string(member) +
+        " stream=" + std::to_string(stream.index) + " grid=";
+    for (std::size_t i = 0; i < 3; ++i) {
+      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_count[i]);
+    }
+    key += " wg=";
+    for (std::size_t i = 0; i < 3; ++i) {
+      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_size[i]);
+    }
+    for (const NodePtr& n : emitted->binding_order) {
+      key += " " + std::string(to_string(n->kind)) + n->shape.to_string() +
+             ":" + std::string(to_string(n->dtype));
+    }
+    profiling.profile.record(std::move(key), submit_ns, completion_ns,
+                              predrain_ns, completed.ok());
+  }
+  LSE_RETURN_IF_ERROR(completed);
   // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
   // this dispatch and prints a checksum and the first values of every bound
   // buffer, so a kernel's inputs and outputs can be compared across builds.
@@ -950,6 +1006,31 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   trace_.emit_ns = trace_.spans.emit.ns;
   trace_.launch_ns = trace_.spans.submit.ns;
   trace_.sync_ns = trace_.spans.host_wait.ns;
+
+  static const bool time_steps = std::getenv("LSE_TIME_STEPS") != nullptr;
+  if (time_steps) {
+    static std::atomic<std::uint64_t> step_sequence{0};
+    const auto& s = trace_.spans;
+    std::fprintf(stderr,
+        "[step-spans] step=%llu ok=%d replayed=%d device_groups=%u "
+        "host_groups=%u views=%u total_ms=%.3f partition_ms=%.3f "
+        "schedule_ms=%.3f emit_ms=%.3f jit_lookup_ms=%.3f "
+        "jit_compile_ms=%.3f bind_ms=%.3f submit_ms=%.3f "
+        "host_wait_ms=%.3f readback_ms=%.3f\n",
+        static_cast<unsigned long long>(step_sequence.fetch_add(1)),
+        static_cast<int>(ran.ok()), static_cast<int>(trace_.replayed),
+        trace_.device_groups, trace_.host_groups, trace_.views_aliased,
+        static_cast<double>(s.step.ns) / 1e6,
+        static_cast<double>(s.partition.ns) / 1e6,
+        static_cast<double>(s.schedule.ns) / 1e6,
+        static_cast<double>(s.emit.ns) / 1e6,
+        static_cast<double>(s.jit_lookup.ns) / 1e6,
+        static_cast<double>(s.jit_compile.ns) / 1e6,
+        static_cast<double>(s.bind.ns) / 1e6,
+        static_cast<double>(s.submit.ns) / 1e6,
+        static_cast<double>(s.host_wait.ns) / 1e6,
+        static_cast<double>(s.readback.ns) / 1e6);
+  }
 
   const Status accumulated = accumulate(acc_, trace_);
   if (!ran.ok()) return ran;

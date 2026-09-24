@@ -13,6 +13,7 @@ function(lse_add_test name)
 endfunction()
 
 lse_add_test(test_generation_stats)
+lse_add_test(test_dispatch_profile)
 lse_add_test(test_dtype)
 lse_add_test(test_reflect)
 # lse_backends is the set of backends this build ships. A test that runs a
@@ -60,6 +61,12 @@ target_sources(test_loom_words PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_loom_flash lse_graph lse_kernels lse_ir)
 target_sources(test_loom_flash PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+lse_add_test(test_loom_cache lse_graph lse_kernels lse_ir)
+target_sources(test_loom_cache PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp

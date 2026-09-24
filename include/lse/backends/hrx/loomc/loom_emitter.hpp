@@ -14,6 +14,8 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 
@@ -28,6 +30,11 @@ namespace lse::backend {
 
 class LoomEmitter final : public graph::IKernelEmitter {
  public:
+  struct CacheStats {
+    std::size_t hits, misses, entries, source_bytes;
+  };
+  [[nodiscard]] CacheStats cache_stats() const;
+
   Result<graph::EmittedKernel> emit(const graph::FusionGroup& group,
                                     const DeviceInfo& device) const override;
 
@@ -56,6 +63,11 @@ class LoomEmitter final : public graph::IKernelEmitter {
   [[nodiscard]] const graph::IPhaseStaging* staging() const noexcept override {
     return nullptr;
   }
+
+ private:
+  mutable std::mutex cache_mutex_;
+  mutable std::unordered_map<std::string, graph::EmittedKernel> emit_cache_;
+  mutable std::size_t cache_hits_ = 0, cache_misses_ = 0, cache_bytes_ = 0;
 };
 
 }  // namespace lse::backend
