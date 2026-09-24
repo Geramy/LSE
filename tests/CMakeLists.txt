@@ -19,6 +19,13 @@ lse_add_test(test_reflect)
 # deliberately does not link any of them, so nothing arrives transitively.
 lse_add_test(test_kernel_env lse_graph lse_backends)
 lse_add_test(test_ir lse_ir lse_graph lse_backends)
+# The Loom text printer only needs kernel IR; keep these regressions usable
+# without libhrx, the Loom compiler, or a GPU.
+lse_add_test(test_loom_print lse_ir)
+target_sources(test_loom_print PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_quant)
 lse_add_test(test_shape)
 lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)

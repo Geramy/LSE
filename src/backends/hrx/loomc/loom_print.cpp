@@ -244,6 +244,10 @@ class Printer {
       for (OpId id : users_[at]) {
         const Operation& u = b_.op(id);
         switch (u.kind) {
+          // collect_subs resolves every operand through binds, so all real
+          // users already attach to the source. Naming an index cannot make
+          // its wrapped value observable on its own.
+          case OpKind::kBind:
           case OpKind::kSubscript:
           case OpKind::kLoadVec:
           case OpKind::kStoreVec:

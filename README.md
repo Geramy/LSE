@@ -6,6 +6,16 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
 are generated at run time from the model's own shapes rather than selected from
 a library.
 
+## Experimental macOS GPU support
+
+[MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu) provides a DriverKit
+AMD GPU driver and HSA runtime for the native HRX/Loom path on Apple Silicon.
+The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
+contains pinned dependencies, macOS adapter build steps and guarded GPU tests.
+R9700/gfx1201 validation covers Q6 projection, causal convolution and loading
+a Qwen 27B text model. Complete macOS token generation remains under qualification;
+Linux release binaries are not macOS builds.
+
 ## Models
 
 The architecture is what a checkpoint is loaded as, not its name, so a family
