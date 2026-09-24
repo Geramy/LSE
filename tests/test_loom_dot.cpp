@@ -1,3 +1,4 @@
+#include "lse/kernels/int8_policy.hpp"
 #include "harness.hpp"
 #include "loom_dot_fixture.hpp"
 LSE_TEST(mixed_dot_signed_result_and_same_width_casts_keep_signed_conversion) {
@@ -26,7 +27,8 @@ LSE_TEST(uniform_unsigned_min_max_keep_index_casts_and_compare_select) {
 LSE_TEST(q4_mixed_dot_is_gated_by_actual_arch_capability) {
  for(const auto* arch:{"gfx1030","gfx90a","gfx942","gfx950","gfx1100","gfx1201"}) {
   auto out=dot_fixture::projection(arch,4);LSE_EXPECT(out.ok());if(!out.ok()){std::fprintf(stderr,"%s: %s\n",arch,out.status().to_string().c_str());continue;}
-  const bool expected=std::string_view(arch)=="gfx1100" || std::string_view(arch)=="gfx1201";
+  const bool expected=lse::kernels::activation_int8_enabled() &&
+      (std::string_view(arch)=="gfx1100" || std::string_view(arch)=="gfx1201");
   LSE_EXPECT((out->source.find("vector.dot4i<s8u8>")!=std::string::npos)==expected);
  }
  auto disabled=dot_fixture::projection("gfx1201",4,true);LSE_EXPECT(disabled.ok());

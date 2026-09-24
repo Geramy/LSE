@@ -1,4 +1,5 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
+#include "lse/kernels/int8_policy.hpp"
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
@@ -513,7 +514,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
 
 std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
-  std::uint64_t h = group.signature();
+  std::uint64_t h = kernels::activation_int8_cache_key(group.signature());
   const KernelPrimitiveBase* self = nullptr;
   if (kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
@@ -599,7 +600,7 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   g.anchor = run.front()->kind;
   g.anchor_class = run.front()->fclass;
 
-  const std::uint64_t key = g.signature();
+  const std::uint64_t key = kernels::activation_int8_cache_key(g.signature());
   if (const auto it = run_scratch_cache_.find(key);
       it != run_scratch_cache_.end()) {
     return it->second;
@@ -773,7 +774,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.traffic = run;
     }
 
-    std::uint64_t sig = group.signature();
+    std::uint64_t sig = kernels::activation_int8_cache_key(group.signature());
     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
     if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
       return LSE_ERROR(kOutOfMemory, "fused run needs ",
@@ -1110,7 +1111,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   // specialize() picks a different body (LDS vs WMMA vs scalar) for the same
   // graph node; the group hash only sees the generic primitive name.
-  std::uint64_t sig = group.signature();
+  std::uint64_t sig = kernels::activation_int8_cache_key(group.signature());
   if (self_indexed != nullptr) {
     sig ^= 0x9e3779b97f4a7c15ull;
     for (char c : self_indexed->name()) {

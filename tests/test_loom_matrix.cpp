@@ -1,3 +1,4 @@
+#include "lse/kernels/int8_policy.hpp"
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_print.hpp"
@@ -156,7 +157,7 @@ LSE_TEST(loom_matrix_availability_does_not_requantize_q6_or_q8) {
       s.intrinsics = &sources;
       s.types = types;
       const auto *specialized = kernels::wmma_quant_linear_for(s);
-      if (bits == 4)
+      if (bits == 4 && kernels::activation_int8_enabled())
         LSE_EXPECT(specialized != nullptr);
       else
         LSE_EXPECT(specialized == nullptr);

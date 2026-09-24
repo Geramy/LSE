@@ -277,3 +277,22 @@ if(TARGET lse_backend_cpu)
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 endif()
+
+# Tests of the existing approximate Q4 algorithms explicitly opt in. The
+# independent policy suite below exercises the default and both flag values.
+if(TEST test_jit)
+  set_property(TEST test_jit APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
+endif()
+set_property(TEST test_loom_dot APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC AND Python3_Interpreter_FOUND)
+  add_executable(test_int8_policy test_int8_policy.cpp)
+  target_link_libraries(test_int8_policy PRIVATE lse_backend_hrx lse_graph lse_kernels lse_ir)
+  target_include_directories(test_int8_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  lse_apply_common_flags(test_int8_policy)
+  add_test(NAME test_int8_policy COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_int8_policy.py $<TARGET_FILE:test_int8_policy>)
+endif()
+
+add_test(NAME test_loom_matrix_int8 COMMAND ${CMAKE_COMMAND} -E env
+  LSE_HRX_INT8=1 $<TARGET_FILE:test_loom_matrix>)

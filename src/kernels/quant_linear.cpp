@@ -26,6 +26,7 @@
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
+#include "lse/kernels/int8_policy.hpp"
 #include "lse/kernels/quant_panel.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
@@ -283,9 +284,9 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
 // Whether this device and this shape take the integer path.
 //
 // has_dot4_iu8 is the arch database's answer for the live device, so a part
-// without the instruction runs the fma codec and gets the same numbers more
-// slowly. That is a hardware capability, not a switch: there is no way to ask
-// for one path on a device that has the other.
+// without the instruction runs the float codec. Converting activations to
+// int8 also requires explicit process-wide accuracy-policy opt-in; hardware
+// support alone does not authorize the additional rounding.
 //
 // It has to be has_dot4_iu8 and not has_dot4_i8: the latter is the
 // same-signedness v_dot4_i32_i8, which RDNA2 and every CDNA also have, but
@@ -294,6 +295,7 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
 // where the emitted kernel does not compile at all.
 bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
             std::uint32_t cpl) {
+  if (!activation_int8_enabled()) return false;
   if (!d.valid || d.spec.bits != quant::kDot4Bits) return false;
   if (s.device == nullptr || s.intrinsics == nullptr) return false;
   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*s.device);
