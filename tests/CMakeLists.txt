@@ -13,6 +13,9 @@ function(lse_add_test name)
 endfunction()
 
 lse_add_test(test_generation_stats)
+lse_add_test(test_http_timings)
+target_include_directories(test_http_timings PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/server ${CMAKE_SOURCE_DIR}/third_party/vendor)
 # Ordinary fused SSA chains need no device or model.
 lse_add_test(test_pointwise_fusion lse_graph lse_kernels lse_ir)
 target_sources(test_pointwise_fusion PRIVATE

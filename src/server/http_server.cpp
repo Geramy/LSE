@@ -1,5 +1,6 @@
 #include "lse/server/http_server.hpp"
 #include "lse/server/shutdown.hpp"
+#include "jit_timings.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -193,6 +194,7 @@ struct Outcome {
   double decode_per_second = 0.0;
   std::uint64_t prefill_ns = 0;
   std::uint64_t decode_ns = 0;
+  detail::JitTotals jit;
   double acceptance = -1.0;  // negative when nothing was speculated
 };
 
@@ -263,6 +265,7 @@ struct HttpServer::Run {
                     out.completion_tokens >= r.limits.max_tokens;
 
     const runtime::GenerationStats& st = gen.stats();
+    out.jit = detail::JitTotals::from(st);
     out.prefill_tokens = st.prompt_tokens;
     out.decode_tokens = st.decoded_tokens();
     out.prefill_ns = st.prefill_ns;
@@ -307,6 +310,7 @@ json timings_of(const Outcome& o) {
          {"predicted_n", o.decode_tokens},
          {"predicted_ms", o.decode_ns / 1e6},
          {"predicted_per_second", o.decode_per_second}};
+  o.jit.append_to(t);
   if (o.acceptance >= 0.0) t["acceptance_rate"] = o.acceptance;
   return t;
 }
