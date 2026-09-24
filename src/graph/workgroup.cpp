@@ -511,14 +511,35 @@ std::vector<WorkgroupCut> Workgroup::cuts() const {
 }
 
 void Workgroup::plan_slots(std::span<const NodePtr> roots) {
+  std::vector<FusionGroup> launches;
+  for (const WorkgroupCut& cut : cuts()) {
+    FusionGroup group;
+    group.nodes = cut.nodes;
+    launches.push_back(std::move(group));
+  }
+  plan_slots(roots, launches);
+}
+
+void Workgroup::plan_slots(std::span<const NodePtr> roots,
+                           std::span<const FusionGroup> launches) {
   slots_.clear();
   slot_of_.clear();
   reused_ = 0;
-  const auto groups = cuts();
-  if (groups.empty()) return;
-
   std::unordered_set<const Node*> member;
   for (const NodePtr& n : members_) member.insert(n.get());
+
+  // The scheduler can merge siblings across original phase boundaries. Keep
+  // this workgroup's ownership, but project its members onto the final launch
+  // schedule so all nodes in one dispatch share one lifetime boundary.
+  std::vector<FusionGroup> groups;
+  for (const FusionGroup& launch : launches) {
+    FusionGroup own;
+    for (const NodePtr& n : launch.nodes) {
+      if (n && member.count(n.get()) != 0) own.nodes.push_back(n);
+    }
+    if (!own.nodes.empty()) groups.push_back(std::move(own));
+  }
+  if (groups.empty()) return;
 
   std::unordered_map<const Node*, std::uint32_t> last_cut;
   for (std::uint32_t ci = 0; ci < groups.size(); ++ci) {

@@ -21,9 +21,13 @@ using namespace lse::graph;
 struct CaptureEmitter final : IKernelEmitter {
   mutable backend::LoomEmitter real;
   mutable unsigned attempts=0, failures=0, pairs=0;
+  mutable std::vector<bool> writes;
   Result<EmittedKernel> emit(const FusionGroup& g,const backend::DeviceInfo& d) const override {
     ++attempts;
     auto result=real.emit(g,d);
+    writes.clear();
+    if (result.ok()) for (const auto& n : result->binding_order)
+      writes.push_back(std::find(g.outputs.begin(), g.outputs.end(), n) != g.outputs.end());
     std::printf("EMIT nodes=%zu outputs=%zu phase=%d ok=%d |",g.nodes.size(),g.outputs.size(),g.is_phase,result.ok());
     for(auto&n:g.nodes)std::printf(" %s",n->prim?std::string(n->prim->name()).c_str():"view");
     if(!result.ok()){++failures;std::printf(" => %s",result.status().to_string().c_str());}
@@ -41,6 +45,7 @@ struct CaptureCompiler final : IKernelCompiler {
 };
 struct CaptureDevice:backend::CpuBackend {
   unsigned launches=0;
+  bool audit_ranges=false, overlapped=false;
   mutable CaptureEmitter emitter;
   mutable CaptureCompiler compiler;
   mutable KernelToolchain chain{Dialect::kLoom,&emitter,&compiler};
@@ -50,7 +55,28 @@ struct CaptureDevice:backend::CpuBackend {
   const backend::DeviceInfo& device_info()const noexcept{return info;}
   std::span<const KernelToolchain>toolchains()const noexcept{return {&chain,1};}
   Result<backend::KernelHandle>load_executable(std::string_view name,std::span<const std::byte>){return backend::KernelHandle{1,0,std::string(name)};}
-  Status launch(const backend::KernelHandle&,const backend::LaunchDims&,const backend::DispatchArgs&,const backend::DispatchTarget&){++launches;return OkStatus();}
+  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
+                const backend::DispatchArgs& args, const backend::DispatchTarget&) {
+    ++launches;
+    if (audit_ranges) {
+      if (emitter.writes.size() != args.bindings.size())
+        return LSE_ERROR(kInternal, "capture binding metadata mismatch");
+      for (std::size_t i = 0; i < args.bindings.size(); ++i) {
+        const auto& a = args.bindings[i];
+        const auto first = reinterpret_cast<std::uintptr_t>(a.buffer->ptr) +
+                           a.buffer->offset + a.offset;
+        for (std::size_t j = i + 1; j < args.bindings.size(); ++j) {
+          if (!emitter.writes[i] && !emitter.writes[j]) continue;
+          const auto& b = args.bindings[j];
+          const auto second = reinterpret_cast<std::uintptr_t>(b.buffer->ptr) +
+                              b.buffer->offset + b.offset;
+          if (first < second + b.length && second < first + a.length)
+            overlapped = true;
+        }
+      }
+    }
+    return OkStatus();
+  }
 };
 void check(Status s){if(!s.ok())throw std::runtime_error(s.to_string());}
 
@@ -80,4 +106,45 @@ LSE_TEST(actual_scheduler_epilogues_preserve_roots_fanout_and_replay) {
   LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
  }
 }
+
+LSE_TEST(final_launch_slots_keep_reduction_input_live_through_fused_epilogue) {
+  for (int rows : {1, 17, 256}) for (int heads : {1, 16})
+      for (bool reduction : {false, true}) {
+    backend::BackendAdapter<CaptureDevice> backend;
+    check(backend.init(0));
+    backend.impl().audit_ranges = true;
+    Scheduler scheduler(backend);
+    scheduler.set_dialect(Dialect::kLoom);
+    const Shape parent_shape{1, rows, 5 * heads * 128};
+    auto buffer = backend.allocate(parent_shape.elem_count() * sizeof(float),
+                                    backend::MemoryClass::kDevice,
+                                    backend::kDefaultStream);
+    LSE_EXPECT(buffer.ok());
+    if (!buffer.ok()) continue;
+    auto parent = Array::from_buffer(buffer.release(), parent_shape, DType::kF32);
+    // Unlike a preallocated leaf, this activation is produced inside the
+    // phase and therefore eligible for slot recycling. Nested reshapes must
+    // extend its underlying allocation's lifetime, not merely a view node's.
+    auto activation = silu(slice(parent, -1, 0, heads * 128));
+    auto flat = reshape(activation, Shape{rows, heads * 128});
+    auto view = reshape(flat, Shape{1, rows, heads, 128});
+    auto norm = reduction ? l2_normalize(view, 1e-6f) : sigmoid(view);
+    auto scaled = norm * Array::full(Shape{1}, DType::kF32, 0.0883883476f);
+    auto out = repeat(scaled, 3, 2);
+    const NodePtr roots[] = {out.node()};
+    Program program;
+    check(scheduler.eval(roots, false, &program));
+    LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 3u);
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    LSE_EXPECT(!backend.impl().overlapped);
+    LSE_EXPECT(activation.node()->buffer.ptr != scaled.node()->buffer.ptr);
+    LSE_EXPECT(scheduler.last_trace().slots_reused > 0);
+    program.reset_compute();
+    check(scheduler.eval(roots, false, &program));
+    LSE_EXPECT(scheduler.last_trace().replayed);
+    LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 3u);
+    LSE_EXPECT(!backend.impl().overlapped);
+  }
+}
+
 LSE_TEST_MAIN()

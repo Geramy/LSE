@@ -20,6 +20,7 @@
 namespace lse::graph {
 
 class Node;
+struct FusionGroup;
 using NodePtr = std::shared_ptr<Node>;
 
 struct WorkgroupDevice {
@@ -162,6 +163,11 @@ class Workgroup {
   // Leftovers: a slot of N bytes is reused by the next cut that needs
   // N bytes after the last reader of the previous tenant.
   void plan_slots(std::span<const NodePtr> roots);
+  // A scheduler that fuses or splits the original cuts must supply the actual
+  // launch groups. Every input stays live through its complete submitted
+  // launch; no output may reuse it before that launch retires.
+  void plan_slots(std::span<const NodePtr> roots,
+                  std::span<const FusionGroup> launches);
   Status bind_slots(backend::IBackend& backend,
                     backend::Stream stream = backend::kDefaultStream);
   [[nodiscard]] std::uint32_t slot_count() const noexcept {

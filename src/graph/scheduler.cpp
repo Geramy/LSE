@@ -1348,26 +1348,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         staged.nodes.push_back(n);
       }
       flush_staged();
-      wg.plan_slots(roots);
-      // A workgroup is member-homogeneous by construction (the partitioner
-      // splits phases where a value changes members), so its slots belong on
-      // that member — allocated through the member's backend and stream, or
-      // every member's phase activations land on the primary and each launch
-      // reads them across the link.
-      std::size_t wg_member = devices_.primary();
-      for (const NodePtr& n : wg.members()) {
-        if (n && n->member != Node::kAnyMember &&
-            static_cast<std::size_t>(n->member) < devices_.size()) {
-          wg_member = static_cast<std::size_t>(n->member);
-          break;
-        }
-      }
-      const backend::Stream wg_stream =
-          devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
-      if (wg.bind_slots(devices_.device(wg_member), wg_stream).ok()) {
-        trace_.slots_reused += wg.reused_slots();
-        trace_.slots_allocated += wg.slot_count();
-      }
     }
   }
 
@@ -1397,6 +1377,34 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       if (!merged) earlier.push_back(i);
     }
     std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
+  }
+
+  if (device_first && !replayed) {
+    for (Workgroup& wg : planned) {
+      // Kernel epilogues and pointwise chains above can remove boundaries
+      // present in Workgroup::cuts(). Plan against the launches we will issue,
+      // otherwise a fused output can overwrite a still-live reduction input.
+      wg.plan_slots(roots, phase_groups);
+      // A workgroup is member-homogeneous by construction (the partitioner
+      // splits phases where a value changes members), so its slots belong on
+      // that member — allocated through the member's backend and stream, or
+      // every member's phase activations land on the primary and each launch
+      // reads them across the link.
+      std::size_t wg_member = devices_.primary();
+      for (const NodePtr& n : wg.members()) {
+        if (n && n->member != Node::kAnyMember &&
+            static_cast<std::size_t>(n->member) < devices_.size()) {
+          wg_member = static_cast<std::size_t>(n->member);
+          break;
+        }
+      }
+      const backend::Stream wg_stream =
+          devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
+      if (wg.bind_slots(devices_.device(wg_member), wg_stream).ok()) {
+        trace_.slots_reused += wg.reused_slots();
+        trace_.slots_allocated += wg.slot_count();
+      }
+    }
   }
 
   std::vector<FusionGroup> ran;
