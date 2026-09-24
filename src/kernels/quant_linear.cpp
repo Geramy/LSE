@@ -19,12 +19,14 @@
 // codes with v_dot4_i32_iu8, spending no per-weight instruction on the scale
 // or the bias at all. quant/group_affine_codec.hpp carries the algebra, and
 // `dot_ok` below carries what a device must have for it.
+#include <algorithm>
 #include <array>
 #include <span>
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
+#include "lse/kernels/quant_panel.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
@@ -322,6 +324,22 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
   return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
 }
 
+// Exact-FP32 prefill schedule for the validated gfx1201 layout. Indexed rows may name different
+// matrices, and externally staged panels have a caller-owned layout, so neither
+// can participate in this reuse path.
+std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
+                              bool indexed) {
+  if (!d.valid || indexed || d.m < 2 || d.spec.bits != 6 ||
+      d.spec.group_size != 64 || s.device == nullptr ||
+      s.device->arch != "gfx1201" || wave_of(s.device) != 32 ||
+      s.input_dtypes[0] != DType::kF32 ||
+      s.input_dtypes[2] != DType::kBF16 || !s.staged.name.empty() ||
+      !s.staged_quant.codes.empty()) return 1;
+  const std::uint32_t rows = d.m >= 4 ? 4u : 2u;
+  const auto tile = std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k));
+  return workgroup_lds_bytes(s.device) >= rows * tile * 4u ? rows : 1u;
+}
+
 // Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
 // rows, under exactly the same conditions and in the same order of decision.
 // The plan and the body cannot be allowed to disagree: this is the number a
@@ -337,6 +355,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
 std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                 std::uint32_t rows) {
   if (!d.valid || rows == 0) return 0;
+  if (rows > 1 && d.spec.bits == 6 && !body_dot(s, d)) {
+    return rows * std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k)) * 4u;
+  }
   const auto k = static_cast<std::uint32_t>(d.k);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
   const bool quant_hoisted =
@@ -440,6 +461,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
 // available where the rows agree on the matrix.
 std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
                              bool indexed) {
+  const auto exact_rows = q6_prefill_rows(s, d, indexed);
+  if (exact_rows > 1) return exact_rows;
   if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
   if (s.device == nullptr) return 1;
   const auto m = static_cast<std::uint32_t>(d.m);
@@ -747,7 +770,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                 const kir::Val<kir::u32>& x_base,
                 const kir::Val<kir::u32>& chunk,
                 const kir::LValue<kir::f32>& acc,
-                std::uint32_t chunks_per_group) {
+                std::uint32_t chunks_per_group, bool rotate_panel) {
   const auto vals = static_cast<std::uint32_t>(spec.values_per_chunk());
   const auto words = static_cast<std::uint32_t>(spec.words_per_chunk());
   const auto group = e.let(chunk / chunks_per_group);
@@ -758,13 +781,90 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
       e, a.packed, spec, e.let(row_base + chunk * words), scale, bias,
       [&](int c, const kir::Val<kir::f32>& w) {
         const auto idx = e.let(k_base + static_cast<std::uint32_t>(c));
-        const auto xe = xs != nullptr ? (*xs)[idx].read() : a.x[x_base + idx];
+        const auto panel_idx = rotate_panel ? e.let(q6_panel_index(idx)) : idx;
+        const auto xe = xs != nullptr ? (*xs)[panel_idx].read() : a.x[x_base + idx];
         acc = math::fma(xe, w, acc.read());
       });
 }
 
+// Every lane visits the same K indices, in the same order, as the one-row
+// kernel. Only the decoded weight's lifetime changes: it feeds several FP32
+// accumulators before being discarded. No activation or weight is narrowed.
+template <class A>
+std::string emit_q6_prefill(const KernelShapes& s, const QuantDims& d,
+                            std::uint32_t rows) {
+  const auto n = static_cast<std::uint32_t>(d.n);
+  const auto m = static_cast<std::uint32_t>(d.m);
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto lanes = static_cast<std::uint32_t>(d.lanes);
+  const auto groups = static_cast<std::uint32_t>(d.groups);
+  const auto tile_k = std::min(1024u, k);
+  constexpr std::uint32_t wave = 32;
+  constexpr std::uint32_t values = 16;
+  constexpr std::uint32_t words = 3;
+  constexpr std::uint32_t chunks_per_group = 4;
+  kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+  kb.set_store(s.store);
+  A a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+  const auto lid = e.let(math::local_id());
+  const auto lane = e.let(lid % wave);
+  const auto col = e.let(math::workgroup_id_x() * (kBlock / wave) + lid / wave);
+  const auto row = e.let(math::workgroup_id_y() * rows);
+  const auto panel = e.lds<kir::f32>(rows * tile_k);
+  std::vector<kir::LValue<kir::f32>> acc;
+  for (std::uint32_t r = 0; r < rows; ++r) acc.push_back(e.var(0.0f));
+  for (auto base : e.range(0u, k, tile_k)) {
+    for (auto at : e.range(lid, e.u32(tile_k), kBlock)) {
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        auto x = e.var(0.0f);
+        if (auto live = e.when(row + r < m && base + at < k)) {
+          x = a.x[(row + r) * k + base + at];
+        }
+        panel[r * tile_k + q6_panel_index(at)] = x.read();
+      }
+    }
+    e.barrier();
+    if (auto live_col = e.when(col < n)) {
+      for (auto chunk : e.range(lane, e.u32(tile_k / values), wave)) {
+        const auto logical_k = e.let(base + chunk * values);
+        if (auto live_k = e.when(logical_k < k)) {
+          const auto global_chunk = e.let(logical_k / values);
+          const auto group = e.let(global_chunk / chunks_per_group);
+          const auto scale = e.let(math::widen(a.scales[col * groups + group]));
+          const auto bias = e.let(math::widen(a.biases[col * groups + group]));
+          quant::dequant_chunk(e, a.packed, d.spec,
+              e.let(col * lanes + global_chunk * words), scale, bias,
+              [&](int c, const kir::Val<kir::f32>& weight) {
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                  const auto at = e.let(r * tile_k + q6_panel_index(
+                      chunk * values + static_cast<std::uint32_t>(c)));
+                  acc[r] = math::fma(panel[at].read(), weight, acc[r].read());
+                }
+              });
+        }
+      }
+    }
+    // All readers retire before any wave refills the shared panel.
+    e.barrier();
+  }
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    for (std::uint32_t bit = 1; bit < wave; bit <<= 1) {
+      acc[r] = acc[r].read() + math::shfl_xor(acc[r].read(), e.u32(bit));
+    }
+    if (auto writer = e.when(lane == 0 && col < n && row + r < m)) {
+      e.store((row + r) * n + col, acc[r].read());
+    }
+  }
+  return kb.lds().ok() ? kb.str() : std::string{};
+}
+
 template <class A>
 std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+  if (const auto rows = q6_prefill_rows(s, d, Indexed<A>); rows > 1) {
+    return emit_q6_prefill<A>(s, d, rows);
+  }
   const auto n = static_cast<std::uint32_t>(d.n);
   const auto k = static_cast<std::uint32_t>(d.k);
   const auto m = static_cast<std::uint32_t>(d.m);
@@ -831,6 +931,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     fill = true;
   }
   const bool stage = static_cast<bool>(xs);
+  // A caller-owned panel retains its declared linear layout. Decode can rotate
+  // only the panel this body fills, using the same map for stores and reads.
+  const bool rotate_panel = fill && d.spec.bits == 6 && d.m == 1 &&
+      d.spec.group_size == 64 && s.device != nullptr &&
+      s.device->arch == "gfx1201" && wave == 32 &&
+      s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16;
 
   // A run whose stages all quantize this row the same way hoists the int8 form
   // once, the way it already hoists the float row. Reading it costs this body
@@ -875,7 +981,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   if (auto in_grid = e.when(tile < ntiles && row < m)) {
     if (fill) {
       for (auto t : e.range(lid, e.u32(k), kBlock)) {
-        xs[t] = a.x[row * k + t];
+        const auto at = rotate_panel ? e.let(q6_panel_index(t)) : t;
+        xs[at] = a.x[row * k + t];
       }
       e.barrier();
     }
@@ -920,7 +1027,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
           for (std::uint32_t u = 0; u < cpl; ++u) {
             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
                           scale_base, x_base, e.let(chunk0 + u), acc[0],
-                          chunks_per_group);
+                          chunks_per_group, rotate_panel);
           }
         }
       }
@@ -932,7 +1039,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
                             chunks_per_group, cb);
           } else {
             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
-                          scale_base, x_base, chunk, acc[0], chunks_per_group);
+                          scale_base, x_base, chunk, acc[0], chunks_per_group,
+                          rotate_panel);
           }
         }
       }
@@ -1051,6 +1159,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   StagedRow staged_row(const KernelShapes& s) const override {
     const QuantDims d = dims_of(s, false);
     if (!shape_ok(d) || !device_fits(s)) return {};
+    // This schedule owns several rows and stages K tiles itself; advertising a
+    // single-row hoisted panel would let fusion change its launch coverage.
+    if (q6_prefill_rows(s, d, false) > 1) return {};
     return {0, static_cast<std::uint32_t>(d.k),
             static_cast<std::uint32_t>(d.m)};
   }

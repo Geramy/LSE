@@ -79,6 +79,19 @@ target_sources(test_loom_cache PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_quant)
+# Compiler/layout contracts only; this test never opens a GPU.
+lse_add_test(test_quant_prefill lse_graph lse_kernels lse_backends lse_ir)
+if(NOT TARGET lse_backend_hrx)
+  target_sources(test_quant_prefill PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
 lse_add_test(test_shape)
 lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
 # Socket lifecycle coverage never opens a model or device.
@@ -162,4 +175,13 @@ if(Python3_Interpreter_FOUND AND TARGET lse-server)
   add_test(NAME test_server_cli
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_server_cli.py
             $<TARGET_FILE:lse-server>)
+endif()
+
+lse_add_test(test_probe_measurement)
+lse_add_test(test_token_ids)
+if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
+  lse_add_test(test_loom_probe lse_backend_hrx)
+endif()
+if(TARGET lse_backend_cpu)
+  lse_add_test(test_probe_policy lse_probe lse_backend_cpu)
 endif()

@@ -13,13 +13,18 @@ AMD GPU driver and HSA runtime for the native HRX/Loom path on Apple Silicon.
 The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
 contains pinned dependencies, macOS adapter build steps and guarded GPU tests.
 R9700/gfx1201 validation covers Q6 projection, convolution, recurrent state,
-paged attention and GPU-only Qwen 27B Q6 text generation. A 16-token CLI run
-completed with zero CPU fallback and clean shutdown. Five interleaved HTTP
-completion/chat requests passed repeated-prompt isolation and graceful shutdown.
-The short chat measured 3.24 prompt tokens/s and 2.63 decode tokens/s with GPU
-execution required, KV128 and MTP disabled. Longer contexts, MTP and broader
-model accuracy remain under qualification. The [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
-includes server, chat and monitor commands.
+paged attention and GPU-only Qwen 27B Q6 text generation. Repeated HTTP
+completion/chat requests pass isolation and graceful shutdown. A five-token
+prompt and 33 generated IDs exactly match an independent same-checkpoint MLX
+run. With explicit batching/polling overrides, three measured resident requests
+reached median 10.12 decode tokens/s; a separate 64-token prompt reached 54.01
+prompt tokens/s and 6.75 decode tokens/s. These KV128/no-MTP workloads do not
+establish llama.cpp performance parity. Broader accuracy, longer contexts and
+MTP remain under qualification; the longer prompt diverges from native MLX at
+an exact BF16 logit tie and is being investigated. See the
+[measurements and limits](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md)
+and [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
+for reproduction, server, chat and monitor commands.
 Linux release binaries are not macOS builds.
 
 ## Models
@@ -33,7 +38,7 @@ shares one kernel. `--list-models` prints what a build registers.
 | `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
 | `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
 
-Weights are read in MLX group-affine form at 4 or 8 bits, or bf16/f16/f32. A
+Weights are read in MLX group-affine form at 4, 6 or 8 bits, or bf16/f16/f32. A
 multi-token-prediction module is used when the checkpoint has one, which is
 what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
 where a checkpoint also ships a vision tower, which this build does not run.

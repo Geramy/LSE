@@ -23,6 +23,7 @@ add_library(lse_backend_hrx
   hipc/hip_types.cpp
   kernels/dist_codec.cpp
   kernels/probe.cpp
+  kernels/probe_loom.cpp
 )
 add_library(lse::backend_hrx ALIAS lse_backend_hrx)
 
