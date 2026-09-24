@@ -28,8 +28,16 @@ for reproduction, server, chat and monitor commands.
 Use the `macos-arm64` release asset for Apple Silicon. Linux release binaries
 are not macOS builds.
 
-The latest R9700 resident-server test measured **87.28 prompt tokens/s and
-12.61 decode tokens/s**: median of three warm requests, each with 64 input and
+**HIPC and Loom currently have different performance.** The earlier HIPC
+(`--dialect hip`) result is reported at approximately **34 decode tokens/s**;
+the measured macOS Loom (`--dialect loom`) result is **12.61 decode tokens/s**.
+The HIPC number is a recalled result whose log and exact model, quantization,
+context and MTP settings still need to be recovered for a matched comparison.
+Loom does not yet match that reported HIPC throughput; closing this gap is a
+current optimization priority.
+
+The latest **macOS Loom** R9700 resident-server test measured **87.28 prompt
+tokens/s and 12.61 decode tokens/s**: median of three warm requests, each with 64 input and
 33 output tokens (32 decode steps), KV128, no MTP, flush64 and 64 µs polling.
 All outputs match the preceding validated fixture. The previous combined
 implementation measured 64.22 PP/s and 12.64 TPS in one warm request: prompt
