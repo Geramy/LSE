@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "lse/graph/workgroup.hpp"
 
 #include "lse/core/dtype.hpp"
@@ -568,6 +569,14 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
   }
   if (groups.empty()) return;
 
+  // Nodes are public graph records, so malformed alias cycles are not ruled
+  // out by construction. Without an owner, no slot recycling is provably
+  // safe. Preserve unique allocations and let normal binding reject an
+  // unmaterialized cyclic input rather than guessing its lifetime.
+  const bool unknown_owner = std::any_of(
+      members_.begin(), members_.end(),
+      [](const NodePtr& n) { return allocation_owner(n.get()) == nullptr; });
+
   std::unordered_map<const Node*, std::uint32_t> last_cut;
   for (std::uint32_t ci = 0; ci < groups.size(); ++ci) {
     for (const NodePtr& n : groups[ci].nodes) {
@@ -628,7 +637,7 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
   static const bool no_reuse = std::getenv("LSE_NO_SLOT_REUSE") != nullptr;
   auto take = [&](std::size_t bytes) -> std::uint32_t {
     auto& bin = free[bytes];
-    if (!no_reuse && !bin.empty()) {
+    if (!no_reuse && !unknown_owner && !bin.empty()) {
       const std::uint32_t id = bin.back();
       bin.pop_back();
       ++reused_;
