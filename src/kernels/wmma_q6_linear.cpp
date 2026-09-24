@@ -5,6 +5,7 @@
 #include "lse/kernels/wmma.hpp"
 #include "lse/math/fp8.hpp"
 #include "lse/quant/group_affine_codec.hpp"
+#include "lse/quant/centered_affine.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -176,7 +177,7 @@ std::string emit_staged_bf16(const KernelShapes &s, const Dims &d) {
     return {};
   return body.str();
 }
-std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
+std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
   using Tile = Base<math::MatrixElem::kBF16>;
   using F = typename Tile::AFrag;
   using Op = typename Tile::Op;
@@ -189,8 +190,11 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
     return {};
   env::Emit e{&body};
   const auto xs = e.lds<F>(64u * 64u), ws = e.lds<F>(64u * 64u);
-  const auto wl = e.lds<F>(64u * 64u);
-  const auto flags = e.lds<kir::f32>(4u);
+  const auto row_partials = e.lds<kir::f32>(64u * 4u);
+  const auto group_scales = e.lds<kir::f32>(64u);
+  const auto group_biases = e.lds<kir::f32>(64u);
+  const auto flags = e.lds<kir::f32>(12u);
+  constexpr float product_headroom = quant::kCenteredProductHeadroom;
   constexpr float min_normal = std::numeric_limits<float>::min();
   constexpr float max_bf16 = 3.3895313892515355e38f;
   const auto lid = e.let(math::local_id()), lane = e.let(lid % 32u);
@@ -207,6 +211,7 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
                            const kir::Val<kir::u32> &k) {
     return r * 64u + ((k / 8u + r % 8u) % 8u) * 8u + k % 8u;
   };
+  auto largest_group = e.var(0.0f);
   std::vector<kir::Local<kir::f32, 8>> acc;
   for (unsigned i = 0; i < 4; ++i) {
     acc.push_back(e.local<kir::f32, 8>());
@@ -215,6 +220,10 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
   }
   for (auto kb : e.range(0u, d.k, 64u)) {
     auto bad = e.var(0.0f);
+    for(unsigned i=0;i<4;++i)for(auto j:e.unroll(8u))
+      if(auto large=e.when(math::abs(acc[i][j].read()) > quant::kCenteredAccumulatorHeadroom))
+        bad=e.f32(1.0f);
+    auto x_max = e.var(0.0f), coefficient_max = e.var(0.0f);
     const auto mark_unsafe = [&](const kir::Val<kir::f32>& value) {
       auto invalid=e.var(1.0f);
       if(auto safe=e.when(math::abs(value)<=max_bf16 &&
@@ -227,11 +236,10 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
       const auto r = e.let(lid / 4u + block * 32u),
                  kc = e.let((lid % 4u) * 16u);
       const auto ar = e.let(mbase + r), bc = e.let(nbase + r);
-      const auto av = e.local<F, 16>(), bv = e.local<F, 16>(), bl = e.local<F, 16>();
+      const auto av = e.local<F, 16>(), bv = e.local<F, 16>();
       for (auto j : e.unroll(16u)) {
         av[j] = math::narrow<F>(e.f32(0));
         bv[j] = math::narrow<F>(e.f32(0));
-        bl[j] = math::narrow<F>(e.f32(0));
       }
       if (auto active = e.when(ar < d.m)) {
         for (unsigned v = 0; v < 4; ++v) {
@@ -239,14 +247,35 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
           for (unsigned j = 0; j < 4; ++j) {
             const auto original=e.let(loaded[j]);
             mark_unsafe(original);
+            x_max = math::max(x_max.read(), math::abs(original));
             av[v * 4 + j] = math::narrow<F>(original);
           }
         }
+      }
+      if (auto owner = e.when(lid % 4u == 0u)) {
+        group_scales[r] = e.f32(0.0f);
+        group_biases[r] = e.f32(0.0f);
       }
       if (auto active = e.when(bc < d.n)) {
         const auto gi = e.let(bc * d.groups + (kb + kc) / d.group);
         const auto scale = e.let(math::widen(a.scales[gi])),
                    bias = e.let(math::widen(a.biases[gi]));
+        mark_unsafe(scale); mark_unsafe(bias);
+        const auto coefficients = quant::centered_affine(e, scale, bias);
+        const auto center = coefficients.center;
+        const auto residual_bias = coefficients.residual_bias;
+        mark_unsafe(residual_bias);
+        // This bounds cancellation in the separated affine terms by three.
+        // Zero scale is supported here only when every weight is zero.
+        if (auto ill_conditioned = e.when(
+                math::abs(residual_bias) > math::abs(scale) * 0.5f))
+          bad = e.f32(1.0f);
+        coefficient_max = math::max(coefficient_max.read(),
+            math::max(math::abs(scale), math::abs(residual_bias)));
+        if (auto owner = e.when(lid % 4u == 0u)) {
+          group_scales[r] = scale;
+          group_biases[r] = residual_bias;
+        }
         const auto wb = e.let(bc * d.words + ((kb + kc) / 16u) * 3u);
         const std::array<kir::Val<kir::u32>, 3> packed{
             e.let(a.packed[wb]), e.let(a.packed[wb + 1u]),
@@ -261,56 +290,86 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
             code = code % 64u;
           const auto original=e.let(math::fma(math::cast<kir::f32>(e.let(code)), scale, bias));
           mark_unsafe(original);
-          bv[j] = math::narrow<F>(original);
-          // Preserve the original FP32 dequantization and subtract the widened
-          // rounded high part. The low part is a second native BF16 operand.
-          const auto residual=e.let(original-math::widen(bv[j].read()));
-          mark_unsafe(residual);
-          bl[j] = math::narrow<F>(residual);
+          // Integer centered codes are exactly representable in BF16.
+          bv[j] = math::narrow<F>(math::cast<kir::f32>(e.let(code)) - center);
         }
       }
+      auto row_sum = e.var(0.0f);
       for (auto j : e.unroll(16u)) {
+        row_sum = row_sum.read() + math::widen(av[j].read());
         const auto index = e.let(address(r, kc + j));
         xs[index] = av[j].read();
         ws[index] = bv[j].read();
-        wl[index] = bl[j].read();
       }
+      row_partials[r * 4u + lid % 4u] = row_sum.read();
     }
-    for(unsigned bit:{1u,2u,4u,8u,16u})
+    for(unsigned bit:{1u,2u,4u,8u,16u}) {
       bad=math::max(bad.read(),math::shfl_xor(bad.read(),e.u32(bit)));
-    if(auto leader=e.when(lane==0u))flags[wave]=bad.read();
+      x_max=math::max(x_max.read(),math::shfl_xor(x_max.read(),e.u32(bit)));
+      coefficient_max=math::max(coefficient_max.read(),
+          math::shfl_xor(coefficient_max.read(),e.u32(bit)));
+    }
+    if(auto leader=e.when(lane==0u)) {
+      flags[wave]=bad.read();
+      flags[4u+wave]=x_max.read();
+      flags[8u+wave]=coefficient_max.read();
+    }
     e.barrier();
-    const auto block_bad=e.let(flags[0u].read()+flags[1u].read()+flags[2u].read()+flags[3u].read());
-    if(auto regular=e.when(block_bad==0.0f)) {
+    auto block_bad=e.var(flags[0u].read()+flags[1u].read()+flags[2u].read()+flags[3u].read());
+    const auto block_x = e.let(math::max(math::max(flags[4u].read(), flags[5u].read()),
+                                       math::max(flags[6u].read(), flags[7u].read())));
+    const auto block_coefficient = e.let(math::max(math::max(flags[8u].read(), flags[9u].read()),
+                                                 math::max(flags[10u].read(), flags[11u].read())));
+    // Guard the unscaled group dot and its separate affine products, even
+    // when cancellation or a tiny scale makes the reference result finite.
+    if (auto overflow = e.when(block_x > product_headroom)) block_bad=e.f32(1.0f);
+    if (auto nonzero = e.when(block_coefficient > 0.0f))
+      if (auto overflow = e.when(block_x > e.f32(product_headroom) / block_coefficient))
+        block_bad=e.f32(1.0f);
+    if(auto regular=e.when(block_bad.read()==0.0f)) {
+    std::vector<kir::Local<kir::f32, 8>> group_acc;
+    for (unsigned i=0;i<4;++i) {
+      group_acc.push_back(e.local<kir::f32,8>());
+      for(auto j:e.unroll(8u)) group_acc.back()[j]=e.f32(0.0f);
+    }
     for (auto slice : e.unroll(4u)) {
-      std::vector<kir::Local<F, 8>> af, bf, blf;
+      std::vector<kir::Local<F, 8>> af, bf;
       for (unsigned i = 0; i < 2; ++i) {
         af.push_back(e.local<F, 8>());
         bf.push_back(e.local<F, 8>());
-        blf.push_back(e.local<F, 8>());
         const auto ar = e.let(am + i * 16u + lo), bc = e.let(bn + i * 16u + lo);
         // K-major fragments occupy eight contiguous BF16 elements. The
         // bank rotation preserves the eight-element alignment at each start.
         const auto k = e.let(slice * 16u + hi * 8u);
         const auto ap = xs.load(e.let(address(ar, k)), 16u);
         const auto bp = ws.load(e.let(address(bc, k)), 16u);
-        const auto blp = wl.load(e.let(address(bc, k)), 16u);
         for (auto j : e.unroll(8u)) {
           af.back()[j] = ap[j];
           bf.back()[j] = bp[j];
-          blf.back()[j] = blp[j];
         }
       }
       for (unsigned m = 0; m < 2; ++m)
         for (unsigned n = 0; n < 2; ++n) {
-          acc[m * 2 + n] = math::mma<Op>(af[m].value(), bf[n].value(),
-                                         acc[m * 2 + n].value());
-          acc[m * 2 + n] = math::mma<Op>(af[m].value(), blf[n].value(),
-                                         acc[m * 2 + n].value());
+          group_acc[m * 2 + n] = math::mma<Op>(af[m].value(), bf[n].value(),
+                                               group_acc[m * 2 + n].value());
         }
     }
+    for(unsigned m=0;m<2;++m)for(unsigned n=0;n<2;++n) {
+      const auto col=e.let(bn+n*16u+lo);
+      const auto scale=e.let(group_scales[col].read());
+      const auto bias=e.let(group_biases[col].read());
+      for(auto j:e.unroll(8u)) {
+        const auto row=e.let(am+m*16u+j*geo.slot_step+hi*geo.half_rows);
+        const auto base=e.let(row*4u);
+        const auto sum=e.let(((row_partials[base].read()+row_partials[base+1u].read())+
+                              row_partials[base+2u].read())+row_partials[base+3u].read());
+        const auto contribution=e.let(math::fma(scale,group_acc[m*2+n][j].read(),bias*sum));
+        largest_group=math::max(largest_group.read(),math::abs(contribution));
+        acc[m*2+n][j]=acc[m*2+n][j].read()+contribution;
+      }
     }
-    if(auto exceptional=e.when(block_bad!=0.0f)) {
+    }
+    if(auto exceptional=e.when(block_bad.read()!=0.0f)) {
       for(unsigned m=0;m<2;++m)for(unsigned n=0;n<2;++n){
         const auto col=e.let(nbase+bn+n*16u+lo);
         for(auto j:e.unroll(8u)){
@@ -337,8 +396,27 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
       for (auto j : e.unroll(8u)) {
         const auto rr = e.let(mbase + am + m * 16u + j * geo.slot_step +
                               hi * geo.half_rows);
-        if (auto active = e.when(rr < d.m && col < d.n))
-          e.store(rr * d.n + col, acc[m * 2 + n][j].read());
+        if (auto active = e.when(rr < d.m && col < d.n)) {
+          auto value=e.var(acc[m * 2 + n][j].read());
+          // Near-cancelling group totals can hide the original ordered-FMA
+          // residual. Recompute only these outputs, after all LDS barriers.
+          if (auto cancellation=e.when(largest_group.read()>0.0f &&
+              math::abs(value.read()) <= quant::kCenteredCancellationRatio*largest_group.read())) {
+            value=e.f32(0.0f);
+            for(auto chunk:e.range(0u,d.k/16u,1u)) {
+              const auto gi=e.let(col*d.groups+(chunk*16u)/d.group);
+              const auto scale=e.let(math::widen(a.scales[gi]));
+              const auto bias=e.let(math::widen(a.biases[gi]));
+              quant::dequant_chunk(e,a.packed,quant::GroupAffine{6,64},
+                e.let(col*d.words+chunk*3u),scale,bias,
+                [&](int q,const kir::Val<kir::f32>& weight) {
+                  value=math::fma(a.x[rr*d.k+chunk*16u+static_cast<unsigned>(q)],
+                                  weight,value.read());
+                });
+            }
+          }
+          e.store(rr*d.n+col,value.read());
+        }
       }
     }
   if (!body.lds().ok())
@@ -391,9 +469,9 @@ const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
   return &kernel;
 }
 
-struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kernel> {
-  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_weight_residual2_vector_lds_v3";
-  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_weight_residual2_vector_lds_v3";
+struct CenteredAffineKernel final : KernelPrimitive<CenteredAffineKernel> {
+  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_centered_affine_v1";
+  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_centered_affine_v1";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }
@@ -401,7 +479,7 @@ struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kern
     const auto d = dims_of(s);
     if (!d.valid || !s.store || !s.types.scalar || !s.intrinsics)
       return {};
-    return emit_staged_bf16_residual2(s, d);
+    return emit_staged_bf16_centered(s, d);
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
     if (in.size() != 4 || in[1].rank() != 2)
@@ -422,17 +500,18 @@ struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kern
       return p;
     p.workgroup_size[0] = 128;
     p.workgroup_count[0] = ((d.m + 63) / 64) * ((d.n + 63) / 64);
-    p.lds_bytes = 24592;
+    p.lds_bytes = 17968;
     p.workgroup_count[1] = p.workgroup_count[2] = 1;
     return p;
   }
 };
-const KernelPrimitiveBase *select_staged_bf16_residual2(const KernelShapes &s) {
+const KernelPrimitiveBase *select_centered_affine(const KernelShapes &s) {
+  if (s.intrinsics->find("rint").empty() || s.intrinsics->find("min").empty()) return nullptr;
   constexpr auto r = Base<math::MatrixElem::kBF16>::kRow;
   if (!r.emittable() || !math::has_cap(device_matrix_caps(*s.device), r.cap) ||
       s.intrinsics->find(r.key).empty())
     return nullptr;
-  static const StagedBF16Residual2Kernel kernel;
+  static const CenteredAffineKernel kernel;
   return &kernel;
 }
 
@@ -527,38 +606,32 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
   kernel.lds_bytes = kResidualLdsBytes;
   return kernel;
 }
-// Private model qualification route. These are the only two measured shapes;
-// the candidate stays unaccepted until complete-model quality is established.
-const KernelPrimitiveBase* select_m256_residual2_candidate(
+// Private qualification route. No centered-affine costs or accepted quality
+// records exist yet. Both dialects select the same exact projection shapes.
+const KernelPrimitiveBase* select_centered_affine_candidate(
     const KernelShapes& s, const Dims& dims) {
-  struct Measured { uint32_t n, k; uint64_t vector_ns, residual2_ns; };
-  // Matched fixed-compiler vector-LDS versus residual2 timings, driver195.
-  static constexpr Measured records[] = {
-      {17408, 5120, 4958328, 6668635},
-      {5120, 17408, 4441641, 6269651}};
-  const Measured* record = nullptr;
-  for (const auto& row : records)
-    if (dims.m == 256 && row.n == dims.n && row.k == dims.k) record = &row;
-  if (!record || record->vector_ns >= record->residual2_ns) return nullptr;
+  if ((dims.m != 256 && dims.m != 512) ||
+      !((dims.n == 17408 && dims.k == 5120) ||
+        (dims.n == 5120 && dims.k == 17408))) return nullptr;
   QuantOperandKernel kernel;
   kernel.operand = QuantOperand::kBF16;
   kernel.strategy = QuantOperandStrategy::kNative;
   kernel.implementation_id =
-      quant_operand_implementation_id(StagedBF16Residual2Kernel::kName);
+      quant_operand_implementation_id(CenteredAffineKernel::kName);
   kernel.implemented = true;
-  kernel.matrix_intrinsic = select_staged_bf16_residual2(s) != nullptr;
+  kernel.matrix_intrinsic = select_centered_affine(s) != nullptr;
   kernel.conversion_intrinsic = true;
   kernel.fp32_exceptional_block_fallback = true;
-  kernel.lds_bytes = 24592;
+  kernel.lds_bytes = 17968;
   QuantOperandProfile profile;
   profile.preferred = QuantOperand::kBF16;
   profile.strategy = QuantOperandStrategy::kNative;
-  profile.min_m = profile.max_m = 256;
+  profile.min_m = profile.max_m = dims.m;
   profile.run_qualification_candidate = true;
   const auto decision = select_quant_operand(residual_request(s, dims), kernel,
                                             profile);
   return decision.reason == OperandReason::kSelected
-      ? select_staged_bf16_residual2(s) : nullptr;
+      ? select_centered_affine(s) : nullptr;
 }
 } // namespace
 const graph::KernelPrimitiveBase *
@@ -570,7 +643,7 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
       s.device->compute_units != 64 ||
       (global && std::strcmp(global, "0") == 0))
     return nullptr;
-  if (dims.m == 256) return select_m256_residual2_candidate(s, dims);
+  if (dims.m == 256 || dims.m == 512) return select_centered_affine_candidate(s, dims);
   const auto request = residual_request(s, dims);
   // Matched driver195 projection experiments: eight post-warm host
   // eval+retire intervals per implementation. These are not device timestamps.
