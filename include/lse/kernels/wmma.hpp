@@ -45,6 +45,8 @@ const graph::KernelPrimitiveBase* wmma_quant_linear_for(
     const graph::KernelShapes& s);
 
 const graph::KernelPrimitiveBase* wmma_q6_linear_for(const graph::KernelShapes& s);
+// Private measured-shape two-stage qualification route.
+bool expand_q6_centered_repair(graph::Node& node, const graph::KernelShapes& s);
 
 // Which family of matrix instructions this device speaks. Not "does it have a
 // matrix core" — the families are different instructions with different

@@ -1,3 +1,4 @@
+#include "lse/graph/graph.hpp"
 // Measured floating-operand matrix contraction over unchanged MLX affine Q6.
 // Weight storage remains packed; staged operands feed the measured matrix core.
 #include "lse/graph/kernel_args.hpp"
@@ -645,6 +646,8 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
   kernel.lds_bytes = kResidualLdsBytes;
   return kernel;
 }
+#include "q6_centered_repair.inc"
+
 // Private M256 qualification route. Synthetic timing is not an accepted
 // model-quality record. Both dialects select the same two projection shapes.
 const KernelPrimitiveBase* select_centered_affine_candidate(
@@ -673,6 +676,30 @@ const KernelPrimitiveBase* select_centered_affine_candidate(
       ? select_centered_affine(s) : nullptr;
 }
 } // namespace
+bool expand_q6_centered_repair(graph::Node& node, const graph::KernelShapes& shapes) {
+  const auto* selected = wmma_q6_linear_for(shapes);
+  if (!selected || selected->name() != CenteredAffineKernel::kName ||
+      node.materialized || node.inputs.size() != 4) return false;
+  static const CenteredStage stage_primitive;
+  static const CenteredRepair repair_primitive;
+  const auto dims = dims_of(shapes);
+  auto stage = std::make_shared<graph::Node>();
+  stage->kind = graph::OpKind::kQuantMatMul;
+  stage->prim = &stage_primitive;
+  stage->fclass = graph::FusionClass::kBarrier;
+  stage->dtype = DType::kF32;
+  stage->shape = Shape{2ll * dims.m, dims.n};
+  stage->inputs = node.inputs;
+  stage->iattrs = node.iattrs;
+  for (const auto& input : stage->inputs) ++input->consumer_count;
+  stage->consumer_count = 1;
+  node.inputs.insert(node.inputs.begin(), std::move(stage));
+  node.kind = graph::OpKind::kCustom;
+  node.prim = &repair_primitive;
+  node.fclass = graph::FusionClass::kBarrier;
+  return true;
+}
+
 const graph::KernelPrimitiveBase *
 wmma_q6_linear_for(const graph::KernelShapes &s) {
   const auto dims = dims_of(s);

@@ -1,3 +1,4 @@
+#include "lse/graph/kernel_expansion.hpp"
 #include "lse/graph/gdn_pair.hpp"
 #include "lse/graph/graph.hpp"
 
@@ -1044,7 +1045,59 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   SpanTimer setup_span(trace_.spans.schedule);
   LSE_RETURN_IF_ERROR(release_phase_tables());
 
+  // Expansions are ordinary graph dependencies: all launch splitting, slot
+  // lifetimes and replay retention must see them before constructing a plan.
+  if (device_first && !rec.holds(roots)) {
+    const auto sources = emitter->sources();
+    for (const NodePtr& node : Partitioner::unmaterialized(roots)) {
+      const auto* expansion =
+          dynamic_cast<const IKernelGraphExpansion*>(node->prim);
+      if (expansion == nullptr) continue;
+      std::vector<Shape> input_shapes;
+      std::vector<DType> input_types;
+      bool complete = true;
+      for (const NodePtr& input : node->inputs) {
+        if (!input) { complete = false; break; }
+        input_shapes.push_back(input->shape);
+        input_types.push_back(input->dtype);
+      }
+      if (!complete) continue;
+      KernelShapes shapes;
+      shapes.inputs = input_shapes;
+      shapes.input_dtypes = input_types;
+      shapes.output = node->shape;
+      shapes.output_dtype = node->dtype;
+      shapes.iattrs = node->iattrs;
+      for (std::size_t i = 0; i < std::min(node->attrs.size(), shapes.attrs.size()); ++i)
+        shapes.attrs[i] = static_cast<float>(node->attrs[i]);
+      shapes.device = &backend().device_info();
+      shapes.intrinsics = &sources;
+      (void)expansion->expand_graph(*node, shapes);
+    }
+  }
+
   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
+  // Views must be valid before partitioning: a device-only view group may
+  // require no dispatch at all, so neither a kernel nor the host interpreter
+  // is guaranteed to validate it later.
+  for (const NodePtr& node : order) {
+    if (node->kind != OpKind::kReshape) continue;
+    if (node->inputs.size() != 1 || !node->inputs[0]) {
+      return LSE_ERROR(kInvalidArgument, "reshape requires one input");
+    }
+    const Node& source = *node->inputs[0];
+    if (source.dtype != node->dtype ||
+        source.element_count() != node->element_count()) {
+      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
+    }
+    const std::size_t bytes =
+        dtype_storage_bytes(node->dtype, node->element_count());
+    if (source.materialized && source.buffer.valid() &&
+        (bytes == 0 || bytes > source.buffer.size_bytes)) {
+      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
+    }
+  }
+
 
   std::vector<FusionGroup> phase_groups;
   bool replayed = false;
@@ -1348,26 +1401,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         staged.nodes.push_back(n);
       }
       flush_staged();
-      wg.plan_slots(roots);
-      // A workgroup is member-homogeneous by construction (the partitioner
-      // splits phases where a value changes members), so its slots belong on
-      // that member — allocated through the member's backend and stream, or
-      // every member's phase activations land on the primary and each launch
-      // reads them across the link.
-      std::size_t wg_member = devices_.primary();
-      for (const NodePtr& n : wg.members()) {
-        if (n && n->member != Node::kAnyMember &&
-            static_cast<std::size_t>(n->member) < devices_.size()) {
-          wg_member = static_cast<std::size_t>(n->member);
-          break;
-        }
-      }
-      const backend::Stream wg_stream =
-          devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
-      if (wg.bind_slots(devices_.device(wg_member), wg_stream).ok()) {
-        trace_.slots_reused += wg.reused_slots();
-        trace_.slots_allocated += wg.slot_count();
-      }
     }
   }
 
@@ -1397,6 +1430,34 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       if (!merged) earlier.push_back(i);
     }
     std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
+  }
+
+  if (device_first && !replayed) {
+    for (Workgroup& wg : planned) {
+      // Kernel epilogues and pointwise chains above can remove boundaries
+      // present in Workgroup::cuts(). Plan against the launches we will issue,
+      // otherwise a fused output can overwrite a still-live reduction input.
+      wg.plan_slots(roots, phase_groups);
+      // A workgroup is member-homogeneous by construction (the partitioner
+      // splits phases where a value changes members), so its slots belong on
+      // that member — allocated through the member's backend and stream, or
+      // every member's phase activations land on the primary and each launch
+      // reads them across the link.
+      std::size_t wg_member = devices_.primary();
+      for (const NodePtr& n : wg.members()) {
+        if (n && n->member != Node::kAnyMember &&
+            static_cast<std::size_t>(n->member) < devices_.size()) {
+          wg_member = static_cast<std::size_t>(n->member);
+          break;
+        }
+      }
+      const backend::Stream wg_stream =
+          devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
+      if (wg.bind_slots(devices_.device(wg_member), wg_stream).ok()) {
+        trace_.slots_reused += wg.reused_slots();
+        trace_.slots_allocated += wg.slot_count();
+      }
+    }
   }
 
   std::vector<FusionGroup> ran;
@@ -1782,8 +1843,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
-      // Not a hard failure: a group the emitter cannot express falls to the
-      // host, which is the documented behaviour. Record why.
+      // Inference qualification must not quietly turn a missing GPU kernel
+      // into a CPU result. Drain prior work before reporting the exact gap.
+      if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+          strict != nullptr && std::string_view(strict) == "1") {
+        for (std::size_t member = 0; member < devices_.size(); ++member) {
+          LSE_RETURN_IF_ERROR(devices_.device(member).synchronize());
+        }
+        return LSE_ERROR(kUnimplemented, "GPU-only execution required: ",
+                         dispatched.message());
+      }
+      // A group the emitter cannot express otherwise falls to the host,
+      // which is the default behaviour. Record why.
       ++trace_.host_groups;
       trace_.host_group_reasons.push_back(dispatched.message());
     }
@@ -1794,6 +1865,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
       LSE_RETURN_IF_ERROR(waited);
       launched = false;
+    }
+
+    if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+        strict != nullptr && std::string_view(strict) == "1") {
+      return LSE_ERROR(kUnimplemented,
+                       "GPU-only execution required: no device kernel backend selected");
     }
 
     // Host-only mode reaches here without passing the device-first arm above,
@@ -1975,6 +2052,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
 ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
 
 Scheduler* default_scheduler() {
+  // Without place linked, this scheduler owns the backend itself. Arrange
+  // runtime dependencies before its destructor is registered as well.
+  if (g_device_set_factory == nullptr) backend::prepare_backend_runtimes();
   static DefaultScheduler d;
   return d.scheduler.get();
 }
