@@ -1,5 +1,4 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
-#include "lse/graph/epilogue_input.hpp"
 #include "lse/kernels/int8_policy.hpp"
 #include "lse/kernels/quant_operand_policy.hpp"
 #include "lse/kernels/quant_operand_cache.hpp"
@@ -550,9 +549,7 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
       probe.device = &device;
       probe.types = type_table;
       probe.intrinsics = &spellings;
-      // phase_spec uses the base RMS under its virtual row walk.
-      const KernelPrimitiveBase* chosen =
-          group.is_phase && n->kind == OpKind::kRMS ? kp : kp->specialize(probe);
+      const KernelPrimitiveBase* chosen = kp->specialize(probe);
       if (chosen == nullptr || !chosen->owns_indexing()) continue;
       if (group.outputs.size() != 1) break;
       self = chosen;
@@ -1211,8 +1208,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       // at the thread id: a wave's lane owns a tile position, not element i.
       for (std::size_t j = 0; j < input_count; ++j) {
         const NodePtr& n = out.binding_order[j];
-        if (pointer_inputs.count(n.get()) != 0 &&
-            !graph::needs_elementwise_input(group, n.get())) continue;
+        if (pointer_inputs.count(n.get()) != 0) continue;
         const std::string var = "ep" + std::to_string(j);
         s << "const float " << var << " = "
           << load_expr("in" + std::to_string(j),
@@ -1406,8 +1402,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   std::unordered_map<const Node*, std::string> value_of;
   for (std::size_t i = 0; i < input_count; ++i) {
     const NodePtr& n = out.binding_order[i];
-    if (pointer_inputs.count(n.get()) != 0 &&
-        !graph::needs_elementwise_input(group, n.get())) continue;
+    if (pointer_inputs.count(n.get()) != 0) continue;
     const std::string var = "in" + std::to_string(i);
     const std::string idx = broadcast_index_expr(n->shape, out_shape, "i");
     src << "  const float " << var << " = "
