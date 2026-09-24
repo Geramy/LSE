@@ -41,17 +41,18 @@ prior control (about 28% higher): Qwen3.8-27B Q6, 1,023 decode steps, KV2048,
 no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
 not a median across many runs.
 
-**The accepted M256 Q6 prefill path now uses vector LDS loads.** In matched
-R9700 resident-server measurements with cooperative RMS, a **512-input/33-output**
-workload measured median **143.26 prompt tokens/s and 15.84 decode tokens/s**, versus
-88.74 prompt tokens/s and 15.91 decode tokens/s for the prior scalar-LDS control.
-The three measured requests in each run reported zero JIT compilations. The
-combined implementation also completed three identical **1,024-input/1,024-output**
-requests with clean shutdown; the final request measured **139.85 prompt tokens/s
-and 14.23 decode tokens/s**. These are different workloads, and the long-request
-result is one post-warmup measurement rather than a many-run median. Tests cover
-full projection outputs and guards, and model logits meet the stated acceptance
-budget; the matrix operand path is not a claim of bitwise FP32 equivalence.
+**The M256 residual-two-product BF16 prefill profile is quarantined.** A new
+matched comparison with the current cooperative-RMS model measured logit relative
+L2 error **0.005030228**, above the **0.005** acceptance limit. Its earlier
+0.004085221 result used a different RMS context. The profile now remains a
+candidate with failed model quality, and the shared HIP/Loom selector uses the
+FP32 fallback for those M256 shapes until a replacement qualifies.
+
+Historical measurements with that withdrawn profile were **143.26 prompt tokens/s
+and 15.84 decode tokens/s** for a matched 512-input/33-output run, and **139.85
+prompt tokens/s and 14.23 decode tokens/s** for the final request of a three-request
+1,024-input/1,024-output run. They document the experiment, not the current default
+prefill rate or an accepted accuracy result.
 
 **Q6 decode now shares activation loads across four output columns** on the
 qualified gfx1201 layout, preserving each output's FP32 arithmetic order.
@@ -63,7 +64,9 @@ matched the previous implementation, and the warmed final request measured
 **139.36 prompt tokens/s and 14.83 decode tokens/s**, versus 14.23 decode
 tokens/s in the prior long run. The long comparison uses one measured request
 per implementation, not a multi-run median. Broader throughput parity remains
-active work.
+active work. Those four-column performance runs also used the now-quarantined
+M256 prefill profile; their prompt rates are historical, not current-default
+throughput claims. The four-column decode arithmetic is unchanged.
 
 KV capacity growth can create additional prefill specializations on the second
 request. Warm up the resident workload twice and check the HTTP JIT timing

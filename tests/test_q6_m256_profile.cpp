@@ -1,4 +1,4 @@
-// Host-only selection contracts for the accepted M256 vector profile.
+// Host-only selection contracts for the quarantined M256 vector profile.
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/hipc/hip_sources.hpp"
@@ -28,10 +28,21 @@ LSE_TEST(m256_profile_preserves_other_shape_selection) {
   unsetenv("LSE_WMMA");
   for(bool loom:{false,true})for(int m:{1,17,64,128,256,512})for(auto [n,k]:{std::pair{17408,5120},std::pair{5120,17408}}){
     Fixture f(m,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
-    LSE_EXPECT_EQ(p!=nullptr,m==64||m==256||m==512);if(!p)continue;
+    LSE_EXPECT_EQ(p!=nullptr,m==64||m==512);if(!p)continue;
     LSE_EXPECT_EQ(p->name().find("weight_residual2")!=std::string_view::npos,m==256);
     LSE_EXPECT_EQ(p->name().find("vector_lds_v4")!=std::string_view::npos,m==256);
-    const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,m==256?24592u:16384u);
+    const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,16384u);
+  }
+}
+LSE_TEST(m256_profile_declines_previously_accepted_model_shapes) {
+  unsetenv("LSE_WMMA");
+  for (bool loom : {false, true}) {
+    for (auto [n, k] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
+      Fixture f(256, n, k, loom);
+      // Full capabilities and formerly measured shapes must still decline:
+      // neither speed nor projection-only tests override failed model quality.
+      LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes) == nullptr);
+    }
   }
 }
 LSE_TEST(m256_profile_rejects_unmeasured_and_ineligible_requests) {

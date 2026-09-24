@@ -526,9 +526,9 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
   kernel.lds_bytes = kResidualLdsBytes;
   return kernel;
 }
-// Only these two M256 shapes have complete-model quality and measured cost
-// evidence for the two-product BF16 implementation. Other widths retain their
-// independently qualified implementation or scalar path.
+// Preserve the measured M256 candidate and its failed current-model quality
+// evidence. The shared policy rejects it; these shapes use the FP32 fallback.
+// Other widths retain their independently qualified implementation or scalar path.
 const KernelPrimitiveBase* select_m256_residual2(
     const KernelShapes& s, const Dims& dims) {
   struct Measured { uint32_t n, k; uint64_t vector_ns, residual2_ns; };
@@ -553,19 +553,20 @@ const KernelPrimitiveBase* select_m256_residual2(
   kernel.fp32_exceptional_block_fallback = true;
   kernel.lds_bytes = 24592;
   auto& profile = option.profile;
-  profile.revision = 1;
-  profile.qualification = OperandQualification::kAccepted;
+  profile.revision = 2;
+  profile.qualification = OperandQualification::kCandidate;
   profile.preferred = QuantOperand::kBF16;
   profile.strategy = QuantOperandStrategy::kNative;
   profile.min_m = profile.max_m = 256;
-  // Sixteen guarded projection cases, two full-size projection checks and
-  // complete-model logits: max projection L2 0.003061827, model 0.004085221.
-  // Rounded upward in ppm. Model repeats are bit-identical with fixed slots.
-  profile.measured_cases = 19;
-  profile.measured_relative_l2_ppm = 4086;
+  // The current cooperative-RMS model versus its matched FP32 reference has
+  // relative L2 0.005030228, exceeding the 0.005 acceptance budget. The older
+  // 0.004085221 result used a different RMS context and does not qualify this
+  // profile. Preserve the observed error rounded upward in ppm.
+  profile.measured_cases = 20;
+  profile.measured_relative_l2_ppm = 5031;
   profile.absolute_error_pass = true;
   profile.nonfinite_pass = true;
-  profile.model_quality_pass = true;
+  profile.model_quality_pass = false;
   profile.performance_pass = true;
   constexpr uint64_t cohort = 0x202609240001ull;
   auto& cost = option.cost;
