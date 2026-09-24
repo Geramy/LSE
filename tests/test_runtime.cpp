@@ -3133,3 +3133,43 @@ LSE_TEST(an_accepted_draft_still_gives_the_decoders_own_tokens) {
                 ids_to_string(*want).c_str(), ids_to_string(*got).c_str());
   }
 }
+
+LSE_TEST(generation_timing_excludes_prefill_token_and_early_stop) {
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  const std::vector<std::uint32_t> prompt{2, 11, 33};
+  for (bool speculative : {false, true}) {
+    for (int count : {0, 1, 3}) {
+      // CPU interpreter fixtures cannot replay speculative verification. The
+      // prefill-only/first-token/cancel paths still exercise speculative timing.
+      if (speculative && count > 1) continue;
+      Generator gen(*fx.lm, greedy_params());
+      if (speculative) gen.use_mtp(*fx.mtp);
+      GenerationLimits limits;
+      limits.max_tokens = count;
+      auto got = gen.generate(prompt, limits);
+      LSE_EXPECT(got.ok());
+      if (!got.ok()) return;
+      LSE_EXPECT_EQ(got->size(), static_cast<std::size_t>(count));
+      LSE_EXPECT_EQ(gen.stats().generated_tokens, count);
+      LSE_EXPECT_EQ(gen.stats().decoded_tokens(), count > 0 ? count - 1 : 0);
+      if (count <= 1) {
+        LSE_EXPECT_EQ(gen.stats().decode_ns, 0u);
+        LSE_EXPECT_EQ(gen.stats().decode_tokens_per_second(), 0.0);
+      } else {
+        LSE_EXPECT(gen.stats().decode_ns > 0);
+        LSE_EXPECT(gen.stats().decode_tokens_per_second() > 0);
+      }
+    }
+    Generator cancelled(*fx.lm, greedy_params());
+    if (speculative) cancelled.use_mtp(*fx.mtp);
+    GenerationLimits limits;
+    limits.max_tokens = 8;
+    auto got = cancelled.generate(prompt, limits, [](std::uint32_t) { return false; });
+    LSE_EXPECT(got.ok());
+    LSE_EXPECT_EQ(cancelled.stats().generated_tokens, 1);
+    LSE_EXPECT_EQ(cancelled.stats().decode_ns, 0u);
+    LSE_EXPECT_EQ(cancelled.stats().decode_tokens_per_second(), 0.0);
+  }
+}

@@ -181,6 +181,8 @@ struct Outcome {
   std::string text;
   int prompt_tokens = 0;
   int completion_tokens = 0;
+  int prefill_tokens = 0;
+  int decode_tokens = 0;
   bool hit_limit = false;
   // Prefill and decode are different rates and a single figure hides which one
   // is the problem, so both are reported. Speculation moves the decode rate
@@ -256,20 +258,19 @@ struct HttpServer::Run {
                     out.completion_tokens >= r.limits.max_tokens;
 
     const runtime::GenerationStats& st = gen.stats();
+    out.prefill_tokens = st.prompt_tokens;
+    out.decode_tokens = st.decoded_tokens();
     out.prefill_ns = st.prefill_ns;
     out.decode_ns = st.decode_ns;
     out.decode_per_second = st.decode_tokens_per_second();
-    if (st.prefill_ns != 0 && st.prompt_tokens > 0) {
-      out.prompt_per_second = static_cast<double>(st.prompt_tokens) * 1e9 /
-                              static_cast<double>(st.prefill_ns);
-    }
+    out.prompt_per_second = st.prompt_tokens_per_second();
     if (st.spec_steps != 0) out.acceptance = st.acceptance_rate();
 
     std::fprintf(stderr,
                  "lse-server: prompt %d in %.2fs (%.1f tok/s) | decode %d in "
                  "%.2fs (%.1f tok/s)%s\n",
-                 out.prompt_tokens, out.prefill_ns / 1e9, out.prompt_per_second,
-                 out.completion_tokens, out.decode_ns / 1e9,
+                 out.prefill_tokens, out.prefill_ns / 1e9, out.prompt_per_second,
+                 out.decode_tokens, out.decode_ns / 1e9,
                  out.decode_per_second,
                  out.acceptance >= 0.0
                      ? (" | accepted " + std::to_string(
@@ -291,10 +292,14 @@ json usage_of(const Outcome& o) {
 // a client that does not know it ignores it, which is what llama.cpp does with
 // the same information.
 json timings_of(const Outcome& o) {
-  json t{{"prompt_n", o.prompt_tokens},
+  json t{{"prompt_n", o.prefill_tokens},
          {"prompt_ms", o.prefill_ns / 1e6},
          {"prompt_per_second", o.prompt_per_second},
-         {"predicted_n", o.completion_tokens},
+         {"generated_n", o.completion_tokens},
+         {"decode_n", o.decode_tokens},
+         {"decode_ms", o.decode_ns / 1e6},
+         {"decode_per_second", o.decode_per_second},
+         {"predicted_n", o.decode_tokens},
          {"predicted_ms", o.decode_ns / 1e6},
          {"predicted_per_second", o.decode_per_second}};
   if (o.acceptance >= 0.0) t["acceptance_rate"] = o.acceptance;

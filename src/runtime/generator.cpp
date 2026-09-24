@@ -441,6 +441,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
 
   std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
   bool running = give(pending);
+  const std::uint64_t decode_start = running ? now_ns() : 0;
 
   std::vector<std::uint32_t> row_in;   // the m tokens the next pass consumes
   std::size_t already = 0;             // leading answers already emitted
@@ -545,6 +546,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     if (!session.restart().ok()) session.clear();
     mtp_->reset();
   }
+  stats_.decode_ns = decode_start == 0 ? 0 : now_ns() - decode_start;
   return generated;
 }
 
@@ -620,10 +622,9 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   const bool device_greedy =
       sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
 
-  const std::uint64_t decode_start = now_ns();
+  std::uint64_t decode_start = 0;
   if (mtp_ != nullptr) {
     LSE_ASSIGN_OR(generated, speculate(session, logits, limits, on_token));
-    stats_.decode_ns = now_ns() - decode_start;
     snapshot_trace(&stats_, &host_reasons_);
     return generated;
   }
@@ -639,6 +640,9 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     if (on_token && !on_token(next)) break;
     if (n + 1 == limits.max_tokens) break;
 
+    // The first token came from prefill. Start timing only when its successor
+    // needs a model step, after the first token has been delivered.
+    if (decode_start == 0) decode_start = now_ns();
     // Only the new token goes in: every block's state already holds the rest.
     if (device_greedy) {
       LSE_ASSIGN_OR(next, greedy_step(session, next));
@@ -648,7 +652,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     }
     session.advance(1);
   }
-  stats_.decode_ns = now_ns() - decode_start;
+  stats_.decode_ns = decode_start == 0 ? 0 : now_ns() - decode_start;
   snapshot_trace(&stats_, &host_reasons_);
 
   return generated;

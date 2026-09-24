@@ -12,6 +12,7 @@ function(lse_add_test name)
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endfunction()
 
+lse_add_test(test_generation_stats)
 lse_add_test(test_dtype)
 lse_add_test(test_reflect)
 # lse_backends is the set of backends this build ships. A test that runs a

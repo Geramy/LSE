@@ -703,8 +703,8 @@ int main(int argc, char** argv) {
   if (opt.show_stats) {
     const runtime::GenerationStats& s = gen.stats();
     std::fprintf(stderr,
-                 "prompt %d tokens, prefill %.2f s | generated %d tokens, "
-                 "%.2f tok/s\n"
+                 "prompt %d tokens, prefill %.2f s (%.2f tok/s) | generated %d tokens | "
+                 "decode %d tokens in %.3f s (%.2f tok/s)\n"
                  "spec steps %u accepted %u (%.1f%%) | %u verify pass(es) "
                  "%.1f ms each | draft %.1f ms each\n"
                  "launches %u | phases %u (ideal %u launch%s) | groups "
@@ -715,7 +715,9 @@ int main(int argc, char** argv) {
                  "sched partition=%.3f s emit=%.3f s launch=%.3f s sync=%.3f s\n"
                  "jit mem=%llu disk=%llu compile=%llu (%.3f s)\n",
                  s.prompt_tokens, static_cast<double>(s.prefill_ns) / 1e9,
-                 s.generated_tokens, s.decode_tokens_per_second(),
+                 s.prompt_tokens_per_second(), s.generated_tokens,
+                 s.decoded_tokens(), static_cast<double>(s.decode_ns) / 1e9,
+                 s.decode_tokens_per_second(),
                  s.spec_steps, s.spec_accepted, s.acceptance_rate() * 100.0,
                  s.spec_verify_passes,
                  s.spec_verify_passes == 0
