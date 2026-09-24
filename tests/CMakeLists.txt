@@ -120,7 +120,7 @@ endif()
 
 if(LSE_ENABLE_CPU)
   lse_add_test(test_backend_cpu lse_backend_cpu)
-  lse_add_test(test_graph lse_graph lse_backends)
+  lse_add_test(test_graph lse_graph lse_kernels lse_backends)
   lse_add_test(test_primitive lse_graph lse_backends)
 endif()
 
