@@ -317,3 +317,32 @@ endif()
 if(TARGET lse_backend_hrx)
   lse_add_test(test_q6_wmma lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
+
+# Loader overrides must change compiler identity even when CMake linked the
+# default image. Fixtures require no GPU or compiler runtime initialization.
+lse_add_test(test_compiler_identity)
+target_link_libraries(test_compiler_identity PRIVATE ${CMAKE_DL_LIBS})
+if(UNIX)
+  foreach(variant IN ITEMS default override)
+    add_library(lse_compiler_fixture_${variant} SHARED compiler_identity_fixture.cpp)
+    set_target_properties(lse_compiler_fixture_${variant} PROPERTIES
+      OUTPUT_NAME lse_compiler_identity_fixture
+      LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/compiler-${variant}")
+  endforeach()
+  target_compile_definitions(lse_compiler_fixture_override PRIVATE LSE_COMPILER_FIXTURE_VALUE=2)
+  add_executable(test_compiler_override test_compiler_override.cpp)
+  target_link_libraries(test_compiler_override PRIVATE lse_core lse_compiler_fixture_default ${CMAKE_DL_LIBS})
+  lse_apply_common_flags(test_compiler_override)
+  add_dependencies(test_compiler_override lse_compiler_fixture_override)
+  if(APPLE)
+    set(_lse_loader_path DYLD_LIBRARY_PATH)
+  else()
+    set(_lse_loader_path LD_LIBRARY_PATH)
+  endif()
+  add_test(NAME compiler_identity_default COMMAND ${CMAKE_COMMAND} -E env
+    "${_lse_loader_path}=$<TARGET_FILE_DIR:lse_compiler_fixture_default>"
+    $<TARGET_FILE:test_compiler_override> 1 $<TARGET_FILE:lse_compiler_fixture_default>)
+  add_test(NAME compiler_identity_override COMMAND ${CMAKE_COMMAND} -E env
+    "${_lse_loader_path}=$<TARGET_FILE_DIR:lse_compiler_fixture_override>"
+    $<TARGET_FILE:test_compiler_override> 2 $<TARGET_FILE:lse_compiler_fixture_override>)
+endif()

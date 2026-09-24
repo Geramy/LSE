@@ -27,7 +27,7 @@ add_library(lse_backend_hrx
 )
 add_library(lse::backend_hrx ALIAS lse_backend_hrx)
 
-target_link_libraries(lse_backend_hrx PUBLIC lse_core lse_backend_registry lse_graph lse_kernels lse_dist lse_probe lse_trace)
+target_link_libraries(lse_backend_hrx PUBLIC ${CMAKE_DL_LIBS} lse_core lse_backend_registry lse_graph lse_kernels lse_dist lse_probe lse_trace)
 target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_HRX_INCLUDE_DIR})
 target_include_directories(lse_backend_hrx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -60,12 +60,10 @@ if(LSE_HAVE_LOOMC)
   target_include_directories(lse_backend_hrx SYSTEM PUBLIC ${LSE_LOOMC_INCLUDE_DIR})
   target_link_libraries(lse_backend_hrx PUBLIC ${LSE_LOOMC_LIBRARY})
   target_compile_definitions(lse_backend_hrx PUBLIC LOOMC_USING_SHARED_LIBRARY)
-  # loomc publishes no version query and its .so carries no build-id note, so
-  # identity() stats the resolved library to notice a rebuild at the same
-  # version. Both are baked, not searched for, at runtime.
+  # Supplemental package version; runtime identity resolves the loaded image
+  # and hashes its contents once, including loader-selected overrides.
   target_compile_definitions(lse_backend_hrx PRIVATE
-    LSE_LOOMC_VERSION="${LSE_LOOMC_VERSION}"
-    LSE_LOOMC_LIBRARY_PATH="${LSE_LOOMC_LIBRARY}")
+    LSE_LOOMC_VERSION="${LSE_LOOMC_VERSION}")
 else()
   target_compile_definitions(lse_backend_hrx PUBLIC LSE_HAVE_LOOMC=0)
 endif()

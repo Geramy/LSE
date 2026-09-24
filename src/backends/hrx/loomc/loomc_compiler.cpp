@@ -8,7 +8,7 @@
 #include <utility>
 
 #if LSE_HAVE_LOOMC
-#include <sys/stat.h>
+#include "lse/backends/hrx/compiler_image_identity.hpp"
 
 #include "loomc/loomc.h"
 #include "loomc/target/amdgpu.h"
@@ -22,9 +22,6 @@ namespace {
 
 #ifndef LSE_LOOMC_VERSION
 #define LSE_LOOMC_VERSION "unknown"
-#endif
-#ifndef LSE_LOOMC_LIBRARY_PATH
-#define LSE_LOOMC_LIBRARY_PATH ""
 #endif
 
 // Every knob an invocation runs with, in one place, so identity() reads the
@@ -67,20 +64,12 @@ const char* control_flow_name(loomc_target_control_flow_lowering_t cf) {
                                                       : "structured_low";
 }
 
-// loomc publishes no version query and its shared object carries no build-id
-// note, so the install's own file stamp is the only thing that moves when loomc
-// is rebuilt at the same package version. It over-invalidates (a reinstall of
-// identical bytes bumps mtime and costs one ~1 ms recompile per kernel) and
-// never under-invalidates, which is the direction a cache key must err in.
+// Resolve the function this compiler actually calls. DYLD_LIBRARY_PATH and
+// loader interposition can select a different image than CMake discovered.
+// Content hashing is deliberately paid once per process, outside compilation.
 const std::string& library_stamp() {
-  static const std::string stamp = [] {
-    const std::string path = LSE_LOOMC_LIBRARY_PATH;
-    if (path.empty()) return std::string("lib=unstamped");
-    struct ::stat st{};
-    if (::stat(path.c_str(), &st) != 0) return "lib=" + path + " size=? mtime=?";
-    return "lib=" + path + " size=" + std::to_string(st.st_size) +
-           " mtime=" + std::to_string(st.st_mtime);
-  }();
+  static const std::string stamp = detail::compiler_image_identity(
+      reinterpret_cast<const void*>(&loomc_compile_module));
   return stamp;
 }
 
@@ -365,11 +354,8 @@ bool LoomcCompiler::available() const {
 
 std::string LoomcCompiler::identity() const {
 #if LSE_HAVE_LOOMC
-  // loomc has no version entry point, so the package version comes from the
-  // install that was discovered at configure time and the file stamp covers a
-  // rebuild that leaves that version alone. Neither is a constant anyone here
-  // maintains, which is the point: a hand-written revision number is one
-  // forgotten increment away from serving an object a different compiler built.
+  // Package metadata is supplementary; the resident image and its contents
+  // identify the compiler actually selected by the dynamic loader.
   std::string id = "loomc." LSE_LOOMC_VERSION " ";
   id += library_stamp();
   id += " pipeline=";

@@ -39,7 +39,7 @@ class LoomcCompiler final : public graph::IKernelCompiler {
 
   [[nodiscard]] bool available() const override;
 
-  // The loomc install this was linked against plus the exact option set every
+  // The actual loaded loomc image plus the exact option set every
   // invocation runs with.
   [[nodiscard]] std::string identity() const override;
 
