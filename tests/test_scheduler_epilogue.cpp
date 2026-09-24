@@ -181,4 +181,64 @@ LSE_TEST(device_retained_overwrite_replays_without_repartitioning) {
   LSE_EXPECT(backend.impl().emitter.attempts >= attempts);
 }
 
+LSE_TEST(device_view_validation_precedes_partition_and_launch) {
+  backend::BackendAdapter<CaptureDevice> backend;
+  check(backend.init(0));
+  Scheduler scheduler(backend);
+  scheduler.set_dialect(Dialect::kLoom);
+  auto allocation = backend.allocate(8 * sizeof(float),
+      backend::MemoryClass::kDevice, backend::kDefaultStream);
+  LSE_EXPECT(allocation.ok());
+  if (!allocation.ok()) return;
+  auto window = allocation.release();
+  window.offset = 2 * sizeof(float);
+  window.size_bytes = 4 * sizeof(float);
+  auto base = Array::from_buffer(std::move(window), Shape{4}, DType::kF32);
+  auto evaluate = [&](Array& view) {
+    const NodePtr roots[] = {view.node()};
+    return scheduler.eval(roots, false);
+  };
+  auto valid = reshape(base, Shape{2, 2});
+  check(evaluate(valid));
+  LSE_EXPECT_EQ(valid.node()->buffer.handle, base.node()->buffer.handle);
+  LSE_EXPECT_EQ(valid.node()->buffer.offset, 2 * sizeof(float));
+  LSE_EXPECT(valid.node()->buffer.storage == base.node()->buffer.storage);
+  auto wrong_count = reshape(base, Shape{5});
+  LSE_EXPECT(evaluate(wrong_count).code() == StatusCode::kInvalidArgument);
+  LSE_EXPECT(!wrong_count.node()->materialized);
+  auto wrong_dtype = reshape(base, Shape{2, 2});
+  wrong_dtype.node()->dtype = DType::kF16;
+  LSE_EXPECT(evaluate(wrong_dtype).code() == StatusCode::kInvalidArgument);
+  auto missing_input = reshape(base, Shape{2, 2});
+  missing_input.node()->inputs.clear();
+  LSE_EXPECT(evaluate(missing_input).code() == StatusCode::kInvalidArgument);
+  auto null_input = reshape(base, Shape{2, 2});
+  null_input.node()->inputs[0].reset();
+  LSE_EXPECT(evaluate(null_input).code() == StatusCode::kInvalidArgument);
+  auto extra_input = reshape(base, Shape{2, 2});
+  extra_input.node()->inputs.push_back(base.node());
+  LSE_EXPECT(evaluate(extra_input).code() == StatusCode::kInvalidArgument);
+  auto nested = reshape(wrong_count, Shape{1, 5});
+  LSE_EXPECT(evaluate(nested).code() == StatusCode::kInvalidArgument);
+  LSE_EXPECT(!nested.node()->materialized);
+
+  auto retained_view = reshape(base, Shape{2, 2});
+  Program retained;
+  const NodePtr roots[] = {retained_view.node()};
+  check(scheduler.eval(roots, false, &retained));
+  LSE_EXPECT(retained.holds(roots));
+  retained.reset_compute();
+  LSE_EXPECT(!retained_view.node()->materialized);
+  base.node()->buffer.size_bytes = 3 * sizeof(float);
+  LSE_EXPECT(scheduler.eval(roots, false, &retained).code() ==
+             StatusCode::kOutOfRange);
+  LSE_EXPECT(!retained_view.node()->materialized);
+
+  auto short_view = reshape(base, Shape{2, 2});
+  base.node()->buffer.size_bytes = 3 * sizeof(float);
+  LSE_EXPECT(evaluate(short_view).code() == StatusCode::kOutOfRange);
+  LSE_EXPECT(!short_view.node()->materialized);
+  LSE_EXPECT_EQ(backend.impl().launches, 0u);
+}
+
 LSE_TEST_MAIN()

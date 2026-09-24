@@ -1045,6 +1045,27 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   LSE_RETURN_IF_ERROR(release_phase_tables());
 
   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
+  // Views must be valid before partitioning: a device-only view group may
+  // require no dispatch at all, so neither a kernel nor the host interpreter
+  // is guaranteed to validate it later.
+  for (const NodePtr& node : order) {
+    if (node->kind != OpKind::kReshape) continue;
+    if (node->inputs.size() != 1 || !node->inputs[0]) {
+      return LSE_ERROR(kInvalidArgument, "reshape requires one input");
+    }
+    const Node& source = *node->inputs[0];
+    if (source.dtype != node->dtype ||
+        source.element_count() != node->element_count()) {
+      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
+    }
+    const std::size_t bytes =
+        dtype_storage_bytes(node->dtype, node->element_count());
+    if (source.materialized && source.buffer.valid() &&
+        (bytes == 0 || bytes > source.buffer.size_bytes)) {
+      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
+    }
+  }
+
 
   std::vector<FusionGroup> phase_groups;
   bool replayed = false;
