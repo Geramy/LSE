@@ -76,6 +76,40 @@ LSE_TEST(cooperative_rms_reduction_keeps_its_producer_dependency_cut) {
  }
  LSE_EXPECT(found);
 }
+LSE_TEST(cooperative_rms_phase_uses_virtual_rows_instead_of_physical_blocks) {
+ Fixture f;
+ // Eight narrow rows previously reached the generic self-indexed phase path.
+ // That path advances virtual i while the standalone RMS uses blockIdx.x,
+ // so one phase workgroup repeatedly normalized the first physical row.
+ auto x=leaf({1,1,8,64});auto gain=leaf({64},DType::kBF16);
+ auto norm=rms_norm(x,gain,1e-6f,true);
+ auto out=reshape(norm,{1,1,512})*leaf({1,1,512});
+ const NodePtr roots[]={out.node()};
+ const auto phases=Partitioner::phases(roots);
+ LSE_EXPECT(!phases.empty());
+ bool found=false;
+ for(const auto& phase:phases) {
+  auto g=Partitioner::phase_group(phase,roots);
+  bool has_rms=false;for(const auto& n:g.nodes)has_rms=has_rms||n->kind==OpKind::kRMS;
+  if(!has_rms)continue;
+  found=true;LSE_EXPECT(g.is_phase);
+  for(auto cus:{1u,64u}) {
+   f.d.compute_units=static_cast<std::uint16_t>(cus);
+   auto emitted=backend::HipEmitter::emit_phase(g,f.d);
+   LSE_EXPECT(emitted.ok());
+   if(emitted.ok()) {
+    // The per-element RMS function consumes each virtual i supplied by the
+    // phase. A standalone self-indexed body cannot provide this contract.
+    LSE_EXPECT(emitted->source.find("__device__ float lse_rms_norm_")!=std::string::npos);
+   }
+   const auto key=f.hip.cache_key(g,f.d);
+   f.d.lds_bytes_per_workgroup=512;
+   LSE_EXPECT_EQ(f.hip.cache_key(g,f.d),key);
+   f.d.lds_bytes_per_workgroup=65536;
+  }
+ }
+ LSE_EXPECT(found);
+}
 LSE_TEST(cooperative_rms_implementation_identity_changes_cache_keys) {
  Fixture f;auto g=solo(rms_norm(leaf({1,5120}),leaf({5120},DType::kBF16),1e-6f));
  auto types=backend::loom_types();auto intr=backend::loom_sources();

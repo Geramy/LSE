@@ -88,15 +88,18 @@ bool is_linked_name(std::string_view n) {
 }
 
 // The primitive the phase actually stages. WMMA owns a grid we cannot share
-// and a linked pipeline owns the whole kernel; the scalar body is the same
-// function and fits the staged walk.
+// and a linked pipeline owns the whole kernel. Standalone cooperative RMS
+// maps physical blockIdx.x to rows; a phase advances virtual rows inside its
+// own grid walk. Keep the base RMS here so the phase-specific reduction below
+// or its per-element function owns that walk.
 const KernelPrimitiveBase* phase_spec(const KernelPrimitiveBase* kp,
                                       const KernelShapes& sh) {
   if (kp == nullptr) return nullptr;
   const KernelPrimitiveBase* spec = kp->specialize(sh);
   if (spec == nullptr) return kp;
   if (spec != kp &&
-      (spec->name() == "linear.wmma" || is_linked_name(spec->name()))) {
+      (spec->name() == "linear.wmma" || is_linked_name(spec->name()) ||
+       (kp->name() == "rms_norm" && spec->owns_indexing()))) {
     return kp;
   }
   return spec;

@@ -31,6 +31,14 @@ namespace lse::kernels {
     probe.output=node->shape; probe.output_dtype=node->dtype;
     probe.attrs=node->attrs; probe.iattrs=node->iattrs;
     probe.device=&device; probe.types=types; probe.intrinsics=&intrinsics;
+    // A phase owns a virtual row walk, unlike the standalone cooperative
+    // RMS launch. Version its identity independently so previously cached
+    // physical-block-indexed phase bodies cannot be reused after this fix.
+    if (node->kind == graph::OpKind::kRMS && group.is_phase) {
+      key ^= quant_operand_implementation_id("rms_norm.phase-row-walk.v1");
+      key *= 1099511628211ull;
+      continue;
+    }
     const auto* chosen=primitive->specialize(probe);
     if (node->kind == graph::OpKind::kRMS && group.outputs.size() != 1)
       chosen=primitive;
