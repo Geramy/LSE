@@ -295,4 +295,61 @@ LSE_TEST(q6_decode_rotation_preserves_resources_and_caller_panel_layout) {
   }
 }
 
+LSE_TEST(q6_decode_quad_plan_matches_both_emitters_and_ragged_columns) {
+  const auto* p = primitive();
+  LSE_EXPECT(p != nullptr);
+  if (!p) return;
+  for (int n : {4, 32, 36, 64}) {
+    for (int k : {64, 1088, 5120, 16384, 16448, 17408}) {
+      Fixture f(1, k);
+      f.inputs[1] = Shape{n, k * 6 / 32};
+      f.inputs[2] = f.inputs[3] = Shape{n, k / 64};
+      f.shapes.output = Shape{1, n};
+      const auto plan = p->plan(f.shapes);
+      LSE_EXPECT_EQ(plan.workgroup_count[0], unsigned((n + 31) / 32));
+      LSE_EXPECT_EQ(plan.workgroup_count[1], 1u);
+      LSE_EXPECT_EQ(plan.lds_bytes, k <= 16384 ? unsigned(k * 4) : 0u);
+      LSE_EXPECT_EQ(p->staged_row(f.shapes).count, 0u);
+      LSE_EXPECT_EQ(p->traffic(f.shapes).workgroups, plan.workgroup_count[0]);
+      auto out = quant_linear(input(f.inputs[0], f.dtypes[0]),
+                              input(f.inputs[1], f.dtypes[1]),
+                              input(f.inputs[2], f.dtypes[2]),
+                              input(f.inputs[3], f.dtypes[3]), 6, 64);
+      const NodePtr roots[] = {out.node()};
+      const auto groups = Partitioner::partition(roots);
+      LSE_EXPECT_EQ(groups.size(), 1u);
+      if (groups.size() != 1) continue;
+      auto hip = backend::HipEmitter{}.emit(groups.front(), f.device);
+      auto loom = backend::LoomEmitter{}.emit(groups.front(), f.device);
+      LSE_EXPECT(hip.ok() && loom.ok());
+      if (!hip.ok() || !loom.ok()) continue;
+      LSE_EXPECT_EQ(hip->dims.workgroup_count[0], plan.workgroup_count[0]);
+      LSE_EXPECT_EQ(loom->dims.workgroup_count[0], plan.workgroup_count[0]);
+      LSE_EXPECT_EQ(hip->lds_bytes, plan.lds_bytes);
+      LSE_EXPECT_EQ(loom->lds_bytes, plan.lds_bytes);
+      LSE_EXPECT(hip->binding_order == loom->binding_order);
+    }
+  }
+}
+
+LSE_TEST(q6_decode_quad_excludes_odd_columns_and_external_panels) {
+  const auto* p = primitive();
+  LSE_EXPECT(p != nullptr);
+  if (!p) return;
+  for (int reason = 0; reason < 5; ++reason) {
+    Fixture f(1, 5120);
+    // All other refusal cases must satisfy the divisible-by-four condition,
+    // otherwise that first gate hides regressions in the gate under test.
+    const int n = reason == 0 ? 19 : 20;
+    f.inputs[1] = Shape{n, 960};
+    f.inputs[2] = f.inputs[3] = Shape{n, 80};
+    f.shapes.output = Shape{1, n};
+    if (reason == 1) f.device.arch = "gfx1200";
+    if (reason == 2) f.shapes.staged = {"caller_panel", 5120};
+    if (reason == 3) f.shapes.staged_quant.codes = "caller_codes";
+    if (reason == 4) f.dtypes[2] = f.dtypes[3] = DType::kF32;
+    LSE_EXPECT_EQ(p->plan(f.shapes).workgroup_count[0], 3u);
+  }
+}
+
 LSE_TEST_MAIN()
