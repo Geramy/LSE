@@ -112,8 +112,9 @@ class Printer {
   // has `index` for the first and `i32` for the second and no unsigned type
   // for either. A word is born in a memory read of an unsigned buffer or in a
   // bit-manipulation row, and it stays a word through the arithmetic it feeds.
-  // Everything else is an address. Nothing is guessed: a value that would have
-  // to be both is a decline, not a silent choice.
+  // Bind aliases retain their source's role. Roles flow forward from word
+  // producers; shared constants remain indices and are cast at word uses.
+  // Back-propagating through constants would misclassify unrelated loop bounds.
   void classify_words() {
     word_.assign(b_.value_count(), 0);
     auto seed = [&](OpId id) {
@@ -136,6 +137,9 @@ class Printer {
         bool any = o.result != kNoValue && o.type.elem == Scalar::kU32 &&
                    word_[o.result] != 0;
         for (ValueId v : o.operands) {
+          // Bind aliases print as their original definition. Classify the
+          // same value that operand() will read, including e.let(load).
+          v = resolve(v);
           if (v < word_.size() && b_.value(v).type.elem == Scalar::kU32 &&
               word_[v] != 0) {
             any = true;
@@ -147,13 +151,7 @@ class Printer {
           word_[o.result] = 1;
           changed = true;
         }
-        for (ValueId v : o.operands) {
-          if (v < word_.size() && b_.value(v).type.elem == Scalar::kU32 &&
-              word_[v] == 0) {
-            word_[v] = 1;
-            changed = true;
-          }
-        }
+
       });
     }
   }
@@ -529,22 +527,28 @@ class Printer {
     if (a == nullptr || b == nullptr) {
       return unsupported("operand of '" + o.key + "' was never defined");
     }
-    // C has one u32 for an address and a packed word; Loom has `index` and
-    // `i32`. Converting the odd one out here is not enough: the quantized
-    // codecs carry the same value through both roles for a dozen lines, and a
-    // per-operator conversion leaves every OTHER use of it in the role the
-    // classifier picked. Measured — coercing at this site turns the decline
-    // into `TYPE/001` on a value the store hook then writes as f32. The role
-    // has to be decided for the whole body, which is what classify_words does
-    // not yet do for a codec, so this stays a decline.
+    // The IR's u32 is used both for packed words and indices. A shared
+    // constant may feed both without changing its definition's role. Convert
+    // only that operand to the unsigned word domain for this operation;
+    // loop bounds and address uses retain their index definitions.
+    std::string lhs = name(o.operands[0]);
+    std::string rhs = name(o.operands[1]);
+    Typed converted;
     if (a->type != b->type) {
-      return unsupported("'" + o.key + "' mixes " + a->type + " and " +
-                         b->type +
-                         "; the u32 index and word roles cannot both be one "
-                         "value");
+      const bool a_index = a->cls == Cls::kIndex && a->elem == Scalar::kU32;
+      const bool b_index = b->cls == Cls::kIndex && b->elem == Scalar::kU32;
+      const bool a_word = a->cls == Cls::kUnsignedInt && a->type == "i32" && a->elem == Scalar::kU32;
+      const bool b_word = b->cls == Cls::kUnsignedInt && b->type == "i32" && b->elem == Scalar::kU32;
+      if ((a_index && b_word) || (b_index && a_word)) {
+        const std::string cast = fresh("word");
+        line(depth, cast + " = index.cast " + (a_index ? lhs : rhs) + " : index to i32");
+        converted = Typed{"i32", Scalar::kU32, Cls::kUnsignedInt, true};
+        if (a_index) { lhs = cast; a = &converted; }
+        else { rhs = cast; b = &converted; }
+      } else {
+        return unsupported("'" + o.key + "' mixes " + a->type + " and " + b->type);
+      }
     }
-    const std::string lhs = name(o.operands[0]);
-    const std::string rhs = name(o.operands[1]);
     const std::string res = name(o.result);
     const std::string& k = o.key;
 
