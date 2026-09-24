@@ -33,6 +33,18 @@ target_sources(test_loom_repeat PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+lse_add_test(test_loom_extent lse_ir)
+target_sources(test_loom_extent PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+lse_add_test(test_loom_conv lse_graph lse_kernels lse_ir)
+target_sources(test_loom_conv PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/kernels/conv.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 # GDN register-state emission needs neither a GPU nor a loaded runtime.
 lse_add_test(test_loom_gdn lse_graph lse_kernels lse_ir)
 target_sources(test_loom_gdn PRIVATE

@@ -470,6 +470,18 @@ class Printer {
   }
 
   Status emit_extent(const Operation& o, int depth) {
+    if (o.has(kFlagRuntimeExtent) && o.operands.size() == 1) {
+      const Typed* source = operand(o.operands[0]);
+      if (source == nullptr || source->cls != Cls::kIndex) {
+        return unsupported("typed runtime extent requires an index source");
+      }
+      const std::string zero = fresh("extent_zero");
+      line(depth, zero + " = index.constant 0 : index");
+      line(depth, name(o.result) + " = index.add " + name(o.operands[0]) +
+                      ", " + zero + " : index");
+      define_from(o.result, o.type);
+      return Status{};
+    }
     if (o.has(kFlagRuntimeExtent)) {
       // A dispatch-bound extent is a launch parameter plus an index.assume
       // stating the bound Loom will not take on faith. Both belong to the

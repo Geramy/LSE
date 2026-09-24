@@ -179,6 +179,20 @@ ValueId Body::extent(std::string_view name, ExtentBinding binding,
   return v;
 }
 
+ValueId Body::runtime_extent(std::string_view name, ValueId source,
+                             ExtentRole role) {
+  Operation o;
+  o.kind = OpKind::kExtent;
+  o.type = scalar_type(Scalar::kU32);
+  o.key = std::string(name);
+  o.operands = {source};
+  o.flags = kFlagRuntimeExtent;
+  if (role == ExtentRole::kWindowBase) o.flags |= kFlagWindowBase;
+  const ValueId value = op(add(std::move(o))).result;
+  runtime_extents_.emplace_back(name);
+  return value;
+}
+
 void Body::erase(OpId id) {
   Operation& o = ops_[id];
   if (o.erased) return;
@@ -287,6 +301,12 @@ void Body::splice(const Body& other, RegionId into) {
       if (s.kind == OpKind::kConst) {
         vmap[s.result] =
             constant(s.text, s.type, s.imm, (s.flags & kFlagIntConst) != 0);
+        continue;
+      }
+      if (s.kind == OpKind::kExtent && !s.operands.empty()) {
+        vmap[s.result] = runtime_extent(
+            s.key, vmap[s.operands[0]],
+            s.has(kFlagWindowBase) ? ExtentRole::kWindowBase : ExtentRole::kSize);
         continue;
       }
       if (s.kind == OpKind::kExtent) {

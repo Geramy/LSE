@@ -82,6 +82,10 @@ class Body {
   // dispatch-constant expression for a runtime one.
   ValueId extent(std::string_view name, ExtentBinding binding, ExtentRole role,
                  std::string spelling, std::int64_t value);
+  // A typed dispatch value, such as a load from a metadata buffer. Unlike
+  // textual extents it stays at its definition so the source dominates it.
+  ValueId runtime_extent(std::string_view name, ValueId source,
+                         ExtentRole role = ExtentRole::kSize);
   // The runtime extents this body reads, in first-use order. An emitter turns
   // each into a dispatch-constants field; a body with none needs no field.
   [[nodiscard]] const std::vector<std::string>& runtime_extents() const noexcept {

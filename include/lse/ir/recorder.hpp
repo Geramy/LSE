@@ -580,6 +580,10 @@ class KernelBody {
             ir_.extent(name, ExtentBinding::kRuntime, ExtentRole::kSize,
                        std::string(field), 0)};
   }
+  [[nodiscard]] Val<u32> runtime_extent(std::string_view name,
+                                        const Val<u32>& source) {
+    return {types_, &ir_, ir_.runtime_extent(name, source.id())};
+  }
   // The base index of the iteration-space window this launch covers. Unlike a
   // size it may enter an address — with a constant coefficient, so the stride
   // the inner loop walks is unchanged and only the origin moves.

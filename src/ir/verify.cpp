@@ -56,7 +56,8 @@ struct Checker {
     return k != OpKind::kCall && k != OpKind::kRawStmt &&
            k != OpKind::kReturn && k != OpKind::kConst &&
            k != OpKind::kSymbol && k != OpKind::kAlloc &&
-           k != OpKind::kBarrier && k != OpKind::kScope;
+           k != OpKind::kBarrier && k != OpKind::kScope &&
+           k != OpKind::kExtent;
   }
 
   // A runtime extent is legal in a guard and in an outermost loop bound; it is
@@ -160,6 +161,11 @@ struct Checker {
       if (fixed_arity(o.kind) && o.operands.size() != arity(o.kind)) {
         return fail(std::string(op_name(o.kind)) + ": wrong operand count");
       }
+      if (o.kind == OpKind::kExtent &&
+          (o.operands.size() > 1 ||
+           (!o.operands.empty() && !o.has(kFlagRuntimeExtent)))) {
+        return fail("extent: invalid typed runtime source");
+      }
       for (ValueId v : o.operands) {
         if (v == kNoValue || v >= b.value_count()) {
           return fail(std::string(op_name(o.kind)) + ": operand is not a value");
@@ -185,6 +191,10 @@ struct Checker {
           }
           return fail(d);
         }
+      }
+      if (o.kind == OpKind::kExtent && !o.operands.empty() &&
+          b.value(o.operands[0]).type != scalar_type(Scalar::kU32)) {
+        return fail("extent: runtime source must be scalar u32");
       }
       if (!check_extent_use(o, loop_depth)) return false;
       propagate(o);

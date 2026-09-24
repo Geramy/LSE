@@ -34,8 +34,10 @@ class Printer {
     if (def.def == kNoOp) return {};
     const Operation& o = b_.op(def.def);
     switch (o.kind) {
-      case OpKind::kConst:
       case OpKind::kExtent:
+        if (!o.operands.empty()) return render(o.operands[0]);
+        [[fallthrough]];
+      case OpKind::kConst:
         // A literal extent is its number; a runtime one is the dispatch
         // constant that carries it. One spelling field, both bindings.
         return o.text;

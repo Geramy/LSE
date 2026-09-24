@@ -190,6 +190,10 @@ struct Emit {
                                                 std::string_view field) {
     return k->runtime_extent(name, field);
   }
+  [[nodiscard]] ir::Val<ir::u32> runtime_extent(std::string_view name,
+                                                const ir::Val<ir::u32>& value) {
+    return k->runtime_extent(name, value);
+  }
   // Base index of the iteration-space window this launch covers.
   [[nodiscard]] ir::Val<ir::u32> window_base(std::string_view dim,
                                              std::string_view field) {
