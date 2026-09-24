@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <limits>
 namespace lse::kernels {
 namespace {
 namespace env = graph::env;
@@ -175,6 +176,170 @@ std::string emit_staged_bf16(const KernelShapes &s, const Dims &d) {
     return {};
   return body.str();
 }
+std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
+  using Tile = Base<math::MatrixElem::kBF16>;
+  using F = typename Tile::AFrag;
+  using Op = typename Tile::Op;
+  constexpr auto geo = geometry_of(Tile::kRow);
+  static_assert(geo.wave == 32 && geo.split_k && geo.lane_k == 8);
+  kir::KernelBody body(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+  body.set_store(s.store);
+  Args a;
+  if (!env::bind(body, a, s))
+    return {};
+  env::Emit e{&body};
+  const auto xs = e.lds<F>(64u * 64u), ws = e.lds<F>(64u * 64u);
+  const auto wl = e.lds<F>(64u * 64u);
+  const auto flags = e.lds<kir::f32>(4u);
+  constexpr float min_normal = std::numeric_limits<float>::min();
+  constexpr float max_bf16 = 3.3895313892515355e38f;
+  const auto lid = e.let(math::local_id()), lane = e.let(lid % 32u);
+  const auto wave = e.let(lid / 32u), lo = e.let(lane % 16u),
+             hi = e.let(lane / 16u);
+  const auto wg = e.let(math::workgroup_id_x());
+  const auto nblocks = (d.n + 63) / 64;
+  const auto mbase = e.let((wg / nblocks) * 64u),
+             nbase = e.let((wg % nblocks) * 64u);
+  const auto am = e.let((wave % 2u) * 32u), bn = e.let((wave / 2u) * 32u);
+  // Rotate eight-half spans by row. Every span remains contiguous, while
+  // neighboring lanes read different LDS bank groups rather than stride64.
+  const auto address = [&](const kir::Val<kir::u32> &r,
+                           const kir::Val<kir::u32> &k) {
+    return r * 64u + ((k / 8u + r % 8u) % 8u) * 8u + k % 8u;
+  };
+  std::vector<kir::Local<kir::f32, 8>> acc;
+  for (unsigned i = 0; i < 4; ++i) {
+    acc.push_back(e.local<kir::f32, 8>());
+    for (auto j : e.unroll(8u))
+      acc.back()[j] = e.f32(0);
+  }
+  for (auto kb : e.range(0u, d.k, 64u)) {
+    auto bad = e.var(0.0f);
+    const auto mark_unsafe = [&](const kir::Val<kir::f32>& value) {
+      auto invalid=e.var(1.0f);
+      if(auto safe=e.when(math::abs(value)<=max_bf16 &&
+          (value==0.0f || math::abs(value)>=min_normal)))invalid=e.f32(0);
+      bad=math::max(bad.read(),invalid.read());
+    };
+    // Each lane stages two16-value row fragments. All128 lanes execute
+    // both barriers, including lanes covering padded M/N output edges.
+    for (auto block : e.unroll(2u)) {
+      const auto r = e.let(lid / 4u + block * 32u),
+                 kc = e.let((lid % 4u) * 16u);
+      const auto ar = e.let(mbase + r), bc = e.let(nbase + r);
+      const auto av = e.local<F, 16>(), bv = e.local<F, 16>(), bl = e.local<F, 16>();
+      for (auto j : e.unroll(16u)) {
+        av[j] = math::narrow<F>(e.f32(0));
+        bv[j] = math::narrow<F>(e.f32(0));
+        bl[j] = math::narrow<F>(e.f32(0));
+      }
+      if (auto active = e.when(ar < d.m)) {
+        for (unsigned v = 0; v < 4; ++v) {
+          const auto loaded = e.load(a.x, ar * d.k + kb + kc + v * 4u, 16u);
+          for (unsigned j = 0; j < 4; ++j) {
+            const auto original=e.let(loaded[j]);
+            mark_unsafe(original);
+            av[v * 4 + j] = math::narrow<F>(original);
+          }
+        }
+      }
+      if (auto active = e.when(bc < d.n)) {
+        const auto gi = e.let(bc * d.groups + (kb + kc) / d.group);
+        const auto scale = e.let(math::widen(a.scales[gi])),
+                   bias = e.let(math::widen(a.biases[gi]));
+        const auto wb = e.let(bc * d.words + ((kb + kc) / 16u) * 3u);
+        const std::array<kir::Val<kir::u32>, 3> packed{
+            e.let(a.packed[wb]), e.let(a.packed[wb + 1u]),
+            e.let(a.packed[wb + 2u])};
+        for (unsigned j = 0; j < 16; ++j) {
+          const unsigned off = (j * 6) % 32, wi = j * 6 / 32;
+          auto code = packed[wi] / (1u << off);
+          if (off > 26)
+            code = code +
+                   (packed[wi + 1] % (1u << (off - 26))) * (1u << (32 - off));
+          else
+            code = code % 64u;
+          const auto original=e.let(math::fma(math::cast<kir::f32>(e.let(code)), scale, bias));
+          mark_unsafe(original);
+          bv[j] = math::narrow<F>(original);
+          // Preserve the original FP32 dequantization and subtract the widened
+          // rounded high part. The low part is a second native BF16 operand.
+          const auto residual=e.let(original-math::widen(bv[j].read()));
+          mark_unsafe(residual);
+          bl[j] = math::narrow<F>(residual);
+        }
+      }
+      for (auto j : e.unroll(16u)) {
+        const auto index = e.let(address(r, kc + j));
+        xs[index] = av[j].read();
+        ws[index] = bv[j].read();
+        wl[index] = bl[j].read();
+      }
+    }
+    for(unsigned bit:{1u,2u,4u,8u,16u})
+      bad=math::max(bad.read(),math::shfl_xor(bad.read(),e.u32(bit)));
+    if(auto leader=e.when(lane==0u))flags[wave]=bad.read();
+    e.barrier();
+    const auto block_bad=e.let(flags[0u].read()+flags[1u].read()+flags[2u].read()+flags[3u].read());
+    if(auto regular=e.when(block_bad==0.0f)) {
+    for (auto slice : e.unroll(4u)) {
+      std::vector<kir::Local<F, 8>> af, bf, blf;
+      for (unsigned i = 0; i < 2; ++i) {
+        af.push_back(e.local<F, 8>());
+        bf.push_back(e.local<F, 8>());
+        blf.push_back(e.local<F, 8>());
+        const auto ar = e.let(am + i * 16u + lo), bc = e.let(bn + i * 16u + lo);
+        for (auto j : e.unroll(8u)) {
+          const auto k = e.let(slice * 16u + hi * 8u + j);
+          af.back()[j] = xs[e.let(address(ar, k))];
+          bf.back()[j] = ws[e.let(address(bc, k))];
+          blf.back()[j] = wl[e.let(address(bc, k))];
+        }
+      }
+      for (unsigned m = 0; m < 2; ++m)
+        for (unsigned n = 0; n < 2; ++n) {
+          acc[m * 2 + n] = math::mma<Op>(af[m].value(), bf[n].value(),
+                                         acc[m * 2 + n].value());
+          acc[m * 2 + n] = math::mma<Op>(af[m].value(), blf[n].value(),
+                                         acc[m * 2 + n].value());
+        }
+    }
+    }
+    if(auto exceptional=e.when(block_bad!=0.0f)) {
+      for(unsigned m=0;m<2;++m)for(unsigned n=0;n<2;++n){
+        const auto col=e.let(nbase+bn+n*16u+lo);
+        for(auto j:e.unroll(8u)){
+          const auto rr=e.let(mbase+am+m*16u+j*geo.slot_step+hi*geo.half_rows);
+          if(auto active=e.when(rr<d.m && col<d.n)){
+            for(auto chunk:e.range(kb/16u,kb/16u+4u,1u)){
+              const auto gi=e.let(col*d.groups+(chunk*16u)/d.group);
+              const auto scale=e.let(math::widen(a.scales[gi])),bias=e.let(math::widen(a.biases[gi]));
+              quant::dequant_chunk(e,a.packed,quant::GroupAffine{6,64},e.let(col*d.words+chunk*3u),scale,bias,
+                [&](int q,const kir::Val<kir::f32>& weight){
+                  const auto x=a.x[rr*d.k+chunk*16u+static_cast<unsigned>(q)];
+                  acc[m*2+n][j]=math::fma(x,weight,acc[m*2+n][j].read());
+                });
+            }
+          }
+        }
+      }
+    }
+    e.barrier();
+  }
+  for (unsigned m = 0; m < 2; ++m)
+    for (unsigned n = 0; n < 2; ++n) {
+      const auto col = e.let(nbase + bn + n * 16u + lo);
+      for (auto j : e.unroll(8u)) {
+        const auto rr = e.let(mbase + am + m * 16u + j * geo.slot_step +
+                              hi * geo.half_rows);
+        if (auto active = e.when(rr < d.m && col < d.n))
+          e.store(rr * d.n + col, acc[m * 2 + n][j].read());
+      }
+    }
+  if (!body.lds().ok())
+    return {};
+  return body.str();
+}
 #include "q6_fp8_residual.inc"
 struct StagedBF16Kernel final : KernelPrimitive<StagedBF16Kernel> {
   static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_reuse";
@@ -218,6 +383,51 @@ const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
       s.intrinsics->find(r.key).empty())
     return nullptr;
   static const StagedBF16Kernel kernel;
+  return &kernel;
+}
+
+struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kernel> {
+  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_weight_residual2_v1";
+  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_weight_residual2_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 4; }
+  bool owns_indexing() const noexcept override { return true; }
+  std::string emit_kernel(const KernelShapes &s) const override {
+    const auto d = dims_of(s);
+    if (!d.valid || !s.store || !s.types.scalar || !s.intrinsics)
+      return {};
+    return emit_staged_bf16_residual2(s, d);
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 4 || in[1].rank() != 2)
+      return LSE_ERROR(kInvalidArgument, "Q6 matrix requires four operands");
+    Shape o;
+    for (std::size_t i = 0; i + 1 < in[0].rank(); ++i)
+      o.push_back(in[0].dim(i));
+    o.push_back(in[1].dim(0));
+    return o;
+  }
+  DType infer_dtype(std::span<const DType>) const override {
+    return DType::kF32;
+  }
+  static ThreadPlan plan_impl(const KernelShapes &s) {
+    ThreadPlan p;
+    auto d = dims_of(s);
+    if (!d.valid)
+      return p;
+    p.workgroup_size[0] = 128;
+    p.workgroup_count[0] = ((d.m + 63) / 64) * ((d.n + 63) / 64);
+    p.lds_bytes = 24592;
+    p.workgroup_count[1] = p.workgroup_count[2] = 1;
+    return p;
+  }
+};
+const KernelPrimitiveBase *select_staged_bf16_residual2(const KernelShapes &s) {
+  constexpr auto r = Base<math::MatrixElem::kBF16>::kRow;
+  if (!r.emittable() || !math::has_cap(device_matrix_caps(*s.device), r.cap) ||
+      s.intrinsics->find(r.key).empty())
+    return nullptr;
+  static const StagedBF16Residual2Kernel kernel;
   return &kernel;
 }
 
@@ -312,6 +522,39 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
   kernel.lds_bytes = kResidualLdsBytes;
   return kernel;
 }
+// Private model qualification route. These are the only two measured shapes;
+// the candidate stays unaccepted until complete-model quality is established.
+const KernelPrimitiveBase* select_m256_residual2_candidate(
+    const KernelShapes& s, const Dims& dims) {
+  struct Measured { uint32_t n, k; uint64_t corrected_ns, scalar_ns; };
+  // Eight post-warm host eval+retire intervals, driver195, unchanged packed Q6.
+  static constexpr Measured records[] = {
+      {17408, 5120, 6566844, 9381594},
+      {5120, 17408, 6379839, 8621917}};
+  const Measured* record = nullptr;
+  for (const auto& row : records)
+    if (dims.m == 256 && row.n == dims.n && row.k == dims.k) record = &row;
+  if (!record || record->corrected_ns >= record->scalar_ns) return nullptr;
+  QuantOperandKernel kernel;
+  kernel.operand = QuantOperand::kBF16;
+  kernel.strategy = QuantOperandStrategy::kNative;
+  kernel.implementation_id =
+      quant_operand_implementation_id(StagedBF16Residual2Kernel::kName);
+  kernel.implemented = true;
+  kernel.matrix_intrinsic = select_staged_bf16_residual2(s) != nullptr;
+  kernel.conversion_intrinsic = true;
+  kernel.fp32_exceptional_block_fallback = true;
+  kernel.lds_bytes = 24592;
+  QuantOperandProfile profile;
+  profile.preferred = QuantOperand::kBF16;
+  profile.strategy = QuantOperandStrategy::kNative;
+  profile.min_m = profile.max_m = 256;
+  profile.run_qualification_candidate = true;
+  const auto decision = select_quant_operand(residual_request(s, dims), kernel,
+                                            profile);
+  return decision.reason == OperandReason::kSelected
+      ? select_staged_bf16_residual2(s) : nullptr;
+}
 } // namespace
 const graph::KernelPrimitiveBase *
 wmma_q6_linear_for(const graph::KernelShapes &s) {
@@ -322,6 +565,7 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
       s.device->compute_units != 64 ||
       (global && std::strcmp(global, "0") == 0))
     return nullptr;
+  if (dims.m == 256) return select_m256_residual2_candidate(s, dims);
   const auto request = residual_request(s, dims);
   // Matched driver195 projection experiments: eight post-warm host
   // eval+retire intervals per implementation. These are not device timestamps.
