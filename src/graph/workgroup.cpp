@@ -524,17 +524,24 @@ namespace {
 // Slot lifetime belongs to the allocation, including temporary inplace
 // outputs. Following only reshapes lets a later reader of an inplace alias
 // observe a slot recycled after the alias-producing launch.
-const Node* allocation_owner(const Node* n) {
-  std::unordered_set<const Node*> seen;
-  while (n != nullptr) {
-    if (!seen.insert(n).second) return nullptr;
-    if (n->kind == OpKind::kReshape && n->inputs.size() == 1) {
-      n = n->inputs[0].get();
-      continue;
-    }
-    const int index = n->prim != nullptr ? n->prim->inplace_input() : -1;
-    if (index < 0 || static_cast<std::size_t>(index) >= n->inputs.size()) break;
-    n = n->inputs[static_cast<std::size_t>(index)].get();
+const Node* alias_source(const Node* n) noexcept {
+  if (n == nullptr) return nullptr;
+  if (n->kind == OpKind::kReshape && n->inputs.size() == 1)
+    return n->inputs[0].get();
+  const int index = n->prim != nullptr ? n->prim->inplace_input() : -1;
+  if (index < 0 || static_cast<std::size_t>(index) >= n->inputs.size())
+    return nullptr;
+  return n->inputs[static_cast<std::size_t>(index)].get();
+}
+
+const Node* allocation_owner(const Node* n) noexcept {
+  const Node* slow = n;
+  const Node* fast = n;
+  while (const Node* next = alias_source(n)) {
+    n = next;
+    slow = alias_source(slow);
+    fast = alias_source(alias_source(fast));
+    if (slow != nullptr && slow == fast) return nullptr;
   }
   return n;
 }
