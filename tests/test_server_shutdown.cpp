@@ -85,7 +85,12 @@ int main() {
     });
     request.store(true);
     wait_for([&] { return issued.load(); });
-    std::this_thread::sleep_for(100ms);
+    // Wait for actual watchdog progress; a fixed sleep does not guarantee
+    // another thread receives three time slices on a loaded CI runner.
+    wait_for([&] {
+      CHECK(!returned.load());
+      return stops.load() >= 3;
+    });
     CHECK(stops.load() >= 3); CHECK(!returned.load());
     release.store(true); client.get(); listener.join(); watch.finish();
     CHECK(returned.load());
