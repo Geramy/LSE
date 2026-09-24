@@ -177,7 +177,8 @@ std::string emit_staged_bf16(const KernelShapes &s, const Dims &d) {
     return {};
   return body.str();
 }
-std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
+std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d,
+                                      bool deferred_repair = false) {
   using Tile = Base<math::MatrixElem::kBF16>;
   using F = typename Tile::AFrag;
   using Op = typename Tile::Op;
@@ -435,8 +436,12 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
           auto value=e.var(acc[m * 2 + n][j].read());
           // Near-cancelling group totals can hide the original ordered-FMA
           // residual. Recompute only these outputs, after all LDS barriers.
-          if (auto cancellation=e.when(largest_group.read()>0.0f &&
-              math::abs(value.read()) <= quant::kCenteredCancellationRatio*largest_group.read())) {
+          const auto needs_repair=e.let(largest_group.read()>0.0f &&
+              math::abs(value.read()) <= quant::kCenteredCancellationRatio*largest_group.read());
+          if (deferred_repair) {
+            e.store(d.m*d.n+rr*d.n+col,
+                    math::select(needs_repair,e.f32(1.0f),e.f32(0.0f)));
+          } else if (auto cancellation=e.when(needs_repair)) {
             value=e.f32(0.0f);
             for(auto chunk:e.range(0u,d.k/16u,1u)) {
               const auto gi=e.let(col*d.groups+(chunk*16u)/d.group);
