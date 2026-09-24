@@ -99,8 +99,13 @@ cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
   -DFETCHCONTENT_SOURCE_DIR_HSA_RUNTIME_HEADERS="$work/deps/hsa-headers"
 cmake --build "$work/hrx-build" --target hrx loomc_shared --parallel "$jobs"
+# HSA uses C++20 jthread; the hosted Xcode SDK library lacks it. Compile
+# and link against the same qualified LLVM libc++ that the package bundles.
 cmake -S "$work/deps/mac-amdgpu/hsa" -B "$work/hsa-build" -G Ninja \
-  "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DBUILD_TESTING=OFF
+  "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DBUILD_TESTING=OFF \
+  -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
+  "-DCMAKE_SHARED_LINKER_FLAGS=-L$llvm/../lib/c++ -Wl,-rpath,$llvm/../lib/c++" \
+  "-DCMAKE_EXE_LINKER_FLAGS=-L$llvm/../lib/c++ -Wl,-rpath,$llvm/../lib/c++"
 cmake --build "$work/hsa-build" --target hsa-runtime64 --parallel "$jobs"
 cmake -S "$work/source" -B "$work/lse-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_CXX_COMPILER="$llvm/clang++" \
