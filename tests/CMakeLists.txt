@@ -95,6 +95,21 @@ if(NOT TARGET lse_backend_hrx)
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 endif()
+lse_add_test(test_quant_int8_q6 lse_graph lse_kernels lse_backends lse_ir)
+if(NOT TARGET lse_backend_hrx)
+  target_sources(test_quant_int8_q6 PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
+set_tests_properties(test_quant_int8_q6 PROPERTIES ENVIRONMENT "LSE_HRX_INT8=0")
+add_test(NAME test_quant_int8_q6_enabled COMMAND test_quant_int8_q6)
+set_tests_properties(test_quant_int8_q6_enabled PROPERTIES ENVIRONMENT "LSE_HRX_INT8=1")
 lse_add_test(test_shape)
 lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
 # Socket lifecycle coverage never opens a model or device.

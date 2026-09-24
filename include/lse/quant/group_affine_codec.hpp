@@ -136,6 +136,34 @@ template <class E>
   return e.let(plane);
 }
 
+// Exact Q6 codes in four byte operands: two per eight-activation chunk.
+// Packed storage remains three dwords for sixteen codes. No widened weight
+// reaches memory and no load reaches a fourth dword at the row boundary.
+template <class E>
+[[nodiscard]] std::array<detail::U<E>, 4> dot4_q6_code_planes(
+    E& e, const std::array<detail::U<E>, 3>& words) {
+  std::array<detail::U<E>, 4> planes;
+  for (int half = 0; half < 2; ++half) {
+    for (int p = 0; p < 2; ++p) {
+      auto plane = e.u32(0u);
+      for (int b = 0; b < 4; ++b) {
+        const int c = half * 8 + dot4_operand_slot(p, b);
+        const int word = c * 6 / 32, offset = c * 6 % 32;
+        auto code = words[static_cast<std::size_t>(word)] / (1u << offset);
+        if (offset > 26) {
+          code = code + (words[static_cast<std::size_t>(word + 1)] %
+                         (1u << (offset - 26))) * (1u << (32 - offset));
+        } else {
+          code = code % 64u;
+        }
+        plane = plane + code * (1u << (8 * b));
+      }
+      planes[static_cast<std::size_t>(half * 2 + p)] = e.let(plane);
+    }
+  }
+  return planes;
+}
+
 // The activation operand that plane `p` multiplies. `byte_of(j)` hands back
 // activation j of the chunk as the unsigned byte its int8 code occupies.
 template <class E, class ByteOf>

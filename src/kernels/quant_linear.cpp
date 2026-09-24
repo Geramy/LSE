@@ -21,6 +21,8 @@
 // `dot_ok` below carries what a device must have for it.
 #include <algorithm>
 #include <array>
+#include <optional>
+#include <limits>
 #include <span>
 #include <string>
 
@@ -255,6 +257,34 @@ std::uint32_t dot_lds_bytes(const QuantDims& d) {
       static_cast<std::uint32_t>(d.groups));
 }
 
+std::uint32_t q6_dot_lds_bytes(const QuantDims& d) {
+  const auto chunks = static_cast<std::uint32_t>(d.k / 8);
+  const auto groups = static_cast<std::uint32_t>(d.groups);
+  // Two code/scale panels, one original activation sum, one flag per wave.
+  return 2u * dot_lds_bytes_span(chunks, groups) -
+         kir::Lds::align(groups * 4u) + kir::Lds::align((kBlock / 32u) * 4u);
+}
+
+// Q6 decode uses the same explicit activation-accuracy policy as Q4. Its
+// 16-code packing and 8-value activation scales have different chunk counts;
+// keep the schedule separate so the existing Q4 layout is unchanged.
+bool q6_dot_decode(const KernelShapes& s, const QuantDims& d) {
+  if (!activation_int8_enabled() || !d.valid || d.spec.bits != 6 ||
+      d.spec.group_size != 64 || d.m != 1 || d.experts != 0 || d.n % 4 != 0 ||
+      s.input_dtypes[0] != DType::kF32 ||
+      s.input_dtypes[2] != DType::kBF16 || s.device == nullptr ||
+      s.intrinsics == nullptr || s.device->arch != "gfx1201" ||
+      wave_of(s.device) != 32 || !s.staged.name.empty() ||
+      !s.staged_quant.codes.empty()) return false;
+  const auto* amd = device_extension<AmdDeviceInfo>(*s.device);
+  if (amd == nullptr || !amd->has_dot4_iu8) return false;
+  for (std::string_view sym : quant::kGroupAffineDotSymbols)
+    if (s.intrinsics->find(sym).empty()) return false;
+  const auto need = q6_dot_lds_bytes(d);
+  const auto budget = workgroup_lds_bytes(s.device);
+  return budget == 0 || need <= budget;
+}
+
 // How many K-SPLITS the staging runs in, or 0 when no split fits. The row
 // rung used to be capped by staging the WHOLE k per row -- at k=17408 four
 // rows of codes cannot exist in LDS at once, so m=4 fell to two rows per
@@ -377,6 +407,8 @@ std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
 std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                 std::uint32_t rows) {
   if (!d.valid || rows == 0) return 0;
+  if (q6_dot_decode(s, d))
+    return q6_dot_lds_bytes(d);
   if (rows > 1 && d.spec.bits == 6 && !body_dot(s, d)) {
     return rows * q6_prefill_tile(static_cast<std::uint32_t>(d.k), rows) * 4u;
   }
@@ -544,7 +576,11 @@ opt::TrafficModel quant_traffic(const KernelShapes& s, bool indexed) {
 template <class Fetch>
 void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
                          const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
-                         std::uint32_t cpg) {
+                         std::uint32_t cpg,
+                         const kir::Tile<kir::f32>* invalid = nullptr,
+                         const DotActs* low = nullptr) {
+  std::optional<kir::LValue<kir::f32>> bad;
+  if (invalid) bad = e.var(0.0f);
   constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
   // An all-zero group would divide by zero; the floor is below any activation
   // that carries information and every code in such a group is 0 regardless.
@@ -552,6 +588,21 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
   for (auto c : e.range(lid, e.u32(nchunks), kBlock)) {
     std::array<kir::Val<kir::f32>, kCodes> v;
     fetch(c, v);
+    if (invalid) {
+      // Protect conversion to i32, the reciprocal floor, and intermediate
+      // sums from exceptional blocks. The scalar GPU path rereads originals.
+      for (auto& value : v) {
+        const auto magnitude = e.let(math::abs(value));
+        auto safe = e.var(value);
+        if (auto exceptional = e.when(
+                (magnitude != magnitude || magnitude > e.f32(1e30f)) ||
+                (magnitude != e.f32(0.0f) && magnitude < e.f32(1e-30f)))) {
+          *bad = e.f32(1.0f);
+          safe = e.f32(0.0f);
+        }
+        value = safe.read();
+      }
+    }
     auto amax = e.let(math::abs(v[0]));
     auto sum = v[0];
     for (std::uint32_t j = 1; j < kCodes; ++j) {
@@ -577,8 +628,10 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
     const auto inv = e.let(127.0f / math::max(amax, e.f32(kAmaxFloor)));
     // |x| <= amax by construction, so the rounded code is inside
     // [-127, 127] and no clamp is needed.
+    std::array<kir::Val<kir::f32>, kCodes> high_codes;
     const auto byte_of = [&](int j) {
       const auto code = e.let(math::rint(v[static_cast<std::size_t>(j)] * inv));
+      if (low) high_codes[static_cast<std::size_t>(j)] = code;
       return e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
     };
     const auto slot = e.let(c * 2u);
@@ -586,9 +639,33 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
     q.codes[swz(e, e.let(slot + 1u))] =
         quant::dot4_activation_word(e, byte_of, 1);
     q.scale[swz(e, c)] = step;
+    if (low) {
+      std::array<kir::Val<kir::f32>, kCodes> residual;
+      for (std::uint32_t j = 0; j < kCodes; ++j)
+        residual[j] = e.let(math::fma(e.f32(0.0f) - high_codes[j], step, v[j]));
+      auto residual_amax = e.let(math::abs(residual[0]));
+      for (std::uint32_t j = 1; j < kCodes; ++j)
+        residual_amax = e.let(math::max(residual_amax, math::abs(residual[j])));
+      const auto low_step = e.let(residual_amax * (1.0f / 127.0f));
+      const auto low_inv = e.let(127.0f / math::max(residual_amax, e.f32(1e-36f)));
+      const auto low_byte = [&](int j) {
+        const auto code = e.let(math::rint(residual[static_cast<std::size_t>(j)] * low_inv));
+        return e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
+      };
+      low->codes[swz(e, slot)] = quant::dot4_activation_word(e, low_byte, 0);
+      low->codes[swz(e, e.let(slot + 1u))] = quant::dot4_activation_word(e, low_byte, 1);
+      low->scale[swz(e, c)] = low_step;
+    }
     if (auto lead = e.when(c % cpg == 0u)) {
       q.sum[e.let(c / cpg)] = sum;
     }
+  }
+  if (invalid) {
+    // All lanes execute this reduction, including lanes without a chunk.
+    for (std::uint32_t bit = 1; bit < 32; bit <<= 1)
+      *bad = bad->read() + math::shfl_xor(bad->read(), e.u32(bit));
+    if (auto leader = e.when(lid % 32u == 0u))
+      (*invalid)[lid / 32u] = bad->read();
   }
   e.barrier();
 }
@@ -676,7 +753,9 @@ template <class A>
 void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                     const kir::Val<kir::u32>& x_base, const DotActs& q,
                     const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
-                    std::uint32_t cpg, std::uint32_t max_bytes) {
+                    std::uint32_t cpg, std::uint32_t max_bytes,
+                      const kir::Tile<kir::f32>* invalid = nullptr,
+                         const DotActs* low = nullptr) {
   constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
   const std::uint32_t wide = row_pack(kCodes, max_bytes, 4);
   stage_dot_acts_from(
@@ -697,7 +776,7 @@ void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
           }
         }
       },
-      q, lid, nchunks, cpg);
+      q, lid, nchunks, cpg, invalid, low);
 }
 
 // acc += the codes of one lane's run of `count` chunks.
@@ -808,6 +887,122 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
         const auto xe = xs != nullptr ? (*xs)[panel_idx].read() : a.x[x_base + idx];
         acc = math::fma(xe, w, acc.read());
       });
+}
+
+// Four outputs share the high/residual activation stream. Each output keeps
+// the one-column INT8 body's K order, high/low product order, affine bias order
+// and wave reduction order. Only independent outputs are interleaved.
+template <class A>
+std::string emit_q6_dot_decode(const KernelShapes& s, const QuantDims& d) {
+  constexpr std::uint32_t wave = 32, cpg = 8, columns = 4;
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto n = static_cast<std::uint32_t>(d.n);
+  const auto groups = static_cast<std::uint32_t>(d.groups);
+  const auto lanes = static_cast<std::uint32_t>(d.lanes);
+  kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+  kb.set_store(s.store);
+  A a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+  const auto lid = e.let(math::local_id());
+  const auto lane = e.let(lid % wave);
+  const auto col = e.let((math::workgroup_id_x() * (kBlock / wave) + lid / wave) * columns);
+  DotActs q{e.lds<kir::u32>(swz_words(2 * (k / 8))),
+            e.lds<kir::f32>(swz_words(k / 8)), e.lds<kir::f32>(groups)};
+  DotActs low{e.lds<kir::u32>(swz_words(2 * (k / 8))),
+              e.lds<kir::f32>(swz_words(k / 8)), q.sum};
+  const auto invalid = e.lds<kir::f32>(kBlock / wave);
+  stage_dot_acts(e, a, nullptr, e.u32(0), q, lid, k / 8, cpg,
+                  device_load_bytes(s.device), &invalid, &low);
+  auto activation_bad = e.var(0.0f);
+  for (std::uint32_t i = 0; i < kBlock / wave; ++i)
+    activation_bad = activation_bad.read() + invalid[e.u32(i)].read();
+  std::array<kir::LValue<kir::f32>, columns> acc{
+      e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+  std::array<kir::LValue<kir::f32>, columns> bad{
+      e.var(activation_bad.read()), e.var(activation_bad.read()),
+      e.var(activation_bad.read()), e.var(activation_bad.read())};
+  // N is divisible by four, so a live wave owns four complete columns. The
+  // partially populated final workgroup still stages with every thread.
+  if (auto live = e.when(col < n)) {
+    if (auto quantized = e.when(activation_bad.read() == e.f32(0.0f))) {
+      for (auto chunk : e.range(lane, e.u32(k / 16), wave)) {
+        std::array<std::array<kir::Val<kir::u32>, 4>, columns> planes;
+        std::array<kir::Val<kir::f32>, columns> scales;
+        std::array<kir::LValue<kir::f32>, columns> partial{
+            e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+        for (std::uint32_t output = 0; output < columns; ++output) {
+          const auto row_base = e.let((col + output) * lanes);
+          std::array<kir::Val<kir::u32>, 3> words;
+          for (std::uint32_t j = 0; j < 3; ++j)
+            words[j] = e.let(a.packed[row_base + chunk * 3u + j]);
+          planes[output] = quant::dot4_q6_code_planes(e, words);
+          scales[output] = e.let(math::widen(a.scales[(col + output) * groups + chunk / 4u]));
+        }
+        for (std::uint32_t half = 0; half < 2; ++half) {
+          const auto ac = e.let(chunk * 2u + half);
+          for (const DotActs* panel : {&q, &low}) {
+            const std::array<kir::Val<kir::u32>, 2> x{
+                e.let(panel->codes[swz(e, ac * 2u)].read()),
+                e.let(panel->codes[swz(e, ac * 2u + 1u)].read())};
+            const auto step = e.let(panel->scale[swz(e, ac)].read());
+            for (std::uint32_t output = 0; output < columns; ++output) {
+              auto dot = e.var(kir::cast<kir::i32>(e.u32(0)));
+              for (std::uint32_t p = 0; p < 2; ++p)
+                dot = math::dot4_iu8(kir::cast<kir::i32>(x[p]),
+                         kir::cast<kir::i32>(planes[output][half * 2u + p]), dot.read());
+              partial[output] = math::fma(step,
+                  kir::cast<kir::f32>(dot.read()), partial[output].read());
+            }
+          }
+        }
+        for (std::uint32_t output = 0; output < columns; ++output) {
+          const auto scale = scales[output];
+          if (auto exceptional = e.when(scale != scale || math::abs(scale) >
+                           e.f32(std::numeric_limits<float>::max() / 128.0f)))
+            bad[output] = e.f32(1.0f);
+          acc[output] = math::fma(scale, partial[output].read(), acc[output].read());
+        }
+      }
+      for (auto g : e.range(lane, e.u32(groups), wave)) {
+        const auto sum = e.let(q.sum[g].read());
+        for (std::uint32_t output = 0; output < columns; ++output) {
+          const auto bias = e.let(math::widen(a.biases[(col + output) * groups + g]));
+          if (auto exceptional = e.when(bias != bias || math::abs(bias) >
+                           e.f32(std::numeric_limits<float>::max() / 2.0f)))
+            bad[output] = e.f32(1.0f);
+          acc[output] = math::fma(bias, sum, acc[output].read());
+        }
+      }
+      for (std::uint32_t output = 0; output < columns; ++output)
+        if (auto exceptional = e.when(acc[output].read() != acc[output].read() ||
+               math::abs(acc[output].read()) > e.f32(std::numeric_limits<float>::max())))
+          bad[output] = e.f32(1.0f);
+    }
+    for (std::uint32_t output = 0; output < columns; ++output)
+      for (std::uint32_t bit = 1; bit < wave; bit <<= 1)
+        bad[output] = bad[output].read() + math::shfl_xor(bad[output].read(), e.u32(bit));
+  }
+  for (std::uint32_t output = 0; output < columns; ++output) {
+    for (std::uint32_t bit = 1; bit < wave; bit <<= 1)
+      acc[output] = acc[output].read() + math::shfl_xor(acc[output].read(), e.u32(bit));
+    // Both predicates are uniform within a wave. Each exceptional output
+    // replays its original scalar sequence; neighbouring outputs stay valid.
+    if (auto scalar = e.when(col < n &&
+            (bad[output].read() != e.f32(0.0f) ||
+             acc[output].read() != acc[output].read() ||
+             math::abs(acc[output].read()) > e.f32(std::numeric_limits<float>::max())))) {
+      acc[output] = e.f32(0.0f);
+      for (auto chunk : e.range(lane, e.u32(k / 16), wave))
+        emit_chunk(e, a, nullptr, d.spec, e.let((col + output) * lanes),
+                   e.let((col + output) * groups), e.u32(0), chunk, acc[output], 4, false);
+      for (std::uint32_t bit = 1; bit < wave; bit <<= 1)
+        acc[output] = acc[output].read() + math::shfl_xor(acc[output].read(), e.u32(bit));
+    }
+    if (auto writer = e.when(lane == 0 && col < n))
+      e.store(col + output, acc[output].read());
+  }
+  return kb.lds().ok() ? kb.str() : std::string{};
 }
 
 // Every lane visits the same K indices, in the same order, as the one-row
@@ -950,6 +1145,7 @@ std::string emit_q6_decode_quad(const KernelShapes& s, const QuantDims& d) {
 
 template <class A>
 std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+  if (q6_dot_decode(s, d)) return emit_q6_dot_decode<A>(s, d);
   if (q6_decode_columns(s, d, Indexed<A>) == 4) return emit_q6_decode_quad<A>(s, d);
   if (const auto rows = q6_prefill_rows(s, d, Indexed<A>); rows > 1) {
     return emit_q6_prefill<A>(s, d, rows);
