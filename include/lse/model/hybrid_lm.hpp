@@ -150,7 +150,7 @@ class HybridLM {
                        const StepRows* rows = nullptr,
                        bool replaces_previous = false);
 
-  // Puts every attention layer's write cursor back to `position`. The paged
+  // Puts every mixer's sequence cursor back to `position`. The paged
   // pool is overwritten in place by the pass that follows, so this plus a
   // `replaces_previous` pass is what un-does a speculative step.
   void rewind(std::vector<MixerState>& states, std::int32_t position) const;

@@ -14,8 +14,12 @@ The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/do
 contains pinned dependencies, macOS adapter build steps and guarded GPU tests.
 R9700/gfx1201 validation covers Q6 projection, convolution, recurrent state,
 paged attention and GPU-only Qwen 27B Q6 text generation. A 16-token CLI run
-completed with zero CPU fallback and clean shutdown. Repeated HTTP sessions,
-longer generation and broader model accuracy remain under qualification.
+completed with zero CPU fallback and clean shutdown. Five interleaved HTTP
+completion/chat requests passed repeated-prompt isolation and graceful shutdown.
+The short chat measured 3.24 prompt tokens/s and 2.63 decode tokens/s with GPU
+execution required, KV128 and MTP disabled. Longer contexts, MTP and broader
+model accuracy remain under qualification. The [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
+includes server, chat and monitor commands.
 Linux release binaries are not macOS builds.
 
 ## Models
