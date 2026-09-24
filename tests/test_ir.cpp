@@ -900,3 +900,48 @@ LSE_TEST(alias_separates_lds_from_a_global_buffer_without_an_oracle) {
   LSE_EXPECT(ir::alias_of(w, r) == ir::Alias::kNo);
   LSE_EXPECT(ir::may_reorder(w, r));
 }
+
+LSE_TEST(loom_ssa_names_cannot_alias_named_temporaries_with_anonymous_values) {
+  ir::Body body(kTypes, kTable);
+  const auto index = body.constant("1u", ir::scalar_type(ir::Scalar::kU32), 1, true);
+  const auto zero = body.constant("0.0f", ir::scalar_type(ir::Scalar::kF32), 0, false);
+  ir::Operation accumulator;
+  accumulator.kind = ir::OpKind::kMutable;
+  accumulator.type = ir::scalar_type(ir::Scalar::kF32);
+  accumulator.operands = {zero};
+  const auto value = body.add_value(std::move(accumulator), "v" + std::to_string(index));
+  LSE_EXPECT(ir::ssa_name(body, index) != ir::ssa_name(body, value));
+  const auto external = body.symbol("input", ir::scalar_type(ir::Scalar::kU32));
+  LSE_EXPECT(ir::ssa_name(body, external) == "%input");
+  ir::Operation bind;
+  bind.kind = ir::OpKind::kBind;
+  bind.type = ir::scalar_type(ir::Scalar::kF32);
+  bind.operands = {value};
+  const auto alias = body.add_value(std::move(bind), "snapshot");
+  LSE_EXPECT(ir::ssa_name(body, alias) == ir::ssa_name(body, value));
+}
+
+LSE_TEST(cse_keeps_anonymous_ssa_hook_indices_and_bind_sources_alive) {
+  const ir::DialectSourceTable loom{std::span<const ir::PrimitiveSource>(kSources),
+                                    ir::Dialect::kLoom};
+  for (bool bind : {false, true}) {
+    ir::KernelBody kb(kTypes, loom);
+    kb.set_store([](std::string_view index, std::string_view value) {
+      return "store " + std::string(value) + " at " + std::string(index);
+    });
+    env::Emit e{&kb};
+    const auto first = e.thread_id() + 7u;
+    e.store(first, e.f32(1.0f));
+    const auto duplicate = e.thread_id() + 7u;
+    const auto index = bind ? e.let(duplicate) : duplicate;
+    e.store(index, e.f32(2.0f));
+    const auto original = kb.ir().value(duplicate.id()).def;
+    LSE_EXPECT(!kb.ir().op(original).erased);
+    const auto pinned_name = ir::ssa_name(kb.ir(), index.id());
+    (void)run_one(kb.ir(), ir::make_cse());
+    (void)run_one(kb.ir(), ir::make_dce());
+    LSE_EXPECT(!kb.ir().op(original).erased);
+    LSE_EXPECT(ir::ssa_name(kb.ir(), index.id()) == pinned_name);
+    LSE_EXPECT(ir::verify(kb.ir()).ok());
+  }
+}

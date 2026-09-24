@@ -211,7 +211,13 @@ std::string ssa_name(const Body& body, ValueId v) {
   }
   if (v == kNoValue || v >= body.value_count()) return {};
   const ValueDef& def = body.value(v);
-  return def.name.empty() ? "%v" + std::to_string(v) : "%" + def.name;
+  // Named C temporaries use a different counter from ValueId. Combining
+  // their names with anonymous %v<ValueId> names can alias an accumulator
+  // onto an unrelated index. Only external symbols retain their spelling;
+  // every SSA definition is identified by its stable value id.
+  if (def.def != kNoOp && body.op(def.def).kind == OpKind::kSymbol)
+    return "%" + def.name;
+  return "%v" + std::to_string(v);
 }
 
 std::string render(const Body& body, ValueId v) {
