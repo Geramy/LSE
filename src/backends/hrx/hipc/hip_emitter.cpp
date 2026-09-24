@@ -705,8 +705,13 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   std::vector<std::size_t> panel_of;
   std::vector<RowPanel> panels = row_panels(stages, panel_of);
   const std::uint32_t lds_budget = workgroup_lds_bytes(&device);
-  const std::string run_entry =
-      "lse_fused_" + std::to_string(group.signature());
+  // Scratch admission and emission must use the same policy-specialized
+  // name, so measured launch costs are looked up for the body we emit.
+  const std::uint64_t run_key = kernels::quant_operand_specialization_key(
+      kernels::quant_operand_cache_key(
+          kernels::activation_int8_cache_key(group.signature())),
+      group, device, hip_types(), hip_sources());
+  const std::string run_entry = "lse_fused_" + std::to_string(run_key);
 
   // Can the emitter write it, and should the engine ask for it. The second
   // question is residency, which is counted from bytes and threads and is
@@ -776,7 +781,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.traffic = run;
     }
 
-    std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
+    std::uint64_t sig = run_key;
     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
     if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
       return LSE_ERROR(kOutOfMemory, "fused run needs ",

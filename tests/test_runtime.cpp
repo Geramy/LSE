@@ -3212,40 +3212,88 @@ LSE_TEST(recurrent_carries_own_mutable_buffers_and_restart_severs_old_graphs) {
   if (!first.ok()) return;
   const auto first_carries = fx.lm->retained_program().carries();
   LSE_EXPECT(first_carries.size() > 1);
+  auto* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (!sched) return;
+  auto& devices = sched->devices();
+  for (std::size_t member = 0; member < devices.size(); ++member) {
+    const auto status = devices.device(member).synchronize();
+    LSE_EXPECT_OK(status);
+    if (!status.ok()) return;
+  }
+  auto same_start = [](const backend::DeviceBuffer& a, const backend::DeviceBuffer& b) {
+    if (a.residency != b.residency || a.offset != b.offset) return false;
+    // A device-local allocation need not have a CPU pointer. Pool views may
+    // share an opaque handle, but their offsets still distinguish the windows.
+    if (a.handle || b.handle) return a.handle == b.handle;
+    return a.ptr == b.ptr;
+  };
   std::vector<graph::NodePtr> old_outputs;
-  std::vector<const void*> inputs;
+  std::vector<backend::DeviceBuffer> inputs;
   for (const auto& c : first_carries) {
     LSE_EXPECT(c.in != nullptr && c.out != nullptr);
-    if (!c.in || !c.out) continue;
+    if (!c.in || !c.out) return;
     LSE_EXPECT(c.in->kind == graph::OpKind::kBuffer);
     LSE_EXPECT(c.in->inputs.empty());
     LSE_EXPECT(c.in->buffer.valid());
-    const void* address = c.in->buffer.ptr;
-    LSE_EXPECT(address != nullptr);  // this fixture uses the CPU backend
-    LSE_EXPECT(std::find(inputs.begin(), inputs.end(), address) == inputs.end());
-    LSE_EXPECT(address != c.out->buffer.ptr);
-    inputs.push_back(address);
+    LSE_EXPECT(c.out->buffer.valid());
+    if (!c.in->buffer.valid() || !c.out->buffer.valid()) return;
+    for (const auto& prior : inputs) {
+      LSE_EXPECT(!same_start(prior, c.in->buffer));
+    }
+    LSE_EXPECT(!same_start(c.in->buffer, c.out->buffer));
+    inputs.push_back(c.in->buffer);
     old_outputs.push_back(c.out);
   }
-  // A fold makes each consumed input writable. Mutating one of those outputs
-  // must leave equal-shaped ordinary zeros and every other layer unchanged.
+  // A fold makes each consumed input writable. Exercise the actual backing
+  // allocation: interpreter writes alone would only change a host mirror on
+  // HIP, and Array::to_host after folding could re-evaluate the old graph.
   LSE_EXPECT(!first_carries.empty());
   if (first_carries.empty()) return;
   graph::Array ordinary_zero = graph::Array::zeros(
       first_carries[0].in->shape, DType::kF32);
-  std::vector<float> zero_values(ordinary_zero.shape().elem_count(), -1.0f);
-  LSE_EXPECT_OK(ordinary_zero.to_host(zero_values.data(),
-                                     zero_values.size() * sizeof(float)));
+  const auto zero_status = ordinary_zero.eval();
+  LSE_EXPECT_OK(zero_status);
+  if (!zero_status.ok()) return;
+  auto copy_values = [&](graph::Node& node, std::vector<float>& values,
+                         bool upload) {
+    const auto member = devices.member_of(node.buffer.residency);
+    LSE_EXPECT(member < devices.size());
+    if (member >= devices.size()) return false;
+    auto& backend = devices.device(member);
+    const auto status = upload
+        ? backend.copy_h2d(values.data(), node.buffer,
+                           values.size() * sizeof(float), 0)
+        : backend.copy_d2h(node.buffer, values.data(),
+                           values.size() * sizeof(float), 0);
+    LSE_EXPECT_OK(status);
+    // Retire even a partially failed transfer before host storage goes away.
+    const auto retired = backend.synchronize();
+    LSE_EXPECT_OK(retired);
+    return status.ok() && retired.ok();
+  };
+  auto expect_values = [&](graph::Node& node, float expected) {
+    std::vector<float> values(node.shape.elem_count(), -1.0f);
+    if (!copy_values(node, values, false)) return false;
+    for (float value : values) LSE_EXPECT_EQ(value, expected);
+    return true;
+  };
   graph::Program folded;
   folded.set_carries(first_carries);
   folded.fold_carries();
-  graph::interpreter::store_element(*first_carries[0].out, 0, 13.0f);
-  for (std::size_t i = 1; i < first_carries.size(); ++i) {
-    LSE_EXPECT_EQ(graph::interpreter::load_element(*first_carries[i].out, 0), 0.0f);
+  for (std::size_t changed = 0; changed < first_carries.size(); ++changed) {
+    auto& output = *first_carries[changed].out;
+    std::vector<float> written(output.shape.elem_count(), 13.0f);
+    if (!copy_values(output, written, true)) return;
+    for (std::size_t i = 0; i < first_carries.size(); ++i) {
+      if (!expect_values(*first_carries[i].out, i == changed ? 13.0f : 0.0f)) {
+        return;
+      }
+    }
+    if (!expect_values(*ordinary_zero.node(), 0.0f)) return;
+    std::fill(written.begin(), written.end(), 0.0f);
+    if (!copy_values(output, written, true)) return;
   }
-  LSE_EXPECT_OK(ordinary_zero.to_host(zero_values.data(),
-                                     zero_values.size() * sizeof(float)));
-  for (float value : zero_values) LSE_EXPECT_EQ(value, 0.0f);
   LSE_EXPECT_OK(session.restart());
   auto restarted = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
   LSE_EXPECT(restarted.ok());

@@ -4297,6 +4297,16 @@ LSE_TEST(the_run_price_is_the_bytes_the_merged_body_declares) {
   // and equality is admitted — this is the case a stricter rule would break.
   LSE_EXPECT_EQ(cost.worst_solo, 2048u);
   LSE_EXPECT_EQ(cost.fused, 2048u);
+  // A cached body must retain that same measured identity, too.
+  const auto cached_cost = kEmitter.run_scratch(run, dev);
+  const auto cached_emit = kEmitter.emit(sibling_group({a, b}), dev);
+  LSE_EXPECT(cached_emit.ok());
+  if (cached_emit.ok()) {
+    LSE_EXPECT(cached_cost.fused_entry == cached_emit->entry_name);
+    LSE_EXPECT(cached_emit->entry_name == e->entry_name);
+    LSE_EXPECT_EQ(cached_cost.fused, cached_emit->lds_bytes);
+    LSE_EXPECT(cached_emit->source == e->source);
+  }
 }
 
 // A run is admitted on RESIDENCY, and refused on it. Three cases, one rule:

@@ -17,6 +17,14 @@ lld="${AMDGPU_LLD:-$(brew --prefix lld@21)/bin/ld.lld}"
 PATH="$llvm:$(dirname "$lld"):$PATH"
 export PATH
 export MACOSX_DEPLOYMENT_TARGET=15.0
+# LLVM's PATH must not select host archive tools implicitly: Darwin ld expects
+# Darwin archive indices, including for translation units with no symbols.
+# Resolve the tools from the selected Xcode, independently of Homebrew PATH.
+darwin_ar="$(xcrun --find ar)"
+darwin_ranlib="$(xcrun --find ranlib)"
+darwin_archive_args=("-DCMAKE_AR=$darwin_ar" "-DCMAKE_RANLIB=$darwin_ranlib"
+  "-DCMAKE_C_COMPILER_AR=$darwin_ar" "-DCMAKE_C_COMPILER_RANLIB=$darwin_ranlib"
+  "-DCMAKE_CXX_COMPILER_AR=$darwin_ar" "-DCMAKE_CXX_COMPILER_RANLIB=$darwin_ranlib")
 command -v cargo >/dev/null
 command -v ninja >/dev/null
 mkdir -p "$work/deps"
@@ -80,7 +88,7 @@ p.write_text(s)
 PY
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
+  "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
   -DCMAKE_C_FLAGS=-DIREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER=1 \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
   -DIREE_CLANG_BINARY="$llvm/clang" -DIREE_LLVM_LINK_BINARY="$llvm/llvm-link" -DIREE_LLD_BINARY="$lld" \
@@ -92,10 +100,10 @@ cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   -DFETCHCONTENT_SOURCE_DIR_HSA_RUNTIME_HEADERS="$work/deps/hsa-headers"
 cmake --build "$work/hrx-build" --target hrx loomc_shared --parallel "$jobs"
 cmake -S "$work/deps/mac-amdgpu/hsa" -B "$work/hsa-build" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DBUILD_TESTING=OFF
+  "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DBUILD_TESTING=OFF
 cmake --build "$work/hsa-build" --target hsa-runtime64 --parallel "$jobs"
 cmake -S "$work/source" -B "$work/lse-build" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_CXX_COMPILER="$llvm/clang++" \
+  "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_CXX_COMPILER="$llvm/clang++" \
   "-DCMAKE_EXE_LINKER_FLAGS=-L$llvm/../lib/c++ -Wl,-rpath,$llvm/../lib/c++" \
   -DLSE_ENABLE_CPU=ON -DLSE_ENABLE_HRX=ON -DLSE_BUILD_TESTS=ON -DLSE_GPU_TARGETS=gfx1201 \
   -DLSE_HRX_INCLUDE_DIR="$work/hrx-source/libhrx/include" \
@@ -117,7 +125,7 @@ cmake --build "$work/lse-build" --target lse lse-server compile_loom_matrix --pa
 # The host suite must not discover a real GPU on a developer's machine.
 # Some tests enumerate the default backend, so give them a CPU-only build.
 cmake -S "$work/source" -B "$work/host-tests" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
   -DCMAKE_CXX_COMPILER="$llvm/clang++" \
   "-DCMAKE_EXE_LINKER_FLAGS=-L$llvm/../lib/c++ -Wl,-rpath,$llvm/../lib/c++" \
   -DLSE_ENABLE_CPU=ON -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
