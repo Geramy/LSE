@@ -74,7 +74,8 @@ inline constexpr DeviceIndex kNoDevice{};
 struct DeviceBuffer {
   // Host address of the allocation base, or null when the allocation is
   // device-local. A view keeps the same pointer and names its window with
-  // `offset` + `size_bytes`; never free a view, only the original.
+  // `offset` + `size_bytes`. A managed view releases its shared storage
+  // reference; an unowned view must never free the original raw pointer.
   void* ptr = nullptr;
   std::size_t size_bytes = 0;
   std::uint64_t handle = 0;     // opaque, backend-private

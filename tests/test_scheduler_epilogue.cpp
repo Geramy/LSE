@@ -147,4 +147,38 @@ LSE_TEST(final_launch_slots_keep_reduction_input_live_through_fused_epilogue) {
   }
 }
 
+LSE_TEST(device_retained_overwrite_replays_without_repartitioning) {
+  backend::BackendAdapter<CaptureDevice> backend;
+  check(backend.init(0));
+  Scheduler scheduler(backend);
+  scheduler.set_dialect(Dialect::kLoom);
+  auto leaf = [&](Shape shape) {
+    auto buffer = backend.allocate(shape.elem_count() * sizeof(float),
+        backend::MemoryClass::kDevice, backend::kDefaultStream);
+    if (!buffer.ok()) throw std::runtime_error(buffer.status().to_string());
+    return Array::from_buffer(buffer.release(), shape, DType::kF32);
+  };
+  auto dst = leaf({1, 1, 4, 2});
+  auto src = leaf({1, 1, 1, 2});
+  auto pos = leaf({1});
+  auto out = overwrite_slice(dst, src, 2, pos);
+  const NodePtr roots[] = {out.node()};
+  Program program;
+  check(scheduler.eval(roots, false, &program));
+  LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 1u);
+  LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+  LSE_EXPECT(program.holds(roots));
+  const auto attempts = backend.impl().emitter.attempts;
+  program.reset_compute();
+  check(scheduler.eval(roots, false, &program));
+  LSE_EXPECT(scheduler.last_trace().replayed);
+  LSE_EXPECT_EQ(scheduler.last_trace().partition_passes, 0u);
+  LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 1u);
+  LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+  LSE_EXPECT_EQ(backend.impl().launches, 2u);
+  LSE_EXPECT_EQ(backend.impl().emitter.failures, 0u);
+  // The real emitter may rebind the held group; no repartition is permitted.
+  LSE_EXPECT(backend.impl().emitter.attempts >= attempts);
+}
+
 LSE_TEST_MAIN()

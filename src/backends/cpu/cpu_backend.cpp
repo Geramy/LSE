@@ -84,14 +84,20 @@ Result<DeviceBuffer> CpuBackend::allocate_impl(std::size_t bytes,
   buf.ptr = ptr;
   buf.size_bytes = bytes;
   buf.handle = reinterpret_cast<std::uint64_t>(ptr);
+  // Views and retained graphs share the allocation, just as device backends
+  // do. The deleter needs no live backend and remains valid after shutdown.
+  buf.storage = std::shared_ptr<void>(ptr, std::free);
   return buf;
 }
 
 void CpuBackend::deallocate_impl(DeviceBuffer& buf) noexcept {
-  std::free(buf.ptr);
-  buf.ptr = nullptr;
-  buf.handle = 0;
-  buf.size_bytes = 0;
+  if (buf.storage) {
+    buf.storage.reset();
+  } else {
+    // Preserve explicit release of legacy, unowned allocation descriptors.
+    std::free(buf.ptr);
+  }
+  buf = {};
 }
 
 Status CpuBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,

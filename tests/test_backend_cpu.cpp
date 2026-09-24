@@ -57,6 +57,35 @@ LSE_TEST(allocate_upload_download_round_trip) {
   be.shutdown();
 }
 
+LSE_TEST(cpu_buffer_views_keep_allocation_alive_after_base_release) {
+  CpuBackend be;
+  LSE_EXPECT_OK(be.init(0));
+  auto allocation = be.allocate(32);
+  LSE_EXPECT(allocation.ok());
+  if (!allocation.ok()) return;
+  auto base = allocation.release();
+  std::weak_ptr<void> lifetime = base.storage;
+  LSE_EXPECT(!lifetime.expired());
+  auto view = base;
+  view.offset = 8;
+  view.size_bytes = 16;
+  be.deallocate(base);
+  LSE_EXPECT(!base.valid());
+  LSE_EXPECT(!lifetime.expired());
+  const std::uint32_t value = 0x12345678u;
+  LSE_EXPECT_OK(be.copy_h2d(&value, view, sizeof(value), 0));
+  std::uint32_t observed = 0;
+  LSE_EXPECT_OK(be.copy_d2h(view, &observed, sizeof(observed), 0));
+  LSE_EXPECT_EQ(observed, value);
+  auto last_owner = view;
+  be.deallocate(view);
+  LSE_EXPECT(!view.valid());
+  LSE_EXPECT(!lifetime.expired());
+  be.shutdown();
+  last_owner = {};
+  LSE_EXPECT(lifetime.expired());
+}
+
 LSE_TEST(copies_are_bounds_checked) {
   CpuBackend be;
   LSE_EXPECT_OK(be.init(0));
