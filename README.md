@@ -20,8 +20,9 @@ run. With explicit batching/polling overrides, three measured resident requests
 reached median 10.12 decode tokens/s; a separate 64-token prompt reached 54.01
 prompt tokens/s and 6.75 decode tokens/s. These KV128/no-MTP workloads do not
 establish llama.cpp performance parity. Broader accuracy, longer contexts and
-MTP remain under qualification; the longer prompt diverges from native MLX at
-an exact BF16 logit tie and is being investigated. See the
+MTP remain under qualification. The longer prompt matches all 33 generated IDs
+of a float32 MLX reference with unchanged packed Q6 weights; native BF16 MLX
+diverges at an exact logit tie. See the
 [measurements and limits](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md)
 and [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
 for reproduction, server, chat and monitor commands.
