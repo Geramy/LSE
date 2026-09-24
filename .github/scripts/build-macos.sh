@@ -120,7 +120,7 @@ cmake -S "$work/source" -B "$work/lse-build" -G Ninja \
 tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu
   test_primitive test_trace test_loom_print test_loom_repeat test_loom_gdn
   test_loom_extent test_loom_conv test_loom_words test_loom_flash
-  test_generation_stats test_server_shutdown test_dispatch_profile test_loom_cache
+  test_generation_stats test_http_timings test_server_shutdown test_dispatch_profile test_loom_cache
   test_pointwise_fusion test_probe_measurement test_probe_policy test_quant_prefill
   test_token_ids test_submission_tuner test_submission_constants test_submission_decode
   test_decode_sample test_loaded_runtime test_hrx_copy_route test_gdn_pair
