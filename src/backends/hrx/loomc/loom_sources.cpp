@@ -35,7 +35,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 37> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 47> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -164,6 +164,129 @@ constexpr std::array<graph::PrimitiveSource, 37> kLoomSources{{
      "$r = vector.extract $t5[0] : vector<1xi32> -> i32"},
     {"rint", "$r = scalar.roundevenf $0 : f32"},
 
+    // The same HIP OCP finite-saturating RNE conversion. Loom E4M3
+    // fptrunc saturates infinities, so turn those into signed NaNs first.
+    {"pack4.fp8.ocp",
+     "$t0 = scalar.constant 448.0 : f32\n"
+     "$t1 = scalar.constant -448.0 : f32\n"
+     "$t2 = scalar.constant inf : f32\n"
+     "$t3 = scalar.absf $0 : f32\n"
+     "$t4 = scalar.cmpf olt, $t3, $t2 : f32\n"
+     "$t5 = scalar.maxnumf $0, $t1 : f32\n"
+     "$t6 = scalar.minnumf $t5, $t0 : f32\n"
+     "$t7 = scf.select $t4, $t6, $0 : f32\n"
+     "$t8 = scalar.cmpf oeq, $t3, $t2 : f32\n"
+     "$t9 = scalar.bitcast $0 : f32 to i32\n"
+     "$t10 = scalar.constant 4194304 : i32\n"
+     "$t11 = scalar.ori $t9, $t10 : i32\n"
+     "$t12 = scalar.bitcast $t11 : i32 to f32\n"
+     "$t13 = scf.select $t8, $t12, $t7 : f32\n"
+     "$t14 = scalar.absf $1 : f32\n"
+     "$t15 = scalar.cmpf olt, $t14, $t2 : f32\n"
+     "$t16 = scalar.maxnumf $1, $t1 : f32\n"
+     "$t17 = scalar.minnumf $t16, $t0 : f32\n"
+     "$t18 = scf.select $t15, $t17, $1 : f32\n"
+     "$t19 = scalar.cmpf oeq, $t14, $t2 : f32\n"
+     "$t20 = scalar.bitcast $1 : f32 to i32\n"
+     "$t21 = scalar.constant 4194304 : i32\n"
+     "$t22 = scalar.ori $t20, $t21 : i32\n"
+     "$t23 = scalar.bitcast $t22 : i32 to f32\n"
+     "$t24 = scf.select $t19, $t23, $t18 : f32\n"
+     "$t25 = scalar.absf $2 : f32\n"
+     "$t26 = scalar.cmpf olt, $t25, $t2 : f32\n"
+     "$t27 = scalar.maxnumf $2, $t1 : f32\n"
+     "$t28 = scalar.minnumf $t27, $t0 : f32\n"
+     "$t29 = scf.select $t26, $t28, $2 : f32\n"
+     "$t30 = scalar.cmpf oeq, $t25, $t2 : f32\n"
+     "$t31 = scalar.bitcast $2 : f32 to i32\n"
+     "$t32 = scalar.constant 4194304 : i32\n"
+     "$t33 = scalar.ori $t31, $t32 : i32\n"
+     "$t34 = scalar.bitcast $t33 : i32 to f32\n"
+     "$t35 = scf.select $t30, $t34, $t29 : f32\n"
+     "$t36 = scalar.absf $3 : f32\n"
+     "$t37 = scalar.cmpf olt, $t36, $t2 : f32\n"
+     "$t38 = scalar.maxnumf $3, $t1 : f32\n"
+     "$t39 = scalar.minnumf $t38, $t0 : f32\n"
+     "$t40 = scf.select $t37, $t39, $3 : f32\n"
+     "$t41 = scalar.cmpf oeq, $t36, $t2 : f32\n"
+     "$t42 = scalar.bitcast $3 : f32 to i32\n"
+     "$t43 = scalar.constant 4194304 : i32\n"
+     "$t44 = scalar.ori $t42, $t43 : i32\n"
+     "$t45 = scalar.bitcast $t44 : i32 to f32\n"
+     "$t46 = scf.select $t41, $t45, $t40 : f32\n"
+     "$t47 = vector.from_elements $t13, $t24, $t35, $t46 : vector<4xf32>\n"
+     "$t48 = vector.fptrunc $t47 : vector<4xf32> to vector<4xf8E4M3>\n"
+     "$t49 = vector.bitcast $t48 : vector<4xf8E4M3> to vector<1xi32>\n"
+     "$r = vector.extract $t49[0] : vector<1xi32> -> i32"},
+    {"value.fp8.0",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
+     "$t2 = vector.extract $t1[0] : vector<4xf8E4M3> -> f8E4M3\n"
+     "$r = scalar.extf $t2 : f8E4M3 to f32"},
+    {"value.fp8.1",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
+     "$t2 = vector.extract $t1[1] : vector<4xf8E4M3> -> f8E4M3\n"
+     "$r = scalar.extf $t2 : f8E4M3 to f32"},
+    {"value.fp8.2",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
+     "$t2 = vector.extract $t1[2] : vector<4xf8E4M3> -> f8E4M3\n"
+     "$r = scalar.extf $t2 : f8E4M3 to f32"},
+    {"value.fp8.3",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"
+     "$t2 = vector.extract $t1[3] : vector<4xf8E4M3> -> f8E4M3\n"
+     "$r = scalar.extf $t2 : f8E4M3 to f32"},
+    {"pack4.bf8.ocp",
+     "$t0 = scalar.constant 57344.0 : f32\n"
+     "$t1 = scalar.constant -57344.0 : f32\n"
+     "$t2 = scalar.constant inf : f32\n"
+     "$t3 = scalar.absf $0 : f32\n"
+     "$t4 = scalar.cmpf olt, $t3, $t2 : f32\n"
+     "$t5 = scalar.maxnumf $0, $t1 : f32\n"
+     "$t6 = scalar.minnumf $t5, $t0 : f32\n"
+     "$t7 = scf.select $t4, $t6, $0 : f32\n"
+     "$t8 = scalar.absf $1 : f32\n"
+     "$t9 = scalar.cmpf olt, $t8, $t2 : f32\n"
+     "$t10 = scalar.maxnumf $1, $t1 : f32\n"
+     "$t11 = scalar.minnumf $t10, $t0 : f32\n"
+     "$t12 = scf.select $t9, $t11, $1 : f32\n"
+     "$t13 = scalar.absf $2 : f32\n"
+     "$t14 = scalar.cmpf olt, $t13, $t2 : f32\n"
+     "$t15 = scalar.maxnumf $2, $t1 : f32\n"
+     "$t16 = scalar.minnumf $t15, $t0 : f32\n"
+     "$t17 = scf.select $t14, $t16, $2 : f32\n"
+     "$t18 = scalar.absf $3 : f32\n"
+     "$t19 = scalar.cmpf olt, $t18, $t2 : f32\n"
+     "$t20 = scalar.maxnumf $3, $t1 : f32\n"
+     "$t21 = scalar.minnumf $t20, $t0 : f32\n"
+     "$t22 = scf.select $t19, $t21, $3 : f32\n"
+     "$t23 = vector.from_elements $t7, $t12, $t17, $t22 : vector<4xf32>\n"
+     "$t24 = vector.fptrunc $t23 : vector<4xf32> to vector<4xf8E5M2>\n"
+     "$t25 = vector.bitcast $t24 : vector<4xf8E5M2> to vector<1xi32>\n"
+     "$r = vector.extract $t25[0] : vector<1xi32> -> i32"},
+    {"value.bf8.0",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
+     "$t2 = vector.extract $t1[0] : vector<4xf8E5M2> -> f8E5M2\n"
+     "$r = scalar.extf $t2 : f8E5M2 to f32"},
+    {"value.bf8.1",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
+     "$t2 = vector.extract $t1[1] : vector<4xf8E5M2> -> f8E5M2\n"
+     "$r = scalar.extf $t2 : f8E5M2 to f32"},
+    {"value.bf8.2",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
+     "$t2 = vector.extract $t1[2] : vector<4xf8E5M2> -> f8E5M2\n"
+     "$r = scalar.extf $t2 : f8E5M2 to f32"},
+    {"value.bf8.3",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E5M2>\n"
+     "$t2 = vector.extract $t1[3] : vector<4xf8E5M2> -> f8E5M2\n"
+     "$r = scalar.extf $t2 : f8E5M2 to f32"},
+
     {"thread.local_id", "$r = kernel.workitem.id<x> : index"},
     {"thread.workgroup_id.x", "$r = kernel.workgroup.id<x> : index"},
     {"thread.workgroup_id.y", "$r = kernel.workgroup.id<y> : index"},
@@ -189,8 +312,10 @@ struct ResultType {
 };
 
 // Everything not listed produces f32, which is what every arithmetic row does.
-constexpr std::array<ResultType, 9> kNonFloatResults{{
+constexpr std::array<ResultType, 11> kNonFloatResults{{
     {"bits.f16", "i32"},
+    {"pack4.fp8.ocp", "i32"},
+    {"pack4.bf8.ocp", "i32"},
     {"dot4.i32.iu8", "i32"},
     {"min.u32", "i32"},
     {"max.u32", "i32"},

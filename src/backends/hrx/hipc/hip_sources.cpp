@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 61> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 71> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -157,6 +157,18 @@ constexpr std::array<graph::PrimitiveSource, 61> kHipSources{{
      "__builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8($0, $1, $2, 0, 0, 0)"},
     {"mfma.f32.32x32x16.fp8_fp8",
      "__builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8($0, $1, $2, 0, 0, 0)"},
+
+    // OCP conversion: finite saturation, RNE; exceptional inputs retain HIP semantics.
+    {"pack4.fp8.ocp", "__builtin_amdgcn_cvt_pk_fp8_f32((__builtin_isfinite($2) ? __builtin_amdgcn_fmed3f($2, 448.0f, -448.0f) : $2), (__builtin_isfinite($3) ? __builtin_amdgcn_fmed3f($3, 448.0f, -448.0f) : $3), __builtin_amdgcn_cvt_pk_fp8_f32((__builtin_isfinite($0) ? __builtin_amdgcn_fmed3f($0, 448.0f, -448.0f) : $0), (__builtin_isfinite($1) ? __builtin_amdgcn_fmed3f($1, 448.0f, -448.0f) : $1), 0, false), true)"},
+    {"value.fp8.0", "__builtin_amdgcn_cvt_f32_fp8($0, 0)"},
+    {"value.fp8.1", "__builtin_amdgcn_cvt_f32_fp8($0, 1)"},
+    {"value.fp8.2", "__builtin_amdgcn_cvt_f32_fp8($0, 2)"},
+    {"value.fp8.3", "__builtin_amdgcn_cvt_f32_fp8($0, 3)"},
+    {"pack4.bf8.ocp", "__builtin_amdgcn_cvt_pk_bf8_f32((__builtin_isfinite($2) ? __builtin_amdgcn_fmed3f($2, 57344.0f, -57344.0f) : $2), (__builtin_isfinite($3) ? __builtin_amdgcn_fmed3f($3, 57344.0f, -57344.0f) : $3), __builtin_amdgcn_cvt_pk_bf8_f32((__builtin_isfinite($0) ? __builtin_amdgcn_fmed3f($0, 57344.0f, -57344.0f) : $0), (__builtin_isfinite($1) ? __builtin_amdgcn_fmed3f($1, 57344.0f, -57344.0f) : $1), 0, false), true)"},
+    {"value.bf8.0", "__builtin_amdgcn_cvt_f32_bf8($0, 0)"},
+    {"value.bf8.1", "__builtin_amdgcn_cvt_f32_bf8($0, 1)"},
+    {"value.bf8.2", "__builtin_amdgcn_cvt_f32_bf8($0, 2)"},
+    {"value.bf8.3", "__builtin_amdgcn_cvt_f32_bf8($0, 3)"},
 
     {"thread.local_id", "threadIdx.x"},
     {"thread.workgroup_id.x", "blockIdx.x"},

@@ -296,3 +296,8 @@ endif()
 
 add_test(NAME test_loom_matrix_int8 COMMAND ${CMAKE_COMMAND} -E env
   LSE_HRX_INT8=1 $<TARGET_FILE:test_loom_matrix>)
+
+lse_add_test(test_fp8_conversion lse_ir lse_graph)
+if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
+  lse_add_test(test_fp8_conversion_native lse_backend_hrx lse_graph lse_kernels lse_ir)
+endif()
