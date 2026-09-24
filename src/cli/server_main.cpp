@@ -1,9 +1,10 @@
 // lse-server — the /v1 HTTP surface over one loaded model.
+#include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <csignal>
-#include <cstdlib>
 #include <string>
 #include <thread>
 
@@ -15,39 +16,17 @@
 #include "lse/place/devices.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/server/http_server.hpp"
+#include "lse/server/shutdown.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 
 namespace {
 
 using namespace lse;
 
-server::HttpServer* g_server = nullptr;
-volatile std::sig_atomic_t g_stopping = 0;
-
-// Sets a flag and nothing else. Closing sockets and taking locks from a signal
-// handler is what turned one ^C into four and then a kill: the handler ran on
-// whichever thread took the signal, and a decode already in flight kept the
-// worker pool -- and so listen() -- open behind it. A second signal is a user
-// saying they are done waiting, so that one leaves immediately.
-void on_signal(int) {
-  if (g_stopping != 0) std::_Exit(130);
-  g_stopping = 1;
-}
-
-// Does the stopping, off the signal handler, where locks are allowed. If the
-// listen loop has not unwound shortly after, this leaves anyway: a server owns
-// nothing that outlives the process, and the kernel reclaims the model's
-// memory and the device faster than a wedged teardown does.
-void shutdown_watch() {
-  while (g_stopping == 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-  }
-  if (g_server != nullptr) g_server->stop();
-  std::this_thread::sleep_for(std::chrono::seconds(2));
-  std::fputs("lse-server: stopped\n", stderr);
-  std::fflush(nullptr);
-  std::_Exit(0);
-}
+// Lock-free atomic access is signal-safe and also synchronizes with the watcher.
+static_assert(std::atomic<bool>::is_always_lock_free);
+std::atomic<bool> g_stopping{false};
+void on_signal(int) { g_stopping.store(true, std::memory_order_relaxed); }
 
 void usage() {
   std::puts(
@@ -61,6 +40,7 @@ void usage() {
       "      --served-name ID model id reported by /v1/models (default: the\n"
       "                       model argument)\n"
       "      --max-tokens N   refuse requests asking for more (default 4096)\n"
+      "      --shutdown-grace-seconds N  drain requests before failing (1..600, default 30)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
       "                       beside the model, when the checkpoint has one)\n"
       "      --no-mtp         decode one token per pass, ignoring any\n"
@@ -94,6 +74,7 @@ int main(int argc, char** argv) {
   std::string pool;
   std::string dialect;
   std::int32_t kv_len = 0;
+  int shutdown_grace_seconds = 30;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -111,6 +92,16 @@ int main(int argc, char** argv) {
     else if (a == "--api-key") opt.api_key = value("--api-key");
     else if (a == "--served-name") served_name = value("--served-name");
     else if (a == "--max-tokens") opt.max_tokens_cap = std::atoi(value("--max-tokens").c_str());
+    else if (a == "--shutdown-grace-seconds") {
+      const auto text = value("--shutdown-grace-seconds");
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
+                                          shutdown_grace_seconds);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          shutdown_grace_seconds < 1 || shutdown_grace_seconds > 600) {
+        std::fputs("lse-server: shutdown grace must be an integer from 1 to 600 seconds\n", stderr);
+        return 2;
+      }
+    }
     else if (a == "--mtp") mtp_path = value("--mtp");
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
@@ -231,23 +222,18 @@ int main(int argc, char** argv) {
     }
   }
 
-  g_server = &http;
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
-  std::thread(shutdown_watch).detach();
+  server::detail::ShutdownWatch shutdown(
+      g_stopping, std::chrono::seconds(shutdown_grace_seconds), [&] { http.stop(); });
 
   std::fprintf(stderr, "lse-server: %s on http://%s:%d\n", opt.model_id.c_str(),
                opt.host.c_str(), opt.port);
   const Status served = http.listen();
+  // httplib joins every request worker before listen returns. Only now may the
+  // model, cached executables, device allocations and runtime be destroyed.
+  shutdown.finish();
   if (!served.ok()) return fail(served, "listening");
-
-  // Leave without running the static destructors. Tearing the device down
-  // while the runtime still holds threads has been seen to wedge: the device
-  // closes, one worker spins and the main thread waits on a futex that never
-  // fires, leaving a process that answers nothing and still holds the model's
-  // memory. Nothing here owns state that outlives the process, so the kernel
-  // reclaiming it is both correct and the only exit that cannot hang.
-  std::fflush(nullptr);
-  std::fprintf(stderr, "lse-server: stopped\n");
-  std::_Exit(0);
+  std::fprintf(stderr, "lse-server: requests drained; releasing model and runtime\n");
+  return 0;
 }

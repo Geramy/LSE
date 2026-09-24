@@ -1,4 +1,5 @@
 #include "lse/server/http_server.hpp"
+#include "lse/server/shutdown.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -109,6 +110,7 @@ struct HttpServer::Impl {
   // long as its completion takes and the server outlives the ^C that asked it
   // to stop.
   std::atomic<bool> stopping{false};
+  std::atomic<bool> listener_stop_issued{false};
   // One resident session, restarted between requests instead of rebuilt: the
   // state arrays keep their nodes, so the model's retained program replays
   // and a warm request skips the per-request partition and emit entirely.
@@ -203,6 +205,9 @@ struct HttpServer::Run {
       HttpServer::Impl& impl, const Request& r,
       const std::function<bool(const std::string&)>& emit) {
     std::lock_guard<std::mutex> held(impl.generate_lock);
+    // A request queued behind another generation must not start new device
+    // work after shutdown has asked the active generation to stop.
+    if (impl.stopping.load()) return LSE_ERROR(kCancelled, "server is stopping");
 
     runtime::Generator gen(impl.model, r.sampling);
     if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
@@ -333,7 +338,7 @@ void HttpServer::use_mtp(model::MtpModule& mtp) noexcept { impl_->mtp = &mtp; }
 
 void HttpServer::stop() {
   impl_->stopping.store(true, std::memory_order_relaxed);
-  impl_->http.stop();
+  detail::stop_listener_once(impl_->http, impl_->listener_stop_issued);
 }
 
 Status HttpServer::listen() {
@@ -389,6 +394,10 @@ Status HttpServer::listen() {
   // choice is shaped; everything after that is shared.
   auto completion_route = [&impl](bool chat) {
     return [&impl, chat](const httplib::Request& req, httplib::Response& res) {
+      if (impl.stopping.load()) {
+        send_error(res, 503, "server is stopping", "server_error");
+        return;
+      }
       json body;
       try {
         body = json::parse(req.body);
@@ -469,7 +478,8 @@ Status HttpServer::listen() {
       if (!r.stream) {
         auto out = HttpServer::Run::generate(impl, r, {});
         if (!out.ok()) {
-          send_error(res, 500, std::string(out.status().message()), "server_error");
+          send_error(res, out.status().code() == StatusCode::kCancelled ? 503 : 500,
+                     std::string(out.status().message()), "server_error");
           return;
         }
         json resp{{"id", id},
@@ -561,6 +571,7 @@ Status HttpServer::listen() {
     });
   }
 
+  if (impl.stopping.load()) return OkStatus();
   if (!impl.http.listen(impl.opt.host, impl.opt.port)) {
     return LSE_ERROR(kIoError, "could not listen on ", impl.opt.host, ":",
                      std::to_string(impl.opt.port));

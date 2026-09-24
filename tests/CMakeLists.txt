@@ -61,6 +61,16 @@ target_sources(test_loom_words PRIVATE
 lse_add_test(test_quant)
 lse_add_test(test_shape)
 lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
+# Socket lifecycle coverage never opens a model or device.
+find_package(Threads REQUIRED)
+add_executable(test_server_shutdown test_server_shutdown.cpp)
+target_include_directories(test_server_shutdown PRIVATE
+  ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/vendor)
+target_link_libraries(test_server_shutdown PRIVATE Threads::Threads)
+lse_apply_common_flags(test_server_shutdown)
+add_test(NAME test_server_shutdown COMMAND test_server_shutdown)
+set_tests_properties(test_server_shutdown PROPERTIES TIMEOUT 15)
+
 lse_add_test(test_model lse_model lse_backends)
 
 if(LSE_ENABLE_CPU)
