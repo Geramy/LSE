@@ -12,8 +12,10 @@ a library.
 AMD GPU driver and HSA runtime for the native HRX/Loom path on Apple Silicon.
 The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
 contains pinned dependencies, macOS adapter build steps and guarded GPU tests.
-R9700/gfx1201 validation covers Q6 projection, causal convolution and loading
-a Qwen 27B text model. Complete macOS token generation remains under qualification;
+R9700/gfx1201 validation covers Q6 projection, convolution, recurrent state,
+paged attention and GPU-only Qwen 27B Q6 text generation. A 16-token CLI run
+completed with zero CPU fallback and clean shutdown. Repeated HTTP sessions,
+longer generation and broader model accuracy remain under qualification.
 Linux release binaries are not macOS builds.
 
 ## Models

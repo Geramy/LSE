@@ -563,8 +563,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     si_shapes.types = type_table;
     si_shapes.intrinsics = &spellings;
 
+    // Binding order deduplicates aliases. Record the logical argument names
+    // through that map too, so a repeated input cannot shift later operands.
+    std::vector<std::string> input_names;
+    for (const NodePtr& input : anchor->inputs) {
+      input_names.push_back(names[binding_of.at(input.get())]);
+    }
     ir::KernelBody::Capture cap;
-    const std::string text = self_indexed->emit_kernel(si_shapes);
+    std::string text;
+    {
+      const ir::RecordOptions options{input_names, {}, {}};
+      const ir::KernelBody::Recording recording(options);
+      text = self_indexed->emit_kernel(si_shapes);
+    }
     if (!epilogue_error.ok()) return epilogue_error;
     if (text.empty() || !cap.has()) {
       return LSE_ERROR(kUnimplemented, "primitive '",
