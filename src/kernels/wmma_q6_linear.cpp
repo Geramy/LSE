@@ -606,11 +606,11 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
   kernel.lds_bytes = kResidualLdsBytes;
   return kernel;
 }
-// Private qualification route. No centered-affine costs or accepted quality
-// records exist yet. Both dialects select the same exact projection shapes.
+// Private M256 qualification route. Synthetic timing is not an accepted
+// model-quality record. Both dialects select the same two projection shapes.
 const KernelPrimitiveBase* select_centered_affine_candidate(
     const KernelShapes& s, const Dims& dims) {
-  if ((dims.m != 256 && dims.m != 512) ||
+  if (dims.m != 256 ||
       !((dims.n == 17408 && dims.k == 5120) ||
         (dims.n == 5120 && dims.k == 17408))) return nullptr;
   QuantOperandKernel kernel;
@@ -643,7 +643,7 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
       s.device->compute_units != 64 ||
       (global && std::strcmp(global, "0") == 0))
     return nullptr;
-  if (dims.m == 256 || dims.m == 512) return select_centered_affine_candidate(s, dims);
+  if (dims.m == 256) return select_centered_affine_candidate(s, dims);
   const auto request = residual_request(s, dims);
   // Matched driver195 projection experiments: eight post-warm host
   // eval+retire intervals per implementation. These are not device timestamps.
