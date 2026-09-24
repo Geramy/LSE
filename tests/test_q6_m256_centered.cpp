@@ -30,7 +30,7 @@ LSE_TEST(m256_profile_preserves_other_shape_selection) {
     Fixture f(m,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
     LSE_EXPECT_EQ(p!=nullptr,m==64||m==256||m==512);if(!p)continue;
     LSE_EXPECT_EQ(p->name().find("centered_activation_residual2")!=std::string_view::npos,m==256);
-    LSE_EXPECT_EQ(p->name().find("centered_activation_residual2_v2")!=std::string_view::npos,m==256);
+    LSE_EXPECT_EQ(p->name().find("centered_activation_residual2_v3")!=std::string_view::npos,m==256);
     const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,m==256?26160u:16384u);
   }
 }

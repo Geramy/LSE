@@ -212,6 +212,22 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
                            const kir::Val<kir::u32> &k) {
     return r * 64u + ((k / 8u + r % 8u) % 8u) * 8u + k % 8u;
   };
+  // Compact original-FP32 fallback: consume the same little-endian 96 bits
+  // in increasing weight order without emitting sixteen copies of the body.
+  // The three DWORD loads are exact; no row-end overread or extra alignment.
+  const auto scalar_chunk = [&](const auto& word_base, const auto& scale,
+                                const auto& bias, auto&& sink) {
+    auto low=e.var(a.packed[word_base]);
+    auto middle=e.var(a.packed[word_base+1u]);
+    auto high=e.var(a.packed[word_base+2u]);
+    for(auto q:e.range(0u,16u,1u)) {
+      const auto code=e.let(low.read()%64u);
+      sink(q,math::fma(math::cast<kir::f32>(code),scale,bias));
+      low=low.read()/64u+(middle.read()%64u)*67108864u;
+      middle=middle.read()/64u+(high.read()%64u)*67108864u;
+      high=high.read()/64u;
+    }
+  };
   auto largest_group = e.var(0.0f);
   std::vector<kir::Local<kir::f32, 8>> acc;
   for (unsigned i = 0; i < 4; ++i) {
@@ -397,9 +413,9 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
             for(auto chunk:e.range(kb/16u,kb/16u+4u,1u)){
               const auto gi=e.let(col*d.groups+(chunk*16u)/d.group);
               const auto scale=e.let(math::widen(a.scales[gi])),bias=e.let(math::widen(a.biases[gi]));
-              quant::dequant_chunk(e,a.packed,quant::GroupAffine{6,64},e.let(col*d.words+chunk*3u),scale,bias,
-                [&](int q,const kir::Val<kir::f32>& weight){
-                  const auto x=a.x[rr*d.k+chunk*16u+static_cast<unsigned>(q)];
+              scalar_chunk(e.let(col*d.words+chunk*3u),scale,bias,
+                [&](const auto& q,const kir::Val<kir::f32>& weight){
+                  const auto x=a.x[rr*d.k+chunk*16u+q];
                   acc[m*2+n][j]=math::fma(x,weight,acc[m*2+n][j].read());
                 });
             }
@@ -426,10 +442,9 @@ std::string emit_staged_bf16_centered(const KernelShapes &s, const Dims &d) {
               const auto gi=e.let(col*d.groups+(chunk*16u)/d.group);
               const auto scale=e.let(math::widen(a.scales[gi]));
               const auto bias=e.let(math::widen(a.biases[gi]));
-              quant::dequant_chunk(e,a.packed,quant::GroupAffine{6,64},
-                e.let(col*d.words+chunk*3u),scale,bias,
-                [&](int q,const kir::Val<kir::f32>& weight) {
-                  value=math::fma(a.x[rr*d.k+chunk*16u+static_cast<unsigned>(q)],
+              scalar_chunk(e.let(col*d.words+chunk*3u),scale,bias,
+                [&](const auto& q,const kir::Val<kir::f32>& weight) {
+                  value=math::fma(a.x[rr*d.k+chunk*16u+q],
                                   weight,value.read());
                 });
             }
@@ -489,8 +504,8 @@ const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
 }
 
 struct CenteredAffineKernel final : KernelPrimitive<CenteredAffineKernel> {
-  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_centered_activation_residual2_v2";
-  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_centered_activation_residual2_v2";
+  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_centered_activation_residual2_v3";
+  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_centered_activation_residual2_v3";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }
