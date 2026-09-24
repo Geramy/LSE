@@ -289,11 +289,16 @@ std::string emit_staged_bf16_residual2(const KernelShapes &s, const Dims &d) {
         bf.push_back(e.local<F, 8>());
         blf.push_back(e.local<F, 8>());
         const auto ar = e.let(am + i * 16u + lo), bc = e.let(bn + i * 16u + lo);
+        // K-major fragments occupy eight contiguous BF16 elements. The
+        // bank rotation preserves the eight-element alignment at each start.
+        const auto k = e.let(slice * 16u + hi * 8u);
+        const auto ap = xs.load(e.let(address(ar, k)), 16u);
+        const auto bp = ws.load(e.let(address(bc, k)), 16u);
+        const auto blp = wl.load(e.let(address(bc, k)), 16u);
         for (auto j : e.unroll(8u)) {
-          const auto k = e.let(slice * 16u + hi * 8u + j);
-          af.back()[j] = xs[e.let(address(ar, k))];
-          bf.back()[j] = ws[e.let(address(bc, k))];
-          blf.back()[j] = wl[e.let(address(bc, k))];
+          af.back()[j] = ap[j];
+          bf.back()[j] = bp[j];
+          blf.back()[j] = blp[j];
         }
       }
       for (unsigned m = 0; m < 2; ++m)
@@ -387,8 +392,8 @@ const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
 }
 
 struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kernel> {
-  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_weight_residual2_v1";
-  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_weight_residual2_v1";
+  static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_weight_residual2_vector_lds_v3";
+  static constexpr std::string_view kEntry = "lse_q6_wmma_bf16_weight_residual2_vector_lds_v3";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }
@@ -526,15 +531,15 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
 // the candidate stays unaccepted until complete-model quality is established.
 const KernelPrimitiveBase* select_m256_residual2_candidate(
     const KernelShapes& s, const Dims& dims) {
-  struct Measured { uint32_t n, k; uint64_t corrected_ns, scalar_ns; };
-  // Eight post-warm host eval+retire intervals, driver195, unchanged packed Q6.
+  struct Measured { uint32_t n, k; uint64_t vector_ns, residual2_ns; };
+  // Matched fixed-compiler vector-LDS versus residual2 timings, driver195.
   static constexpr Measured records[] = {
-      {17408, 5120, 6566844, 9381594},
-      {5120, 17408, 6379839, 8621917}};
+      {17408, 5120, 4958328, 6668635},
+      {5120, 17408, 4441641, 6269651}};
   const Measured* record = nullptr;
   for (const auto& row : records)
     if (dims.m == 256 && row.n == dims.n && row.k == dims.k) record = &row;
-  if (!record || record->corrected_ns >= record->scalar_ns) return nullptr;
+  if (!record || record->vector_ns >= record->residual2_ns) return nullptr;
   QuantOperandKernel kernel;
   kernel.operand = QuantOperand::kBF16;
   kernel.strategy = QuantOperandStrategy::kNative;
