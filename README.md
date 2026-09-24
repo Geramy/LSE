@@ -85,7 +85,8 @@ It packages `lse`, `lse-server`, HRX, Loom and the MacAMDGPU HSA runtime, checks
 host behavior and native kernel compilation, and tests the package after moving
 it to a different directory. These hosted checks do not execute AMD GPU kernels.
 
-For **Apple Silicon macOS 15 or later**:
+For **Apple Silicon** (binaries target macOS 15 or later; the current
+MacAMDGPU driver requires macOS Tahoe 26.2 or later):
 
 ```bash
 # Pick the macos-arm64 asset from https://github.com/Geramy/LSE/releases

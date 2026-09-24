@@ -60,7 +60,8 @@ def main():
         pending.append(dst)
 
     for binary in ('lse', 'lse-server', 'compile_loom_matrix'):
-        add(work / 'lse-build' / binary, package / 'libexec' / binary)
+        add(work / 'lse-build' / ('tests/' + binary if binary == 'compile_loom_matrix' else binary),
+            package / 'libexec' / binary)
     # HRX opens HSA by basename at runtime; it is absent from otool's closure.
     add(work / 'hsa-build/libhsa-runtime64.dylib', package / 'lib/libhsa-runtime64.1.dylib')
     (package / 'lib/libhsa-runtime64.dylib').symlink_to('libhsa-runtime64.1.dylib')
@@ -100,16 +101,27 @@ def main():
         for dep in dependencies(dst):
             if not dep.startswith(('/System/', '/usr/lib/', '@rpath/')):
                 raise RuntimeError(f'Nonportable dependency in package: {dst}: {dep}')
+    # The original compiler library path is unavailable after relocation.
+    # Isolate the default JIT cache by immutable source/toolchain identity.
+    build_inputs = {
+        'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
+        'portability_patch': hashlib.sha256((root / '.github/patches/macos-portability.patch').read_bytes()).hexdigest(),
+        'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
+        'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
+        'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
+    }
+    cache_identity = hashlib.sha256(json.dumps(build_inputs, sort_keys=True).encode()).hexdigest()[:24]
     for binary in ('lse', 'lse-server'):
         wrapper = package / 'bin' / binary
         wrapper.write_text('#!/bin/sh\nset -eu\n'
             'package_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"\n'
             'export DYLD_LIBRARY_PATH="$package_root/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"\n'
+            'export LSE_CACHE_DIR="${LSE_CACHE_DIR:-$HOME/Library/Caches/lse/' + cache_identity + '}"\n'
             f'exec "$package_root/libexec/{binary}" "$@"\n')
         wrapper.chmod(0o755)
     for src, dst in ((root / 'LICENSE.md', 'LSE.md'),
                      (work / 'deps/mac-amdgpu/LICENSE', 'MacAMDGPU'),
-                     (work / 'hrx-source/LICENSE', 'HRX'),
+                     (work / 'hrx-source/LICENSE', 'HRX.txt'),
                      (llvm / 'LICENSE.TXT', 'LLVM.txt')):
         if not src.is_file():
             alternatives = [src.with_suffix('.md'), src.with_suffix('.txt')]
@@ -118,12 +130,29 @@ def main():
             raise RuntimeError(f'Missing dependency license: {src}')
         shutil.copy2(src, package / 'licenses' / dst)
     # Include the upstream notices for statically linked third-party code.
-    for depdir, prefix in ((work / 'hrx-source', 'hrx'), (work / 'source/third_party', 'lse')):
+    for depdir, prefix in ((work / 'hrx-source', 'hrx'), (work / 'hrx-build/_deps', 'hrx-deps'),
+                            (work / 'source/third_party/vendor', 'lse-vendor'),
+                            (work / 'source/reference/fastokens', 'fastokens')):
         for license_file in depdir.rglob('*'):
             if license_file.is_file() and license_file.name.upper().startswith(('LICENSE', 'NOTICE', 'COPYING')):
                 target = package / 'licenses' / prefix / license_file.relative_to(depdir)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(license_file, target)
+    crate = work / 'source/third_party/fastokens-ffi/Cargo.toml'
+    metadata = json.loads(run('cargo', 'metadata', '--locked', '--offline',
+                              '--filter-platform', 'aarch64-apple-darwin',
+                              '--format-version', '1', '--manifest-path', str(crate)))
+    rust_notices = []
+    for dep in metadata['packages']:
+        directory = Path(dep['manifest_path']).parent
+        notice = {'name': dep['name'], 'version': dep['version'], 'license': dep['license']}
+        rust_notices.append(notice)
+        for license_file in directory.iterdir():
+            if license_file.is_file() and license_file.name.upper().startswith(('LICENSE', 'NOTICE', 'COPYING')):
+                target = package / 'licenses/rust' / f"{dep['name']}-{dep['version']}" / license_file.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(license_file, target)
+    (package / 'licenses/rust-dependencies.json').write_text(json.dumps(rust_notices, indent=2) + '\n')
     shutil.copy2(root / 'README.md', package / 'README.md')
     manifest = {
         'lse_revision': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
@@ -136,11 +165,15 @@ def main():
         'gpu_target': 'gfx1201',
         'dialect': 'loom',
         'gpu_execution_tested_in_ci': False,
+        'jit_cache_identity': cache_identity,
+        'jit_cache_build_inputs': build_inputs,
         'portability_patch_sha256': hashlib.sha256((root / '.github/patches/macos-portability.patch').read_bytes()).hexdigest(),
     }
     (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (package / 'QUICKSTART.txt').write_text(
-        'Apple Silicon macOS 15 or newer; gfx1201/R9700 qualification target.\n'
+        'Binary deployment target: Apple Silicon macOS 15 or newer.\n'
+        'External AMD GPU use requires the driver-supported macOS version\n'
+        '(currently macOS Tahoe 26.2+); gfx1201/R9700 qualification target.\n'
         'Install and enable the MacAMDGPU DriverKit extension separately:\n'
         'https://github.com/lemonade-sdk/mac-amdgpu\n'
         'The extension is not bundled or installed by this archive.\n\n'
@@ -148,6 +181,9 @@ def main():
         './bin/lse --model /path/to/model --pool hrx:0 --dialect loom --prompt "Hello"\n'
         './bin/lse-server --model /path/to/model --pool hrx:0 --dialect loom\n\n'
         'Use the bin wrappers so HRX finds the bundled HSA runtime.\n'
+        'Default JIT cache: ~/Library/Caches/lse/<build identity>.\n'
+        'This prevents stale kernel reuse between relocated release packages.\n'
+        'An explicit LSE_CACHE_DIR overrides that default.\n'
         'HIPC/comgr is unavailable in this macOS package.\n'
         'CI checks host behavior, relocation, and native kernel compilation;\n'
         'CI runners do not have an external AMD GPU and do not execute GPU kernels.\n'

@@ -10,6 +10,12 @@ llvm="${AMDGPU_LLVM_BIN:-$(brew --prefix llvm@21)/bin}"
 [[ "$("$llvm/llvm-config" --version)" == 21.1.8 ]] || {
   echo 'The qualified host compiler is LLVM 21.1.8 (brew install llvm@21).' >&2; exit 1;
 }
+lld="${AMDGPU_LLD:-$(brew --prefix lld@21)/bin/ld.lld}"
+"$lld" --version | grep -q 'LLD 21.1.8' || {
+  echo 'The qualified AMDGPU linker is LLD 21.1.8 (brew install lld@21).' >&2; exit 1;
+}
+PATH="$llvm:$(dirname "$lld"):$PATH"
+export PATH
 export MACOSX_DEPLOYMENT_TARGET=15.0
 command -v cargo >/dev/null
 command -v ninja >/dev/null
@@ -55,6 +61,10 @@ git -C "$root" archive HEAD | tar -x -C "$work/source"
 mkdir -p "$work/source/reference/fastokens"
 git -C "$work/deps/fastokens" archive HEAD | tar -x -C "$work/source/reference/fastokens"
 git -C "$work/deps/hrx" archive HEAD | tar -x -C "$work/hrx-source"
+# Isolate the extracted trees from the enclosing repository. Otherwise git
+# apply treats paths as outside the current prefix and silently skips them.
+git -C "$work/source" init -q
+git -C "$work/hrx-source" init -q
 git -C "$work/source" apply --check "$root/.github/patches/macos-portability.patch"
 git -C "$work/source" apply "$root/.github/patches/macos-portability.patch"
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
@@ -73,9 +83,11 @@ cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
   -DCMAKE_C_FLAGS=-DIREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER=1 \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
+  -DIREE_CLANG_BINARY="$llvm/clang" -DIREE_LLVM_LINK_BINARY="$llvm/llvm-link" -DIREE_LLD_BINARY="$lld" \
   -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMDGPU=ON \
   -DIREE_HAL_AMDGPU_TARGETS=gfx1201 -DLOOM_BUILD=ON \
   -DLOOM_TARGET_DEFAULTS=OFF -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=gfx1201 \
+  -DLOOM_TARGET_LLVMIR=ON -DLOOM_TARGET_IREE_VM=ON -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON \
   -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
   -DFETCHCONTENT_SOURCE_DIR_HSA_RUNTIME_HEADERS="$work/deps/hsa-headers"
 cmake --build "$work/hrx-build" --target hrx loomc_shared --parallel "$jobs"
@@ -101,12 +113,20 @@ tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_backend_cpu
   test_decode_sample test_loaded_runtime test_hrx_copy_route test_gdn_pair
   test_gdn_scheduler test_scheduler_epilogue test_loom_matrix test_loom_dot
   test_fp8_conversion test_quant_operand_policy)
-cmake --build "$work/lse-build" --target lse lse-server compile_loom_matrix "${tests[@]}" --parallel "$jobs"
+cmake --build "$work/lse-build" --target lse lse-server compile_loom_matrix --parallel "$jobs"
+# The host suite must not discover a real GPU on a developer's machine.
+# Some tests enumerate the default backend, so give them a CPU-only build.
+cmake -S "$work/source" -B "$work/host-tests" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+  -DCMAKE_CXX_COMPILER="$llvm/clang++" \
+  "-DCMAKE_EXE_LINKER_FLAGS=-L$llvm/../lib/c++ -Wl,-rpath,$llvm/../lib/c++" \
+  -DLSE_ENABLE_CPU=ON -DLSE_ENABLE_HRX=OFF -DLSE_BUILD_TESTS=ON
+cmake --build "$work/host-tests" --target "${tests[@]}" --parallel "$jobs"
 regex="$(IFS='|'; echo "${tests[*]}")"
-ctest --test-dir "$work/lse-build" --output-on-failure -R "^($regex)$"
+ctest --test-dir "$work/host-tests" --output-on-failure -R "^($regex)$"
 python3 "$work/source/tests/test_server_cli.py" "$work/lse-build/lse-server"
 mkdir -p "$work/native-fixtures"
-"$work/lse-build/compile_loom_matrix" "$work/native-fixtures"
+"$work/lse-build/tests/compile_loom_matrix" "$work/native-fixtures"
 "$work/lse-build/lse" --help > "$work/lse-build/help.txt"
 python3 "$root/.github/scripts/package-macos.py" \
   --root "$root" --work "$work" --llvm "$llvm/.." --tag "${LSE_RELEASE_TAG:-snapshot}"

@@ -52,7 +52,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "name=lse-${tag}-macos-arm64" >> "$GITHUB_OUTPUT"
       - name: Install native build tools
-        run: brew install llvm@21 cmake ninja rust
+        run: brew install llvm@21 lld@21 cmake ninja rust
       - name: Build, check host behavior, and verify relocated package
         env:
           LSE_RELEASE_TAG: ${{ steps.package.outputs.tag }}
