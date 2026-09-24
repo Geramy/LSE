@@ -1,5 +1,11 @@
 # Lemon Seed Engine (LSE)
 
+> **Experimental cooperative RMS branch — not qualified for promotion.**
+> Short Qwen tests reach about 16.8 TPS, but two repeated 1K-input/1K-output
+> checks produced different greedy text. Stable `master` retains the previous
+> implementation. The HIP phase fix passed all 58 Linux tests and GPU/HTTP
+> checks; the separate Mac long-repeat failure remains under investigation.
+
 A modular C++ inference engine for hybrid LLMs -- Gated DeltaNet
 interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
 [HRX](https://github.com/ROCm/hrx-system) native runtime on AMD GPUs. Kernels
