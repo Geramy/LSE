@@ -926,18 +926,34 @@ std::string emit_q6_dot_decode(const KernelShapes& s, const QuantDims& d) {
   // partially populated final workgroup still stages with every thread.
   if (auto live = e.when(col < n)) {
     if (auto quantized = e.when(activation_bad.read() == e.f32(0.0f))) {
-      for (auto chunk : e.range(lane, e.u32(k / 16), wave)) {
-        std::array<std::array<kir::Val<kir::u32>, 4>, columns> planes;
-        std::array<kir::Val<kir::f32>, columns> scales;
-        std::array<kir::LValue<kir::f32>, columns> partial{
-            e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+      const std::uint32_t iterations = k % 1024u == 0u ? 2u : 1u;
+      for (auto first : e.range(lane, e.u32(k / 16), wave * iterations)) {
+        std::array<std::array<std::array<kir::Val<kir::u32>, 3>, columns>, 2> prefetched_words;
+        std::array<std::array<kir::Val<kir::f32>, columns>, 2> prefetched_scales;
+        // Two complete wave iterations are loaded before consuming either.
+        // K divisible by 1024 makes both chunks valid for every live lane.
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+          const auto chunk = e.let(first + iteration * wave);
+          for (std::uint32_t output = 0; output < columns; ++output) {
+            const auto row_base = e.let((col + output) * lanes);
+            prefetched_scales[iteration][output] = e.let(math::widen(a.scales[(col + output) * groups + chunk / 4u]));
+            for (std::uint32_t j = 0; j < 3; ++j)
+              prefetched_words[iteration][output][j] = e.let(a.packed[row_base + chunk * 3u + j]);
+          }
+        }
+        for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+          const auto chunk = e.let(first + iteration * wave);
+          const auto& scales = prefetched_scales[iteration];
+          const auto& words = prefetched_words[iteration];
+          std::array<std::array<kir::Val<kir::u32>, 4>, columns> planes;
+          std::array<kir::LValue<kir::f32>, columns> partial{
+              e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
         for (std::uint32_t output = 0; output < columns; ++output) {
-          const auto row_base = e.let((col + output) * lanes);
-          std::array<kir::Val<kir::u32>, 3> words;
-          for (std::uint32_t j = 0; j < 3; ++j)
-            words[j] = e.let(a.packed[row_base + chunk * 3u + j]);
-          planes[output] = quant::dot4_q6_code_planes(e, words);
-          scales[output] = e.let(math::widen(a.scales[(col + output) * groups + chunk / 4u]));
+          const auto scale = scales[output];
+          if (auto exceptional = e.when(scale != scale || math::abs(scale) >
+                           e.f32(std::numeric_limits<float>::max() / 128.0f)))
+            bad[output] = e.f32(1.0f);
+          planes[output] = quant::dot4_q6_code_planes(e, words[output]);
         }
         for (std::uint32_t half = 0; half < 2; ++half) {
           const auto ac = e.let(chunk * 2u + half);
@@ -957,11 +973,8 @@ std::string emit_q6_dot_decode(const KernelShapes& s, const QuantDims& d) {
           }
         }
         for (std::uint32_t output = 0; output < columns; ++output) {
-          const auto scale = scales[output];
-          if (auto exceptional = e.when(scale != scale || math::abs(scale) >
-                           e.f32(std::numeric_limits<float>::max() / 128.0f)))
-            bad[output] = e.f32(1.0f);
-          acc[output] = math::fma(scale, partial[output].read(), acc[output].read());
+          acc[output] = math::fma(scales[output], partial[output].read(), acc[output].read());
+        }
         }
       }
       for (auto g : e.range(lane, e.u32(groups), wave)) {
