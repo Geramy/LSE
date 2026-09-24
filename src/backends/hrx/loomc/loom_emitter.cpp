@@ -1,6 +1,7 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -453,6 +454,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       stored = true;
       std::string s;
       std::unordered_map<const Node*, std::string> value_of;
+
       value_of[anchor.get()] = std::string(value);
       const std::string idx(index);
 
@@ -607,7 +609,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
   std::unordered_set<const Node*> pointer_inputs;
   for (const NodePtr& n : group.nodes) {
-    if (dynamic_cast<const KernelPrimitiveBase*>(n->prim) == nullptr) continue;
+    if (dynamic_cast<const KernelPrimitiveBase*>(n->prim) == nullptr &&
+        n->kind != graph::OpKind::kRepeat) continue;
     for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
   }
 
@@ -624,6 +627,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
   std::string inner;
   std::unordered_map<const Node*, std::string> value_of;
+  // Shape-only copies must preserve integer bits and floating-point payloads.
+  std::unordered_map<const Node*, std::string> raw_value_of;
   for (std::size_t i = 0; i < input_count; ++i) {
     const NodePtr& n = out.binding_order[i];
     if (pointer_inputs.count(n.get()) != 0) continue;
@@ -716,6 +721,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       continue;
     }
 
+    if (n->kind == graph::OpKind::kRepeat) {
+      if (n->inputs.size() != 1 || n->iattrs[1] <= 0) {
+        return LSE_ERROR(kInvalidArgument, "repeat requires one input and a positive count");
+      }
+      const NodePtr& input = n->inputs[0];
+      const Shape& sh = input->shape;
+      const auto axis = static_cast<std::size_t>(n->iattrs[0]);
+      const auto count = static_cast<std::uint64_t>(n->iattrs[1]);
+      if (axis >= sh.rank() || sh.rank() != n->shape.rank() ||
+          input->dtype != n->dtype) {
+        return LSE_ERROR(kInvalidArgument, "repeat shape, axis, or dtype mismatch");
+      }
+      std::uint64_t inner_size = 1, total = 1;
+      for (std::size_t d = 0; d < sh.rank(); ++d) {
+        const auto dim = sh.dim(d);
+        if (dim <= 0 || total > std::numeric_limits<std::uint32_t>::max() /
+                                  static_cast<std::uint64_t>(dim)) {
+          return LSE_ERROR(kInvalidArgument, "repeat requires nonempty u32-sized shapes");
+        }
+        total *= static_cast<std::uint64_t>(dim);
+        if (d > axis) inner_size *= static_cast<std::uint64_t>(dim);
+        const std::uint64_t expected = static_cast<std::uint64_t>(dim) *
+                                       (d == axis ? count : 1);
+        if (n->shape.dim(d) <= 0 ||
+            static_cast<std::uint64_t>(n->shape.dim(d)) != expected) {
+          return LSE_ERROR(kInvalidArgument, "repeat output shape does not match count");
+        }
+      }
+      if (total > std::numeric_limits<std::uint32_t>::max() / count) {
+        return LSE_ERROR(kInvalidArgument, "repeat output exceeds u32 indexing");
+      }
+      const auto binding = binding_of.find(input.get());
+      if (binding == binding_of.end()) {
+        return LSE_ERROR(kInternal, "repeat input is not bound in this group");
+      }
+      auto constant = [&](std::uint64_t value) {
+        const std::string id = mint("repeat");
+        inner += "  " + id + " = index.constant " + std::to_string(value) + " : index\n";
+        return id;
+      };
+      auto binary = [&](std::string_view op, const std::string& a,
+                        const std::string& b) {
+        const std::string id = mint("repeat");
+        inner += "  " + id + " = index." + std::string(op) + " " + a + ", " + b + " : index\n";
+        return id;
+      };
+      const auto axis_size = static_cast<std::uint64_t>(sh.dim(axis));
+      const auto stride = constant(inner_size);
+      const auto copies = constant(count);
+      const auto input_axis = constant(axis_size);
+      const auto span = constant(axis_size * count * inner_size);
+      // A wider sibling output can launch extra lanes. Map those lanes into
+      // this input too; the existing per-output store guard discards them.
+      std::string flat = "%i";
+      if (total * count < launch_elems) {
+        flat = binary("rem", flat, constant(total * count));
+      }
+      const auto outer = binary("div", flat, span);
+      const auto within = binary("rem", flat, span);
+      const auto position = binary("div", binary("div", within, stride), copies);
+      const auto source_axis = binary("add", binary("mul", outer, input_axis), position);
+      const auto source = binary("add", binary("mul", source_axis, stride),
+                                 binary("rem", flat, stride));
+      const auto at = bounded(source, total, mint, inner);
+      const auto raw = mint("repeat_value");
+      inner += "  " + raw + " = view.load %" + names[binding->second] + "_view[" + at +
+               "] : " + loom_view_type(elem_of(n->dtype), total) + " -> " +
+               std::string(loom_storage_type(elem_of(n->dtype))) + "\n";
+      raw_value_of[n.get()] = raw;
+      value_of[n.get()] = widen_to_f32(raw, n->dtype, mint, inner);
+      continue;
+    }
+
     std::vector<std::string> args;
     args.reserve(n->inputs.size());
     for (const NodePtr& in : n->inputs) {
@@ -785,7 +863,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       inner += "  scf.if " + ok + " {\n";
       guard_close = "  }\n";
     }
-    const std::string narrowed =
+    const auto raw = raw_value_of.find(n.get());
+    const std::string narrowed = raw != raw_value_of.end() ? raw->second :
         narrow_from_f32(it->second, n->dtype, mint, inner);
     const std::string dst = bounded("%i", n->element_count(), mint, inner);
     inner += "  view.store " + narrowed + ", %" + names[i] + "_view[" + dst +
