@@ -67,8 +67,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
 
 Ops are lazy: they record into a DAG and execute only when a host-visible read
 demands a value. On demand the graph is partitioned into fusion groups, each
-group is emitted as HIP source, compiled with `amd_comgr` into an AMDGPU code
-object, cached on disk, and dispatched through the native HRX ABI
+group is emitted as HIP or Loom source, compiled with the selected toolchain into
+an AMDGPU code object, cached on disk, and dispatched through the native HRX ABI
 (`hrx_stream_dispatch`) — not through HIP. Every extension seam (backend,
 transport, quantization scheme, layer, sampler) is a CRTP base that owns the
 shared algorithms and calls into the derived type for the primitives.
@@ -124,6 +124,35 @@ prediction module, or point at one:
 ./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
 ```
 
+### Choose HIP or Loom
+
+Both the CLI and server accept **`--dialect hip`** or **`--dialect loom`**.
+The HIP code generator is named `hipc` in the source; its command-line value is
+`hip`, not `hipc`. Both paths dispatch through HRX.
+
+| Platform / path | Flags | Compiler and runtime |
+|---|---|---|
+| Linux, HIP source | `--pool hrx:0 --dialect hip` | HIP code generation and ROCm `amd_comgr`, with HRX |
+| Linux, Loom source | `--pool hrx:0 --dialect loom` | Loom compiler and HRX; requires a build that includes Loom |
+| Apple Silicon + MacAMDGPU | `--pool hrx:0 --dialect loom` | Native macOS Loom, HRX and MacAMDGPU HSA runtime |
+
+```bash
+# macOS AMDGPU inference (also valid for a Loom-enabled Linux build)
+./lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
+./lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
+
+# Linux HIP-source path
+./lse --pool hrx:0 --dialect hip -m /path/to/model --no-mtp -n 128 "Hello"
+./lse-server --pool hrx:0 --dialect hip -m /path/to/model --no-mtp --port 8080
+```
+
+The macOS package supports Loom; it does not include a macOS HIP compiler.
+`--dialect` is a preference among the device's available toolchains. If a device
+does not declare the requested dialect, LSE reports that fact and uses its own
+choice. Check the startup `generates hip` / `generates loom` line to confirm the
+selected path. `--pool hrx:0` selects the first HRX device; omit it for automatic
+device selection. Check `--devices` before loading a model.
+
 ### `lse` options
 
 | Option | Default | |
@@ -174,6 +203,8 @@ works by changing the base URL.
 | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
 | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
 | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
+| `--pool LIST` | `$LSE_POOL` | Device selection, for example `hrx:0` |
+| `--dialect NAME` | the device's choice | Kernel source dialect: `hip` or `loom` (not `hipc`) |
 
 Binding beyond localhost gives anyone who can reach the machine use of the
 GPU, so pair `--host 0.0.0.0` with `--api-key`:

@@ -255,6 +255,7 @@ target_sources(test_loom_matrix PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)
 if(LSE_ENABLE_HRX)
   add_executable(compile_loom_matrix compile_loom_matrix.cpp)
+  lse_apply_common_flags(compile_loom_matrix)
   target_link_libraries(compile_loom_matrix PRIVATE lse_backend_hrx lse_graph lse_kernels)
 endif()
 
