@@ -16,7 +16,7 @@ template <class Buffer, std::size_t Capacity = 16>
 class ProbeRetirement {
   struct Slot {
     bool used = false;
-    std::array<Buffer, 2> buffers{};
+    std::array<Buffer, 3> buffers{};
     std::size_t count = 0;
   };
   struct Registry {

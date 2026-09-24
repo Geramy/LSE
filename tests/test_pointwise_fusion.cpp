@@ -85,7 +85,7 @@ LSE_TEST(escaping_roots_and_fanout_stay_materialized) {
   LSE_EXPECT(!join(g, b));
   LSE_EXPECT(g.outputs[0] == a.node());
 }
-LSE_TEST(reductions_and_indexed_kernels_cannot_join) {
+LSE_TEST(kernel_consumers_cannot_join_but_supported_epilogues_can) {
   auto x = leaf();
   auto a = sigmoid(x);
   auto r = sum(a, -1, true);
@@ -94,7 +94,8 @@ LSE_TEST(reductions_and_indexed_kernels_cannot_join) {
   auto n = rms_norm(x, leaf(Shape{128}), 1e-6f, false);
   auto out = n * x;
   auto norm = solo(n);
-  LSE_EXPECT(!join(norm, out));
+  LSE_EXPECT(join(norm, out));
+  LSE_EXPECT(norm.anchor == n.node()->kind);
 }
 LSE_TEST(views_and_shape_changes_cannot_join) {
   auto x = leaf();
@@ -138,5 +139,43 @@ LSE_TEST(missing_dialect_spelling_refuses_before_dispatch) {
   auto g = solo(a);
   DialectSourceTable empty(std::span<const PrimitiveSource>{});
   LSE_EXPECT(!join_pointwise_chain(g, b.node(), {}, empty));
+}
+LSE_TEST(kernel_roots_fanout_shape_and_narrowing_stay_materialized) {
+  auto x=leaf(Shape{1,256});auto cut=slice(x,-1,3,131);auto out=silu(cut);
+  const NodePtr roots[]{cut.node(),out.node()};auto g=solo(cut);
+  LSE_EXPECT(!join(g,out,roots));
+  auto extra=neg(cut);(void)extra;LSE_EXPECT(!join(g,out));
+  auto small=slice(x,-1,3,4);auto broad=small*leaf(Shape{1,128});auto sg=solo(small);
+  LSE_EXPECT(!join(sg,broad));
+  auto half=slice(leaf(Shape{1,256},DType::kBF16),-1,3,131);auto hn=silu(half);auto hg=solo(half);
+  LSE_EXPECT(!join(hg,hn));
+}
+LSE_TEST(epilogue_retains_anchor_shape_input_aliases_and_indexing) {
+  for(int rows:{1,64}) {
+    auto x=leaf(Shape{rows,256});auto cut=slice(x,-1,3,131);auto activated=silu(cut);auto out=activated*activated;
+    auto g=solo(cut);LSE_EXPECT(join(g,activated));LSE_EXPECT(join(g,out));
+    LSE_EXPECT(g.nodes.size()==3);LSE_EXPECT(g.inputs.size()==1);LSE_EXPECT(g.inputs.front()==x.node());
+    LSE_EXPECT(g.outputs.size()==1&&g.outputs.front()==out.node());
+    LSE_EXPECT(g.anchor==cut.node()->kind);
+  }
+}
+LSE_TEST(kernel_epilogue_body_matches_existing_generic_partitioner) {
+  backend::DeviceInfo device;device.arch="gfx1201";device.compute_units=64;device.max_threads_per_workgroup=1024;device.wavefront_size=32;device.lds_bytes_per_workgroup=65536;
+  backend::AmdDeviceInfo amd;backend::apply_arch_defaults(device,amd);device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;
+  for(int kind:{0,1,2})for(int rows:{1,64}) {
+    Array producer;
+    if(kind==0)producer=slice(leaf(Shape{rows,256}),-1,3,131);
+    if(kind==1)producer=l2_normalize(leaf(Shape{rows,128}),1e-6f);
+    if(kind==2)producer=quant_linear(leaf(Shape{rows,64}),leaf(Shape{17,12},DType::kU32),leaf(Shape{17,1},DType::kBF16),leaf(Shape{17,1},DType::kBF16),6,64);
+    auto out=silu(producer);const NodePtr roots[]{out.node()};
+    auto generic=Partitioner::partition(roots);LSE_EXPECT_EQ(generic.size(),1u);if(generic.size()!=1)continue;
+    auto local=solo(producer);LSE_EXPECT(join(local,out,roots));
+    backend::LoomEmitter emitter;auto before=emitter.emit(generic.front(),device);auto after=emitter.emit(local,device);
+    LSE_EXPECT(before.ok());LSE_EXPECT(after.ok());if(!before.ok()||!after.ok())continue;
+    LSE_EXPECT(before->binding_order==after->binding_order);
+    const auto a=before->source.find("} launch("),b=after->source.find("} launch(");
+    LSE_EXPECT(a!=std::string::npos&&b!=std::string::npos);
+    if(a!=std::string::npos&&b!=std::string::npos)LSE_EXPECT(before->source.substr(a)==after->source.substr(b));
+  }
 }
 int main() { return lse::test::run_all(); }

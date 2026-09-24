@@ -1,3 +1,4 @@
+#include "lse/graph/gdn_pair.hpp"
 #include "lse/graph/graph.hpp"
 
 #include <algorithm>
@@ -845,17 +846,6 @@ void alias_ready_reshapes(const FusionGroup& group) {
   }
 }
 
-bool is_gdn_node(const Node& n) noexcept {
-  return n.kind == OpKind::kGDNChunkScan;
-}
-
-bool same_gdn_inputs(const Node& a, const Node& b) noexcept {
-  if (a.inputs.size() != 6 || b.inputs.size() != 6) return false;
-  for (std::size_t i = 0; i < 6; ++i) {
-    if (a.inputs[i].get() != b.inputs[i].get()) return false;
-  }
-  return true;
-}
 
 Status accumulate_spans(Scheduler::Trace::Spans& acc,
                         const Scheduler::Trace::Spans& step) {
@@ -1162,18 +1152,13 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         return 0;
       };
       auto join_gdn_pair = [&](const NodePtr& n) -> bool {
-        if (phase_groups.empty() || !is_gdn_node(*n)) return false;
+        if (phase_groups.empty()) return false;
         FusionGroup& prev = phase_groups.back();
         if (prev.is_phase || prev.nodes.size() != 1) return false;
-        if (!is_gdn_node(*prev.nodes[0])) return false;
-        if (!same_gdn_inputs(*prev.nodes[0], *n)) return false;
-        if (prev.nodes[0]->iattrs[0] == n->iattrs[0]) return false;
+        const auto pair = exact_gdn_pair(prev.nodes.front(), n);
+        if (!pair) return false;
         prev.nodes.push_back(n);
-        prev.outputs.clear();
-        for (const NodePtr& m : prev.nodes) {
-          if (m->iattrs[0] == 0) prev.outputs.push_back(m);
-        }
-        if (prev.outputs.empty()) prev.outputs.push_back(prev.nodes[0]);
+        prev.outputs = {pair.output, pair.state};
         return true;
       };
       auto join_wide_linear = [&](const NodePtr& n) -> bool {
@@ -1384,6 +1369,34 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         trace_.slots_allocated += wg.slot_count();
       }
     }
+  }
+
+  // Exact GDN siblings can be separated by consumers of the primary output.
+  // Both read the same six nodes, so the later pure recurrence can run at the
+  // earlier position. Preserve both original output identities and bindings.
+  if (!replayed && emitter != nullptr && emitter->staging() == nullptr) {
+    std::unordered_map<const Node*, std::vector<std::size_t>> candidates;
+    for (std::size_t i = 0; i < phase_groups.size(); ++i) {
+      auto& group = phase_groups[i];
+      if (group.is_phase || group.nodes.size() != 1) continue;
+      const auto n = group.nodes.front();
+      if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6) continue;
+      auto& earlier = candidates[n->inputs.front().get()];
+      bool merged = false;
+      for (auto j : earlier) {
+        auto& previous = phase_groups[j];
+        if (previous.nodes.size() != 1) continue;
+        const auto pair = exact_gdn_pair(previous.nodes.front(), n);
+        if (!pair) continue;
+        previous.nodes.push_back(n);
+        previous.outputs = {pair.output, pair.state};
+        group.nodes.clear();
+        merged = true;
+        break;
+      }
+      if (!merged) earlier.push_back(i);
+    }
+    std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
   }
 
   std::vector<FusionGroup> ran;

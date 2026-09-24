@@ -1,4 +1,5 @@
 #include "lse/backends/hrx/probe_emit.hpp"
+#include "lse/backends/hrx/probe_matrix.hpp"
 
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/graph.hpp"
@@ -67,6 +68,34 @@ struct TouchProbe final : KernelPrimitive<TouchProbe> {
   }
 };
 
+struct MatrixRateProbe final : KernelPrimitive<MatrixRateProbe> {
+  static constexpr std::string_view kName = "probe.matrix_rate";
+  static constexpr std::string_view kEntry = "lse_probe_matrix_rate";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 2; }
+  bool owns_indexing() const noexcept override { return true; }
+  Result<Shape> infer_shape(std::span<const Shape>) const override {
+    return Shape{probe_matrix::kRateM, probe_matrix::kRateN};
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!s.intrinsics || s.iattrs.size() < 2 || !s.device) return {};
+    const auto rows = math::matrix_core_table();
+    const auto index = static_cast<std::size_t>(s.iattrs[0]);
+    if (index >= rows.size()) return {};
+    return probe_matrix::rate_body(*s.device, rows[index],
+        static_cast<DType>(s.iattrs[1]), s.types, *s.intrinsics, &s);
+  }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan p;
+    const auto dims = probe_matrix::rate_dims(*s.device,
+        math::matrix_core_table()[static_cast<std::size_t>(s.iattrs[0])]);
+    p.workgroup_size[0] = dims.workgroup_size[0];
+    p.workgroup_count[0] = dims.workgroup_count[0];
+    return p;
+  }
+};
+
 NodePtr node(Shape shape, const Primitive* primitive = nullptr) {
   auto n = std::make_shared<Node>();
   n->set_kind(primitive ? OpKind::kCustom : OpKind::kBuffer);
@@ -111,5 +140,39 @@ Result<graph::EmittedKernel> emit_loom_touch_probe(const DeviceInfo& device) {
   }
   static const TouchProbe primitive;
   return emit(node(Shape{1}, &primitive), device);
+}
+Result<graph::EmittedKernel> emit_loom_matrix_rate_probe(
+    const DeviceInfo& device, const math::MatrixCoreRow& requested, DType storage) {
+  using namespace probe_matrix;
+  const auto target = kernels::matrix_target(device);
+  const auto table = math::matrix_core_table();
+  std::size_t index = table.size();
+  for (std::size_t i = 0; i < table.size(); ++i) {
+    if (table[i].key == requested.key && table[i].acc == requested.acc &&
+        table[i].operand == requested.operand) { index = i; break; }
+  }
+  if (index == table.size() || !target || table[index].target != *target ||
+      !table[index].emittable() || table[index].m != kTileM ||
+      table[index].n != kTileN || table[index].k_step != kTileK ||
+      table[index].wave != device.wavefront_size ||
+      device.max_threads_per_workgroup < 64 ||
+      !math::has_cap(kernels::device_matrix_caps(device), table[index].cap) ||
+      loom_sources().find(table[index].key).empty()) {
+    return LSE_ERROR(kUnimplemented, "no supported Loom matrix probe row");
+  }
+  const auto& row = table[index];
+  const auto elements = static_cast<std::int64_t>(kRateK / row.pack);
+  static const MatrixRateProbe primitive;
+  auto out = node(Shape{kRateM, kRateN}, &primitive);
+  bool bound = kernels::with_matrix_operand<bool>(storage,
+      [&]<class X, class W, math::MatrixElem A, math::MatrixElem T>() {
+        if (A != row.acc || T != row.operand) return false;
+        auto x = node(Shape{kRateM, elements}); x->dtype = env::elem_dtype<X>::value;
+        auto w = node(Shape{kRateN, elements}); w->dtype = env::elem_dtype<W>::value;
+        out->inputs = {x,w}; return true;
+      });
+  if (!bound) return LSE_ERROR(kUnimplemented, "matrix probe has no matching storage arm");
+  out->iattrs = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(storage)};
+  return emit(out, device);
 }
 }  // namespace lse::backend::hrx_kernels

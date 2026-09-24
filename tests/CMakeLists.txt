@@ -181,6 +181,11 @@ lse_add_test(test_probe_measurement)
 lse_add_test(test_token_ids)
 if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
   lse_add_test(test_loom_probe lse_backend_hrx)
+  if(TARGET lse_backend_cpu)
+    lse_add_test(test_matrix_probe_lifecycle lse_backend_hrx lse_backend_cpu lse_probe)
+    target_sources(test_matrix_probe_lifecycle PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/kernels/probe.cpp)
+  endif()
 endif()
 if(TARGET lse_backend_cpu)
   lse_add_test(test_probe_policy lse_probe lse_backend_cpu)
@@ -204,3 +209,71 @@ target_sources(test_attention_decode PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+
+if(APPLE)
+  add_library(lse_runtime_fixture SHARED loaded_runtime_fixture.cpp)
+  set_target_properties(lse_runtime_fixture PROPERTIES VERSION 1.2 SOVERSION 1)
+  add_executable(test_loaded_runtime test_loaded_runtime.cpp)
+  target_link_libraries(test_loaded_runtime PRIVATE lse_core)
+  target_include_directories(test_loaded_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  lse_apply_common_flags(test_loaded_runtime)
+  add_dependencies(test_loaded_runtime lse_runtime_fixture)
+  add_test(NAME test_loaded_runtime COMMAND ${CMAKE_COMMAND} -E env
+    "DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:lse_runtime_fixture>"
+    $<TARGET_FILE:test_loaded_runtime> $<TARGET_FILE:lse_runtime_fixture>)
+endif()
+
+lse_add_test(test_hrx_copy_route)
+
+# Exact paired recurrence scheduling and logical binding contracts, no GPU.
+lse_add_test(test_gdn_pair lse_graph lse_kernels lse_backends lse_ir)
+if(NOT TARGET lse_backend_hrx)
+  target_sources(test_gdn_pair PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
+
+if(TARGET lse_backend_cpu)
+  lse_add_test(test_scheduler_epilogue lse_graph lse_kernels lse_ir lse_backend_cpu)
+  target_sources(test_scheduler_epilogue PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
+
+lse_add_test(test_loom_matrix lse_ir lse_kernels lse_graph)
+target_sources(test_loom_matrix PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)
+if(LSE_ENABLE_HRX)
+  add_executable(compile_loom_matrix compile_loom_matrix.cpp)
+  target_link_libraries(compile_loom_matrix PRIVATE lse_backend_hrx lse_graph lse_kernels)
+endif()
+
+# Mixed-sign dot and activation rounding remain independently typed and gated.
+lse_add_test(test_loom_dot lse_graph lse_kernels lse_ir)
+target_sources(test_loom_dot PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
+  lse_add_test(test_loom_dot_native lse_backend_hrx lse_graph lse_kernels lse_ir)
+endif()
+
+if(TARGET lse_backend_cpu)
+  lse_add_test(test_gdn_scheduler lse_graph lse_kernels lse_ir lse_backend_cpu)
+  target_sources(test_gdn_scheduler PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()

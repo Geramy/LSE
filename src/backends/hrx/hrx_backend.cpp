@@ -1,4 +1,6 @@
 #include "lse/backends/hrx/hrx_backend.hpp"
+#include "lse/backends/hrx/loaded_library.hpp"
+#include "lse/backends/hrx/copy_route.hpp"
 
 #include <dlfcn.h>
 
@@ -156,9 +158,14 @@ class HsaRuntime {
   // preload_gpu_runtime already loaded rather than a second runtime. The hot
   // path keeps load_if_missing=false, so it behaves exactly as before.
   explicit HsaRuntime(bool load_if_missing = false) noexcept {
-    lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
+#if defined(__APPLE__)
+    constexpr const char* soname = "libhsa-runtime64.dylib";
+#else
+    constexpr const char* soname = "libhsa-runtime64.so.1";
+#endif
+    lib_ = detail::open_loaded_library(soname, "hsa_init");
     if (lib_ == nullptr && load_if_missing) {
-      lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY);
+      lib_ = dlopen(soname, RTLD_LAZY);
     }
     if (lib_ == nullptr) return;
     init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
@@ -272,6 +279,9 @@ class HsaRuntime {
   [[nodiscard]] bool dma_copy(void* dst, HsaAgent dst_agent, const void* src,
                               HsaAgent src_agent, std::size_t bytes) const noexcept {
     if (!can_dma()) return false;
+    // One reusable signal belongs to one transfer at a time, including reset
+    // and completion observation. Different backend instances share this helper.
+    const std::lock_guard lock(dma_mutex_);
     if (!shared_signal_ready_) {
       if (signal_create_(1, 0, nullptr, &shared_signal_) != kHsaSuccess) {
         return false;
@@ -289,10 +299,11 @@ class HsaRuntime {
       // an interrupt round trip is the same order as the transfer.
       constexpr int kConditionLt = 2;
       constexpr int kWaitActive = 1;
-      (void)signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
-                         kWaitActive);
+      // Negative completion is an asynchronous transfer failure, not success.
+      return signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
+                          kWaitActive) == 0;
     }
-    return issued;
+    return false;
   }
 
   // Pins a host range so the copy engine can reach it, returning the address
@@ -429,6 +440,7 @@ class HsaRuntime {
   // One completion signal, reused. Creating one is a driver object and costs
   // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
   // per copy, so a model load pays it per tensor.
+  mutable std::mutex dma_mutex_;
   mutable HsaSignal shared_signal_{};
   mutable bool shared_signal_ready_ = false;
   SignalWaitFn signal_wait_ = nullptr;
@@ -1822,6 +1834,26 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   if (!hrx_owns_residency(src.residency) ||
       !hrx_owns_residency(dst.residency)) {
     return LSE_ERROR(kUnimplemented, "copy_peer needs two hrx-owned buffers");
+  }
+  if (detail::own_single_device_copy(device_index(), physical_count_,
+                                     streams_.size(), src, dst)) {
+    // HRX allocations may be opaque GPU buffers: get_device_ptr currently
+    // attempts a CPU mapping and cannot supply a native VA for those buffers.
+    // Its standard copy API owns the address resolution and GPU submission.
+    // Drain every producer/consumer stream before overwriting the destination;
+    // retirement below makes source release safe when this blocking call returns.
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    LSE_ASSIGN_OR(void* stream, stream_at(0));
+    LSE_SYNC_TRACE("copy_d2d HRX-owned buffers %zu bytes", bytes);
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(stream),
+                               reinterpret_cast<hrx_buffer_t>(src.handle),
+                               src.offset + src_offset,
+                               reinterpret_cast<hrx_buffer_t>(dst.handle),
+                               dst.offset + dst_offset, bytes),
+        "hrx_stream_copy_buffer (d2d)"));
+    unflushed_launches_[0] = 0;
+    return synchronize_stream_impl(Stream{0});
   }
   const HsaRuntime& hsa = shared_hsa();
   if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");

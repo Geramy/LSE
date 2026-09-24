@@ -1,5 +1,6 @@
 #include "harness.hpp"
 #include "lse/backends/hrx/probe_measurement.hpp"
+#include "lse/backends/hrx/probe_matrix_measurement.hpp"
 #include <limits>
 #include <memory>
 #include "lse/backends/hrx/probe_retirement.hpp"
@@ -91,5 +92,42 @@ LSE_TEST(probe_unwinding_without_drain_preserves_buffer_owner) {
   LSE_EXPECT(!owner.expired());
   ProbeRetirement<Buffer, 2> next;
   LSE_EXPECT(!next.available());
+}
+LSE_TEST(matrix_probe_seeds_exact_typed_ones) {
+  for(auto storage:{lse::DType::kF16,lse::DType::kBF16,lse::DType::kI32})for(bool x:{false,true}) {
+    auto bytes=matrix_probe_ones(storage,x,64);LSE_EXPECT(bytes.ok());if(!bytes.ok())continue;
+    const unsigned width=storage==lse::DType::kI32||x?4:2;
+    const std::uint32_t expected=storage==lse::DType::kI32?0x01010101u:x?0x3f800000u:storage==lse::DType::kF16?0x3c00u:0x3f80u;
+    for(std::size_t i=0;i<bytes->size();i+=width){std::uint32_t bits=0;std::memcpy(&bits,bytes->data()+i,width);LSE_EXPECT_EQ(bits,expected);}
+  }
+  LSE_EXPECT(!matrix_probe_ones(lse::DType::kU8,false,64).ok());
+  LSE_EXPECT(!matrix_probe_ones(lse::DType::kF16,false,3).ok());
+}
+LSE_TEST(matrix_probe_checks_prefix_payload_and_suffix_exactly) {
+  constexpr std::size_t guard=16,payload=256*256;
+  std::vector<float> values(payload+2*guard,-1234.0f);std::fill_n(values.begin()+guard,payload,1024.0f);
+  LSE_EXPECT_OK(check_matrix_probe_output(values,guard,payload,1024));
+  for(std::size_t i:{std::size_t{0},guard-1,guard,guard+12345,guard+payload-1,guard+payload,values.size()-1}) {
+    const auto old=values[i];values[i]=std::numeric_limits<float>::quiet_NaN();
+    LSE_EXPECT(!check_matrix_probe_output(values,guard,payload,1024).ok());values[i]=old;
+  }
+  LSE_EXPECT(!check_matrix_probe_output(values,0,payload,1024).ok());
+}
+LSE_TEST(matrix_probe_three_buffer_retirement_retains_all_on_failure) {
+  using Buffer=OwnedProbeBuffer<4>;
+  ProbeRetirement<Buffer,2> pending;std::array<std::weak_ptr<int>,3> owners;
+  for(unsigned i=0;i<3;++i){Buffer b{std::make_shared<int>(int(i))};owners[i]=b.storage;LSE_EXPECT(pending.track(b));}
+  Buffer extra{std::make_shared<int>(9)};LSE_EXPECT(!pending.track(extra));
+  unsigned releases=0;LSE_EXPECT(!pending.finish([]{return false;},[&](Buffer&){++releases;}));
+  LSE_EXPECT_EQ(releases,0u);for(auto&owner:owners)LSE_EXPECT(!owner.expired());
+  ProbeRetirement<Buffer,2> later;LSE_EXPECT(!later.available());
+}
+LSE_TEST(matrix_probe_three_buffers_release_only_after_drain) {
+  using Buffer=OwnedProbeBuffer<5>;
+  ProbeRetirement<Buffer,2> pending;std::array<std::weak_ptr<int>,3> owners;
+  for(unsigned i=0;i<3;++i){Buffer b{std::make_shared<int>(int(i))};owners[i]=b.storage;LSE_EXPECT(pending.track(b));}
+  bool drained=false;unsigned releases=0;
+  LSE_EXPECT(pending.finish([&]{drained=true;return true;},[&](Buffer&b){LSE_EXPECT(drained);b={};++releases;}));
+  LSE_EXPECT_EQ(releases,3u);for(auto&owner:owners)LSE_EXPECT(owner.expired());
 }
 LSE_TEST_MAIN()

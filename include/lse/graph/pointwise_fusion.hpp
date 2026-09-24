@@ -9,9 +9,11 @@
 
 namespace lse::graph {
 
-// Preserve ordinary per-element fusion when an emitter has no staged-phase
-// form. This never fuses a reduction, an indexed kernel, a view or a state
-// write. Call only for adjacent nodes within the same already ordered phase.
+// Preserve the common partitioner's pointwise and kernel-epilogue contracts
+// when an emitter has no staged-phase form. A supported kernel may be the
+// first producer, but never an appended consumer: its existing output hook
+// evaluates the equal-shape FP32 epilogue at the same logical element index.
+// Call only for adjacent nodes within the same already ordered phase.
 inline bool join_pointwise_chain(FusionGroup &previous, const NodePtr &next,
                                  std::span<const NodePtr> roots,
                                  const DialectSourceTable &sources) {
@@ -37,16 +39,24 @@ inline bool join_pointwise_chain(FusionGroup &previous, const NodePtr &next,
   // or change the indexing of an aliased/broadcast value.
   if (!Partitioner::can_fuse(*producer, *next))
     return false;
-  for (const NodePtr &n : previous.nodes) {
-    if (!ordinary(n) || n->shape != next->shape || n->member != next->member) {
-      return false;
-    }
+  bool kernel_anchor = false;
+  for (std::size_t i = 0; i < previous.nodes.size(); ++i) {
+    const NodePtr &n = previous.nodes[i];
+    if (!n || n->materialized || n->dtype != DType::kF32 ||
+        n->shape != next->shape || n->member != next->member) return false;
+    if (ordinary(n)) continue;
+    const auto *kernel = dynamic_cast<const KernelPrimitiveBase *>(n->prim);
+    if (i != 0 || kernel == nullptr || !kernel->supports_epilogue() ||
+        kernel->inplace_input() >= 0) return false;
+    kernel_anchor = true;
   }
 
   previous.nodes.push_back(next);
   previous.outputs.assign(1, next);
-  previous.anchor = next->kind;
-  previous.anchor_class = next->fclass;
+  if (!kernel_anchor) {
+    previous.anchor = next->kind;
+    previous.anchor_class = next->fclass;
+  }
   // Retain only outside bindings. Repeated operands share a binding, while
   // every internal producer remains an SSA value in the generated body.
   previous.inputs.clear();

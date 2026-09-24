@@ -12,6 +12,7 @@
 #include "lse/backends/hrx/loomc/loom_sources.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/ir/lower.hpp"
+#include "lse/math.hpp"
 
 namespace lse::backend {
 
@@ -121,7 +122,11 @@ class Printer {
       const Operation& o = b_.op(id);
       if (o.result == kNoValue) return;
       if (o.type.elem != Scalar::kU32) return;
-      if (o.kind == OpKind::kLoadVec || o.kind == OpKind::kSubscript) {
+      if (o.kind == OpKind::kCast && !o.operands.empty() &&
+          b_.value(o.operands[0]).type.elem == Scalar::kI32) {
+        // Signed activation bytes cast to u32 keep their 32-bit pattern.
+        word_[o.result] = 1;
+      } else if (o.kind == OpKind::kLoadVec || o.kind == OpKind::kSubscript) {
         word_[o.result] = 1;
       } else if (o.kind == OpKind::kCall &&
                  loom_result_type(o.key) == "i32") {
@@ -169,10 +174,21 @@ class Printer {
       const Operation& o = b_.op(id);
       if (o.erased) continue;
       if (o.kind == OpKind::kAssign && !o.operands.empty()) {
-        const ValueId t = resolve(o.operands[0]);
+        ValueId t = resolve(o.operands[0]);
+        if (t < b_.value_count()) {
+          const auto& target = b_.value(t);
+          if (target.def != kNoOp) {
+            const auto& sub = b_.op(target.def);
+            if (sub.kind == OpKind::kSubscript && !sub.operands.empty())
+              t = resolve(sub.operands[0]);
+          }
+        }
         if (t < b_.value_count()) {
           const ValueDef& d = b_.value(t);
-          if (d.def != kNoOp && b_.op(d.def).kind == OpKind::kMutable) {
+          if (d.def != kNoOp && (b_.op(d.def).kind == OpKind::kMutable ||
+              (b_.op(d.def).kind == OpKind::kAlloc &&
+               b_.op(d.def).type.space == Space::kPrivate &&
+               !b_.op(d.def).has(kFlagArray)))) {
             here.insert(t);
           }
         }
@@ -546,7 +562,7 @@ class Printer {
         if (a_index) { lhs = cast; a = &converted; }
         else { rhs = cast; b = &converted; }
       } else {
-        return unsupported("'" + o.key + "' mixes " + a->type + " and " + b->type);
+        return unsupported("'" + o.key + "' mixes " + a->type + " " + lhs + " and " + b->type + " " + rhs + " result " + name(o.result));
       }
     }
     const std::string res = name(o.result);
@@ -682,6 +698,15 @@ class Printer {
       define(o.result, dst_type, o.cast_to, dst_cls);
       return Status{};
     };
+    if (src->type == "i32" && dst_type == "i32" &&
+        (src->elem == Scalar::kI32 || src->elem == Scalar::kU32) &&
+        (o.cast_to == Scalar::kI32 || o.cast_to == Scalar::kU32)) {
+      // Loom integers are signless. C's same-width signedness conversion
+      // changes the interpretation of later operations, not these bits.
+      auto st = done();
+      cur_[o.result] = in;
+      return st;
+    }
     if (src->type == dst_type) {
       // A conversion between one Loom type and itself. C spells it and Loom
       // has no op for it, so there is nothing to name the result with; the
@@ -780,7 +805,22 @@ class Printer {
       if (operand(v) == nullptr) {
         return unsupported("operand of '" + o.key + "' was never defined");
       }
-      args.push_back(name(v));
+      auto arg = name(v);
+      if ((o.key == "min.u32" || o.key == "max.u32") &&
+          operand(v)->cls == Cls::kIndex) {
+        arg = fresh("word");
+        line(depth, arg + " = index.cast " + name(v) + " : index to i32");
+      }
+      args.push_back(arg);
+    }
+    if (const auto* row = loom_matrix_row(o.key)) {
+      if (o.operands.size() != 3 ||
+          operand(o.operands[0])->type != loom_vector_type(row->a_elem, static_cast<std::uint32_t>(row->a_len)) ||
+          operand(o.operands[1])->type != loom_vector_type(row->b_elem, static_cast<std::uint32_t>(row->b_len)) ||
+          operand(o.operands[2])->type != loom_vector_type(row->c_elem, static_cast<std::uint32_t>(row->c_len)) ||
+          o.type.elem != row->c_elem || o.type.lanes != static_cast<std::uint32_t>(row->c_len)) {
+        return unsupported("matrix fragment types do not match the shared contract for '" + o.key + "'");
+      }
     }
     const std::string prefix =
         "%" + o_.name_prefix + "c" + std::to_string(seq_++) + "_t";
@@ -798,9 +838,11 @@ class Printer {
     if (o.result != kNoValue) {
       if (rt.empty()) return unsupported("row '" + o.key + "' has no result");
       define(o.result, std::string(rt), o.type.elem,
-             rt == "index" ? Cls::kIndex
+             rt.starts_with("vector<") ? Cls::kOther
+             : rt == "index" ? Cls::kIndex
              : rt == "f32" ? Cls::kFloat
-                           : Cls::kUnsignedInt);
+             : o.type.elem == Scalar::kI32 ? Cls::kSignedInt
+                                           : Cls::kUnsignedInt);
     }
     return Status{};
   }
@@ -874,6 +916,12 @@ class Printer {
     if (o.result < store_target_.size() && store_target_[o.result] != 0) {
       // The address half of `buf[i] = v`. kAssign prints the store; nothing is
       // loaded here.
+      const auto* base = operand(o.operands[0]);
+      if (base && base->type.starts_with("vector<") &&
+          cur_.count(resolve(o.operands[0]))) {
+        pending_vector_store_.insert(o.result);
+        return Status{};
+      }
       auto acc = access_of(o.operands[0]);
       if (!acc.ok()) return acc.status();
       pending_store_[o.result] = *acc;
@@ -895,7 +943,7 @@ class Printer {
       // lowering sees it. A lane from any other loop would survive to codegen
       // as a dynamic lane select, which this target has no plan for, so it
       // declines instead of emitting something that fails downstream.
-      if (!literal && !unrolled_iv_.count(lane)) {
+      if (!literal && !static_vector_lane(lane)) {
         return unsupported("a register-vector lane that is not a literal");
       }
       const std::string elem(loom_storage_type(base->elem));
@@ -921,6 +969,16 @@ class Printer {
   }
 
   Status emit_alloc(const Operation& o, int depth) {
+    if (!o.has(kFlagArray) && o.type.space == Space::kPrivate &&
+        o.type.lanes > 1 && o.type.lanes <= 64) {
+      const std::string vt = loom_vector_type(o.type.elem, o.type.lanes);
+      const std::string n = name(o.result);
+      line(depth, n + " = vector.constant " +
+          (is_float(o.type.elem) ? "0.0" : "0") + " : " + vt);
+      define(o.result, vt, o.type.elem, Cls::kOther);
+      cur_[o.result] = n;
+      return Status{};
+    }
     if (!o.has(kFlagArray) || o.type.space != Space::kWorkgroup) {
       return unsupported(
           "a private allocation; Loom keeps register state in SSA and this "
@@ -947,9 +1005,48 @@ class Printer {
     return Status{};
   }
 
+  bool static_vector_lane(ValueId value) const {
+    const auto v = resolve(value);
+    if (unrolled_iv_.count(v)) return true;
+    if (v >= b_.value_count() || b_.value(v).def == kNoOp) return false;
+    const auto& op = b_.op(b_.value(v).def);
+    if (op.has(kFlagIntConst)) return true;
+    if (op.kind != OpKind::kBinary ||
+        (op.key != "+" && op.key != "*" && op.key != "/" && op.key != "%")) return false;
+    for (const auto arg : op.operands) if (!static_vector_lane(arg)) return false;
+    return !op.operands.empty();
+  }
+
   Status emit_assign(const Operation& o, int depth) {
     if (o.operands.size() != 2) return unsupported("assign with 2 operands");
     const ValueId target = resolve(o.operands[0]);
+    if (pending_vector_store_.count(target)) {
+      const auto& sub = b_.op(b_.value(target).def);
+      const auto base = resolve(sub.operands[0]);
+      const auto* vector = operand(base);
+      const auto* value = operand(o.operands[1]);
+      std::string input = name(o.operands[1]);
+      Typed converted;
+      if (vector && value && vector->elem == Scalar::kU32 && value->cls == Cls::kIndex) {
+        input = fresh("word");
+        line(depth, input + " = index.cast " + name(o.operands[1]) + " : index to i32");
+        converted = Typed{"i32", Scalar::kU32, Cls::kUnsignedInt, true};
+        value = &converted;
+      }
+      if (!vector || !value || value->type != loom_storage_type(vector->elem) ||
+          !static_vector_lane(sub.operands[1]))
+        return unsupported("a private-vector store with nonstatic lane or wrong element type: vector=" + (vector ? vector->type : "missing") + " value=" + (value ? value->type : "missing") + " lane=" + name(sub.operands[1]));
+      std::int64_t lane = 0;
+      const bool literal = int_const(sub.operands[1], &lane);
+      if (literal && (lane < 0 || static_cast<std::uint64_t>(lane) >= b_.value(base).type.lanes))
+        return unsupported("an out-of-range private-vector lane");
+      const std::string at = literal ? std::to_string(lane) : name(sub.operands[1]);
+      const std::string next = fresh("insert");
+      line(depth, next + " = vector.insert " + input + " into " +
+          name(base) + "[" + at + "] : " + value->type + ", " + vector->type);
+      cur_[base] = next;
+      return Status{};
+    }
     if (cur_.count(target) != 0) {
       const Typed* v = operand(o.operands[1]);
       if (v == nullptr) return unsupported("assigned value was never defined");
@@ -1260,6 +1357,7 @@ class Printer {
   std::vector<std::string> results_;
   std::vector<std::vector<OpId>> users_;
   std::unordered_map<ValueId, Access> pending_store_;
+  std::unordered_set<ValueId> pending_vector_store_;
   std::unordered_set<ValueId> unprefixed_;
   std::unordered_map<std::string, ValueId> raw_names_;
   std::string retarget_;

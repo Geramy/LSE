@@ -43,7 +43,7 @@ std::string hex64(std::uint64_t v) {
 std::string local_identity(const PoolMember& member) {
   if (member.backend == nullptr) return "absent";
   const backend::DeviceInfo& info = member.backend->device_info();
-  std::string s = "device-probe-v3-validated-stream-touch|";
+  std::string s = "device-probe-v4-validated-matrix|";
   s += member.backend->name();
   s += '|';
   s += info.arch;

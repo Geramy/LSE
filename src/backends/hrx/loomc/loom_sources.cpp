@@ -15,11 +15,9 @@
 //     a `buffer.alloca` + `buffer.view` pair the printer synthesizes from the
 //     allocation's own type. A row would let something text-scan for a keyword
 //     that has no Loom form.
-//   * every `wmma.*`, `wmma12.*` and `mfma.*` row — Loom's matrix path is
-//     `vector.mma` against a fragment descriptor whose layout Loom owns, not a
-//     builtin call on a hand-shaped ext_vector. Porting it is a join against
-//     the 152-row contract catalog, not a string swap, so the rows are absent
-//     rather than wrong.
+//   * Unqualified matrix rows remain absent. The measured RDNA4 wave32
+//     rows below join the shared matrix contract to Loom fragment schemas;
+//     the register payload and lane mapping remain owned by that contract.
 //
 // Where Loom offers a NAMED op for something HIP spells as a formula —
 // `siluf`, `logisticf`, `softplusf`, `geluf` — the formula is spelled out here
@@ -29,12 +27,15 @@
 #include "lse/backends/hrx/loomc/loom_sources.hpp"
 
 #include <array>
+#include <vector>
+#include "lse/math.hpp"
+#include "lse/backends/hrx/loomc/loom_types.hpp"
 
 namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 37> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -121,8 +122,14 @@ constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
 
     {"fma", "$r = scalar.fmaf $0, $1, $2 : f32"},
     {"max", "$r = scalar.maxnumf $0, $1 : f32"},
-    {"min.u32", "$r = scalar.minui $0, $1 : i32"},
-    {"max.u32", "$r = scalar.maxui $0, $1 : i32"},
+    // Unsigned min/max may be workgroup-uniform. The current target lowers
+    // scalar.minui/maxui to VGPR-only instructions without converting uniform
+    // SGPR operands/results. Compare/select preserves unsigned semantics and
+    // lets the target choose scalar or vector register classes consistently.
+    {"min.u32", "$t0 = scalar.cmpi ult, $0, $1 : i32\n"
+                "$r = scf.select $t0, $0, $1 : i32"},
+    {"max.u32", "$t0 = scalar.cmpi ugt, $0, $1 : i32\n"
+                "$r = scf.select $t0, $0, $1 : i32"},
     {"min", "$r = scalar.minnumf $0, $1 : f32"},
     {"neg_inf", "$r = scalar.constant -inf : f32"},
     {"abs", "$r = scalar.absf $0 : f32"},
@@ -144,6 +151,18 @@ constexpr std::array<graph::PrimitiveSource, 35> kLoomSources{{
      "$t0 = scalar.trunci $0 : i32 to i16\n"
      "$t1 = scalar.bitcast $t0 : i16 to f16\n"
      "$r = scalar.extf $t1 : f16 to f32"},
+
+    // Preserve the HIP mixed-sign dot: signed activation bytes, unsigned
+    // affine codes, and a wrapping i32 accumulator (no saturation).
+    {"dot4.i32.iu8",
+     "$t0 = vector.splat $0 : vector<1xi32>\n"
+     "$t1 = vector.splat $1 : vector<1xi32>\n"
+     "$t2 = vector.splat $2 : vector<1xi32>\n"
+     "$t3 = vector.bitcast $t0 : vector<1xi32> to vector<4xi8>\n"
+     "$t4 = vector.bitcast $t1 : vector<1xi32> to vector<4xi8>\n"
+     "$t5 = vector.dot4i<s8u8> $t3, $t4, $t2 : vector<4xi8>, vector<4xi8>, vector<1xi32>\n"
+     "$r = vector.extract $t5[0] : vector<1xi32> -> i32"},
+    {"rint", "$r = scalar.roundevenf $0 : f32"},
 
     {"thread.local_id", "$r = kernel.workitem.id<x> : index"},
     {"thread.workgroup_id.x", "$r = kernel.workgroup.id<x> : index"},
@@ -170,8 +189,11 @@ struct ResultType {
 };
 
 // Everything not listed produces f32, which is what every arithmetic row does.
-constexpr std::array<ResultType, 6> kNonFloatResults{{
+constexpr std::array<ResultType, 9> kNonFloatResults{{
     {"bits.f16", "i32"},
+    {"dot4.i32.iu8", "i32"},
+    {"min.u32", "i32"},
+    {"max.u32", "i32"},
     {"thread.local_id", "index"},
     {"thread.workgroup_id.x", "index"},
     {"thread.workgroup_id.y", "index"},
@@ -179,13 +201,77 @@ constexpr std::array<ResultType, 6> kNonFloatResults{{
     {"thread.grid_dim.x", "index"},
 }};
 
+// Only these shared measured layouts match Loom's RDNA4 single-tile catalog.
+// Chained/unmeasured rows are deliberately absent even when a key is shared.
+struct MatrixSpelling {
+  const math::MatrixCoreRow* row = nullptr;
+  std::string text;
+  std::string result;
+};
+const std::vector<MatrixSpelling>& matrix_spellings() {
+  static const std::vector<MatrixSpelling> rows = [] {
+    std::vector<MatrixSpelling> out;
+    for (const auto& r : math::matrix_core_table()) {
+      if (r.target != math::MatrixTarget::kRdna4 || !r.emittable() ||
+          r.chained != 1 || r.m != 16 || r.n != 16 || r.k != 16 ||
+          r.wave != 32 || r.operands != math::OperandLayout::kLaneRowSplitK ||
+          r.acc_layout != math::AccLayout::kRowBlockHalfWave) continue;
+      std::string a_format, b_format;
+      switch (r.operand) {
+        case math::MatrixElem::kF16: a_format = b_format = "f16"; break;
+        case math::MatrixElem::kBF16: a_format = b_format = "bf16"; break;
+        case math::MatrixElem::kI8: a_format = b_format = "i8"; break;
+        case math::MatrixElem::kSU8: a_format = "i8"; b_format = "u8"; break;
+        case math::MatrixElem::kFp8: a_format = b_format = "f8e4m3"; break;
+        case math::MatrixElem::kBf8: a_format = b_format = "f8e5m2"; break;
+        default: continue;
+      }
+      const std::string a = loom_vector_type(r.a_elem, static_cast<std::uint32_t>(r.a_len));
+      const std::string b = loom_vector_type(r.b_elem, static_cast<std::uint32_t>(r.b_len));
+      const std::string c = loom_vector_type(r.c_elem, static_cast<std::uint32_t>(r.c_len));
+      auto schema = [&](int temporary, const std::string& format, int length,
+                        ir::Scalar elem) {
+        return "$t" + std::to_string(temporary) +
+            " = encoding.define #matrix_operand<element_format=" + format +
+            ", payload_elements=" + std::to_string(length * r.pack) +
+            ", payload_registers=" + std::to_string(static_cast<unsigned>(length) * ir::scalar_bytes(elem) / 4) +
+            "> : encoding<schema>\n";
+      };
+      std::string text = "$t0 = index.constant " + std::to_string(r.m) + " : index\n";
+      text += "$t1 = index.constant " + std::to_string(r.n) + " : index\n";
+      text += "$t2 = index.constant " + std::to_string(r.k) + " : index\n";
+      text += schema(3, a_format, r.a_len, r.a_elem);
+      text += schema(4, b_format, r.b_len, r.b_elem);
+      text += "$t5 = vector.fragment<lhs> $0 shape [$t0, $t2] using {schema = $t3 : encoding<schema>} : " + a + "\n";
+      text += "$t6 = vector.fragment<rhs> $1 shape [$t2, $t1] using {schema = $t4 : encoding<schema>} : " + b + "\n";
+      text += "$t7 = vector.fragment<init> $2 shape [$t0, $t1] : " + c + "\n";
+      text += "$r = vector.mma $t5, $t6, $t7 : " + a + ", " + b + ", " + c;
+      out.push_back({&r, std::move(text), c});
+    }
+    return out;
+  }();
+  return rows;
+}
 }  // namespace
 
+const math::MatrixCoreRow* loom_matrix_row(std::string_view key) noexcept {
+  for (const auto& r : matrix_spellings()) if (r.row->key == key) return r.row;
+  return nullptr;
+}
+
 graph::DialectSourceTable loom_sources() noexcept {
-  return graph::DialectSourceTable(kLoomSources, graph::Dialect::kLoom);
+  static const std::vector<graph::PrimitiveSource> rows = [] {
+    std::vector<graph::PrimitiveSource> all(kLoomSources.begin(), kLoomSources.end());
+    for (const auto& r : matrix_spellings()) all.push_back({r.row->key, r.text});
+    return all;
+  }();
+  return graph::DialectSourceTable(rows, graph::Dialect::kLoom);
 }
 
 std::string_view loom_result_type(std::string_view primitive) noexcept {
+  for (const auto& r : matrix_spellings()) {
+    if (r.row->key == primitive) return r.result;
+  }
   if (graph::DialectSourceTable(kLoomSources).find(primitive).empty()) {
     return {};
   }

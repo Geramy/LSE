@@ -13,6 +13,8 @@
 #include "lse/backends/hrx/loomc/loom_print.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/graph/gdn_pair.hpp"
+#include "lse/kernels/gdn.hpp"
 #include "lse/graph/ops.hpp"
 
 namespace lse::backend {
@@ -398,7 +400,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     return s;
   };
 
-  if (kernels::linked_bindings(group).ok) {
+  GdnPair gdn_pair;
+  if (group.nodes.size() == 2 && group.outputs.size() == 2) {
+    gdn_pair = exact_gdn_pair(group.nodes[0], group.nodes[1]);
+    if (gdn_pair && (!std::ranges::count(group.outputs, gdn_pair.output) ||
+                     !std::ranges::count(group.outputs, gdn_pair.state))) gdn_pair = {};
+  }
+  if (!gdn_pair && kernels::linked_bindings(group).ok) {
     KernelShapes probe;
     if (kernels::linked_kernel_for(group, probe) != nullptr) {
       return LSE_ERROR(kUnimplemented,
@@ -428,6 +436,22 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     break;
   }
 
+  std::vector<NodePtr> logical_inputs;
+  if (gdn_pair) {
+    self_indexed = kernels::gdn_pair_kernel();
+    anchor = gdn_pair.output;
+    logical_inputs = anchor->inputs;
+    logical_inputs.push_back(gdn_pair.state);
+    si_storage.clear(); si_dtypes.clear();
+    for (const auto& input : logical_inputs) {
+      si_storage.push_back(input->shape);
+      si_dtypes.push_back(input->dtype);
+    }
+    si_shapes = shapes_for(anchor, storage, dtypes);
+    si_shapes.inputs = si_storage;
+    si_shapes.input_dtypes = si_dtypes;
+  } else if (anchor) logical_inputs = anchor->inputs;
+
   EmittedKernel out;
   out.dialect = Dialect::kLoom;
   const std::string identity = emission_identity(group, device);
@@ -442,7 +466,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   // A self-indexing primitive names its operands in0..inN in its own order, so
   // they are bound first and an epilogue's extra inputs cannot shift them.
   if (self_indexed != nullptr && anchor) {
-    for (const NodePtr& in : anchor->inputs) bind(in);
+    for (const NodePtr& in : logical_inputs) bind(in);
   }
   for (const NodePtr& in : group.inputs) bind(in);
   const std::size_t input_count = out.binding_order.size();
@@ -502,7 +526,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                        ", which is a block layout rather than a Loom element "
                        "type");
     }
-    const bool is_out = output_set.count(n.get()) != 0;
+    const bool is_out = gdn_pair ? n == gdn_pair.output : output_set.count(n.get()) != 0;
     const std::string name =
         si ? (is_out ? std::string("out") : "in" + std::to_string(i))
            : "b" + std::to_string(i);
@@ -542,7 +566,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   // on the pair.
   const int inplace =
       (si && anchor && anchor->prim) ? anchor->prim->inplace_input() : -1;
-  const bool aliased = inplace >= 0;
+  const bool aliased = inplace >= 0 || bool(gdn_pair);
   if (!aliased && out.binding_order.size() > 1) {
     std::string lhs;
     std::string rhs;
@@ -581,7 +605,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
   if (si) {
     // ---- a primitive that owns its indexing -------------------------------
-    const NodePtr& sink = group.outputs.front();
+    const NodePtr& sink = gdn_pair ? gdn_pair.output : group.outputs.front();
     Status epilogue_error;
     bool stored = false;
     Mint hook_mint;
@@ -598,7 +622,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
         const NodePtr& n = out.binding_order[j];
         // A kernel primitive indexes its own operands; they must not be
         // pre-loaded at the output index, because the shapes do not line up.
-        bool is_operand = false;
+        bool is_operand = std::ranges::count(logical_inputs, n) != 0;
         for (const NodePtr& m : group.nodes) {
           if (dynamic_cast<const KernelPrimitiveBase*>(m->prim) == nullptr) {
             continue;
@@ -702,7 +726,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     // Binding order deduplicates aliases. Record the logical argument names
     // through that map too, so a repeated input cannot shift later operands.
     std::vector<std::string> input_names;
-    for (const NodePtr& input : anchor->inputs) {
+    for (const NodePtr& input : logical_inputs) {
       input_names.push_back(names[binding_of.at(input.get())]);
     }
     ir::KernelBody::Capture cap;
