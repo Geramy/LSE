@@ -51,6 +51,31 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0        # release notes read the log back to the last tag
+          ref: ${{ github.sha }}
+
+      - name: Validate release identity
+        id: identity
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          tag="${REQUESTED_TAG:-v${version}-$(git rev-parse --short HEAD)}"
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+            echo '::error::Release tag must contain only letters, digits, dot, underscore, or hyphen.'
+            exit 1
+          }
+          git check-ref-format "refs/tags/$tag"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$GITHUB_SHA" || {
+              echo '::error::Existing release tag identifies a different source commit.'
+              exit 1
+            }
+          fi
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Select GPU targets
         id: targets
@@ -103,7 +128,7 @@ jobs:
           echo "gcc=$(g++-16 -dumpfullversion)" >> "$GITHUB_OUTPUT"
           echo "cmake=$(cmake --version | head -1 | awk '{print $3}')" >> "$GITHUB_OUTPUT"
           if [ -x "$ROCM_PATH/bin/hipconfig" ]; then
-            echo "rocm=$($ROCM_PATH/bin/hipconfig --version 2>/dev/null | head -1)" >> "$GITHUB_OUTPUT"
+            echo "rocm=$("$ROCM_PATH/bin/hipconfig" --version 2>/dev/null | head -1)" >> "$GITHUB_OUTPUT"
           else
             echo "rocm=$(basename "$(readlink -f "$ROCM_PATH")")" >> "$GITHUB_OUTPUT"
           fi
@@ -112,9 +137,9 @@ jobs:
         id: configure
         run: |
           set -euo pipefail
-          hrx_arg=""
+          hrx_args=()
           if [ -n "${HRX_ROOT:-}" ] && [ -d "$HRX_ROOT" ]; then
-            hrx_arg="-DLSE_HRX_ROOT=$HRX_ROOT"
+            hrx_args=("-DLSE_HRX_ROOT=$HRX_ROOT")
             echo "hrx=yes" >> "$GITHUB_OUTPUT"
           else
             echo "hrx=no" >> "$GITHUB_OUTPUT"
@@ -125,7 +150,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-16 \
             -DLSE_GPU_TARGETS="${{ steps.targets.outputs.gpu_targets }}" \
             -DLSE_ROCM_PATH="$ROCM_PATH" \
-            $hrx_arg
+            "${hrx_args[@]}"
 
       - name: Build
         run: cmake --build build
@@ -134,7 +159,11 @@ jobs:
         id: test
         run: |
           set -euo pipefail
-          export LD_LIBRARY_PATH="$ROCM_PATH/lib:$HRX_ROOT/lib:${LD_LIBRARY_PATH:-}"
+          # Use the same comgr/HSA component chosen by CMake and tested by CI.
+          # ROCM_PATH/lib can belong to a different LLVM release than bitcode.
+          RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
+          echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
+          export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           ctest --test-dir build --output-on-failure | tee ctest.log
           echo "summary=$(grep -oE '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' ctest.log | tail -1)" >> "$GITHUB_OUTPUT"
 
@@ -142,7 +171,8 @@ jobs:
         id: smoke
         run: |
           set -euo pipefail
-          export LD_LIBRARY_PATH="$ROCM_PATH/lib:${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
+          export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           # Skipped rather than failed when the model is not cached on this
           # runner: a missing checkpoint is a runner fact, not a defect, and
           # asserting on generated text needs the weights that produced it.
@@ -156,12 +186,13 @@ jobs:
 
       - name: Package
         id: package
+        env:
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
-          sha=$(git rev-parse --short HEAD)
-          tag="${{ inputs.tag }}"
-          [ -n "$tag" ] || tag="v${version}-${sha}"
+          version="$RELEASE_VERSION"
+          tag="$RELEASE_TAG"
           name="lse-${tag}-linux-x86_64"
 
           rm -rf "dist/$name" && mkdir -p "dist/$name"
@@ -172,9 +203,11 @@ jobs:
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
-          echo "name=$name"       >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "name=$name"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Write the release notes
         id: notes
@@ -209,11 +242,19 @@ jobs:
           echo "::error::Release requested but this build has no HRX backend, so it runs on no GPU. Set the repository variable LSE_HRX_ROOT and run again."
           exit 1
 
+      - name: Refuse to release without the GPU smoke test
+        if: ${{ inputs.release && steps.smoke.outputs.ran != 'yes' }}
+        run: |
+          echo '::error::Release requested but the GPU and HTTP smoke test did not run. Cache LSE_SMOKE_MODEL on the runner and retry.'
+          exit 1
+
       - name: Publish the release
         if: ${{ inputs.release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.package.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
           name: LSE ${{ steps.package.outputs.tag }}
           body_path: dist/RELEASE_NOTES.md
           prerelease: ${{ inputs.prerelease }}
