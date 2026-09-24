@@ -422,6 +422,12 @@ class Tile {
   }
   [[nodiscard]] ValueId id() const noexcept { return id_; }
 
+  // The selected vector must fit entirely within this view. The effective
+  // element index (including a slice offset) must have vector-byte alignment.
+  // As with Buffer::load, the caller establishes these index preconditions.
+  [[nodiscard]] Pack<T> load(const Val<u32>& index,
+                             std::uint32_t max_bytes) const;
+
   template <typename I>
   [[nodiscard]] LValue<T> operator[](const Val<I>& index) const {
     if (off_ == 0) {
@@ -836,6 +842,11 @@ inline std::uint32_t pack_n(std::uint32_t max_bytes,
 template <typename T>
 Pack<T> Buffer<T>::load(const Val<u32>& index, std::uint32_t max_bytes) const {
   return body_->load_pack<T>(id_, index, max_bytes);
+}
+
+template <typename T>
+Pack<T> Tile<T>::load(const Val<u32>& index, std::uint32_t max_bytes) const {
+  return body_->load_pack<T>(id_, off_ ? index + off_ : index, max_bytes);
 }
 
 template <typename T>

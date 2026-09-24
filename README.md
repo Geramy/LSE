@@ -41,11 +41,21 @@ prior control (about 28% higher): Qwen3.8-27B Q6, 1,023 decode steps, KV2048,
 no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
 not a median across many runs.
 
-An earlier, different **64-input/33-output** fixture measured 16.75–16.82 decode
-tokens/s and about 116 prompt tokens/s with cooperative RMS. That short-workload
-result has not been remeasured on this final integration. Long-request prompt
-rates are not yet reported as steady state: growing KV capacity can cause new
-prefill specializations on the second request.
+**The accepted M256 Q6 prefill path now uses vector LDS loads.** In matched
+R9700 resident-server measurements with cooperative RMS, a **512-input/33-output**
+workload measured median **143.26 prompt tokens/s and 15.84 decode tokens/s**, versus
+88.74 prompt tokens/s and 15.91 decode tokens/s for the prior scalar-LDS control.
+The three measured requests in each run reported zero JIT compilations. The
+combined implementation also completed three identical **1,024-input/1,024-output**
+requests with clean shutdown; the final request measured **139.85 prompt tokens/s
+and 14.23 decode tokens/s**. These are different workloads, and the long-request
+result is one post-warmup measurement rather than a many-run median. Tests cover
+full projection outputs and guards, and model logits meet the stated acceptance
+budget; the matrix operand path is not a claim of bitwise FP32 equivalence.
+
+KV capacity growth can create additional prefill specializations on the second
+request. Warm up the resident workload twice and check the HTTP JIT timing
+counters before reporting steady-state prompt throughput.
 
 The repeatability investigation found a shared activation-slot lifetime bug:
 fused normalization could overwrite an input still read by another wave. The

@@ -139,9 +139,9 @@ regex="$(IFS='|'; echo "${tests[*]}")"
 ctest --test-dir "$work/host-tests" --output-on-failure -R "^($regex)$"
 # This HRX-linked test uses CpuBackend allocations and simulated kernel results;
 # it never opens a GPU. It is not available in the CPU-only CMake configuration.
-cmake --build "$work/lse-build" --target test_matrix_probe_lifecycle --parallel "$jobs"
+cmake --build "$work/lse-build" --target test_matrix_probe_lifecycle test_q6_m256_profile test_tile_vector_load --parallel "$jobs"
 LSE_BACKEND=cpu ctest --test-dir "$work/lse-build" --output-on-failure \
-  -R '^test_matrix_probe_lifecycle$'
+  -R '^test_(matrix_probe_lifecycle|q6_m256_profile|tile_vector_load)$'
 python3 "$work/source/tests/test_server_cli.py" "$work/lse-build/lse-server"
 mkdir -p "$work/native-fixtures"
 "$work/lse-build/tests/compile_loom_matrix" "$work/native-fixtures"
