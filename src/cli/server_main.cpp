@@ -7,6 +7,8 @@
 #include <string>
 #include <thread>
 
+#include "lse/graph/graph.hpp"
+#include "lse/graph/jit.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/registry.hpp"
@@ -66,6 +68,8 @@ void usage() {
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
       "      --kv-len N       allocate the KV cache for N tokens\n"
+      "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
+      "      --dialect NAME   source dialect: hip or loom\n"
       "  -h, --help           this message\n"
       "\n"
       "Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,\n"
@@ -88,6 +92,7 @@ int main(int argc, char** argv) {
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   std::string served_name;
   std::string pool;
+  std::string dialect;
   std::int32_t kv_len = 0;
 
   for (int i = 1; i < argc; ++i) {
@@ -111,6 +116,14 @@ int main(int argc, char** argv) {
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
     else if (a == "--pool") pool = value("--pool");
+    else if (a == "--dialect") {
+      dialect = value("--dialect");
+      if (!graph::dialect_from_name(dialect).has_value()) {
+        std::fprintf(stderr, "lse-server: no dialect is spelled '%s'\n",
+                     dialect.c_str());
+        return 2;
+      }
+    }
     else {
       std::fprintf(stderr, "lse-server: unknown option '%s'\n", a.c_str());
       return 2;
@@ -147,6 +160,26 @@ int main(int argc, char** argv) {
   } else {
     std::fprintf(stderr, "lse-server: device %s\n",
                  std::string(first_device.name()).c_str());
+  }
+
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return fail(LSE_ERROR(kDeviceError, "no scheduler could be built"),
+                "selecting the kernel dialect");
+  }
+  if (!dialect.empty()) {
+    const graph::Dialect want = *graph::dialect_from_name(dialect);
+    sched->set_dialect(want);
+    for (std::size_t i = 0; i < devices->size(); ++i) {
+      const graph::KernelToolchain* tc = sched->toolchain(i);
+      if (tc == nullptr) continue;
+      std::fprintf(stderr, "lse-server: %s generates %s%s\n",
+                   std::string(devices->device(i).name()).c_str(),
+                   std::string(to_string(tc->dialect)).c_str(),
+                   tc->dialect == want
+                       ? ""
+                       : " -- it does not declare the one asked for");
+    }
   }
 
   std::fprintf(stderr, "lse-server: loading %s\n", model.c_str());

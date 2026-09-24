@@ -93,3 +93,11 @@ if(LSE_ROCM_RUNTIME_DIR)
   set_tests_properties(${lse_tests} PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
 endif()
+
+# Exercise argument handling without opening a model, device or HTTP listener.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND AND TARGET lse-server)
+  add_test(NAME test_server_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_server_cli.py
+            $<TARGET_FILE:lse-server>)
+endif()
