@@ -578,7 +578,7 @@ class Printer {
                : k == "<=" ? "ole"
                : k == ">=" ? "oge"
                : k == "==" ? "oeq"
-                           : "one";
+                           : "une";
         line(depth, res + " = scalar.cmpf " + pred + ", " + lhs + ", " + rhs +
                         " : " + a->type);
       } else if (a->cls == Cls::kIndex || a->cls == Cls::kUnsignedInt ||

@@ -1,5 +1,7 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/kernels/int8_policy.hpp"
+#include "lse/kernels/quant_operand_policy.hpp"
+#include "lse/kernels/quant_operand_cache.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -40,8 +42,11 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
     key.append(value);
   };
   text("loom");
-  number(2);  // identity format includes activation conversion policy
+  number(3);  // identity includes the shared compute-operand policy
   number(kernels::activation_int8_enabled());
+  number(kernels::quant_operand_cache_key(0));
+  number(kernels::quant_operand_specialization_key(0, group, device,
+                                                  loom_types(), loom_sources()));
   text(device.arch);
   // Kernel selection overrides also distinguish persistent JIT identities.
   // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.

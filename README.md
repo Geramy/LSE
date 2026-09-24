@@ -6,7 +6,7 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
 are generated at run time from the model's own shapes rather than selected from
 a library.
 
-## Experimental macOS GPU support
+## Working macOS GPU inference
 
 [MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu) provides a DriverKit
 AMD GPU driver and HSA runtime for the native HRX/Loom path on Apple Silicon.
@@ -16,17 +16,36 @@ R9700/gfx1201 validation covers Q6 projection, convolution, recurrent state,
 paged attention and GPU-only Qwen 27B Q6 text generation. Repeated HTTP
 completion/chat requests pass isolation and graceful shutdown. A five-token
 prompt and 33 generated IDs exactly match an independent same-checkpoint MLX
-run. With explicit batching/polling overrides, three measured resident requests
-reached median 10.12 decode tokens/s; a separate 64-token prompt reached 54.01
-prompt tokens/s and 6.75 decode tokens/s. These KV128/no-MTP workloads do not
-establish llama.cpp performance parity. Broader accuracy, longer contexts and
-MTP remain under qualification. The longer prompt matches all 33 generated IDs
+run. Qwen Q6 also completed exactly 1,024 input and 1,024 output tokens with
+KV capacity 2,048 and MTP disabled. These workloads do not establish llama.cpp
+performance parity. Broader model accuracy and MTP remain under qualification.
+The 64-token prompt matches all 33 generated IDs
 of a float32 MLX reference with unchanged packed Q6 weights; native BF16 MLX
 diverges at an exact logit tie. See the
 [measurements and limits](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md)
 and [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
 for reproduction, server, chat and monitor commands.
 Linux release binaries are not macOS builds.
+
+The latest R9700 resident-server test measured **87.28 prompt tokens/s and
+12.61 decode tokens/s**: median of three warm requests, each with 64 input and
+33 output tokens (32 decode steps), KV128, no MTP, flush64 and 64 µs polling.
+All outputs match the preceding validated fixture. The previous combined
+implementation measured 64.22 PP/s and 12.64 TPS in one warm request: prompt
+processing improved by about 36%, while decode was essentially unchanged.
+
+HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
+FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
+rounding boundaries and buffer guards. The optimizer selects accepted kernels
+using shape, capabilities, accuracy, and matched timing evidence. Staged BF16
+won the four qualified large Q6 projection shapes; single-token decode and
+unknown shapes retain their existing floating-point path. No manual FP8/BF8
+selection is needed. Packed Q6 weights remain packed in VRAM; matrix
+accumulation remains FP32. See [operand selection](docs/QUANT_OPERANDS.md).
+
+Set **`LSE_HRX_INT8=1`** to opt into the existing activation-quantized **Q4**
+dot/WMMA paths. It does not enable Q6/Q8 INT8 conversion.
+[Precision policy](docs/INT8_POLICY.md)
 
 ## Models
 
@@ -459,7 +478,7 @@ Single-device gfx1201 Loom decode measures submission intervals during ordinary
 warm decode steps, excludes JIT/fallback/repartition samples, and retains only
 stable improvements over the 16-dispatch baseline. Explicit
 `LSE_FLUSH_INTERVAL` overrides selection; `LSE_AUTO_BATCH=0` disables it.
-The macOS Qwen3.8-27B-MLX-6bit short-context fixture reached 6.97 decode tokens/s
-with default 1000 µs host polling and 10.13 with a 64 µs override. These are
-HTTP end-to-end rates at KV128, not equivalent to the other benchmark workloads.
+The measured macOS short-context rates use explicit flush64 and 64 µs polling
+overrides, KV128 and no MTP. They are HTTP end-to-end rates and are not
+equivalent to other engines' benchmark workloads.
 See [the macOS measurements](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md).

@@ -1,4 +1,5 @@
 #include "harness.hpp"
+#include "loom_float_compare_fixture.hpp"
 #include "loom_dot_fixture.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 namespace {
@@ -21,5 +22,16 @@ LSE_TEST(signed_mixed_dot_and_ties_even_rounding_emit_shader_bytes) {
 }
 LSE_TEST(workgroup_uniform_unsigned_minmax_emit_shader_bytes) {
  compile_fixture(2);
+}
+LSE_TEST(ordered_equal_and_unordered_not_equal_compile_native_shaders) {
+ lse::backend::LoomcCompiler compiler;LSE_EXPECT(compiler.available());
+ if(!compiler.available())return;
+ for(bool ne:{false,true}) {
+  auto printed=float_compare_fixture::body(ne);LSE_EXPECT(printed.ok());if(!printed.ok())continue;
+  auto code=compiler.compile(float_compare_fixture::kernel(*printed),"gfx1201");
+  LSE_EXPECT(code.ok());
+  if(!code.ok())std::fprintf(stderr,"float comparison: %s\n",code.status().to_string().c_str());
+  else LSE_EXPECT(!code->code.empty());
+ }
 }
 LSE_TEST_MAIN()

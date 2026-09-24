@@ -1,5 +1,7 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/kernels/int8_policy.hpp"
+#include "lse/kernels/quant_operand_policy.hpp"
+#include "lse/kernels/quant_operand_cache.hpp"
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
@@ -514,7 +516,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
 
 std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
-  std::uint64_t h = kernels::activation_int8_cache_key(group.signature());
+  std::uint64_t h = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
   const KernelPrimitiveBase* self = nullptr;
   if (kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
@@ -600,7 +602,7 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   g.anchor = run.front()->kind;
   g.anchor_class = run.front()->fclass;
 
-  const std::uint64_t key = kernels::activation_int8_cache_key(g.signature());
+  const std::uint64_t key = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(g.signature())), g, device, hip_types(), hip_sources());
   if (const auto it = run_scratch_cache_.find(key);
       it != run_scratch_cache_.end()) {
     return it->second;
@@ -774,7 +776,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.traffic = run;
     }
 
-    std::uint64_t sig = kernels::activation_int8_cache_key(group.signature());
+    std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
     if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
       return LSE_ERROR(kOutOfMemory, "fused run needs ",
@@ -938,7 +940,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       // This is why removing the per-stage barriers that `lds_fold` used to
       // leave behind was not the win it looked like.
       if (si + 1 < stages.size()) {
-        const ir::RecordOptions opts{{}, {}, "c" + std::to_string(si) + "_"};
+        const std::string convoy_prefix = "c" + std::to_string(si) + "_";
+        const ir::RecordOptions opts{{}, {}, convoy_prefix};
         const ir::KernelBody::Recording rec(opts);
         ir::KernelBody::Capture cap;
         {
@@ -1111,7 +1114,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   // specialize() picks a different body (LDS vs WMMA vs scalar) for the same
   // graph node; the group hash only sees the generic primitive name.
-  std::uint64_t sig = kernels::activation_int8_cache_key(group.signature());
+  std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
   if (self_indexed != nullptr) {
     sig ^= 0x9e3779b97f4a7c15ull;
     for (char c : self_indexed->name()) {

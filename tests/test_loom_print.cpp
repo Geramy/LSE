@@ -1,5 +1,8 @@
 // Source-only regressions: no Loom compiler, HRX library or GPU is required.
 #include "harness.hpp"
+#include "loom_float_compare_fixture.hpp"
+#include <cmath>
+#include <limits>
 #include "lse/backends/hrx/loomc/loom_print.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -51,4 +54,24 @@ LSE_TEST(index_subtraction_wrap_observed_through_aliases_still_declines) {
   }
 }
 
+LSE_TEST(float_inequality_preserves_cpp_nan_and_finite_semantics) {
+  const float nan=std::numeric_limits<float>::quiet_NaN();
+  const float inf=std::numeric_limits<float>::infinity();
+  for (const auto [a,b] : {std::pair{nan,nan},std::pair{nan,1.0f},
+                          std::pair{1.0f,nan},std::pair{1.0f,1.0f},
+                          std::pair{1.0f,2.0f},std::pair{0.0f,-0.0f},
+                          std::pair{inf,inf},std::pair{inf,-inf}}) {
+    const bool ordered_equal=!std::isnan(a)&&!std::isnan(b)&&a==b;
+    const bool unordered_not_equal=std::isnan(a)||std::isnan(b)||a!=b;
+    LSE_EXPECT_EQ(ordered_equal,a==b);
+    LSE_EXPECT_EQ(unordered_not_equal,a!=b);
+  }
+  for(bool ne:{false,true}) {
+    auto printed=float_compare_fixture::body(ne);LSE_EXPECT(printed.ok());
+    if(printed.ok()) {
+      LSE_EXPECT(printed->text.find(ne?"scalar.cmpf une,":"scalar.cmpf oeq,")!=std::string::npos);
+      LSE_EXPECT(printed->text.find("scalar.cmpf one,")==std::string::npos);
+    }
+  }
+}
 LSE_TEST_MAIN()

@@ -79,7 +79,9 @@ int main(int argc, char **argv) {
         const bool loom_dot =
             l->source.find("vector.dot4i<s8u8>") != std::string::npos;
         const bool loom_matrix =
-            l->source.find("vector.mma") != std::string::npos;
+            l->source.find("vector.mma") != std::string::npos &&
+            l->source.find("element_format=i8") != std::string::npos &&
+            l->source.find("element_format=u8") != std::string::npos;
         require((hip_dot || hip_matrix) == expected,
                 "HIP activation-conversion selection mismatch");
         require((loom_dot || loom_matrix) == expected,

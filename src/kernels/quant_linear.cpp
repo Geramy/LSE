@@ -1180,6 +1180,7 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   // thirds of its vector instructions unpacking nibbles. Decode is one row and
   // bandwidth bound, and the gate below leaves it here.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
     return this;
   }
