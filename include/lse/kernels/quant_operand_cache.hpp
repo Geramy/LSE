@@ -7,6 +7,8 @@
 namespace lse::kernels {
 // Selection runs before the cache lookup: a generic quant_matmul node can
 // specialize to different registered implementations under one graph shape.
+// RMSNorm also specializes its launch geometry, so its selected implementation
+// must invalidate both persistent kernels and cached emission metadata.
 // Names are registered implementation identities; a new strategy/revision must
 // have a distinct name. Cost samples themselves never enter this fingerprint.
 [[nodiscard]] inline std::uint64_t quant_operand_specialization_key(
@@ -16,7 +18,8 @@ namespace lse::kernels {
   std::vector<Shape> inputs;
   std::vector<DType> dtypes;
   for (const auto& node : group.nodes) {
-    if (node->kind != graph::OpKind::kQuantMatMul) continue;
+    if (node->kind != graph::OpKind::kQuantMatMul &&
+        node->kind != graph::OpKind::kRMS) continue;
     const auto* primitive = dynamic_cast<const graph::KernelPrimitiveBase*>(node->prim);
     if (!primitive) continue;
     inputs.clear(); dtypes.clear();
@@ -29,6 +32,8 @@ namespace lse::kernels {
     probe.attrs=node->attrs; probe.iattrs=node->iattrs;
     probe.device=&device; probe.types=types; probe.intrinsics=&intrinsics;
     const auto* chosen=primitive->specialize(probe);
+    if (node->kind == graph::OpKind::kRMS && group.outputs.size() != 1)
+      chosen=primitive;
     key ^= quant_operand_implementation_id(chosen ? chosen->name() : "unavailable");
     key *= 1099511628211ull;
   }

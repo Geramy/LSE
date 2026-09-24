@@ -29,19 +29,25 @@ Use the `macos-arm64` release asset for Apple Silicon. Linux release binaries
 are not macOS builds.
 
 **HIPC and Loom currently have different performance.** The earlier HIPC
-(`--dialect hip`) result is reported at approximately **34 decode tokens/s**;
-the measured macOS Loom (`--dialect loom`) result is **12.61 decode tokens/s**.
+(`--dialect hip`) result is reported at approximately **34 decode tokens/s**.
+The measured macOS Loom (`--dialect loom`) result has now improved from
+**12.61 to 16.75 decode tokens/s** with cooperative RMS normalization.
 The HIPC number is a recalled result whose log and exact model, quantization,
 context and MTP settings still need to be recovered for a matched comparison.
-Loom does not yet match that reported HIPC throughput; closing this gap is a
-current optimization priority.
+Loom does not yet match that reported HIPC throughput.
 
-The latest **macOS Loom** R9700 resident-server test measured **87.28 prompt
-tokens/s and 12.61 decode tokens/s**: median of three warm requests, each with 64 input and
-33 output tokens (32 decode steps), KV128, no MTP, flush64 and 64 µs polling.
-All outputs match the preceding validated fixture. The previous combined
-implementation measured 64.22 PP/s and 12.64 TPS in one warm request: prompt
-processing improved by about 36%, while decode was essentially unchanged.
+The latest **macOS Loom** R9700 resident-server test measured **115.90 prompt
+tokens/s and 16.75 decode tokens/s**: median of three warm requests, each with
+64 input and 33 output tokens (32 decode steps), Qwen3.8-27B MLX Q6, KV128,
+no MTP, flush64 and 64 µs polling. An immediate unchanged-baseline rerun measured
+86.58 PP/s and 12.53 TPS, making the improvement about **34%** for both phases.
+All outputs match the preceding validated fixture. The change distributes each
+RMS row reduction across a workgroup instead of redundantly reducing the entire
+row in every wave.
+
+The [v0.4.0 release](https://github.com/Geramy/LSE/releases/tag/v0.4.0) contains
+the preceding 12.61-TPS baseline. Cooperative normalization is a subsequent
+source change and is not included in those release archives.
 
 HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
 FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including

@@ -317,3 +317,18 @@ endif()
 if(TARGET lse_backend_hrx)
   lse_add_test(test_q6_wmma lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
+
+lse_add_test(test_cooperative_rms lse_graph lse_kernels lse_ir)
+if(TARGET lse_backend_hrx)
+  target_link_libraries(test_cooperative_rms PRIVATE lse_backend_hrx)
+else()
+  target_sources(test_cooperative_rms PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()

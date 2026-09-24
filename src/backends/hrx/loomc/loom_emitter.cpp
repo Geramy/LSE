@@ -1,4 +1,5 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/graph/epilogue_input.hpp"
 #include "lse/kernels/int8_policy.hpp"
 #include "lse/kernels/quant_operand_policy.hpp"
 #include "lse/kernels/quant_operand_cache.hpp"
@@ -638,7 +639,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
             if (in.get() == n.get()) is_operand = true;
           }
         }
-        if (is_operand) continue;
+        if (is_operand && !graph::needs_elementwise_input(group, n.get())) continue;
         const std::string at = bounded(
             broadcast_index(n->shape, sink->shape, idx, hook_mint, s),
             n->element_count(), hook_mint, s);
@@ -810,7 +811,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   std::unordered_map<const Node*, std::string> raw_value_of;
   for (std::size_t i = 0; i < input_count; ++i) {
     const NodePtr& n = out.binding_order[i];
-    if (pointer_inputs.count(n.get()) != 0) continue;
+    if (pointer_inputs.count(n.get()) != 0 &&
+        !graph::needs_elementwise_input(group, n.get())) continue;
     const std::string at =
         bounded(broadcast_index(n->shape, out_shape, "%i", mint, inner),
                 n->element_count(), mint, inner);
@@ -860,6 +862,10 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       KernelShapes shapes = shapes_for(n, shp, dts);
       const KernelPrimitiveBase* chosen = kp->specialize(shapes);
       if (chosen == nullptr) chosen = kp;
+      // A multi-output RMS group cannot use the single-output store hook.
+      // Keep its original per-element implementation, as the HIP scaffold does.
+      if (n->kind == graph::OpKind::kRMS && chosen->owns_indexing() &&
+          !kp->owns_indexing()) chosen = kp;
       if (chosen->owns_indexing()) {
         return LSE_ERROR(kUnimplemented, "primitive '",
                          std::string(chosen->name()),
