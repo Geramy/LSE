@@ -117,7 +117,7 @@ cmake -S "$work/source" -B "$work/lse-build" -G Ninja \
   -DLSE_LOOMC_LIBRARY="$work/hrx-build/loom/binding/c/libloomc.dylib"
 # All these tests are host-only; do not run the entire suite on a runner with
 # no external AMD GPU, and never report CPU checks as GPU qualification.
-tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_backend_cpu
+tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu
   test_primitive test_trace test_loom_print test_loom_repeat test_loom_gdn
   test_loom_extent test_loom_conv test_loom_words test_loom_flash
   test_generation_stats test_server_shutdown test_dispatch_profile test_loom_cache
