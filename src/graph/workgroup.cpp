@@ -520,6 +520,26 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots) {
   plan_slots(roots, launches);
 }
 
+namespace {
+// Slot lifetime belongs to the allocation, including temporary inplace
+// outputs. Following only reshapes lets a later reader of an inplace alias
+// observe a slot recycled after the alias-producing launch.
+const Node* allocation_owner(const Node* n) {
+  std::unordered_set<const Node*> seen;
+  while (n != nullptr) {
+    if (!seen.insert(n).second) return nullptr;
+    if (n->kind == OpKind::kReshape && n->inputs.size() == 1) {
+      n = n->inputs[0].get();
+      continue;
+    }
+    const int index = n->prim != nullptr ? n->prim->inplace_input() : -1;
+    if (index < 0 || static_cast<std::size_t>(index) >= n->inputs.size()) break;
+    n = n->inputs[static_cast<std::size_t>(index)].get();
+  }
+  return n;
+}
+}  // namespace
+
 void Workgroup::plan_slots(std::span<const NodePtr> roots,
                            std::span<const FusionGroup> launches) {
   slots_.clear();
@@ -546,7 +566,7 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
     for (const NodePtr& n : groups[ci].nodes) {
       last_cut[n.get()] = ci;
       for (const NodePtr& in : n->inputs) {
-        const Node* p = skip_reshape(in.get());
+        const Node* p = allocation_owner(in.get());
         if (p && member.count(p)) last_cut[p] = ci;
       }
     }
@@ -574,8 +594,7 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
     const auto it = direct_readers.find(n.get());
     const std::uint32_t direct = it == direct_readers.end() ? 0 : it->second;
     if (root_set.count(n.get()) == 0 && n->consumer_count <= direct) continue;
-    if (n->kind == OpKind::kReshape && !n->inputs.empty()) {
-      const Node* owner = skip_reshape(n->inputs[0].get());
+    if (const Node* owner = allocation_owner(n.get()); owner != n.get()) {
       if (owner != nullptr && member.count(owner) != 0 &&
           owner->fclass != FusionClass::kLeaf) {
         last_cut[owner] = static_cast<std::uint32_t>(groups.size());

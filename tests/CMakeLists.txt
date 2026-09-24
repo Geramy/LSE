@@ -369,3 +369,5 @@ if(TARGET lse_backend_hrx)
   lse_add_test(test_q6_m256_profile lse_backend_hrx lse_graph lse_kernels lse_ir)
   lse_add_test(test_tile_vector_load lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
+
+lse_add_test(test_inplace_owner lse_graph lse_backend_cpu lse_kernels lse_ir)
