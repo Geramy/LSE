@@ -29,27 +29,30 @@ Use the `macos-arm64` release asset for Apple Silicon. Linux release binaries
 are not macOS builds.
 
 **HIPC and Loom currently have different performance.** The earlier HIPC
-(`--dialect hip`) result is reported at approximately **34 decode tokens/s**;
-the measured macOS Loom (`--dialect loom`) result is **12.61 decode tokens/s**.
-The HIPC number is a recalled result whose log and exact model, quantization,
-context and MTP settings still need to be recovered for a matched comparison.
-Loom does not yet match that reported HIPC throughput; closing this gap is a
-current optimization priority.
+(`--dialect hip`) result is reported at approximately **34 decode tokens/s**,
+but its log and exact model, context and MTP settings still need to be recovered
+for a matched comparison. It is not a measured macOS Loom result.
 
-The latest **macOS Loom** R9700 resident-server test measured **87.28 prompt
-tokens/s and 12.61 decode tokens/s**: median of three warm requests, each with 64 input and
-33 output tokens (32 decode steps), KV128, no MTP, flush64 and 64 µs polling.
-All outputs match the preceding validated fixture. The previous combined
-implementation measured 64.22 PP/s and 12.64 TPS in one warm request: prompt
-processing improved by about 36%, while decode was essentially unchanged.
+**Cooperative RMS normalization is now the default shared HIP/Loom kernel**
+for supported shapes. On macOS, the R9700 resident server completed two identical
+greedy requests with **1,024 input and 1,024 output tokens**, with clean shutdown.
+The second request measured **14.28 decode tokens/s**, versus **11.18** for the
+prior control (about 28% higher): Qwen3.8-27B Q6, 1,023 decode steps, KV2048,
+no MTP, flush64 and 64 µs polling. This is a long-context qualification result,
+not a median across many runs.
 
-The [cooperative RMS experiment](https://github.com/Geramy/LSE/tree/testing/r9700-cooperative-rms)
-reached 16.75–16.82 TPS and about 116 PP/s on the short fixture, but failed
-repeated 1K-input/1K-output greedy text equality. It remains on a testing branch;
-stable source retains the preceding implementation, which passed the matched
-long-repeat check. A later logit diagnostic also reproduced near-tied token
-variation in the unchanged baseline, so the cause is not isolated to RMS.
-The faster implementation is not the default while this is investigated.
+An earlier, different **64-input/33-output** fixture measured 16.75–16.82 decode
+tokens/s and about 116 prompt tokens/s with cooperative RMS. That short-workload
+result has not been remeasured on this final integration. Long-request prompt
+rates are not yet reported as steady state: growing KV capacity can cause new
+prefill specializations on the second request.
+
+The repeatability investigation found a shared activation-slot lifetime bug:
+fused normalization could overwrite an input still read by another wave. The
+planner now uses the final submitted kernel groups. The focused GPU diagnostic
+then matched all 62 captured first-layer operands exactly across requests, and
+the long cooperative-RMS repeat passed. This qualification covers the stated
+model and fixtures; it is not a guarantee of bitwise equality for every model.
 
 HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
 FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
