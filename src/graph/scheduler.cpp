@@ -884,6 +884,7 @@ std::uint64_t attributed_ns(const Scheduler::Trace::Spans& s) noexcept {
 
 Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
   acc.device_groups += step.device_groups;
+  acc.partition_passes += step.partition_passes;
   acc.host_groups += step.host_groups;
   acc.phase_groups += step.phase_groups;
   acc.phase_ideal_launches += step.phase_ideal_launches;
@@ -1086,6 +1087,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // ones and pays none of it, which is why this and `schedule` are two spans
   // and not one.
   SpanTimer build_span(trace_.spans.partition, setup_span.close());
+  if (!replayed) ++trace_.partition_passes;
   auto planned = replayed
                      ? std::vector<Workgroup>{}
                      : Partitioner::phases(roots, &backend().device_info());
@@ -1688,6 +1690,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // dispatch loop to the remainder rather than being folded in here — which is
   // what the old partition_ns did, silently.
   const auto t_repartition = place_span.close();
+  ++trace_.partition_passes;
   std::vector<FusionGroup> groups =
       Partitioner::partition(roots, &backend().device_info());
   trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));

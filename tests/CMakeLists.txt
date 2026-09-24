@@ -185,3 +185,15 @@ endif()
 if(TARGET lse_backend_cpu)
   lse_add_test(test_probe_policy lse_probe lse_backend_cpu)
 endif()
+
+lse_add_test(test_submission_tuner)
+lse_add_test(test_submission_constants lse_graph lse_kernels lse_ir)
+target_sources(test_submission_constants PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+if(TARGET lse_backend_cpu)
+  lse_add_test(test_decode_sample lse_graph lse_kernels lse_backend_cpu)
+  lse_add_test(test_submission_decode lse_runtime lse_model lse_graph lse_backends lse_backend_cpu)
+endif()

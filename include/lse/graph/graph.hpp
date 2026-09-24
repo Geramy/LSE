@@ -362,6 +362,8 @@ class Scheduler {
   struct Trace {
     std::vector<std::string> group_descriptions;
     std::uint32_t kernels_launched = 0;
+    // Actual partitioner invocations, independent of host timer resolution.
+    std::uint32_t partition_passes = 0;
     std::uint32_t nodes_evaluated = 0;
     std::uint32_t collectives_issued = 0;
     // Nodes the device backend could not run, executed on the host instead.

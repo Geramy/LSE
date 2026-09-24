@@ -452,3 +452,14 @@ warnings under the full warning set.
 Non-commercial use is free for everyone; commercial use requires a separate
 license, with exceptions for the organizations listed in Exhibit A. See
 **[LICENSE.md](LICENSE.md)**.
+
+### macOS decode submission policy
+
+Single-device gfx1201 Loom decode measures submission intervals during ordinary
+warm decode steps, excludes JIT/fallback/repartition samples, and retains only
+stable improvements over the 16-dispatch baseline. Explicit
+`LSE_FLUSH_INTERVAL` overrides selection; `LSE_AUTO_BATCH=0` disables it.
+The macOS Qwen3.8-27B-MLX-6bit short-context fixture reached 6.97 decode tokens/s
+with default 1000 µs host polling and 10.13 with a 64 µs override. These are
+HTTP end-to-end rates at KV128, not equivalent to the other benchmark workloads.
+See [the macOS measurements](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md).

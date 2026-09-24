@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/code_object.hpp"
+#include "lse/core/hash.hpp"
 
 extern "C" {
 #include "hrx_runtime.h"
@@ -1138,6 +1140,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
     }
   }
 
+  baseline_flush_interval_ = flush_interval_;
+#if defined(__APPLE__)
+  automatic_submission_ = physical_count_ == 1 && info_.arch == "gfx1201" &&
+      automatic_submission_policy(std::getenv("LSE_FLUSH_INTERVAL"),
+                                  std::getenv("LSE_AUTO_BATCH"));
+#endif
+  submission_tuner_ = {};
+  submission_sample_ = nullptr;
+
   queue_count_ = probe_queue_count(device);
   stream_caps_ = derive_stream_capabilities(info_, queue_count_);
   if (physical_count_ > 1 && stream_caps_.stream_count < physical_count_) {
@@ -1985,6 +1996,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
 #endif
 }
 
+Status HrxBackend::begin_decode_sample_impl(std::uint64_t key) {
+  if (!automatic_submission_) return OkStatus();
+  if (submission_sample_ != nullptr) {
+    // Sampling must not turn an otherwise valid request into an error.
+    // Decline overlapping observations; their latency cannot isolate a policy.
+    cancel_decode_sample_impl();
+    return OkStatus();
+  }
+  auto* state = submission_tuner_.find(key);
+  if (state == nullptr) return OkStatus();
+  const auto interval = SubmissionTuner::next(*state);
+  if (interval != flush_interval_) {
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    flush_interval_ = interval;
+  }
+  submission_sample_ = state;
+  submission_signature_ = kHashSeed;
+  submission_dispatches_ = 0;
+  return OkStatus();
+}
+
+Status HrxBackend::end_decode_sample_impl(std::uint64_t elapsed, bool eligible) {
+  if (submission_sample_ == nullptr) return OkStatus();
+  const auto boundary_start = std::chrono::steady_clock::now();
+  auto* state = submission_sample_;
+  const bool was_done = state->done;
+  const auto prior_signature = state->signature;
+  const auto prior_attempts = state->attempts;
+  const auto prior_warm = state->warm;
+  const auto prior_samples = state->samples;
+  const auto sampled_interval = flush_interval_;
+  // The result readback already orders the inference dependency chain; drain
+  // every stream before changing a backend-global submission policy as well.
+  const Status retired = synchronize_impl();
+  submission_sample_ = nullptr;
+  flush_interval_ = baseline_flush_interval_;
+  if (!retired.ok()) {
+    automatic_submission_ = false;
+    return retired;
+  }
+  const auto boundary_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - boundary_start).count();
+  SubmissionTuner::observe(*state, submission_signature_,
+                           static_cast<double>(elapsed) + static_cast<double>(boundary_ns),
+                           eligible && submission_dispatches_ >= 64);
+  static const bool tuning_trace = [] {
+    const char* value = std::getenv("LSE_AUTO_BATCH_TRACE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  static std::atomic<unsigned> trace_lines{0};
+  if (tuning_trace && trace_lines.fetch_add(1) < 256) {
+    std::fprintf(stderr, "[batch-tune-trace] workload=%llx prior-signature=%llx signature=%llx "
+                         "same=%d interval=%u eligible=%d dispatches=%u attempts=%u->%u "
+                         "warm=%u->%u samples=%u->%u done=%d boundary-ns=%llu\n",
+                 static_cast<unsigned long long>(state->key),
+                 static_cast<unsigned long long>(prior_signature),
+                 static_cast<unsigned long long>(submission_signature_),
+                 prior_signature == submission_signature_ ? 1 : 0, sampled_interval,
+                 eligible ? 1 : 0, submission_dispatches_, prior_attempts, state->attempts,
+                 prior_warm, state->warm, prior_samples, state->samples, state->done ? 1 : 0,
+                 static_cast<unsigned long long>(boundary_ns));
+  }
+  if (state->done && !was_done) {
+    std::fprintf(stderr, "[batch-tune] scope=resident-decode clock=host-steady "
+                         "workload=%llx signature=%llx interval=%u selected=%s "
+                         "samples=%u attempts=%u medians-ns=%.0f,%.0f,%.0f,%.0f\n",
+                 static_cast<unsigned long long>(state->key),
+                 static_cast<unsigned long long>(state->signature), state->interval,
+                 state->selected ? "yes" : "no", state->samples, state->attempts,
+                 state->medians[0], state->medians[1], state->medians[2], state->medians[3]);
+  }
+  return OkStatus();
+}
+
+void HrxBackend::cancel_decode_sample_impl() noexcept {
+  submission_sample_ = nullptr;
+  flush_interval_ = baseline_flush_interval_;
+  // An inference error is not a measurement. Do not schedule further tuning
+  // or claim retirement; the normal error path owns device recovery.
+  automatic_submission_ = false;
+}
+
 Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
                                const DispatchArgs& args,
                                const DispatchTarget& target) {
@@ -2022,6 +2115,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
     out.offset = ref.buffer->offset + ref.offset;
     out.length = ref.length != 0 ? ref.length : ref.buffer->size_bytes;
     bindings.push_back(out);
+  }
+
+  if (submission_sample_ != nullptr) {
+    // Process-local executable handles identify exact loaded code objects.
+    // Allocation addresses and token values deliberately do not: ordinary
+    // ping-pong/rebinding must remain the same workload. Sizes, constants and
+    // launch geometry conservatively invalidate changed work.
+    submission_signature_ = hash_mix(submission_signature_, kernel.executable);
+    submission_signature_ = hash_mix(submission_signature_, kernel.export_ordinal);
+    for (unsigned i = 0; i < 3; ++i) {
+      submission_signature_ = hash_mix(submission_signature_, dims.workgroup_count[i]);
+      submission_signature_ = hash_mix(submission_signature_, dims.workgroup_size[i]);
+    }
+    submission_signature_ = hash_mix(submission_signature_, dims.subgroup_size);
+    submission_signature_ = hash_mix(submission_signature_, target.stream.index);
+    submission_signature_ = hash_mix(submission_signature_, args.flags);
+    submission_signature_ = hash_mix(submission_signature_, args.bindings.size());
+    submission_signature_ = hash_mix(submission_signature_, args.constants.size());
+    for (const auto& binding : args.bindings)
+      submission_signature_ = hash_mix(submission_signature_, binding.length != 0
+          ? binding.length : binding.buffer->size_bytes);
+    for (const auto byte : args.constants)
+      submission_signature_ = hash_mix(submission_signature_, std::to_integer<unsigned char>(byte));
+    ++submission_dispatches_;
   }
 
   const std::uint32_t index = target.stream.index;

@@ -1010,6 +1010,12 @@ class IBackend {
                 const DispatchArgs& args) {
     return launch(kernel, dims, args, DispatchTarget{});
   }
+  // Optional online policy observation around one complete, ordinary decode
+  // step. begin/end may change submission batching only after a confirmed
+  // drain. The caller never repeats model work and excludes cold/JIT samples.
+  virtual Status begin_decode_sample(std::uint64_t) { return OkStatus(); }
+  virtual Status end_decode_sample(std::uint64_t, bool) { return OkStatus(); }
+  virtual void cancel_decode_sample() noexcept {}
   virtual Status synchronize() = 0;
 
   // What this device's streams can do, and how to order two of them. A caller
@@ -1137,6 +1143,20 @@ class BackendAdapter final : public IBackend {
     return impl_.launch(k, d, a, t);
   }
   using IBackend::launch;
+  Status begin_decode_sample(std::uint64_t key) override {
+    if constexpr (requires { impl_.begin_decode_sample_impl(key); })
+      return impl_.begin_decode_sample_impl(key);
+    return OkStatus();
+  }
+  Status end_decode_sample(std::uint64_t elapsed, bool eligible) override {
+    if constexpr (requires { impl_.end_decode_sample_impl(elapsed, eligible); })
+      return impl_.end_decode_sample_impl(elapsed, eligible);
+    return OkStatus();
+  }
+  void cancel_decode_sample() noexcept override {
+    if constexpr (requires { impl_.cancel_decode_sample_impl(); })
+      impl_.cancel_decode_sample_impl();
+  }
   Status synchronize() override { return impl_.synchronize(); }
   const StreamCapabilities& stream_capabilities() const noexcept override {
     return impl_.stream_capabilities();

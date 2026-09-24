@@ -1,12 +1,17 @@
 #include "lse/runtime/generator.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <chrono>
 #include <cstdlib>
 
 #include "lse/graph/graph.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/core/hash.hpp"
+#include "lse/runtime/decode_sample.hpp"
 
 namespace lse::runtime {
 
@@ -22,6 +27,19 @@ std::uint64_t now_ns() {
           std::chrono::steady_clock::now().time_since_epoch())
           .count());
 }
+
+// Ensure every early return (and unwinding) abandons an active observation.
+// Cancellation changes policy bookkeeping only; it never claims GPU retirement.
+struct DecodeSampleScope {
+  backend::IBackend* backend = nullptr;
+  ~DecodeSampleScope() { if (backend != nullptr) backend->cancel_decode_sample(); }
+  Status finish(std::uint64_t elapsed, bool eligible) {
+    if (backend == nullptr) return OkStatus();
+    const Status status = backend->end_decode_sample(elapsed, eligible);
+    if (status.ok()) backend = nullptr;
+    return status;
+  }
+};
 
 // Token ids ride the graph as f32, matching how every other index does.
 Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
@@ -643,13 +661,66 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     // The first token came from prefill. Start timing only when its successor
     // needs a model step, after the first token has been delivered.
     if (decode_start == 0) decode_start = now_ns();
-    // Only the new token goes in: every block's state already holds the rest.
-    if (device_greedy) {
-      LSE_ASSIGN_OR(next, greedy_step(session, next));
-    } else {
-      LSE_ASSIGN_OR(logits, step(session, {next}));
-      next = sampler_.sample(logits, session.history());
+    // Measure ordinary complete decode steps, never prefill or speculative
+    // verification. hidden() alone only submits work: logits/readback closes
+    // the interval and includes the actual host recording/GPU overlap.
+    graph::Scheduler* tuning_sched = graph::default_scheduler();
+    const auto* chain = tuning_sched != nullptr && tuning_sched->devices().size() == 1
+        ? tuning_sched->toolchain(0) : nullptr;
+    backend::IBackend* tuning_backend = chain != nullptr && chain->dialect == graph::Dialect::kLoom
+        ? &tuning_sched->backend() : nullptr;
+    DecodeSampleCounters before;
+    std::uint64_t partition_ns_before = 0, tuning_key = 0;
+    DecodeSampleScope observation{tuning_backend};
+    // Include any begin-boundary drain. The backend adds its final drain to
+    // this interval before accepting a sample; neither cost is hidden.
+    const auto step_start = now_ns();
+    if (tuning_backend != nullptr) {
+      // Cache only within this backend lifetime. Context buckets prevent a
+      // short-context choice from silently covering very different KV work.
+      tuning_key = hash_mix(kHashSeed, reinterpret_cast<std::uintptr_t>(&model_));
+      tuning_key = hash_mix(tuning_key, device_greedy);
+      tuning_key = hash_mix(tuning_key, static_cast<std::uint64_t>(session.position()) / 128);
+      LSE_RETURN_IF_ERROR(tuning_backend->begin_decode_sample(tuning_key));
+      const auto jit = tuning_sched->jit_stats();
+      const auto& trace = tuning_sched->accumulated_trace();
+      before = {jit.compiles, jit.disk_hits, trace.partition_passes, trace.host_groups};
+      partition_ns_before = trace.partition_ns;
     }
+    const auto advanced = [&]() -> Result<std::uint32_t> {
+      // Only the new token goes in: each block already holds the prior state.
+      if (device_greedy) return greedy_step(session, next);
+      LSE_ASSIGN_OR(logits, step(session, {next}));
+      return sampler_.sample(logits, session.history());
+    }();
+    if (!advanced.ok()) return advanced.status();
+    const auto step_ns = now_ns() - step_start;
+    if (tuning_backend != nullptr) {
+      const auto jit_after = tuning_sched->jit_stats();
+      const auto& trace = tuning_sched->accumulated_trace();
+      const DecodeSampleCounters after{jit_after.compiles, jit_after.disk_hits,
+                                       trace.partition_passes, trace.host_groups};
+      const bool warm = warm_decode_sample(before, after);
+      static const bool tuning_trace = [] {
+        const char* value = std::getenv("LSE_AUTO_BATCH_TRACE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+      }();
+      static std::atomic<unsigned> evidence_lines{0};
+      if (tuning_trace && evidence_lines.fetch_add(1) < 256) {
+        std::fprintf(stderr, "[batch-tune-evidence] workload=%llx position=%d eligible=%d "
+                             "compiles=%llu disk-loads=%llu partition-passes=%llu "
+                             "partition-ns=%llu host-groups=%llu elapsed-ns=%llu\n",
+                     static_cast<unsigned long long>(tuning_key), session.position(), warm ? 1 : 0,
+                     static_cast<unsigned long long>(after.compiles - before.compiles),
+                     static_cast<unsigned long long>(after.disk_loads - before.disk_loads),
+                     static_cast<unsigned long long>(after.partition_passes - before.partition_passes),
+                     static_cast<unsigned long long>(trace.partition_ns - partition_ns_before),
+                     static_cast<unsigned long long>(after.host_groups - before.host_groups),
+                     static_cast<unsigned long long>(step_ns));
+      }
+      LSE_RETURN_IF_ERROR(observation.finish(step_ns, warm));
+    }
+    next = *advanced;
     session.advance(1);
   }
   stats_.decode_ns = decode_start == 0 ? 0 : now_ns() - decode_start;
