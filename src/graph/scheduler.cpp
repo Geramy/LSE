@@ -23,6 +23,7 @@
 #include "lse/graph/program.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/graph/pointwise_fusion.hpp"
 #include "lse/opt/fusion.hpp"
 #include "dispatch_profile.hpp"
 
@@ -1100,6 +1101,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     // the same one-group path a node it refuses to stage already takes.
     const IPhaseStaging* staging = emitter->staging();
     for (Workgroup& wg : planned) {
+      const std::size_t phase_begin = phase_groups.size();
       FusionGroup g = Partitioner::phase_group(wg, roots);
       if (g.nodes.empty()) continue;
       alias_ready_reshapes(g);
@@ -1288,6 +1290,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         if (staging == nullptr || !staging->can_stage(*n)) {
           flush_staged();
           if (join_gdn_pair(n)) continue;
+          // No staged/grid barrier is needed for a single-consumer pointwise
+          // chain. Keep the ordinary emitter's existing fused SSA form.
+          if (staging == nullptr && phase_groups.size() > phase_begin &&
+              join_pointwise_chain(phase_groups.back(), n, roots, emitter->sources())) {
+            continue;
+          }
           FusionGroup one;
           one.nodes.push_back(n);
           one.outputs.push_back(n);

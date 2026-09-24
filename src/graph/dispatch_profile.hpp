@@ -44,11 +44,11 @@ class DispatchProfile {
               std::uint64_t completion_ns, std::uint64_t predrain_ns,
               bool succeeded) {
     const std::lock_guard lock(mutex_);
-    if (key.size() > kMaxKeyBytes ||
-        (!samples_.contains(key) && samples_.size() >= kMaxShapes)) {
-      key = "<other-shapes>";
-    }
-    auto& s = samples_[std::move(key)];
+    const bool overflow = key.size() > kMaxKeyBytes ||
+        (!samples_.contains(key) && samples_.size() >= kMaxShapes);
+    // Do not move a shortened oversized string into the map: its capacity
+    // could retain the original allocation despite the bounded key length.
+    auto& s = overflow ? samples_["<other-shapes>"] : samples_[std::move(key)];
     ++s.count;
     if (!succeeded) ++s.failures;
     s.submit_ns += submit_ns;

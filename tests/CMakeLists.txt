@@ -13,6 +13,13 @@ function(lse_add_test name)
 endfunction()
 
 lse_add_test(test_generation_stats)
+# Ordinary fused SSA chains need no device or model.
+lse_add_test(test_pointwise_fusion lse_graph lse_kernels lse_ir)
+target_sources(test_pointwise_fusion PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_dispatch_profile)
 lse_add_test(test_dtype)
 lse_add_test(test_reflect)
