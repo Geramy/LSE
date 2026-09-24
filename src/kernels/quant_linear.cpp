@@ -327,6 +327,12 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
 // Exact-FP32 prefill schedule for the validated gfx1201 layout. Indexed rows may name different
 // matrices, and externally staged panels have a caller-owned layout, so neither
 // can participate in this reuse path.
+std::uint32_t q6_prefill_tile(std::uint32_t k, std::uint32_t rows) {
+  // Eight rows retain the validated four-row panel's 16 KiB maximum LDS.
+  // 512 is exactly one 32-lane wave of 16-code chunks, preserving K order.
+  return std::min(rows >= 8 ? 512u : 1024u, k);
+}
+
 std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
                               bool indexed) {
   if (!d.valid || indexed || d.m < 2 || d.spec.bits != 6 ||
@@ -335,9 +341,11 @@ std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
       s.input_dtypes[0] != DType::kF32 ||
       s.input_dtypes[2] != DType::kBF16 || !s.staged.name.empty() ||
       !s.staged_quant.codes.empty()) return 1;
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto budget = workgroup_lds_bytes(s.device);
+  if (d.m >= 32 && budget >= 8u * q6_prefill_tile(k, 8u) * 4u) return 8u;
   const std::uint32_t rows = d.m >= 4 ? 4u : 2u;
-  const auto tile = std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k));
-  return workgroup_lds_bytes(s.device) >= rows * tile * 4u ? rows : 1u;
+  return budget >= rows * q6_prefill_tile(k, rows) * 4u ? rows : 1u;
 }
 
 // Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
@@ -356,7 +364,7 @@ std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                 std::uint32_t rows) {
   if (!d.valid || rows == 0) return 0;
   if (rows > 1 && d.spec.bits == 6 && !body_dot(s, d)) {
-    return rows * std::min<std::uint32_t>(1024u, static_cast<std::uint32_t>(d.k)) * 4u;
+    return rows * q6_prefill_tile(static_cast<std::uint32_t>(d.k), rows) * 4u;
   }
   const auto k = static_cast<std::uint32_t>(d.k);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
@@ -798,7 +806,7 @@ std::string emit_q6_prefill(const KernelShapes& s, const QuantDims& d,
   const auto k = static_cast<std::uint32_t>(d.k);
   const auto lanes = static_cast<std::uint32_t>(d.lanes);
   const auto groups = static_cast<std::uint32_t>(d.groups);
-  const auto tile_k = std::min(1024u, k);
+  const auto tile_k = q6_prefill_tile(k, rows);
   constexpr std::uint32_t wave = 32;
   constexpr std::uint32_t values = 16;
   constexpr std::uint32_t words = 3;

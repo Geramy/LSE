@@ -61,14 +61,14 @@ LSE_TEST(q6_prefill_plan_declares_multirow_resources_and_no_single_row_panel) {
   const auto* p = primitive();
   LSE_EXPECT(p != nullptr);
   if (!p) return;
-  for (int m : {1, 2, 3, 4, 5, 17, 128, 256}) {
+  for (int m : {1, 2, 3, 4, 5, 17, 31, 32, 33, 63, 128, 256}) {
     for (int k : {64, 576, 1024, 1088, 4096, 5120, 17408}) {
       Fixture f(m, k);
-      const unsigned rows = m >= 4 ? 4u : (m >= 2 ? 2u : 1u);
+      const unsigned rows = m >= 32 ? 8u : (m >= 4 ? 4u : (m >= 2 ? 2u : 1u));
       const auto plan = p->plan(f.shapes);
       LSE_EXPECT_EQ(plan.workgroup_count[0], 3u);
       LSE_EXPECT_EQ(plan.workgroup_count[1], (unsigned(m) + rows - 1) / rows);
-      LSE_EXPECT_EQ(plan.lds_bytes, m > 1 ? rows * unsigned(std::min(k, 1024)) * 4u
+      LSE_EXPECT_EQ(plan.lds_bytes, m > 1 ? rows * unsigned(std::min(k, rows >= 8 ? 512 : 1024)) * 4u
                                        : (k <= 16384 ? unsigned(k) * 4u : 0u));
       if (m > 1) LSE_EXPECT_EQ(p->staged_row(f.shapes).count, 0u);
     }
@@ -111,7 +111,7 @@ LSE_TEST(q6_prefill_fallback_preserves_architecture_and_staging_contracts) {
 }
 
 LSE_TEST(q6_prefill_hip_and_loom_emit_matching_launch_and_lds_requirements) {
-  for (int m : {3, 5, 17}) {
+  for (int m : {3, 5, 17, 31, 32, 33, 128}) {
     Fixture f(m, 1088);
     auto y = quant_linear(input(f.inputs[0], f.dtypes[0]),
                           input(f.inputs[1], f.dtypes[1]),
@@ -125,9 +125,9 @@ LSE_TEST(q6_prefill_hip_and_loom_emit_matching_launch_and_lds_requirements) {
     auto loom = backend::LoomEmitter{}.emit(groups.front(), f.device);
     LSE_EXPECT(hip.ok() && loom.ok());
     if (!hip.ok() || !loom.ok()) continue;
-    const unsigned rows = m >= 4 ? 4u : 2u;
+    const unsigned rows = m >= 32 ? 8u : (m >= 4 ? 4u : 2u);
     LSE_EXPECT_EQ(hip->dims.workgroup_count[1], (unsigned(m) + rows - 1) / rows);
-    LSE_EXPECT_EQ(hip->lds_bytes, rows * 4096u);
+    LSE_EXPECT_EQ(hip->lds_bytes, rows * (rows >= 8 ? 2048u : 4096u));
     LSE_EXPECT_EQ(loom->lds_bytes, hip->lds_bytes);
     LSE_EXPECT_EQ(loom->dims.workgroup_count[1], hip->dims.workgroup_count[1]);
     auto actual_shared = backend::HipEmitter::shared_bytes(hip->source);
@@ -205,10 +205,11 @@ int check_schedule() {
   }
   std::puts("PASS physical panel bounds/permutation and per-instruction bank distribution (not measured stalls)");
   unsigned checked = 0;
-  for (unsigned m : {2u, 3u, 4u, 5u, 17u, 128u}) {
+  for (unsigned m : {2u, 3u, 4u, 5u, 17u, 31u, 32u, 33u, 63u, 128u}) {
     for (unsigned k : {64u, 576u, 1088u, 4096u, 17408u}) {
       constexpr unsigned n = 17;
-      const unsigned rows = m >= 4 ? 4 : 2, tile = k < 1024 ? k : 1024;
+      const unsigned rows = m >= 32 ? 8 : (m >= 4 ? 4 : 2);
+      const unsigned tile = std::min(k, rows >= 8 ? 512u : 1024u);
       std::vector<float> expected(m * n), actual(m * n, NAN);
       std::uint64_t baseline_weights = 0, reused_weights = 0;
       for (unsigned row = 0; row < m; ++row) for (unsigned col = 0; col < n; ++col) {
@@ -223,7 +224,7 @@ int check_schedule() {
         expected[row * n + col] = reduce(sums);
       }
       for (unsigned row = 0; row < m; row += rows) for (unsigned col = 0; col < n; ++col) {
-        std::array<std::array<float, 32>, 4> sums{};
+        std::array<std::array<float, 32>, 8> sums{};
         for (unsigned base = 0; base < k; base += tile) {
           std::vector<float> panel(rows * tile);
           for (unsigned r = 0; r < rows; ++r)
