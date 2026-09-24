@@ -29,7 +29,14 @@ struct RecordingDevice : backend::CpuBackend {
   Result<std::size_t> sample_free_memory() const { return 32u << 20; }
   Result<backend::DeviceBuffer> allocate(std::size_t bytes,backend::MemoryClass cls,backend::Stream stream) {
     auto result=backend::CpuBackend::allocate(bytes,cls,stream);
-    if(result.ok()) {result->storage=std::shared_ptr<void>(result->ptr,std::free); owners.push_back(result->storage);}
+    if (result.ok()) {
+      // CpuBackend already owns the allocation. Creating a second owner from
+      // ptr would release the first owner here and leave both a dangling pointer
+      // and a second free pending.
+      LSE_EXPECT(result->storage != nullptr);
+      LSE_EXPECT(result->storage.get() == result->ptr);
+      owners.push_back(result->storage);
+    }
     return result;
   }
   void deallocate(backend::DeviceBuffer& buffer) noexcept { ++releases; buffer={}; }

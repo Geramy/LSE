@@ -137,6 +137,11 @@ cmake -S "$work/source" -B "$work/host-tests" -G Ninja \
 cmake --build "$work/host-tests" --target "${tests[@]}" --parallel "$jobs"
 regex="$(IFS='|'; echo "${tests[*]}")"
 ctest --test-dir "$work/host-tests" --output-on-failure -R "^($regex)$"
+# This HRX-linked test uses CpuBackend allocations and simulated kernel results;
+# it never opens a GPU. It is not available in the CPU-only CMake configuration.
+cmake --build "$work/lse-build" --target test_matrix_probe_lifecycle --parallel "$jobs"
+LSE_BACKEND=cpu ctest --test-dir "$work/lse-build" --output-on-failure \
+  -R '^test_matrix_probe_lifecycle$'
 python3 "$work/source/tests/test_server_cli.py" "$work/lse-build/lse-server"
 mkdir -p "$work/native-fixtures"
 "$work/lse-build/tests/compile_loom_matrix" "$work/native-fixtures"

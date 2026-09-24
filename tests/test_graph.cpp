@@ -17,6 +17,7 @@
 
 #include "harness.hpp"
 #include "lse/graph/interpreter.hpp"
+#include "lse/backends/cpu/cpu_backend.hpp"
 #include "lse/graph/codegen.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
@@ -39,6 +40,18 @@ Array host_array(std::vector<float> values, Shape shape) {
     interpreter::store_element(*a.node(), i, values[i]);
   }
   return a;
+}
+
+// These fixtures exercise interpreter storage semantics independently of the
+// machine's selected compute backend (Linux CI also has a real GPU backend).
+Array cpu_host_array(backend::IBackend& cpu, std::vector<float> values,
+                     Shape shape) {
+  auto allocation = cpu.allocate(values.size() * sizeof(float),
+      backend::MemoryClass::kStaging, backend::kDefaultStream);
+  LSE_EXPECT(allocation.ok());
+  if (!allocation.ok()) return {};
+  std::memcpy(allocation->ptr, values.data(), values.size() * sizeof(float));
+  return Array::from_buffer(allocation.release(), shape, DType::kF32);
 }
 
 std::vector<float> drain(Array& a) {
@@ -317,10 +330,9 @@ LSE_TEST(reshape_of_a_materialized_buffer_is_a_view) {
 }
 
 LSE_TEST(host_reshape_preserves_window_mutations_and_allocation_owner) {
-  auto* scheduler = default_scheduler();
-  LSE_EXPECT(scheduler != nullptr);
-  if (!scheduler || !scheduler->backend().device_info().unified_memory) return;
-  auto allocation = scheduler->backend().allocate(10 * sizeof(float),
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT_OK(cpu.init(0));
+  auto allocation = cpu.allocate(10 * sizeof(float),
       backend::MemoryClass::kStaging, backend::kDefaultStream);
   LSE_EXPECT(allocation.ok());
   if (!allocation.ok()) return;
@@ -333,7 +345,7 @@ LSE_TEST(host_reshape_preserves_window_mutations_and_allocation_owner) {
   buffer.size_bytes = 6 * sizeof(float);
   auto base = Array::from_buffer(std::move(buffer), Shape{2, 3}, DType::kF32);
   auto view = reshape(base, Shape{3, 2});
-  LSE_EXPECT_OK(view.eval());
+  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
   LSE_EXPECT(view.node()->buffer.storage == base.node()->buffer.storage);
   LSE_EXPECT_EQ(view.node()->buffer.offset, 2 * sizeof(float));
   interpreter::store_element(*base.node(), 1, 7.0f);
@@ -356,20 +368,19 @@ LSE_TEST(host_reshape_preserves_window_mutations_and_allocation_owner) {
 }
 
 LSE_TEST(host_reshape_rebinds_replaced_storage_and_dirty_state) {
-  auto* scheduler = default_scheduler();
-  LSE_EXPECT(scheduler != nullptr);
-  if (!scheduler || !scheduler->backend().device_info().unified_memory) return;
-  auto base = host_array({1, 2, 3, 4}, Shape{4});
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT_OK(cpu.init(0));
+  auto base = cpu_host_array(cpu, {1, 2, 3, 4}, Shape{4});
   auto view = reshape(base, Shape{2, 2});
-  LSE_EXPECT_OK(view.eval());
-  auto replacement = host_array({5, 6, 7, 8}, Shape{4});
+  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
+  auto replacement = cpu_host_array(cpu, {5, 6, 7, 8}, Shape{4});
   const auto old_handle = view.node()->buffer.handle;
   base.node()->buffer = replacement.node()->buffer;
   base.node()->host_dirty = true;
   base.node()->device_dirty = true;
   view.node()->host_mirror.assign(16, std::byte{0xff});
   view.node()->materialized = false;
-  LSE_EXPECT_OK(interpreter::evaluate(view.node(), scheduler->backend()));
+  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
   LSE_EXPECT(view.node()->buffer.handle != old_handle);
   LSE_EXPECT(view.node()->buffer.storage == replacement.node()->buffer.storage);
   LSE_EXPECT(view.node()->host_mirror.empty());
@@ -379,18 +390,20 @@ LSE_TEST(host_reshape_rebinds_replaced_storage_and_dirty_state) {
   base.node()->host_dirty = false;
   base.node()->device_dirty = true;
   view.node()->materialized = false;
-  LSE_EXPECT_OK(interpreter::evaluate(view.node(), scheduler->backend()));
+  LSE_EXPECT_OK(interpreter::evaluate(view.node(), cpu));
   LSE_EXPECT(!view.node()->host_dirty);
   LSE_EXPECT(view.node()->device_dirty);
 }
 
 LSE_TEST(host_reshape_rejects_invalid_shape_and_short_windows) {
-  auto a = host_array({1, 2, 3, 4}, Shape{4});
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT_OK(cpu.init(0));
+  auto a = cpu_host_array(cpu, {1, 2, 3, 4}, Shape{4});
   auto wrong = reshape(a, Shape{5});
-  LSE_EXPECT(!wrong.eval().ok());
+  LSE_EXPECT(!interpreter::evaluate(wrong.node(), cpu).ok());
   auto short_view = reshape(a, Shape{2, 2});
   a.node()->buffer.size_bytes = 3 * sizeof(float);
-  LSE_EXPECT(!short_view.eval().ok());
+  LSE_EXPECT(!interpreter::evaluate(short_view.node(), cpu).ok());
 }
 
 LSE_TEST(slice_copies_a_window) {
