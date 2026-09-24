@@ -47,7 +47,9 @@ The [cooperative RMS experiment](https://github.com/Geramy/LSE/tree/testing/r970
 reached 16.75–16.82 TPS and about 116 PP/s on the short fixture, but failed
 repeated 1K-input/1K-output greedy text equality. It remains on a testing branch;
 stable source retains the preceding implementation, which passed the matched
-long-repeat check. The faster implementation is not the default.
+long-repeat check. A later logit diagnostic also reproduced near-tied token
+variation in the unchanged baseline, so the cause is not isolated to RMS.
+The faster implementation is not the default while this is investigated.
 
 HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
 FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
