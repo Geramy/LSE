@@ -39,10 +39,6 @@
 
 namespace lse::kernels {
 
-// Forward declaration: the Q6/WGMMA selector lives in wmma_q6_linear.cpp
-// (same target, lse_kernels), which defines it after the anonymous namespace.
-const graph::KernelPrimitiveBase *wmma_q6_linear_for(const graph::KernelShapes &);
-
 // These name device facts, which the backend supplies.
 using backend::AmdDeviceInfo;
 using backend::DeviceInfo;
@@ -192,6 +188,55 @@ ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave,
   const std::uint32_t rows = rows_per_wg != 0 ? rows_per_wg : 1;
   const auto m = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
   tp.workgroup_count[1] = (m + rows - 1) / rows;
+  tp.workgroup_count[2] = 1;
+  tp.lds_bytes = lds_bytes;
+  return tp;
+}
+
+// TEST-ONLY geometry for the decode GEMV microbenchmark variants. These live
+// beside gemv_plan and are referenced only by the test-only micro TU below;
+// the production plan path never calls them.
+ThreadPlan gemv_plan_8col(const QuantDims& d, std::uint32_t wave,
+                          std::uint32_t lds_bytes) {
+  if (wave != 32 && wave != 64) wave = 32;
+  const std::uint32_t waves = kBlock / wave * 8u;
+  ThreadPlan tp;
+  tp.workgroup_size[0] = kBlock;
+  tp.workgroup_count[0] =
+      static_cast<std::uint32_t>((d.n + waves - 1) / waves);
+  const auto m = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
+  tp.workgroup_count[1] = m;
+  tp.workgroup_count[2] = 1;
+  tp.lds_bytes = lds_bytes;
+  return tp;
+}
+
+ThreadPlan gemv_plan_ksplit(const QuantDims& d, std::uint32_t wave,
+                            std::uint32_t lds_bytes) {
+  if (wave != 32 && wave != 64) wave = 32;
+  // 8 waves x 4 columns, each wave holding a half of K.
+  const std::uint32_t waves = kBlock / wave * 4u;
+  ThreadPlan tp;
+  tp.workgroup_size[0] = kBlock;
+  tp.workgroup_count[0] =
+      static_cast<std::uint32_t>((d.n + waves - 1) / waves);
+  const auto m = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
+  tp.workgroup_count[1] = m;
+  tp.workgroup_count[2] = 1;
+  tp.lds_bytes = lds_bytes;
+  return tp;
+}
+
+ThreadPlan gemv_plan_nopanel(const QuantDims& d, std::uint32_t wave,
+                             std::uint32_t lds_bytes) {
+  if (wave != 32 && wave != 64) wave = 32;
+  const std::uint32_t waves = kBlock / wave * 4u;
+  ThreadPlan tp;
+  tp.workgroup_size[0] = kBlock;
+  tp.workgroup_count[0] =
+      static_cast<std::uint32_t>((d.n + waves - 1) / waves);
+  const auto m = static_cast<std::uint32_t>(d.m > 0 ? d.m : 1);
+  tp.workgroup_count[1] = m;
   tp.workgroup_count[2] = 1;
   tp.lds_bytes = lds_bytes;
   return tp;
