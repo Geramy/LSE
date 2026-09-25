@@ -563,9 +563,7 @@ warnings under the full warning set.
 
 ## License
 
-Non-commercial use is free for everyone; commercial use requires a separate
-license, with exceptions for the organizations listed in Exhibit A. See
-**[LICENSE.md](LICENSE.md)**.
+MIT — see **[LICENSE.md](LICENSE.md)**.
 
 ### macOS decode submission policy
 
