@@ -44,6 +44,10 @@ const graph::KernelPrimitiveBase* wmma_linear_for(const graph::KernelShapes& s);
 const graph::KernelPrimitiveBase* wmma_quant_linear_for(
     const graph::KernelShapes& s);
 
+// The Q6 (group-affine, 6-bit) matrix-core selector; defined in
+// wmma_q6_linear.cpp, null when the device, shapes or opt-in decline it.
+const graph::KernelPrimitiveBase* wmma_q6_linear_for(const graph::KernelShapes& s);
+
 // Which family of matrix instructions this device speaks. Not "does it have a
 // matrix core" — the families are different instructions with different
 // operand layouts, so a row belongs to exactly one of them.
