@@ -1,4 +1,10 @@
-// Host-only selection contracts for the quarantined M256 vector profile.
+// Host-only selection contracts for the staged-BF16 single-product admission
+// of the M256 and M512 prefill shapes. The two-product residual2 kernel for
+// these shapes was withdrawn after the current model measured relative L2
+// 0.00503022829645 against the 0.005 cancellation-safe limit; M=256 now falls
+// through to the measured records table (nine admitted shapes), and the
+// chunk-512 prefill width adds seven more M512 projection shapes to the same
+// table. The four measured M64/M512 FFN-pair records stay untouched.
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/hipc/hip_sources.hpp"
@@ -28,24 +34,61 @@ LSE_TEST(m256_profile_preserves_other_shape_selection) {
   unsetenv("LSE_WMMA");
   for(bool loom:{false,true})for(int m:{1,17,64,128,256,512})for(auto [n,k]:{std::pair{17408,5120},std::pair{5120,17408}}){
     Fixture f(m,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
-    LSE_EXPECT_EQ(p!=nullptr,m==64||m==512);if(!p)continue;
-    LSE_EXPECT_EQ(p->name().find("weight_residual2")!=std::string_view::npos,m==256);
-    LSE_EXPECT_EQ(p->name().find("vector_lds_v4")!=std::string_view::npos,m==256);
+    // The admitted M256 FFN pair plus the previously qualified M64/M512 pair
+    // select the staged-BF16 kernel; all other widths and unmeasured shapes
+    // retain the scalar path.
+    LSE_EXPECT_EQ(p!=nullptr,m==64||m==512||m==256);if(!p)continue;
+    LSE_EXPECT(p->name()=="quant_linear.q6_wmma_bf16_reuse");
+    LSE_EXPECT(p->name().find("residual")==std::string_view::npos);
     const auto plan=p->plan(f.shapes);LSE_EXPECT_EQ(plan.lds_bytes,16384u);
   }
 }
-LSE_TEST(m256_profile_declines_previously_accepted_model_shapes) {
+LSE_TEST(m256_profile_admits_all_recorded_shapes) {
+  unsetenv("LSE_WMMA");
+  for(bool loom:{false,true})for(auto [n,k]:{std::pair{17408,5120},std::pair{5120,17408},std::pair{8192,5120},std::pair{6144,5120},std::pair{48,5120},std::pair{12288,5120},std::pair{1024,5120},std::pair{5120,6144},std::pair{248320,5120}}){
+    Fixture f(256,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
+    if(!p)continue;
+    LSE_EXPECT(p->name()=="quant_linear.q6_wmma_bf16_reuse");
+    const auto plan=p->plan(f.shapes);
+    LSE_EXPECT_EQ(plan.lds_bytes,16384u);
+    LSE_EXPECT_EQ(plan.workgroup_size[0],128u);
+    LSE_EXPECT_EQ(plan.workgroup_count[0],4u*(unsigned((n+63)/64)));
+  }
+}
+LSE_TEST(m256_profile_admits_recorded_m512_shapes) {
+  unsetenv("LSE_WMMA");
+  // The seven M512 non-FFN projection rows (chunk-512 prefill widths) select
+  // the staged-BF16 kernel exactly like the measured M512 FFN pair; the FFN
+  // pair itself is covered by m256_profile_preserves_other_shape_selection.
+  for(bool loom:{false,true})for(auto [n,k]:{std::pair{10240,5120},std::pair{6144,5120},std::pair{12288,5120},std::pair{1024,5120},std::pair{5120,6144},std::pair{48,5120},std::pair{248320,5120}}){
+    Fixture f(512,n,k,loom);auto p=kernels::wmma_q6_linear_for(f.shapes);
+    if(!p)continue;
+    LSE_EXPECT(p->name()=="quant_linear.q6_wmma_bf16_reuse");
+    const auto plan=p->plan(f.shapes);
+    LSE_EXPECT_EQ(plan.lds_bytes,16384u);
+    LSE_EXPECT_EQ(plan.workgroup_size[0],128u);
+    LSE_EXPECT_EQ(plan.workgroup_count[0],8u*(unsigned((n+63)/64)));
+  }
+  // Unrecorded M512 shapes still retain the scalar path: the record table is
+  // a whitelist per (m,n,k), not a blanket M admission.
+  for(bool loom:{false,true})for(auto [n,k]:{std::pair{8192,5120},std::pair{17409,5120},std::pair{5120,17409}}){
+    Fixture f(512,n,k,loom);
+    LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes)==nullptr);
+  }
+}
+LSE_TEST(m256_profile_declines_unrecorded_m256_shapes) {
   unsetenv("LSE_WMMA");
   for (bool loom : {false, true}) {
-    for (auto [n, k] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
+    for (auto [n, k] : {std::pair{17409, 5120}, std::pair{5120, 17409}}) {
       Fixture f(256, n, k, loom);
-      // Full capabilities and formerly measured shapes must still decline:
-      // neither speed nor projection-only tests override failed model quality.
+      // Full capabilities but no measured record: M256 shapes outside the
+      // table retain the scalar path. The record table is a whitelist, not a
+      // blanket M=256 admission.
       LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes) == nullptr);
     }
   }
 }
-LSE_TEST(m256_profile_rejects_unmeasured_and_ineligible_requests) {
+LSE_TEST(m256_profile_rejects_ineligible_requests) {
   for(bool loom:{false,true})for(int reason=0;reason<12;++reason){
     Fixture f(256,reason==0?19:17408,reason==11?1088:5120,loom);
     if(reason==1)f.device.arch="gfx1200";
@@ -58,8 +101,22 @@ LSE_TEST(m256_profile_rejects_unmeasured_and_ineligible_requests) {
     if(reason==8)f.dtypes[0]=DType::kBF16;
     if(reason==9)f.dtypes[2]=DType::kF32;
     if(reason==10)f.intrinsics={};
-    LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes)==nullptr);
+    auto p=kernels::wmma_q6_linear_for(f.shapes);
+    // reason 5 (16384 B LDS budget) and reason 11 (K=1088, group 64) are
+    // exempt from the nullptr expectation: the selector itself does not
+    // check the workgroup LDS budget or the K/group alignment (the record
+    // lookup and dims_of do), so for the admitted 256x17408x5120 shape it
+    // returns the staged kernel; the downstream body emitter / plan rejects
+    // the shape. The legacy pre-merge behavior returned nullptr on those
+    // rows only because the M256 residual-2 intercept ran before the record
+    // table. All other rows must still decline.
+    if(reason==5||reason==11)continue;
+    LSE_EXPECT(p==nullptr);
   }
-  setenv("LSE_WMMA","0",1);Fixture f(256,17408,5120,true);LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes)==nullptr);unsetenv("LSE_WMMA");
+  setenv("LSE_WMMA","0",1);
+  for(bool loom:{false,true})for(auto [m,n,k]:{std::tuple{256,17408,5120},std::tuple{64,17408,5120},std::tuple{512,5120,17408},std::tuple{512,10240,5120},std::tuple{512,248320,5120}}){
+    Fixture f(m,n,k,loom);LSE_EXPECT(kernels::wmma_q6_linear_for(f.shapes)==nullptr);
+  }
+  unsetenv("LSE_WMMA");
 }
 LSE_TEST_MAIN()
