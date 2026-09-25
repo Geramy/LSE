@@ -677,6 +677,44 @@ class Backend {
     return derived().copy_d2h_impl(src, dst, bytes, src_offset);
   }
 
+  // A small device->host readback of `bytes` at `src_offset`, ordered after
+  // everything already queued on `stream` (the producer stream), and the host
+  // blocks until the copy itself retires -- WITHOUT draining any other stream.
+  // A stream's own timeline orders the copy behind the producer, so the wait
+  // is for this transfer and nothing else. The default drains the whole device
+  // first (the safe-but-slow path), so a backend with no stream-ordered blit
+  // is unaffected; the HRX backend overrides it with the same-stream blit that
+  // the decode token readback (a 4-byte argmax) uses.
+  Status copy_d2h_ordered(const DeviceBuffer& src, void* dst, std::size_t bytes,
+                          std::size_t src_offset, Stream stream) {
+    if constexpr (requires(Derived& d) {
+                    d.copy_d2h_ordered_impl(src, dst, bytes, src_offset, stream);
+                  }) {
+      return derived()
+          .copy_d2h_ordered_impl(src, dst, bytes, src_offset, stream);
+    }
+    LSE_RETURN_IF_ERROR(derived().synchronize_impl());
+    return derived().copy_d2h_impl(src, dst, bytes, src_offset);
+  }
+
+  // A host->device write of `bytes` into `dst` at `dst_offset`, submitted on
+  // `stream` WITHOUT the leading whole-device drain the generic copy_h2d
+  // performs. The caller must have ordered `stream` behind every producer of
+  // the destination bytes (for the decode token poke that is the blit the
+  // stream just retired, on the same stream). The generic copy_h2d keeps its
+  // drain; this is the escape hatch for a caller that just drained the one
+  // stream that owns the write.
+  Status copy_h2d_ordered(const void* src, DeviceBuffer& dst, std::size_t bytes,
+                          std::size_t dst_offset, Stream stream) {
+    if constexpr (requires(Derived& d) {
+                    d.copy_h2d_ordered_impl(src, dst, bytes, dst_offset, stream);
+                  }) {
+      return derived()
+          .copy_h2d_ordered_impl(src, dst, bytes, dst_offset, stream);
+    }
+    return derived().copy_h2d_impl(src, dst, bytes, dst_offset);
+  }
+
   // One device's memory to another's, without the bytes touching host memory.
   //
   // Issued on this backend, which is the destination's; `src` belongs to the
@@ -981,6 +1019,32 @@ class IBackend {
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,
                           std::size_t src_offset) = 0;
+  // A small device->host readback of `bytes` at `src_offset`, ordered after
+  // everything already queued on `stream` (the producer stream), with the
+  // host blocking until the copy itself retires -- WITHOUT draining any other
+  // stream. The stream's own timeline orders the copy behind the producer, so
+  // the wait is for this transfer and nothing else. The default drains the
+  // whole device first (the safe-but-slow path), so a backend with no
+  // stream-ordered blit is unaffected; the HRX backend overrides it with the
+  // same-stream blit the decode token readback (a 4-byte argmax) uses.
+  virtual Status copy_d2h_ordered(const DeviceBuffer& src, void* dst,
+                                  std::size_t bytes, std::size_t src_offset,
+                                  Stream stream) {
+    LSE_RETURN_IF_ERROR(synchronize());
+    return copy_d2h(src, dst, bytes, src_offset);
+  }
+  // A host->device write of `bytes` into `dst` at `dst_offset`, submitted on
+  // `stream` WITHOUT the leading whole-device drain the generic copy_h2d
+  // performs. The caller must have ordered `stream` behind every producer of
+  // the destination bytes (for the decode token poke that is the blit the
+  // stream just retired, on the same stream). The default is the drained
+  // copy_h2d; the HRX backend overrides it with the stream-ordered blit.
+  virtual Status copy_h2d_ordered(const void* src, DeviceBuffer& dst,
+                                  std::size_t bytes, std::size_t dst_offset,
+                                  Stream stream) {
+    (void)stream;
+    return copy_h2d(src, dst, bytes, dst_offset);
+  }
   // A peer copy the two streams order between themselves: it runs after what
   // the producer has queued and the consumer's next work runs after it, with
   // the host in neither edge. A backend that cannot say that falls back to the

@@ -138,6 +138,44 @@ struct Scheduler::Impl {
   std::vector<std::unordered_map<std::uint32_t, backend::DeviceBuffer>>
       grid_bars;
 
+  // D3: replay binding memo. On a replayed step the group list, kernel handle,
+  // dims, constants and pointer-table flag are all fixed (the groups are the
+  // retained program's own objects and emission_identity is a pure function
+  // of them once the env is latched, D5), so the per-dispatch re-computation
+  // of emission_identity (two full string-walk string builds per group per
+  // step) and the emit_cache_ source copy collapse to a map lookup. The entry
+  // stores derived values only -- never node state -- and the per-dispatch
+  // binding loop still runs, because n->buffer can legitimately differ per
+  // step (a regrown KV pool swaps buffers, the token slot is re-poked).
+  // Keyed (FusionGroup*, generation): generation is bumped at every
+  // Program::retain/destroy, so a freed+reallocated group pointer in a new
+  // program is a different entry. LSE_REPLAY_MEMO=0 disables it.
+  struct ReplayBinding {
+    std::uint64_t ident = 0;
+    std::uint64_t generation = 0;
+    backend::KernelHandle handle{};
+    std::string entry_name;
+    std::uint32_t workgroup_count[3] = {1, 1, 1};
+    std::uint32_t workgroup_size[3] = {1, 1, 1};
+    std::uint32_t subgroup_size = 0;
+    std::uint32_t constants_total_bytes = 0;
+    std::string constants_name;
+    std::uint8_t constants_size = 0;
+    std::vector<std::byte> constants;
+    bool pointer_table = false;
+    bool persist_grid = false;
+    std::vector<NodePtr> binding_order;
+  };
+  std::unordered_map<const FusionGroup*, ReplayBinding> replay_bindings;
+  // The per-dispatch LSE_PROFILE_DISPATCH key is entry_name + shapes + dims,
+  // all stable within a generation: build it once per group on replay.
+  std::unordered_map<const FusionGroup*, std::string> replay_profile_keys;
+  // D4 latch: which (program, generation) the reshape-window pre-check has
+  // been run for. A replay of the same bound program skips the per-step topo
+  // walk until the next retain/destroy bumps the generation.
+  const Program* reshape_precheck_program = nullptr;
+  std::uint64_t reshape_precheck_generation = 0;
+
   Program program;
   StreamPlan plan;
   std::vector<backend::StreamEvent> events;
@@ -164,6 +202,9 @@ struct Scheduler::Impl {
                        " kernel compiler");
     }
     jit = std::make_unique<JitCache>(devices);
+    // A rebuilt JitCache invalidates every handle the memo stored.
+    replay_bindings.clear();
+    replay_profile_keys.clear();
     return OkStatus();
   }
   // Whether each member has queued work we have not waited on. See make_local.
@@ -376,7 +417,9 @@ Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
 
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
-                                     std::size_t member) {
+                                     std::size_t member,
+                                     std::uint64_t generation,
+                                     bool replayed) {
   backend::IBackend& be = devices_.device(member);
   // The dialect this run asked for if this member declares it, and this
   // member's own first choice otherwise. Both halves come from the one
@@ -390,47 +433,118 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   }
   LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member, *tc));
 
-  const std::uint64_t ident =
-      emitter->cache_key(group, be.device_info());
-
-  const auto t_emit = SpanClock::now();
-  auto emitted = emitter->emit(group, be.device_info());
-  const auto t_emitted = SpanClock::now();
-  trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
-  if (!emitted.ok()) return emitted.status();
-
-  // Compile only when this kernel is not already loaded for this device.
-  // Disk miss / source change / arch change still go through get_or_compile.
-  //
-  // The compiler runs INSIDE get_or_compile, which is inside this span, so its
-  // own measurement is subtracted back out rather than counted twice. Without
-  // that, a cold prefill reported 3113 ms of "emit" that was 98.5% compile, and
-  // adding the report's emit line to its jit line counted the same milliseconds
-  // three times.
-  const std::uint64_t compile_before = impl_->jit->stats().compile_ns;
-  dump_hip_source(*emitted, ident);
-  backend::KernelHandle launched;
-  Status jit_status = OkStatus();
-  if (const backend::KernelHandle* cached =
-          impl_->jit->try_get(member, ident, emitted->dialect)) {
-    launched = *cached;
-  } else {
-    auto kernel = impl_->jit->get_or_compile(member, ident, *emitted);
-    if (kernel.ok()) {
-      launched = kernel.release();
-    } else {
-      jit_status = kernel.status();
+  // D3: on a replayed step the group's identity, handle, dims, constants and
+  // launch flags are fixed (the group is the retained program's own object and
+  // emission_identity is pure in its inputs once the env is latched, D5), so
+  // the per-dispatch emission_identity string builds and emit_cache_ source
+  // copy collapse to a map lookup. The memo stores derived values only; the
+  // binding loop below still runs on every dispatch because n->buffer can
+  // differ per step. LSE_REPLAY_MEMO=0 disables the memo (current behavior).
+  static const bool replay_memo = [] {
+    const char* v = std::getenv("LSE_REPLAY_MEMO");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  const Impl::ReplayBinding* rb = nullptr;
+  EmittedKernel emitted;
+  std::uint64_t ident = 0;
+  backend::KernelHandle launched{};
+  bool memo_hit = false;
+  if (replayed && replay_memo) {
+    const auto found = impl_->replay_bindings.find(&group);
+    if (found != impl_->replay_bindings.end() &&
+        found->second.generation == generation) {
+      rb = &found->second;
+      memo_hit = true;
     }
   }
-  const auto t_resolved = SpanClock::now();
-  const std::uint64_t compiled =
-      impl_->jit->stats().compile_ns - compile_before;
-  const std::uint64_t looked_up = elapsed_ns(t_emitted, t_resolved);
-  trace_.spans.jit_compile.add(compiled);
-  trace_.spans.jit_lookup.add(looked_up > compiled ? looked_up - compiled : 0);
-  LSE_RETURN_IF_ERROR(jit_status);
+  if (memo_hit) {
+    ident = rb->ident;
+    launched = rb->handle;
+    emitted.dialect = tc->dialect;
+    emitted.entry_name = rb->entry_name;
+    std::memcpy(emitted.dims.workgroup_count, rb->workgroup_count, 12);
+    std::memcpy(emitted.dims.workgroup_size, rb->workgroup_size, 12);
+    emitted.dims.subgroup_size = rb->subgroup_size;
+    emitted.constants.fields.clear();
+    if (!rb->constants_name.empty()) {
+      emitted.constants.add(rb->constants_name, rb->constants_size);
+    }
+    emitted.pointer_table = rb->pointer_table;
+    emitted.persist_grid = rb->persist_grid;
+    emitted.binding_order = rb->binding_order;
+    trace_.spans.jit_lookup.add(elapsed_ns(SpanClock::now(), SpanClock::now()));
+  } else {
+    ident = emitter->cache_key(group, be.device_info());
 
-  SpanTimer bind_span(trace_.spans.bind, t_resolved);
+    const auto t_emit = SpanClock::now();
+    auto emitted_res = emitter->emit(group, be.device_info());
+    const auto t_emitted = SpanClock::now();
+    trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
+    if (!emitted_res.ok()) return emitted_res.status();
+    emitted = std::move(*emitted_res);
+
+    // Compile only when this kernel is not already loaded for this device.
+    // Disk miss / source change / arch change still go through get_or_compile.
+    //
+    // The compiler runs INSIDE get_or_compile, which is inside this span, so
+    // its own measurement is subtracted back out rather than counted twice.
+    // Without that, a cold prefill reported 3113 ms of "emit" that was 98.5%
+    // compile, and adding the report's emit line to its jit line counted the
+    // same milliseconds three times.
+    const std::uint64_t compile_before = impl_->jit->stats().compile_ns;
+    dump_hip_source(emitted, ident);
+    Status jit_status = OkStatus();
+    if (const backend::KernelHandle* cached =
+            impl_->jit->try_get(member, ident, emitted.dialect)) {
+      launched = *cached;
+    } else {
+      auto kernel = impl_->jit->get_or_compile(member, ident, emitted);
+      if (kernel.ok()) {
+        launched = kernel.release();
+      } else {
+        jit_status = kernel.status();
+      }
+    }
+    const auto t_resolved = SpanClock::now();
+    const std::uint64_t compiled =
+        impl_->jit->stats().compile_ns - compile_before;
+    const std::uint64_t looked_up = elapsed_ns(t_emitted, t_resolved);
+    trace_.spans.jit_compile.add(compiled);
+    trace_.spans.jit_lookup.add(looked_up > compiled ? looked_up - compiled : 0);
+    LSE_RETURN_IF_ERROR(jit_status);
+
+    // Populate (or refresh) the memo so every replay of this group in this
+    // generation skips the identity builds above. The build pass is where the
+    // entry is written: replays find it.
+    if (!replayed && !group.nodes.empty()) {
+      Impl::ReplayBinding fresh;
+      fresh.ident = ident;
+      fresh.generation = generation;
+      fresh.handle = launched;
+      fresh.entry_name = emitted.entry_name;
+      std::memcpy(fresh.workgroup_count, emitted.dims.workgroup_count, 12);
+      std::memcpy(fresh.workgroup_size, emitted.dims.workgroup_size, 12);
+      fresh.subgroup_size = emitted.dims.subgroup_size;
+      fresh.constants_total_bytes = emitted.constants.total_bytes;
+      fresh.constants_name = emitted.constants.fields.empty()
+                                  ? std::string{}
+                                  : emitted.constants.fields.front().name;
+      fresh.constants_size = emitted.constants.fields.empty()
+                                 ? 0
+                                 : emitted.constants.fields.front().size;
+      fresh.pointer_table = emitted.pointer_table;
+      fresh.persist_grid = emitted.persist_grid;
+      fresh.binding_order = emitted.binding_order;
+      impl_->replay_bindings.emplace(&group, std::move(fresh));
+      if (impl_->replay_bindings.size() > 4096) {
+        impl_->replay_bindings.clear();
+        impl_->replay_profile_keys.clear();
+      }
+    }
+  }
+
+  const auto t_bind = SpanClock::now();
+  SpanTimer bind_span(trace_.spans.bind, t_bind);
 
   for (const NodePtr& n : group.nodes) {
     if (!n || n->prim == nullptr) continue;
@@ -442,7 +556,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     }
     n->buffer = src->buffer;
   }
-  for (const NodePtr& n : emitted->binding_order) {
+  for (const NodePtr& n : emitted.binding_order) {
     if (!n || n->prim == nullptr) continue;
     const int a = n->prim->inplace_input();
     if (a < 0 || static_cast<std::size_t>(a) >= n->inputs.size()) continue;
@@ -461,8 +575,8 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
 
   // Inputs must already be materialized; outputs need a buffer to write into.
   std::vector<backend::BufferRef> bindings;
-  bindings.reserve(emitted->binding_order.size());
-  for (const NodePtr& n : emitted->binding_order) {
+  bindings.reserve(emitted.binding_order.size());
+  for (const NodePtr& n : emitted.binding_order) {
     // A constant carries its value in attrs and is usually inlined as a
     // literal, which leaves it "materialized" with no buffer at all. When a
     // later group binds it as a buffer instead, that fresh allocation holds
@@ -571,7 +685,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     elements = group.nodes.back()->element_count();
   }
 
-  std::vector<std::byte> constants(emitted->constants.total_bytes);
+  std::vector<std::byte> constants(emitted.constants.total_bytes);
   if (constants.size() < sizeof(std::uint32_t)) {
     return LSE_ERROR(kInternal, "constants block has no room for the count");
   }
@@ -580,7 +694,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
 
   backend::DeviceBuffer table_buf;
   std::vector<backend::BufferRef> table_bindings;
-  if (emitted->pointer_table) {
+  if (emitted.pointer_table) {
     std::vector<void*> ptrs(bindings.size(), nullptr);
     for (std::size_t i = 0; i < bindings.size(); ++i) {
       auto p = be.device_pointer(*bindings[i].buffer);
@@ -599,7 +713,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     table_bindings.back().buffer = &impl_->phase_tables.back();
   }
 
-  if (emitted->persist_grid) {
+  if (emitted.persist_grid) {
     if (impl_->grid_bars.size() <= stream.index) {
       impl_->grid_bars.resize(stream.index + 1);
     }
@@ -615,7 +729,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // Keyed by width, so kernels that agree share and kernels that differ do
     // not. Zeroed once per buffer rather than per dispatch: a host copy before
     // every persistent launch cost more than the launches it saved.
-    const std::uint32_t width = emitted->dims.workgroup_count[0];
+    const std::uint32_t width = emitted.dims.workgroup_count[0];
     auto& bars = impl_->grid_bars[stream.index];
     backend::DeviceBuffer& bar_buf = bars[width];
     if (!bar_buf.valid()) {
@@ -630,7 +744,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   }
 
   backend::DispatchArgs args;
-  args.bindings = emitted->pointer_table ? table_bindings : bindings;
+  args.bindings = emitted.pointer_table ? table_bindings : bindings;
   args.constants = constants;
 
   // Read ONCE. getenv walks the environment block, and this sits in the
@@ -638,17 +752,17 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   // every run, including the runs with no debugging enabled at all.
   static const char* const dump_entry = std::getenv("LSE_DUMP_ENTRY");
   if (const char* want = dump_entry) {
-    if (emitted->entry_name.find(want) != std::string::npos) {
-      std::fprintf(stderr, "--- %s ---\n%s---\n", emitted->entry_name.c_str(),
-                   emitted->source.c_str());
+    if (emitted.entry_name.find(want) != std::string::npos) {
+      std::fprintf(stderr, "--- %s ---\n%s---\n", emitted.entry_name.c_str(),
+                   emitted.source.c_str());
     }
   }
   static const bool trace_dispatch = std::getenv("LSE_TRACE_DISPATCH") != nullptr;
   if (trace_dispatch) {
     std::fprintf(stderr, "dispatch %s phase=%d count=%u wg=%u x %u |",
-                 emitted->entry_name.c_str(), (int)group.is_phase, count,
-                 emitted->dims.workgroup_count[0], emitted->dims.workgroup_size[0]);
-    for (const NodePtr& n : emitted->binding_order) {
+                 emitted.entry_name.c_str(), (int)group.is_phase, count,
+                 emitted.dims.workgroup_count[0], emitted.dims.workgroup_size[0]);
+    for (const NodePtr& n : emitted.binding_order) {
       std::fprintf(stderr, " %s%s", std::string(to_string(n->kind)).c_str(),
                    n->shape.to_string().c_str());
     }
@@ -691,7 +805,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   }
   impl_->member_dirty[member] = 1;
   const Status submitted = be.launch(
-      launched, emitted->dims, args,
+      launched, emitted.dims, args,
       backend::DispatchTarget{stream, devices_.residency(member), {}});
   const auto after_submit = SpanClock::now();
   const std::uint64_t submit_ns = elapsed_ns(t_launch, after_submit);
@@ -705,20 +819,36 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     trace_.spans.host_wait.add(elapsed_ns(after_submit, after_completion));
   }
   if (profiling.mode != detail::DispatchProfileMode::kOff) {
-    std::string key = emitted->entry_name + " anchor=" +
-        std::string(to_string(group.anchor)) + " phase=" +
-        std::to_string(group.is_phase) + " member=" + std::to_string(member) +
-        " stream=" + std::to_string(stream.index) + " grid=";
-    for (std::size_t i = 0; i < 3; ++i) {
-      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_count[i]);
+    // D3: on a memo-hit replay the key is entry_name + shapes + dims, all
+    // stable within a generation, so build it once per group instead of per
+    // dispatch. A memo miss (the build pass, or LSE_REPLAY_MEMO=0) builds it
+    // per dispatch exactly as before.
+    std::string key;
+    if (memo_hit) {
+      auto it = impl_->replay_profile_keys.find(&group);
+      if (it != impl_->replay_profile_keys.end()) {
+        key = it->second;
+      }
     }
-    key += " wg=";
-    for (std::size_t i = 0; i < 3; ++i) {
-      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_size[i]);
-    }
-    for (const NodePtr& n : emitted->binding_order) {
-      key += " " + std::string(to_string(n->kind)) + n->shape.to_string() +
-             ":" + std::string(to_string(n->dtype));
+    if (key.empty()) {
+      key = emitted.entry_name + " anchor=" +
+          std::string(to_string(group.anchor)) + " phase=" +
+          std::to_string(group.is_phase) + " member=" + std::to_string(member) +
+          " stream=" + std::to_string(stream.index) + " grid=";
+      for (std::size_t i = 0; i < 3; ++i) {
+        key += (i == 0 ? "" : "x") + std::to_string(emitted.dims.workgroup_count[i]);
+      }
+      key += " wg=";
+      for (std::size_t i = 0; i < 3; ++i) {
+        key += (i == 0 ? "" : "x") + std::to_string(emitted.dims.workgroup_size[i]);
+      }
+      for (const NodePtr& n : emitted.binding_order) {
+        key += " " + std::string(to_string(n->kind)) + n->shape.to_string() +
+               ":" + std::string(to_string(n->dtype));
+      }
+      if (replayed && replay_memo) {
+        impl_->replay_profile_keys.emplace(&group, key);
+      }
     }
     profiling.profile.record(std::move(key), submit_ns, completion_ns,
                               predrain_ns, completed.ok());
@@ -729,7 +859,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   // buffer, so a kernel's inputs and outputs can be compared across builds.
   static const char* const dump_buffers = std::getenv("LSE_DUMP_BUFFERS");
   if (const char* want = dump_buffers) {
-    if (emitted->entry_name.find(want) != std::string::npos) {
+    if (emitted.entry_name.find(want) != std::string::npos) {
       (void)be.synchronize();
       std::size_t bi = 0;
       for (const backend::BufferRef& ref : bindings) {
@@ -739,7 +869,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
         if (be.copy_d2h(*ref.buffer, h.data(), h.size() * sizeof(float), ref.offset).ok()) {
           if (const char* dir = std::getenv("LSE_DUMP_BUFFERS_DIR")) {
             static std::size_t seq = 0;
-            const std::string path = std::string(dir) + "/" + emitted->entry_name +
+            const std::string path = std::string(dir) + "/" + emitted.entry_name +
                                      "_" + std::to_string(seq / bindings.size()) +
                                      "_b" + std::to_string(bi) + ".bin";
             ++seq;
@@ -751,7 +881,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
           double sum = 0.0, asum = 0.0;
           for (float v : h) { sum += v; asum += std::abs(static_cast<double>(v)); }
           std::fprintf(stderr, "[buf] %s b%zu n=%zu sum=%.9g abs=%.9g first=%.6g,%.6g,%.6g,%.6g\n",
-                       emitted->entry_name.c_str(), bi, h.size(), sum, asum,
+                       emitted.entry_name.c_str(), bi, h.size(), sum, asum,
                        h.size() > 0 ? h[0] : 0.f, h.size() > 1 ? h[1] : 0.f,
                        h.size() > 2 ? h[2] : 0.f, h.size() > 3 ? h[3] : 0.f);
         }
@@ -1044,30 +1174,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   SpanTimer setup_span(trace_.spans.schedule);
   LSE_RETURN_IF_ERROR(release_phase_tables());
 
-  const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
-  // Views must be valid before partitioning: a device-only view group may
-  // require no dispatch at all, so neither a kernel nor the host interpreter
-  // is guaranteed to validate it later.
-  for (const NodePtr& node : order) {
-    if (node->kind != OpKind::kReshape) continue;
-    if (node->inputs.size() != 1 || !node->inputs[0]) {
-      return LSE_ERROR(kInvalidArgument, "reshape requires one input");
-    }
-    const Node& source = *node->inputs[0];
-    if (source.dtype != node->dtype ||
-        source.element_count() != node->element_count()) {
-      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
-    }
-    const std::size_t bytes =
-        dtype_storage_bytes(node->dtype, node->element_count());
-    if (source.materialized && source.buffer.valid() &&
-        (bytes == 0 || bytes > source.buffer.size_bytes)) {
-      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
-    }
-  }
-
-
-  std::vector<FusionGroup> phase_groups;
+  std::vector<NodePtr> order;
   bool replayed = false;
   if (device_first && rec.holds(roots) && !rec.groups().empty()) {
     bool ready = !roots.empty();
@@ -1093,6 +1200,60 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     if (trace_.phase_groups == 0) trace_.phase_groups = 1;
     trace_.phase_ideal_launches = 1;
   }
+  // D4: on a replay the retained program's groups are about to run, so the
+  // per-step topo walk (Partitioner::unmaterialized -> topo_visit over the
+  // whole decode DAG) exists only to feed the reshape-window pre-check below.
+  // That check can only fail if a reshape's source buffer is too small for
+  // its view, and a retained source buffer is only ever swapped for a LARGER
+  // pool at a regrow -- which invalidates the KV leaves and rebuilds the
+  // program (a new generation). So once the check passes for the program
+  // currently bound, it cannot start failing on a replay of it: latch the
+  // check per (program, generation) and skip the walk on replays until the
+  // next retain/destroy. LSE_REPLAY_TOPO=0 forces the walk on every step
+  // (current behavior). A model-owned program (decode's head program, the
+  // hidden-state slot) is retained once per shape and then only replayed, so
+  // this removes the walk from every decode step. The build path keeps the
+  // walk unconditionally: it needs `order` for retain, and a failure there is
+  // the real pre-check.
+  static const bool replay_topo_skip = [] {
+    const char* v = std::getenv("LSE_REPLAY_TOPO");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  if (!(replayed && replay_topo_skip &&
+        impl_->reshape_precheck_program == &rec &&
+        impl_->reshape_precheck_generation == rec.generation())) {
+    order = Partitioner::unmaterialized(roots);
+  }
+  // Views must be valid before partitioning: a device-only view group may
+  // require no dispatch at all, so neither a kernel nor the host interpreter
+  // is guaranteed to validate it later. Skipped on a latched replay: the
+  // same nodes and the same (larger-or-equal) buffers were checked when the
+  // latch was set.
+  if (!order.empty()) {
+    for (const NodePtr& node : order) {
+      if (node->kind != OpKind::kReshape) continue;
+      if (node->inputs.size() != 1 || !node->inputs[0]) {
+        return LSE_ERROR(kInvalidArgument, "reshape requires one input");
+      }
+      const Node& source = *node->inputs[0];
+      if (source.dtype != node->dtype ||
+          source.element_count() != node->element_count()) {
+        return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
+      }
+      const std::size_t bytes =
+          dtype_storage_bytes(node->dtype, node->element_count());
+      if (source.materialized && source.buffer.valid() &&
+          (bytes == 0 || bytes > source.buffer.size_bytes)) {
+        return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
+      }
+    }
+  }
+  if (replayed && replay_topo_skip) {
+    impl_->reshape_precheck_program = &rec;
+    impl_->reshape_precheck_generation = rec.generation();
+  }
+
+  std::vector<FusionGroup> phase_groups;
 
   // The build: what groups this step is made of. A replay reuses the retained
   // ones and pays none of it, which is why this and `schedule` are two spans
@@ -1622,7 +1783,8 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           if (!st.ok()) break;
           if (seen != nullptr) *seen = j;
         }
-        if (st.ok()) st = try_dispatch_group(g, on, gm);
+        if (st.ok()) st = try_dispatch_group(g, on, gm, rec.generation(),
+                                             replayed);
         // A joined run the emitter cannot express is not a reason to abandon
         // the phase: its members are independent by construction, so each one
         // still dispatches alone. Splitting costs one launch per member;
@@ -1638,7 +1800,8 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
             one.inputs = n->inputs;
             one.anchor = n->kind;
             one.anchor_class = n->fclass;
-            each = try_dispatch_group(one, on, gm);
+            each = try_dispatch_group(one, on, gm, rec.generation(),
+                                      replayed);
             if (!each.ok()) break;
             ++trace_.device_groups;
             ++trace_.kernels_launched;
@@ -1798,7 +1961,8 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       }
       const backend::Stream on =
           devices_.stream_for(gm).value_or(backend::kDefaultStream);
-      Status dispatched = try_dispatch_group(g, on, gm);
+      Status dispatched =
+          try_dispatch_group(g, on, gm, rec.generation(), false);
       if (dispatched.ok() && devices_.size() > 1) {
         auto ev = devices_.device(gm).record_event(on);
         if (ev.ok()) last_issue[gm] = ev.release();

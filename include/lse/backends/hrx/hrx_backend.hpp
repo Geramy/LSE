@@ -96,6 +96,16 @@ class HrxBackend : public Backend<HrxBackend> {
                         std::size_t dst_offset);
   Status copy_d2h_impl(const DeviceBuffer& src, void* dst, std::size_t bytes,
                        std::size_t src_offset);
+  // The decode readback: a 4-byte blit ordered on the producer's own stream,
+  // retired by a wait of that one stream. No cross-stream edge, no drain of
+  // the other streams. See copy_d2h_impl for the qualified drain path that
+  // LSE_DECODE_BLIT=0 falls back to.
+  Status copy_d2h_ordered_impl(const DeviceBuffer& src, void* dst,
+                               std::size_t bytes, std::size_t src_offset,
+                               Stream stream);
+  Status copy_h2d_ordered_impl(const void* src, DeviceBuffer& dst,
+                               std::size_t bytes, std::size_t dst_offset,
+                               Stream stream);
 
   Result<KernelHandle> load_executable_impl(std::string_view name,
                                             std::span<const std::byte> code_object);

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 
 #include "lse/backend/backend.hpp"
 #include "lse/graph/graph.hpp"
@@ -32,5 +33,10 @@ const void* host_bytes(const Node& node) noexcept;
 // host memory, so the CPU backend pays nothing for them.
 Status sync_to_device(Node& node, backend::IBackend& backend);
 Status sync_from_device(Node& node, backend::IBackend& backend);
+
+// D1 policy latch, shared by the Generator (which side the token readback and
+// poke take) and the HRX backend (which side the blit override takes). Latched
+// once for the process; LSE_DECODE_BLIT=0 restores the qualified drain path.
+[[nodiscard]] bool decode_blit_ordered() noexcept;
 
 }  // namespace lse::graph::interpreter

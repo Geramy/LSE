@@ -173,6 +173,22 @@ Status Generator::poke_decode_ids(std::uint32_t token) {
   n.materialized = true;
   // No upload here: the forward replay pokes the slot (its own 4-byte H2D)
   // and a rebuild syncs it when the embedding group binds it.
+  //
+  // D1: when the ordered readback (the blit path) is on, this step's blit
+  // has already retired the step stream, and the only work that wrote
+  // decode_ids_ this step is the blit's own ordering predecessor on that
+  // same stream -- so the poke's H2D needs no whole-device drain and goes
+  // through copy_h2d_ordered (stream-ordered, no leading synchronize).
+  // It stays ordered after ALL of the step's dispatches: the blit waited
+  // the stream, and this write is submitted on the same stream behind it.
+  // The LSE_DECODE_BLIT=0 (drain) path keeps the old sync_to_device,
+  // whose copy_h2d opens with the qualified synchronize_impl.
+  if (graph::interpreter::decode_blit_ordered()) {
+    LSE_RETURN_IF_ERROR(sched->backend().copy_h2d_ordered(
+        n.host_mirror.data(), n.buffer, bytes, 0, backend::kDefaultStream));
+    n.device_dirty = true;
+    n.host_dirty = false;
+  }
   return OkStatus();
 }
 
@@ -219,14 +235,39 @@ Result<graph::Array> Generator::decode_head(Session& session,
     if (n) n->materialized = false;
   }
   const graph::NodePtr roots[] = {root.node()};
-  LSE_RETURN_IF_ERROR(sched->eval(roots, true, &head_.program));
+  // D1: the greedy 4-byte argmax readback goes through the ordered blit
+  // (greedy_step below), which retires the step stream itself. The blanket
+  // pull_host=true path -- synchronize() over EVERY stream followed by
+  // sync_from_device's own drain -- is three full-device drains around a
+  // 4-byte value, and it never runs on decode when the blit is on.
+  const bool pull = !greedy || !graph::interpreter::decode_blit_ordered();
+  LSE_RETURN_IF_ERROR(sched->eval(roots, pull, &head_.program));
   return root;
 }
 
 Result<std::uint32_t> Generator::greedy_step(Session& session,
                                              std::uint32_t token) {
   LSE_ASSIGN_OR(Array pick, decode_head(session, token, true));
-  const float id = graph::interpreter::load_element(*pick.node(), 0);
+  graph::Node& n = *pick.node();
+  // D1: read the argmax through the stream-ordered blit when the device
+  // backend offers one. The blit is enqueued behind everything the step
+  // recorded on the step stream (argmax.final is the step's last dispatch),
+  // retires that one stream, and copies the 4 bytes into pinned staging --
+  // replacing the eval drain + copy_d2h drain of the pull path. The node's
+  // device_dirty flag stays set (we copied a copy; the device still owns
+  // the value), so no later host read can mistake the mirror for fresh.
+  if (graph::interpreter::decode_blit_ordered()) {
+    graph::Scheduler* sched = graph::default_scheduler();
+    if (sched == nullptr) {
+      return LSE_ERROR(kInternal, "no usable backend for the argmax read");
+    }
+    float id = 0.0f;
+    LSE_RETURN_IF_ERROR(sched->backend().copy_d2h_ordered(
+        n.buffer, &id, dtype_storage_bytes(n.dtype, 1), 0,
+        backend::kDefaultStream));
+    return static_cast<std::uint32_t>(id);
+  }
+  const float id = graph::interpreter::load_element(n, 0);
   return static_cast<std::uint32_t>(id);
 }
 

@@ -343,7 +343,8 @@ class Scheduler {
   Status eval_step(std::span<const NodePtr> roots, bool pull_host,
                    Program* plan);
   Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
-                            std::size_t member);
+                            std::size_t member, std::uint64_t generation,
+                            bool replayed);
   // Which member of the set runs this group: the one already holding its
   // operands. Not a cost decision — a group whose inputs are resident on one
   // device has nowhere else to run until something moves them, and moving them

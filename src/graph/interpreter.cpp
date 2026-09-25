@@ -1491,4 +1491,17 @@ Status read_raw(const Node& node, void* dst, std::size_t bytes) {
   return OkStatus();
 }
 
+// D1 policy latch, shared by the Generator (which side the token readback
+// and poke take) and the HRX backend (which side the blit override takes).
+// Latched once: a mid-run flip would order a step's poke by a different
+// rule than its readback. LSE_DECODE_BLIT=0 restores the qualified drain
+// path (eval drain + copy_d2h drain + poke drain).
+[[nodiscard]] bool decode_blit_ordered() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("LSE_DECODE_BLIT");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+
 }  // namespace lse::graph::interpreter

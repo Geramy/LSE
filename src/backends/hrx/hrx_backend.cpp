@@ -1533,6 +1533,19 @@ Result<DeviceTimestamp> HrxBackend::sample_device_time_impl() const {
 // Grows the transfer staging buffer to at least `bytes`, in powers of two so a
 // run of increasing transfers reallocates a handful of times rather than every
 // call.
+namespace {
+// Process-latched once for the HRX side of the D1 policy (the Generator side
+// latches the same env in lse::graph::interpreter::decode_blit_ordered; the
+// two must agree, and they do because neither env is ever mutated at runtime).
+// LSE_DECODE_BLIT=0 restores the qualified drain path.
+bool decode_blit_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("LSE_DECODE_BLIT");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return enabled;
+}
+}  // namespace
 Status HrxBackend::ensure_staging(std::size_t bytes) {
 #if !LSE_HRX_LINKED
   (void)bytes;
@@ -1968,6 +1981,108 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
     unflushed_launches_[0] = 0;
     LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{0}));
     std::memcpy(out + done, staging_host_, n);
+    done += n;
+  }
+  return OkStatus();
+#endif
+}
+
+// The decode token readback (D1). The step's dispatches (including argmax.final,
+// the last group of the head program) are all queued on the step stream. This
+// blit is enqueued on THAT SAME stream, so the stream's own timeline orders it
+// behind every dispatch the step recorded: no new device-side wait edge exists
+// (the cross-stream racy/deadlock shapes documented in wait_event_impl do not
+// apply), and the host then retires the stream. hrx_stream_synchronize first
+// flushes the open command buffer (so the blit is submitted) and then waits for
+// the stream to reach its flushed head -- the blit's retirement -- while every
+// OTHER stream is untouched. That is the drain-free readback: the value read
+// below is ordered after argmax's write by stream order, not by a device-wide
+// wait. The bytes land in the backend-lifetime pinned staging buffer (the same
+// one copy_d2h/copy_h2d use), so there is no allocation on the hot path.
+Status HrxBackend::copy_d2h_ordered_impl(const DeviceBuffer& src, void* dst,
+                                         std::size_t bytes,
+                                         std::size_t src_offset,
+                                         Stream stream) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)src_offset; (void)stream;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (dst == nullptr || src.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer binding in d2h blit");
+  }
+  if (src_offset + bytes > src.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "d2h blit reads past the end of the buffer");
+  }
+  if (!decode_blit_enabled()) {
+    // Kill switch: the qualified drain path, always available.
+    return copy_d2h_impl(src, dst, bytes, src_offset);
+  }  auto the_stream = stream_at(stream.index);
+  if (!the_stream.ok()) return the_stream.status();
+  LSE_RETURN_IF_ERROR(ensure_staging(bytes));
+  LSE_SYNC_TRACE("copy_d2h_ordered %zu bytes (blit on stream %u)",
+                 bytes, stream.index);
+  const std::size_t n = std::min<std::size_t>(bytes, staging_bytes_);
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*the_stream),
+                             reinterpret_cast<hrx_buffer_t>(src.handle),
+                             src.offset + src_offset,
+                             static_cast<hrx_buffer_t>(staging_buffer_), 0, n),
+      "hrx_stream_copy_buffer (d2h ordered blit)"));
+  // Waits for the blit's retirement on THIS stream only, and flushes the open
+  // command buffer so the blit is submitted before the wait. synchronize_impl
+  // would wait EVERY stream; that is the ~1.8 ms per step this change removes.
+  LSE_RETURN_IF_ERROR(synchronize_stream_impl(stream));
+  std::memcpy(dst, staging_host_, bytes);
+  return OkStatus();
+#endif
+}
+
+// The decode token poke (D1, H2D half). The caller has just retired the step
+// stream through copy_d2h_ordered (its wait is the only edge this write needs:
+// the buffer the poke lands in was written by that same stream's last group),
+// so the whole-device drain copy_h2d_impl opens with is pure cost here -- on
+// the steady single-stream replay path the stream's other work has already
+// retired. The chunked staging path below orders the copy on the named stream
+// and retires that stream only. LSE_DECODE_BLIT=0 falls back to the qualified
+// copy_h2d_impl drain path.
+Status HrxBackend::copy_h2d_ordered_impl(const void* src, DeviceBuffer& dst,
+                                         std::size_t bytes,
+                                         std::size_t dst_offset,
+                                         Stream stream) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)dst_offset; (void)stream;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (src == nullptr || dst.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer in ordered copy_h2d");
+  }
+  if (dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange,
+                     "ordered copy_h2d writes past the end of the buffer");
+  }
+  if (!decode_blit_enabled()) {
+    return copy_h2d_impl(src, dst, bytes, dst_offset);
+  }
+  auto the_stream = stream_at(stream.index);
+  if (!the_stream.ok()) return the_stream.status();
+  LSE_SYNC_TRACE("copy_h2d_ordered %zu bytes (stream %u, no drain)",
+                 bytes, stream.index);
+  // The DMA/imported paths both open with a whole-device drain (they were
+  // written for weight loading, where the drain is correct); the decode poke
+  // uses the stream-ordered blit path only.
+  constexpr std::size_t kChunk = 32u << 20;
+  const auto* in = static_cast<const std::byte*>(src);
+  for (std::size_t done = 0; done < bytes;) {
+    const std::size_t n = std::min(kChunk, bytes - done);
+    LSE_RETURN_IF_ERROR(ensure_staging(n));
+    std::memcpy(staging_host_, in + done, n);
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*the_stream),
+                               static_cast<hrx_buffer_t>(staging_buffer_), 0,
+                               reinterpret_cast<hrx_buffer_t>(dst.handle),
+                               dst.offset + dst_offset + done, n),
+        "hrx_stream_copy_buffer (h2d ordered blit)"));
+    LSE_RETURN_IF_ERROR(synchronize_stream_impl(stream));
     done += n;
   }
   return OkStatus();

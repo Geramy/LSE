@@ -52,6 +52,10 @@ void Program::retain(std::span<const NodePtr> roots,
                      std::vector<Workgroup> phases,
                      std::vector<FusionGroup> groups,
                      std::span<const NodePtr> compute_order) {
+  // A new retained program is a new generation: the replay memo keys on
+  // (FusionGroup*, generation), so a freed+reallocated group pointer is a
+  // different entry, never a stale hit.
+  ++generation_;
   roots_.assign(roots.begin(), roots.end());
   nodes_.clear();
   std::unordered_set<const Node*> seen;
@@ -132,6 +136,9 @@ void Program::destroy() noexcept {
   cuts_.clear();
   sig_ = 0;
   compute_nodes_ = 0;
+  // Same reason as retain(): the groups freed here may be reallocated at the
+  // same addresses, and the memo must not survive that.
+  ++generation_;
 }
 
 bool Program::holds(std::span<const NodePtr> roots) const noexcept {

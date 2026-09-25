@@ -32,6 +32,12 @@ class Program {
   [[nodiscard]] bool holds(std::span<const NodePtr> roots) const noexcept;
 
   [[nodiscard]] std::uint64_t signature() const noexcept { return sig_; }
+  // Bumped at every retain() and destroy(): a replay memo keyed on a
+  // FusionGroup* is only valid within one retained program's life. A rebuild
+  // frees the old groups and may reallocate a group at the same address, so
+  // the same pointer in two generations is a different structure, and a
+  // remap produces new group objects that miss the memo naturally.
+  [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
   [[nodiscard]] std::uint32_t node_count() const noexcept {
     return static_cast<std::uint32_t>(nodes_.size());
   }
@@ -85,6 +91,7 @@ class Program {
   };
   std::vector<Cut> cuts_;
   std::uint64_t sig_ = 0;
+  std::uint64_t generation_ = 0;
   std::uint32_t compute_nodes_ = 0;
 };
 

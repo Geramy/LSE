@@ -50,10 +50,23 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
                                                   loom_types(), loom_sources()));
   text(device.arch);
   // Kernel selection overrides also distinguish persistent JIT identities.
-  // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.
-  for (const char* name : {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M"}) {
-    const char* value = std::getenv(name);
-    text(value != nullptr ? std::string_view(value) : std::string_view{});
+  // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process;
+  // D5 latches the reads HERE too (once, at first emission), so the identity
+  // is pure in its inputs: the replay memo (D3) keys on (group, generation)
+  // and must never see a different identity for the same group from a
+  // getenv that changes between dispatches. Values are latched for the
+  // process anyway, so the identity is unchanged for the current env.
+  static const std::array<std::string, 3> env_overrides = [] {
+    std::array<std::string, 3> out{};
+    const char* names[3] = {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M"};
+    for (std::size_t i = 0; i < 3; ++i) {
+      const char* value = std::getenv(names[i]);
+      if (value != nullptr) out[i] = value;
+    }
+    return out;
+  }();
+  for (const std::string& value : env_overrides) {
+    text(std::string_view(value));
   }
   number(device.lds_bytes_per_workgroup);
   number(device.compute_units);
