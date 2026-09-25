@@ -598,7 +598,12 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
       s.device->compute_units != 64 ||
       (global && std::strcmp(global, "0") == 0))
     return nullptr;
-  if (dims.m == 256) return select_m256_residual2(s, dims);
+  // The M256 two-product residual2 intercept is no longer consulted: that
+  // kernel was withdrawn after the current model measured relative L2
+  // 0.00503022829645 against the 0.005 cancellation-safe limit. M=256 now
+  // falls through to the measured-records table below, where the admitted
+  // single-product staged-BF16 shapes are listed; other M=256 shapes have no
+  // record and retain the scalar path.
   const auto request = residual_request(s, dims);
   // Matched driver195 projection experiments: eight post-warm host
   // eval+retire intervals per implementation. These are not device timestamps.
@@ -610,7 +615,22 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
       {64, 17408, 5120, 1877865, 4170963, 1987625},
       {512, 17408, 5120, 6711219, 18451005, 9670537},
       {64, 5120, 17408, 3005271, 4375042, 3662411},
-      {512, 5120, 17408, 8312625, 13622156, 11045698}};
+      {512, 5120, 17408, 8312625, 13622156, 11045698},
+      // M256 single-product rows: no per-shape host eval+retire timing exists
+      // for these shapes. All three cost columns carry the same nonzero
+      // sentinel; BF16 is the only eligible option (the FP8/BF8 profiles
+      // carry performance_pass=false), so the value cannot affect the 3-way
+      // ranking. A zero cost is deliberately avoided so future eligible
+      // options are not ranked against a free sample.
+      {256, 17408, 5120, 1000000, 1000000, 1000000},
+      {256, 5120, 17408, 1000000, 1000000, 1000000},
+      {256, 8192, 5120, 1000000, 1000000, 1000000},
+      {256, 6144, 5120, 1000000, 1000000, 1000000},
+      {256, 48, 5120, 1000000, 1000000, 1000000},
+      {256, 12288, 5120, 1000000, 1000000, 1000000},
+      {256, 1024, 5120, 1000000, 1000000, 1000000},
+      {256, 5120, 6144, 1000000, 1000000, 1000000},
+      {256, 248320, 5120, 1000000, 1000000, 1000000}};
   const Measured *record = nullptr;
   for (const auto &r : records)
     if (r.m == dims.m && r.n == dims.n && r.k == dims.k)
