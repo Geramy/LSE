@@ -593,6 +593,19 @@ const graph::KernelPrimitiveBase *
 wmma_q6_linear_for(const graph::KernelShapes &s) {
   const auto dims = dims_of(s);
   const auto *global = std::getenv("LSE_WMMA");
+  // Build 199b true-scalar attribution arm: when LSE_WMMA_FORCE_SCALAR_FFNS
+  // is set, the M=512 FFN 17408 shapes (both up and down) decline PAST the
+  // production tile selector to the true scalar quant_linear body. This is
+  // the companion to LSE_FFN_WMMA2_SCALAR (which declines the r2 selector);
+  // together they force the 17408 shapes fully scalar while the mid-shape
+  // M=512 tile path (10240/6144/12288, other shapes) stays on the production
+  // tile, isolating the r2 FFN kernel's own context-sensitive error.
+  if (const auto *fs = std::getenv("LSE_WMMA_FORCE_SCALAR_FFNS")) {
+    if (fs[0] != '0' && fs[0] != '\0' && dims.valid && dims.m == 512 &&
+        ((dims.n == 17408 && dims.k == 5120) ||
+         (dims.n == 5120 && dims.k == 17408)))
+      return nullptr;
+  }
   if (!s.device || !s.intrinsics || !dims.valid ||
       s.device->max_threads_per_workgroup < 128 ||
       s.device->compute_units != 64 ||

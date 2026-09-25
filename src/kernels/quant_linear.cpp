@@ -30,6 +30,7 @@
 #include "lse/kernels/quant_panel.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
+#include "lse/kernels/ffn_wmma2_q6.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -38,10 +39,6 @@
 #include "lse/quant/group_affine_codec.hpp"
 
 namespace lse::kernels {
-
-// Forward declaration: the Q6/WGMMA selector lives in wmma_q6_linear.cpp
-// (same target, lse_kernels), which defines it after the anonymous namespace.
-const graph::KernelPrimitiveBase *wmma_q6_linear_for(const graph::KernelShapes &);
 
 // These name device facts, which the backend supplies.
 using backend::AmdDeviceInfo;
@@ -1263,7 +1260,8 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   // thirds of its vector instructions unpacking nibbles. Decode is one row and
   // bandwidth bound, and the gate below leaves it here.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
-    if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
+    if (const KernelPrimitiveBase* w = ffn_wmma2_q6_for(s)) return w;
+  if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
     return this;
   }
