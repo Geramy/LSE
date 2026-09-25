@@ -229,6 +229,8 @@ add_library(lse_kernels
   src/kernels/matmul.cpp
   src/kernels/quant_embedding.cpp
   src/kernels/quant_linear.cpp
+  src/kernels/ffn_wmma2_q6.cpp
+  src/kernels/ffn_f32_q6.cpp
   src/kernels/reduction.cpp
   src/kernels/rope.cpp
   src/kernels/scatter.cpp

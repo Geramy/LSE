@@ -43,7 +43,9 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
     key.append(value);
   };
   text("loom");
-  number(3);  // identity includes the shared compute-operand policy
+  number(7);  // identity includes the shared compute-operand policy
+              // (cand-ffn-f32: bump 6 -> 7 so the f32 FFN candidate's JIT
+              // namespace cannot collide with the wmma2 candidates')
   number(kernels::activation_int8_enabled());
   number(kernels::quant_operand_cache_key(0));
   number(kernels::quant_operand_specialization_key(0, group, device,
@@ -51,7 +53,11 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
   text(device.arch);
   // Kernel selection overrides also distinguish persistent JIT identities.
   // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.
-  for (const char* name : {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M"}) {
+  for (const char* name : {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M",
+                       "LSE_FFN_WMMA2", "LSE_FFN_WMMA2_SCALAR",
+                       "LSE_WMMA_FORCE_SCALAR_FFNS",
+                       "LSE_FFN_F32", "LSE_FFN_F32_SCALAR",
+                       "LSE_FFN_F32_V1"}) {
     const char* value = std::getenv(name);
     text(value != nullptr ? std::string_view(value) : std::string_view{});
   }
