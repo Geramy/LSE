@@ -37,6 +37,8 @@ struct GenerationStats {
   std::int32_t prompt_tokens = 0;
   std::int32_t generated_tokens = 0;
   std::uint64_t prefill_ns = 0;
+  // Wall time after the first token callback, including later model steps,
+  // sampling and callbacks. Zero when no post-prefill step was attempted.
   std::uint64_t decode_ns = 0;
   std::uint32_t device_groups = 0;
   std::uint32_t host_groups = 0;
@@ -91,9 +93,21 @@ struct GenerationStats {
     return static_cast<double>(spec_accepted) / static_cast<double>(spec_steps);
   }
 
+  // The first generated token is sampled from prefill logits. Only later
+  // emitted tokens belong to the decode interval, including speculative ones.
+  [[nodiscard]] std::int32_t decoded_tokens() const noexcept {
+    return generated_tokens > 0 ? generated_tokens - 1 : 0;
+  }
+
+  [[nodiscard]] double prompt_tokens_per_second() const noexcept {
+    if (prefill_ns == 0 || prompt_tokens <= 0) return 0.0;
+    return static_cast<double>(prompt_tokens) * 1e9 /
+           static_cast<double>(prefill_ns);
+  }
+
   [[nodiscard]] double decode_tokens_per_second() const noexcept {
-    if (decode_ns == 0 || generated_tokens == 0) return 0.0;
-    return static_cast<double>(generated_tokens) * 1e9 /
+    if (decode_ns == 0 || decoded_tokens() == 0) return 0.0;
+    return static_cast<double>(decoded_tokens()) * 1e9 /
            static_cast<double>(decode_ns);
   }
 };

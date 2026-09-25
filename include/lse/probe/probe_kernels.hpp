@@ -46,7 +46,7 @@ struct StreamArgs {
 //
 // `elems` must be a whole number of `threads * width`, so every load lands
 // inside the buffer and none of them needs a tail guard.
-template <class E>
+template <class E, bool StoreThroughHook = false>
 void stream_read(E& e, StreamArgs<E>& a, std::uint32_t elems,
                  std::uint32_t threads, std::uint32_t load_bytes) {
   const std::uint32_t width =
@@ -60,7 +60,8 @@ void stream_read(E& e, StreamArgs<E>& a, std::uint32_t elems,
       acc = lse::math::fma(v[j], e.f32(1.0f), acc);
     }
   }
-  a.out[tid] = acc;
+  if constexpr (StoreThroughHook) e.store(tid, acc.read());
+  else a.out[tid] = acc;
 }
 
 template <class E>
@@ -70,11 +71,12 @@ struct TouchArgs {
 
 // The smallest dispatch that still has to be dispatched. What is left when its
 // time is divided by the launch count is submission cost and nothing else.
-template <class E>
+template <class E, bool StoreThroughHook = false>
 void touch_one(E& e, TouchArgs<E>& a) {
   const auto tid = e.thread_id();
   if (auto only = e.when(tid < 1u)) {
-    a.out[0] = e.f32(1.0f);
+    if constexpr (StoreThroughHook) e.store(e.u32(0), e.f32(1.0f));
+    else a.out[0] = e.f32(1.0f);
   }
 }
 

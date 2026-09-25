@@ -190,6 +190,42 @@ Result<Array> HybridLM::embed(const Array& tokens) const {
 
 namespace {
 
+// Recurrent inputs become writable outputs when a retained pass folds its
+// carries. They must never use the scheduler's interned constant allocations.
+Result<Array> mutable_zeros(const Shape& shape) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for mixer state");
+  backend::IDeviceSet& set = sched->devices();
+  const std::size_t member = graph::preferred_member();
+  backend::IBackend& be =
+      member < set.size() ? set.device(member) : sched->backend();
+  const backend::Stream at =
+      member < set.size()
+          ? set.stream_for(member).value_or(backend::kDefaultStream)
+          : backend::kDefaultStream;
+  const std::size_t bytes = dtype_storage_bytes(
+      DType::kF32, static_cast<std::size_t>(shape.elem_count()));
+  LSE_ASSIGN_OR(backend::DeviceBuffer owned,
+                be.allocate(bytes, backend::MemoryClass::kDevice, at));
+  const std::vector<std::byte> zeros(bytes, std::byte{0});
+  LSE_RETURN_IF_ERROR(be.copy_h2d(zeros.data(), owned, bytes, 0));
+  Array out = Array::from_buffer(std::move(owned), shape, DType::kF32);
+  out.node()->device_dirty = true;
+  return out;
+}
+
+// Keep the allocation and its current contents, but sever the previous
+// request's computation DAG. Session::restart has already zeroed these bytes.
+void detach_state(Array& a) {
+  if (!a.valid() || !a.node()->buffer.valid()) return;
+  const graph::NodePtr old = a.node();
+  a = Array::from_buffer(old->buffer, old->shape, old->dtype);
+  a.node()->member = old->member;
+  a.node()->host_mirror = old->host_mirror;
+  a.node()->host_dirty = old->host_dirty;
+  a.node()->device_dirty = old->device_dirty;
+}
+
 struct StateSnap {
   graph::NodePtr gdn, cq, ck, cv, cqkv, keys, values;
 };
@@ -277,7 +313,7 @@ Status poke_tokens(Array& slot, const Array& incoming) {
 void HybridLM::rewind(std::vector<MixerState>& states,
                       std::int32_t position) const {
   for (MixerState& s : states) {
-    if (s.key_cache.valid()) s.position = position;
+    s.position = position;
   }
 }
 
@@ -295,6 +331,30 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                      " mixer states (", std::to_string(blocks_.size()),
                      " layers x ", std::to_string(state_shards()),
                      " shards), got ", std::to_string(states->size()));
+  }
+
+  // Program carries alias graph nodes across pass shapes. Retain them within
+  // one sequence, but do not let a restarted request inherit those aliases.
+  // The backend's compiled-kernel cache and the model weights remain resident.
+  const bool new_sequence = states != nullptr && rows == nullptr &&
+      !replaces_previous &&
+      std::all_of(states->begin(), states->end(),
+                  [](const MixerState& s) { return s.position == 0; });
+  if (new_sequence && last_pass_id_ != 0) {
+    if (graph::Scheduler* sched = graph::default_scheduler()) {
+      LSE_RETURN_IF_ERROR(sched->drain());
+    }
+    for (MixerState& s : *states) {
+      detach_state(s.gdn_state);
+      detach_state(s.gdn_conv_q);
+      detach_state(s.gdn_conv_k);
+      detach_state(s.gdn_conv_v);
+      detach_state(s.gdn_conv_qkv);
+    }
+    for (ForwardCache& c : caches_) c = ForwardCache{};
+    next_cache_ = 0;
+    last_pass_id_ = 0;
+    last_pass_host_groups_ = 0;
   }
 
   const std::int64_t t_now =
@@ -349,7 +409,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                                        ? i % shards
                                        : member_for_layer(layer));
       if (!st.gdn_state.valid()) {
-        st.gdn_state = Array::zeros(Shape{batch, vh_m, vd, vd}, DType::kF32);
+        LSE_ASSIGN_OR(st.gdn_state, mutable_zeros(Shape{batch, vh_m, vd, vd}));
       }
       if (tail <= 0) continue;
       // The tail is not an optimization: causal_conv1d zero-pads, so a decode
@@ -357,17 +417,17 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       // tokens belong.
       if (fused > 0) {
         if (!st.gdn_conv_qkv.valid()) {
-          st.gdn_conv_qkv = Array::zeros(Shape{batch, tail, fused}, DType::kF32);
+          LSE_ASSIGN_OR(st.gdn_conv_qkv, mutable_zeros(Shape{batch, tail, fused}));
         }
       } else if (width > 0) {
         if (!st.gdn_conv_q.valid()) {
-          st.gdn_conv_q = Array::zeros(Shape{batch, tail, width}, DType::kF32);
+          LSE_ASSIGN_OR(st.gdn_conv_q, mutable_zeros(Shape{batch, tail, width}));
         }
         if (!st.gdn_conv_k.valid()) {
-          st.gdn_conv_k = Array::zeros(Shape{batch, tail, width}, DType::kF32);
+          LSE_ASSIGN_OR(st.gdn_conv_k, mutable_zeros(Shape{batch, tail, width}));
         }
         if (!st.gdn_conv_v.valid()) {
-          st.gdn_conv_v = Array::zeros(Shape{batch, tail, width}, DType::kF32);
+          LSE_ASSIGN_OR(st.gdn_conv_v, mutable_zeros(Shape{batch, tail, width}));
         }
       }
     }
@@ -558,14 +618,14 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     // must start from zero, not from wherever the previous conversation's
     // folds left the in-buffers. Folding here handed request 2 the tail of
     // request 1's state. A batch resumption arrives with row metadata and
-    // keeps the fold. Decode (t_now == 1) always folds: it genuinely carries.
+    // keeps the fold. Decode at a nonzero cursor also preserves its carry.
     // Only the FIRST chunk of a prefill ladder starts the sequence; the later
     // chunks' carry-ins hold the state the chunk before them just produced,
     // and zeroing those mid-ladder replays the rest of the prompt against a
-    // blank recurrence.
+    // blank recurrence. A one-token prompt is also a fresh sequence: token
+    // count cannot distinguish it from decode; the state cursor does.
     const bool fresh_sequence =
-        t_now > 1 && rows == nullptr && !replaces_previous &&
-        at_sequence_start;
+        rows == nullptr && !replaces_previous && at_sequence_start;
     if (fresh_sequence) {
       graph::Scheduler* sched = graph::default_scheduler();
       if (sched == nullptr) return LSE_ERROR(kInternal, "no backend");
@@ -612,11 +672,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       }
     }
     if (states != nullptr) {
-      for (MixerState& s : *states) {
-        if (s.key_cache.valid()) {
-          s.position = kv_len;
-        }
-      }
+      for (MixerState& s : *states) s.position = kv_len;
     }
     last_pass_id_ = cache_.pass_id;
     return cache_.hidden;
@@ -793,9 +849,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
           st.key_cache.valid() ? st.key_cache.node().get() : nullptr);
       cache_.kv_leaves.push_back(
           st.value_cache.valid() ? st.value_cache.node().get() : nullptr);
-      if (st.key_cache.valid()) {
-        st.position = kv_len;
-      }
+      st.position = kv_len;
     }
   }
   cache_.state_stamp.clear();

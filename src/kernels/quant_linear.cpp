@@ -19,12 +19,15 @@
 // codes with v_dot4_i32_iu8, spending no per-weight instruction on the scale
 // or the bias at all. quant/group_affine_codec.hpp carries the algebra, and
 // `dot_ok` below carries what a device must have for it.
+#include <algorithm>
 #include <array>
 #include <span>
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
+#include "lse/kernels/int8_policy.hpp"
+#include "lse/kernels/quant_panel.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
@@ -35,6 +38,10 @@
 #include "lse/quant/group_affine_codec.hpp"
 
 namespace lse::kernels {
+
+// Forward declaration: the Q6/WGMMA selector lives in wmma_q6_linear.cpp
+// (same target, lse_kernels), which defines it after the anonymous namespace.
+const graph::KernelPrimitiveBase *wmma_q6_linear_for(const graph::KernelShapes &);
 
 // These name device facts, which the backend supplies.
 using backend::AmdDeviceInfo;
@@ -174,9 +181,10 @@ std::uint32_t chunks_per_step(const QuantDims& d, std::uint32_t max_bytes) {
 }
 
 ThreadPlan gemv_plan(const QuantDims& d, std::uint32_t wave,
-                     std::uint32_t lds_bytes, std::uint32_t rows_per_wg) {
+                     std::uint32_t lds_bytes, std::uint32_t rows_per_wg,
+                     std::uint32_t cols_per_wave = 1) {
   if (wave != 32 && wave != 64) wave = 32;
-  const std::uint32_t waves = kBlock / wave;
+  const std::uint32_t waves = kBlock / wave * cols_per_wave;
   ThreadPlan tp;
   tp.workgroup_size[0] = kBlock;
   tp.workgroup_count[0] =
@@ -281,9 +289,9 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
 // Whether this device and this shape take the integer path.
 //
 // has_dot4_iu8 is the arch database's answer for the live device, so a part
-// without the instruction runs the fma codec and gets the same numbers more
-// slowly. That is a hardware capability, not a switch: there is no way to ask
-// for one path on a device that has the other.
+// without the instruction runs the float codec. Converting activations to
+// int8 also requires explicit process-wide accuracy-policy opt-in; hardware
+// support alone does not authorize the additional rounding.
 //
 // It has to be has_dot4_iu8 and not has_dot4_i8: the latter is the
 // same-signedness v_dot4_i32_i8, which RDNA2 and every CDNA also have, but
@@ -292,6 +300,7 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
 // where the emitted kernel does not compile at all.
 bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
             std::uint32_t cpl) {
+  if (!activation_int8_enabled()) return false;
   if (!d.valid || d.spec.bits != quant::kDot4Bits) return false;
   if (s.device == nullptr || s.intrinsics == nullptr) return false;
   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*s.device);
@@ -322,6 +331,41 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
   return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
 }
 
+// Exact-FP32 prefill schedule for the validated gfx1201 layout. Indexed rows may name different
+// matrices, and externally staged panels have a caller-owned layout, so neither
+// can participate in this reuse path.
+// Four independent output columns reuse the activation stream without changing
+// either output's chunk order, fused rounding points, or wave reduction.
+std::uint32_t q6_decode_columns(const KernelShapes& s, const QuantDims& d,
+                                bool indexed) {
+  return d.valid && !indexed && d.m == 1 && d.n % 4 == 0 &&
+      d.spec.bits == 6 && d.spec.group_size == 64 && s.device != nullptr &&
+      s.device->arch == "gfx1201" && wave_of(s.device) == 32 &&
+      s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16 &&
+      s.staged.name.empty() && s.staged_quant.codes.empty() ? 4u : 1u;
+}
+
+std::uint32_t q6_prefill_tile(std::uint32_t k, std::uint32_t rows) {
+  // Eight rows retain the validated four-row panel's 16 KiB maximum LDS.
+  // 512 is exactly one 32-lane wave of 16-code chunks, preserving K order.
+  return std::min(rows >= 8 ? 512u : 1024u, k);
+}
+
+std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
+                              bool indexed) {
+  if (!d.valid || indexed || d.m < 2 || d.spec.bits != 6 ||
+      d.spec.group_size != 64 || s.device == nullptr ||
+      s.device->arch != "gfx1201" || wave_of(s.device) != 32 ||
+      s.input_dtypes[0] != DType::kF32 ||
+      s.input_dtypes[2] != DType::kBF16 || !s.staged.name.empty() ||
+      !s.staged_quant.codes.empty()) return 1;
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto budget = workgroup_lds_bytes(s.device);
+  if (d.m >= 32 && budget >= 8u * q6_prefill_tile(k, 8u) * 4u) return 8u;
+  const std::uint32_t rows = d.m >= 4 ? 4u : 2u;
+  return budget >= rows * q6_prefill_tile(k, rows) * 4u ? rows : 1u;
+}
+
 // Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
 // rows, under exactly the same conditions and in the same order of decision.
 // The plan and the body cannot be allowed to disagree: this is the number a
@@ -337,6 +381,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
 std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                 std::uint32_t rows) {
   if (!d.valid || rows == 0) return 0;
+  if (rows > 1 && d.spec.bits == 6 && !body_dot(s, d)) {
+    return rows * q6_prefill_tile(static_cast<std::uint32_t>(d.k), rows) * 4u;
+  }
   const auto k = static_cast<std::uint32_t>(d.k);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
   const bool quant_hoisted =
@@ -372,7 +419,8 @@ opt::TrafficModel traffic_at(const KernelShapes& s, const QuantDims& d,
                              bool indexed, std::uint32_t rows) {
   if (!shape_ok(d) || !device_fits(s) || rows == 0) return {};
   const std::uint32_t wave = wave_of(s.device);
-  const std::uint32_t cols = kBlock / wave;
+  const std::uint32_t columns = q6_decode_columns(s, d, indexed);
+  const std::uint32_t cols = kBlock / wave * columns;
   const auto scale_elem =
       static_cast<std::uint32_t>(dtype_storage_bytes(s.input_dtypes[2], 1));
   // One scale and one bias per group, for every column the workgroup owns.
@@ -388,7 +436,7 @@ opt::TrafficModel traffic_at(const KernelShapes& s, const QuantDims& d,
                static_cast<std::uint64_t>(rows) * d.keep * sizeof(float));
   }
   const ThreadPlan plan =
-      gemv_plan(d, wave, body_lds_bytes_at(s, d, rows), rows);
+      gemv_plan(d, wave, body_lds_bytes_at(s, d, rows), rows, columns);
   m.workgroups = plan.workgroup_count[0] * plan.workgroup_count[1];
   m.workgroup_threads = plan.workgroup_size[0];
   return m;
@@ -440,6 +488,8 @@ constexpr std::uint32_t kMaxRowsPerGroup = 8;
 // available where the rows agree on the matrix.
 std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
                              bool indexed) {
+  const auto exact_rows = q6_prefill_rows(s, d, indexed);
+  if (exact_rows > 1) return exact_rows;
   if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
   if (s.device == nullptr) return 1;
   const auto m = static_cast<std::uint32_t>(d.m);
@@ -747,7 +797,7 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                 const kir::Val<kir::u32>& x_base,
                 const kir::Val<kir::u32>& chunk,
                 const kir::LValue<kir::f32>& acc,
-                std::uint32_t chunks_per_group) {
+                std::uint32_t chunks_per_group, bool rotate_panel) {
   const auto vals = static_cast<std::uint32_t>(spec.values_per_chunk());
   const auto words = static_cast<std::uint32_t>(spec.words_per_chunk());
   const auto group = e.let(chunk / chunks_per_group);
@@ -758,13 +808,156 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
       e, a.packed, spec, e.let(row_base + chunk * words), scale, bias,
       [&](int c, const kir::Val<kir::f32>& w) {
         const auto idx = e.let(k_base + static_cast<std::uint32_t>(c));
-        const auto xe = xs != nullptr ? (*xs)[idx].read() : a.x[x_base + idx];
+        const auto panel_idx = rotate_panel ? e.let(q6_panel_index(idx)) : idx;
+        const auto xe = xs != nullptr ? (*xs)[panel_idx].read() : a.x[x_base + idx];
         acc = math::fma(xe, w, acc.read());
       });
 }
 
+// Every lane visits the same K indices, in the same order, as the one-row
+// kernel. Only the decoded weight's lifetime changes: it feeds several FP32
+// accumulators before being discarded. No activation or weight is narrowed.
+template <class A>
+std::string emit_q6_prefill(const KernelShapes& s, const QuantDims& d,
+                            std::uint32_t rows) {
+  const auto n = static_cast<std::uint32_t>(d.n);
+  const auto m = static_cast<std::uint32_t>(d.m);
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto lanes = static_cast<std::uint32_t>(d.lanes);
+  const auto groups = static_cast<std::uint32_t>(d.groups);
+  const auto tile_k = q6_prefill_tile(k, rows);
+  constexpr std::uint32_t wave = 32;
+  constexpr std::uint32_t values = 16;
+  constexpr std::uint32_t words = 3;
+  constexpr std::uint32_t chunks_per_group = 4;
+  kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+  kb.set_store(s.store);
+  A a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+  const auto lid = e.let(math::local_id());
+  const auto lane = e.let(lid % wave);
+  const auto col = e.let(math::workgroup_id_x() * (kBlock / wave) + lid / wave);
+  const auto row = e.let(math::workgroup_id_y() * rows);
+  const auto panel = e.lds<kir::f32>(rows * tile_k);
+  std::vector<kir::LValue<kir::f32>> acc;
+  for (std::uint32_t r = 0; r < rows; ++r) acc.push_back(e.var(0.0f));
+  for (auto base : e.range(0u, k, tile_k)) {
+    for (auto at : e.range(lid, e.u32(tile_k), kBlock)) {
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        auto x = e.var(0.0f);
+        if (auto live = e.when(row + r < m && base + at < k)) {
+          x = a.x[(row + r) * k + base + at];
+        }
+        panel[r * tile_k + q6_panel_index(at)] = x.read();
+      }
+    }
+    e.barrier();
+    if (auto live_col = e.when(col < n)) {
+      for (auto chunk : e.range(lane, e.u32(tile_k / values), wave)) {
+        const auto logical_k = e.let(base + chunk * values);
+        if (auto live_k = e.when(logical_k < k)) {
+          const auto global_chunk = e.let(logical_k / values);
+          const auto group = e.let(global_chunk / chunks_per_group);
+          const auto scale = e.let(math::widen(a.scales[col * groups + group]));
+          const auto bias = e.let(math::widen(a.biases[col * groups + group]));
+          quant::dequant_chunk(e, a.packed, d.spec,
+              e.let(col * lanes + global_chunk * words), scale, bias,
+              [&](int c, const kir::Val<kir::f32>& weight) {
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                  const auto at = e.let(r * tile_k + q6_panel_index(
+                      chunk * values + static_cast<std::uint32_t>(c)));
+                  acc[r] = math::fma(panel[at].read(), weight, acc[r].read());
+                }
+              });
+        }
+      }
+    }
+    // All readers retire before any wave refills the shared panel.
+    e.barrier();
+  }
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    for (std::uint32_t bit = 1; bit < wave; bit <<= 1) {
+      acc[r] = acc[r].read() + math::shfl_xor(acc[r].read(), e.u32(bit));
+    }
+    if (auto writer = e.when(lane == 0 && col < n && row + r < m)) {
+      e.store((row + r) * n + col, acc[r].read());
+    }
+  }
+  return kb.lds().ok() ? kb.str() : std::string{};
+}
+
+template <class A>
+std::string emit_q6_decode_quad(const KernelShapes& s, const QuantDims& d) {
+  const auto n = static_cast<std::uint32_t>(d.n);
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto lanes = static_cast<std::uint32_t>(d.lanes);
+  const auto groups = static_cast<std::uint32_t>(d.groups);
+  constexpr std::uint32_t wave = 32, columns = 4, vals = 16, words = 3;
+  const auto chunks = k / vals;
+  const auto aligned = chunks / wave * wave;
+  kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+  kb.set_store(s.store);
+  A a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+  const auto lid = e.let(math::local_id());
+  const auto lane = e.let(lid % wave);
+  const auto col = e.let((math::workgroup_id_x() * (kBlock / wave) + lid / wave) * columns);
+  kir::Tile<kir::f32> xs;
+  if (e.lds_fits<kir::f32>(k)) {
+    xs = e.lds<kir::f32>(k);
+    for (auto at : e.range(lid, e.u32(k), kBlock)) xs[e.let(q6_panel_index(at))] = a.x[at];
+    e.barrier();
+  }
+  std::array<kir::LValue<kir::f32>, columns> acc{e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+  if (auto live = e.when(col < n)) {
+    auto accumulate = [&](const kir::Val<kir::u32>& chunk) {
+      std::array<kir::Val<kir::f32>, columns> scales, biases;
+      std::array<std::array<kir::Val<kir::u32>, words>, columns> packed;
+      for (std::uint32_t output = 0; output < columns; ++output) {
+        const auto current = e.let(col + output);
+        const auto group = e.let(current * groups + chunk / 4u);
+        scales[output] = e.let(math::widen(a.scales[group]));
+        biases[output] = e.let(math::widen(a.biases[group]));
+        const auto first = e.let(current * lanes + chunk * words);
+        for (std::uint32_t word = 0; word < words; ++word)
+          packed[output][word] = e.let(a.packed[first + word]);
+      }
+      const auto first_x = e.let(chunk * vals);
+      for (int code = 0; code < int(vals); ++code) {
+        const auto index = e.let(first_x + static_cast<std::uint32_t>(code));
+        const auto x = e.let(xs ? xs[e.let(q6_panel_index(index))].read() : a.x[index]);
+        const auto word = static_cast<std::size_t>(d.spec.chunk_word(code));
+        const int offset = d.spec.chunk_bit(code), carry = d.spec.chunk_carry(code);
+        for (std::uint32_t output = 0; output < columns; ++output) {
+          auto value = packed[output][word] / (1u << offset);
+          if (carry > 0)
+            value = value + (packed[output][word + 1] % (1u << carry)) * (1u << (32 - offset));
+          else value = value % 64u;
+          const auto weight = math::fma(math::cast<kir::f32>(e.let(value)), scales[output], biases[output]);
+          acc[output] = math::fma(x, weight, acc[output].read());
+        }
+      }
+    };
+    for (auto c0 : e.range(0u, aligned, wave)) accumulate(e.let(c0 + lane));
+    if (aligned < chunks)
+      for (auto chunk : e.range(e.u32(aligned) + lane, e.u32(chunks), wave)) accumulate(chunk);
+  }
+  for (std::uint32_t output = 0; output < columns; ++output) {
+    for (std::uint32_t bit = 1; bit < wave; bit <<= 1)
+      acc[output] = acc[output].read() + math::shfl_xor(acc[output].read(), e.u32(bit));
+    if (auto writer = e.when(lane == 0u && col < n)) e.store(col + output, acc[output].read());
+  }
+  return kb.lds().ok() ? kb.str() : std::string{};
+}
+
 template <class A>
 std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+  if (q6_decode_columns(s, d, Indexed<A>) == 4) return emit_q6_decode_quad<A>(s, d);
+  if (const auto rows = q6_prefill_rows(s, d, Indexed<A>); rows > 1) {
+    return emit_q6_prefill<A>(s, d, rows);
+  }
   const auto n = static_cast<std::uint32_t>(d.n);
   const auto k = static_cast<std::uint32_t>(d.k);
   const auto m = static_cast<std::uint32_t>(d.m);
@@ -831,6 +1024,12 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     fill = true;
   }
   const bool stage = static_cast<bool>(xs);
+  // A caller-owned panel retains its declared linear layout. Decode can rotate
+  // only the panel this body fills, using the same map for stores and reads.
+  const bool rotate_panel = fill && d.spec.bits == 6 && d.m == 1 &&
+      d.spec.group_size == 64 && s.device != nullptr &&
+      s.device->arch == "gfx1201" && wave == 32 &&
+      s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16;
 
   // A run whose stages all quantize this row the same way hoists the int8 form
   // once, the way it already hoists the float row. Reading it costs this body
@@ -875,7 +1074,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   if (auto in_grid = e.when(tile < ntiles && row < m)) {
     if (fill) {
       for (auto t : e.range(lid, e.u32(k), kBlock)) {
-        xs[t] = a.x[row * k + t];
+        const auto at = rotate_panel ? e.let(q6_panel_index(t)) : t;
+        xs[at] = a.x[row * k + t];
       }
       e.barrier();
     }
@@ -920,7 +1120,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
           for (std::uint32_t u = 0; u < cpl; ++u) {
             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
                           scale_base, x_base, e.let(chunk0 + u), acc[0],
-                          chunks_per_group);
+                          chunks_per_group, rotate_panel);
           }
         }
       }
@@ -932,7 +1132,8 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
                             chunks_per_group, cb);
           } else {
             emit_chunk<A>(e, a, stage ? &xs : nullptr, d.spec, row_base,
-                          scale_base, x_base, chunk, acc[0], chunks_per_group);
+                          scale_base, x_base, chunk, acc[0], chunks_per_group,
+                          rotate_panel);
           }
         }
       }
@@ -1051,6 +1252,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   StagedRow staged_row(const KernelShapes& s) const override {
     const QuantDims d = dims_of(s, false);
     if (!shape_ok(d) || !device_fits(s)) return {};
+    // This schedule owns several rows and stages K tiles itself; advertising a
+    // single-row hoisted panel would let fusion change its launch coverage.
+    if (q6_prefill_rows(s, d, false) > 1 || q6_decode_columns(s, d, false) > 1) return {};
     return {0, static_cast<std::uint32_t>(d.k),
             static_cast<std::uint32_t>(d.m)};
   }
@@ -1059,6 +1263,7 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   // thirds of its vector instructions unpacking nibbles. Decode is one row and
   // bandwidth bound, and the gate below leaves it here.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
     return this;
   }
@@ -1098,7 +1303,7 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     const QuantDims d = dims_of(s, false);
     return gemv_plan(d, wave_of(s.device), body_lds_bytes(s, d, false),
-                     dot_rows(s, d, false));
+                     dot_rows(s, d, false), q6_decode_columns(s, d, false));
   }
 };
 

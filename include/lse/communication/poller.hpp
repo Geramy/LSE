@@ -73,7 +73,7 @@ class Poller {
   Poller() = default;
 
   int epoll_fd_ = -1;
-  int wake_fd_ = -1;
+  [[maybe_unused]] int wake_fd_ = -1; // kqueue uses an EVFILT_USER event.
   std::map<int, IReady*> owners_;
   std::vector<unsigned char> scratch_;
 };

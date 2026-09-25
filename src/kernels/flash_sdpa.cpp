@@ -14,6 +14,7 @@
 // the running form: one pass over the keys carrying a max and a denominator,
 // rescaling the accumulator when a window raises the max.
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -39,12 +40,6 @@ constexpr std::uint32_t kQTile = 8;
 // a channel for the accumulation, and neither mapping needs a cross-lane
 // primitive this IR does not have.
 constexpr std::uint32_t kKWin = kThreads;
-
-std::string dispatch_u32(const kir::KernelBody& k, const kir::TypeTable& types,
-                         std::size_t input, unsigned element) {
-  return "(" + std::string(types.scalar(kir::Scalar::kU32)) + ")(" +
-         k.input_name(input) + "[" + std::to_string(element) + "u])";
-}
 
 constexpr bool is_pow2(std::uint32_t v) noexcept {
   return v >= 2 && (v & (v - 1)) == 0;
@@ -82,7 +77,8 @@ Dims dims_of(const KernelShapes& s) {
   if (!is_pow2(d.ts) || kKWin % d.ts != 0) return d;
   d.group = d.qh / d.kvh;
   d.stride = static_cast<std::uint32_t>(s.inputs[4].dim(s.inputs[4].rank() - 1));
-  if (d.stride == 0) return d;
+  if (d.stride == 0 ||
+      d.stride > std::numeric_limits<std::uint32_t>::max() / d.ts) return d;
   if (static_cast<std::uint32_t>(s.iattrs[3]) != d.ts) return d;
   if (s.inputs[3].elem_count() <
       static_cast<std::size_t>(
@@ -155,7 +151,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     const auto q0 = e.let(qt * kQTile);
     const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
 
-    const auto rows = e.runtime_extent("rows", dispatch_u32(k, s.types, 3, 2));
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
     // A pass widened to a bucket carries rows that are not in the batch. They
     // answer zero, the same as the kernel this replaces, rather than reading a
     // block table row that belongs to nobody.
@@ -176,7 +172,12 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
         e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
               b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
     const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
-    const auto row_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    // Metadata cannot extend a row beyond its bound block-table view.
+    // Clamp the loaded lengths, rather than asserting a bound they may not
+    // satisfy. This also makes dead windows provable to structured lowering.
+    const auto capacity = e.u32(d.stride * d.ts);
+    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
     const auto tb = e.let(b * d.stride);
 
     // The query tile, read once into LDS and then read by every key.
@@ -189,10 +190,11 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
         const auto r = e.let(idx / d.dh);
         const auto dd = e.let(idx % d.dh);
         const auto qrow = e.let(q0 + r);
+        // Recording guards have no C++ else arm: initialize the padding
+        // before conditionally loading a live query row.
+        qs[idx] = e.f32(0.0f);
         if (auto g = e.when(qrow < d.tq)) {
           qs[idx] = a.q[e.let(((b * d.qh + h) * d.tq + qrow) * d.dh + dd)];
-        } else {
-          qs[idx] = e.f32(0.0f);
         }
       }
     }
@@ -209,7 +211,9 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     // The longest live KV in the pass sets the trip count -- an outermost one,
     // which is the only place a runtime extent is legal. A shorter row spends
     // the remaining windows on compares.
-    const auto kv_len = e.runtime_extent("kv_len", dispatch_u32(k, s.types, 3, 1));
+    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
+    const auto kv_len = e.runtime_extent(
+        "kv_len", select(loaded_max < capacity, loaded_max, capacity));
     const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
     for (auto w : e.range(nwin)) {
       const auto wbase = e.let(w * kKWin);
@@ -318,14 +322,16 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
           const auto vb0 = e.let(((blk * d.kvh + kh) * d.ts) * d.dv);
           for (std::uint32_t jj = 0; jj < d.ts; ++jj) {
             const std::uint32_t slot = bi * d.ts + jj;
-            for (std::uint32_t p = 0; p < dpt; ++p) {
-              const auto dd = e.let(lid + p * kThreads);
-              if (auto g = e.when(dd < d.dv)) {
-                const auto vv = e.let(a.v[e.let(vb0 + jj * d.dv + dd)]);
-                for (std::uint32_t r = 0; r < kQTile; ++r) {
-                  o[r * dpt + p] =
-                      math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
-                                o[r * dpt + p].read());
+            if (auto live_value = e.when(j0 + jj < row_len)) {
+              for (std::uint32_t p = 0; p < dpt; ++p) {
+                const auto dd = e.let(lid + p * kThreads);
+                if (auto g = e.when(dd < d.dv)) {
+                  const auto vv = e.let(a.v[e.let(vb0 + jj * d.dv + dd)]);
+                  for (std::uint32_t r = 0; r < kQTile; ++r) {
+                    o[r * dpt + p] =
+                        math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
+                                  o[r * dpt + p].read());
+                  }
                 }
               }
             }

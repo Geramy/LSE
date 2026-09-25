@@ -26,6 +26,7 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
+#include "lse/kernels/int8_policy.hpp"
 #include "lse/math.hpp"
 #include "lse/quant/group_affine_codec.hpp"
 
@@ -538,6 +539,7 @@ const QuantWmmaKernel kQuantWmma;
 // disagree on their expert -- a routed row picks its own matrix and there is
 // no shared operand for a tile to hold.
 const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
+  if (!activation_int8_enabled()) return nullptr;
   const Dims d = dims_of(s);
   if (!d.valid || s.device == nullptr || s.intrinsics == nullptr) return nullptr;
 

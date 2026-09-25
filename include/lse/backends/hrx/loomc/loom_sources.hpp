@@ -7,7 +7,12 @@
 
 #include "lse/graph/dialect_source.hpp"
 
+namespace lse::math { struct MatrixCoreRow; }
+
 namespace lse::backend {
+
+// Shared register/layout contract for the qualified Loom matrix spelling.
+[[nodiscard]] const math::MatrixCoreRow* loom_matrix_row(std::string_view key) noexcept;
 
 [[nodiscard]] graph::DialectSourceTable loom_sources() noexcept;
 

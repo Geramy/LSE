@@ -19,6 +19,8 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -26,6 +28,13 @@
 #include <vector>
 
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
+#include "lse/backends/hrx/probe_emit.hpp"
+#include "lse/backends/hrx/probe_matrix.hpp"
+#include "lse/backends/hrx/probe_matrix_measurement.hpp"
+#include "lse/backends/hrx/loomc/loom_sources.hpp"
+#include "lse/backends/hrx/probe_measurement.hpp"
+#include "lse/backends/hrx/probe_retirement.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/backends/hrx/hipc/hip_sources.hpp"
@@ -58,24 +67,9 @@ double ns_since(Clock::time_point t0) {
           .count());
 }
 
-// The shape the matrix rows are rated at.
-//
-// Deliberately small enough that both operands stay resident in L2: the tile
-// re-reads its A row and B column for every output tile, so a shape that spills
-// to DRAM would measure the same roofline the streaming probe already reports
-// and tell the cost model nothing new about the matrix core. K is long so the
-// instruction loop, not the tile setup, dominates.
-constexpr std::uint32_t kRateM = 256;
-constexpr std::uint32_t kRateN = 256;
-constexpr std::uint32_t kRateK = 1024;
-constexpr int kRateReps = 8;
+using namespace probe_matrix;
 
-constexpr int kTileM = 16;
-constexpr int kTileN = 16;
-constexpr int kTileK = 16;
-
-// 64 MB is far past this class of part's L2, so the streaming number is DRAM's.
-constexpr std::size_t kStreamBytes = 64u << 20;
+// The allocation budget chooses the streaming working set at runtime.
 constexpr int kStreamReps = 4;
 constexpr std::uint32_t kBlock = 256;
 constexpr int kLaunchReps = 512;
@@ -148,41 +142,6 @@ std::string touch_source(std::string_view entry) {
   return wrapper(entry, params, body);
 }
 
-template <class E, class X = kir::f32, class W = kir::f32>
-struct RateArgs {
-  env::In<X, E> x;
-  env::In<W, E> w;
-  env::Out<kir::f32, E> out;
-};
-
-// The one thing this adds to the shared tile: the accumulator goes straight to
-// memory. There is no fused epilogue to run and no emitter store hook outside
-// the graph, so the Out slot the binding contract already names is the target.
-template <math::MatrixTarget G, math::MatrixElem A, math::MatrixElem T>
-struct RateTile : MatrixTile<RateTile<G, A, T>, G, A, T, kTileM, kTileN, kTileK> {
-  const env::Out<kir::f32, env::Emit>* out = nullptr;
-  std::uint32_t cols = 0;
-
-  void emit_element(env::Emit&, const kir::Val<kir::u32>& row,
-                    const kir::Val<kir::u32>& col,
-                    const kir::Val<kir::f32>& v) const {
-    (*out)[row * cols + col] = v;
-  }
-};
-
-// The generations whose lane layouts have been measured here. Same pack the
-// linear kernel carries, for the same reason: an unmeasured layout is a silent
-// wrong answer, and a probe that emitted one would be timing nonsense.
-template <math::MatrixTarget... Live, class F>
-[[nodiscard]] std::string for_live_target(math::MatrixTarget t, F&& fn) {
-  std::string out;
-  const auto one = [&]<math::MatrixTarget L>() {
-    if (t == L) out = fn.template operator()<L>();
-  };
-  (one.template operator()<Live>(), ...);
-  return out;
-}
-
 // The storage format whose operand form a row consumes, or none when this probe
 // has no body that can feed it. `with_matrix_operand` is the table of arms, so
 // this is the same set the linear kernel can emit and not a second list.
@@ -215,31 +174,7 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
                         const math::MatrixCoreRow& row, DType storage) {
   const kir::TypeTable types = hip_types();
   const DialectSourceTable table = hip_sources();
-  const std::uint32_t kb = static_cast<std::uint32_t>(
-      kRateK / static_cast<std::uint32_t>(row.pack));
-
-  const std::string body = for_live_target<math::MatrixTarget::kRdna3,
-                                   math::MatrixTarget::kRdna4>(
-      row.target, [&]<math::MatrixTarget G>() -> std::string {
-        return with_matrix_operand<std::string>(
-            storage,
-            [&]<class X, class W, math::MatrixElem A, math::MatrixElem T>()
-                -> std::string {
-              if (A != row.acc || T != row.operand) return {};
-              kir::KernelBody k(types, table);
-              RateArgs<env::Emit, X, W> a;
-              const DType ins[] = {env::elem_dtype<X>::value,
-                                   env::elem_dtype<W>::value};
-              if (!env::bind(k, a, ins, DType::kF32)) return {};
-              env::Emit e{&k};
-              RateTile<G, A, T> tile;
-              tile.out = &a.out;
-              tile.cols = kRateN;
-              tile.run(e, a.x, a.w, kRateM, kRateN, kb,
-                       device_load_bytes(&info));
-              return k.str();
-            });
-      });
+  const std::string body = rate_body(info, row, storage, types, table);
   if (body.empty()) return {};
 
   const std::string params[] = {
@@ -262,9 +197,11 @@ std::string rate_source(std::string_view entry, const DeviceInfo& info,
 class HrxDeviceProbe final : public probe::IDeviceProbe {
  public:
   explicit HrxDeviceProbe(IBackend& be)
-      : be_(be), cache_(be, compiler_) {
+      : be_(be), use_loom_(!compiler_.available() && loom_compiler_.available()),
+        cache_(be, use_loom_ ? static_cast<const IKernelCompiler&>(loom_compiler_)
+                            : static_cast<const IKernelCompiler&>(compiler_)) {
     const DeviceInfo& info = be_.device_info();
-    if (!compiler_.available()) {
+    if (!compiler_.available() && !use_loom_) {
       declined_ = "no JIT compiler in this build, so no probe kernel can be "
                   "compiled and every device-side rate stays unknown";
     } else if (device_extension<AmdDeviceInfo>(info) == nullptr) {
@@ -287,13 +224,31 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     // A measurement that fails leaves its field unknown; it never falls back to
     // a plausible number, and it does not stop the others from being taken.
     if (const Status s = measure_stream(out); !s.ok()) note(s);
+    if (!retired_) return OkStatus();
     if (const Status s = measure_launch(out); !s.ok()) note(s);
+    if (!retired_) return OkStatus();
     if (const Status s = measure_matrix(out); !s.ok()) note(s);
+    if (!retired_) return OkStatus();
     fill_paths(out);
     return OkStatus();
   }
 
  private:
+  bool retired_ = true;
+  Status finish_buffers(ProbeRetirement<DeviceBuffer>& buffers, Status operation) {
+    Status drain;
+    retired_ = buffers.finish([&] {
+      drain = be_.synchronize();
+      return drain.ok();
+    }, [&](DeviceBuffer& buffer) { be_.deallocate(buffer); });
+    if (!retired_) {
+      std::fprintf(stderr, "[probe] retirement unconfirmed; retaining allocations "
+                           "until process exit and stopping calibration\n");
+      return drain.ok() ? LSE_ERROR(kDeviceError, "probe retirement unavailable") : drain;
+    }
+    return operation;
+  }
+
   void note(const Status& s) {
     if (!declined_.empty()) declined_ += "; ";
     declined_ += s.message();
@@ -313,41 +268,82 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     return cache_.get_or_compile(0, hash_bytes(entry), emitted);
   }
 
+  Result<KernelHandle> compiled_loom(Result<EmittedKernel> source) {
+    if (!source.ok()) return source.status();
+    const std::uint64_t key = hash_bytes(source->source);
+    return cache_.get_or_compile(0, key, *source);
+  }
+
+  Status poison_output(DeviceBuffer& dst, std::size_t payload) {
+    std::vector<float> values(payload + 16, -1234.0f);
+    std::fill_n(values.begin(), payload, std::numeric_limits<float>::quiet_NaN());
+    return be_.copy_h2d(values.data(), dst, values.size() * sizeof(float), 0);
+  }
+
+  Status validate_output(const DeviceBuffer& dst, std::size_t payload,
+                         float expected) {
+    std::vector<float> values(payload + 16);
+    LSE_RETURN_IF_ERROR(be_.copy_d2h(dst, values.data(), values.size() * sizeof(float), 0));
+    return check_probe_output(values, payload, expected);
+  }
+
   // --- roofline ----------------------------------------------------------
   Status measure_stream(probe::DeviceProfile& out) {
     const DeviceInfo& info = be_.device_info();
     const std::uint32_t load_bytes = device_load_bytes(&info);
     const std::uint32_t width =
         kir::pack_n(load_bytes, kir::pack_elem_bytes<kir::f32>());
-    const std::uint32_t groups =
-        (info.compute_units != 0 ? info.compute_units : 8u) * 8u;
+    if (info.compute_units == 0 || info.wavefront_size == 0 ||
+        info.max_threads_per_workgroup < kBlock) {
+      return LSE_ERROR(kUnimplemented, "stream probe needs known device geometry");
+    }
+    const auto free = be_.sample_free_memory();
+    const std::size_t stream_bytes = streaming_probe_bytes(
+        info.total_memory, free.ok() ? std::optional<std::size_t>(*free) : std::nullopt);
+    if (stream_bytes == 0) {
+      return LSE_ERROR(kUnimplemented, "no known memory budget for stream probe");
+    }
+    if (info.compute_units > std::numeric_limits<std::uint32_t>::max() / (8u * kBlock * width)) {
+      return LSE_ERROR(kInvalidArgument, "stream probe geometry overflows its index");
+    }
+    const std::uint32_t groups = info.compute_units * 8u;
     const std::uint32_t threads = groups * kBlock;
     const std::uint32_t span = threads * width;
     // A whole number of strides, so the last pack of every thread lands inside
     // the buffer and no load needs a tail guard.
     std::uint32_t elems =
-        static_cast<std::uint32_t>(kStreamBytes / sizeof(float));
+        static_cast<std::uint32_t>(stream_bytes / sizeof(float));
     elems = (elems / span) * span;
     if (elems == 0) {
       return LSE_ERROR(kInvalidArgument, "stream probe has no work to do");
     }
 
-    LSE_ASSIGN_OR(const KernelHandle kernel,
-                  compiled("lse_probe_stream",
-                           stream_source("lse_probe_stream", elems, threads,
-                                         load_bytes)));
+    Result<KernelHandle> built = use_loom_
+        ? compiled_loom(emit_loom_stream_probe(info, elems, threads, load_bytes))
+        : compiled("lse_probe_stream", stream_source(
+              "lse_probe_stream", elems, threads, load_bytes));
+    if (!built.ok()) return built.status();
+    const KernelHandle kernel = built.release();
+    std::fprintf(stderr, "[probe] streaming dialect=%s working_set=%u "
+                         "bytes clock=host-steady cache-residency=unverified\n",
+                 use_loom_ ? "loom" : "hip", elems * 4u);
 
+    ProbeRetirement<DeviceBuffer> buffers;
+    if (!buffers.available()) {
+      return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
+    }
     auto in = be_.allocate(static_cast<std::size_t>(elems) * sizeof(float),
                            MemoryClass::kDevice);
     if (!in.ok()) return in.status();
     DeviceBuffer src = in.release();
-    auto sink = be_.allocate(static_cast<std::size_t>(threads) * sizeof(float),
+    buffers.track(src);
+    auto sink = be_.allocate((static_cast<std::size_t>(threads) + 16) * sizeof(float),
                              MemoryClass::kDevice);
     if (!sink.ok()) {
-      be_.deallocate(src);
-      return sink.status();
+      return finish_buffers(buffers, sink.status());
     }
     DeviceBuffer dst = sink.release();
+    buffers.track(dst);
 
     // Written before it is read: an allocation nothing has touched is not
     // backed by anything, and streaming it would time the page fault path
@@ -358,9 +354,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
                                     static_cast<std::size_t>(elems) *
                                         sizeof(float), 0);
       if (!s.ok()) {
-        be_.deallocate(src);
-        be_.deallocate(dst);
-        return s;
+        return finish_buffers(buffers, s);
       }
     }
 
@@ -369,12 +363,18 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     dims.workgroup_count[0] = groups;
     dims.subgroup_size = wavefront();
     const BufferRef refs[] = {{&src, 0, src.size_bytes},
-                              {&dst, 0, dst.size_bytes}};
+                              {&dst, 0, static_cast<std::size_t>(threads) * sizeof(float)}};
     DispatchArgs args;
     args.bindings = refs;
+    const std::uint32_t count = threads;
+    if (use_loom_) args.constants = std::as_bytes(std::span(&count, 1));
 
-    Status status = be_.launch(kernel, dims, args);
+    Status status = poison_output(dst, threads);
+    if (status.ok()) status = be_.launch(kernel, dims, args);
     if (status.ok()) status = be_.synchronize();
+    const float expected = static_cast<float>(elems / threads);
+    if (status.ok()) status = validate_output(dst, threads, expected);
+    if (status.ok()) status = poison_output(dst, threads);
     if (status.ok()) {
       const auto t0 = Clock::now();
       for (int r = 0; r < kStreamReps && status.ok(); ++r) {
@@ -382,34 +382,51 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
       }
       if (status.ok()) status = be_.synchronize();
       const double ns = ns_since(t0);
+      if (status.ok()) status = validate_output(dst, threads, expected);
       if (status.ok() && ns > 0.0) {
         out.dram_bytes_per_s = probe::Measured::measured(
             static_cast<double>(elems) * sizeof(float) * kStreamReps * 1e9 / ns);
       }
     }
-    be_.deallocate(src);
-    be_.deallocate(dst);
+    status = finish_buffers(buffers, status);
+    if (!status.ok()) out.dram_bytes_per_s = {};
     return status;
   }
 
   // --- dispatch cost -----------------------------------------------------
   Status measure_launch(probe::DeviceProfile& out) {
-    LSE_ASSIGN_OR(const KernelHandle kernel,
-                  compiled("lse_probe_touch", touch_source("lse_probe_touch")));
-    auto sink = be_.allocate(sizeof(float), MemoryClass::kDevice);
+    if (wavefront() == 0 || wavefront() > be_.device_info().max_threads_per_workgroup) {
+      return LSE_ERROR(kUnimplemented, "touch probe needs known device geometry");
+    }
+    Result<KernelHandle> built = use_loom_
+        ? compiled_loom(emit_loom_touch_probe(be_.device_info()))
+        : compiled("lse_probe_touch", touch_source("lse_probe_touch"));
+    if (!built.ok()) return built.status();
+    const KernelHandle kernel = built.release();
+    ProbeRetirement<DeviceBuffer> buffers;
+    if (!buffers.available()) {
+      return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
+    }
+    auto sink = be_.allocate(17 * sizeof(float), MemoryClass::kDevice);
     if (!sink.ok()) return sink.status();
     DeviceBuffer dst = sink.release();
+    buffers.track(dst);
 
     LaunchDims dims;
     dims.workgroup_size[0] = wavefront() != 0 ? wavefront() : 32u;
     dims.workgroup_count[0] = 1;
     dims.subgroup_size = wavefront();
-    const BufferRef refs[] = {{&dst, 0, dst.size_bytes}};
+    const BufferRef refs[] = {{&dst, 0, sizeof(float)}};
     DispatchArgs args;
     args.bindings = refs;
+    const std::uint32_t count = 1;
+    if (use_loom_) args.constants = std::as_bytes(std::span(&count, 1));
 
-    Status status = be_.launch(kernel, dims, args);
+    Status status = poison_output(dst, 1);
+    if (status.ok()) status = be_.launch(kernel, dims, args);
     if (status.ok()) status = be_.synchronize();
+    if (status.ok()) status = validate_output(dst, 1, 1.0f);
+    if (status.ok()) status = poison_output(dst, 1);
     if (status.ok()) {
       const auto t0 = Clock::now();
       for (int r = 0; r < kLaunchReps && status.ok(); ++r) {
@@ -417,6 +434,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
       }
       if (status.ok()) status = be_.synchronize();
       const double ns = ns_since(t0);
+      if (status.ok()) status = validate_output(dst, 1, 1.0f);
       if (status.ok() && ns > 0.0) {
         // One workgroup of one wave writing one float: what is left after
         // dividing is the submission path, which is what a placement decision
@@ -425,7 +443,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
             probe::Measured::measured(ns / static_cast<double>(kLaunchReps));
       }
     }
-    be_.deallocate(dst);
+    status = finish_buffers(buffers, status);
+    if (!status.ok()) out.launch_overhead_ns = {};
     return status;
   }
 
@@ -435,7 +454,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     const std::optional<math::MatrixTarget> target = matrix_target(info);
     if (!target.has_value()) return;
     const std::uint32_t caps = device_matrix_caps(info);
-    const DialectSourceTable table = hip_sources();
+    const DialectSourceTable table = use_loom_ ? loom_sources() : hip_sources();
 
     for (const math::MatrixCoreRow& r : math::matrix_core_table()) {
       if (r.target != *target) continue;
@@ -483,6 +502,7 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
 
       const Status s = measure_one_row(info, *row, *storage, rate);
       if (!s.ok() && first.ok()) first = s;
+      if (!retired_) break;
     }
     return first;
   }
@@ -491,8 +511,9 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
                          const math::MatrixCoreRow& row, DType storage,
                          probe::MatrixRowRate& rate) {
     const std::string entry = "lse_probe_mma_" + std::string(to_string(storage));
-    LSE_ASSIGN_OR(const KernelHandle kernel,
-                  compiled(entry, rate_source(entry, info, row, storage)));
+    LSE_ASSIGN_OR(const KernelHandle kernel, use_loom_
+        ? compiled_loom(emit_loom_matrix_rate_probe(info, row, storage))
+        : compiled(entry, rate_source(entry, info, row, storage)));
 
     const std::size_t operand_elems =
         static_cast<std::size_t>(kRateK / static_cast<std::uint32_t>(row.pack));
@@ -503,53 +524,44 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     }
     const std::size_t a_bytes = kRateM * operand_elems * widths.x;
     const std::size_t b_bytes = kRateN * operand_elems * widths.w;
+    ProbeRetirement<DeviceBuffer> buffers;
+    if (!buffers.available()) return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
+    constexpr std::size_t guard = 16;
+    constexpr std::size_t output_elements = static_cast<std::size_t>(kRateM) * kRateN;
     auto ba = be_.allocate(a_bytes, MemoryClass::kDevice);
     if (!ba.ok()) return ba.status();
-    DeviceBuffer x = ba.release();
+    DeviceBuffer x = ba.release(); buffers.track(x);
     auto bb = be_.allocate(b_bytes, MemoryClass::kDevice);
-    if (!bb.ok()) {
-      be_.deallocate(x);
-      return bb.status();
-    }
-    DeviceBuffer w = bb.release();
-    auto bo = be_.allocate(
-        static_cast<std::size_t>(kRateM) * kRateN * sizeof(float),
-        MemoryClass::kDevice);
-    if (!bo.ok()) {
-      be_.deallocate(x);
-      be_.deallocate(w);
-      return bo.status();
-    }
-    DeviceBuffer o = bo.release();
+    if (!bb.ok()) return finish_buffers(buffers, bb.status());
+    DeviceBuffer w = bb.release(); buffers.track(w);
+    auto bo = be_.allocate((output_elements + 2 * guard) * sizeof(float), MemoryClass::kDevice);
+    if (!bo.ok()) return finish_buffers(buffers, bo.status());
+    DeviceBuffer o = bo.release(); buffers.track(o);
 
-    // Defined operands: an uninitialized buffer is a timing measurement over
-    // whatever the allocator last left there.
-    std::vector<std::byte> seed(std::max(a_bytes, b_bytes), std::byte{0x11});
-    Status seeded = be_.copy_h2d(seed.data(), x, a_bytes, 0);
-    if (seeded.ok()) seeded = be_.copy_h2d(seed.data(), w, b_bytes, 0);
-    if (!seeded.ok()) {
-      be_.deallocate(x);
-      be_.deallocate(w);
-      be_.deallocate(o);
-      return seeded;
-    }
+    auto x_seed = matrix_probe_ones(storage, true, a_bytes);
+    auto w_seed = matrix_probe_ones(storage, false, b_bytes);
+    if (!x_seed.ok()) return finish_buffers(buffers, x_seed.status());
+    if (!w_seed.ok()) return finish_buffers(buffers, w_seed.status());
+    Status seeded = be_.copy_h2d(x_seed->data(), x, a_bytes, 0);
+    if (seeded.ok()) seeded = be_.copy_h2d(w_seed->data(), w, b_bytes, 0);
+    if (!seeded.ok()) return finish_buffers(buffers, seeded);
 
-    const auto lanes = static_cast<std::uint32_t>(row.wave);
-    const std::uint32_t tiles_n = (kRateN + kTileN - 1) / kTileN;
-    const std::uint32_t tiles = ((kRateM + kTileM - 1) / kTileM) * tiles_n;
-    const std::uint32_t cap =
-        info.max_threads_per_workgroup >= 256 ? 256u : 64u;
-    const std::uint32_t waves = cap / lanes;
-    LaunchDims dims;
-    dims.workgroup_size[0] = waves * lanes;
-    dims.workgroup_count[0] = (tiles + waves - 1) / waves;
-    dims.subgroup_size = lanes;
-
-    const BufferRef refs[] = {{&x, 0, x.size_bytes},
-                              {&w, 0, w.size_bytes},
-                              {&o, 0, o.size_bytes}};
-    DispatchArgs args;
-    args.bindings = refs;
+    const auto poison = [&] {
+      std::vector<float> data(output_elements + 2 * guard, -1234.0f);
+      std::fill_n(data.begin() + guard, output_elements, std::numeric_limits<float>::quiet_NaN());
+      return be_.copy_h2d(data.data(), o, data.size() * sizeof(float), 0);
+    };
+    const auto validate = [&]() -> Status {
+      std::vector<float> data(output_elements + 2 * guard);
+      LSE_RETURN_IF_ERROR(be_.copy_d2h(o, data.data(), data.size() * sizeof(float), 0));
+      return check_matrix_probe_output(data, guard, output_elements, static_cast<float>(kRateK));
+    };
+    const LaunchDims dims = rate_dims(info, row);
+    const BufferRef refs[] = {{&x, 0, a_bytes}, {&w, 0, b_bytes},
+                              {&o, guard * sizeof(float), output_elements * sizeof(float)}};
+    DispatchArgs args; args.bindings = refs;
+    const std::uint32_t count = static_cast<std::uint32_t>(output_elements);
+    if (use_loom_) args.constants = std::as_bytes(std::span(&count, 1));
 
     // WARM THE CLOCKS BEFORE TIMING THEM.
     //
@@ -565,8 +577,11 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     // price every fusion and tile decision against these figures, so an
     // under-measured compute rate tells the whole optimizer that compute is
     // scarce on a part where it is abundant.
-    Status status = be_.launch(kernel, dims, args);
+    Status status = poison();
+    if (status.ok()) status = be_.launch(kernel, dims, args);
     if (status.ok()) status = be_.synchronize();
+    if (status.ok()) status = validate();
+    double measured_rate = 0.0;
     if (status.ok()) {
       // Sustained load until the governor has had time to ramp, then a timed
       // window long enough that the ramp is not inside it.
@@ -579,6 +594,9 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
         }
         if (status.ok()) status = be_.synchronize();
       }
+      // Re-poison after warming so timed work must produce the full image.
+      if (status.ok()) status = poison();
+      if (status.ok()) status = be_.synchronize();
       int reps = 0;
       const auto t0 = Clock::now();
       while (status.ok() && ns_since(t0) < kMinNs) {
@@ -590,18 +608,22 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
       }
       if (status.ok()) status = be_.synchronize();
       const double ns = ns_since(t0);
-      if (status.ok() && ns > 0.0) {
+      if (status.ok()) status = validate();
+      if (status.ok() && ns > 0.0 && reps > 0) {
         // `reps` actually issued, not the batch constant: the timed window
         // now runs as many batches as it needs to fill 20 ms.
         const double flops =
             2.0 * kRateM * kRateN * kRateK * static_cast<double>(reps);
-        rate.flops = probe::Measured::measured(flops * 1e9 / ns);
-        rate.support = probe::RowSupport::kMeasured;
+        measured_rate = flops * 1e9 / ns;
       }
     }
-    be_.deallocate(x);
-    be_.deallocate(w);
-    be_.deallocate(o);
+    status = finish_buffers(buffers, status);
+    if (status.ok() && measured_rate > 0.0) {
+      rate.flops = probe::Measured::measured(measured_rate);
+      rate.support = probe::RowSupport::kMeasured;
+    } else {
+      rate.flops = {};
+    }
     return status;
   }
 
@@ -664,6 +686,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
 
   IBackend& be_;
   ComgrCompiler compiler_;
+  LoomcCompiler loom_compiler_;
+  bool use_loom_;
   graph::JitCache cache_;
   bool usable_ = false;
   std::string declined_;

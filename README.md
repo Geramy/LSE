@@ -6,6 +6,79 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
 are generated at run time from the model's own shapes rather than selected from
 a library.
 
+## Working macOS GPU inference
+
+[MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu) provides a DriverKit
+AMD GPU driver and HSA runtime for the native HRX/Loom path on Apple Silicon.
+The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
+contains pinned dependencies, macOS adapter build steps and guarded GPU tests.
+R9700/gfx1201 validation covers Q6 projection, convolution, recurrent state,
+paged attention and GPU-only Qwen 27B Q6 text generation. Repeated HTTP
+completion/chat requests pass isolation and graceful shutdown. A five-token
+prompt and 33 generated IDs exactly match an independent same-checkpoint MLX
+run. Qwen Q6 also completed exactly 1,024 input and 1,024 output tokens with
+KV capacity 2,048 and MTP disabled. These workloads do not establish llama.cpp
+performance parity. Broader model accuracy and MTP remain under qualification.
+The 64-token prompt matches all 33 generated IDs
+of a float32 MLX reference with unchanged packed Q6 weights; native BF16 MLX
+diverges at an exact logit tie. See the
+[measurements and limits](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md)
+and [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
+for reproduction, server, chat and monitor commands.
+Use the `macos-arm64` release asset for Apple Silicon. Linux release binaries
+are not macOS builds.
+
+**HIPC and Loom currently have different performance.** The earlier HIPC
+(`--dialect hip`) result is reported at approximately **34 decode tokens/s**,
+but its log and exact model, context and MTP settings still need to be recovered
+for a matched comparison. It is not a measured macOS Loom result.
+
+**The current macOS Loom default generates at 16.67 tokens/s**, with prompt
+processing at **88.82 tokens/s**, on the local Qwen3.8-27B-MLX-6bit checkpoint.
+The workload is 512 input / 129 output tokens, KV1024, MTP disabled, flush64 and
+64 µs polling: one measured request after two warmups. All three texts matched,
+the measured request compiled no new shaders, and shutdown completed cleanly.
+An independent run of the same server with the prior HSA library measured
+88.68 PP/s and 16.68 TPS. These are current-default measurements; they do not
+establish matched llama.cpp parity.
+
+Working shared HIP/Loom optimizations include cooperative RMS normalization,
+Q6 activation reuse across four output columns, and buffer-lifetime planning
+based on the final fused kernel groups. Four-column decode preserves each
+output's FP32 arithmetic order. The two M256 feed-forward projections currently
+use FP32: their experimental BF16 profile exceeded the unchanged model accuracy
+limit, and a centered replacement also failed the expanded code-prompt check.
+Faster experimental prefill rates are documented in the linked measurement
+report rather than presented as current-default throughput.
+
+**GPU profiling is working through rocprofmac.** The matched timestamp capture
+preserved all six profile-off/on responses and added about 1.0% prefill time and
+3.7% decode time in this sequential comparison. The two feed-forward projection
+shapes account for 67.3% of summed prefill kernel durations; this guides ongoing
+matrix-kernel optimization. Those sums and the gaps between dispatches are not
+GPU utilization measurements.
+
+The opt-in Q6 INT8 candidate has passed its GPU numerical suite but remains
+experimental: full-shape timing improves one projection and regresses the two
+main feed-forward shapes. It is not part of the released INT8 policy.
+
+KV capacity growth can create additional prefill specializations on the second
+request. Warm up the resident workload twice and check the HTTP JIT timing
+counters before reporting steady-state prompt throughput.
+
+HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
+FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
+rounding boundaries and buffer guards. The optimizer selects accepted kernels
+using shape, capabilities, accuracy, and matched timing evidence. Staged BF16
+won the four qualified large Q6 projection shapes; single-token decode and
+unknown shapes retain their existing floating-point path. No manual FP8/BF8
+selection is needed. Packed Q6 weights remain packed in VRAM; matrix
+accumulation remains FP32. See [operand selection](docs/QUANT_OPERANDS.md).
+
+Set **`LSE_HRX_INT8=1`** to opt into the existing activation-quantized **Q4**
+dot/WMMA paths. It does not enable Q6/Q8 INT8 conversion.
+[Precision policy](docs/INT8_POLICY.md)
+
 ## Models
 
 The architecture is what a checkpoint is loaded as, not its name, so a family
@@ -17,7 +90,7 @@ shares one kernel. `--list-models` prints what a build registers.
 | `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
 | `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
 
-Weights are read in MLX group-affine form at 4 or 8 bits, or bf16/f16/f32. A
+Weights are read in MLX group-affine form at 4, 6 or 8 bits, or bf16/f16/f32. A
 multi-token-prediction module is used when the checkpoint has one, which is
 what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
 where a checkpoint also ships a vision tower, which this build does not run.
@@ -26,8 +99,8 @@ where a checkpoint also ships a vision tower, which this build does not run.
 
 Ops are lazy: they record into a DAG and execute only when a host-visible read
 demands a value. On demand the graph is partitioned into fusion groups, each
-group is emitted as HIP source, compiled with `amd_comgr` into an AMDGPU code
-object, cached on disk, and dispatched through the native HRX ABI
+group is emitted as HIP or Loom source, compiled with the selected toolchain into
+an AMDGPU code object, cached on disk, and dispatched through the native HRX ABI
 (`hrx_stream_dispatch`) — not through HIP. Every extension seam (backend,
 transport, quantization scheme, layer, sampler) is a CRTP base that owns the
 shared algorithms and calls into the derived type for the primitives.
@@ -37,6 +110,36 @@ shared algorithms and calls into the derived type for the primitives.
 Releases are built by the **Build & Release** workflow in the Actions tab and
 carry ahead-of-time kernels for the architectures selected for that build,
 which the release notes list.
+
+The **macOS ARM64** workflow builds on GitHub-hosted Apple Silicon runners.
+It packages `lse`, `lse-server`, HRX, Loom and the MacAMDGPU HSA runtime, checks
+host behavior and native kernel compilation, and tests the package after moving
+it to a different directory. These hosted checks do not execute AMD GPU kernels.
+
+For **Apple Silicon** (binaries target macOS 15 or later; the current
+MacAMDGPU driver requires macOS Tahoe 26.2 or later):
+
+```bash
+# Pick the macos-arm64 asset from https://github.com/Geramy/LSE/releases
+curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-macos-arm64.tar.gz
+curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-macos-arm64.tar.gz.sha256
+shasum -a 256 -c lse-<tag>-macos-arm64.tar.gz.sha256
+tar -xzf lse-<tag>-macos-arm64.tar.gz
+cd lse-<tag>-macos-arm64
+./bin/lse --devices
+./bin/lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
+./bin/lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
+```
+
+Install, approve and initialize the
+[MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu#hardware-requirements)
+separately before GPU use. Hardware qualification currently covers the R9700
+(`gfx1201`) on Apple Silicon; this is not general support for every AMD GPU.
+The archive does not install a system extension. Use its `bin/` launchers to
+load the bundled runtime libraries. Binaries are ad-hoc signed, not Developer ID
+notarized. The package uses Loom; HIP/comgr is not included on macOS.
+
+For **Linux x86_64**:
 
 ```bash
 # Pick the asset from https://github.com/Geramy/LSE/releases
@@ -82,6 +185,35 @@ prediction module, or point at one:
 ```bash
 ./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
 ```
+
+### Choose HIP or Loom
+
+Both the CLI and server accept **`--dialect hip`** or **`--dialect loom`**.
+The HIP code generator is named `hipc` in the source; its command-line value is
+`hip`, not `hipc`. Both paths dispatch through HRX.
+
+| Platform / path | Flags | Compiler and runtime |
+|---|---|---|
+| Linux, HIP source | `--pool hrx:0 --dialect hip` | HIP code generation and ROCm `amd_comgr`, with HRX |
+| Linux, Loom source | `--pool hrx:0 --dialect loom` | Loom compiler and HRX; requires a build that includes Loom |
+| Apple Silicon + MacAMDGPU | `--pool hrx:0 --dialect loom` | Native macOS Loom, HRX and MacAMDGPU HSA runtime |
+
+```bash
+# macOS AMDGPU inference (also valid for a Loom-enabled Linux build)
+./lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
+./lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
+
+# Linux HIP-source path
+./lse --pool hrx:0 --dialect hip -m /path/to/model --no-mtp -n 128 "Hello"
+./lse-server --pool hrx:0 --dialect hip -m /path/to/model --no-mtp --port 8080
+```
+
+The macOS package supports Loom; it does not include a macOS HIP compiler.
+`--dialect` is a preference among the device's available toolchains. If a device
+does not declare the requested dialect, LSE reports that fact and uses its own
+choice. Check the startup `generates hip` / `generates loom` line to confirm the
+selected path. `--pool hrx:0` selects the first HRX device; omit it for automatic
+device selection. Check `--devices` before loading a model.
 
 ### `lse` options
 
@@ -133,6 +265,8 @@ works by changing the base URL.
 | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
 | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
 | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
+| `--pool LIST` | `$LSE_POOL` | Device selection, for example `hrx:0` |
+| `--dialect NAME` | the device's choice | Kernel source dialect: `hip` or `loom` (not `hipc`) |
 
 Binding beyond localhost gives anyone who can reach the machine use of the
 GPU, so pair `--host 0.0.0.0` with `--api-key`:
@@ -430,3 +564,14 @@ warnings under the full warning set.
 Non-commercial use is free for everyone; commercial use requires a separate
 license, with exceptions for the organizations listed in Exhibit A. See
 **[LICENSE.md](LICENSE.md)**.
+
+### macOS decode submission policy
+
+Single-device gfx1201 Loom decode measures submission intervals during ordinary
+warm decode steps, excludes JIT/fallback/repartition samples, and retains only
+stable improvements over the 16-dispatch baseline. Explicit
+`LSE_FLUSH_INTERVAL` overrides selection; `LSE_AUTO_BATCH=0` disables it.
+The measured macOS short-context rates use explicit flush64 and 64 µs polling
+overrides, KV128 and no MTP. They are HTTP end-to-end rates and are not
+equivalent to other engines' benchmark workloads.
+See [the macOS measurements](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md).

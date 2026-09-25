@@ -139,7 +139,9 @@ struct DeviceProfile {
   bool unified_memory = false;
 
   // The roofline. Achieved streaming read rate out of device memory, which is
-  // what decode is bound by; not the theoretical pin rate.
+  // what decode is bound by; not the theoretical pin rate. The historical
+  // field name does not promise cache bypass: unqueried last-level caches may
+  // contribute, so reports label it streaming bandwidth.
   Measured dram_bytes_per_s;
   // Wall time one dispatch costs when the kernel does nothing, on the
   // submission path the engine actually uses.

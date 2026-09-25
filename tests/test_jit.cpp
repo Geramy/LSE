@@ -1632,18 +1632,43 @@ LSE_TEST(loom_identity_carries_the_install_and_every_option) {
   LSE_EXPECT(id.find("format=amdgpu-hsaco") != std::string::npos);
   LSE_EXPECT(id.find("manifest=none") != std::string::npos);
 
-  // The install stamp is real: loomc publishes no version query and its .so
-  // carries no build-id, so identity() stats the library it resolved. A rebuild
-  // at the same package version has to move this or the cache serves objects a
-  // different compiler produced.
-  const std::string lib = identity_field(id, "lib=");
+  // Identify the image actually selected by the loader, including its file
+  // contents and nanosecond timestamp. Paths may contain spaces, so the path
+  // ends at the next named field rather than the first space.
+  const auto file_at = id.find("file=");
+  const auto bytes_at = id.find(" bytes=", file_at);
+  LSE_EXPECT(file_at != std::string::npos);
+  LSE_EXPECT(bytes_at != std::string::npos);
+  if (file_at == std::string::npos || bytes_at == std::string::npos) return;
+  const std::string lib = id.substr(file_at + 5, bytes_at - file_at - 5);
   LSE_EXPECT(!lib.empty());
   struct ::stat st{};
-  LSE_EXPECT_EQ(::stat(lib.c_str(), &st), 0);
-  LSE_EXPECT(identity_field(id, "size=") ==
+  const int stat_result = ::stat(lib.c_str(), &st);
+  LSE_EXPECT_EQ(stat_result, 0);
+  if (stat_result != 0) return;
+  LSE_EXPECT(identity_field(id, "bytes=") ==
              std::to_string(static_cast<long long>(st.st_size)));
+  const auto hex_field = [](const std::string& value, std::size_t length) {
+    return value.size() == length &&
+           value.find_first_not_of("0123456789abcdef") == std::string::npos;
+  };
+  LSE_EXPECT(hex_field(identity_field(id, "content="), 16));
+#if defined(__APPLE__)
+  const auto modified = st.st_mtimespec;
+  const auto uuid = identity_field(id, "resident_uuid=");
+  if (uuid.empty()) {
+    // A nonstandard Mach-O image without LC_UUID must be process-scoped.
+    LSE_EXPECT(identity_field(id, "resident=") == "unknown");
+    LSE_EXPECT(!identity_field(id, "process=").empty());
+  } else {
+    LSE_EXPECT(hex_field(uuid, 32));
+  }
+#else
+  const auto modified = st.st_mtim;
+#endif
   LSE_EXPECT(identity_field(id, "mtime=") ==
-             std::to_string(static_cast<long long>(st.st_mtime)));
+             std::to_string(static_cast<long long>(modified.tv_sec)) + ":" +
+             std::to_string(static_cast<long long>(modified.tv_nsec)));
 
   // Two dialects on one device must not share a compiler identity.
   LSE_EXPECT(kLoom.identity() != kCompiler.identity());

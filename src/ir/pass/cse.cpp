@@ -16,6 +16,18 @@ namespace {
 void pin_from(const Body& b, ValueId v, std::vector<bool>& pinned) {
   if (v == kNoValue || v >= b.value_count()) return;
   const ValueDef& d = b.value(v);
+  if (b.intrinsics().dialect() == Dialect::kLoom) {
+    // SSA store hooks name anonymous expressions too. Keep that definition,
+    // following bind aliases exactly as ssa_name() did when recording the hook.
+    pinned[v] = true;
+    if (d.def != kNoOp) {
+      const Operation& o = b.op(d.def);
+      if (o.kind == OpKind::kBind && !o.operands.empty()) {
+        pin_from(b, o.operands[0], pinned);
+      }
+    }
+    return;
+  }
   if (!d.name.empty()) {
     pinned[v] = true;
     return;

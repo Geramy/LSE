@@ -1,6 +1,9 @@
 #include "lse/trace/record.hpp"
 
 #include <ctime>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 
 #include <algorithm>
 
@@ -20,7 +23,16 @@ std::uint64_t clock_ns(clockid_t id) noexcept {
 HostClockPair read_host_clocks() noexcept {
   HostClockPair pair;
   pair.monotonic_ns = clock_ns(CLOCK_MONOTONIC);
+#ifdef __APPLE__
+  // Darwin's continuous clock includes time spent asleep, matching BOOTTIME.
+  static const mach_timebase_info_data_t scale=[] {
+    mach_timebase_info_data_t value{};mach_timebase_info(&value);return value;
+  }();
+  if (scale.denom) pair.boottime_ns=static_cast<std::uint64_t>(
+      static_cast<__uint128_t>(mach_continuous_time())*scale.numer/scale.denom);
+#else
   pair.boottime_ns = clock_ns(CLOCK_BOOTTIME);
+#endif
   return pair;
 }
 

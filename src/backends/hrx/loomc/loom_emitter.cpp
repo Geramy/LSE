@@ -1,6 +1,13 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/graph/epilogue_input.hpp"
+#include "lse/kernels/int8_policy.hpp"
+#include "lse/kernels/quant_operand_policy.hpp"
+#include "lse/kernels/quant_operand_cache.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cstdlib>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -10,6 +17,8 @@
 #include "lse/backends/hrx/loomc/loom_print.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/graph/gdn_pair.hpp"
+#include "lse/kernels/gdn.hpp"
 #include "lse/graph/ops.hpp"
 
 namespace lse::backend {
@@ -17,6 +26,120 @@ namespace lse::backend {
 using namespace lse::graph;
 
 namespace {
+
+// Full structural identity, independent of graph addresses. The graph's
+// display signature omits edges and aliasing; those change argument indices
+// and cannot identify reusable source or JIT objects.
+std::string emission_identity(const FusionGroup& group, const DeviceInfo& device) {
+  std::string key;
+  key.reserve(1024);
+  auto number = [&](std::uint64_t value) {
+    for (unsigned byte = 0; byte < 8; ++byte) {
+      key.push_back(static_cast<char>((value >> (byte * 8)) & 255u));
+    }
+  };
+  auto text = [&](std::string_view value) {
+    number(value.size());
+    key.append(value);
+  };
+  text("loom");
+  number(3);  // identity includes the shared compute-operand policy
+  number(kernels::activation_int8_enabled());
+  number(kernels::quant_operand_cache_key(0));
+  number(kernels::quant_operand_specialization_key(0, group, device,
+                                                  loom_types(), loom_sources()));
+  text(device.arch);
+  // Kernel selection overrides also distinguish persistent JIT identities.
+  // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.
+  for (const char* name : {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M"}) {
+    const char* value = std::getenv(name);
+    text(value != nullptr ? std::string_view(value) : std::string_view{});
+  }
+  number(device.lds_bytes_per_workgroup);
+  number(device.compute_units);
+  number(device.max_threads_per_workgroup);
+  number(device.wavefront_size);
+  number(device.max_waves_per_cu);
+  number(device.cus_per_lds_pool);
+  auto fact = [&](const auto& value) {
+    number(static_cast<std::uint64_t>(value.source));
+    number(value.value);
+  };
+  const auto& f = device.arch_facts;
+  fact(f.vector_registers_per_simd);
+  fact(f.vector_register_alloc_granule);
+  fact(f.vector_registers_addressable_per_wave);
+  fact(f.scalar_registers_per_simd);
+  fact(f.scalar_register_alloc_granule);
+  fact(f.scalar_registers_addressable_per_wave);
+  fact(f.lds_bytes_addressable_per_workgroup);
+  fact(f.lds_banks);
+  fact(f.max_flat_workgroup_size);
+  fact(f.wave_slots_per_simd);
+  fact(f.simds_per_lds_pool);
+  fact(f.lds_bytes_per_pool);
+  fact(f.lds_alloc_granule_bytes);
+  number(static_cast<std::uint64_t>(device.residency_bandwidth.source));
+  for (auto p : device.residency_bandwidth.percent) number(p);
+  text(device.extension_id);
+  const auto* amd = device_extension<AmdDeviceInfo>(device);
+  number(amd != nullptr);
+  if (amd != nullptr) {
+    number(amd->l2_cache_bytes);
+    number(amd->clock_khz);
+    number(static_cast<std::uint64_t>(amd->matrix_core));
+    number(amd->has_bf16_arith);
+    number(amd->matrix_core_bf16);
+    number(amd->has_dot4_i8);
+    number(amd->has_dot4_iu8);
+    number(amd->max_load_bytes);
+    number(amd->max_store_bytes);
+  }
+  number(static_cast<std::uint64_t>(group.anchor));
+  number(static_cast<std::uint64_t>(group.anchor_class));
+  number(group.is_phase);
+  std::unordered_map<const Node*, std::uint64_t> ids;
+  std::vector<const Node*> nodes;
+  auto identify = [&](const NodePtr& node) {
+    if (!node) return std::uint64_t{0};
+    const auto [it, inserted] = ids.emplace(node.get(), ids.size() + 1);
+    if (inserted) nodes.push_back(node.get());
+    return it->second;
+  };
+  auto sequence = [&](const auto& list) {
+    number(list.size());
+    for (const auto& node : list) number(identify(node));
+  };
+  sequence(group.inputs);
+  sequence(group.nodes);
+  sequence(group.outputs);
+  // Edges of computed nodes, including any boundary input absent from the
+  // caller's input list. Boundary nodes' own producers do not enter the kernel.
+  for (const auto& node : group.nodes) sequence(node->inputs);
+  number(nodes.size());
+  for (const Node* node : nodes) {
+    number(static_cast<std::uint64_t>(node->kind));
+    number(static_cast<std::uint64_t>(node->fclass));
+    number(static_cast<std::uint64_t>(node->dtype));
+    number(node->shape.rank());
+    for (std::size_t i = 0; i < node->shape.rank(); ++i) {
+      number(static_cast<std::uint64_t>(node->shape.dim(i)));
+    }
+    for (auto value : node->iattrs) number(static_cast<std::uint64_t>(value));
+    for (float value : node->attrs) number(std::bit_cast<std::uint32_t>(value));
+    text(node->prim ? node->prim->name() : std::string_view{});
+  }
+  return key;
+}
+
+std::uint64_t identity_hash(std::string_view key) {
+  std::uint64_t hash = 1469598103934665603ull;
+  for (unsigned char c : key) {
+    hash ^= c;
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
 
 kir::Scalar elem_of(DType dt) {
   switch (dt) {
@@ -231,13 +354,7 @@ std::string kernel_header(const EmittedKernel& out,
 
 std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
                                      const DeviceInfo& device) const {
-  // Same group, same device, different language: the emit cache and the JIT
-  // cache both key on this, so the dialect has to be in it or the two
-  // toolchains serve each other's objects.
-  std::uint64_t h = IKernelEmitter::cache_key(group, device);
-  h ^= static_cast<std::uint64_t>(Dialect::kLoom) + 0x9e3779b97f4a7c15ull;
-  h *= 1099511628211ull;
-  return h;
+  return identity_hash(emission_identity(group, device));
 }
 
 Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
@@ -291,7 +408,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     return s;
   };
 
-  if (kernels::linked_bindings(group).ok) {
+  GdnPair gdn_pair;
+  if (group.nodes.size() == 2 && group.outputs.size() == 2) {
+    gdn_pair = exact_gdn_pair(group.nodes[0], group.nodes[1]);
+    if (gdn_pair && (!std::ranges::count(group.outputs, gdn_pair.output) ||
+                     !std::ranges::count(group.outputs, gdn_pair.state))) gdn_pair = {};
+  }
+  if (!gdn_pair && kernels::linked_bindings(group).ok) {
     KernelShapes probe;
     if (kernels::linked_kernel_for(group, probe) != nullptr) {
       return LSE_ERROR(kUnimplemented,
@@ -321,9 +444,26 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     break;
   }
 
+  std::vector<NodePtr> logical_inputs;
+  if (gdn_pair) {
+    self_indexed = kernels::gdn_pair_kernel();
+    anchor = gdn_pair.output;
+    logical_inputs = anchor->inputs;
+    logical_inputs.push_back(gdn_pair.state);
+    si_storage.clear(); si_dtypes.clear();
+    for (const auto& input : logical_inputs) {
+      si_storage.push_back(input->shape);
+      si_dtypes.push_back(input->dtype);
+    }
+    si_shapes = shapes_for(anchor, storage, dtypes);
+    si_shapes.inputs = si_storage;
+    si_shapes.input_dtypes = si_dtypes;
+  } else if (anchor) logical_inputs = anchor->inputs;
+
   EmittedKernel out;
   out.dialect = Dialect::kLoom;
-  out.entry_name = "lse_loom_" + std::to_string(group.signature());
+  const std::string identity = emission_identity(group, device);
+  out.entry_name = "lse_loom_" + std::to_string(identity_hash(identity));
 
   std::unordered_map<const Node*, std::size_t> binding_of;
   auto bind = [&](const NodePtr& n) {
@@ -334,7 +474,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   // A self-indexing primitive names its operands in0..inN in its own order, so
   // they are bound first and an epilogue's extra inputs cannot shift them.
   if (self_indexed != nullptr && anchor) {
-    for (const NodePtr& in : anchor->inputs) bind(in);
+    for (const NodePtr& in : logical_inputs) bind(in);
   }
   for (const NodePtr& in : group.inputs) bind(in);
   const std::size_t input_count = out.binding_order.size();
@@ -347,6 +487,35 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     output_set.insert(o.get());
   }
   out.constants.add("count", 4);
+
+  // Keep only source and launch metadata. The bindings above always come from
+  // this invocation, including a rebuilt graph after a request restart.
+  {
+    const std::lock_guard lock(cache_mutex_);
+    if (const auto it = emit_cache_.find(identity); it != emit_cache_.end()) {
+      auto bindings = std::move(out.binding_order);
+      out = it->second;
+      out.binding_order = std::move(bindings);
+      ++cache_hits_;
+      return out;
+    }
+    ++cache_misses_;
+  }
+  auto remember = [&] {
+    EmittedKernel saved = out;
+    saved.binding_order.clear();
+    const std::lock_guard lock(cache_mutex_);
+    constexpr std::size_t kSourceBudget = 64u * 1024u * 1024u;
+    if (saved.source.size() > kSourceBudget) return;
+    if (emit_cache_.size() >= 1024 ||
+        cache_bytes_ + saved.source.size() > kSourceBudget) {
+      emit_cache_.clear();
+      cache_bytes_ = 0;
+    }
+    if (emit_cache_.emplace(identity, std::move(saved)).second) {
+      cache_bytes_ += out.source.size();
+    }
+  };
 
   // The launch parameters, and the views the body reads through. Parameter
   // names follow the emitter convention the recorder already binds against:
@@ -365,7 +534,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                        ", which is a block layout rather than a Loom element "
                        "type");
     }
-    const bool is_out = output_set.count(n.get()) != 0;
+    const bool is_out = gdn_pair ? n == gdn_pair.output : output_set.count(n.get()) != 0;
     const std::string name =
         si ? (is_out ? std::string("out") : "in" + std::to_string(i))
            : "b" + std::to_string(i);
@@ -405,7 +574,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   // on the pair.
   const int inplace =
       (si && anchor && anchor->prim) ? anchor->prim->inplace_input() : -1;
-  const bool aliased = inplace >= 0;
+  const bool aliased = inplace >= 0 || bool(gdn_pair);
   if (!aliased && out.binding_order.size() > 1) {
     std::string lhs;
     std::string rhs;
@@ -444,7 +613,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
   if (si) {
     // ---- a primitive that owns its indexing -------------------------------
-    const NodePtr& sink = group.outputs.front();
+    const NodePtr& sink = gdn_pair ? gdn_pair.output : group.outputs.front();
     Status epilogue_error;
     bool stored = false;
     Mint hook_mint;
@@ -453,6 +622,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       stored = true;
       std::string s;
       std::unordered_map<const Node*, std::string> value_of;
+
       value_of[anchor.get()] = std::string(value);
       const std::string idx(index);
 
@@ -460,7 +630,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
         const NodePtr& n = out.binding_order[j];
         // A kernel primitive indexes its own operands; they must not be
         // pre-loaded at the output index, because the shapes do not line up.
-        bool is_operand = false;
+        bool is_operand = std::ranges::count(logical_inputs, n) != 0;
         for (const NodePtr& m : group.nodes) {
           if (dynamic_cast<const KernelPrimitiveBase*>(m->prim) == nullptr) {
             continue;
@@ -469,7 +639,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
             if (in.get() == n.get()) is_operand = true;
           }
         }
-        if (is_operand) continue;
+        if (is_operand && !graph::needs_elementwise_input(group, n.get())) continue;
         const std::string at = bounded(
             broadcast_index(n->shape, sink->shape, idx, hook_mint, s),
             n->element_count(), hook_mint, s);
@@ -561,8 +731,19 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     si_shapes.types = type_table;
     si_shapes.intrinsics = &spellings;
 
+    // Binding order deduplicates aliases. Record the logical argument names
+    // through that map too, so a repeated input cannot shift later operands.
+    std::vector<std::string> input_names;
+    for (const NodePtr& input : logical_inputs) {
+      input_names.push_back(names[binding_of.at(input.get())]);
+    }
     ir::KernelBody::Capture cap;
-    const std::string text = self_indexed->emit_kernel(si_shapes);
+    std::string text;
+    {
+      const ir::RecordOptions options{input_names, {}, {}};
+      const ir::KernelBody::Recording recording(options);
+      text = self_indexed->emit_kernel(si_shapes);
+    }
     if (!epilogue_error.ok()) return epilogue_error;
     if (text.empty() || !cap.has()) {
       return LSE_ERROR(kUnimplemented, "primitive '",
@@ -595,6 +776,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     }
     out.source = kernel_header(out, params) + prologue + printed->text +
                  "  kernel.return\n}\n";
+    remember();
     return out;
   }
 
@@ -607,7 +789,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
   std::unordered_set<const Node*> pointer_inputs;
   for (const NodePtr& n : group.nodes) {
-    if (dynamic_cast<const KernelPrimitiveBase*>(n->prim) == nullptr) continue;
+    if (dynamic_cast<const KernelPrimitiveBase*>(n->prim) == nullptr &&
+        n->kind != graph::OpKind::kRepeat) continue;
     for (const NodePtr& in : n->inputs) pointer_inputs.insert(in.get());
   }
 
@@ -624,9 +807,12 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
   std::string inner;
   std::unordered_map<const Node*, std::string> value_of;
+  // Shape-only copies must preserve integer bits and floating-point payloads.
+  std::unordered_map<const Node*, std::string> raw_value_of;
   for (std::size_t i = 0; i < input_count; ++i) {
     const NodePtr& n = out.binding_order[i];
-    if (pointer_inputs.count(n.get()) != 0) continue;
+    if (pointer_inputs.count(n.get()) != 0 &&
+        !graph::needs_elementwise_input(group, n.get())) continue;
     const std::string at =
         bounded(broadcast_index(n->shape, out_shape, "%i", mint, inner),
                 n->element_count(), mint, inner);
@@ -676,6 +862,10 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       KernelShapes shapes = shapes_for(n, shp, dts);
       const KernelPrimitiveBase* chosen = kp->specialize(shapes);
       if (chosen == nullptr) chosen = kp;
+      // A multi-output RMS group cannot use the single-output store hook.
+      // Keep its original per-element implementation, as the HIP scaffold does.
+      if (n->kind == graph::OpKind::kRMS && chosen->owns_indexing() &&
+          !kp->owns_indexing()) chosen = kp;
       if (chosen->owns_indexing()) {
         return LSE_ERROR(kUnimplemented, "primitive '",
                          std::string(chosen->name()),
@@ -713,6 +903,79 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       inner += printed->text;
       value_of[n.get()] = printed->result;
       ++sub;
+      continue;
+    }
+
+    if (n->kind == graph::OpKind::kRepeat) {
+      if (n->inputs.size() != 1 || n->iattrs[1] <= 0) {
+        return LSE_ERROR(kInvalidArgument, "repeat requires one input and a positive count");
+      }
+      const NodePtr& input = n->inputs[0];
+      const Shape& sh = input->shape;
+      const auto axis = static_cast<std::size_t>(n->iattrs[0]);
+      const auto count = static_cast<std::uint64_t>(n->iattrs[1]);
+      if (axis >= sh.rank() || sh.rank() != n->shape.rank() ||
+          input->dtype != n->dtype) {
+        return LSE_ERROR(kInvalidArgument, "repeat shape, axis, or dtype mismatch");
+      }
+      std::uint64_t inner_size = 1, total = 1;
+      for (std::size_t d = 0; d < sh.rank(); ++d) {
+        const auto dim = sh.dim(d);
+        if (dim <= 0 || total > std::numeric_limits<std::uint32_t>::max() /
+                                  static_cast<std::uint64_t>(dim)) {
+          return LSE_ERROR(kInvalidArgument, "repeat requires nonempty u32-sized shapes");
+        }
+        total *= static_cast<std::uint64_t>(dim);
+        if (d > axis) inner_size *= static_cast<std::uint64_t>(dim);
+        const std::uint64_t expected = static_cast<std::uint64_t>(dim) *
+                                       (d == axis ? count : 1);
+        if (n->shape.dim(d) <= 0 ||
+            static_cast<std::uint64_t>(n->shape.dim(d)) != expected) {
+          return LSE_ERROR(kInvalidArgument, "repeat output shape does not match count");
+        }
+      }
+      if (total > std::numeric_limits<std::uint32_t>::max() / count) {
+        return LSE_ERROR(kInvalidArgument, "repeat output exceeds u32 indexing");
+      }
+      const auto binding = binding_of.find(input.get());
+      if (binding == binding_of.end()) {
+        return LSE_ERROR(kInternal, "repeat input is not bound in this group");
+      }
+      auto constant = [&](std::uint64_t value) {
+        const std::string id = mint("repeat");
+        inner += "  " + id + " = index.constant " + std::to_string(value) + " : index\n";
+        return id;
+      };
+      auto binary = [&](std::string_view op, const std::string& a,
+                        const std::string& b) {
+        const std::string id = mint("repeat");
+        inner += "  " + id + " = index." + std::string(op) + " " + a + ", " + b + " : index\n";
+        return id;
+      };
+      const auto axis_size = static_cast<std::uint64_t>(sh.dim(axis));
+      const auto stride = constant(inner_size);
+      const auto copies = constant(count);
+      const auto input_axis = constant(axis_size);
+      const auto span = constant(axis_size * count * inner_size);
+      // A wider sibling output can launch extra lanes. Map those lanes into
+      // this input too; the existing per-output store guard discards them.
+      std::string flat = "%i";
+      if (total * count < launch_elems) {
+        flat = binary("rem", flat, constant(total * count));
+      }
+      const auto outer = binary("div", flat, span);
+      const auto within = binary("rem", flat, span);
+      const auto position = binary("div", binary("div", within, stride), copies);
+      const auto source_axis = binary("add", binary("mul", outer, input_axis), position);
+      const auto source = binary("add", binary("mul", source_axis, stride),
+                                 binary("rem", flat, stride));
+      const auto at = bounded(source, total, mint, inner);
+      const auto raw = mint("repeat_value");
+      inner += "  " + raw + " = view.load %" + names[binding->second] + "_view[" + at +
+               "] : " + loom_view_type(elem_of(n->dtype), total) + " -> " +
+               std::string(loom_storage_type(elem_of(n->dtype))) + "\n";
+      raw_value_of[n.get()] = raw;
+      value_of[n.get()] = widen_to_f32(raw, n->dtype, mint, inner);
       continue;
     }
 
@@ -785,7 +1048,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       inner += "  scf.if " + ok + " {\n";
       guard_close = "  }\n";
     }
-    const std::string narrowed =
+    const auto raw = raw_value_of.find(n.get());
+    const std::string narrowed = raw != raw_value_of.end() ? raw->second :
         narrow_from_f32(it->second, n->dtype, mint, inner);
     const std::string dst = bounded("%i", n->element_count(), mint, inner);
     inner += "  view.store " + narrowed + ", %" + names[i] + "_view[" + dst +
@@ -809,7 +1073,13 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   out.lds_bytes = 0;
   out.source =
       kernel_header(out, params) + prologue + body + "  kernel.return\n}\n";
+  remember();
   return out;
+}
+
+LoomEmitter::CacheStats LoomEmitter::cache_stats() const {
+  const std::lock_guard lock(cache_mutex_);
+  return {cache_hits_, cache_misses_, emit_cache_.size(), cache_bytes_};
 }
 
 }  // namespace lse::backend

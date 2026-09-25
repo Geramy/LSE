@@ -7,6 +7,7 @@
 #include "lse/backends/hrx/device_info.hpp"
 
 #include <string>
+#include <vector>
 
 namespace lse::kernels {
 
@@ -81,13 +82,21 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
   const auto h = e.let((wid / D) % heads);
   const auto b = e.let(wid / (D * heads));
 
-  k.statement("float s[" + std::to_string(tile) + "];");
-  kir::Tile<kir::f32> srow(&k, &k.types(), "s", tile);
+  // Each lane owns at most four state scalars. Record these as mutable IR
+  // locals so every dialect sees their definitions and loop-carried updates;
+  // a raw C array declaration leaves only an unresolved storage symbol in IR.
+  std::vector<kir::LValue<kir::f32>> srow;
+  srow.reserve(tile);
+  for (std::uint32_t ei = 0; ei < tile; ++ei) {
+    srow.emplace_back(e.var(0.0f));
+  }
 
-  for (auto ei : e.unroll(tile)) {
+  for (std::uint32_t ei = 0; ei < tile; ++ei) {
     const auto j = e.let(lane + ei * wave);
     const auto idx = ((b * heads + h) * D + row) * D + j;
-    srow[ei] = kir::select(j < D, a.s[idx], e.f32(0.0f));
+    if (auto in = e.when(j < D)) {
+      srow[ei] = a.s[idx];
+    }
   }
 
   auto reduce = [&](kir::Val<kir::f32> acc) {
@@ -102,7 +111,7 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     const auto vec = sc * D;
     const auto al = e.let(a.alpha[sc]);
     auto skp = e.var(0.0f);
-    for (auto ei : e.unroll(tile)) {
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
       const auto j = lane + ei * wave;
       srow[ei] = srow[ei].read() * al;
       if (auto in = e.when(j < D)) {
@@ -113,7 +122,7 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     const auto bt = e.let(a.beta[sc]);
     const auto delta = e.let((a.v[vec + row] - sk) * bt);
     auto accp = e.var(0.0f);
-    for (auto ei : e.unroll(tile)) {
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
       const auto j = lane + ei * wave;
       if (auto in = e.when(j < D)) {
         srow[ei] = math::fma(delta, a.k[vec + j], srow[ei].read());
@@ -131,7 +140,7 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
   }
 
   if (write_state) {
-    for (auto ei : e.unroll(tile)) {
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
       const auto j = e.let(lane + ei * wave);
       if (auto in = e.when(j < D)) {
         const auto idx = ((b * heads + h) * D + row) * D + j;

@@ -28,6 +28,7 @@
 #include "lse/runtime/batch.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
+#include "token_ids.hpp"
 
 namespace {
 
@@ -52,6 +53,7 @@ struct Options {
   // does not say gets.
   std::string dialect;
   bool show_stats = false;
+  bool token_ids = false;
   bool list_devices = false;
   bool list_cache = false;
   bool debug = false;
@@ -105,6 +107,8 @@ void usage() {
       "                         below what the batch needs, sequences are\n"
       "                         preempted and resume (default: no limit)\n"
       "      --stats            print timings when done\n"
+      "      --token-ids        print exact prompt/generated IDs as JSON to stderr\n"
+      "                         after generation (single sequence only)\n"
       "      --debug            print the HIP dump path and file count\n"
       "      --devices          report every device this build can see, with\n"
       "                         its identity and what it will not answer\n"
@@ -151,6 +155,8 @@ bool parse(int argc, char** argv, Options* opt) {
                      opt->dialect.c_str());
         return false;
       }
+    } else if (a == "--token-ids") {
+      opt->token_ids = true;
     } else if (a == "--stats") {
       opt->show_stats = true;
     } else if (a == "--debug") {
@@ -206,6 +212,11 @@ bool parse(int argc, char** argv, Options* opt) {
     } else {
       positional.push_back(a);
     }
+  }
+
+  if (opt->token_ids && (opt->batch != 1 || !opt->prompts.empty())) {
+    std::fputs("lse: --token-ids requires a single sequence (no --batch or --prompt)\n", stderr);
+    return false;
   }
 
   if (!positional.empty()) {
@@ -699,12 +710,24 @@ int main(int argc, char** argv) {
   auto out = gen.generate(*prompt, opt.limits, emit);
   if (!out.ok()) return fail(out.status(), "generating");
   std::putchar('\n');
+  // The generator already owns both vectors. No per-token hook or collection
+  // is added; diagnostic formatting happens after measured generation ends.
+  if (opt.token_ids) {
+    if (std::fflush(stdout) != 0) {
+      std::fputs("lse: flushing generated text failed\n", stderr);
+      return 1;
+    }
+    if (!cli::print_token_ids(stderr, *prompt, *out)) {
+      std::fputs("lse: writing token-ID diagnostic failed\n", stderr);
+      return 1;
+    }
+  }
 
   if (opt.show_stats) {
     const runtime::GenerationStats& s = gen.stats();
     std::fprintf(stderr,
-                 "prompt %d tokens, prefill %.2f s | generated %d tokens, "
-                 "%.2f tok/s\n"
+                 "prompt %d tokens, prefill %.2f s (%.2f tok/s) | generated %d tokens | "
+                 "decode %d tokens in %.3f s (%.2f tok/s)\n"
                  "spec steps %u accepted %u (%.1f%%) | %u verify pass(es) "
                  "%.1f ms each | draft %.1f ms each\n"
                  "launches %u | phases %u (ideal %u launch%s) | groups "
@@ -715,7 +738,9 @@ int main(int argc, char** argv) {
                  "sched partition=%.3f s emit=%.3f s launch=%.3f s sync=%.3f s\n"
                  "jit mem=%llu disk=%llu compile=%llu (%.3f s)\n",
                  s.prompt_tokens, static_cast<double>(s.prefill_ns) / 1e9,
-                 s.generated_tokens, s.decode_tokens_per_second(),
+                 s.prompt_tokens_per_second(), s.generated_tokens,
+                 s.decoded_tokens(), static_cast<double>(s.decode_ns) / 1e9,
+                 s.decode_tokens_per_second(),
                  s.spec_steps, s.spec_accepted, s.acceptance_rate() * 100.0,
                  s.spec_verify_passes,
                  s.spec_verify_passes == 0

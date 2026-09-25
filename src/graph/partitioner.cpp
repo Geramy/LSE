@@ -1,4 +1,5 @@
 #include "lse/graph/graph.hpp"
+#include "lse/graph/gdn_pair.hpp"
 
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/workgroup.hpp"
@@ -722,6 +723,40 @@ std::vector<FusionGroup> Partitioner::partition(
     groups = std::move(kept);
   }
 
+  // Both recurrence siblings read the same six immutable input nodes. Move
+  // only the later singleton into the earlier singleton; all inputs were
+  // already ready there, and every consumer/root keeps its original node.
+  // Other kernel/epilogue groups remain untouched.
+  std::unordered_map<const Node*, std::vector<std::size_t>> gdn_candidates;
+  for (std::size_t gi = 0; gi < groups.size(); ++gi) {
+    auto& group = groups[gi];
+    if (group.nodes.size() != 1 || group.is_phase) continue;
+    const auto& n = group.nodes.front();
+    if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6 || !n->inputs[0]) continue;
+    auto& earlier = gdn_candidates[n->inputs[0].get()];
+    bool merged = false;
+    for (const auto dst : earlier) {
+      if (groups[dst].nodes.size() != 1 ||
+          !exact_gdn_pair(groups[dst].nodes.front(), n) || !inputs_ordered(*n, dst)) continue;
+      groups[dst].nodes.push_back(n);
+      group_of[n.get()] = dst;
+      group.nodes.clear();
+      merged = true;
+      break;
+    }
+    if (!merged) earlier.push_back(gi);
+  }
+  {
+    std::vector<FusionGroup> kept;
+    std::vector<std::size_t> remap(groups.size());
+    for (std::size_t gi = 0; gi < groups.size(); ++gi) {
+      remap[gi] = kept.size();
+      if (!groups[gi].nodes.empty()) kept.push_back(std::move(groups[gi]));
+    }
+    for (auto& [node, gi] : group_of) gi = remap[gi];
+    groups = std::move(kept);
+  }
+
   // Inputs are values read from outside the group; outputs are values a node in
   // another group, or a root, needs.
   for (std::size_t gi = 0; gi < groups.size(); ++gi) {
@@ -757,7 +792,8 @@ std::vector<FusionGroup> Partitioner::partition(
 
     Workgroup wg(wg_dev);
     for (const NodePtr& n : g.nodes) (void)wg.try_add(n);
-    g.launches = wg.launches();
+    g.launches = g.nodes.size() == 2 && exact_gdn_pair(g.nodes[0], g.nodes[1])
+        ? 1u : wg.launches();
   }
 
   return groups;

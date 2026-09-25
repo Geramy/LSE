@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -70,7 +71,17 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
   // 4 KiB keeps every window page-aligned, which is the strictest alignment
   // any kernel here asks of a binding.
   constexpr std::size_t kAlign = 4096;
-  constexpr std::size_t kSlab = std::size_t{512} << 20;
+  std::size_t kSlab = std::size_t{512} << 20;
+#if defined(__APPLE__)
+  // Device-only VRAM slabs have no individual host-DMA descriptor limit.
+  // Bound each slab to 1/16 of reported VRAM and at most 2 GiB so a large
+  // checkpoint does not exhaust the transport's BO slots merely on weights.
+  // CPU and small/unknown-capacity devices retain the original 512 MiB slab.
+  if (be.name() == "hrx") {
+    const std::size_t budget = be.device_info().total_memory / 16;
+    kSlab = std::clamp(budget & ~(kAlign - 1), kSlab, std::size_t{2} << 30);
+  }
+#endif
   static std::mutex mu;
   static std::vector<WeightSlab> slabs;
   const std::size_t need = (bytes + kAlign - 1) & ~(kAlign - 1);
@@ -96,6 +107,15 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
     made.base = got.release();
     slabs.push_back(std::move(made));
     use = &slabs.back();
+    if (std::getenv("LSE_TIME_LOAD") != nullptr) {
+      std::size_t total = 0;
+      for (const WeightSlab& slab : slabs) total += slab.base.size_bytes;
+      std::fprintf(stderr, "lse weights: %zu live slabs, %.3f GiB reserved; "
+                           "new slab %.1f MiB\n",
+                   slabs.size(), double(total) / double(std::size_t{1} << 30),
+                   double(want) / double(std::size_t{1} << 20));
+      std::fflush(stderr);
+    }
   }
   // A view: same allocation, same residency and member, its own window. This
   // is the shape DeviceBuffer already documents for a reshape's alias.

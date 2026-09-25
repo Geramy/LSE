@@ -2799,15 +2799,18 @@ struct MtpFixture {
 // same token, which is how the accept path gets exercised without trained
 // weights.
 MtpFixture build_mtp_fixture(bool passthrough = false,
-                             std::int32_t gdn_head_dim = 16) {
+                             std::int32_t gdn_head_dim = 16,
+                             bool recurrent_only = false) {
   MtpFixture fx;
   fx.config = mtp_test_config(gdn_head_dim);
+  if (recurrent_only) fx.config.full_attention_interval = fx.config.num_layers + 1;
   const std::int64_t h = fx.config.hidden_size;
   std::error_code ec;
   const std::filesystem::path base =
       std::filesystem::temp_directory_path() /
       (passthrough ? "lse-mtp-fixture-pt"
-                   : "lse-mtp-fixture-" + std::to_string(gdn_head_dim));
+                   : "lse-mtp-fixture-" + std::to_string(gdn_head_dim) +
+                         (recurrent_only ? "-recurrent" : ""));
   std::filesystem::create_directories(base / "mtp", ec);
   fx.module_dir = (base / "mtp").string();
 
@@ -3131,5 +3134,127 @@ LSE_TEST(an_accepted_draft_still_gives_the_decoders_own_tokens) {
     std::printf("       accepted %u/%u  plain %s  spec %s\n",
                 spec.stats().spec_accepted, spec.stats().spec_steps,
                 ids_to_string(*want).c_str(), ids_to_string(*got).c_str());
+  }
+}
+
+LSE_TEST(generation_timing_excludes_prefill_token_and_early_stop) {
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  const std::vector<std::uint32_t> prompt{2, 11, 33};
+  for (bool speculative : {false, true}) {
+    for (int count : {0, 1, 3}) {
+      // CPU interpreter fixtures cannot replay speculative verification. The
+      // prefill-only/first-token/cancel paths still exercise speculative timing.
+      if (speculative && count > 1) continue;
+      Generator gen(*fx.lm, greedy_params());
+      if (speculative) gen.use_mtp(*fx.mtp);
+      GenerationLimits limits;
+      limits.max_tokens = count;
+      auto got = gen.generate(prompt, limits);
+      LSE_EXPECT(got.ok());
+      if (!got.ok()) return;
+      LSE_EXPECT_EQ(got->size(), static_cast<std::size_t>(count));
+      LSE_EXPECT_EQ(gen.stats().generated_tokens, count);
+      LSE_EXPECT_EQ(gen.stats().decoded_tokens(), count > 0 ? count - 1 : 0);
+      if (count <= 1) {
+        LSE_EXPECT_EQ(gen.stats().decode_ns, 0u);
+        LSE_EXPECT_EQ(gen.stats().decode_tokens_per_second(), 0.0);
+      } else {
+        LSE_EXPECT(gen.stats().decode_ns > 0);
+        LSE_EXPECT(gen.stats().decode_tokens_per_second() > 0);
+      }
+    }
+    Generator cancelled(*fx.lm, greedy_params());
+    if (speculative) cancelled.use_mtp(*fx.mtp);
+    GenerationLimits limits;
+    limits.max_tokens = 8;
+    auto got = cancelled.generate(prompt, limits, [](std::uint32_t) { return false; });
+    LSE_EXPECT(got.ok());
+    LSE_EXPECT_EQ(cancelled.stats().generated_tokens, 1);
+    LSE_EXPECT_EQ(cancelled.stats().decode_ns, 0u);
+    LSE_EXPECT_EQ(cancelled.stats().decode_tokens_per_second(), 0.0);
+  }
+}
+
+LSE_TEST(resident_restart_cursors_distinguish_single_token_prefill_from_decode) {
+  for (bool recurrent_only : {false, true}) {
+    MtpFixture fx = build_mtp_fixture(false, 16, recurrent_only);
+    LSE_EXPECT(fx.ok);
+    if (!fx.ok) return;
+    Session session("resident-cursors", fx.lm->state_slots());
+    auto first = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
+    LSE_EXPECT(first.ok());
+    if (!first.ok()) return;
+    for (const auto& state : session.states()) LSE_EXPECT_EQ(state.position, 1);
+    auto next = fx.lm->hidden(ids_array({11, 33}), &session.states(), nullptr);
+    LSE_EXPECT(next.ok());
+    if (!next.ok()) return;
+    for (const auto& state : session.states()) LSE_EXPECT_EQ(state.position, 3);
+    fx.lm->rewind(session.states(), 1);
+    for (const auto& state : session.states()) LSE_EXPECT_EQ(state.position, 1);
+    LSE_EXPECT_OK(session.restart());
+    for (const auto& state : session.states()) LSE_EXPECT_EQ(state.position, 0);
+    auto restarted = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
+    LSE_EXPECT(restarted.ok());
+    if (!restarted.ok()) return;
+    for (const auto& state : session.states()) LSE_EXPECT_EQ(state.position, 1);
+  }
+}
+
+LSE_TEST(recurrent_carries_own_mutable_buffers_and_restart_severs_old_graphs) {
+  MtpFixture fx = build_mtp_fixture(false, 16, true);
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  Session session("resident-ownership", fx.lm->state_slots());
+  auto first = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
+  LSE_EXPECT(first.ok());
+  if (!first.ok()) return;
+  const auto first_carries = fx.lm->retained_program().carries();
+  LSE_EXPECT(first_carries.size() > 1);
+  std::vector<graph::NodePtr> old_outputs;
+  std::vector<const void*> inputs;
+  for (const auto& c : first_carries) {
+    LSE_EXPECT(c.in != nullptr && c.out != nullptr);
+    if (!c.in || !c.out) continue;
+    LSE_EXPECT(c.in->kind == graph::OpKind::kBuffer);
+    LSE_EXPECT(c.in->inputs.empty());
+    LSE_EXPECT(c.in->buffer.valid());
+    const void* address = c.in->buffer.ptr;
+    LSE_EXPECT(address != nullptr);  // this fixture uses the CPU backend
+    LSE_EXPECT(std::find(inputs.begin(), inputs.end(), address) == inputs.end());
+    LSE_EXPECT(address != c.out->buffer.ptr);
+    inputs.push_back(address);
+    old_outputs.push_back(c.out);
+  }
+  // A fold makes each consumed input writable. Mutating one of those outputs
+  // must leave equal-shaped ordinary zeros and every other layer unchanged.
+  LSE_EXPECT(!first_carries.empty());
+  if (first_carries.empty()) return;
+  graph::Array ordinary_zero = graph::Array::zeros(
+      first_carries[0].in->shape, DType::kF32);
+  std::vector<float> zero_values(ordinary_zero.shape().elem_count(), -1.0f);
+  LSE_EXPECT_OK(ordinary_zero.to_host(zero_values.data(),
+                                     zero_values.size() * sizeof(float)));
+  graph::Program folded;
+  folded.set_carries(first_carries);
+  folded.fold_carries();
+  graph::interpreter::store_element(*first_carries[0].out, 0, 13.0f);
+  for (std::size_t i = 1; i < first_carries.size(); ++i) {
+    LSE_EXPECT_EQ(graph::interpreter::load_element(*first_carries[i].out, 0), 0.0f);
+  }
+  LSE_EXPECT_OK(ordinary_zero.to_host(zero_values.data(),
+                                     zero_values.size() * sizeof(float)));
+  for (float value : zero_values) LSE_EXPECT_EQ(value, 0.0f);
+  LSE_EXPECT_OK(session.restart());
+  auto restarted = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
+  LSE_EXPECT(restarted.ok());
+  if (!restarted.ok()) return;
+  for (const auto& c : fx.lm->retained_program().carries()) {
+    LSE_EXPECT(c.in != nullptr);
+    if (!c.in) continue;
+    LSE_EXPECT(c.in->kind == graph::OpKind::kBuffer);
+    LSE_EXPECT(c.in->inputs.empty());
+    for (const auto& old : old_outputs) LSE_EXPECT(c.in.get() != old.get());
   }
 }

@@ -74,7 +74,8 @@ inline constexpr DeviceIndex kNoDevice{};
 struct DeviceBuffer {
   // Host address of the allocation base, or null when the allocation is
   // device-local. A view keeps the same pointer and names its window with
-  // `offset` + `size_bytes`; never free a view, only the original.
+  // `offset` + `size_bytes`. A managed view releases its shared storage
+  // reference; an unowned view must never free the original raw pointer.
   void* ptr = nullptr;
   std::size_t size_bytes = 0;
   std::uint64_t handle = 0;     // opaque, backend-private
@@ -1010,6 +1011,12 @@ class IBackend {
                 const DispatchArgs& args) {
     return launch(kernel, dims, args, DispatchTarget{});
   }
+  // Optional online policy observation around one complete, ordinary decode
+  // step. begin/end may change submission batching only after a confirmed
+  // drain. The caller never repeats model work and excludes cold/JIT samples.
+  virtual Status begin_decode_sample(std::uint64_t) { return OkStatus(); }
+  virtual Status end_decode_sample(std::uint64_t, bool) { return OkStatus(); }
+  virtual void cancel_decode_sample() noexcept {}
   virtual Status synchronize() = 0;
 
   // What this device's streams can do, and how to order two of them. A caller
@@ -1137,6 +1144,20 @@ class BackendAdapter final : public IBackend {
     return impl_.launch(k, d, a, t);
   }
   using IBackend::launch;
+  Status begin_decode_sample(std::uint64_t key) override {
+    if constexpr (requires { impl_.begin_decode_sample_impl(key); })
+      return impl_.begin_decode_sample_impl(key);
+    return OkStatus();
+  }
+  Status end_decode_sample(std::uint64_t elapsed, bool eligible) override {
+    if constexpr (requires { impl_.end_decode_sample_impl(elapsed, eligible); })
+      return impl_.end_decode_sample_impl(elapsed, eligible);
+    return OkStatus();
+  }
+  void cancel_decode_sample() noexcept override {
+    if constexpr (requires { impl_.cancel_decode_sample_impl(); })
+      impl_.cancel_decode_sample_impl();
+  }
   Status synchronize() override { return impl_.synchronize(); }
   const StreamCapabilities& stream_capabilities() const noexcept override {
     return impl_.stream_capabilities();
@@ -1337,10 +1358,16 @@ using StableRefResolver =
 // Backends self-register from their own TU: linking one in is all that makes
 // it selectable by name.
 using BackendFactory = std::unique_ptr<IBackend> (*)();
+using RuntimePreparer = void (*)();
+
+// Load runtime dependencies and register teardown before static device owners
+// are constructed. This must not initialize devices or submit GPU work.
+void prepare_backend_runtimes();
 
 void register_backend(std::string_view name, BackendFactory factory,
                       DeviceEnumerator enumerator = nullptr,
-                      StableRefResolver stable_ref_resolver = nullptr);
+                      StableRefResolver stable_ref_resolver = nullptr,
+                      RuntimePreparer runtime_preparer = nullptr);
 Result<std::unique_ptr<IBackend>> create_backend(std::string_view name);
 
 // What a stable reference names, before any of it is opened. nullopt when the
@@ -1379,8 +1406,9 @@ std::vector<std::string> default_backend_order();
 struct BackendRegistrar {
   BackendRegistrar(std::string_view name, BackendFactory factory,
                    DeviceEnumerator enumerator,
-                   StableRefResolver stable_ref = nullptr) {
-    register_backend(name, factory, enumerator, stable_ref);
+                   StableRefResolver stable_ref = nullptr,
+                   RuntimePreparer runtime_preparer = nullptr) {
+    register_backend(name, factory, enumerator, stable_ref, runtime_preparer);
   }
 };
 
@@ -1410,6 +1438,15 @@ template <typename Derived>
   }
 }
 
+template <typename Derived>
+[[nodiscard]] constexpr RuntimePreparer runtime_preparer_for() noexcept {
+  if constexpr (requires { RuntimePreparer{&Derived::prepare_runtime}; }) {
+    return &Derived::prepare_runtime;
+  } else {
+    return nullptr;
+  }
+}
+
 // No token pasting: Type may be a qualified name. One registration per TU.
 #define LSE_REGISTER_BACKEND(name, Type)                                  \
   namespace {                                                             \
@@ -1418,7 +1455,8 @@ template <typename Derived>
         return std::make_unique<::lse::backend::BackendAdapter<Type>>();  \
       },                                                                  \
       ::lse::backend::device_enumerator_for<Type>(),                      \
-      ::lse::backend::stable_ref_resolver_for<Type>()};                   \
+      ::lse::backend::stable_ref_resolver_for<Type>(),                    \
+      ::lse::backend::runtime_preparer_for<Type>()};                   \
   }  // namespace
 
 }  // namespace lse::backend

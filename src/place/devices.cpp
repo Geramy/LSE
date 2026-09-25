@@ -485,7 +485,10 @@ struct DefaultSet {
   }
 };
 
+void prepare_device_runtime();
+
 DefaultSet& default_set() {
+  prepare_device_runtime();
   static DefaultSet d;
   return d;
 }
@@ -523,7 +526,11 @@ void raise_fd_limit() {
 
 void preload_gpu_runtime() {
   namespace fs = std::filesystem;
+#if defined(__APPLE__)
+  constexpr const char* kHsaSoname = "libhsa-runtime64.dylib";
+#else
   constexpr const char* kHsaSoname = "libhsa-runtime64.so.1";
+#endif
 
   // Somebody already put it in the process. That somebody may be a profiler
   // that intends to intercept every HSA call, and loading a second copy beside
@@ -547,6 +554,12 @@ void preload_gpu_runtime() {
     if (ok) return;
   }
 
+#if defined(__APPLE__)
+  // Honor dyld's configured library search, matching the HRX adapter's name.
+  if (void* native = dlopen(kHsaSoname, RTLD_NOW | RTLD_GLOBAL); native != nullptr) {
+    if (dlsym(native, "hsa_amd_vmem_address_reserve_align") != nullptr) return;
+  }
+#endif
   std::vector<std::string> roots;
   if (const char* env = std::getenv("ROCM_PATH"); env != nullptr && *env != 0) {
     roots.emplace_back(env);
@@ -585,15 +598,19 @@ void preload_gpu_runtime() {
   }
 }
 
-}  // namespace
-
-Status open_default_devices(std::string_view selector) {
+void prepare_device_runtime() {
   static const bool preloaded = [] {
     raise_fd_limit();
     preload_gpu_runtime();
+    backend::prepare_backend_runtimes();
     return true;
   }();
   (void)preloaded;
+}
+
+}  // namespace
+
+Status open_default_devices(std::string_view selector) {
   DefaultSet& d = default_set();
   std::lock_guard lock(d.mu);
   if (d.built) {

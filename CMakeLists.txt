@@ -10,7 +10,7 @@ if(NOT CMAKE_CXX_COMPILER)
 endif()
 
 project(lse
-  VERSION 0.2.1
+  VERSION 0.4.1
   DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
   LANGUAGES CXX)
 
@@ -89,12 +89,17 @@ add_subdirectory(src/backends)
 # is chosen from the endpoint string and the declared capabilities, never
 # named by a caller.
 # ---------------------------------------------------------------------------
+if(APPLE)
+  set(LSE_POLLER_SOURCE src/communication/poller_kqueue.cpp)
+else()
+  set(LSE_POLLER_SOURCE src/communication/poller_epoll.cpp)
+endif()
 add_library(lse_communication
   src/communication/endpoint.cpp
   src/communication/capabilities.cpp
   src/communication/transport.cpp
   src/communication/reactor.cpp
-  src/communication/poller_epoll.cpp
+  ${LSE_POLLER_SOURCE}
   src/communication/stream_link.cpp
   src/communication/socket.cpp
   src/communication/rdma.cpp
@@ -104,8 +109,12 @@ add_library(lse::communication ALIAS lse_communication)
 # machine what it has. It is not a build dependency on any fabric: there is none.
 target_link_libraries(lse_communication PUBLIC lse_core ${CMAKE_DL_LIBS})
 # Transports self-register from a TU with no referenced symbols.
-target_link_options(lse_communication INTERFACE
+if(APPLE)
+  target_link_options(lse_communication INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_communication>")
+else()
+  target_link_options(lse_communication INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_communication>,--no-whole-archive")
+endif()
 lse_apply_common_flags(lse_communication)
 
 # ---------------------------------------------------------------------------
@@ -139,8 +148,12 @@ add_library(lse_dist
 add_library(lse::dist ALIAS lse_dist)
 target_link_libraries(lse_dist PUBLIC lse_core lse_ir lse_backend_registry lse_communication)
 # Transports self-register from a TU with no referenced symbols.
-target_link_options(lse_dist INTERFACE
+if(APPLE)
+  target_link_options(lse_dist INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_dist>")
+else()
+  target_link_options(lse_dist INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_dist>,--no-whole-archive")
+endif()
 lse_apply_common_flags(lse_dist)
 
 # ---------------------------------------------------------------------------
@@ -226,21 +239,30 @@ add_library(lse_kernels
   src/kernels/transpose.cpp
   src/kernels/wmma_linear.cpp
   src/kernels/wmma_quant_linear.cpp
+  src/kernels/wmma_q6_linear.cpp
 )
 add_library(lse::kernels ALIAS lse_kernels)
 target_link_libraries(lse_kernels PUBLIC lse_core lse_ir lse_graph)
 # Each primitive self-registers from a TU nothing references, so the archive
 # has to be linked whole or none of them exist at run time.
-target_link_options(lse_kernels INTERFACE
+if(APPLE)
+  target_link_options(lse_kernels INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_kernels>")
+else()
+  target_link_options(lse_kernels INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_kernels>,--no-whole-archive")
+endif()
 lse_apply_common_flags(lse_kernels)
 
 # No backend edge here, in either direction of the build: lse_backend_hrx links
 # lse_graph because it implements graph's emitter and compiler seams, so an edge
 # back would be a cycle. Executables link lse_backends to make one selectable.
 # Primitives self-register from a TU with no referenced symbols.
-target_link_options(lse_graph INTERFACE
+if(APPLE)
+  target_link_options(lse_graph INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_graph>")
+else()
+  target_link_options(lse_graph INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_graph>,--no-whole-archive")
+endif()
 
 lse_apply_common_flags(lse_graph)
 # Review copies of generated HIP land in ${CMAKE_BINARY_DIR}/hip/.
@@ -307,8 +329,12 @@ add_library(lse_model
 )
 add_library(lse::model ALIAS lse_model)
 # Model kernels self-register from a TU nothing references.
-target_link_options(lse_model INTERFACE
+if(APPLE)
+  target_link_options(lse_model INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_model>")
+else()
+  target_link_options(lse_model INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_model>,--no-whole-archive")
+endif()
 target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops)
 lse_apply_common_flags(lse_model)
 
@@ -335,8 +361,12 @@ target_compile_definitions(lse_place PRIVATE
   LSE_CONFIGURED_ROCM_PATH="${LSE_ROCM_PATH}")
 # The set registers itself as graph's device-set factory from a TU with no
 # referenced symbols, the same way transports and backends register.
-target_link_options(lse_place INTERFACE
+if(APPLE)
+  target_link_options(lse_place INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_place>")
+else()
+  target_link_options(lse_place INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_place>,--no-whole-archive")
+endif()
 lse_apply_common_flags(lse_place)
 
 # ---------------------------------------------------------------------------

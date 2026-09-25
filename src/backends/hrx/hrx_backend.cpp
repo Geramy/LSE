@@ -1,4 +1,6 @@
 #include "lse/backends/hrx/hrx_backend.hpp"
+#include "lse/backends/hrx/loaded_library.hpp"
+#include "lse/backends/hrx/copy_route.hpp"
 
 #include <dlfcn.h>
 
@@ -6,6 +8,7 @@
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +20,7 @@
 
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/code_object.hpp"
+#include "lse/core/hash.hpp"
 
 extern "C" {
 #include "hrx_runtime.h"
@@ -154,9 +158,14 @@ class HsaRuntime {
   // preload_gpu_runtime already loaded rather than a second runtime. The hot
   // path keeps load_if_missing=false, so it behaves exactly as before.
   explicit HsaRuntime(bool load_if_missing = false) noexcept {
-    lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY | RTLD_NOLOAD);
+#if defined(__APPLE__)
+    constexpr const char* soname = "libhsa-runtime64.dylib";
+#else
+    constexpr const char* soname = "libhsa-runtime64.so.1";
+#endif
+    lib_ = detail::open_loaded_library(soname, "hsa_init");
     if (lib_ == nullptr && load_if_missing) {
-      lib_ = dlopen("libhsa-runtime64.so.1", RTLD_LAZY);
+      lib_ = dlopen(soname, RTLD_LAZY);
     }
     if (lib_ == nullptr) return;
     init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
@@ -270,6 +279,9 @@ class HsaRuntime {
   [[nodiscard]] bool dma_copy(void* dst, HsaAgent dst_agent, const void* src,
                               HsaAgent src_agent, std::size_t bytes) const noexcept {
     if (!can_dma()) return false;
+    // One reusable signal belongs to one transfer at a time, including reset
+    // and completion observation. Different backend instances share this helper.
+    const std::lock_guard lock(dma_mutex_);
     if (!shared_signal_ready_) {
       if (signal_create_(1, 0, nullptr, &shared_signal_) != kHsaSuccess) {
         return false;
@@ -287,10 +299,11 @@ class HsaRuntime {
       // an interrupt round trip is the same order as the transfer.
       constexpr int kConditionLt = 2;
       constexpr int kWaitActive = 1;
-      (void)signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
-                         kWaitActive);
+      // Negative completion is an asynchronous transfer failure, not success.
+      return signal_wait_(shared_signal_, kConditionLt, 1, UINT64_MAX,
+                          kWaitActive) == 0;
     }
-    return issued;
+    return false;
   }
 
   // Pins a host range so the copy engine can reach it, returning the address
@@ -427,6 +440,7 @@ class HsaRuntime {
   // One completion signal, reused. Creating one is a driver object and costs
   // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
   // per copy, so a model load pays it per tensor.
+  mutable std::mutex dma_mutex_;
   mutable HsaSignal shared_signal_{};
   mutable bool shared_signal_ready_ = false;
   SignalWaitFn signal_wait_ = nullptr;
@@ -673,26 +687,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
 // exactly what enumerating devices before binding one would otherwise cause.
 std::atomic<bool> g_accelerator_up{false};
 
-// Registered during this translation unit's dynamic initialization — before
-// main, and so before any object that can own a backend exists. Exit handlers
-// run in reverse registration order, which is what puts the global teardown
-// AFTER the last HrxBackend has released its streams and device.
-//
-// Registering it lazily on first bring-up does NOT achieve that, however early
-// the bring-up is: the first one happens from inside whatever owns the backends
-// (place::Devices, a Scheduler, a test fixture), whose own handler is therefore
-// registered first and runs last — leaving hrx_gpu_shutdown to run while those
-// backends are still holding streams and a device reference.
-[[maybe_unused]] const bool kTeardownRegistered = [] {
-  std::atexit([] {
-    if (g_accelerator_up.load(std::memory_order_acquire)) {
-      hrx_status_ignore(hrx_gpu_shutdown());
-    }
-  });
-  return true;
-}();
+// The runtime is dlopened, so its global destructors are registered at load
+// time. Register shutdown after that load but before a static device owner is
+// constructed: owner -> HRX shutdown -> HSA globals. A pre-main atexit callback
+// runs too late on Darwin and calls hsa_shut_down with already-destroyed locks.
+void prepare_accelerator_runtime() {
+  static const HsaRuntime lifetime(true);
+  if (!lifetime.reachable()) return;
+  static const bool registered = [] {
+    std::atexit([] {
+      if (g_accelerator_up.exchange(false, std::memory_order_acq_rel)) {
+        hrx_status_ignore(hrx_gpu_shutdown());
+      }
+    });
+    return true;
+  }();
+  (void)registered;
+}
 
 Status accelerator_up() {
+  prepare_accelerator_runtime();
   static std::mutex mu;
   const std::lock_guard lock(mu);
   if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
@@ -702,9 +716,17 @@ Status accelerator_up() {
   // for here because bringing the accelerator up is once per process and the
   // topology is fixed at that moment.
   const std::string group = backend::requested_device_group("hrx");
+#if defined(__APPLE__)
+  if (!group.empty()) {
+    return LSE_ERROR(kUnimplemented,
+                     "the macOS HRX adapter does not support spanning GPU groups");
+  }
+  const hrx_status_t status = hrx_gpu_initialize(0);
+#else
   const hrx_status_t status =
       group.empty() ? hrx_gpu_initialize(0)
                     : hrx_gpu_initialize_over(group.c_str(), 0);
+#endif
   if (hrx_status_is_ok(status)) {
     g_accelerator_up.store(true, std::memory_order_release);
     return OkStatus();
@@ -719,6 +741,12 @@ Status accelerator_up() {
 #endif
 
 }  // namespace
+
+void HrxBackend::prepare_runtime() {
+#if LSE_HRX_LINKED
+  prepare_accelerator_runtime();
+#endif
+}
 
 bool HrxBackend::available() noexcept {
 #if LSE_HRX_LINKED
@@ -1137,6 +1165,15 @@ Status HrxBackend::init_impl(int device_ordinal) {
       flush_interval_ = static_cast<std::uint32_t>(v);
     }
   }
+
+  baseline_flush_interval_ = flush_interval_;
+#if defined(__APPLE__)
+  automatic_submission_ = physical_count_ == 1 && info_.arch == "gfx1201" &&
+      automatic_submission_policy(std::getenv("LSE_FLUSH_INTERVAL"),
+                                  std::getenv("LSE_AUTO_BATCH"));
+#endif
+  submission_tuner_ = {};
+  submission_sample_ = nullptr;
 
   queue_count_ = probe_queue_count(device);
   stream_caps_ = derive_stream_capabilities(info_, queue_count_);
@@ -1812,6 +1849,26 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
       !hrx_owns_residency(dst.residency)) {
     return LSE_ERROR(kUnimplemented, "copy_peer needs two hrx-owned buffers");
   }
+  if (detail::own_single_device_copy(device_index(), physical_count_,
+                                     streams_.size(), src, dst)) {
+    // HRX allocations may be opaque GPU buffers: get_device_ptr currently
+    // attempts a CPU mapping and cannot supply a native VA for those buffers.
+    // Its standard copy API owns the address resolution and GPU submission.
+    // Drain every producer/consumer stream before overwriting the destination;
+    // retirement below makes source release safe when this blocking call returns.
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    LSE_ASSIGN_OR(void* stream, stream_at(0));
+    LSE_SYNC_TRACE("copy_d2d HRX-owned buffers %zu bytes", bytes);
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(stream),
+                               reinterpret_cast<hrx_buffer_t>(src.handle),
+                               src.offset + src_offset,
+                               reinterpret_cast<hrx_buffer_t>(dst.handle),
+                               dst.offset + dst_offset, bytes),
+        "hrx_stream_copy_buffer (d2d)"));
+    unflushed_launches_[0] = 0;
+    return synchronize_stream_impl(Stream{0});
+  }
   const HsaRuntime& hsa = shared_hsa();
   if (!hsa.can_dma()) return LSE_ERROR(kUnimplemented, "no DMA entry points");
   const std::vector<HsaAgent>& agents = peer_agents();
@@ -1985,6 +2042,88 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
 #endif
 }
 
+Status HrxBackend::begin_decode_sample_impl(std::uint64_t key) {
+  if (!automatic_submission_) return OkStatus();
+  if (submission_sample_ != nullptr) {
+    // Sampling must not turn an otherwise valid request into an error.
+    // Decline overlapping observations; their latency cannot isolate a policy.
+    cancel_decode_sample_impl();
+    return OkStatus();
+  }
+  auto* state = submission_tuner_.find(key);
+  if (state == nullptr) return OkStatus();
+  const auto interval = SubmissionTuner::next(*state);
+  if (interval != flush_interval_) {
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    flush_interval_ = interval;
+  }
+  submission_sample_ = state;
+  submission_signature_ = kHashSeed;
+  submission_dispatches_ = 0;
+  return OkStatus();
+}
+
+Status HrxBackend::end_decode_sample_impl(std::uint64_t elapsed, bool eligible) {
+  if (submission_sample_ == nullptr) return OkStatus();
+  const auto boundary_start = std::chrono::steady_clock::now();
+  auto* state = submission_sample_;
+  const bool was_done = state->done;
+  const auto prior_signature = state->signature;
+  const auto prior_attempts = state->attempts;
+  const auto prior_warm = state->warm;
+  const auto prior_samples = state->samples;
+  const auto sampled_interval = flush_interval_;
+  // The result readback already orders the inference dependency chain; drain
+  // every stream before changing a backend-global submission policy as well.
+  const Status retired = synchronize_impl();
+  submission_sample_ = nullptr;
+  flush_interval_ = baseline_flush_interval_;
+  if (!retired.ok()) {
+    automatic_submission_ = false;
+    return retired;
+  }
+  const auto boundary_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - boundary_start).count();
+  SubmissionTuner::observe(*state, submission_signature_,
+                           static_cast<double>(elapsed) + static_cast<double>(boundary_ns),
+                           eligible && submission_dispatches_ >= 64);
+  static const bool tuning_trace = [] {
+    const char* value = std::getenv("LSE_AUTO_BATCH_TRACE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  static std::atomic<unsigned> trace_lines{0};
+  if (tuning_trace && trace_lines.fetch_add(1) < 256) {
+    std::fprintf(stderr, "[batch-tune-trace] workload=%llx prior-signature=%llx signature=%llx "
+                         "same=%d interval=%u eligible=%d dispatches=%u attempts=%u->%u "
+                         "warm=%u->%u samples=%u->%u done=%d boundary-ns=%llu\n",
+                 static_cast<unsigned long long>(state->key),
+                 static_cast<unsigned long long>(prior_signature),
+                 static_cast<unsigned long long>(submission_signature_),
+                 prior_signature == submission_signature_ ? 1 : 0, sampled_interval,
+                 eligible ? 1 : 0, submission_dispatches_, prior_attempts, state->attempts,
+                 prior_warm, state->warm, prior_samples, state->samples, state->done ? 1 : 0,
+                 static_cast<unsigned long long>(boundary_ns));
+  }
+  if (state->done && !was_done) {
+    std::fprintf(stderr, "[batch-tune] scope=resident-decode clock=host-steady "
+                         "workload=%llx signature=%llx interval=%u selected=%s "
+                         "samples=%u attempts=%u medians-ns=%.0f,%.0f,%.0f,%.0f\n",
+                 static_cast<unsigned long long>(state->key),
+                 static_cast<unsigned long long>(state->signature), state->interval,
+                 state->selected ? "yes" : "no", state->samples, state->attempts,
+                 state->medians[0], state->medians[1], state->medians[2], state->medians[3]);
+  }
+  return OkStatus();
+}
+
+void HrxBackend::cancel_decode_sample_impl() noexcept {
+  submission_sample_ = nullptr;
+  flush_interval_ = baseline_flush_interval_;
+  // An inference error is not a measurement. Do not schedule further tuning
+  // or claim retirement; the normal error path owns device recovery.
+  automatic_submission_ = false;
+}
+
 Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
                                const DispatchArgs& args,
                                const DispatchTarget& target) {
@@ -2022,6 +2161,30 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
     out.offset = ref.buffer->offset + ref.offset;
     out.length = ref.length != 0 ? ref.length : ref.buffer->size_bytes;
     bindings.push_back(out);
+  }
+
+  if (submission_sample_ != nullptr) {
+    // Process-local executable handles identify exact loaded code objects.
+    // Allocation addresses and token values deliberately do not: ordinary
+    // ping-pong/rebinding must remain the same workload. Sizes, constants and
+    // launch geometry conservatively invalidate changed work.
+    submission_signature_ = hash_mix(submission_signature_, kernel.executable);
+    submission_signature_ = hash_mix(submission_signature_, kernel.export_ordinal);
+    for (unsigned i = 0; i < 3; ++i) {
+      submission_signature_ = hash_mix(submission_signature_, dims.workgroup_count[i]);
+      submission_signature_ = hash_mix(submission_signature_, dims.workgroup_size[i]);
+    }
+    submission_signature_ = hash_mix(submission_signature_, dims.subgroup_size);
+    submission_signature_ = hash_mix(submission_signature_, target.stream.index);
+    submission_signature_ = hash_mix(submission_signature_, args.flags);
+    submission_signature_ = hash_mix(submission_signature_, args.bindings.size());
+    submission_signature_ = hash_mix(submission_signature_, args.constants.size());
+    for (const auto& binding : args.bindings)
+      submission_signature_ = hash_mix(submission_signature_, binding.length != 0
+          ? binding.length : binding.buffer->size_bytes);
+    for (const auto byte : args.constants)
+      submission_signature_ = hash_mix(submission_signature_, std::to_integer<unsigned char>(byte));
+    ++submission_dispatches_;
   }
 
   const std::uint32_t index = target.stream.index;

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "lse/backend/backend.hpp"
+#include "lse/backends/hrx/submission_tuner.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
@@ -30,10 +31,14 @@ namespace lse::backend {
 class HrxBackend : public Backend<HrxBackend> {
  public:
   static constexpr std::string_view kName = "hrx";
+  static void prepare_runtime();
 
   ~HrxBackend();
 
   Status init_impl(int device_ordinal);
+  Status begin_decode_sample_impl(std::uint64_t key);
+  Status end_decode_sample_impl(std::uint64_t elapsed, bool eligible);
+  void cancel_decode_sample_impl() noexcept;
   void shutdown_impl() noexcept;
   const DeviceInfo& device_info_impl() const noexcept { return info_; }
 
@@ -213,6 +218,12 @@ class HrxBackend : public Backend<HrxBackend> {
   // per launch, 0 = only at sync/transfer boundaries). Counted per stream:
   // batching is a property of one command buffer, not of the device.
   std::uint32_t flush_interval_ = 0;
+  bool automatic_submission_ = false;
+  std::uint32_t baseline_flush_interval_ = 16;
+  SubmissionTuner submission_tuner_;
+  SubmissionTuner::State* submission_sample_ = nullptr;
+  std::uint64_t submission_signature_ = 0;
+  std::uint32_t submission_dispatches_ = 0;
   std::vector<std::uint32_t> unflushed_launches_;
 
   Result<void*> stream_at(std::uint32_t index);

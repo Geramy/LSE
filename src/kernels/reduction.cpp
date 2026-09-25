@@ -1,15 +1,10 @@
-// Row-wise normalizations, as device kernels.
-//
-// These are the ops that kept the whole model on the host: 41 RMSNorms plus
-// every softmax and l2-normalize. Each one reduces over the last axis and
-// produces a tensor the same shape as its input, so it fits the one-thread-
-// per-output-element contract without needing cross-thread cooperation.
-//
-// Each thread re-reduces its own row rather than sharing a partial sum through
-// LDS. That is `dim` redundant reads per element, which is a real cost worth
-// removing later — but it is correct, it needs no new machinery, and it is far
-// cheaper than the host round trip it replaces.
+// Row-wise normalizations shared by device backends. RMSNorm specializes to
+// one cooperative workgroup per row where the target supports the required
+// scratch and barriers; the scalar forms remain the general fallback.
 #include <string>
+#include <limits>
+
+#include "lse/backends/hrx/device_info.hpp"
 
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
@@ -56,6 +51,101 @@ struct RmsNormArgs {
   env::Out<kir::f32, E> out;
 };
 
+namespace {
+constexpr std::uint32_t kRmsBlock = 256;
+constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
+
+bool cooperative_rms_usable(const KernelShapes& s) {
+  if (s.inputs.size() != 2 || s.inputs[0].rank() == 0 || !usable(s) ||
+      s.input_dtypes.size() != 2 || s.inputs[1].rank() != 1 ||
+      s.output != s.inputs[0] || s.input_dtypes[0] != DType::kF32 ||
+      s.output_dtype != DType::kF32 || s.device == nullptr ||
+      s.device->max_threads_per_workgroup < kRmsBlock ||
+      backend::workgroup_lds_bytes(s.device) < kRmsScratch ||
+      !s.staged.name.empty() || !s.staged_quant.codes.empty()) return false;
+  const auto dtype = s.input_dtypes[1];
+  if (dtype != DType::kF32 && dtype != DType::kF16 && dtype != DType::kBF16)
+    return false;
+  const auto d = last_dim(s.inputs[0]);
+  if (d < 32 || s.inputs[1].elem_count() != static_cast<std::size_t>(d) ||
+      s.output.elem_count() == 0 ||
+      s.output.elem_count() > std::numeric_limits<std::uint32_t>::max() / sizeof(float))
+    return false;
+  for (std::string_view op : {"thread.local_id", "thread.workgroup_id.x",
+                              "barrier", "fma", "rsqrt"}) {
+    if (s.intrinsics->find(op).empty()) return false;
+  }
+  return true;
+}
+}  // namespace
+
+struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel> {
+  static constexpr std::string_view kName = "rms_norm.cooperative.v1";
+  static constexpr std::string_view kEntry = "lse_rms_norm_cooperative_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 2; }
+  FusionClass fusion_class() const noexcept override { return FusionClass::kReduction; }
+  bool owns_indexing() const noexcept override { return true; }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!cooperative_rms_usable(s) || !s.store) return {};
+    const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
+    return with_elem(s.input_dtypes[1], [&]<class G>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+      k.set_store(s.store);
+      RmsNormArgs<env::Emit, G> a;
+      if (!env::bind(k, a, s)) return {};
+      env::Emit e{&k};
+      const auto lane = e.let(math::local_id());
+      const auto row = e.let(math::workgroup_id_x() * d);
+      auto partial = e.var(0.0f);
+      for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
+        const auto value = e.let(a.x[row + col]);
+        partial = math::fma(value, value, partial.read());
+      }
+      auto sums = e.lds<kir::f32>(kRmsBlock);
+      if (!sums) return {};
+      sums[lane] = partial.read();
+      e.barrier();
+      for (std::uint32_t offset = kRmsBlock / 2; offset > 0; offset >>= 1) {
+        if (auto active = e.when(lane < offset)) {
+          sums[lane] = sums[lane].read() + sums[lane + offset].read();
+        }
+        e.barrier();
+      }
+      // Every lane has finished reading the row before any output store.
+      // Stores pass through the emitter hook so trailing elementwise work
+      // keeps its original index and the normal buffer-alias contract.
+      const auto scale = e.let(math::rsqrt(
+          sums[0].read() / static_cast<float>(d) + s.attrs[0]));
+      for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
+        const auto gain = math::widen(a.g[col]);
+        const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+        const auto index = e.let(row + col);
+        e.store(index, a.x[index] * scale * weight);
+      }
+      if (!k.lds().ok()) return {};
+      return k.str();
+    });
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 2) return LSE_ERROR(kInvalidArgument, "rms_norm takes 2 inputs");
+    return in[0];
+  }
+  DType infer_dtype(std::span<const DType> in) const override {
+    return in.empty() ? DType::kF32 : in[0];
+  }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    tp.workgroup_size[0] = kRmsBlock;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(
+        s.output.elem_count() / static_cast<std::size_t>(last_dim(s.inputs[0])));
+    tp.lds_bytes = kRmsScratch;
+    return tp;
+  }
+};
+LSE_REGISTER_PRIMITIVE(CooperativeRmsNormKernel);
+
 // scale = rsqrt(mean(x^2) + eps); out = x * scale * (bias + w[col]).
 // The host reference accumulates in fp64 and this in fp32; over 1024 terms
 // that stays inside the 1e-5 relative bound the differential tests hold to.
@@ -67,6 +157,11 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
   std::size_t arity() const noexcept override { return 2; }
   FusionClass fusion_class() const noexcept override {
     return FusionClass::kReduction;
+  }
+  const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    static const CooperativeRmsNormKernel cooperative;
+    if (cooperative_rms_usable(s)) return &cooperative;
+    return this;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {

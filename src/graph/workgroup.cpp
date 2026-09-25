@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "lse/graph/workgroup.hpp"
 
 #include "lse/core/dtype.hpp"
@@ -511,21 +512,77 @@ std::vector<WorkgroupCut> Workgroup::cuts() const {
 }
 
 void Workgroup::plan_slots(std::span<const NodePtr> roots) {
+  std::vector<FusionGroup> launches;
+  for (const WorkgroupCut& cut : cuts()) {
+    FusionGroup group;
+    group.nodes = cut.nodes;
+    launches.push_back(std::move(group));
+  }
+  plan_slots(roots, launches);
+}
+
+namespace {
+// Slot lifetime belongs to the allocation, including temporary inplace
+// outputs. Following only reshapes lets a later reader of an inplace alias
+// observe a slot recycled after the alias-producing launch.
+const Node* alias_source(const Node* n) noexcept {
+  if (n == nullptr) return nullptr;
+  if (n->kind == OpKind::kReshape && n->inputs.size() == 1)
+    return n->inputs[0].get();
+  const int index = n->prim != nullptr ? n->prim->inplace_input() : -1;
+  if (index < 0 || static_cast<std::size_t>(index) >= n->inputs.size())
+    return nullptr;
+  return n->inputs[static_cast<std::size_t>(index)].get();
+}
+
+const Node* allocation_owner(const Node* n) noexcept {
+  const Node* slow = n;
+  const Node* fast = n;
+  while (const Node* next = alias_source(n)) {
+    n = next;
+    slow = alias_source(slow);
+    fast = alias_source(alias_source(fast));
+    if (slow != nullptr && slow == fast) return nullptr;
+  }
+  return n;
+}
+}  // namespace
+
+void Workgroup::plan_slots(std::span<const NodePtr> roots,
+                           std::span<const FusionGroup> launches) {
   slots_.clear();
   slot_of_.clear();
   reused_ = 0;
-  const auto groups = cuts();
-  if (groups.empty()) return;
-
   std::unordered_set<const Node*> member;
   for (const NodePtr& n : members_) member.insert(n.get());
+
+  // The scheduler can merge siblings across original phase boundaries. Keep
+  // this workgroup's ownership, but project its members onto the final launch
+  // schedule so all nodes in one dispatch share one lifetime boundary.
+  std::vector<FusionGroup> groups;
+  for (const FusionGroup& launch : launches) {
+    FusionGroup own;
+    for (const NodePtr& n : launch.nodes) {
+      if (n && member.count(n.get()) != 0) own.nodes.push_back(n);
+    }
+    if (!own.nodes.empty()) groups.push_back(std::move(own));
+  }
+  if (groups.empty()) return;
+
+  // Nodes are public graph records, so malformed alias cycles are not ruled
+  // out by construction. Without an owner, no slot recycling is provably
+  // safe. Preserve unique allocations and let normal binding reject an
+  // unmaterialized cyclic input rather than guessing its lifetime.
+  const bool unknown_owner = std::any_of(
+      members_.begin(), members_.end(),
+      [](const NodePtr& n) { return allocation_owner(n.get()) == nullptr; });
 
   std::unordered_map<const Node*, std::uint32_t> last_cut;
   for (std::uint32_t ci = 0; ci < groups.size(); ++ci) {
     for (const NodePtr& n : groups[ci].nodes) {
       last_cut[n.get()] = ci;
       for (const NodePtr& in : n->inputs) {
-        const Node* p = skip_reshape(in.get());
+        const Node* p = allocation_owner(in.get());
         if (p && member.count(p)) last_cut[p] = ci;
       }
     }
@@ -553,8 +610,7 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots) {
     const auto it = direct_readers.find(n.get());
     const std::uint32_t direct = it == direct_readers.end() ? 0 : it->second;
     if (root_set.count(n.get()) == 0 && n->consumer_count <= direct) continue;
-    if (n->kind == OpKind::kReshape && !n->inputs.empty()) {
-      const Node* owner = skip_reshape(n->inputs[0].get());
+    if (const Node* owner = allocation_owner(n.get()); owner != n.get()) {
       if (owner != nullptr && member.count(owner) != 0 &&
           owner->fclass != FusionClass::kLeaf) {
         last_cut[owner] = static_cast<std::uint32_t>(groups.size());
@@ -581,7 +637,7 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots) {
   static const bool no_reuse = std::getenv("LSE_NO_SLOT_REUSE") != nullptr;
   auto take = [&](std::size_t bytes) -> std::uint32_t {
     auto& bin = free[bytes];
-    if (!no_reuse && !bin.empty()) {
+    if (!no_reuse && !unknown_owner && !bin.empty()) {
       const std::uint32_t id = bin.back();
       bin.pop_back();
       ++reused_;

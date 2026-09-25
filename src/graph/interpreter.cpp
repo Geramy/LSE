@@ -1271,6 +1271,29 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
   Node& n = *node;
   if (n.materialized) return OkStatus();
 
+  // A host-addressable reshape names the same bytes as its source. Copy the
+  // allocation owner and window before ensure_buffer() can allocate a second
+  // buffer. This also rebinds a retained view if its input storage was swapped.
+  if (n.kind == OpKind::kReshape && n.inputs.size() == 1 && n.inputs[0]) {
+    const Node& src = *n.inputs[0];
+    if (src.dtype != n.dtype || src.element_count() != n.element_count()) {
+      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
+    }
+    if (src.materialized && src.buffer.ptr != nullptr) {
+      const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
+      if (bytes == 0 || bytes > src.buffer.size_bytes) {
+        return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
+      }
+      n.buffer = src.buffer;
+      n.buffer.size_bytes = bytes;
+      n.host_mirror.clear();
+      n.host_dirty = src.host_dirty;
+      n.device_dirty = src.device_dirty && !src.host_dirty;
+      n.materialized = true;
+      return OkStatus();
+    }
+  }
+
   if (n.prim != nullptr) {
     const int a = n.prim->inplace_input();
     if (a >= 0 && static_cast<std::size_t>(a) < n.inputs.size() &&

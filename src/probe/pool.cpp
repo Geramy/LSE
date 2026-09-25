@@ -1,6 +1,8 @@
 #include "lse/probe/pool.hpp"
 
+#include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <set>
 
 #include "lse/core/hash.hpp"
@@ -16,6 +18,18 @@ namespace {
 constexpr int kTagFingerprint = 0x60;
 constexpr int kTagProfile = 0x62;
 
+// Match the macOS HSA runtime's bounded wait setting. Invalid spellings select
+// the runtime default rather than creating distinct profiles for one policy.
+std::uint32_t mac_hsa_poll_us(const char* setting) {
+  if (setting == nullptr) return 1000;
+  const std::string_view text(setting);
+  std::uint32_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+      value < 10 || value > 1000) return 1000;
+  return value;
+}
+
 std::string hex64(std::uint64_t v) {
   char buf[17];
   std::snprintf(buf, sizeof(buf), "%016llx",
@@ -29,7 +43,7 @@ std::string hex64(std::uint64_t v) {
 std::string local_identity(const PoolMember& member) {
   if (member.backend == nullptr) return "absent";
   const backend::DeviceInfo& info = member.backend->device_info();
-  std::string s;
+  std::string s = "device-probe-v4-validated-matrix|";
   s += member.backend->name();
   s += '|';
   s += info.arch;
@@ -44,6 +58,22 @@ std::string local_identity(const PoolMember& member) {
   s += '|';
   const graph::IKernelCompiler* compiler = member.backend->compiler();
   s += compiler != nullptr ? compiler->identity() : std::string("no-compiler");
+  // The HRX calibration can use Loom when COMGR is absent. Changes to that
+  // compiler or to submission batching change what the measured rates mean.
+  if (member.backend->name() == "hrx") {
+    if (const auto* loom = member.backend->toolchain_for(graph::Dialect::kLoom);
+        loom != nullptr && loom->compiler != nullptr) {
+      s += "|loom=" + loom->compiler->identity();
+      s += loom->compiler->available() ? "|available" : "|unavailable";
+    }
+    const char* flush = std::getenv("LSE_FLUSH_INTERVAL");
+    s += "|flush=";
+    s += flush != nullptr ? flush : "16";
+#if defined(__APPLE__)
+    s += "|mac-hsa-blocked-poll-us=";
+    s += std::to_string(mac_hsa_poll_us(std::getenv("MAC_HSA_BLOCKED_POLL_US")));
+#endif
+  }
   return s;
 }
 

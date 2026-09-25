@@ -244,7 +244,7 @@ std::string PoolProfile::describe() const {
   char line[256];
   for (const DeviceProfile& d : devices) {
     std::snprintf(line, sizeof(line),
-                  "  %-8s %-10s  dram %8.1f GB/s (%s)  launch %7.2f us (%s)"
+                  "  %-8s %-10s  stream %8.1f GB/s (%s)  launch %7.2f us (%s)"
                   "  free %7.1f GB (%s)\n",
                   d.id.str().c_str(), d.arch.c_str(),
                   d.dram_bytes_per_s.value / 1e9,

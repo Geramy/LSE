@@ -151,10 +151,16 @@ struct ConvTailShiftKernel final : KernelPrimitive<ConvTailShiftKernel> {
       // Position seq + p in tail ++ x: the first keep-seq slots come from
       // the old tail shifted left, the rest from x.
       const auto shift = keep - seq;
+      // Keep the conditional loads guarded, but merge their values before
+      // returning: structured dialects cannot lower a return inside a branch.
+      auto value = e.var(0.0f);
       if (auto from_tail = e.when(p < shift)) {
-        e.ret(a.tail[(bi * keep + seq + p) * channels + c]);
+        value = a.tail[(bi * keep + seq + p) * channels + c];
       }
-      e.ret(a.x[(bi * seq + p - shift) * channels + c]);
+      if (auto from_input = e.when(p >= shift)) {
+        value = a.x[(bi * seq + p - shift) * channels + c];
+      }
+      e.ret(value.read());
     }
     return k.str();
   }

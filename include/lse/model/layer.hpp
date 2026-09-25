@@ -44,6 +44,8 @@ struct MixerState {
   // Shared per-step descriptor the decode program pokes: f32 [3] =
   // {first query position, live KV length, real rows}.
   Array kv_meta;
+  // Sequence cursor for every mixer, including GDN-only models. Zero marks
+  // a fresh sequence when choosing whether retained carry-ins must be cleared.
   std::int32_t position = 0;
 
   [[nodiscard]] bool empty() const noexcept {

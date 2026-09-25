@@ -1,4 +1,8 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
+#include "lse/graph/epilogue_input.hpp"
+#include "lse/kernels/int8_policy.hpp"
+#include "lse/kernels/quant_operand_policy.hpp"
+#include "lse/kernels/quant_operand_cache.hpp"
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
@@ -513,7 +517,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
 
 std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
-  std::uint64_t h = group.signature();
+  std::uint64_t h = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
   const KernelPrimitiveBase* self = nullptr;
   if (kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
@@ -546,7 +550,9 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
       probe.device = &device;
       probe.types = type_table;
       probe.intrinsics = &spellings;
-      const KernelPrimitiveBase* chosen = kp->specialize(probe);
+      // phase_spec uses the base RMS under its virtual row walk.
+      const KernelPrimitiveBase* chosen =
+          group.is_phase && n->kind == OpKind::kRMS ? kp : kp->specialize(probe);
       if (chosen == nullptr || !chosen->owns_indexing()) continue;
       if (group.outputs.size() != 1) break;
       self = chosen;
@@ -599,7 +605,7 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   g.anchor = run.front()->kind;
   g.anchor_class = run.front()->fclass;
 
-  const std::uint64_t key = g.signature();
+  const std::uint64_t key = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(g.signature())), g, device, hip_types(), hip_sources());
   if (const auto it = run_scratch_cache_.find(key);
       it != run_scratch_cache_.end()) {
     return it->second;
@@ -773,7 +779,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       out.traffic = run;
     }
 
-    std::uint64_t sig = group.signature();
+    std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
     for (const IndexedStage& st : stages) mix_name(sig, st.prim->name());
     if (const auto it = lds_refused_.find(sig); it != lds_refused_.end()) {
       return LSE_ERROR(kOutOfMemory, "fused run needs ",
@@ -937,7 +943,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       // This is why removing the per-stage barriers that `lds_fold` used to
       // leave behind was not the win it looked like.
       if (si + 1 < stages.size()) {
-        const ir::RecordOptions opts{{}, {}, "c" + std::to_string(si) + "_"};
+        const std::string convoy_prefix = "c" + std::to_string(si) + "_";
+        const ir::RecordOptions opts{{}, {}, convoy_prefix};
         const ir::KernelBody::Recording rec(opts);
         ir::KernelBody::Capture cap;
         {
@@ -1110,7 +1117,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   // specialize() picks a different body (LDS vs WMMA vs scalar) for the same
   // graph node; the group hash only sees the generic primitive name.
-  std::uint64_t sig = group.signature();
+  std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
   if (self_indexed != nullptr) {
     sig ^= 0x9e3779b97f4a7c15ull;
     for (char c : self_indexed->name()) {
@@ -1199,7 +1206,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       // at the thread id: a wave's lane owns a tile position, not element i.
       for (std::size_t j = 0; j < input_count; ++j) {
         const NodePtr& n = out.binding_order[j];
-        if (pointer_inputs.count(n.get()) != 0) continue;
+        if (pointer_inputs.count(n.get()) != 0 &&
+            !graph::needs_elementwise_input(group, n.get())) continue;
         const std::string var = "ep" + std::to_string(j);
         s << "const float " << var << " = "
           << load_expr("in" + std::to_string(j),
@@ -1393,7 +1401,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   std::unordered_map<const Node*, std::string> value_of;
   for (std::size_t i = 0; i < input_count; ++i) {
     const NodePtr& n = out.binding_order[i];
-    if (pointer_inputs.count(n.get()) != 0) continue;
+    if (pointer_inputs.count(n.get()) != 0 &&
+        !graph::needs_elementwise_input(group, n.get())) continue;
     const std::string var = "in" + std::to_string(i);
     const std::string idx = broadcast_index_expr(n->shape, out_shape, "i");
     src << "  const float " << var << " = "

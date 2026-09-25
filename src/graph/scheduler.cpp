@@ -1,3 +1,4 @@
+#include "lse/graph/gdn_pair.hpp"
 #include "lse/graph/graph.hpp"
 
 #include <algorithm>
@@ -23,7 +24,9 @@
 #include "lse/graph/program.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/graph/pointwise_fusion.hpp"
 #include "lse/opt/fusion.hpp"
+#include "dispatch_profile.hpp"
 
 namespace lse::graph {
 namespace {
@@ -656,7 +659,33 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   // ones a wrong-device launch would read.
   LSE_RETURN_IF_ERROR(check_residency(bindings, member));
 
-  const auto t_launch = bind_span.close();
+  // Submit mode preserves normal command-buffer batching. Serial mode is an
+  // intrusive diagnostic: drain prior work, submit one dispatch, then wait for
+  // completion. Its clock includes runtime/queue overhead, not just GPU work.
+  struct ProfileLifetime {
+    detail::DispatchProfileMode mode =
+        detail::dispatch_profile_mode(std::getenv("LSE_PROFILE_DISPATCH"));
+    detail::DispatchProfile profile;
+    ~ProfileLifetime() {
+      profile.print(stderr, mode == detail::DispatchProfileMode::kSerial);
+    }
+  };
+  static ProfileLifetime profiling;
+  if (profiling.mode == detail::DispatchProfileMode::kInvalid) {
+    return LSE_ERROR(kInvalidArgument,
+                     "LSE_PROFILE_DISPATCH must be off, submit, or serial");
+  }
+  const bool serial = profiling.mode == detail::DispatchProfileMode::kSerial;
+  auto t_launch = bind_span.close();
+  std::uint64_t predrain_ns = 0;
+  if (serial) {
+    const Status drained = be.synchronize();
+    const auto after_drain = SpanClock::now();
+    predrain_ns = elapsed_ns(t_launch, after_drain);
+    trace_.spans.host_wait.add(predrain_ns);
+    LSE_RETURN_IF_ERROR(drained);
+    t_launch = after_drain;
+  }
   if (impl_->member_dirty.size() <= member) {
     impl_->member_dirty.resize(member + 1, 0);
   }
@@ -664,8 +693,37 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   const Status submitted = be.launch(
       launched, emitted->dims, args,
       backend::DispatchTarget{stream, devices_.residency(member), {}});
-  trace_.spans.submit.add(elapsed_ns(t_launch, SpanClock::now()));
-  LSE_RETURN_IF_ERROR(submitted);
+  const auto after_submit = SpanClock::now();
+  const std::uint64_t submit_ns = elapsed_ns(t_launch, after_submit);
+  trace_.spans.submit.add(submit_ns);
+  Status completed = submitted;
+  std::uint64_t completion_ns = 0;
+  if (serial && submitted.ok()) {
+    completed = be.synchronize();
+    const auto after_completion = SpanClock::now();
+    completion_ns = elapsed_ns(t_launch, after_completion);
+    trace_.spans.host_wait.add(elapsed_ns(after_submit, after_completion));
+  }
+  if (profiling.mode != detail::DispatchProfileMode::kOff) {
+    std::string key = emitted->entry_name + " anchor=" +
+        std::string(to_string(group.anchor)) + " phase=" +
+        std::to_string(group.is_phase) + " member=" + std::to_string(member) +
+        " stream=" + std::to_string(stream.index) + " grid=";
+    for (std::size_t i = 0; i < 3; ++i) {
+      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_count[i]);
+    }
+    key += " wg=";
+    for (std::size_t i = 0; i < 3; ++i) {
+      key += (i == 0 ? "" : "x") + std::to_string(emitted->dims.workgroup_size[i]);
+    }
+    for (const NodePtr& n : emitted->binding_order) {
+      key += " " + std::string(to_string(n->kind)) + n->shape.to_string() +
+             ":" + std::string(to_string(n->dtype));
+    }
+    profiling.profile.record(std::move(key), submit_ns, completion_ns,
+                              predrain_ns, completed.ok());
+  }
+  LSE_RETURN_IF_ERROR(completed);
   // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
   // this dispatch and prints a checksum and the first values of every bound
   // buffer, so a kernel's inputs and outputs can be compared across builds.
@@ -788,17 +846,6 @@ void alias_ready_reshapes(const FusionGroup& group) {
   }
 }
 
-bool is_gdn_node(const Node& n) noexcept {
-  return n.kind == OpKind::kGDNChunkScan;
-}
-
-bool same_gdn_inputs(const Node& a, const Node& b) noexcept {
-  if (a.inputs.size() != 6 || b.inputs.size() != 6) return false;
-  for (std::size_t i = 0; i < 6; ++i) {
-    if (a.inputs[i].get() != b.inputs[i].get()) return false;
-  }
-  return true;
-}
 
 Status accumulate_spans(Scheduler::Trace::Spans& acc,
                         const Scheduler::Trace::Spans& step) {
@@ -827,6 +874,7 @@ std::uint64_t attributed_ns(const Scheduler::Trace::Spans& s) noexcept {
 
 Status accumulate(Scheduler::Trace& acc, const Scheduler::Trace& step) {
   acc.device_groups += step.device_groups;
+  acc.partition_passes += step.partition_passes;
   acc.host_groups += step.host_groups;
   acc.phase_groups += step.phase_groups;
   acc.phase_ideal_launches += step.phase_ideal_launches;
@@ -951,6 +999,31 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   trace_.launch_ns = trace_.spans.submit.ns;
   trace_.sync_ns = trace_.spans.host_wait.ns;
 
+  static const bool time_steps = std::getenv("LSE_TIME_STEPS") != nullptr;
+  if (time_steps) {
+    static std::atomic<std::uint64_t> step_sequence{0};
+    const auto& s = trace_.spans;
+    std::fprintf(stderr,
+        "[step-spans] step=%llu ok=%d replayed=%d device_groups=%u "
+        "host_groups=%u views=%u total_ms=%.3f partition_ms=%.3f "
+        "schedule_ms=%.3f emit_ms=%.3f jit_lookup_ms=%.3f "
+        "jit_compile_ms=%.3f bind_ms=%.3f submit_ms=%.3f "
+        "host_wait_ms=%.3f readback_ms=%.3f\n",
+        static_cast<unsigned long long>(step_sequence.fetch_add(1)),
+        static_cast<int>(ran.ok()), static_cast<int>(trace_.replayed),
+        trace_.device_groups, trace_.host_groups, trace_.views_aliased,
+        static_cast<double>(s.step.ns) / 1e6,
+        static_cast<double>(s.partition.ns) / 1e6,
+        static_cast<double>(s.schedule.ns) / 1e6,
+        static_cast<double>(s.emit.ns) / 1e6,
+        static_cast<double>(s.jit_lookup.ns) / 1e6,
+        static_cast<double>(s.jit_compile.ns) / 1e6,
+        static_cast<double>(s.bind.ns) / 1e6,
+        static_cast<double>(s.submit.ns) / 1e6,
+        static_cast<double>(s.host_wait.ns) / 1e6,
+        static_cast<double>(s.readback.ns) / 1e6);
+  }
+
   const Status accumulated = accumulate(acc_, trace_);
   if (!ran.ok()) return ran;
   return accumulated;
@@ -972,6 +1045,27 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   LSE_RETURN_IF_ERROR(release_phase_tables());
 
   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
+  // Views must be valid before partitioning: a device-only view group may
+  // require no dispatch at all, so neither a kernel nor the host interpreter
+  // is guaranteed to validate it later.
+  for (const NodePtr& node : order) {
+    if (node->kind != OpKind::kReshape) continue;
+    if (node->inputs.size() != 1 || !node->inputs[0]) {
+      return LSE_ERROR(kInvalidArgument, "reshape requires one input");
+    }
+    const Node& source = *node->inputs[0];
+    if (source.dtype != node->dtype ||
+        source.element_count() != node->element_count()) {
+      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
+    }
+    const std::size_t bytes =
+        dtype_storage_bytes(node->dtype, node->element_count());
+    if (source.materialized && source.buffer.valid() &&
+        (bytes == 0 || bytes > source.buffer.size_bytes)) {
+      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
+    }
+  }
+
 
   std::vector<FusionGroup> phase_groups;
   bool replayed = false;
@@ -1004,6 +1098,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // ones and pays none of it, which is why this and `schedule` are two spans
   // and not one.
   SpanTimer build_span(trace_.spans.partition, setup_span.close());
+  if (!replayed) ++trace_.partition_passes;
   auto planned = replayed
                      ? std::vector<Workgroup>{}
                      : Partitioner::phases(roots, &backend().device_info());
@@ -1019,6 +1114,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     // the same one-group path a node it refuses to stage already takes.
     const IPhaseStaging* staging = emitter->staging();
     for (Workgroup& wg : planned) {
+      const std::size_t phase_begin = phase_groups.size();
       FusionGroup g = Partitioner::phase_group(wg, roots);
       if (g.nodes.empty()) continue;
       alias_ready_reshapes(g);
@@ -1077,18 +1173,13 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         return 0;
       };
       auto join_gdn_pair = [&](const NodePtr& n) -> bool {
-        if (phase_groups.empty() || !is_gdn_node(*n)) return false;
+        if (phase_groups.empty()) return false;
         FusionGroup& prev = phase_groups.back();
         if (prev.is_phase || prev.nodes.size() != 1) return false;
-        if (!is_gdn_node(*prev.nodes[0])) return false;
-        if (!same_gdn_inputs(*prev.nodes[0], *n)) return false;
-        if (prev.nodes[0]->iattrs[0] == n->iattrs[0]) return false;
+        const auto pair = exact_gdn_pair(prev.nodes.front(), n);
+        if (!pair) return false;
         prev.nodes.push_back(n);
-        prev.outputs.clear();
-        for (const NodePtr& m : prev.nodes) {
-          if (m->iattrs[0] == 0) prev.outputs.push_back(m);
-        }
-        if (prev.outputs.empty()) prev.outputs.push_back(prev.nodes[0]);
+        prev.outputs = {pair.output, pair.state};
         return true;
       };
       auto join_wide_linear = [&](const NodePtr& n) -> bool {
@@ -1207,6 +1298,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         if (staging == nullptr || !staging->can_stage(*n)) {
           flush_staged();
           if (join_gdn_pair(n)) continue;
+          // No staged/grid barrier is needed for a single-consumer pointwise
+          // chain. Keep the ordinary emitter's existing fused SSA form.
+          if (staging == nullptr && phase_groups.size() > phase_begin &&
+              join_pointwise_chain(phase_groups.back(), n, roots, emitter->sources())) {
+            continue;
+          }
           FusionGroup one;
           one.nodes.push_back(n);
           one.outputs.push_back(n);
@@ -1272,7 +1369,43 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         staged.nodes.push_back(n);
       }
       flush_staged();
-      wg.plan_slots(roots);
+    }
+  }
+
+  // Exact GDN siblings can be separated by consumers of the primary output.
+  // Both read the same six nodes, so the later pure recurrence can run at the
+  // earlier position. Preserve both original output identities and bindings.
+  if (!replayed && emitter != nullptr && emitter->staging() == nullptr) {
+    std::unordered_map<const Node*, std::vector<std::size_t>> candidates;
+    for (std::size_t i = 0; i < phase_groups.size(); ++i) {
+      auto& group = phase_groups[i];
+      if (group.is_phase || group.nodes.size() != 1) continue;
+      const auto n = group.nodes.front();
+      if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6) continue;
+      auto& earlier = candidates[n->inputs.front().get()];
+      bool merged = false;
+      for (auto j : earlier) {
+        auto& previous = phase_groups[j];
+        if (previous.nodes.size() != 1) continue;
+        const auto pair = exact_gdn_pair(previous.nodes.front(), n);
+        if (!pair) continue;
+        previous.nodes.push_back(n);
+        previous.outputs = {pair.output, pair.state};
+        group.nodes.clear();
+        merged = true;
+        break;
+      }
+      if (!merged) earlier.push_back(i);
+    }
+    std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
+  }
+
+  if (device_first && !replayed) {
+    for (Workgroup& wg : planned) {
+      // Kernel epilogues and pointwise chains above can remove boundaries
+      // present in Workgroup::cuts(). Plan against the launches we will issue,
+      // otherwise a fused output can overwrite a still-live reduction input.
+      wg.plan_slots(roots, phase_groups);
       // A workgroup is member-homogeneous by construction (the partitioner
       // splits phases where a value changes members), so its slots belong on
       // that member — allocated through the member's backend and stream, or
@@ -1599,6 +1732,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // dispatch loop to the remainder rather than being folded in here — which is
   // what the old partition_ns did, silently.
   const auto t_repartition = place_span.close();
+  ++trace_.partition_passes;
   std::vector<FusionGroup> groups =
       Partitioner::partition(roots, &backend().device_info());
   trace_.spans.partition.add(elapsed_ns(t_repartition, SpanClock::now()));
@@ -1677,8 +1811,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
-      // Not a hard failure: a group the emitter cannot express falls to the
-      // host, which is the documented behaviour. Record why.
+      // Inference qualification must not quietly turn a missing GPU kernel
+      // into a CPU result. Drain prior work before reporting the exact gap.
+      if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+          strict != nullptr && std::string_view(strict) == "1") {
+        for (std::size_t member = 0; member < devices_.size(); ++member) {
+          LSE_RETURN_IF_ERROR(devices_.device(member).synchronize());
+        }
+        return LSE_ERROR(kUnimplemented, "GPU-only execution required: ",
+                         dispatched.message());
+      }
+      // A group the emitter cannot express otherwise falls to the host,
+      // which is the default behaviour. Record why.
       ++trace_.host_groups;
       trace_.host_group_reasons.push_back(dispatched.message());
     }
@@ -1689,6 +1833,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
       LSE_RETURN_IF_ERROR(waited);
       launched = false;
+    }
+
+    if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+        strict != nullptr && std::string_view(strict) == "1") {
+      return LSE_ERROR(kUnimplemented,
+                       "GPU-only execution required: no device kernel backend selected");
     }
 
     // Host-only mode reaches here without passing the device-first arm above,
@@ -1870,6 +2020,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
 ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
 
 Scheduler* default_scheduler() {
+  // Without place linked, this scheduler owns the backend itself. Arrange
+  // runtime dependencies before its destructor is registered as well.
+  if (g_device_set_factory == nullptr) backend::prepare_backend_runtimes();
   static DefaultScheduler d;
   return d.scheduler.get();
 }
