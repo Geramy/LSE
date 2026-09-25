@@ -125,6 +125,24 @@ void dequant_16(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
     w[j] = e.let(math::fma(math::cast<kir::f32>(e.let(code)), scale, bias));
   }
 }
+// LValue overload: stores dequantized values in local variables (scope-safe).
+void dequant_16(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
+                const kir::Val<kir::f32> &scale,
+                const kir::Val<kir::f32> &bias,
+                kir::LValue<kir::f32> *w) {
+  const std::array<kir::Val<kir::u32>, 3> packed{
+      e.let(a.packed[wb]), e.let(a.packed[wb + 1u]), e.let(a.packed[wb + 2u])};
+  for (unsigned j = 0; j < 16; ++j) {
+    const unsigned off = (j * 6) % 32, wi = j * 6 / 32;
+    auto code = packed[wi] / (1u << off);
+    if (off > 26)
+      code = code +
+             (packed[wi + 1] % (1u << (off - 26))) * (1u << (32 - off));
+    else
+      code = code % 64u;
+    w[j] = e.let(math::fma(math::cast<kir::f32>(e.let(code)), scale, bias));
+  }
+}
 // Bank swizzle for the 64-wide f32 panels (the v0/production 8-float
 // rotate). A 32-wide swizzle would collide lanes within one 4-float group
 // (lane l%16 and (l%16)+16 hit the same bank quad); the 64-wide map stays.
@@ -169,23 +187,18 @@ std::string emit_ffn_f32_v1a(const KernelShapes &s, const Dims &d) {
   // 32-row x 32-k stage = 1024 4-f32 runs = 128 lanes x 8: run = t,
   // row = run/8 (8 rows per run-window, 2 windows per 16-row span),
   // k-run = (run%8)*4 + (lid%16)*4.
-  for (unsigned r16 = 0; r16 < 2; ++r16) {
-    for (unsigned half = 0; half < 2; ++half) {
-      auto& dst = half == 0 ? xs0 : xs1;
-      // rows 16*r16..16*r16+15: 16 runs x 16 lanes = 256 4-f32 runs =
-      // 1024 / 128 lanes = 8 per lane: run = t, k-run = (run%8)*4 + (lid%16)*4,
-      // row = 16*r16 + run/8.
-      for (unsigned t = 0; t < 8; ++t) {
-        const auto rr = e.let(e.u32(r16 * 16 + t) / 8u);
-        const auto kc0 = e.let(e.u32((r16 * 16 + t) % 8u) * 4u +
-                               (lid % 16u) * 4u);
-        const auto ar = e.let(mbase + rr);
-        const auto loaded = e.load(
-            a.x, e.let(ar * d.k + e.u32(half * 32) + kc0), 16u);
-        for (unsigned j = 0; j < 4; ++j)
-          dst[x16_address(e, rr, kc0 + e.u32(j))] = e.let(loaded[j]);
-      }
-    }
+  // 256 runs per 32-row x 32-k stage: row = t/8, k = (t%8)*4 + j.
+  // 2 runs per lane (t in [lid, 256, 128)). Stage 0: k [0,32), stage 1: k [32,64).
+  for (auto t : e.range(lid, e.u32(256u), 128u)) {
+    const auto rr = e.let(t / 8u);
+    const auto kc = e.let((t % 8u) * 4u);
+    const auto ar = e.let(mbase + rr);
+    const auto l0 = e.load(a.x, e.let(ar * d.k + kc), 16u);
+    for (unsigned j = 0; j < 4; ++j)
+      xs0[x16_address(e, rr, kc + e.u32(j))] = e.let(l0[j]);
+    const auto l1 = e.load(a.x, e.let(ar * d.k + e.u32(32) + kc), 16u);
+    for (unsigned j = 0; j < 4; ++j)
+      xs1[x16_address(e, rr, kc + e.u32(j))] = e.let(l1[j]);
   }
   e.barrier();
   for (auto kb : e.range(0u, d.k, 64u)) {
@@ -200,20 +213,21 @@ std::string emit_ffn_f32_v1a(const KernelShapes &s, const Dims &d) {
         //    In-bounds: on the whitelist K is a multiple of 64, so the
         //    last fill lands exactly at the end of row K (index < ar*K +
         //    (K-1) since koff+kc0+j <= 64+32+16+28+3 < 144 <= K).
-        for (unsigned t = 0; t < 4; ++t) {
+        // Fill next 32-K half: 256 runs = 2 per lane.
+        // Next half's k offset: kb + 64 + thalf*32 + sub*16.
+        {
           const std::uint32_t thalf = (half + 1u) % 2u;
-          const std::uint32_t run = sub * 16 + t;  // 16-run row window
-          const std::uint32_t rr_c = run / 8u;
-          const std::uint32_t kc0_c = (run % 8u) * 4u;
           const std::uint32_t nko_c = 64u + thalf * 32u + sub * 16u;
-          const auto rr = e.let(e.u32(rr_c));
-          const auto kc0 =
-              e.let(e.u32(kc0_c) + (lid % 16u) * 4u);
-          const auto ar = e.let(mbase + rr);
-          const auto nko = e.let(kb + e.u32(nko_c));
-          const auto loaded = e.load(a.x, e.let(ar * d.k + nko + kc0), 16u);
-          for (unsigned j = 0; j < 4; ++j)
-            nxt[x16_address(e, rr, kc0 + e.u32(j))] = e.let(loaded[j]);
+          for (auto t : e.range(lid, e.u32(256u), 128u)) {
+            const auto rr = e.let(t / 8u);
+            const auto kc = e.let((t % 8u) * 4u);
+            const auto ar = e.let(mbase + rr);
+            const auto nko = e.let(kb + e.u32(nko_c));
+            const auto loaded =
+                e.load(a.x, e.let(ar * d.k + nko + kc), 16u);
+            for (unsigned j = 0; j < 4; ++j)
+              nxt[x16_address(e, rr, kc + e.u32(j))] = e.let(loaded[j]);
+          }
         }
         // -- Consume the 16 K values. The lane decodes its TWO output
         //    columns (the scalar body's per-column Q6 path), then 16
@@ -226,18 +240,26 @@ std::string emit_ffn_f32_v1a(const KernelShapes &s, const Dims &d) {
         const auto bias1 = e.let(math::widen(a.biases[gi1]));
         const auto wb0 = e.let(col0 * d.words + kbase / 16u * 3u);
         const auto wb1 = e.let(col1 * d.words + kbase / 16u * 3u);
-        std::array<kir::Val<kir::f32>, 16> w0{}, w1{};
-        if (auto active = e.when(col0 < d.n))
-          dequant_16(e, a, wb0, scale0, bias0, w0);
-        if (auto active = e.when(col1 < d.n))
-          dequant_16(e, a, wb1, scale1, bias1, w1);
+        std::vector<kir::LValue<kir::f32>> w0l, w1l;
+        for (unsigned i = 0; i < 16; ++i) {
+          w0l.push_back(e.var(0.0f));
+          w1l.push_back(e.var(0.0f));
+        }
+        {
+          auto* pw0 = w0l.data();
+          auto* pw1 = w1l.data();
+          dequant_16(e, a, wb0, scale0, bias0, pw0);
+          dequant_16(e, a, wb1, scale1, bias1, pw1);
+        }
         for (unsigned kk = 0; kk < 16; ++kk) {
           const auto k = e.let(kbase + e.u32(kk));
+          const auto w0v = w0l[kk].read();
+          const auto w1v = w1l[kk].read();
           for (unsigned r = 0; r < 8; ++r) {
             const auto x =
                 cur[x16_address(e, rbase + e.u32(r), k)].read();
-            acc[2 * r] = math::fma(x, w0[kk], acc[2 * r].read());
-            acc[2 * r + 1] = math::fma(x, w1[kk], acc[2 * r + 1].read());
+            acc[r] = math::fma(x, w0v, acc[r].read());
+            acc[8 + r] = math::fma(x, w1v, acc[8 + r].read());
           }
         }
       }
@@ -248,9 +270,9 @@ std::string emit_ffn_f32_v1a(const KernelShapes &s, const Dims &d) {
   for (unsigned r = 0; r < 8; ++r) {
     const auto rr0 = e.let(mbase + rbase + e.u32(r));
     if (auto active = e.when(rr0 < d.m && col0 < d.n))
-      e.store(e.let(rr0 * d.n + col0), acc[2 * r].read());
+      e.store(e.let(rr0 * d.n + col0), acc[r].read());
     if (auto active = e.when(rr0 < d.m && col1 < d.n))
-      e.store(e.let(rr0 * d.n + col1), acc[2 * r + 1].read());
+      e.store(e.let(rr0 * d.n + col1), acc[8 + r].read());
   }
   return body.lds().ok() ? body.str() : std::string{};
 }
@@ -357,7 +379,8 @@ std::string emit_ffn_f32_v1b(const KernelShapes &s, const Dims &d) {
     {
       // Guard the fill-ahead on the DEVICE value: kb is a Val, so the
       // comparison must stay device-side (the host cannot see it).
-      if (auto not_last = e.when(kb < e.let(e.u32(d.k) - 64u)))
+      if (auto not_last =
+              e.when(kb + e.u32(64u) < e.let(e.u32(d.k))))
         fill_block(ws1, e.let(kb + e.u32(64u)));
     }
     e.barrier();
