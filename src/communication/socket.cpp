@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <algorithm>
 #include <array>
@@ -91,7 +92,7 @@ Result<Address> inet_address(std::string_view authority) {
   sockaddr_in v4{};
   if (::inet_pton(AF_INET, host.c_str(), &v4.sin_addr) == 1) {
     v4.sin_family = AF_INET;
-    v4.sin_port = ::htons(static_cast<std::uint16_t>(port_value));
+    v4.sin_port = htons(static_cast<std::uint16_t>(port_value));
     std::memcpy(&out.storage, &v4, sizeof(v4));
     out.len = sizeof(v4);
     out.family = AF_INET;
@@ -100,7 +101,7 @@ Result<Address> inet_address(std::string_view authority) {
   sockaddr_in6 v6{};
   if (::inet_pton(AF_INET6, host.c_str(), &v6.sin6_addr) == 1) {
     v6.sin6_family = AF_INET6;
-    v6.sin6_port = ::htons(static_cast<std::uint16_t>(port_value));
+    v6.sin6_port = htons(static_cast<std::uint16_t>(port_value));
     std::memcpy(&out.storage, &v6, sizeof(v6));
     out.len = sizeof(v6);
     out.family = AF_INET6;
@@ -125,6 +126,9 @@ Result<Address> unix_address(const Endpoint& ep) {
   // A leading '@' is the abstract namespace: no filesystem entry, so nothing to
   // unlink and nothing left behind by a crash.
   const bool abstract = name.front() == '@';
+#ifdef __APPLE__
+  if (abstract) return LSE_ERROR(kUnimplemented, "macOS unix sockets require a filesystem path; abstract namespace is Linux-only");
+#endif
   const std::string body = abstract ? name.substr(1) : name;
   if (body.size() + 1 > sizeof(un.sun_path)) {
     return LSE_ERROR(kOutOfRange, "unix socket name '", name, "' is longer than ",
@@ -151,9 +155,34 @@ Result<Address> address_of(const Endpoint& ep) {
   return inet_address(ep.authority());
 }
 
+#ifdef __APPLE__
+bool configure_socket(int fd) {
+  const int flags=::fcntl(fd,F_GETFL,0);
+  const int descriptor_flags=::fcntl(fd,F_GETFD,0);
+  const int one=1;
+  return flags>=0 && descriptor_flags>=0 &&
+      ::fcntl(fd,F_SETFL,flags|O_NONBLOCK)==0 &&
+      ::fcntl(fd,F_SETFD,descriptor_flags|FD_CLOEXEC)==0 &&
+      ::setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof(one))==0;
+}
+int darwin_socket(int family) {
+  const int fd=::socket(family,SOCK_STREAM,0);
+  if (fd>=0 && !configure_socket(fd)) { const int saved=errno;::close(fd);errno=saved;return -1; }
+  return fd;
+}
+int darwin_accept(int listener) {
+  const int fd=::accept(listener,nullptr,nullptr);
+  if (fd>=0 && !configure_socket(fd)) { const int saved=errno;::close(fd);errno=saved;return -1; }
+  return fd;
+}
+#endif
+
 Result<int> make_socket(int family) {
-  const int fd =
-      ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#ifdef __APPLE__
+  const int fd = darwin_socket(family);
+#else
+  const int fd = ::socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#endif
   if (fd < 0) {
     return LSE_ERROR(kIoError, "socket(): ", std::strerror(errno));
   }
@@ -178,7 +207,7 @@ std::string describe_peer(int fd, const Endpoint& fallback) {
     std::array<char, INET_ADDRSTRLEN> text{};
     ::inet_ntop(AF_INET, &v4.sin_addr, text.data(), text.size());
     return "tcp://" + std::string(text.data()) + ":" +
-           std::to_string(::ntohs(v4.sin_port));
+           std::to_string(ntohs(v4.sin_port));
   }
   if (ss.ss_family == AF_INET6) {
     sockaddr_in6 v6{};
@@ -186,7 +215,7 @@ std::string describe_peer(int fd, const Endpoint& fallback) {
     std::array<char, INET6_ADDRSTRLEN> text{};
     ::inet_ntop(AF_INET6, &v6.sin6_addr, text.data(), text.size());
     return "tcp://[" + std::string(text.data()) + "]:" +
-           std::to_string(::ntohs(v6.sin6_port));
+           std::to_string(ntohs(v6.sin6_port));
   }
   return fallback.str();
 }
@@ -205,14 +234,14 @@ Result<Endpoint> bound_endpoint(int fd, const Endpoint& requested) {
     std::array<char, INET_ADDRSTRLEN> text{};
     ::inet_ntop(AF_INET, &v4.sin_addr, text.data(), text.size());
     authority = std::string(text.data()) + ":" +
-                std::to_string(::ntohs(v4.sin_port));
+                std::to_string(ntohs(v4.sin_port));
   } else {
     sockaddr_in6 v6{};
     std::memcpy(&v6, &ss, sizeof(v6));
     std::array<char, INET6_ADDRSTRLEN> text{};
     ::inet_ntop(AF_INET6, &v6.sin6_addr, text.data(), text.size());
     authority = "[" + std::string(text.data()) + "]:" +
-                std::to_string(::ntohs(v6.sin6_port));
+                std::to_string(ntohs(v6.sin6_port));
   }
   std::string text = std::string(requested.scheme()) + "://" + authority;
   bool first = true;
@@ -564,8 +593,12 @@ constexpr std::uint64_t kAcceptRetryNs = 50'000'000ull;
 
 void SocketListener::accept_ready() {
   for (;;) {
+#ifdef __APPLE__
+    const int fd = darwin_accept(fd_);
+#else
     const int fd = ::accept4(fd_, nullptr, nullptr,
                              SOCK_NONBLOCK | SOCK_CLOEXEC);
+#endif
     if (fd < 0) {
       // Out of descriptors: the connection stays queued and the listening
       // socket stays readable, so waiting on it again would report ready

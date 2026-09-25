@@ -39,6 +39,10 @@
 
 namespace lse::kernels {
 
+// Forward declaration: the Q6/WGMMA selector lives in wmma_q6_linear.cpp
+// (same target, lse_kernels), which defines it after the anonymous namespace.
+const graph::KernelPrimitiveBase *wmma_q6_linear_for(const graph::KernelShapes &);
+
 // These name device facts, which the backend supplies.
 using backend::AmdDeviceInfo;
 using backend::DeviceInfo;

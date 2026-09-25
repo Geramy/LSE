@@ -19,6 +19,7 @@ struct Entry {
   BackendFactory factory = nullptr;
   DeviceEnumerator enumerator = nullptr;
   StableRefResolver stable_ref_resolver = nullptr;
+  RuntimePreparer runtime_preparer = nullptr;
 };
 
 struct Registry {
@@ -54,11 +55,26 @@ DeviceIndex next_device_index() noexcept {
 
 void register_backend(std::string_view name, BackendFactory factory,
                       DeviceEnumerator enumerator,
-                      StableRefResolver stable_ref_resolver) {
+                      StableRefResolver stable_ref_resolver,
+                      RuntimePreparer runtime_preparer) {
   Registry& r = registry();
   std::lock_guard lock(r.mu);
   r.factories.emplace(std::string(name),
-                      Entry{factory, enumerator, stable_ref_resolver});
+                      Entry{factory, enumerator, stable_ref_resolver, runtime_preparer});
+}
+
+void prepare_backend_runtimes() {
+  std::vector<RuntimePreparer> callbacks;
+  {
+    Registry& r = registry();
+    std::lock_guard lock(r.mu);
+    for (const auto& [name, entry] : r.factories) {
+      (void)name;
+      if (entry.runtime_preparer) callbacks.push_back(entry.runtime_preparer);
+    }
+  }
+  // dlopen may itself register backends; never hold the registry lock here.
+  for (const auto callback : callbacks) callback();
 }
 
 namespace {

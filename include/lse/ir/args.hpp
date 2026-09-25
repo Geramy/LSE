@@ -21,14 +21,20 @@
 // than that. Requiring 202603 turned a compiler that works into one that
 // stops at the first header, which is a worse answer than trying.
 #if !defined(__cpp_impl_reflection) || __cpp_impl_reflection < 202506L
-#error "kernel_args.hpp needs P2996 reflection (g++-16 -std=c++26 -freflection)"
+#define LSE_PORTABLE_AGGREGATE_ARGS 1
 #endif
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
+#if !defined(LSE_PORTABLE_AGGREGATE_ARGS)
 #include <meta>
+#else
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#endif
 
 #include "lse/core/dtype.hpp"
 #include "lse/ir/env.hpp"
@@ -100,14 +106,53 @@ struct arg_traits<InOut<T, Emit>> {
   using elem = T;
 };
 
+#ifndef LSE_PORTABLE_AGGREGATE_ARGS
 template <class A>
 consteval auto members() {
   return std::define_static_array(std::meta::nonstatic_data_members_of(
       ^^A, std::meta::access_context::current()));
 }
 
+#else
+// The portable path supports plain aggregate parameter bundles only. Member
+// order comes from C++ structured binding, retaining the reflected ABI order.
+struct AggregateElement { template<class T> constexpr operator T() const noexcept; };
+template<class A, std::size_t... I>
+consteval bool initializes(std::index_sequence<I...>) {
+  return requires { A{(static_cast<void>(I), AggregateElement{})...}; };
+}
+template<class A, std::size_t N=0> consteval std::size_t member_count() {
+  static_assert(std::is_aggregate_v<A>, "kernel parameter bundle must be an aggregate");
+  if constexpr (initializes<A>(std::make_index_sequence<N+1>{})) {
+    static_assert(N<16, "portable kernel parameter bundle exceeds 16 members");
+    return member_count<A,N+1>();
+  } else return N;
+}
+template<class A> auto member_refs(A& value) {
+  constexpr auto count=member_count<A>();
+  if constexpr (count==0) return std::tuple<>();
+  else if constexpr (count==1) { auto& [m0]=value; return std::tie(m0); }
+  else if constexpr (count==2) { auto& [m0, m1]=value; return std::tie(m0, m1); }
+  else if constexpr (count==3) { auto& [m0, m1, m2]=value; return std::tie(m0, m1, m2); }
+  else if constexpr (count==4) { auto& [m0, m1, m2, m3]=value; return std::tie(m0, m1, m2, m3); }
+  else if constexpr (count==5) { auto& [m0, m1, m2, m3, m4]=value; return std::tie(m0, m1, m2, m3, m4); }
+  else if constexpr (count==6) { auto& [m0, m1, m2, m3, m4, m5]=value; return std::tie(m0, m1, m2, m3, m4, m5); }
+  else if constexpr (count==7) { auto& [m0, m1, m2, m3, m4, m5, m6]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6); }
+  else if constexpr (count==8) { auto& [m0, m1, m2, m3, m4, m5, m6, m7]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7); }
+  else if constexpr (count==9) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8); }
+  else if constexpr (count==10) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9); }
+  else if constexpr (count==11) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10); }
+  else if constexpr (count==12) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11); }
+  else if constexpr (count==13) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12); }
+  else if constexpr (count==14) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13); }
+  else if constexpr (count==15) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14); }
+  else if constexpr (count==16) { auto& [m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15]=value; return std::tie(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15); }
+}
+#endif
+
 }  // namespace detail
 
+#ifndef LSE_PORTABLE_AGGREGATE_ARGS
 template <class A>
 consteval std::size_t input_count() {
   std::size_t n = 0;
@@ -132,6 +177,20 @@ consteval std::size_t output_count() {
   return n;
 }
 
+#else
+template<class A, bool Inputs> consteval std::size_t count_arguments() {
+  using Fields=decltype(detail::member_refs(std::declval<A&>()));
+  return []<std::size_t... I>(std::index_sequence<I...>) {
+    return (std::size_t{0} + ... + (Inputs ?
+      detail::arg_traits<std::remove_cvref_t<std::tuple_element_t<I,Fields>>>::is_in :
+      detail::arg_traits<std::remove_cvref_t<std::tuple_element_t<I,Fields>>>::is_out));
+  }(std::make_index_sequence<std::tuple_size_v<Fields>>{});
+}
+template<class A> consteval std::size_t input_count() { return count_arguments<A,true>(); }
+template<class A> consteval std::size_t output_count() { return count_arguments<A,false>(); }
+
+#endif
+
 // Attach every member to the recorder: In members take input slots in
 // declaration order, the Out member takes the output. A member that is
 // neither is a mistake the compiler reports here, not a silent skip.
@@ -150,6 +209,7 @@ template <class A>
                         DType out_dtype) {
   std::size_t index = 0;
   bool ok = true;
+#ifndef LSE_PORTABLE_AGGREGATE_ARGS
   template for (constexpr std::meta::info m : detail::members<A>()) {
     using M = typename[:std::meta::type_of(m):];
     using Tr = detail::arg_traits<M>;
@@ -172,6 +232,31 @@ template <class A>
       args.[:m:].tt = &k.types();
     }
   }
+#else
+  const auto attach = [&](auto& member) {
+    using M = std::remove_cvref_t<decltype(member)>;
+    using Tr = detail::arg_traits<M>;
+    static_assert(Tr::is_in || Tr::is_out,
+                  "kernel args members must be env::In or env::Out");
+    if constexpr (Tr::is_in) {
+      if (!in_dtypes.empty() && index < in_dtypes.size() &&
+          in_dtypes[index] != elem_dtype<typename Tr::elem>::value) {
+        ok = false;
+      }
+      // Names follow the emitter's binding convention directly; this is the
+      // one place that convention is spelled for authored kernels.
+      member.b =
+          Buffer<typename Tr::elem>(&k, &k.types(), k.input_name(index++));
+      member.tt = &k.types();
+    } else if constexpr (Tr::is_out) {
+      if (out_dtype != elem_dtype<typename Tr::elem>::value) ok = false;
+      member.b =
+          Buffer<typename Tr::elem>(&k, &k.types(), k.output_name());
+      member.tt = &k.types();
+    }
+  };
+  std::apply([&](auto&... member) { (attach(member), ...); }, detail::member_refs(args));
+#endif
   // At most one: kernels that return their element value or store through
   // the emitter's hook declare no Out at all.
   static_assert(output_count<A>() <= 1,

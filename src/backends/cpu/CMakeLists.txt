@@ -9,7 +9,11 @@ target_link_libraries(lse_backend_cpu PUBLIC lse_core lse_backend_registry)
 
 # The registrar is a static initializer in a TU with no referenced symbols;
 # without whole-archive the linker drops it and the backend silently vanishes.
-target_link_options(lse_backend_cpu INTERFACE
+if(APPLE)
+  target_link_options(lse_backend_cpu INTERFACE "LINKER:-force_load,$<TARGET_FILE:lse_backend_cpu>")
+else()
+  target_link_options(lse_backend_cpu INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_backend_cpu>,--no-whole-archive")
+endif()
 target_include_directories(lse_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 lse_apply_common_flags(lse_backend_cpu)

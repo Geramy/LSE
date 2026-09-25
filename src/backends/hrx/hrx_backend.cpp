@@ -687,26 +687,26 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
 // exactly what enumerating devices before binding one would otherwise cause.
 std::atomic<bool> g_accelerator_up{false};
 
-// Registered during this translation unit's dynamic initialization — before
-// main, and so before any object that can own a backend exists. Exit handlers
-// run in reverse registration order, which is what puts the global teardown
-// AFTER the last HrxBackend has released its streams and device.
-//
-// Registering it lazily on first bring-up does NOT achieve that, however early
-// the bring-up is: the first one happens from inside whatever owns the backends
-// (place::Devices, a Scheduler, a test fixture), whose own handler is therefore
-// registered first and runs last — leaving hrx_gpu_shutdown to run while those
-// backends are still holding streams and a device reference.
-[[maybe_unused]] const bool kTeardownRegistered = [] {
-  std::atexit([] {
-    if (g_accelerator_up.load(std::memory_order_acquire)) {
-      hrx_status_ignore(hrx_gpu_shutdown());
-    }
-  });
-  return true;
-}();
+// The runtime is dlopened, so its global destructors are registered at load
+// time. Register shutdown after that load but before a static device owner is
+// constructed: owner -> HRX shutdown -> HSA globals. A pre-main atexit callback
+// runs too late on Darwin and calls hsa_shut_down with already-destroyed locks.
+void prepare_accelerator_runtime() {
+  static const HsaRuntime lifetime(true);
+  if (!lifetime.reachable()) return;
+  static const bool registered = [] {
+    std::atexit([] {
+      if (g_accelerator_up.exchange(false, std::memory_order_acq_rel)) {
+        hrx_status_ignore(hrx_gpu_shutdown());
+      }
+    });
+    return true;
+  }();
+  (void)registered;
+}
 
 Status accelerator_up() {
+  prepare_accelerator_runtime();
   static std::mutex mu;
   const std::lock_guard lock(mu);
   if (g_accelerator_up.load(std::memory_order_relaxed)) return OkStatus();
@@ -716,9 +716,17 @@ Status accelerator_up() {
   // for here because bringing the accelerator up is once per process and the
   // topology is fixed at that moment.
   const std::string group = backend::requested_device_group("hrx");
+#if defined(__APPLE__)
+  if (!group.empty()) {
+    return LSE_ERROR(kUnimplemented,
+                     "the macOS HRX adapter does not support spanning GPU groups");
+  }
+  const hrx_status_t status = hrx_gpu_initialize(0);
+#else
   const hrx_status_t status =
       group.empty() ? hrx_gpu_initialize(0)
                     : hrx_gpu_initialize_over(group.c_str(), 0);
+#endif
   if (hrx_status_is_ok(status)) {
     g_accelerator_up.store(true, std::memory_order_release);
     return OkStatus();
@@ -733,6 +741,12 @@ Status accelerator_up() {
 #endif
 
 }  // namespace
+
+void HrxBackend::prepare_runtime() {
+#if LSE_HRX_LINKED
+  prepare_accelerator_runtime();
+#endif
+}
 
 bool HrxBackend::available() noexcept {
 #if LSE_HRX_LINKED

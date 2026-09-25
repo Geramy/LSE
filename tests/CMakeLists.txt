@@ -288,6 +288,7 @@ if(TEST test_jit)
   set_property(TEST test_jit APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
 endif()
 set_property(TEST test_loom_dot APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
+
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC AND Python3_Interpreter_FOUND)
   add_executable(test_int8_policy test_int8_policy.cpp)
@@ -317,7 +318,10 @@ if(TARGET lse_backend_hrx)
   add_test(NAME test_quant_operand_cache COMMAND test_quant_operand_cache)
 endif()
 
-if(TARGET lse_backend_hrx)
+# The Q6 WMMA suite only links the emitter when no HRX backend is built; it
+# needs a loomc compiler at runtime for its native compile checks, so it is
+# registered alongside the other LSE_HAVE_LOOMC-gated native tests.
+if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
   lse_add_test(test_q6_wmma lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
 

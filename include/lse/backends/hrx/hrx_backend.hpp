@@ -31,6 +31,7 @@ namespace lse::backend {
 class HrxBackend : public Backend<HrxBackend> {
  public:
   static constexpr std::string_view kName = "hrx";
+  static void prepare_runtime();
 
   ~HrxBackend();
 

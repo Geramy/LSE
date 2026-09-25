@@ -1811,8 +1811,18 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
-      // Not a hard failure: a group the emitter cannot express falls to the
-      // host, which is the documented behaviour. Record why.
+      // Inference qualification must not quietly turn a missing GPU kernel
+      // into a CPU result. Drain prior work before reporting the exact gap.
+      if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+          strict != nullptr && std::string_view(strict) == "1") {
+        for (std::size_t member = 0; member < devices_.size(); ++member) {
+          LSE_RETURN_IF_ERROR(devices_.device(member).synchronize());
+        }
+        return LSE_ERROR(kUnimplemented, "GPU-only execution required: ",
+                         dispatched.message());
+      }
+      // A group the emitter cannot express otherwise falls to the host,
+      // which is the default behaviour. Record why.
       ++trace_.host_groups;
       trace_.host_group_reasons.push_back(dispatched.message());
     }
@@ -1823,6 +1833,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
       LSE_RETURN_IF_ERROR(waited);
       launched = false;
+    }
+
+    if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+        strict != nullptr && std::string_view(strict) == "1") {
+      return LSE_ERROR(kUnimplemented,
+                       "GPU-only execution required: no device kernel backend selected");
     }
 
     // Host-only mode reaches here without passing the device-first arm above,
@@ -2004,6 +2020,9 @@ ScopedMember::ScopedMember(std::size_t member) noexcept
 ScopedMember::~ScopedMember() { g_preferred_member = previous_; }
 
 Scheduler* default_scheduler() {
+  // Without place linked, this scheduler owns the backend itself. Arrange
+  // runtime dependencies before its destructor is registered as well.
+  if (g_device_set_factory == nullptr) backend::prepare_backend_runtimes();
   static DefaultScheduler d;
   return d.scheduler.get();
 }
