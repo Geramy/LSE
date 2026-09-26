@@ -734,6 +734,16 @@ class Backend {
 
   Status synchronize() { return derived().synchronize_impl(); }
 
+  // The step's recording is finished; submit it. Default: nothing is being
+  // recorded, so a step boundary is the same as no boundary at all.
+  Status flush_step() {
+    if constexpr (requires { derived().flush_step(); }) {
+      return derived().flush_step();
+    } else {
+      return OkStatus();
+    }
+  }
+
   // --- execution streams -----------------------------------------------
   // A backend that implements none of the *_impl below still satisfies the
   // whole seam: it gets one stream, everything ordered, and events that are
@@ -1017,6 +1027,11 @@ class IBackend {
   virtual Status begin_decode_sample(std::uint64_t) { return OkStatus(); }
   virtual Status end_decode_sample(std::uint64_t, bool) { return OkStatus(); }
   virtual void cancel_decode_sample() noexcept {}
+  // One pass is over: submit whatever the step recorded. No device wait —
+  // the caller that needs the result drains after. A backend whose launches
+  // accumulate in a recording buffer uses this to bound the unsubmitted tail
+  // to one step instead of one launch interval.
+  virtual Status flush_step() { return OkStatus(); }
   virtual Status synchronize() = 0;
 
   // What this device's streams can do, and how to order two of them. A caller
@@ -1159,6 +1174,7 @@ class BackendAdapter final : public IBackend {
       impl_.cancel_decode_sample_impl();
   }
   Status synchronize() override { return impl_.synchronize(); }
+  Status flush_step() override { return impl_.flush_step(); }
   const StreamCapabilities& stream_capabilities() const noexcept override {
     return impl_.stream_capabilities();
   }

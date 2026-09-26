@@ -659,7 +659,12 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
   // Pinned plans — a spanning device placing by member — do not read this
   // flag; their ordering is emitted regardless (see plan_streams).
   // LSE_SPREAD=1 is the experiment gate for hunting the ordering hole; it is
-  // not a supported mode until the hole is found.
+  // not a supported mode until the hole is found. Measured on gfx1201 Q6 27B
+  // decode (2025-09-25, build macos-decode-25): spreading dropped 17.5 ->
+  // 12.7 tok/s with the same coherent text, so the extra event edges and the
+  // per-dispatch retire/issue barriers inside the command buffers cost more
+  // than the two rings overlap. Off by default until a variant without that
+  // tax is proven.
   caps.uniform_launch_cost = std::getenv("LSE_SPREAD") != nullptr;
   // A dispatch is a grid, and a grid cannot be cut. Flips when a kernel
   // declares work items instead; nothing else about the seam changes.
@@ -2422,6 +2427,18 @@ Status HrxBackend::synchronize_stream_impl(Stream stream) {
       "hrx_stream_synchronize");
   LSE_SYNC_TRACE("stream_synchronize(%u) leave", stream.index);
   return synced;
+#endif
+}
+
+Status HrxBackend::flush_step() {
+#if LSE_HRX_LINKED
+  if (!initialized_) return OkStatus();
+  for (std::uint32_t i = 0; i < streams_.size(); ++i) {
+    LSE_RETURN_IF_ERROR(flush_stream(i));
+  }
+  return OkStatus();
+#else
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #endif
 }
 

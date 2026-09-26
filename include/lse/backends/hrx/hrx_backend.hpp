@@ -101,6 +101,7 @@ class HrxBackend : public Backend<HrxBackend> {
                                             std::span<const std::byte> code_object);
   Status launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
                      const DispatchArgs& args, const DispatchTarget& target);
+  Status flush_step();
   Status synchronize_impl();
   Result<void*> device_pointer_impl(const DeviceBuffer& buf) const;
 

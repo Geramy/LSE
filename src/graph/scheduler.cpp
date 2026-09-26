@@ -1080,6 +1080,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     if (ready) {
       const auto t_ready = setup_span.close();
       if (pull_host) {
+        // The work already ran on a previous eval of this same retained
+        // program; whatever it left unsubmitted is flushed before this
+        // readback can race it.
+        LSE_RETURN_IF_ERROR(backend().flush_step());
+      }
+      if (pull_host) {
         SpanTimer readback_span(trace_.spans.readback, t_ready);
         for (const NodePtr& r : roots) {
           if (r) LSE_RETURN_IF_ERROR(interpreter::sync_from_device(*r, backend()));
@@ -1700,6 +1706,16 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       }
       if (launched_phase) {
         if (!replayed) rec.retain(roots, std::move(planned), ran, order);
+        // The step's recording is done; submit what it left open. A backend
+        // that accumulates launches in a buffer (hrx's per-stream command
+        // buffer) otherwise carries the whole step unsubmitted until its
+        // periodic interval fires mid-recording, and the GPU idles on every
+        // kernel boundary the host is still recording past. No wait: pull_host
+        // drains below, and the next step's first drain is ordered after this
+        // submission, not before it.
+        if (pull_host) {
+          LSE_RETURN_IF_ERROR(backend().flush_step());
+        }
         if (pull_host) {
           const auto t_wait = SpanClock::now();
           const Status waited = backend().synchronize();
@@ -1899,6 +1915,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   }
 
   if (launched) {
+    // Submit the step's open recording before the drain, so the wait covers
+    // exactly this step's work and nothing older is still mid-recording.
+    LSE_RETURN_IF_ERROR(backend().flush_step());
     const auto t_wait = SpanClock::now();
     const Status waited = backend().synchronize();
     trace_.spans.host_wait.add(elapsed_ns(t_wait, SpanClock::now()));
