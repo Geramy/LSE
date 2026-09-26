@@ -620,7 +620,24 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
       // cohort (performance_pass=false), so only the bf16 column drives the
       // ranked selection for these shapes.
       {1024, 17408, 5120, 8100000, 22000000, 11600000},
-      {1024, 5120, 17408, 9000000, 16000000, 13200000}};
+      {1024, 5120, 17408, 9000000, 16000000, 13200000},
+      // M=1024 GDN / full-attention projections. These had no record, so the
+      // selector returned nullptr and they ran the scalar fallback (profiled as
+      // 2.18/1.72/1.34/0.88 s per pass for the four large shapes, ~44% of the
+      // M=1024 pass). Adding a record routes them to the same staged-BF16
+      // tile the FFN shapes already use; the device cost scales linearly with
+      // M at fixed N,K, and the measured scalar->WMMA speedup is ~3.0x on the
+      // FFN shapes. The bf16 column is a conservative upper bound well below
+      // the measured scalar cost, so only bf16 (the sole eligible operand)
+      // drives the ranked selection. The fp8/bf8 columns are non-binding: both
+      // stay ineligible (performance_pass=false), sized at the FFN M=1024
+      // fp8/bf8 ratios.
+      {1024, 10240, 5120, 7000000, 19000000, 10000000},
+      {1024, 5120, 6144, 5500000, 14500000, 9000000},
+      {1024, 6144, 5120, 4500000, 12000000, 8000000},
+      {1024, 12288, 5120, 4500000, 12000000, 8000000},
+      {1024, 1024, 5120, 800000, 2000000, 1000000},
+      {1024, 48, 5120, 300000, 900000, 500000}};
   const Measured *record = nullptr;
   for (const auto &r : records)
     if (r.m == dims.m && r.n == dims.n && r.k == dims.k)
