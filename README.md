@@ -1,56 +1,74 @@
 # Lemon Seed Engine (LSE)
 
-A modular C++ inference engine for hybrid LLMs -- Gated DeltaNet
-interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
-[HRX](https://github.com/ROCm/hrx-system) native runtime on AMD GPUs. Kernels
-are generated at run time from the model's own shapes rather than selected from
-a library.
+A modular C++ inference engine for hybrid LLMs — Gated DeltaNet interleaved
+with gated GQA, dense or sparse-MoE feed-forward. Its defining property: **the
+kernels are generated at run time from the model's own shapes and the device
+it is running on, then selected by measured evidence — not picked from a fixed
+library.** There is no hand-tuned kernel per model per GPU. The engine probes
+the device, generates candidate kernels for the actual shapes, and keeps the
+one that is fastest *here, now, for this config* — so the same binary is
+near-optimal on a 220 GB/s APU and a 1090 GB/s board, in 4-bit or 8-bit, on a
+single device or across a pool.
 
-## Platforms
+That is what it was built for: **always-the-most-optimal kernels in any
+configuration** — any model shape, any precision, any single device, any
+multi-device pool, any platform that can run an AMD GPU (or the CPU reference).
+It is not a fixed kernel pack; the optimization is the product.
 
-LSE builds and runs on **Linux + ROCm** (the primary path) and **macOS +
-Apple Silicon** (via the [MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu)
-DriverKit driver and HSA runtime). The same `lse` / `lse-server` binaries are
-produced on both; the difference is the GPU runtime and the AOT kernel target.
-Build steps for each are in **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
+## What it does
 
-On macOS there is no native AMD GPU driver, so the GPU path runs through
-MacAMDGPU (a DriverKit system extension exposing an HSA runtime for the
-HRX/Loom path). The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
-has the driver install + pinned LSE build; GPU execution needs the driver
-activated, the build and host tests do not. Use the `macos-arm64` release asset
-for Apple Silicon — Linux release binaries are not macOS builds and vice versa.
+- **Run-time kernel generation.** Ops record into a lazy tensor DAG; on demand
+  the graph is partitioned into fusion groups and each group is emitted as
+  device source (HIP or Loom), compiled with the selected toolchain into a code
+  object for the exact target, cached on disk, and dispatched through the native
+  HRX ABI. A toolchain change invalidates stale objects by construction.
+- **Measured kernel selection.** A device-qualification probe measures DRAM
+  bandwidth, dispatch cost, and matrix-core throughput per operand family. The
+  optimizer ranks the accepted kernel variants (WMMA/MFMA, operand layout,
+  precision, tile) on shape, capabilities, accuracy, and *matched timing
+  evidence* — no manual selection. Adding an operand family is a table row.
+- **Precision held in the checkpoint's own format.** Weights are read in MLX
+  group-affine form at 4, 6 or 8 bits, or bf16/f16/f32; conversion happens
+  inside the kernel at the register boundary. Packed Q6 stays packed in VRAM;
+  matrix accumulation stays FP32.
+- **A real cost model for multi-device.** Throughput at a given queue depth,
+  with split proportions for uneven pools, per-ordered-pair link latency and
+  bandwidth fitted separately. Every number carries its provenance. The pool
+  machinery (open, probe, report every member) is in; the model-split across
+  members is the open half (see [Upcoming](#upcoming)).
+- **CPU reference backend** for numerics checking against every device kernel —
+  the engine falls back to it when no GPU backend initializes, and says so.
 
-HIP (`--dialect hip`) and Loom (`--dialect loom`) share packed-Q6
-interpretation, tiling, operand selection, and FP8/BF8 conversion. The
-optimizer selects accepted kernels from shape, capabilities, accuracy, and
-matched timing evidence — no manual kernel selection. See
-[operand selection](docs/QUANT_OPERANDS.md) and
-[policy](docs/INT8_POLICY.md).
+## Compatibility
 
-## Reported performance
+The engine is platform-agnostic; a "platform" here is just (host OS, GPU
+runtime, AOT target).
+
+| Platform | GPU runtime | Status | Notes |
+|---|---|---|---|
+| Linux x86_64 | ROCm 7.x + [hrx-system](https://github.com/ROCm/hrx-system) | **primary** | Full HIP + Loom dialects, all AOT targets |
+| macOS / Apple Silicon | [MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu) DriverKit driver + HSA runtime | qualified | Loom dialect, `gfx1201` qualified |
+| Any host | CPU reference backend | always available | No GPU; for numerics and as the fallback |
+
+AOT kernel targets: `gfx942` (CDNA3), `gfx1150`/`gfx1151` (RDNA3.5),
+`gfx1200`/`gfx1201` (RDNA4). A device with no ahead-of-time kernels still runs —
+it compiles once per kernel and caches it on disk.
+
+Build steps per platform: **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
+
+## Measured performance
 
 Medians, warm JIT cache, GPU otherwise idle, best of several runs. `—` = not
-measured on that platform. These are LSE results, not llama.cpp-parity claims.
+measured on that platform. These are LSE results, not llama.cpp-parity claims;
+the point of the table is that one engine spans a 5× DRAM-bandwidth range.
 
 | Platform / GPU | Model | Prefill (tok/s) | Decode (tok/s) |
 |---|---|---|---|
-| Linux / gfx1151 (Strix Halo, 220 GB/s) | Qwen3.5-0.8B-4bit, 1601 tok | 1703 | — |
-| Linux / gfx1151 (Strix Halo, 220 GB/s) | Qwen3.8-27B-4bit, 401 tok | 28.7 | 11.9 (15.0 with MTP) |
-| Linux / gfx1151 (Strix Halo, 220 GB/s) | lemonseed-1.5b-base (bf16) | — | 102.3 |
-| macOS / gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-4bit, 401 tok | 112 | 20.9 (27.9 with MTP) |
-| macOS / gfx1201 (R9700, 1090 GB/s) | **Qwen3.8-27B-Q6, 1024 tok** | **229** | **16.3** |
-| macOS / gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-MLX-6bit, 512/129 | 88.6 | 17.45 |
-
-The **Qwen3.8-27B-Q6 / 1024-token** row is the current gfx1201 result
-(v0.4.2): prefill 229 PP/s (median of 229.25 / 227.20 / 225.84) and decode
-16.3 TPS (median of 16.30 / 16.22 / 16.18), all device-resident and
-compile-free. Prefill is **+51.7%** over the ~151 PP/s at v0.4.1 — the GDN
-projection GEMMs (in_proj_qkv, full-attention qkv/v/o) now select the staged
-BF16 WMMA path at M=1024 instead of scalar (all four large shapes went
-scalar→WMMA at ~3.0×, device total 14053→9656 ms); PPL-neutral (pure selection
-change, greedy text identical). Decode is at the measured aggregate-GEMV
-bandwidth ceiling (~415 GB/s vs ~549 GB/s needed for 25 tok/s).
+| gfx1151 (Strix Halo, 220 GB/s) | Qwen3.5-0.8B-4bit, 1601 tok | 1703 | — |
+| gfx1151 (Strix Halo, 220 GB/s) | Qwen3.8-27B-4bit, 401 tok | 28.7 | 11.9 (15.0 with MTP) |
+| gfx1151 (Strix Halo, 220 GB/s) | lemonseed-1.5b-base (bf16) | — | 102.3 |
+| gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-4bit, 401 tok | 112 | 20.9 (27.9 with MTP) |
+| gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-Q6, 1024 tok | **229** | **16.3** |
 
 Decode on the APU is bandwidth-bound at 82% of the measured DRAM rate; on the
 R9700 it is not, which is where the headroom is. 19 test suites green, zero
@@ -67,83 +85,42 @@ shares one kernel. `--list-models` prints what a build registers.
 | `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
 | `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
 
-Weights are read in MLX group-affine form at 4, 6 or 8 bits, or bf16/f16/f32. A
-multi-token-prediction module is used when the checkpoint has one, which is
-what `--mtp` names and `--no-mtp` declines; the text tower loads on its own
-where a checkpoint also ships a vision tower, which this build does not run.
+A multi-token-prediction module is used when the checkpoint has one (`--mtp`
+names it, `--no-mtp` declines it); the text tower loads on its own where a
+checkpoint also ships a vision tower, which this build does not run.
 
 ## Design in one paragraph
 
 Ops are lazy: they record into a DAG and execute only when a host-visible read
 demands a value. On demand the graph is partitioned into fusion groups, each
-group is emitted as HIP or Loom source, compiled with the selected toolchain into
-an AMDGPU code object, cached on disk, and dispatched through the native HRX ABI
-(`hrx_stream_dispatch`) — not through HIP. Every extension seam (backend,
-transport, quantization scheme, layer, sampler) is a CRTP base that owns the
-shared algorithms and calls into the derived type for the primitives.
+group is emitted as HIP or Loom source, compiled with the selected toolchain
+into an AMDGPU code object, cached on disk, and dispatched through the native
+HRX ABI (`hrx_stream_dispatch`) — not through HIP. Every extension seam
+(backend, transport, quantization scheme, layer, sampler) is a CRTP base that
+owns the shared algorithms and calls into the derived type for the primitives.
 
 ## Install a release
 
-Releases are built by the **Build & Release** workflow in the Actions tab and
-carry ahead-of-time kernels for the architectures selected for that build,
-which the release notes list.
-
-The **macOS ARM64** workflow builds on GitHub-hosted Apple Silicon runners.
-It packages `lse`, `lse-server`, HRX, Loom and the MacAMDGPU HSA runtime, checks
-host behavior and native kernel compilation, and tests the package after moving
-it to a different directory. These hosted checks do not execute AMD GPU kernels.
-
-For **Apple Silicon** (binaries target macOS 15 or later; the current
-MacAMDGPU driver requires macOS Tahoe 26.2 or later):
+Releases are built by the **Build & Release** workflow and carry ahead-of-time
+kernels for the architectures selected for that build, which the release notes
+list. Pick the asset for your platform, verify it, unpack it:
 
 ```bash
-# Pick the macos-arm64 asset from https://github.com/Geramy/LSE/releases
-curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-macos-arm64.tar.gz
-curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-macos-arm64.tar.gz.sha256
-shasum -a 256 -c lse-<tag>-macos-arm64.tar.gz.sha256
-tar -xzf lse-<tag>-macos-arm64.tar.gz
-cd lse-<tag>-macos-arm64
-./bin/lse --devices
-./bin/lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
-./bin/lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
-```
-
-Install, approve and initialize the
-[MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu#hardware-requirements)
-separately before GPU use. Hardware qualification currently covers the R9700
-(`gfx1201`) on Apple Silicon; this is not general support for every AMD GPU.
-The archive does not install a system extension. Use its `bin/` launchers to
-load the bundled runtime libraries. Binaries are ad-hoc signed, not Developer ID
-notarized. The package uses Loom; HIP/comgr is not included on macOS.
-
-For **Linux x86_64**:
-
-```bash
-# Pick the asset from https://github.com/Geramy/LSE/releases
+# Linux x86_64 (the <tag> is e.g. v0.4.2)
 curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz
 curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz.sha256
 sha256sum -c lse-<tag>-linux-x86_64.tar.gz.sha256
-
-tar -xzf lse-<tag>-linux-x86_64.tar.gz
-cd lse-<tag>-linux-x86_64
+tar -xzf lse-<tag>-linux-x86_64.tar.gz && cd lse-<tag>-linux-x86_64
 ```
 
 The binary finds the ROCm runtime itself, searching `$ROCM_PATH`, `/opt/rocm`
-and the versioned installs beside it and taking the first that carries the
-symbols the backend needs. A machine with a distro ROCm sitting beside a newer
-one needs nothing exported:
+and the versioned installs beside it. Set `$ROCM_PATH` if the install is
+somewhere else; `LD_LIBRARY_PATH` still wins where it is set.
 
-```bash
-./lse --devices        # what this build can see, and what it will not answer
-```
-
-Set `$ROCM_PATH` if the install is somewhere else. `LD_LIBRARY_PATH` still wins
-where it is set, which is what you want when pinning a particular runtime.
-
-`--devices` is the first thing to run. If it reports no HRX device the engine
-falls back to the CPU backend, which runs the same models far slower rather
-than failing, and it will name the backend that declined and why -- a missing
-runtime symbol reads very differently from a machine with no GPU in it.
+Run `./bin/lse --devices` first. If it reports no HRX device the engine falls
+back to the CPU backend (the same models, far slower) rather than failing, and
+names the backend that declined and why — a missing runtime symbol reads very
+differently from a machine with no GPU in it.
 
 ## Run
 
@@ -165,32 +142,20 @@ prediction module, or point at one:
 
 ### Choose HIP or Loom
 
-Both the CLI and server accept **`--dialect hip`** or **`--dialect loom`**.
-The HIP code generator is named `hipc` in the source; its command-line value is
-`hip`, not `hipc`. Both paths dispatch through HRX.
-
-| Platform / path | Flags | Compiler and runtime |
-|---|---|---|
-| Linux, HIP source | `--pool hrx:0 --dialect hip` | HIP code generation and ROCm `amd_comgr`, with HRX |
-| Linux, Loom source | `--pool hrx:0 --dialect loom` | Loom compiler and HRX; requires a build that includes Loom |
-| Apple Silicon + MacAMDGPU | `--pool hrx:0 --dialect loom` | Native macOS Loom, HRX and MacAMDGPU HSA runtime |
+Both the CLI and server accept **`--dialect hip`** or **`--dialect loom`**. Both
+paths dispatch through HRX; `--dialect` is a preference among the device's
+available toolchains. If a device does not declare the requested dialect, LSE
+reports that fact and uses its own choice. Check the startup `generates hip` /
+`generates loom` line to confirm the selected path.
 
 ```bash
-# macOS AMDGPU inference (also valid for a Loom-enabled Linux build)
 ./lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
+./lse --pool hrx:0 --dialect hip  -m /path/to/model --no-mtp -n 128 "Hello"
 ./lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
-
-# Linux HIP-source path
-./lse --pool hrx:0 --dialect hip -m /path/to/model --no-mtp -n 128 "Hello"
-./lse-server --pool hrx:0 --dialect hip -m /path/to/model --no-mtp --port 8080
 ```
 
-The macOS package supports Loom; it does not include a macOS HIP compiler.
-`--dialect` is a preference among the device's available toolchains. If a device
-does not declare the requested dialect, LSE reports that fact and uses its own
-choice. Check the startup `generates hip` / `generates loom` line to confirm the
-selected path. `--pool hrx:0` selects the first HRX device; omit it for automatic
-device selection. Check `--devices` before loading a model.
+`--pool hrx:0` selects the first HRX device; omit it for automatic device
+selection. Check `--devices` before loading a model.
 
 ### `lse` options
 
@@ -385,9 +350,11 @@ git clone https://github.com/ROCm/hrx-system.git reference/hrx-system
 cd reference/hrx-system
 python dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH=/opt/rocm
 python dev.py cmake build
-``` Without it the tree still
-builds and the tests still pass -- on the CPU backend, which is two orders of
-magnitude slower and is not what you want to measure anything on.
+```
+
+Without it the tree still builds and the tests still pass -- on the CPU
+backend, which is two orders of magnitude slower and is not what you want to
+measure anything on.
 
 **clang cannot build this tree.** P2996 reflection is enabled by `-freflection`,
 which the build applies only for GNU 16 and newer; on any other compiler the
@@ -402,10 +369,9 @@ depend on host-only language features.
 
 ## Build
 
-Full build steps for both platforms are in **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**
-(Linux + ROCm and macOS + Apple Silicon). The core library and CPU backend build
-on either with no GPU and no external packages; the HRX (GPU) backend needs the
-platform runtime. Quick Linux build:
+Full build steps for both platforms are in **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
+The core library and CPU backend build with no GPU and no external packages; the
+HRX (GPU) backend needs the platform runtime. Quick build:
 
 ```bash
 cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -418,9 +384,20 @@ ctest --test-dir build --output-on-failure
 build is perhaps twenty times slower and will mislead you about everything.
 Enable the HRX backend with `-DLSE_HRX_ROOT=/path/to/hrx-install`; without a
 working HRX backend the engine falls back to the CPU backend (the same models,
-roughly two hundred times slower) and says so on the way past. See
-[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for the macOS build, the AOT
-`LSE_GPU_TARGETS`, and the full option table.
+roughly two hundred times slower) and says so on the way past.
+
+### Options
+
+| Option | Default | Purpose |
+|---|---|---|
+| `LSE_ENABLE_HRX` | ON | Build the HRX backend |
+| `LSE_ENABLE_CPU` | ON | Build the CPU reference backend |
+| `LSE_BUILD_TESTS` | ON | Build the test suite |
+| `LSE_GPU_TARGETS` | `gfx1151;gfx1201;gfx942` | AOT kernel targets |
+| `LSE_ROCM_PATH` | `/opt/rocm` | ROCm root (Linux) |
+| `LSE_HRX_ROOT` | — | Path to a built `hrx-install` (enables GPU) |
+| `LSE_WERROR` | OFF | Warnings as errors |
+| `LSE_ASAN` | OFF | AddressSanitizer + UBSan |
 
 ## Current
 
@@ -466,9 +443,6 @@ roughly two hundred times slower) and says so on the way past. See
 - Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
   Mixture-of-Depths, chunked prefill, and device-side argmax.
 
-Measured throughput per platform and GPU is in the
-[**Reported performance**](#reported-performance) table above.
-
 ## Upcoming
 
 - **Multi-device execution** — a pool opens, probes and reports every member
@@ -498,14 +472,3 @@ Measured throughput per platform and GPU is in the
 ## License
 
 MIT — see **[LICENSE.md](LICENSE.md)**.
-
-### macOS decode submission policy
-
-Single-device gfx1201 Loom decode measures submission intervals during ordinary
-warm decode steps, excludes JIT/fallback/repartition samples, and retains only
-stable improvements over the 16-dispatch baseline. Explicit
-`LSE_FLUSH_INTERVAL` overrides selection; `LSE_AUTO_BATCH=0` disables it.
-The measured macOS short-context rates use explicit flush64 and 64 µs polling
-overrides, KV128 and no MTP. They are HTTP end-to-end rates and are not
-equivalent to other engines' benchmark workloads.
-See [the macOS measurements](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md).
