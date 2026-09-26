@@ -31,6 +31,17 @@ def run(*args, default=""):
         return default
 
 
+def measured_performance():
+    """The measured-results file, or "" when absent or empty."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "release_perf.md")
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def previous_tag(tag):
     """The tag before `tag`, or the first commit when there is none."""
     prev = run("git", "describe", "--tags", "--abbrev=0", f"{tag}^",
@@ -139,6 +150,14 @@ def main():
             L.append("")
             L.extend(f"- {s}" for s in items)
             L.append("")
+
+    perf = measured_performance()
+    if perf:
+        L.append("## Measured performance (gfx1201 / R9700, "
+                 "Qwen3.8-27B-Q6)")
+        L.append("")
+        L.append(perf)
+        L.append("")
 
     L.append("## Verification")
     L.append("")
