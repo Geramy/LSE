@@ -73,8 +73,10 @@ git -C "$work/deps/hrx" archive HEAD | tar -x -C "$work/hrx-source"
 # apply treats paths as outside the current prefix and silently skips them.
 git -C "$work/source" init -q
 git -C "$work/hrx-source" init -q
-git -C "$work/source" apply --check "$root/.github/patches/macos-portability.patch"
-git -C "$work/source" apply "$root/.github/patches/macos-portability.patch"
+# The LSE source is already macOS-portable (kqueue poller, __APPLE__ socket
+# handling, LSE_POLLER_SOURCE selection all in-tree since 79f39c0), so no
+# portability patch is applied to it. Only the fetched hrx dependency still
+# needs its coarse-host-adapter patch.
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
 # The committed Cargo.lock determines transitive tokenizer dependencies.
