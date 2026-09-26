@@ -25,6 +25,7 @@
 #include <string>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/kernels/ffn_fp8_q6.hpp"
 #include "lse/kernels/lds_linear.hpp"
 #include "lse/kernels/int8_policy.hpp"
 #include "lse/kernels/quant_panel.hpp"
@@ -1263,6 +1264,7 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
   // thirds of its vector instructions unpacking nibbles. Decode is one row and
   // bandwidth bound, and the gate below leaves it here.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    if (const KernelPrimitiveBase* w = ffn_fp8_q6_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
     return this;
