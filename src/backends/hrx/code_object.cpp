@@ -2,8 +2,11 @@
 
 #include "lse/backends/hrx/arch_database.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #if LSE_HAVE_COMGR
 #include <amd_comgr/amd_comgr.h>
@@ -246,12 +249,273 @@ ArchFacts query_isa_facts(std::string_view arch) {
 
 #else  // !LSE_HAVE_COMGR
 
-std::vector<KernelResources> read_code_object_resources(
-    std::span<const std::byte>) {
+// The comgr-free path. A build without the comgr library (this macOS host
+// adapter is one: the device compiler is loomc, and comgr is a Linux/ROCm
+// dependency) still gets the measured resources, because the `amdhsa.kernels`
+// note is a standard ELF note that both the comgr and loomc code objects carry.
+// The `amdhsa.kernels` note description is NOT plain YAML: it is LLVM's
+// AMDGPU metadata binary format. Both the comgr and loomc code objects carry
+// it, and both readers must decode it the same way. The grammar (verified
+// byte-for-byte against the objects this toolchain emits):
+//   - a string is one tag byte `0xa0 | len` (0 <= len <= 31) followed by `len`
+//     bytes; a key is such a string;
+//   - a small integer (0 <= v <= 127) is one byte, `v`;
+//   - a larger integer is the tag byte `0xcd` followed by two bytes,
+//     high then low, so the value is `(b0 << 8) | b1`;
+//   - container tags (`0x83`, `0x91`, `0x8c`, `0x93`, ...) introduce nested
+//     maps/arrays; the field we want is located by scanning for its key string
+//     and reading the value token that immediately follows it.
+//
+// This is the same field set comgr reads (same keys, same "name not symbol"
+// rule, same unknown-is-not-zero discipline); only the transport differs — a
+// binary note instead of a comgr metadata handle.
+
+namespace {
+
+// Reads a little-endian field of `bytes` from `off` of an ELF64 header/section
+// table entry. The note section we walk is always a 64-bit object, so the
+// access widths are fixed; a 32-bit object simply yields no `.note` the way we
+// find it and degrades to "no resources" the same as before.
+std::uint64_t le64(const std::byte* p) {
+  std::uint64_t v = 0;
+  for (int i = 7; i >= 0; --i) v = (v << 8) | static_cast<std::uint8_t>(p[i]);
+  return v;
+}
+std::uint32_t le32(const std::byte* p) {
+  std::uint32_t v = 0;
+  for (int i = 3; i >= 0; --i) v = (v << 8) | static_cast<std::uint8_t>(p[i]);
+  return v;
+}
+std::uint16_t le16(const std::byte* p) {
+  return static_cast<std::uint16_t>(
+      static_cast<std::uint8_t>(p[0]) | (static_cast<std::uint8_t>(p[1]) << 8));
+}
+
+// The byte sequence a key is stored as: its `0xa0 | len` tag then its bytes.
+std::string key_bytes(const std::string& key) {
+  if (key.size() > 31) return {};  // long keys do not occur for our fields
+  std::string b;
+  b.push_back(static_cast<char>(0xa0 | key.size()));
+  b += key;
+  return b;
+}
+
+// A key match at `pos` is standalone when the byte before its tag is not the
+// tag byte of a longer string that runs on past `pos`. A key tag is in
+// [0xa0, 0xbf); if the preceding byte is in that range too, the previous
+// string would end at (pos-1)+len+1, and if that is not exactly pos the key is
+// a substring of a longer key, not a key of its own.
+bool key_is_standalone(std::string_view note, std::size_t pos) {
+  if (pos == 0) return true;
+  const unsigned char prev = static_cast<unsigned char>(note[pos - 1]);
+  if (prev < 0xa0 || prev > 0xbf) return true;
+  const std::size_t prev_len = prev - 0xa0;
+  return (pos - 1) + prev_len + 1 == pos;
+}
+
+// Finds the LAST occurrence of `key` in the note (position just past its
+// bytes), or npos. Used for `.name`, which appears once per argument inside
+// the `.args` list before the kernel's own entry; the kernel's is the last.
+std::size_t find_last_key(std::string_view note, const std::string& key) {
+  const std::string needle = key_bytes(key);
+  if (needle.empty()) return std::string_view::npos;
+  std::size_t pos = note.rfind(needle);
+  while (pos != std::string_view::npos) {
+    if (key_is_standalone(note, pos)) return pos + needle.size();
+    pos = note.rfind(needle, pos == 0 ? 0 : pos - 1);
+  }
+  return std::string_view::npos;
+}
+
+// Finds `key` in the note and returns the position just past its bytes, or
+// npos when absent. The key must be a standalone string token: the byte before
+// its tag must not itself be part of a longer string, which guards against a
+// key that is a substring of an unrelated longer key.
+std::size_t find_key(std::string_view note, const std::string& key) {
+  const std::string needle = key_bytes(key);
+  if (needle.empty()) return std::string_view::npos;
+  std::size_t pos = note.find(needle);
+  while (pos != std::string_view::npos) {
+    if (key_is_standalone(note, pos)) return pos + needle.size();
+    pos = note.find(needle, pos + 1);
+  }
+  return std::string_view::npos;
+}
+
+// Reads the integer value token at `pos`. Returns false when the token is not
+// an integer (it is a string or a container, which the caller does not want for
+// the numeric fields). A small int is one byte; a large int is `0xcd` + two
+// bytes (high, low).
+bool read_int(std::string_view note, std::size_t pos, std::uint32_t* out) {
+  if (pos >= note.size()) return false;
+  const unsigned char b = static_cast<unsigned char>(note[pos]);
+  if (b == 0xcd) {
+    if (pos + 3 > note.size()) return false;
+    const unsigned char hi = static_cast<unsigned char>(note[pos + 1]);
+    const unsigned char lo = static_cast<unsigned char>(note[pos + 2]);
+    *out = (static_cast<std::uint32_t>(hi) << 8) | lo;
+    return true;
+  }
+  if (b >= 0xa0) return false;  // a string tag, not an integer
+  // A small integer: one byte. Container tags and other high bytes are not
+  // small-int values, so refuse anything >= 0x80 (those are tag/struct bytes).
+  if (b >= 0x80) return false;
+  *out = b;
+  return true;
+}
+
+// Reads the three-element `.reqd_workgroup_size` list at `pos` (the position
+// just past the key string, as returned by find_key). The value is a container
+// tag byte followed by its three integer elements in order; each element is a
+// small int or a `0xcd`-extended int.
+void read_reqd(std::string_view note, std::size_t pos, std::array<std::uint32_t, 3>* out) {
+  std::size_t q = pos;
+  // Skip the list container tag byte (>= 0x80) if present.
+  if (q < note.size() && static_cast<unsigned char>(note[q]) >= 0x80) ++q;
+  std::size_t got = 0;
+  while (got < 3 && q < note.size()) {
+    std::uint32_t v = 0;
+    if (!read_int(note, q, &v)) break;
+    // A small int is one byte, a `0xcd` int is three bytes.
+    q += (static_cast<unsigned char>(note[q]) == 0xcd) ? 3 : 1;
+    (*out)[got++] = v;
+  }
+}
+
+// Walks the `.note` section of a 64-bit ELF and returns the description bytes
+// of the note whose owner is `owner` (NUL-terminated). An ELF note is a
+// 12-byte header (namesz, descsz, type, each 4 bytes LE) followed by the
+// owner name padded to a 4-byte multiple, then the description padded the
+// same way. Notes are laid out back to back in the section.
+std::vector<std::byte> find_note(const std::byte* obj, std::size_t size,
+                                 std::string_view owner) {
+  if (size < 64 || obj[0] != static_cast<std::byte>(0x7f) ||
+      obj[1] != static_cast<std::byte>('E') || obj[2] != static_cast<std::byte>('L') ||
+      obj[3] != static_cast<std::byte>('F'))
+    return {};
+  if (obj[4] != static_cast<std::byte>(2))
+    return {};  // ELFCLASS64 only; this tree's objects are 64-bit.
+  const auto shoff = static_cast<std::size_t>(le64(obj + 0x28));
+  const auto shentsize = le16(obj + 0x3A);
+  const auto shnum = le16(obj + 0x3C);
+  const auto shstrndx = le16(obj + 0x3E);
+  if (shoff == 0 || shentsize < 64 || shnum == 0 || shnum > 4096) return {};
+  if (shoff + static_cast<std::size_t>(shnum) * shentsize > size) return {};
+  const std::byte* sh = obj + shoff;
+  const auto section_names_off = static_cast<std::size_t>(le64(sh + shstrndx * shentsize + 0x18));
+  const auto section_names_size = static_cast<std::size_t>(le64(sh + shstrndx * shentsize + 0x20));
+  if (section_names_off + section_names_size > size) return {};
+  for (std::size_t i = 0; i < shnum; ++i) {
+    const std::byte* e = sh + i * shentsize;
+    const auto sh_name_off = le32(e + 0x00);
+    if (sh_name_off >= section_names_size) continue;
+    const char* name = reinterpret_cast<const char*>(obj + section_names_off + sh_name_off);
+    if (std::string(name) != ".note") continue;
+    const auto note_off = static_cast<std::size_t>(le64(e + 0x18));
+    const auto note_size = static_cast<std::size_t>(le64(e + 0x20));
+    if (note_off + note_size > size) continue;
+    std::size_t p = note_off;
+    while (p + 12 <= note_off + note_size) {
+      const auto namesz = le32(obj + p);
+      const auto descsz = le32(obj + p + 4);
+      // n_type at p+8; we match on owner text, not type, so it is read but unused.
+      p += 12;
+      const auto padded_name = (namesz + 3) & ~static_cast<std::uint32_t>(3);
+      if (p + padded_name + descsz > note_off + note_size) break;
+      if (namesz > 0 && namesz < 64) {
+        std::string_view got(reinterpret_cast<const char*>(obj + p), namesz);
+        // namesz counts the NUL terminator (the ELF note stores "AMDGPU\0"),
+        // so drop it before comparing to the un-terminated owner.
+        while (!got.empty() && got.back() == '\0') got.remove_suffix(1);
+        if (got == owner) {
+          return {obj + p + padded_name, obj + p + padded_name + descsz};
+        }
+      }
+      p += padded_name + descsz;
+    }
+  }
   return {};
 }
 
-std::string read_code_object_target(std::span<const std::byte>) { return {}; }
+}  // namespace
+
+std::vector<KernelResources> read_code_object_resources(
+    std::span<const std::byte> object) {
+  std::vector<KernelResources> out;
+  if (object.empty()) return out;
+
+  // The note is the standard `AMDGPU` owner / NT_AMDGPU_METADATA note whose
+  // description is the LLVM metadata binary; `amdhsa.kernels` is a key inside
+  // that document, not the ELF note owner. (The comgr path reads the same note
+  // and walks into its `amdhsa.kernels` list; we decode the binary directly.)
+  const std::vector<std::byte> note =
+      find_note(object.data(), object.size(), "AMDGPU");
+  if (note.empty()) return out;
+  std::string_view doc(reinterpret_cast<const char*>(note.data()), note.size());
+
+  // Locate the kernel's own `.name`. `.name` also appears once per argument
+  // inside the `.args` list (the binding names and `count`), all of which come
+  // before the kernel's own entry; the kernel's `.name` is the last `.name`
+  // token in the entry. (The loader symbol `.symbol`, where present, is the
+  // same string plus a ".kd" descriptor suffix.)
+  const std::size_t entry_pos = find_last_key(doc, ".name");
+  if (entry_pos == std::string_view::npos) return out;
+  // The `.name` value is a string token: `0xa0|len` tag then the bytes.
+  const unsigned char tag = static_cast<unsigned char>(doc[entry_pos]);
+  if (tag < 0xa0 || tag > 0xbf) return out;
+  const std::size_t len = tag - 0xa0;
+  if (entry_pos + 1 + len > doc.size()) return out;
+  const std::string_view entry(doc.data() + entry_pos + 1, len);
+
+  KernelResources r;
+  r.entry = std::string(entry);
+
+  // Each numeric field: find the key, read the integer token that follows.
+  // Key PRESENCE is the provenance: a field the note names (even as zero) is
+  // a real answer; a field it does not name is UNKNOWN, not a guessed zero.
+  auto num = [&](const char* key, DeviceFact<std::uint32_t>* slot) {
+    const std::size_t p = find_key(doc, key);
+    if (p == std::string_view::npos) return;
+    std::uint32_t v = 0;
+    if (read_int(doc, p, &v)) *slot = DeviceFact<std::uint32_t>::queried(v);
+  };
+  num(".vgpr_count", &r.vector_registers);
+  num(".sgpr_count", &r.scalar_registers);
+  num(".agpr_count", &r.accum_registers);
+  num(".group_segment_fixed_size", &r.workgroup_segment_bytes);
+  num(".private_segment_fixed_size", &r.private_segment_bytes);
+  num(".vgpr_spill_count", &r.vector_spills);
+  num(".sgpr_spill_count", &r.scalar_spills);
+  num(".kernarg_segment_size", &r.kernarg_segment_bytes);
+  num(".max_flat_workgroup_size", &r.max_flat_workgroup_size);
+  num(".wavefront_size", &r.wavefront_size);
+  const std::size_t reqd_pos = find_key(doc, ".reqd_workgroup_size");
+  if (reqd_pos != std::string_view::npos) {
+    std::array<std::uint32_t, 3> reqd{};
+    read_reqd(doc, reqd_pos, &reqd);
+    if (reqd[0] != 0)
+      r.required_workgroup_size =
+          DeviceFact<std::array<std::uint32_t, 3>>::queried(reqd);
+  }
+  out.push_back(std::move(r));
+  return out;
+}
+
+std::string read_code_object_target(std::span<const std::byte> object) {
+  if (object.empty()) return {};
+  const std::vector<std::byte> note =
+      find_note(object.data(), object.size(), "AMDGPU");
+  if (note.empty()) return {};
+  std::string_view doc(reinterpret_cast<const char*>(note.data()), note.size());
+  // `amdhsa.target` is a top-level key (a `0xa0|len` string token).
+  const std::size_t p = find_key(doc, "amdhsa.target");
+  if (p == std::string_view::npos) return {};
+  const unsigned char tag = static_cast<unsigned char>(doc[p]);
+  if (tag < 0xa0 || tag > 0xbf) return {};
+  const std::size_t len = tag - 0xa0;
+  if (p + 1 + len > doc.size()) return {};
+  return std::string(doc.data() + p + 1, len);
+}
 
 ArchFacts query_isa_facts(std::string_view) { return {}; }
 

@@ -127,6 +127,10 @@ endif()
 # Codegen belongs to the backend now, so its test needs one that has codegen.
 if(TARGET lse_backend_hrx)
   lse_add_test(test_jit lse_graph lse_backends)
+  # The measured kernel-occupancy census over the real decode GEMV shapes.
+  # Host-only: loomc compiles for gfx1201 without a device, and the census is
+  # occupancy arithmetic over the code object's measured resources.
+  lse_add_test(test_decode_occupancy lse_graph lse_backends lse_opt)
 endif()
 
 # Client and server both run in this process over a real socket and a real

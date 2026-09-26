@@ -125,6 +125,7 @@ lse_apply_common_flags(lse_communication)
 add_library(lse_opt
   src/opt/arrangement.cpp
   src/opt/occupancy.cpp
+  src/opt/kernel_census.cpp
   src/opt/fusion.cpp
   src/opt/measurements.cpp
   src/opt/traffic.cpp
