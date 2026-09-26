@@ -6,80 +6,55 @@ interleaved with gated GQA, dense or sparse-MoE feed-forward -- running on the
 are generated at run time from the model's own shapes rather than selected from
 a library.
 
-## Working macOS GPU inference
+## Platforms
 
-[MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu) provides a DriverKit
-AMD GPU driver and HSA runtime for the native HRX/Loom path on Apple Silicon.
-The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
-contains pinned dependencies, macOS adapter build steps and guarded GPU tests.
-R9700/gfx1201 validation covers Q6 projection, convolution, recurrent state,
-paged attention and GPU-only Qwen 27B Q6 text generation. Repeated HTTP
-completion/chat requests pass isolation and graceful shutdown. A five-token
-prompt and 33 generated IDs exactly match an independent same-checkpoint MLX
-run. Qwen Q6 also completed exactly 1,024 input and 1,024 output tokens with
-KV capacity 2,048 and MTP disabled. These workloads do not establish llama.cpp
-performance parity. Broader model accuracy and MTP remain under qualification.
-The 64-token prompt matches all 33 generated IDs
-of a float32 MLX reference with unchanged packed Q6 weights; native BF16 MLX
-diverges at an exact logit tie. See the
-[measurements and limits](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md)
-and [local run sheet](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/LOCAL_RUN.md)
-for reproduction, server, chat and monitor commands.
-Use the `macos-arm64` release asset for Apple Silicon. Linux release binaries
-are not macOS builds.
+LSE builds and runs on **Linux + ROCm** (the primary path) and **macOS +
+Apple Silicon** (via the [MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu)
+DriverKit driver and HSA runtime). The same `lse` / `lse-server` binaries are
+produced on both; the difference is the GPU runtime and the AOT kernel target.
+Build steps for each are in **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
 
-**HIPC and Loom currently have different performance.** The earlier HIPC
-(`--dialect hip`) result is reported at approximately **34 decode tokens/s**,
-but its log and exact model, context and MTP settings still need to be recovered
-for a matched comparison. It is not a measured macOS Loom result.
+On macOS there is no native AMD GPU driver, so the GPU path runs through
+MacAMDGPU (a DriverKit system extension exposing an HSA runtime for the
+HRX/Loom path). The [reproduction guide](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
+has the driver install + pinned LSE build; GPU execution needs the driver
+activated, the build and host tests do not. Use the `macos-arm64` release asset
+for Apple Silicon — Linux release binaries are not macOS builds and vice versa.
 
-**The qualified macOS Loom build generates at about 17.45 tokens/s**, with
-prompt processing at **88.63 tokens/s**, on Qwen3.8-27B-MLX-6bit. These are medians
-of six measured requests across two runs, each after two warmups: 512 input /
-129 output, KV1024, MTP disabled, flush64 and 64 microsecond polling. Measured
-requests have zero JIT compilations and disk-cache hits, generated text matches
-the control, and shutdown succeeds. This does not establish llama.cpp parity.
+HIP (`--dialect hip`) and Loom (`--dialect loom`) share packed-Q6
+interpretation, tiling, operand selection, and FP8/BF8 conversion. The
+optimizer selects accepted kernels from shape, capabilities, accuracy, and
+matched timing evidence — no manual kernel selection. See
+[operand selection](docs/QUANT_OPERANDS.md) and
+[policy](docs/INT8_POLICY.md).
 
-Working shared HIP/Loom optimizations include cooperative RMS normalization,
-Q6 activation reuse across four output columns, and buffer-lifetime planning
-based on final fused launches and inplace allocation ownership. Four-column
-decode preserves each output's FP32 arithmetic order. The lifetime fix prevents
-premature recycling through aliases without a measurable throughput change.
-The Mac runtime also includes the qualified same-queue dependency path and
-GPU code-cache synchronization when loading executables.
+## Reported performance
 
-The two-pass centered Q6 prefill experiment now passes all three fixed model
-accuracy contexts, but measures **76.72 PP/s**, slower than the **88.57 PP/s**
-control. The two M256 feed-forward projections therefore continue using FP32.
-See [qualification results and reproduction](docs/R9700_QUALIFICATION.md).
+Medians, warm JIT cache, GPU otherwise idle, best of several runs. `—` = not
+measured on that platform. These are LSE results, not llama.cpp-parity claims.
 
-**GPU profiling is working through rocprofmac.** The matched timestamp capture
-preserved all six profile-off/on responses and added about 1.0% prefill time and
-3.7% decode time in this sequential comparison. The two feed-forward projection
-shapes account for 67.3% of summed prefill kernel durations; this guides ongoing
-matrix-kernel optimization. Those sums and the gaps between dispatches are not
-GPU utilization measurements.
+| Platform / GPU | Model | Prefill (tok/s) | Decode (tok/s) |
+|---|---|---|---|
+| Linux / gfx1151 (Strix Halo, 220 GB/s) | Qwen3.5-0.8B-4bit, 1601 tok | 1703 | — |
+| Linux / gfx1151 (Strix Halo, 220 GB/s) | Qwen3.8-27B-4bit, 401 tok | 28.7 | 11.9 (15.0 with MTP) |
+| Linux / gfx1151 (Strix Halo, 220 GB/s) | lemonseed-1.5b-base (bf16) | — | 102.3 |
+| macOS / gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-4bit, 401 tok | 112 | 20.9 (27.9 with MTP) |
+| macOS / gfx1201 (R9700, 1090 GB/s) | **Qwen3.8-27B-Q6, 1024 tok** | **229** | **16.3** |
+| macOS / gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-MLX-6bit, 512/129 | 88.6 | 17.45 |
 
-The Q6 INT8 prefetch candidate remains experimental: it passes numerical tests
-but measures **16.32 TPS** versus the **17.46 TPS** control. It is not part of
-the released INT8 policy; the full multi-context decode-logit gate remains open.
+The **Qwen3.8-27B-Q6 / 1024-token** row is the current gfx1201 result
+(v0.4.2): prefill 229 PP/s (median of 229.25 / 227.20 / 225.84) and decode
+16.3 TPS (median of 16.30 / 16.22 / 16.18), all device-resident and
+compile-free. Prefill is **+51.7%** over the ~151 PP/s at v0.4.1 — the GDN
+projection GEMMs (in_proj_qkv, full-attention qkv/v/o) now select the staged
+BF16 WMMA path at M=1024 instead of scalar (all four large shapes went
+scalar→WMMA at ~3.0×, device total 14053→9656 ms); PPL-neutral (pure selection
+change, greedy text identical). Decode is at the measured aggregate-GEMV
+bandwidth ceiling (~415 GB/s vs ~549 GB/s needed for 25 tok/s).
 
-KV capacity growth can create additional prefill specializations on the second
-request. Warm up the resident workload twice and check the HTTP JIT timing
-counters before reporting steady-state prompt throughput.
-
-HIP and Loom share packed-Q6 interpretation, tiling, operand selection, and
-FP8/BF8 conversion. R9700 tests verify native OCP FP8/BF8 operations, including
-rounding boundaries and buffer guards. The optimizer selects accepted kernels
-using shape, capabilities, accuracy, and matched timing evidence. Staged BF16
-won the four qualified large Q6 projection shapes; single-token decode and
-unknown shapes retain their existing floating-point path. No manual FP8/BF8
-selection is needed. Packed Q6 weights remain packed in VRAM; matrix
-accumulation remains FP32. See [operand selection](docs/QUANT_OPERANDS.md).
-
-Set **`LSE_HRX_INT8=1`** to opt into the existing activation-quantized **Q4**
-dot/WMMA paths. It does not enable Q6/Q8 INT8 conversion.
-[Precision policy](docs/INT8_POLICY.md)
+Decode on the APU is bandwidth-bound at 82% of the measured DRAM rate; on the
+R9700 it is not, which is where the headroom is. 19 test suites green, zero
+warnings under the full warning set.
 
 ## Models
 
@@ -427,6 +402,11 @@ depend on host-only language features.
 
 ## Build
 
+Full build steps for both platforms are in **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**
+(Linux + ROCm and macOS + Apple Silicon). The core library and CPU backend build
+on either with no GPU and no external packages; the HRX (GPU) backend needs the
+platform runtime. Quick Linux build:
+
 ```bash
 cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_CXX_COMPILER=g++-16
@@ -434,49 +414,13 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The core library and CPU backend build with no GPU and no external packages.
 `RelWithDebInfo` is what the numbers in this README were taken on; a `Debug`
 build is perhaps twenty times slower and will mislead you about everything.
-
-If ROCm sits somewhere other than `/opt/rocm`, say so once and both the build
-and the run-time search follow it:
-
-```bash
-cmake -S . -B build -GNinja -DCMAKE_CXX_COMPILER=g++-16 \
-      -DLSE_ROCM_PATH=/opt/rocm-7.2.1
-```
-
-To enable the HRX backend, build `hrx-system` and point at its install:
-
-```bash
-cmake -S . -B build -GNinja -DCMAKE_CXX_COMPILER=g++-16 \
-      -DLSE_HRX_ROOT=/path/to/hrx-install
-```
-
-The build records where `hrx-install` was, so its libraries are found without
-help; the ROCm runtime is searched for at start-up. Point `$ROCM_PATH` at a
-ROCm the search would not find, or set `LD_LIBRARY_PATH` to pin a particular
-one:
-
-```bash
-export ROCM_PATH=/opt/rocm-7.2.1
-```
-
-If the HRX backend cannot initialize the engine falls back to the CPU backend,
-which runs the same models roughly two hundred times slower. It says so on the
-way past, with the reason the backend gave.
-
-### Options
-
-| Option | Default | Purpose |
-|---|---|---|
-| `LSE_ENABLE_HRX` | ON | Build the HRX backend |
-| `LSE_ENABLE_CPU` | ON | Build the CPU reference backend |
-| `LSE_BUILD_TESTS` | ON | Build the test suite |
-| `LSE_GPU_TARGETS` | `gfx1151;gfx1201;gfx942` | AOT kernel targets |
-| `LSE_ROCM_PATH` | `/opt/rocm` | ROCm root (flat or TheRock layout) |
-| `LSE_WERROR` | OFF | Warnings as errors |
-| `LSE_ASAN` | OFF | AddressSanitizer + UBSan |
+Enable the HRX backend with `-DLSE_HRX_ROOT=/path/to/hrx-install`; without a
+working HRX backend the engine falls back to the CPU backend (the same models,
+roughly two hundred times slower) and says so on the way past. See
+[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for the macOS build, the AOT
+`LSE_GPU_TARGETS`, and the full option table.
 
 ## Current
 
@@ -522,18 +466,8 @@ way past, with the reason the backend gave.
 - Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
   Mixture-of-Depths, chunked prefill, and device-side argmax.
 
-**Measured** — warm cache, GPU otherwise idle, best of several runs.
-
-| | gfx1151 (Strix Halo APU, 220 GB/s) | gfx1201 (Radeon AI PRO R9700, 1090 GB/s) |
-|---|---|---|
-| Qwen3.5-0.8B-4bit prefill, 1601 tok | 1703 tok/s | — |
-| Qwen3.8-27B-4bit prefill, 401 tok | 28.7 tok/s | 112 tok/s |
-| Qwen3.8-27B-4bit decode | 11.9 tok/s, 15.0 with MTP | 20.9 tok/s, 27.9 with MTP |
-| lemonseed-1.5b-base (bf16) decode | 102.3 tok/s | — |
-
-Decode on the APU is bandwidth-bound at 82% of the measured DRAM rate; on the
-R9700 it is not, which is where the headroom is. 19 test suites green, zero
-warnings under the full warning set.
+Measured throughput per platform and GPU is in the
+[**Reported performance**](#reported-performance) table above.
 
 ## Upcoming
 
