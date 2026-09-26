@@ -75,7 +75,7 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 // The row axis is bucketed the same way (model::kBatchRungs) and for the same
 // reason, and the two share the ladder: a decode pass of B sequences and a
 // prefill pass of B tokens present the same row count to every GEMM.
-constexpr std::size_t kPrefillChunk = 512;
+constexpr std::size_t kPrefillChunk = 1024;
 
 std::size_t prefill_chunk() { return kPrefillChunk; }
 
