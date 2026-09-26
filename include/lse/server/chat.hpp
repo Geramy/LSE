@@ -20,8 +20,19 @@ struct ChatMessage {
 // from the checkpoint's own chat_template, which is Jinja and would need an
 // engine to evaluate; a checkpoint trained on some other framing would need
 // its own renderer rather than a different template string.
+//
+// Reasoning models (Qwen3.x) gate the 
+// `enable_thinking` false, it instead emits an empty
+// "
+// answers directly with no hidden pass. A model that is not a reasoner
+// never emits these tokens either way, so the flag is inert for it.
 [[nodiscard]] std::string render_chatml(const std::vector<ChatMessage>& messages,
-                                        bool add_generation_prompt = true);
+                                        bool add_generation_prompt = true,
+                                        bool enable_thinking = true);
+
+// System-prompt text a Qwen3.x reasoner uses to steer how hard it
+// thinks, verbatim from the checkpoint chat_template. "" = default.
+[[nodiscard]] std::string reasoning_effort_instructions(const std::string& level);
 
 // Ids that end a turn: the tokenizer's own end-of-sequence plus ChatML's
 // <|im_end|>. Missing ones are skipped, so a tokenizer without them simply

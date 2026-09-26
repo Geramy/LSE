@@ -30,6 +30,15 @@ namespace lse::backend {
 
 namespace {
 
+// Standard location the MacAMDGPU driver installer drops the HSA/HRX/Loom
+// runtime dylibs. The HsaRuntime loader below prefers it so a fresh install
+// needs no DYLD_LIBRARY_PATH export. File-scope (not a local constexpr) so the
+// Apple-only probe can reference it without a lambda capture.
+#if defined(__APPLE__)
+constexpr const char* kInstalledRuntimeDir = "/Library/MacAMDGPU/runtime";
+constexpr const char* kInstalledHsaLib = "/Library/MacAMDGPU/runtime/libhsa-runtime64.dylib";
+#endif
+
 // Residencies stamped by live hrx backends. copy_peer receives whatever
 // buffer the link probe offers — including another backend family's — and an
 // hrx_buffer_t reinterpreted from a foreign handle walks libhrx off a cliff.
@@ -167,6 +176,18 @@ class HsaRuntime {
     if (lib_ == nullptr && load_if_missing) {
       lib_ = dlopen(soname, RTLD_LAZY);
     }
+#if defined(__APPLE__)
+    // The soname dlopen uses the process DYLD search path, which a driver
+    // installer cannot set for an already-running binary. If it came up empty,
+    // try the standard installed-runtime location directly. (We do NOT set
+    // IREE_HAL_AMDGPU_LIBHSA_PATH here: that variable is read by the IREE HSA
+    // loader, which looks for the *Linux* .so soname and would not find the
+    // macOS .dylib in the same directory.)
+    if (lib_ == nullptr) {
+      lib_ = dlopen(kInstalledHsaLib,
+                    RTLD_LAZY);
+    }
+#endif
     if (lib_ == nullptr) return;
     init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
     iterate_ = reinterpret_cast<IterateFn>(dlsym(lib_, "hsa_iterate_agents"));

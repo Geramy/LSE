@@ -89,6 +89,12 @@ struct Request {
   std::vector<std::string> stop_strings;
   bool stream = false;
   std::string model;
+  // Thinking control for reasoning models (Qwen3.x). `thinking_enabled`
+  // defaults to the model's own behaviour (on for Qwen3.8); a client sets it
+  // false to suppress the <tool_call> pass. `thinking_budget` caps the reasoning
+  // tokens; 0 means the model decides.
+  bool thinking_enabled = true;
+  std::string thinking_level;   // "" | low | medium | high | xhigh
 };
 
 // Where a completion stopped, in OpenAI's vocabulary.
@@ -148,6 +154,33 @@ struct HttpServer::Impl {
     // is mapped rather than passed: 0 means off on both sides.
     const float freq = get_or<float>(body, "frequency_penalty", 0.0f);
     r.sampling.repetition_penalty = freq > 0.0f ? 1.0f + freq : 1.0f;
+
+    // Thinking control. Accepts the OpenAI-style `reasoning_effort` ("none",
+    // "low", "medium", "high", "xhigh") and a direct `thinking` (bool or
+    // {type}); a client that sends neither keeps the model's default
+    // (reasoning on at its own level). The level steers how hard the model
+    // thinks via a system prompt (see reasoning_effort_instructions).
+    r.thinking_enabled = true;
+    if (body.contains("thinking")) {
+      const json& t = body.at("thinking");
+      if (t.is_boolean()) {
+        r.thinking_enabled = t.get<bool>();
+      } else if (t.is_object()) {
+        r.thinking_enabled = get_or<std::string>(t, "type", "enabled") != "disabled";
+      }
+    }
+    if (body.contains("reasoning_effort")) {
+      const std::string effort = get_or<std::string>(body, "reasoning_effort", "");
+      if (effort == "none") {
+        r.thinking_enabled = false;
+      } else if (!effort.empty()) {
+        r.thinking_level = effort;   // low | medium | high | xhigh
+      }
+    }
+    if (body.contains("thinking_level")) {
+      const std::string lvl = get_or<std::string>(body, "thinking_level", "");
+      if (lvl != "none" && !lvl.empty()) r.thinking_level = lvl;
+    }
 
     std::int32_t want = get_or<std::int32_t>(body, "max_tokens", 0);
     if (want == 0) want = get_or<std::int32_t>(body, "max_completion_tokens", 256);
@@ -315,19 +348,72 @@ json timings_of(const Outcome& o) {
   return t;
 }
 
+// Splits a reasoning model's output into the <think> pass and the
+// answer that follows it. Returns the answer (empty if the model emitted only
+// thinking) and, via `reasoning`, the hidden pass.
+//
+// The open <think> tag lives in the *prompt*, not the output: the chat
+// template appends it to the assistant generation prompt when thinking is on,
+// and the model then emits its reasoning as plain prose followed by a single
+// closing </think> tag and the answer. So the output's </think> tag is what
+// delimits the two regions. (If a model does emit an explicit open tag too, the
+// text before the close tag is still the hidden pass, so this stays correct.)
+static std::pair<std::string, std::string> split_thinking(const std::string& text) {
+  const std::string open = "<think>";
+  const std::string close = "</think>";
+
+  const std::size_t end = text.find(close);
+  if (end == std::string::npos) {
+    // No close tag: the model never ended a thinking block. If it emitted an
+    // explicit open tag, treat everything after it as the hidden pass with no
+    // answer; otherwise it is a non-reasoning answer and passes through whole.
+    const std::size_t at = text.find(open);
+    if (at != std::string::npos) return {"", text.substr(at + open.size())};
+    return {text, ""};
+  }
+  std::string reasoning = text.substr(0, end);
+  std::string answer = text.substr(end + close.size());
+  // Trim the whitespace each side of the boundary: the model writes the pass
+  // and the answer as plain text separated by the tag, with newlines around it.
+  const std::size_t rl = reasoning.find_first_not_of(" \t\r\n");
+  if (rl != std::string::npos) reasoning = reasoning.substr(rl);
+  else reasoning.clear();
+  const std::size_t first = answer.find_first_not_of(" \t\r\n");
+  if (first != std::string::npos) answer = answer.substr(first);
+  return {answer, reasoning};
+}
+
 // text_completion and chat.completion differ only in the shape of a choice.
-json chat_choice(const std::string& text, bool hit_limit) {
+json chat_choice(const std::string& text, bool hit_limit, bool expose_thinking) {
+  std::string reasoning;
+  std::string content = text;
+  if (expose_thinking) {
+    auto [answer, r] = split_thinking(text);
+    content = answer;
+    reasoning = r;
+  }
+  json message{{"role", "assistant"}, {"content", content}};
+  if (!reasoning.empty()) message["reasoning_content"] = reasoning;
   return json{{"index", 0},
-              {"message", {{"role", "assistant"}, {"content", text}}},
+              {"message", std::move(message)},
               {"logprobs", nullptr},
               {"finish_reason", finish_reason(hit_limit)}};
 }
 
-json text_choice(const std::string& text, bool hit_limit) {
-  return json{{"index", 0},
-              {"text", text},
+json text_choice(const std::string& text, bool hit_limit, bool expose_thinking) {
+  std::string reasoning;
+  std::string out = text;
+  if (expose_thinking) {
+    auto [answer, r] = split_thinking(text);
+    out = answer;
+    reasoning = r;
+  }
+  json choice{{"index", 0},
+              {"text", std::move(out)},
               {"logprobs", nullptr},
               {"finish_reason", finish_reason(hit_limit)}};
+  if (!reasoning.empty()) choice["reasoning"] = std::move(reasoning);
+  return choice;
 }
 
 }  // namespace
@@ -445,7 +531,31 @@ Status HttpServer::listen() {
           }
           messages.push_back(std::move(cm));
         }
-        prompt_text = render_chatml(messages);
+        // A reasoning-effort level becomes the system-prompt instruction the
+        // checkpoint chat_template ships (verbatim; only low and xhigh/high
+        // carry text, medium is uninstructed). The template frames the whole
+        // turn with it: if the client already sent a system message the
+        // instruction is prepended to it, otherwise a system message holding
+        // just the instruction is added at the front.
+        //
+        // The template resolves a missing effort as its default: when thinking
+        // is on, `reasoning_effort|default('xhigh')`, so an absent/empty level
+        // means xhigh (the model's top depth) and carries that instruction. When
+        // thinking is off the template never computes the instruction at all, so
+        // the level is left empty and no system message is added.
+        std::string level = r.thinking_level;
+        if (r.thinking_enabled && level.empty()) level = "xhigh";
+        const std::string effort = reasoning_effort_instructions(level);
+        if (!effort.empty()) {
+          if (!messages.empty() && messages.front().role == "system") {
+            // Prepend to the existing system message, the way the template
+            // renders `reasoning_instructions + '\n\n' + content`.
+            messages.front().content = effort + "\n\n" + messages.front().content;
+          } else {
+            messages.insert(messages.begin(), ChatMessage{"system", effort});
+          }
+        }
+        prompt_text = render_chatml(messages, true, r.thinking_enabled);
       } else {
         if (!body.contains("prompt")) {
           send_error(res, 400, "prompt is required", "invalid_request_error", "prompt");
@@ -462,6 +572,12 @@ Status HttpServer::listen() {
                      "invalid_request_error", "prompt");
           return;
         }
+        // /v1/completions is a raw passthrough: the prompt is sent to the
+        // model verbatim, exactly as llama.cpp and MLX treat it. The chat
+        // template (and with it the reasoning gate and effort instruction) is
+        // applied only on /v1/chat/completions, so nothing is injected here.
+        // A client that wants the reasoning framing uses the chat route or
+        // supplies the framing tokens itself in the prompt.
       }
 
       auto encoded = impl.tok.encode(prompt_text);
@@ -490,8 +606,8 @@ Status HttpServer::listen() {
                   {"object", object},
                   {"created", created},
                   {"model", impl.opt.model_id},
-                  {"choices", json::array({chat ? chat_choice(out->text, out->hit_limit)
-                                                : text_choice(out->text, out->hit_limit)})},
+                  {"choices", json::array({chat ? chat_choice(out->text, out->hit_limit, r.thinking_enabled)
+                                                : text_choice(out->text, out->hit_limit, r.thinking_enabled)})},
                   {"usage", usage_of(*out)},
                   {"timings", timings_of(*out)}};
         res.set_content(resp.dump(), "application/json");
