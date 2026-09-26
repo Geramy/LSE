@@ -1,5 +1,8 @@
 #include "lse/backends/hrx/hrx_backend.hpp"
 #include "lse/backends/hrx/loaded_library.hpp"
+#if defined(__APPLE__)
+#include "sq_profiler.hpp"
+#endif
 #include "lse/backends/hrx/copy_route.hpp"
 
 #include <dlfcn.h>
@@ -779,6 +782,49 @@ bool HrxBackend::available() noexcept {
 
 HrxBackend::~HrxBackend() { shutdown_impl(); }
 
+#if defined(__APPLE__)
+namespace {
+// The shared observer slot is a 16-byte region the MacAMDGPU dext owns and
+// the HSA transport maps into this process once the profiler is enabled
+// (LSE_SQ_PROFILER_SLOT, a CPU address of the mapped BO). Until then there is
+// no slot and the profiler does not start.
+std::uint32_t* sq_profiler_slot_host() {
+  if (const char* env = std::getenv("LSE_SQ_PROFILER_SLOT")) {
+    char* end = nullptr;
+    const std::uint64_t v = std::strtoull(env, &end, 16);
+    if (end != env && *end == '\0' && v != 0 && v % 16 == 0) {
+      return reinterpret_cast<std::uint32_t*>(v);
+    }
+  }
+  return nullptr;
+}
+}  // namespace
+
+void HrxBackend::start_sq_profiler() {
+  // Best-effort real-hardware SQ busy-cycle capture (aqlprofile via the HRX
+  // HAL). A failed start is not a backend failure: the observer panel simply
+  // shows n/a. The slot comes from the dext-mapped shared buffer.
+  std::uint32_t* slot = sq_profiler_slot_host();
+  if (slot == nullptr) return;
+  lse::hrx::sq_profiler_set_slot(slot);
+  sq_profiler_ =
+      lse::hrx::make_sq_profiler(device_, slot);
+  if (sq_profiler_ != nullptr) {
+    std::fprintf(stderr,
+                 "hrx: SQ busy-cycle profiler %s (%s)\n",
+                 sq_profiler_->active() ? "active" : "idle",
+                 sq_profiler_->status_text());
+  } else {
+    std::fprintf(stderr, "hrx: SQ busy-cycle profiler unavailable\n");
+  }
+}
+
+void HrxBackend::stop_sq_profiler() noexcept {
+  lse::hrx::destroy_sq_profiler(
+      reinterpret_cast<std::unique_ptr<lse::hrx::SqProfiler>&>(sq_profiler_));
+}
+#endif  // __APPLE__
+
 Result<std::vector<DeviceDescriptor>> HrxBackend::enumerate_devices() {
 #if !LSE_HRX_LINKED
   return LSE_ERROR(kUnimplemented,
@@ -1222,6 +1268,10 @@ Status HrxBackend::init_impl(int device_ordinal) {
   // uses it, including the stream-ordered allocator.
   LSE_RETURN_IF_ERROR(stream_at(0).status());
 
+#if defined(__APPLE__)
+  start_sq_profiler();
+#endif
+
   initialized_ = true;
   return OkStatus();
 #endif
@@ -1312,6 +1362,9 @@ void HrxBackend::shutdown_impl() noexcept {
   }
   streams_.clear();
   unflushed_launches_.clear();
+#if defined(__APPLE__)
+  stop_sq_profiler();  // must run before the device is released
+#endif
   if (device_ != nullptr) {
     hrx_device_release(static_cast<hrx_device_t>(device_));
     device_ = nullptr;

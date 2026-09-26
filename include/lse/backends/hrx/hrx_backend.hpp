@@ -26,6 +26,12 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 
+namespace lse {
+namespace hrx {
+class SqProfiler;
+}
+}
+
 namespace lse::backend {
 
 class HrxBackend : public Backend<HrxBackend> {
@@ -209,6 +215,14 @@ class HrxBackend : public Backend<HrxBackend> {
   // when a pool asked for one device over several, in which case stream i
   // drives GPU i.
   std::uint32_t physical_count_ = 1;
+  // Real-hardware SQ busy-cycle windows published to the shared observer
+  // slot (backends/hrx/sq_profiler.hpp). Best-effort: null when the runtime
+  // cannot open a counter session. The member uses the lse::hrx::SqProfiler
+  // type; the class itself is forward-declared above and the complete type
+  // is included by the .cpp (which also defines the seam used here).
+  std::unique_ptr<::lse::hrx::SqProfiler> sq_profiler_;
+  void start_sq_profiler();
+  void stop_sq_profiler() noexcept;
   // Logical queues this device's submission path can actually address, probed
   // at init rather than read off a header (see probe_queue_count).
   std::uint32_t queue_count_ = 1;
