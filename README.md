@@ -7,7 +7,7 @@ it is running on, then selected by measured evidence — not picked from a fixed
 library.** There is no hand-tuned kernel per model per GPU. The engine probes
 the device, generates candidate kernels for the actual shapes, and keeps the
 one that is fastest *here, now, for this config* — so the same binary is
-near-optimal on a 220 GB/s APU and a 1090 GB/s board, in 4-bit or 8-bit, on a
+near-optimal on a 256 GB/s APU and a 644.6 GB/s board, in 4-bit or 8-bit, on a
 single device or across a pool.
 
 That is what it was built for: **always-the-most-optimal kernels in any
@@ -60,15 +60,15 @@ Build steps per platform: **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
 
 Medians, warm JIT cache, GPU otherwise idle, best of several runs. `—` = not
 measured on that platform. These are LSE results, not llama.cpp-parity claims;
-the point of the table is that one engine spans a 5× DRAM-bandwidth range.
+the point of the table is that one engine spans a 2.5× DRAM-bandwidth range.
 
 | Platform / GPU | Model | Prefill (tok/s) | Decode (tok/s) |
 |---|---|---|---|
-| gfx1151 (Strix Halo, 220 GB/s) | Qwen3.5-0.8B-4bit, 1601 tok | 1703 | — |
-| gfx1151 (Strix Halo, 220 GB/s) | Qwen3.8-27B-4bit, 401 tok | 28.7 | 11.9 (15.0 with MTP) |
-| gfx1151 (Strix Halo, 220 GB/s) | lemonseed-1.5b-base (bf16) | — | 102.3 |
-| gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-4bit, 401 tok | 112 | 20.9 (27.9 with MTP) |
-| gfx1201 (R9700, 1090 GB/s) | Qwen3.8-27B-Q6, 1024 tok | **229** | **16.3** |
+| gfx1151 (Strix Halo, 256 GB/s) | Qwen3.5-0.8B-4bit, 1601 tok | 1703 | — |
+| gfx1151 (Strix Halo, 256 GB/s) | Qwen3.8-27B-4bit, 401 tok | 28.7 | 11.9 (15.0 with MTP) |
+| gfx1151 (Strix Halo, 256 GB/s) | lemonseed-1.5b-base (bf16) | — | 102.3 |
+| gfx1201 (R9700, 644.6 GB/s) | Qwen3.8-27B-4bit, 401 tok | 112 | 20.9 (27.9 with MTP) |
+| gfx1201 (R9700, 644.6 GB/s) | Qwen3.8-27B-Q6, 1024 tok | **229** | **16.3** |
 
 Decode on the APU is bandwidth-bound at 82% of the measured DRAM rate; on the
 R9700 it is not, which is where the headroom is. 19 test suites green, zero
