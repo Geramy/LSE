@@ -77,7 +77,14 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 // prefill pass of B tokens present the same row count to every GEMM.
 constexpr std::size_t kPrefillChunk = 512;
 
-std::size_t prefill_chunk() { return kPrefillChunk; }
+// LSE_PREFILL_CHUNK overrides the compiled default for tuning runs: it relaunches
+// the engine at another pass width without a rebuild. 0 restores one-pass.
+std::size_t prefill_chunk() {
+  const char* v = std::getenv("LSE_PREFILL_CHUNK");
+  if (v == nullptr) return kPrefillChunk;
+  const long n = std::strtol(v, nullptr, 10);
+  return n > 0 ? static_cast<std::size_t>(n) : 0;
+}
 
 // Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
 // two below it}, so the whole engine only ever compiles that many prefill
