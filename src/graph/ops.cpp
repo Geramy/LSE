@@ -1,3 +1,4 @@
+#include "lse/dispatch/attention.hpp"
 #include "lse/graph/ops.hpp"
 
 #include <algorithm>
@@ -370,6 +371,33 @@ Array topk(const Array& x, int k, int axis, Array* indices, float score_band) {
   for (std::size_t i = 0; i < x.shape().rank(); ++i) {
     out.push_back(i == a ? static_cast<std::int64_t>(k) : x.shape().dim(i));
   }
+  const auto width = x.shape().dim(a);
+  if (a + 1 == x.shape().rank() && x.dtype() == DType::kF32 &&
+      width >= 4096 && width < 16777215 && k >= 1 && k <= 16) {
+    Array candidates = x;
+    auto count = width;
+    bool pairs = false;
+    while (true) {
+      const auto chunks = (count + 511) / 512;
+      Shape stage_shape{static_cast<std::int64_t>(x.shape().elem_count()) / width, chunks, k, 2};
+      auto stage = make(OpKind::kCustom, stage_shape, DType::kF32, {candidates.node()});
+      stage->attrs = {static_cast<float>(k), static_cast<float>(count), pairs ? 1.0f : 0.0f, 0.0f};
+      stage->prim = find_primitive("topk.chunk");
+      candidates = Array(stage);
+      if (chunks == 1) break;
+      count = chunks * k;
+      pairs = true;
+    }
+    auto extract = [&](bool write_index) {
+      auto node = make(OpKind::kCustom, out, DType::kF32, {candidates.node()});
+      node->attrs = {static_cast<float>(k), write_index ? 1.0f : 0.0f, score_band, 0.0f};
+      node->prim = find_primitive("topk.extract");
+      return Array(node);
+    };
+    Array values = extract(false);
+    if (indices != nullptr) *indices = extract(true);
+    return values;
+  }
   auto make_topk = [&](std::int32_t write_idx) {
     auto n = make(OpKind::kTopK, out, x.dtype(), {x.node()});
     n->iattrs[0] = static_cast<std::int32_t>(a);
@@ -487,6 +515,33 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
   return Array(n);
 }
 
+namespace {
+Array split_paged_attention(const NodePtr& baseline, std::string_view partial_name,
+                            std::string_view merge_name, bool short_query) {
+  const auto* partial_prim = find_primitive(partial_name);
+  const auto* merge_prim = find_primitive(merge_name);
+  if (!partial_prim || !merge_prim) return Array(baseline);
+  const auto& q = baseline->inputs[0]->shape;
+  const auto capacity = baseline->inputs[1]->shape.dim(2) * baseline->inputs[4]->shape.dim(1);
+  const auto parts = (capacity + 127) / 128;
+  const Shape shape = short_query ? Shape{q.dim(0), q.dim(1), q.dim(2), parts, 258}
+                                  : Shape{q.dim(0), q.dim(1), parts, 258};
+  auto partial = make(OpKind::kCustom, shape, DType::kF32, baseline->inputs);
+  partial->prim = partial_prim;
+  partial->fclass = partial_prim->fusion_class();
+  partial->attrs = baseline->attrs;
+  partial->iattrs = baseline->iattrs;
+  auto merged = make(OpKind::kCustom, baseline->shape, DType::kF32, {partial});
+  merged->prim = merge_prim;
+  merged->fclass = merge_prim->fusion_class();
+  const auto& inputs = baseline->inputs;
+  for (std::size_t i = 0; i < inputs.size(); ++i)
+    if (std::find(inputs.begin(), inputs.begin() + static_cast<std::ptrdiff_t>(i), inputs[i]) ==
+        inputs.begin() + static_cast<std::ptrdiff_t>(i)) --inputs[i]->consumer_count;
+  return Array(merged);
+}
+}  // namespace
+
 Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  MaskKind mask, int window, const Array& meta,
                  const Array& table, int block_size,
@@ -502,39 +557,22 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
   n->iattrs[3] = block_size;
   n->prim = find_primitive("attention");
   if (device != nullptr) {
-    // An explicit context opts into the experiment after the portable shape
-    // gates. Both barrier nodes remain ordinary ordered graph dependencies.
     const Shape shapes[] = {q.shape(), k.shape(), v.shape(), meta.shape(), table.shape()};
     const DType dtypes[] = {q.dtype(), k.dtype(), v.dtype(), meta.dtype(), table.dtype()};
-    KernelShapes ks;
-    ks.inputs = shapes;
-    ks.input_dtypes = dtypes;
-    ks.output = out;
-    ks.output_dtype = q.dtype();
-    ks.attrs = n->attrs;
-    ks.iattrs = n->iattrs;
-    ks.device = device;
-    const auto* partial_prim = find_primitive("attention.decode_partial128.wg128c2.v2");
-    const auto* merge_prim = find_primitive("attention.decode_merge128.wg128c2.v2");
-    const auto* partial_kernel = dynamic_cast<const KernelPrimitiveBase*>(partial_prim);
-    if (partial_kernel && merge_prim && partial_kernel->specialize(ks) != nullptr) {
-      const auto capacity = k.shape().dim(2) * table.shape().dim(1);
-      auto partial = make(OpKind::kCustom,
-          Shape{sq.dim(0), sq.dim(1), (capacity + 127) / 128, 258},
-          DType::kF32, n->inputs);
-      partial->prim = partial_prim;
-      partial->fclass = partial_prim->fusion_class();
-      partial->attrs = n->attrs;
-      partial->iattrs = n->iattrs;
-      auto merged = make(OpKind::kCustom, out, DType::kF32, {partial});
-      merged->prim = merge_prim;
-      merged->fclass = merge_prim->fusion_class();
-      // The unused baseline node added one consumer to each input.
-      for (std::size_t i = 0; i < n->inputs.size(); ++i)
-        if (std::find(n->inputs.begin(), n->inputs.begin() + static_cast<std::ptrdiff_t>(i), n->inputs[i]) == n->inputs.begin() + static_cast<std::ptrdiff_t>(i))
-          --n->inputs[i]->consumer_count;
-      return Array(merged);
-    }
+    KernelShapes request;
+    request.inputs = shapes;
+    request.input_dtypes = dtypes;
+    request.output = out;
+    request.output_dtype = q.dtype();
+    request.attrs = n->attrs;
+    request.iattrs = n->iattrs;
+    request.device = device;
+    if (dispatch::split_short_default_supported(request))
+      return split_paged_attention(n, "attention.short_partial128.wg128c2.v1",
+                                     "attention.short_merge128.wg128c2.v1", true);
+    if (dispatch::split_decode_supported(request))
+      return split_paged_attention(n, "attention.decode_partial128.wg128c2.v2",
+                                     "attention.decode_merge128.wg128c2.v2", false);
   }
   return Array(n);
 }

@@ -71,9 +71,8 @@ struct GatedAttentionWeights {
 struct PagedKvLayer {
   Array keys;
   Array values;
-  // [rows, stride] block ids as f32; `stride` is fixed at the engine capacity
-  // in blocks so it is a literal in the generated address arithmetic and never
-  // varies with how many blocks a sequence currently holds.
+  // [rows, stride] block ids as f32. The stride grows with the pool rung,
+  // bounded by the per-row context limit, and never shrinks.
   Array table;
   kv::BlockAllocator alloc;
   std::vector<kv::BlockTable> tables;

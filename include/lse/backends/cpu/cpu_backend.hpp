@@ -39,6 +39,10 @@ class CpuBackend : public Backend<CpuBackend> {
   Status copy_d2h_impl(const DeviceBuffer& src, void* dst, std::size_t bytes,
                        std::size_t src_offset);
 
+  Status copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                        std::size_t bytes, std::size_t src_offset,
+                        std::size_t dst_offset);
+
   Result<KernelHandle> load_executable_impl(std::string_view name,
                                             std::span<const std::byte> code_object);
   Status launch_impl(const KernelHandle& kernel, const LaunchDims& dims,

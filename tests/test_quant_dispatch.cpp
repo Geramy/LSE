@@ -50,6 +50,7 @@ void baseline(const dispatch::QuantPlan& p) {
   LSE_EXPECT(!p.rotate_decode_panel);
   LSE_EXPECT_EQ(p.decode_columns, 1u);
   LSE_EXPECT_EQ(p.prefill_rows, 1u);
+  LSE_EXPECT_EQ(p.row_ladder_ceiling, 0u);
 }
 }
 
@@ -75,11 +76,11 @@ LSE_TEST(quant_ffn_m512_uses_architecture_defaults) {
 
 LSE_TEST(quant_scalar_defaults_are_shape_specific) {
   for (bool loom : {false, true}) {
-    for (int m : {1, 32, 512}) {
+    for (int m : {1, 2, 3, 7, 8, 9, 32, 512}) {
       for (int bits : {4, 6, 8}) {
         Fixture f(m, 17, 64, bits, loom);
         const auto p = f.plan();
-        LSE_EXPECT_EQ(p.int8_activations, bits == 4 && (m == 1 || m == 512));
+        LSE_EXPECT_EQ(p.int8_activations, bits == 4 && (m <= 8 || m == 512));
         LSE_EXPECT_EQ(p.matrix != nullptr, bits == 4 && m == 512);
         if (bits != 4 || m != 512) scalar(p);
       }
@@ -98,6 +99,85 @@ LSE_TEST(quant_scalar_defaults_are_shape_specific) {
     LSE_EXPECT_EQ(tail.plan().decode_columns, 1u);
     Fixture other(512, 10240, 5120, 6, loom);
     scalar(other.plan());
+  }
+}
+
+LSE_TEST(quant_mtp_int8_requires_supported_architecture_and_intrinsics) {
+  for (bool loom : {false, true}) {
+    for (int m : {2, 3, 7, 8}) {
+      for (int fault = 0; fault < 7; ++fault) {
+        Fixture f(m, 17, 1024, 4, loom);
+        if (fault == 0) f.device.arch = "gfx1200";
+        if (fault == 1) f.device.wavefront_size = 64;
+        if (fault == 2) f.amd.has_dot4_iu8 = false;
+        if (fault == 3) f.intrinsics = {};
+        if (fault == 4) {
+          f.shapes.iattrs[1] = 128;
+          f.inputs[2] = f.inputs[3] = Shape{17, 8};
+        }
+        if (fault == 5) f.dtypes[0] = DType::kBF16;
+        baseline(f.plan(fault == 6));
+      }
+      Fixture allowed(m, 17, 1024, 4, loom);
+      LSE_EXPECT(allowed.plan().int8_activations);
+      scalar(allowed.plan());
+    }
+    for (int m : {1, 512}) {
+      Fixture previous(m, 17, 1024, 4, loom);
+      previous.device.arch = "gfx1151";
+      LSE_EXPECT(previous.plan().int8_activations);
+    }
+  }
+}
+
+LSE_TEST(quant_mtp_ffn_row_ladder_uses_measured_shapes) {
+  const auto* primitive = dynamic_cast<const graph::KernelPrimitiveBase*>(
+      graph::find_primitive("quant_linear"));
+  LSE_EXPECT(primitive != nullptr);
+  if (!primitive) return;
+  for (bool loom : {false, true}) {
+    for (int m : {3, 7}) {
+      for (auto [n, k] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
+        Fixture f(m, n, k, 4, loom);
+        const auto plan = f.plan();
+        LSE_EXPECT_EQ(plan.row_ladder_ceiling, m == 3 ? 4u : 8u);
+        LSE_EXPECT(plan.int8_activations);
+        scalar(plan);
+        const auto geometry = primitive->plan(f.shapes);
+        LSE_EXPECT_EQ(geometry.workgroup_count[0], static_cast<std::uint32_t>(n / 8));
+        LSE_EXPECT_EQ(geometry.workgroup_count[1], 1u);
+        LSE_EXPECT_EQ(geometry.workgroup_size[0], 256u);
+        LSE_EXPECT(geometry.lds_bytes <= f.device.lds_bytes_per_workgroup);
+        const std::uint32_t minimum = k == 5120 ? (m == 3 ? 33088u : 33152u)
+                                               : (m == 3 ? 56128u : 56192u);
+        f.device.lds_bytes_per_workgroup = minimum;
+        LSE_EXPECT_EQ(f.plan().row_ladder_ceiling, m == 3 ? 4u : 8u);
+        --f.device.lds_bytes_per_workgroup;
+        LSE_EXPECT_EQ(f.plan().row_ladder_ceiling, 0u);
+      }
+    }
+    for (int m : {1, 2, 4, 5, 6, 8, 9, 32, 512}) {
+      Fixture f(m, 17408, 5120, 4, loom);
+      LSE_EXPECT_EQ(f.plan().row_ladder_ceiling, 0u);
+    }
+    for (int fault = 0; fault < 11; ++fault) {
+      Fixture f(3, 17408, 5120, 4, loom);
+      if (fault == 0) f.device.arch = "gfx1200";
+      if (fault == 1) f.device.wavefront_size = 64;
+      if (fault == 2) f.amd.has_dot4_iu8 = false;
+      if (fault == 3) f.intrinsics = {};
+      if (fault == 4) f.dtypes[2] = f.dtypes[3] = DType::kF32;
+      if (fault == 5) f.device.max_threads_per_workgroup = 255;
+      if (fault == 6) {
+        f.inputs[1] = Shape{17409, 640};
+        f.inputs[2] = f.inputs[3] = Shape{17409, 80};
+        f.shapes.output = Shape{3, 17409};
+      }
+      if (fault == 7) f.shapes.iattrs[0] = 8;
+      if (fault == 9) f.shapes.staged = {"caller", 5120};
+      if (fault == 10) f.shapes.staged_quant.codes = "caller";
+      LSE_EXPECT_EQ(f.plan(fault == 8).row_ladder_ceiling, 0u);
+    }
   }
 }
 

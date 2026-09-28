@@ -15,11 +15,40 @@ using graph::KernelShapes;
 constexpr std::uint32_t kThreads = 256, kKeyWindow = 256;
 constexpr std::uint32_t kSplitRecord = 258;
 
-struct FlashRule { std::string_view arch; std::uint32_t rows; AttentionPlan plan; };
-constexpr std::array kFlashRules{
-    FlashRule{"gfx1201", 12, AttentionPlan::kFlash12},
-    FlashRule{{}, 8, AttentionPlan::kFlash8},
+struct FlashRule {
+  std::string_view arch;
+  std::uint32_t min_rows, tile_rows;
+  AttentionPlan plan;
 };
+constexpr std::array kFlashRules{
+    FlashRule{"gfx1201", 12, 12, AttentionPlan::kFlash12},
+    FlashRule{{}, 2, 8, AttentionPlan::kFlash8},
+};
+
+struct SplitShortRule {
+  std::string_view arch;
+  std::uint32_t wave, min_rows, max_rows, threads, max_keys;
+};
+constexpr std::array kSplitShortRules{
+    SplitShortRule{"gfx1201", 32, 2, 8, 128, 8192},
+};
+
+struct SplitShortDefaultRule {
+  std::uint32_t queries, capacity;
+};
+constexpr std::array kSplitShortDefaultRules{
+    SplitShortDefaultRule{3, 1024}, SplitShortDefaultRule{3, 2048},
+    SplitShortDefaultRule{4, 1024}, SplitShortDefaultRule{4, 2048},
+    SplitShortDefaultRule{7, 1024},
+};
+
+bool short_default_shape(const Shape& query, std::int64_t capacity) {
+  if (query.rank() != 4 || query.dim(0) != 1 || query.dim(1) != 24 ||
+      query.dim(3) != 256) return false;
+  for (const auto& rule : kSplitShortDefaultRules)
+    if (query.dim(2) == rule.queries && capacity == rule.capacity) return true;
+  return false;
+}
 
 bool power_of_two(std::int64_t n) { return n >= 2 && (n & (n - 1)) == 0; }
 
@@ -58,7 +87,8 @@ bool attention_ops(const KernelShapes& s) {
 bool paged_inputs(const KernelShapes& s) {
   if (s.inputs.size() != 5 || !f32_inputs(s, 5) ||
       s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
-      s.inputs[2].rank() != 4 || s.inputs[4].rank() != 2) return false;
+      s.inputs[2].rank() != 4 || s.inputs[4].rank() != 2 ||
+      (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0)) return false;
   for (const auto& shape : s.inputs)
     if (!positive_shape(shape)) return false;
   const auto& q = s.inputs[0];
@@ -116,8 +146,7 @@ bool split_decode_scope(const Shape& query, std::int64_t offset, std::int64_t ca
 
 bool shared_decode_supported(const KernelShapes& s) {
   if (!paged_inputs(s) || !s.device || s.device->arch != "gfx1201" ||
-      s.device->max_threads_per_workgroup < kThreads || !attention_ops(s) ||
-      (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0)) return false;
+      s.device->max_threads_per_workgroup < kThreads || !attention_ops(s)) return false;
   const auto& q = s.inputs[0];
   const auto& keys = s.inputs[1];
   const auto stride = s.inputs[4].dim(1), block = keys.dim(2);
@@ -141,6 +170,48 @@ bool split_decode_merge_supported(const KernelShapes& s) {
   return ((bytes + 15u) / 16u) * 16u <= backend::workgroup_lds_bytes(s.device);
 }
 
+bool split_short_scope(const Shape& query, std::int64_t offset, std::int64_t capacity) {
+  return offset >= 512 && short_default_shape(query, capacity);
+}
+
+bool split_short_default_supported(const KernelShapes& s) {
+  return split_short_supported(s) && s.inputs[1].dim(1) == 4 &&
+         s.inputs[1].dim(2) == 16 && s.iattrs[0] == 1 && s.iattrs[1] == 0 &&
+         short_default_shape(s.inputs[0], s.inputs[4].dim(1) * s.inputs[1].dim(2));
+}
+
+bool split_short_supported(const KernelShapes& s) {
+  if (!paged_inputs(s) || !s.device || !attention_ops(s) ||
+      s.inputs[0].dim(3) != 256 || s.inputs[1] != s.inputs[2] ||
+      !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return false;
+  const auto capacity = s.inputs[4].dim(1) * s.inputs[1].dim(2);
+  for (const auto& rule : kSplitShortRules)
+    if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+        s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
+        s.device->max_threads_per_workgroup >= rule.threads &&
+        capacity <= rule.max_keys &&
+        backend::workgroup_lds_bytes(s.device) >= 128u * sizeof(float)) {
+      const Shape partial{s.inputs[0].dim(0), s.inputs[0].dim(1),
+                          s.inputs[0].dim(2), (capacity + 127) / 128, kSplitRecord};
+      return positive_shape(partial);
+    }
+  return false;
+}
+
+bool split_short_merge_supported(const KernelShapes& s) {
+  if (s.inputs.size() != 1 || s.inputs[0].rank() != 5 ||
+      !positive_shape(s.inputs[0]) || s.inputs[0].dim(3) > 64 ||
+      s.inputs[0].dim(4) != kSplitRecord || !f32_inputs(s, 1) ||
+      !s.device || !attention_ops(s)) return false;
+  for (const auto& rule : kSplitShortRules)
+    if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+        s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
+        s.device->max_threads_per_workgroup >= rule.threads &&
+        ((static_cast<std::uint32_t>(s.inputs[0].dim(3)) * sizeof(float) + 15u) / 16u) * 16u <=
+            backend::workgroup_lds_bytes(s.device)) return true;
+  return false;
+}
+
 AttentionPlan attention_plan(const KernelShapes& s) {
   if (shared_decode_supported(s)) return AttentionPlan::kSharedExp;
   const auto d = flash_dimensions(s);
@@ -149,7 +220,7 @@ AttentionPlan attention_plan(const KernelShapes& s) {
   const auto budget = backend::workgroup_lds_bytes(s.device);
   for (const auto& rule : kFlashRules)
     if ((rule.arch.empty() || s.device->arch == rule.arch) &&
-        d.tq >= rule.rows && flash_lds_bytes(d, rule.rows) <= budget)
+        d.tq >= rule.min_rows && flash_lds_bytes(d, rule.tile_rows) <= budget)
       return rule.plan;
   return AttentionPlan::kScalar;
 }

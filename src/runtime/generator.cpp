@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
-#include <cstdlib>
 
 #include "lse/graph/graph.hpp"
 #include "lse/graph/interpreter.hpp"
@@ -59,38 +58,8 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
   return a;
 }
 
-// Tokens per prefill pass. Extents are baked into the generated HIP, so one
-// pass over the whole prompt makes every distinct prompt length its own JIT
-// cold start; a ladder caps the shapes the engine can ever see.
-//
-// Measured on this box: a fresh cache pays ~35-48 compiles at ~54 ms for each
-// new pass width, and the ladder below makes the reachable widths exactly
-// {1,2,4,8,16,32,64,128,256} — so the whole engine costs ~340 compiles once
-// and a novel prompt length costs zero. Without it every length is its own
-// set. 256 and not 128: every chunk pays the phase ladder's fixed launch cost
-// again, and with programs retained across requests the one-time compiles for
-// the extra width amortize to nothing while the halved chunk count is paid
-// back on every long prompt.
-//
-// The row axis is bucketed the same way (model::kBatchRungs) and for the same
-// reason, and the two share the ladder: a decode pass of B sequences and a
-// prefill pass of B tokens present the same row count to every GEMM.
-//
-// 512, not 1024: on gfx1201 / driver 201 a full sweep at a fixed 2821-token
-// prompt gives warm PP/s of 128->74.8, 256->80.1, 384->78.0, 512->126.0,
-// 768 and 1024->RESOURCE_EXHAUSTED (the buffer slab OOMs on a repeat prefill
-// pass at those widths), so 512 is both the fastest and the largest chunk that
-// survives repeated long prompts. See build/lse-prefill-q4.md.
+// Bound retained pass shapes to the measured prefill chunk.
 constexpr std::size_t kPrefillChunk = 512;
-
-// LSE_PREFILL_CHUNK overrides the compiled default for tuning runs: it relaunches
-// the engine at another pass width without a rebuild. 0 restores one-pass.
-std::size_t prefill_chunk() {
-  const char* v = std::getenv("LSE_PREFILL_CHUNK");
-  if (v == nullptr) return kPrefillChunk;
-  const long n = std::strtol(v, nullptr, 10);
-  return n > 0 ? static_cast<std::size_t>(n) : 0;
-}
 
 // Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
 // two below it}, so the whole engine only ever compiles that many prefill
@@ -285,7 +254,7 @@ Result<std::vector<float>> Generator::step(
     Session& session, const std::vector<std::uint32_t>& tokens) {
   // A one-token prompt still goes the long way when the module is in play: the
   // decode head skips the hidden state the module needs for its first row.
-  if (tokens.size() == 1 && mtp_ == nullptr) {
+  if (tokens.size() == 1 && mtp_ == nullptr && dflash2_ == nullptr) {
     LSE_ASSIGN_OR(Array logits, decode_head(session, tokens[0], false));
     std::vector<float> out(logits.shape().elem_count());
     LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
@@ -304,11 +273,19 @@ Result<std::vector<float>> Generator::step(
   }
   Array hidden;
   std::size_t at = 0;
-  for (std::size_t take : prefill_plan(tokens.size(), prefill_chunk())) {
+  for (std::size_t take : prefill_plan(tokens.size(), kPrefillChunk)) {
     const auto first = tokens.begin() + static_cast<std::ptrdiff_t>(at);
     LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(
                                  first, first + static_cast<std::ptrdiff_t>(take))));
-    LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr));
+    model::FeatureCapture capture;
+    if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
+    LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr,
+                                       nullptr, nullptr, false,
+                                       dflash2_ != nullptr ? &capture : nullptr));
+    if (dflash2_ != nullptr) {
+      LSE_RETURN_IF_ERROR(dflash2_->append_context(
+          capture.features, base + static_cast<std::int32_t>(at)));
+    }
     if (mtp_ != nullptr) {
       LSE_RETURN_IF_ERROR(mtp_prefill_chunk(
           hidden, std::span<const std::uint32_t>(&*first, take),
@@ -360,9 +337,13 @@ Status Generator::verify(Session& session,
   }
 
   const std::uint64_t started = now_ns();
+  model::FeatureCapture capture;
+  if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
   LSE_ASSIGN_OR(Array hidden,
                 model_.hidden(spec_ids_, &session.states(), nullptr, nullptr,
-                              nullptr, replaces_previous));
+                              nullptr, replaces_previous,
+                              dflash2_ != nullptr ? &capture : nullptr));
+  spec_features_ = std::move(capture.features);
 
   const SamplingParams& sp = sampler_.params();
   const bool greedy = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
@@ -402,27 +383,32 @@ Status Generator::verify(Session& session,
         *spec_.logits.node(), spec_logits_.data(),
         spec_logits_.size() * sizeof(float)));
   }
-  LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
+  if (mtp_ != nullptr) {
+    LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
+  }
   stats_.spec_verify_ns += now_ns() - started;
   ++stats_.spec_verify_passes;
   return OkStatus();
 }
 
-// Up to depth+1 tokens per decoder pass. The module proposes a CHAIN of
-// depth tokens, the decoder answers every row of the pass, and the answers
-// are emitted while they keep agreeing with the chain. The first disagreement
-// ends the pass's harvest: the rows past it consumed wrong inputs, so the
-// pass is rewound and re-run with the corrected prefix spliced in and fresh
-// drafts filling the tail -- the redo IS the next speculation round, and its
-// leading rows re-derive tokens already emitted, which the scan skips.
-//
-// The undo is why this is a pass and not a snapshot. After a pass the carried
-// recurrent state still sits where that pass started from -- the produced
-// state lives on the other node of the carry pair and is not folded across
-// until the next step -- so re-running from the same input with corrected
-// tokens reproduces exactly what a non-speculating decode would have carried.
-// The paged KV needs no more than its cursor put back: the redo overwrites
-// the same slots.
+Status Generator::append_draft_context(std::size_t rows, std::int32_t first) {
+  if (dflash2_ == nullptr) return OkStatus();
+  if (!spec_features_.valid() || rows == 0 ||
+      rows > static_cast<std::size_t>(spec_features_.shape().dim(1))) {
+    return LSE_ERROR(kInternal, "invalid verified draft feature prefix");
+  }
+  const auto started = now_ns();
+  Array prefix = rows == static_cast<std::size_t>(spec_features_.shape().dim(1))
+                     ? spec_features_
+                     : graph::slice(spec_features_, 1, 0,
+                                    static_cast<std::int64_t>(rows));
+  LSE_RETURN_IF_ERROR(dflash2_->append_context(prefix, first));
+  stats_.spec_draft_ns += now_ns() - started;
+  return OkStatus();
+}
+
+// The target answers each input row. Rejected suffixes are overwritten by a
+// same-width replacement pass whose carry inputs remain at the original cursor.
 Result<std::vector<std::uint32_t>> Generator::speculate(
     Session& session, std::vector<float>& prefill_logits,
     const GenerationLimits& limits, const TokenCallback& on_token) {
@@ -430,22 +416,32 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   generated.reserve(static_cast<std::size_t>(std::max(limits.max_tokens, 0)));
   if (limits.max_tokens <= 0) return generated;
 
-  // How many tokens the module proposes per pass. Since the staging fix a
-  // depth-3 chain wins wherever the drafts land 85%+ (34.6 and 32.9 tok/s
-  // against 30.9 and 30.2 at depth 1) and loses where they land 59% (22.7
-  // against 29.6) -- prompt-dependent, a wash on average, so the safe default
-  // stays 1. An adaptive controller was built and measured TWICE (optimistic
-  // start, then shallow start with hysteresis and per-width head caching):
-  // both lost to the better fixed depth on every prompt, because a 32-60
-  // token generation is over before the width transients amortize. Do not
-  // rebuild it without measuring on long generations. Depth+1 must sit on
-  // the batch-rung ladder: width 3 repartitions every step, 2.2 s per pass.
-  const std::uint32_t depth = [] {
-    const char* v = std::getenv("LSE_SPEC_DEPTH");
-    const long n = v != nullptr ? std::strtol(v, nullptr, 10) : 1;
-    return static_cast<std::uint32_t>(std::clamp(n, 1L, 7L));
-  }();
-  const std::size_t m = depth + 1;
+  const std::uint32_t depth = dflash2_ != nullptr
+                                  ? dflash2_->block_size() - 1
+                                  : limits.mtp_depth;
+  std::size_t m = 0;
+  const auto next_width = [&] {
+    return mtp_verify_rows(
+        depth, static_cast<std::uint64_t>(limits.max_tokens) - generated.size(),
+        static_cast<std::int64_t>(model_.config().kv_capacity()) - session.position());
+  };
+  const auto draft_for_width = [&](std::span<const float> hidden,
+                                    std::span<const std::uint32_t> tokens,
+                                    std::int32_t first, std::uint32_t proposals)
+      -> Result<std::vector<std::uint32_t>> {
+    if (dflash2_ != nullptr) {
+      if (proposals == 0) return std::vector<std::uint32_t>{};
+      return dflash2_->draft(tokens.back(),
+                            first + static_cast<std::int32_t>(tokens.size()) - 1,
+                            proposals);
+    }
+    if (proposals == 0) {
+      // Even a one-row verifier must keep the draft cache caught up.
+      LSE_RETURN_IF_ERROR(mtp_->draft(hidden, tokens, first).status());
+      return std::vector<std::uint32_t>{};
+    }
+    return mtp_->draft_chain(hidden, tokens, first, proposals);
+  };
 
   const auto is_stop = [&limits](std::uint32_t id) {
     return std::find(limits.stop_tokens.begin(), limits.stop_tokens.end(), id) !=
@@ -472,23 +468,29 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
 
   std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
   bool running = give(pending);
-  const std::uint64_t decode_start = running ? now_ns() : 0;
+  std::uint64_t decode_start = 0;
 
   std::vector<std::uint32_t> row_in;   // the m tokens the next pass consumes
   std::size_t already = 0;             // leading answers already emitted
   if (running) {
-    const std::uint64_t started = now_ns();
-    LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
-                  mtp_->draft_chain(prefill_tail_, std::span(&pending, 1),
-                                    static_cast<std::int32_t>(session.position()),
-                                    depth));
-    stats_.spec_draft_ns += now_ns() - started;
-    row_in.assign(1, pending);
-    row_in.insert(row_in.end(), chain.begin(), chain.end());
+    const std::uint32_t width = next_width();
+    if (width == 0) {
+      running = false;
+    } else {
+      decode_start = now_ns();
+      const std::uint64_t started = now_ns();
+      LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
+                    draft_for_width(prefill_tail_, std::span(&pending, 1),
+                                    session.position(), width - 1));
+      stats_.spec_draft_ns += now_ns() - started;
+      row_in.assign(1, pending);
+      row_in.insert(row_in.end(), chain.begin(), chain.end());
+    }
   }
 
   bool replaces = false;
   while (running) {
+    m = row_in.size();
     const auto at = static_cast<std::int32_t>(session.position());
     LSE_RETURN_IF_ERROR(verify(session, row_in, replaces));
     ++stats_.spec_steps;
@@ -509,6 +511,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       emitted_to = i + 1;
       if (!running) break;
       if (i + 1 < m) {
+        ++stats_.spec_tested;
         if (answers[i] == row_in[i + 1]) {
           ++stats_.spec_accepted;
         } else {
@@ -522,15 +525,21 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       break;
     }
 
+    LSE_RETURN_IF_ERROR(append_draft_context(emitted_to, at));
     if (!mismatch) {
       // Every row agreed: the pass stands, and the module catches up on the
       // decoder's hiddens for all of it before chaining the next proposals.
       session.advance(static_cast<std::int32_t>(m));
       pending = answers[m - 1];
       std::vector<std::uint32_t> caught(answers.begin(), answers.end());
+      const std::uint32_t width = next_width();
+      if (width == 0) {
+        running = false;
+        break;
+      }
       const std::uint64_t drafted = now_ns();
       LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
-                    mtp_->draft_chain(spec_hidden_, caught, at + 1, depth));
+                    draft_for_width(spec_hidden_, caught, at + 1, width - 1));
       stats_.spec_draft_ns += now_ns() - drafted;
       row_in.assign(1, pending);
       row_in.insert(row_in.end(), chain.begin(), chain.end());
@@ -556,7 +565,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       const std::uint64_t drafted = now_ns();
       LSE_ASSIGN_OR(
           std::vector<std::uint32_t> chain,
-          mtp_->draft_chain(
+          draft_for_width(
               std::span<const float>(spec_hidden_.data(), good * width),
               std::span<const std::uint32_t>(answers.data(), good), at + 1,
               need));
@@ -568,14 +577,15 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     replaces = true;
   }
 
-  // A step that stopped between its two halves left the decoder holding one
-  // token more than was emitted, and then the cache no longer describes the
-  // text. Dropping it is what keeps a follow-up turn honest; it costs that turn
-  // a re-prefill and nothing else.
+  // Stopping within a verifier pass can leave uncommitted rows in the cache.
+  // Restart before a subsequent turn consumes that speculative suffix.
+  const auto draft_position = mtp_ != nullptr ? mtp_->position()
+                                              : dflash2_->context_position();
   if (static_cast<std::size_t>(session.position()) + 1 !=
-      session.history().size()) {
+          session.history().size() || draft_position != session.position()) {
     if (!session.restart().ok()) session.clear();
-    mtp_->reset();
+    if (mtp_ != nullptr) mtp_->reset();
+    if (dflash2_ != nullptr) dflash2_->reset();
   }
   stats_.decode_ns = decode_start == 0 ? 0 : now_ns() - decode_start;
   return generated;
@@ -594,10 +604,15 @@ Result<std::vector<std::uint32_t>> Generator::generate(
 Result<std::vector<std::uint32_t>> Generator::generate(
     Session& session, const std::vector<std::uint32_t>& prompt,
     const GenerationLimits& limits, const TokenCallback& on_token) {
+  if (!valid_mtp_depth(limits.mtp_depth)) {
+    return LSE_ERROR(kInvalidArgument, "mtp_depth must be an integer from 1 to 7");
+  }
   if (prompt.empty()) {
     return LSE_ERROR(kInvalidArgument, "cannot generate from an empty prompt");
   }
   stats_ = GenerationStats{};
+  stats_.mtp_depth = mtp_ != nullptr ? limits.mtp_depth : 0;
+  stats_.dflash2_depth = dflash2_ != nullptr ? dflash2_->block_size() - 1 : 0;
   host_reasons_.clear();
   if (graph::Scheduler* sched = graph::default_scheduler()) {
     sched->reset_accumulated_trace();
@@ -619,6 +634,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     // arrays and orphan every retained program's leaves.
     if (!session.restart().ok()) session.clear();
     if (mtp_ != nullptr) mtp_->reset();
+    if (dflash2_ != nullptr) dflash2_->reset();
   }
   const std::size_t start = continues ? covered : 0;
   const std::vector<std::uint32_t> fresh(prompt.begin() + static_cast<std::ptrdiff_t>(start),
@@ -654,7 +670,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
       sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
 
   std::uint64_t decode_start = 0;
-  if (mtp_ != nullptr) {
+  if (mtp_ != nullptr || dflash2_ != nullptr) {
     LSE_ASSIGN_OR(generated, speculate(session, logits, limits, on_token));
     snapshot_trace(&stats_, &host_reasons_);
     return generated;

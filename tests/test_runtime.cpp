@@ -25,6 +25,7 @@
 #include "lse/kv/block.hpp"
 #include "lse/kv/policy.hpp"
 #include "lse/model/config.hpp"
+#include "lse/ops/attention.hpp"
 #include "lse/ops/rope.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/lemonseed.hpp"
@@ -233,7 +234,9 @@ LSE_TEST(cached_decode_matches_a_full_forward_pass) {
       LSE_EXPECT_EQ(st.value_cache.shape().dim(2), kv::kBlockSize);
       LSE_EXPECT_EQ(st.key_cache.shape().dim(0), kv::kMinPoolBlocks);
       LSE_EXPECT(st.key_cache.shape().dim(0) * kv::kBlockSize < cap);
-      LSE_EXPECT_EQ(st.paged.stride(), kv::blocks_for(cap, kv::kBlockSize));
+      LSE_EXPECT_EQ(st.paged.stride(),
+                    std::min(kv::blocks_for(cap, kv::kBlockSize),
+                             static_cast<std::int32_t>(st.key_cache.shape().dim(0))));
       break;
     }
   }
@@ -1738,6 +1741,330 @@ LSE_TEST(a_two_row_pass_gives_each_row_what_it_gets_alone) {
              std::string::npos);
 }
 
+LSE_TEST(q4_mtp_rows_match_a_scalar_reference_on_device) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+  const auto& device = sched->backend().device_info();
+  if (sched->backend().emitter() == nullptr || device.arch != "gfx1201" ||
+      device.wavefront_size != 32)
+    LSE_SKIP("requires gfx1201 wave32 Q4 dispatch");
+  struct RestoreMode {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode saved;
+    ~RestoreMode() { scheduler.set_mode(saved); }
+  } restore{*sched, sched->mode()};
+  sched->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  constexpr std::int64_t kN = 17;
+  const auto upload = [&](Shape shape, DType dtype, const auto& values) {
+    auto a = graph::Array::zeros(shape, dtype);
+    auto& node = *a.node();
+    if (!graph::interpreter::ensure_output_buffer(node, sched->backend()).ok())
+      return graph::Array{};
+    std::memcpy(graph::interpreter::host_bytes(node), values.data(),
+                values.size() * sizeof(values[0]));
+    node.materialized = true;
+    node.host_dirty = true;
+    node.device_dirty = false;
+    if (!graph::interpreter::sync_to_device(node, sched->backend()).ok())
+      return graph::Array{};
+    return a;
+  };
+  for (std::int64_t m : {2, 3, 7, 8}) {
+    for (std::int64_t k : {64, 576}) {
+      const auto chunks = static_cast<std::size_t>(k / 8);
+      const auto groups = static_cast<std::size_t>(k / 64);
+      std::vector<float> x(static_cast<std::size_t>(m * k));
+      std::vector<std::uint32_t> packed(static_cast<std::size_t>(kN) * chunks);
+      std::vector<std::uint16_t> scales(static_cast<std::size_t>(kN) * groups);
+      std::vector<std::uint16_t> biases(scales.size());
+      for (std::int64_t row = 0; row < m; ++row) {
+        for (std::int64_t at = 0; at < k; ++at) {
+          const int code = at % 8 == row % 8 ? 127
+              : static_cast<int>((row * 37 + at * 19 + 11) % 255) - 127;
+          x[static_cast<std::size_t>(row * k + at)] = (at / 8) % 5 == 4 ? 0.0f
+              : std::ldexp(static_cast<float>(code),
+                            -static_cast<int>(8 + row % 3));
+        }
+      }
+      for (std::size_t col = 0; col < static_cast<std::size_t>(kN); ++col) {
+        for (std::size_t chunk = 0; chunk < chunks; ++chunk) {
+          std::uint32_t word = 0;
+          for (unsigned i = 0; i < 8; ++i)
+            word |= static_cast<std::uint32_t>((col * 5 + chunk * 7 + i * 3) % 16)
+                    << (4 * i);
+          packed[col * chunks + chunk] = word;
+        }
+        for (std::size_t group = 0; group < groups; ++group) {
+          scales[col * groups + group] = bfloat16_t::from_float(
+              static_cast<float>((col + group) % 7 + 1) / 1024.0f);
+          biases[col * groups + group] = bfloat16_t::from_float(
+              static_cast<float>(static_cast<int>((col * 3 + group) % 9) - 4) / 64.0f);
+        }
+      }
+      auto xa = upload(Shape{m, k}, DType::kF32, x);
+      auto pa = upload(Shape{kN, k / 8}, DType::kU32, packed);
+      auto sa = upload(Shape{kN, k / 64}, DType::kBF16, scales);
+      auto ba = upload(Shape{kN, k / 64}, DType::kBF16, biases);
+      LSE_EXPECT(xa.valid() && pa.valid() && sa.valid() && ba.valid());
+      if (!xa.valid() || !pa.valid() || !sa.valid() || !ba.valid()) return;
+      auto out = graph::quant_linear(xa, pa, sa, ba, 4, 64);
+      const auto status = out.eval();
+      LSE_EXPECT_OK(status);
+      if (!status.ok()) return;
+      const auto trace = sched->last_trace();
+      LSE_EXPECT_EQ(trace.host_groups, 0u);
+      LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+      LSE_EXPECT(trace.device_groups > 0u && trace.kernels_launched > 0u);
+      const auto got = read_all(out);
+      LSE_EXPECT_EQ(got.size(), static_cast<std::size_t>(m * kN));
+      if (got.size() != static_cast<std::size_t>(m * kN)) return;
+      double max_abs = 0.0;
+      for (std::size_t row = 0; row < static_cast<std::size_t>(m); ++row) {
+        for (std::size_t col = 0; col < static_cast<std::size_t>(kN); ++col) {
+          double expected = 0.0;
+          for (std::size_t at = 0; at < static_cast<std::size_t>(k); ++at) {
+            const auto group = at / 64;
+            const auto code = (packed[col * chunks + at / 8] >> (4 * (at % 8))) & 15u;
+            bfloat16_t stored_scale, stored_bias;
+            stored_scale.bits = scales[col * groups + group];
+            stored_bias.bits = biases[col * groups + group];
+            const auto scale = stored_scale.to_float();
+            const auto bias = stored_bias.to_float();
+            expected += static_cast<double>(x[row * static_cast<std::size_t>(k) + at]) *
+                        std::fma(static_cast<float>(code), scale, bias);
+          }
+          const auto value = got[row * static_cast<std::size_t>(kN) + col];
+          LSE_EXPECT(std::isfinite(value));
+          max_abs = std::max(max_abs, std::abs(static_cast<double>(value) - expected));
+        }
+        if (row) LSE_EXPECT(got[row * static_cast<std::size_t>(kN)] !=
+                             got[(row - 1) * static_cast<std::size_t>(kN)]);
+      }
+      std::printf("       Q4 M%lld K%lld N17 max_abs=%.3e device=%u host=%u fallback=%u\n",
+                  static_cast<long long>(m), static_cast<long long>(k), max_abs,
+                  trace.device_groups, trace.host_groups, trace.host_fallbacks);
+      LSE_EXPECT(max_abs < 1e-5);
+    }
+  }
+}
+
+LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+  if (sched->backend().emitter() == nullptr)
+    LSE_SKIP("requires native attention dispatch");
+  struct RestoreMode {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode saved;
+    ~RestoreMode() { scheduler.set_mode(saved); }
+  } restore{*sched, sched->mode()};
+  constexpr std::int64_t kRows = 3, kHeads = 2, kDim = 256, kPool = 4;
+  constexpr std::int32_t kStride = 4;
+  const float scale = 1.0f / 16.0f;
+  const float poison = std::numeric_limits<float>::quiet_NaN();
+  for (std::int32_t tq : {2, 3, 7}) {
+    sched->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+    const std::int32_t lengths[]{32 + tq, 3 + tq};
+    std::vector<float> q(static_cast<std::size_t>(kRows * kHeads * tq * kDim));
+    std::vector<float> keys(static_cast<std::size_t>(kPool * kv::kBlockSize * kDim));
+    std::vector<float> values(keys.size());
+    for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 37) * 0.25f;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      keys[i] = noise(i + 301) * 0.25f;
+      values[i] = noise(i + 7901) * 0.25f;
+    }
+    std::fill(q.begin() + static_cast<std::ptrdiff_t>(2 * kHeads * tq * kDim),
+               q.end(), poison);
+    for (int row = 0; row < 2; ++row) {
+      const int last_block = row == 0 ? 3 : 1;
+      for (int slot = lengths[row] % kv::kBlockSize; slot < kv::kBlockSize; ++slot)
+        for (std::int64_t d = 0; d < kDim; ++d) {
+          const auto i = static_cast<std::size_t>(
+              (last_block * kv::kBlockSize + slot) * kDim + d);
+          keys[i] = values[i] = poison;
+        }
+    }
+    auto qa = filled(Shape{kRows, kHeads, tq, kDim}, q);
+    auto ka = filled(Shape{kPool, 1, kv::kBlockSize, kDim}, keys);
+    auto va = filled(Shape{kPool, 1, kv::kBlockSize, kDim}, values);
+    // The padded table row is deliberately invalid and must never be read.
+    auto table = filled(Shape{kRows, kStride},
+                         {2, 0, 3, 0, 1, 0, 0, 0, 99999, 99999, 99999, 99999});
+    auto meta = step_meta({{32, lengths[0]}, {3, lengths[1]}, {0, 0}});
+    for (auto mask : {graph::MaskKind::kCausal, graph::MaskKind::kSlidingWindow}) {
+      sched->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+      auto native = graph::sdpa_paged(qa, ka, va, scale, mask, 5, meta, table,
+                                      kv::kBlockSize);
+      const auto status = native.eval();
+      LSE_EXPECT_OK(status);
+      if (!status.ok()) return;
+      for (const auto& reason : sched->last_trace().host_group_reasons)
+        std::fprintf(stderr, "short Flash Tq=%d mask=%d fallback: %s\n", tq,
+                      static_cast<int>(mask), reason.c_str());
+      LSE_EXPECT_EQ(sched->last_trace().host_groups, 0u);
+      LSE_EXPECT(sched->last_trace().kernels_launched > 0u);
+      const auto got = read_all(native);
+      sched->set_mode(graph::Scheduler::Mode::kHostOnly);
+      auto host = graph::sdpa_paged(qa, ka, va, scale, mask, 5, meta, table,
+                                    kv::kBlockSize);
+      const auto expected = read_all(host);
+      LSE_EXPECT_EQ(got.size(), q.size());
+      LSE_EXPECT_EQ(expected.size(), got.size());
+      if (got.size() != q.size() || expected.size() != got.size()) return;
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        LSE_EXPECT(std::isfinite(got[i]) && std::isfinite(expected[i]));
+        LSE_EXPECT_NEAR(got[i], expected[i], 2e-4);
+        if (i >= static_cast<std::size_t>(2 * kHeads * tq * kDim))
+          LSE_EXPECT_EQ(got[i], 0.0f);
+      }
+    }
+  }
+}
+
+LSE_TEST(a_large_context_uses_small_paged_tables_and_grows_without_losing_keys) {
+  if (std::getenv("LSE_KV_PREALLOC") != nullptr)
+    LSE_SKIP("requires the default growing KV pool");
+  graph::Scheduler* sched = graph::default_scheduler();
+  LSE_EXPECT(sched != nullptr);
+  if (sched == nullptr) return;
+  struct HostMode {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode saved;
+    ~HostMode() { scheduler.set_mode(saved); }
+  } mode{*sched, sched->mode()};
+  sched->set_mode(graph::Scheduler::Mode::kHostOnly);
+
+  constexpr std::int32_t kCapacity = 262100;
+  constexpr std::int32_t kTokens = 257;
+  ops::GatedAttentionSpec spec;
+  spec.q_heads = spec.kv_heads = 1;
+  spec.head_dim = 2;
+  spec.kv_length = kCapacity;
+  ops::GatedAttentionWeights weights;
+  weights.q_proj = weights.k_proj = weights.v_proj = weights.o_proj =
+      filled(Shape{2, 2}, {1, 0, 0, 1});
+  weights.g_proj = filled(Shape{2, 2}, {0, 0, 0, 0});
+  weights.q_norm = weights.k_norm = filled(Shape{2}, {0, 0});
+  auto rope = ops::build_rope(2, kTokens, 10000.0f);
+  LSE_EXPECT_OK(rope.status());
+  if (!rope.ok()) return;
+  std::vector<float> inputs(static_cast<std::size_t>(2 * kTokens));
+  for (std::size_t i = 0; i < inputs.size(); ++i) inputs[i] = noise(i + 71);
+  auto whole = ops::gated_attention(
+      filled(Shape{1, kTokens, 2}, inputs), weights, spec, *rope, 0);
+  LSE_EXPECT_OK(whole.status());
+  if (!whole.ok()) return;
+  const auto reference = read_all(*whole);
+  LSE_EXPECT_EQ(reference.size(), inputs.size());
+  if (reference.size() != inputs.size()) return;
+  for (float value : reference) LSE_EXPECT(std::isfinite(value));
+
+  ops::PagedKvLayer layer;
+  ops::AttentionCache cache;
+  cache.paged = &layer;
+  cache.capacity = kCapacity;
+  std::int32_t at = 0;
+  for (std::int32_t count : {127, 1, 1, 128}) {
+    if (at == 128) {
+      const auto table_before = read_all(layer.table);
+      const auto used_before = layer.alloc.used();
+      const auto blocks_before = std::vector<kv::BlockId>(
+          layer.tables[0].blocks().begin(), layer.tables[0].blocks().end());
+      auto needs_growth = ops::extend_paged(layer, at + count);
+      LSE_EXPECT_OK(needs_growth.status());
+      LSE_EXPECT(needs_growth.ok() && *needs_growth);
+      LSE_EXPECT_EQ(layer.alloc.used(), used_before);
+      LSE_EXPECT(std::equal(blocks_before.begin(), blocks_before.end(),
+                            layer.tables[0].blocks().begin(),
+                            layer.tables[0].blocks().end()));
+      LSE_EXPECT(read_all(layer.table) == table_before);
+    }
+    const auto end = at + count;
+    cache.used = at;
+    cache.meta = step_meta({{at, end}});
+    std::vector<float> chunk(inputs.begin() + 2 * at, inputs.begin() + 2 * end);
+    auto pass = ops::gated_attention(filled(Shape{1, count, 2}, chunk),
+                                      weights, spec, *rope, at, &cache);
+    LSE_EXPECT_OK(pass.status());
+    if (!pass.ok()) return;
+    const auto got = read_all(*pass);
+    LSE_EXPECT_EQ(got.size(), chunk.size());
+    if (got.size() != chunk.size()) return;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      LSE_EXPECT(std::isfinite(got[i]));
+      LSE_EXPECT_NEAR(got[i], reference[static_cast<std::size_t>(2 * at) + i],
+                      2e-6);
+    }
+    const auto expected_pool = kv::pool_rung(
+        kv::blocks_for(end, kv::kBlockSize),
+        kv::blocks_for(kCapacity, kv::kBlockSize));
+    LSE_EXPECT_EQ(layer.stride(), expected_pool);
+    LSE_EXPECT_EQ(layer.keys.shape().dim(0), expected_pool);
+    LSE_EXPECT_EQ(layer.tables[0].size(), kv::blocks_for(end, kv::kBlockSize));
+    LSE_EXPECT_EQ(cache.capacity, kCapacity);
+    LSE_EXPECT(layer.stride() < kv::blocks_for(kCapacity, kv::kBlockSize));
+    at = end;
+  }
+  LSE_EXPECT_EQ(at, kTokens);
+  const auto stride = layer.stride();
+  const auto pool = layer.keys.node();
+  auto full_context = ops::extend_paged(layer, kCapacity);
+  LSE_EXPECT_OK(full_context.status());
+  LSE_EXPECT(full_context.ok() && *full_context);
+  LSE_EXPECT_EQ(layer.tables[0].size(), kv::blocks_for(kTokens, kv::kBlockSize));
+  LSE_EXPECT_OK(ops::release_row(layer, 0));
+  layer.row_tokens = {1};
+  cache.used = 0;
+  cache.meta = step_meta({{0, 1}});
+  auto shorter = ops::gated_attention(filled(Shape{1, 1, 2}, {0.25f, -0.5f}),
+                                     weights, spec, *rope, 0, &cache);
+  LSE_EXPECT_OK(shorter.status());
+  LSE_EXPECT_EQ(layer.stride(), stride);
+  LSE_EXPECT(layer.keys.node() == pool);
+  LSE_EXPECT_EQ(layer.tables[0].size(), 1);
+  LSE_EXPECT_EQ(cache.capacity, kCapacity);
+  auto fits = ops::extend_paged(layer, 1);
+  LSE_EXPECT_OK(fits.status());
+  LSE_EXPECT(fits.ok() && !*fits);
+
+  // Ragged rows share the pool rung, while retaining independent block lists.
+  ops::PagedKvLayer ragged;
+  ops::AttentionCache batch;
+  batch.paged = &ragged;
+  batch.capacity = kCapacity;
+  ragged.row_tokens = {17, 0};
+  batch.meta = step_meta({{16, 17}, {0, 0}});
+  const auto x = filled(Shape{2, 1, 2}, {1, 2, 3, 4});
+  auto first = ops::gated_attention(x, weights, spec, *rope, 16, &batch);
+  LSE_EXPECT_OK(first.status());
+  if (!first.ok()) return;
+  LSE_EXPECT_EQ(ragged.stride(), kv::kMinPoolBlocks);
+  LSE_EXPECT_EQ(ragged.tables[0].size(), 2);
+  LSE_EXPECT(ragged.tables[1].empty());
+  const auto retained = std::vector<kv::BlockId>(ragged.tables[0].blocks().begin(),
+                                               ragged.tables[0].blocks().end());
+  const auto table_before = read_all(ragged.table);
+  ragged.row_tokens = {17, 129};
+  auto replay = ops::extend_paged(ragged, 129);
+  LSE_EXPECT_OK(replay.status());
+  LSE_EXPECT(replay.ok() && *replay);
+  LSE_EXPECT(ragged.tables[1].empty());
+  LSE_EXPECT_EQ(ragged.alloc.used(), 2);
+  LSE_EXPECT(read_all(ragged.table) == table_before);
+  batch.used = 128;
+  batch.meta = step_meta({{16, 17}, {128, 129}});
+  auto grown = ops::gated_attention(x, weights, spec, *rope, 128, &batch);
+  LSE_EXPECT_OK(grown.status());
+  LSE_EXPECT_EQ(ragged.stride(), 16);
+  LSE_EXPECT_EQ(ragged.keys.shape().dim(0), 16);
+  LSE_EXPECT_EQ(ragged.tables[1].size(), 9);
+  LSE_EXPECT(std::equal(retained.begin(), retained.end(),
+                        ragged.tables[0].blocks().begin(),
+                        ragged.tables[0].blocks().end()));
+}
+
 LSE_TEST(a_context_that_outgrows_its_pool_keeps_the_keys_it_wrote) {
   // Crossing a pool rung reallocates the block pool and copies the used prefix.
   // Two pass plans over the same 132 tokens cross it at different points; if the
@@ -3062,6 +3389,7 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
   if (!fx.ok) return;
 
   GenerationLimits limits;
+  limits.mtp_depth = 1;
   // Odd, so the last speculative step lands on its second half and the session
   // ends holding exactly the text it emitted.
   limits.max_tokens = 7;
@@ -3097,7 +3425,7 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
     LSE_EXPECT(got.ok());
     if (!got.ok()) return;
     LSE_EXPECT(spec.stats().spec_steps > 0);
-    rejections += spec.stats().spec_steps - spec.stats().spec_accepted;
+    rejections += spec.stats().spec_tested - spec.stats().spec_accepted;
     ++compared;
     LSE_EXPECT(*got == *want);
     if (*got != *want) {
@@ -3123,6 +3451,7 @@ LSE_TEST(an_accepted_draft_still_gives_the_decoders_own_tokens) {
   if (!fx.ok) return;
 
   GenerationLimits limits;
+  limits.mtp_depth = 1;
   limits.max_tokens = 7;
   const std::vector<std::uint32_t> prompt{2, 11, 33};
 

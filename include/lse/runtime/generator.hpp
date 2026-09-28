@@ -20,6 +20,7 @@
 #include "lse/graph/program.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
+#include "lse/model/dflash2.hpp"
 #include "lse/runtime/sampler.hpp"
 #include "lse/runtime/session.hpp"
 
@@ -27,10 +28,29 @@ namespace lse::runtime {
 
 using model::HybridLM;
 
+inline constexpr std::uint32_t kDefaultMtpDepth = 2;
+inline constexpr std::uint32_t kMaxMtpDepth = 7;
+[[nodiscard]] constexpr bool valid_mtp_depth(std::uint32_t depth) noexcept {
+  return depth >= 1 && depth <= kMaxMtpDepth;
+}
+
+[[nodiscard]] constexpr std::uint32_t mtp_verify_rows(
+    std::uint32_t depth, std::uint64_t remaining_tokens,
+    std::int64_t remaining_positions) noexcept {
+  if (!valid_mtp_depth(depth) || remaining_tokens == 0 || remaining_positions <= 0)
+    return 0;
+  std::uint64_t rows = depth + 1;
+  if (rows > remaining_tokens) rows = remaining_tokens;
+  if (rows > static_cast<std::uint64_t>(remaining_positions))
+    rows = static_cast<std::uint64_t>(remaining_positions);
+  return static_cast<std::uint32_t>(rows);
+}
+
 struct GenerationLimits {
   std::int32_t max_tokens = 256;
   // Generation stops on any of these. Empty means run to max_tokens.
   std::vector<std::uint32_t> stop_tokens;
+  std::uint32_t mtp_depth = kDefaultMtpDepth;
 };
 
 struct GenerationStats {
@@ -75,12 +95,12 @@ struct GenerationStats {
   std::uint64_t jit_disk_hits = 0;
   std::uint64_t jit_compiles = 0;
   std::uint64_t jit_compile_ns = 0;
-  // Speculation. A step is one draft plus the decoder pass that verifies it;
-  // it is accepted when the decoder's own token at the drafted position is the
-  // drafted one. A rejected step costs a second decoder pass, so the rate is
-  // what decides whether the whole thing pays.
+  // One verifier pass can compare several draft proposals.
   std::uint32_t spec_steps = 0;
   std::uint32_t spec_accepted = 0;
+  std::uint32_t spec_tested = 0;
+  std::uint32_t mtp_depth = 0;
+  std::uint32_t dflash2_depth = 0;
   // Where a speculative step's time goes: the decoder passes that verify a
   // proposal (two of them when it is rejected) against the module pass that
   // made it. The second is what speculation costs whether or not it pays.
@@ -89,8 +109,8 @@ struct GenerationStats {
   std::uint32_t spec_verify_passes = 0;
 
   [[nodiscard]] double acceptance_rate() const noexcept {
-    if (spec_steps == 0) return 0.0;
-    return static_cast<double>(spec_accepted) / static_cast<double>(spec_steps);
+    if (spec_tested == 0) return 0.0;
+    return static_cast<double>(spec_accepted) / static_cast<double>(spec_tested);
   }
 
   // The first generated token is sampled from prefill logits. Only later
@@ -143,12 +163,12 @@ class Generator {
   }
   [[nodiscard]] Sampler& sampler() noexcept { return sampler_; }
 
-  // Decode two tokens per decoder pass by having `mtp` propose the second one.
-  // The proposal is verified by the decoder in the same pass, so the text is
-  // whatever the decoder alone would have produced; only the number of passes
-  // it took changes. The module's cache and the session's must be reset
-  // together, which generate() does.
-  void use_mtp(model::MtpModule& mtp) noexcept { mtp_ = &mtp; }
+  // Proposals are checked by the decoder; limits.mtp_depth selects the chain
+  // length. The module and session caches are reset together by generate().
+  void use_mtp(model::MtpModule& mtp) noexcept { mtp_ = &mtp; dflash2_ = nullptr; }
+  void use_dflash2(model::DFlash2Module& draft) noexcept {
+    dflash2_ = &draft; mtp_ = nullptr;
+  }
 
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
   static Result<graph::Array> last_hidden(const graph::Array& hidden);
@@ -192,8 +212,7 @@ class Generator {
   // whichever program consumes it, never re-allocated per token.
   graph::Array decode_ids_;
 
-  // The two-row verify pass and its head. Same shape every step, so it is
-  // retained and replayed exactly as the one-row decode head is.
+  // The current verifier width retains its head across passes.
   struct SpecHead {
     graph::Program program;
     graph::Array hidden;
@@ -204,13 +223,10 @@ class Generator {
   };
   SpecHead spec_;
   graph::Array spec_ids_;
-  // Adaptive depth switches the verify width between passes; each width keeps
-  // its own head and id slot here so a switch swaps programs instead of
-  // re-recording one -- rebuilding the head on every width change is what
-  // made the first adaptive cut SLOWER than either fixed depth.
+  // Preserve recorded heads and token slots when the verifier width changes.
   std::unordered_map<std::size_t, SpecHead> spec_by_m_;
   std::unordered_map<std::size_t, graph::Array> spec_ids_by_m_;
-  // Host copies the module reads: the pass's two hidden rows, and its logits
+  // Host copies the module reads: the pass's hidden rows, and its logits
   // when the sampler needs more than an argmax.
   std::vector<float> spec_hidden_;
   std::vector<float> spec_logits_;
@@ -219,11 +235,11 @@ class Generator {
   std::vector<float> prefill_tail_;
 
   model::MtpModule* mtp_ = nullptr;
+  model::DFlash2Module* dflash2_ = nullptr;
+  graph::Array spec_features_;
+  Status append_draft_context(std::size_t rows, std::int32_t first);
 
-  // What one verify pass answered: the decoder's own tokens at the two
-  // positions it covered. `second` is only the true continuation when the
-  // proposal at the first position was accepted or the pass was a redo.
-// Runs the given row tokens at the session's current position and leaves the
+  // Runs row tokens at the session cursor and leaves the
   // per-row answers readable: the greedy picks in spec_, the raw logits in
   // spec_logits_ otherwise, and every row's hidden in spec_hidden_.
   // `replaces_previous` says this pass stands in for the one that just ran

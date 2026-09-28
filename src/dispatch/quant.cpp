@@ -34,6 +34,18 @@ constexpr std::array kScalarRules{
     ScalarRule{"gfx1201", 32, 6, 64, 4, 8},
 };
 
+struct RowLadderRule {
+  std::string_view arch;
+  std::uint32_t wave, m, ceiling, lds;
+  std::uint64_t n, k;
+};
+constexpr std::array kRowLadderRules{
+    RowLadderRule{"gfx1201", 32, 3, 4, 33088, 17408, 5120},
+    RowLadderRule{"gfx1201", 32, 3, 4, 56128, 5120, 17408},
+    RowLadderRule{"gfx1201", 32, 7, 8, 33152, 17408, 5120},
+    RowLadderRule{"gfx1201", 32, 7, 8, 56192, 5120, 17408},
+};
+
 const math::MatrixCoreRow* matrix_row(const KernelShapes& s,
                                     math::MatrixElem acc,
                                     math::MatrixElem operand) {
@@ -100,11 +112,23 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
   const auto budget = backend::workgroup_lds_bytes(s.device);
   const bool staged = !s.staged.name.empty() || !s.staged_quant.codes.empty();
   const auto* amd = backend::device_extension<backend::AmdDeviceInfo>(*s.device);
+  const bool small_batch = s.device->arch == "gfx1201" &&
+                              s.device->wavefront_size == 32 && m >= 2 && m <= 8;
   if (s.iattrs[0] == 4 && s.iattrs[1] == 64 && amd && amd->has_dot4_iu8 &&
-      (m == 1 || m >= 512)) {
+      (m == 1 || small_batch || m >= 512)) {
     plan.int8_activations = true;
     for (const auto symbol : quant::kGroupAffineDotSymbols)
       if (s.intrinsics->find(symbol).empty()) plan.int8_activations = false;
+  }
+  if (!staged && plan.int8_activations && s.input_dtypes[2] == DType::kBF16 &&
+      s.device->max_threads_per_workgroup >= 256) {
+    for (const auto& rule : kRowLadderRules) {
+      if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+          m == rule.m && n == rule.n && k == rule.k && budget >= rule.lds) {
+        plan.row_ladder_ceiling = rule.ceiling;
+        break;
+      }
+    }
   }
   if (!staged) {
     for (const auto& rule : kMatrixRules) {

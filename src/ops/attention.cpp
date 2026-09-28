@@ -198,7 +198,7 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
                        " tokens exceeds capacity ", std::to_string(capacity));
     }
   }
-  const std::int32_t stride = kv::blocks_for(capacity, kv::kBlockSize);
+  const std::int32_t table_ceiling = kv::blocks_for(capacity, kv::kBlockSize);
   std::int32_t want_blocks =
       paged_pool_blocks(want_tokens, pool_ceiling(layer, rows, capacity));
   // The pool never shrinks. Its block count is an input dimension the JIT keys
@@ -209,6 +209,8 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
     want_blocks = std::max(
         want_blocks, static_cast<std::int32_t>(layer.keys.shape().dim(0)));
   }
+  const std::int32_t stride =
+      std::max(layer.stride(), std::min(table_ceiling, want_blocks));
 
   if (layer.tables.size() != static_cast<std::size_t>(rows)) {
     // Rows that survive keep their blocks: widening or narrowing the batch must
@@ -268,6 +270,8 @@ Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens) {
   const auto rows = static_cast<std::int32_t>(layer.tables.size());
   LSE_ASSIGN_OR(const std::vector<std::int32_t> want_tokens,
                 row_demand(layer, rows, tokens));
+  for (std::int32_t t : want_tokens)
+    if (kv::blocks_for(t, kv::kBlockSize) > layer.stride()) return true;
   for (std::size_t r = 0; r < layer.tables.size(); ++r) {
     kv::BlockTable& t = layer.tables[r];
     const std::int32_t want = kv::blocks_for(want_tokens[r], kv::kBlockSize);
@@ -372,9 +376,9 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
   }
 
   const backend::DeviceInfo* split_device = nullptr;
-  // Resolve the existing paged device context only for qualified decode sizes.
-  if (paged && dispatch::split_decode_scope(
-                   q.shape(), offset, cache->table.shape().dim(1) * kv::kBlockSize)) {
+  const auto table_capacity = paged ? cache->table.shape().dim(1) * kv::kBlockSize : 0;
+  if (paged && (dispatch::split_decode_scope(q.shape(), offset, table_capacity) ||
+                dispatch::split_short_scope(q.shape(), offset, table_capacity))) {
     if (auto* scheduler = graph::default_scheduler()) {
       const auto member = graph::preferred_member();
       if (member < scheduler->devices().size())

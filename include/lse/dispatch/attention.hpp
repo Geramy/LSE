@@ -24,6 +24,11 @@ struct FlashDims {
 [[nodiscard]] bool shared_decode_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_merge_supported(const graph::KernelShapes&);
+[[nodiscard]] bool split_short_scope(const Shape& query, std::int64_t offset,
+                                    std::int64_t capacity);
+[[nodiscard]] bool split_short_default_supported(const graph::KernelShapes&);
+[[nodiscard]] bool split_short_supported(const graph::KernelShapes&);
+[[nodiscard]] bool split_short_merge_supported(const graph::KernelShapes&);
 [[nodiscard]] bool reduction_row_supported(const graph::KernelShapes&);
 [[nodiscard]] bool cooperative_rms_supported(const graph::KernelShapes&);
 [[nodiscard]] bool phase_cooperative_rms_supported(const graph::KernelShapes&);

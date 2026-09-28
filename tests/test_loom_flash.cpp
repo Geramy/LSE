@@ -22,34 +22,35 @@ LSE_TEST(flash_attention_handles_long_ragged_queries_and_bound_cache_windows) {
   device.wavefront_size = 32;
   device.max_threads_per_workgroup = 1024;
   device.lds_bytes_per_workgroup = 65536;
-  for (int seq : {8, 17, 33, 128}) {
+  for (int seq : {2, 3, 7, 8, 17, 33, 128}) {
     for (int capacity : {128, 320}) {
-      for (bool alias : {false, true}) {
-        auto q = leaf(Shape{2, 2, seq, 16});
-        auto keys = leaf(Shape{2 * capacity / 16, 1, 16, 16});
-        auto values = alias ? keys : leaf(keys.shape());
-        auto meta = leaf(Shape{kv::step_meta_elems(2)});
-        auto table = leaf(Shape{2, capacity / 16});
-        auto output = sdpa_paged(q, keys, values, 0.25f, MaskKind::kCausal,
-                                 0, meta, table, 16);
-        const NodePtr roots[] = {output.node()};
-        auto groups = Partitioner::partition(roots);
-        LSE_EXPECT(groups.size() == 1);
-        for (const auto& group : groups) {
-          auto emitted = backend::LoomEmitter{}.emit(group, device);
-          LSE_EXPECT(emitted.ok());
-          if (emitted.ok()) {
-            LSE_EXPECT(emitted->lds_bytes > 0);
-            LSE_EXPECT(emitted->dims.workgroup_size[0] == 256);
-            const unsigned tile = seq >= 12 ? 12u : 8u;
-            LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],
-                          4u * ((static_cast<unsigned>(seq) + tile - 1u) / tile));
-            LSE_EXPECT(emitted->binding_order.size() == (alias ? 5u : 6u));
-            LSE_EXPECT(emitted->source.find("extent_zero") != std::string::npos);
-            LSE_EXPECT(emitted->source.find("kernel.barrier") != std::string::npos);
+      for (auto mask : {MaskKind::kCausal, MaskKind::kSlidingWindow})
+        for (bool alias : {false, true}) {
+          auto q = leaf(Shape{2, 2, seq, 16});
+          auto keys = leaf(Shape{2 * capacity / 16, 1, 16, 16});
+          auto values = alias ? keys : leaf(keys.shape());
+          auto meta = leaf(Shape{kv::step_meta_elems(2)});
+          auto table = leaf(Shape{2, capacity / 16});
+          auto output = sdpa_paged(q, keys, values, 0.25f, mask,
+                                   5, meta, table, 16);
+          const NodePtr roots[] = {output.node()};
+          auto groups = Partitioner::partition(roots);
+          LSE_EXPECT(groups.size() == 1);
+          for (const auto& group : groups) {
+            auto emitted = backend::LoomEmitter{}.emit(group, device);
+            LSE_EXPECT(emitted.ok());
+            if (emitted.ok()) {
+              LSE_EXPECT(emitted->lds_bytes > 0);
+              LSE_EXPECT(emitted->dims.workgroup_size[0] == 256);
+              const unsigned tile = seq >= 12 ? 12u : 8u;
+              LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],
+                            4u * ((static_cast<unsigned>(seq) + tile - 1u) / tile));
+              LSE_EXPECT(emitted->binding_order.size() == (alias ? 5u : 6u));
+              LSE_EXPECT(emitted->source.find("extent_zero") != std::string::npos);
+              LSE_EXPECT(emitted->source.find("kernel.barrier") != std::string::npos);
+            }
           }
         }
-      }
     }
   }
 }

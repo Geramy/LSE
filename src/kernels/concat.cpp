@@ -9,14 +9,17 @@ namespace lse::kernels {
 
 using namespace lse::graph;
 
-// Concat takes 2-4 inputs; every possible slot is declared and the body only
-// touches the first `parts` of them.
+// Unused slots are bound but never read.
 template <class E>
 struct ConcatArgs {
   env::In<kir::f32, E> in0;
   env::In<kir::f32, E> in1;
   env::In<kir::f32, E> in2;
   env::In<kir::f32, E> in3;
+  env::In<kir::f32, E> in4;
+  env::In<kir::f32, E> in5;
+  env::In<kir::f32, E> in6;
+  env::In<kir::f32, E> in7;
   // Ret-style kernel: the element value is returned, not stored; the slot
   // exists to satisfy the binding contract.
   env::Out<kir::f32, E> out;
@@ -24,9 +27,10 @@ struct ConcatArgs {
 
 template <class E>
 auto concat_element(E& e, ConcatArgs<E>& a, std::size_t parts,
-                    const std::uint32_t (&lens)[4], std::uint32_t out_axis,
+                    const std::uint32_t (&lens)[8], std::uint32_t out_axis,
                     std::uint32_t inner) {
-  const env::In<kir::f32, E>* src[4] = {&a.in0, &a.in1, &a.in2, &a.in3};
+  const env::In<kir::f32, E>* src[8] = {&a.in0, &a.in1, &a.in2, &a.in3,
+                                       &a.in4, &a.in5, &a.in6, &a.in7};
   auto i = e.thread_id();
   auto span = e.u32(out_axis * inner);
   auto o = e.let(i / span);
@@ -55,7 +59,7 @@ struct ConcatKernel final : KernelPrimitive<ConcatKernel> {
   std::size_t arity() const noexcept override { return 2; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (s.inputs.size() < 2 || s.inputs.size() > 4 ||
+    if (s.inputs.size() < 2 || s.inputs.size() > 8 ||
         s.types.scalar == nullptr || s.intrinsics == nullptr) {
       return {};
     }
@@ -71,7 +75,7 @@ struct ConcatKernel final : KernelPrimitive<ConcatKernel> {
     }
     if (inner == 0 || out_axis == 0) return {};
 
-    std::uint32_t lens[4] = {};
+    std::uint32_t lens[8] = {};
     for (std::size_t p = 0; p < s.inputs.size(); ++p) {
       if (axis >= s.inputs[p].rank()) return {};
       lens[p] = static_cast<std::uint32_t>(s.inputs[p].dim(axis));

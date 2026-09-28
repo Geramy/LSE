@@ -321,7 +321,8 @@ void HybridLM::rewind(std::vector<MixerState>& states,
 Result<Array> HybridLM::hidden(const Array& tokens,
                                std::vector<MixerState>* states, Array* aux_loss,
                                std::vector<Array>* trace, const StepRows* rows,
-                               bool replaces_previous) {
+                               bool replaces_previous,
+                               FeatureCapture* capture) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -332,6 +333,39 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                      " mixer states (", std::to_string(blocks_.size()),
                      " layers x ", std::to_string(state_shards()),
                      " shards), got ", std::to_string(states->size()));
+  }
+
+  const std::span<const std::int32_t> feature_layers =
+      capture != nullptr ? capture->layer_ids : std::span<const std::int32_t>{};
+  if (capture != nullptr && feature_layers.empty()) {
+    return LSE_ERROR(kInvalidArgument, "feature capture needs at least one layer");
+  }
+  std::int32_t previous_layer = -1;
+  for (const std::int32_t layer : feature_layers) {
+    if (layer < 0 || static_cast<std::size_t>(layer) >= blocks_.size() ||
+        layer <= previous_layer) {
+      return LSE_ERROR(kInvalidArgument,
+                       "feature layers must be in range, sorted and unique");
+    }
+    previous_layer = layer;
+  }
+  auto feature_layers_match = [&](const ForwardCache& cache) {
+    return std::equal(feature_layers.begin(), feature_layers.end(),
+                      cache.feature_layers.begin(), cache.feature_layers.end());
+  };
+  const std::int64_t t_now =
+      tokens.valid() ? tokens.shape().dim(tokens.shape().rank() - 1) : 0;
+  // A replacement must keep the original roots and carry inputs. Check before
+  // allocating state, extending pools or changing any retention slot.
+  if (replaces_previous) {
+    for (const ForwardCache& cache : caches_) {
+      if ((cache.t_key == t_now ||
+           (last_pass_id_ != 0 && cache.pass_id == last_pass_id_)) &&
+          !feature_layers_match(cache)) {
+        return LSE_ERROR(kInvalidArgument,
+                         "a replacement pass cannot change feature layers");
+      }
+    }
   }
 
   // Program carries alias graph nodes across pass shapes. Retain them within
@@ -358,8 +392,6 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     last_pass_host_groups_ = 0;
   }
 
-  const std::int64_t t_now =
-      tokens.valid() ? tokens.shape().dim(tokens.shape().rank() - 1) : 0;
   // The retention slot for THIS pass shape. Named cache_ so the thirty uses
   // below read as they always did; the member is caches_ now.
   ForwardCache& cache_ = cache_slot(t_now);
@@ -576,7 +608,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   const bool split_scope_ok = !cache_.split_decode_attention ||
                               replaces_previous || kv_len >= 512;
   const bool can_reuse =
-      chain_ok && split_scope_ok &&
+      chain_ok && split_scope_ok && feature_layers_match(cache_) &&
+      (capture == nullptr || cache_.features.valid()) &&
       aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
       cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
@@ -674,6 +707,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       for (MixerState& s : *states) s.position = kv_len;
     }
     last_pass_id_ = cache_.pass_id;
+    if (capture != nullptr) capture->features = cache_.features;
     return cache_.hidden;
   }
 
@@ -716,6 +750,17 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   LSE_ASSIGN_OR(Array x, embed(tokens));
   if (trace != nullptr) trace->reserve(blocks_.size());
+  std::vector<Array> feature_outputs;
+  feature_outputs.reserve(feature_layers.size());
+  auto capture_layer = [&](std::size_t layer, const Array& output) {
+    if (feature_outputs.size() < feature_layers.size() &&
+        feature_layers[feature_outputs.size()] ==
+            static_cast<std::int32_t>(layer)) {
+      feature_outputs.push_back(output.dtype() == DType::kF32
+                                    ? output
+                                    : graph::cast(output, DType::kF32));
+    }
+  };
 
   const std::size_t shards = state_shards();
   if (shards > 1) {
@@ -735,6 +780,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
           states != nullptr ? &(*states)[i * shards] : nullptr;
       LSE_ASSIGN_OR(xs, blocks_[i]->forward_shards(xs, state, aux_loss, ctx));
       if (trace != nullptr) trace->push_back(xs[0]);
+      capture_layer(i, xs[0]);
     }
     x = xs[0];
   } else {
@@ -749,6 +795,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
         member_for_layer(static_cast<std::int32_t>(i)));
     LSE_ASSIGN_OR(x, blocks_[i]->forward(x, state, aux_loss, ctx));
     if (trace != nullptr) trace->push_back(x);
+    capture_layer(i, x);
   }
   }
 
@@ -761,8 +808,24 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                                               config_.rms_eps)
                 : ops::rms_norm(x, final_norm_weight_, config_.rms_eps);
 
+  Array features;
+  if (capture != nullptr) {
+    while (feature_outputs.size() > 8) {
+      std::vector<Array> next;
+      for (std::size_t first = 0; first < feature_outputs.size(); first += 8) {
+        const auto end = std::min(first + 8, feature_outputs.size());
+        std::vector<Array> parts(feature_outputs.begin() + first,
+                                 feature_outputs.begin() + end);
+        next.push_back(parts.size() == 1 ? parts.front() : graph::concat(parts, -1));
+      }
+      feature_outputs = std::move(next);
+    }
+    features = feature_outputs.size() == 1 ? feature_outputs.front()
+                                           : graph::concat(feature_outputs, -1);
+  }
   std::vector<graph::NodePtr> roots;
   roots.push_back(y.node());
+  if (features.valid()) roots.push_back(features.node());
   // A traced block output is only read after the whole stack has run, and the
   // slot planner recycles any buffer whose in-graph consumers are done. Held
   // Array handles are not consumers, so without this every trace entry aliases
@@ -837,10 +900,13 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   for (const auto& group : cache_.program.groups())
     for (const auto& node : group.nodes)
       if (node->prim && (node->prim->name() == "attention.decode_partial128.v1" ||
-                         node->prim->name() == "attention.decode_partial128.wg128c2.v2"))
+                         node->prim->name() == "attention.decode_partial128.wg128c2.v2" ||
+                         node->prim->name() == "attention.short_partial128.wg128c2.v1"))
         cache_.split_decode_attention = true;
   cache_.tokens = tokens;
   cache_.hidden = y;
+  cache_.features = features;
+  cache_.feature_layers.assign(feature_layers.begin(), feature_layers.end());
   cache_.states = states;
   cache_.seq = t_now;
   cache_.pass_id = ++pass_counter_;
@@ -889,6 +955,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     }
     cache_.program.set_carries(std::move(carries));
   }
+  if (capture != nullptr) capture->features = cache_.features;
   return y;
 }
 

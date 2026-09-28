@@ -106,6 +106,7 @@ struct HttpServer::Impl {
   model::HybridLM& model;
   tokenizer::Tokenizer& tok;
   model::MtpModule* mtp = nullptr;
+  model::DFlash2Module* dflash2 = nullptr;
   ServerOptions opt;
   httplib::Server http;
   // One model on one device. Two decodes at once would interleave on the same
@@ -198,6 +199,21 @@ struct HttpServer::Impl {
     }
     r.limits.max_tokens = want;
     r.limits.stop_tokens = stop_ids;
+    r.limits.mtp_depth = opt.mtp_depth;
+    if (body.contains("mtp_depth")) {
+      const auto& depth = body.at("mtp_depth");
+      if (!depth.is_number_integer() || depth < 1 || depth > runtime::kMaxMtpDepth) {
+        send_error(res, 400, "mtp_depth must be an integer from 1 to 7",
+                   "invalid_request_error", "mtp_depth");
+        return LSE_ERROR(kInvalidArgument, "mtp_depth");
+      }
+      r.limits.mtp_depth = depth.get<std::uint32_t>();
+    }
+    if (!runtime::valid_mtp_depth(r.limits.mtp_depth)) {
+      send_error(res, 400, "mtp_depth must be an integer from 1 to 7",
+                 "invalid_request_error", "mtp_depth");
+      return LSE_ERROR(kInvalidArgument, "mtp_depth");
+    }
 
     const std::int32_t n = get_or<std::int32_t>(body, "n", 1);
     if (n != 1) {
@@ -228,6 +244,10 @@ struct Outcome {
   std::uint64_t prefill_ns = 0;
   std::uint64_t decode_ns = 0;
   detail::JitTotals jit;
+  std::uint32_t mtp_depth = 0;
+  std::uint32_t dflash2_depth = 0;
+  std::uint32_t spec_steps = 0, spec_tested = 0, spec_accepted = 0;
+  std::uint64_t spec_draft_ns = 0, spec_verify_ns = 0;
   double acceptance = -1.0;  // negative when nothing was speculated
 };
 
@@ -246,6 +266,7 @@ struct HttpServer::Run {
 
     runtime::Generator gen(impl.model, r.sampling);
     if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
+    if (impl.dflash2 != nullptr) gen.use_dflash2(*impl.dflash2);
 
     // The resident session: same state arrays every request, so the model's
     // shape checks see the graph it already retained. restart() zeroes the
@@ -299,6 +320,13 @@ struct HttpServer::Run {
 
     const runtime::GenerationStats& st = gen.stats();
     out.jit = detail::JitTotals::from(st);
+    out.mtp_depth = st.mtp_depth;
+    out.dflash2_depth = st.dflash2_depth;
+    out.spec_steps = st.spec_steps;
+    out.spec_tested = st.spec_tested;
+    out.spec_accepted = st.spec_accepted;
+    out.spec_draft_ns = st.spec_draft_ns;
+    out.spec_verify_ns = st.spec_verify_ns;
     out.prefill_tokens = st.prompt_tokens;
     out.decode_tokens = st.decoded_tokens();
     out.prefill_ns = st.prefill_ns;
@@ -310,8 +338,8 @@ struct HttpServer::Run {
     std::fprintf(stderr,
                  "lse-server: prompt %d in %.2fs (%.1f tok/s) | decode %d in "
                  "%.2fs (%.1f tok/s)%s\n",
-                 out.prefill_tokens, out.prefill_ns / 1e9, out.prompt_per_second,
-                 out.decode_tokens, out.decode_ns / 1e9,
+                 out.prefill_tokens, static_cast<double>(out.prefill_ns) / 1e9, out.prompt_per_second,
+                 out.decode_tokens, static_cast<double>(out.decode_ns) / 1e9,
                  out.decode_per_second,
                  out.acceptance >= 0.0
                      ? (" | accepted " + std::to_string(
@@ -343,7 +371,18 @@ json timings_of(const Outcome& o) {
          {"predicted_n", o.decode_tokens},
          {"predicted_ms", o.decode_ns / 1e6},
          {"predicted_per_second", o.decode_per_second}};
+  t["mtp_depth"] = o.mtp_depth;
+  t["dflash2_depth"] = o.dflash2_depth;
+  t["spec_method"] = o.dflash2_depth != 0 ? "dflash2"
+                       : o.mtp_depth != 0 ? "mtp" : "none";
   o.jit.append_to(t);
+  if (o.mtp_depth != 0 || o.dflash2_depth != 0) {
+    t["spec_steps"] = o.spec_steps;
+    t["spec_tested"] = o.spec_tested;
+    t["spec_accepted"] = o.spec_accepted;
+    t["spec_draft_ms"] = static_cast<double>(o.spec_draft_ns) / 1e6;
+    t["spec_verify_ms"] = static_cast<double>(o.spec_verify_ns) / 1e6;
+  }
   if (o.acceptance >= 0.0) t["acceptance_rate"] = o.acceptance;
   return t;
 }
@@ -389,7 +428,12 @@ HttpServer::HttpServer(model::HybridLM& model, tokenizer::Tokenizer& tok,
 
 HttpServer::~HttpServer() = default;
 
-void HttpServer::use_mtp(model::MtpModule& mtp) noexcept { impl_->mtp = &mtp; }
+void HttpServer::use_mtp(model::MtpModule& mtp) noexcept {
+  impl_->mtp = &mtp; impl_->dflash2 = nullptr;
+}
+void HttpServer::use_dflash2(model::DFlash2Module& draft) noexcept {
+  impl_->dflash2 = &draft; impl_->mtp = nullptr;
+}
 
 void HttpServer::stop() {
   impl_->stopping.store(true, std::memory_order_relaxed);
@@ -422,8 +466,14 @@ Status HttpServer::listen() {
         return httplib::Server::HandlerResponse::Unhandled;
       });
 
-  impl.http.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-    res.set_content(json{{"status", "ok"}}.dump(), "application/json");
+  impl.http.Get("/health", [&impl](const httplib::Request&, httplib::Response& res) {
+    res.set_content(json{{"status", "ok"},
+                          {"mtp_enabled", impl.mtp != nullptr},
+                          {"mtp_depth", impl.mtp != nullptr ? impl.opt.mtp_depth : 0},
+                          {"dflash2_enabled", impl.dflash2 != nullptr},
+                          {"dflash2_depth", impl.dflash2 != nullptr
+                                               ? impl.dflash2->block_size() - 1 : 0}}
+                        .dump(), "application/json");
   });
 
   auto list_models = [&impl](const httplib::Request&, httplib::Response& res) {

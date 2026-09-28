@@ -16,6 +16,7 @@ struct QuantPlan {
   bool rotate_decode_panel = false;
   std::uint32_t decode_columns = 1;
   std::uint32_t prefill_rows = 1;
+  std::uint32_t row_ladder_ceiling = 0;
 };
 
 [[nodiscard]] QuantPlan quant_plan(const graph::KernelShapes&, bool indexed = false);

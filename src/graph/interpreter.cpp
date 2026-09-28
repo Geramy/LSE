@@ -11,6 +11,7 @@
 // group that misses the device path runs here instead, and a host fallback that
 // disagrees is a wrong answer nothing else reports.
 #include "lse/kv/block.hpp"
+#include "lse/graph/kernel_primitive.hpp"
 #include "lse/quant/group_affine.hpp"
 
 namespace lse::graph::interpreter {
@@ -1324,13 +1325,15 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
                      "' is device source only; it needs the JIT backend");
   }
   if (n.prim != nullptr && n.prim->has_host_impl()) {
+    const auto* kernel = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
+    const bool raw_inputs = kernel != nullptr && kernel->owns_indexing();
     std::vector<std::vector<float>> staged(n.inputs.size());
     std::vector<const float*> ptrs(n.inputs.size());
     for (std::size_t i = 0; i < n.inputs.size(); ++i) {
-      staged[i].resize(count);
       const Node& src = *n.inputs[i];
-      for (std::size_t e = 0; e < count; ++e) {
-        staged[i][e] = load_element(src, broadcast_index(src.shape, n.shape, e));
+      staged[i].resize(raw_inputs ? src.element_count() : count);
+      for (std::size_t e = 0; e < staged[i].size(); ++e) {
+        staged[i][e] = load_element(src, raw_inputs ? e : broadcast_index(src.shape, n.shape, e));
       }
       ptrs[i] = staged[i].data();
     }

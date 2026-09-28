@@ -3,6 +3,7 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/dispatch/cache.hpp"
 #include <cstdio>
 #include <stdexcept>
 using namespace lse;
@@ -79,6 +80,39 @@ int main(){try{
   device.lds_bytes_per_workgroup=65536;
   auto replay=e->emit(scalar_group,device);
   require(replay.ok()&&replay->source==wide->source,"restored scalar row plan missed identity");
+ }
+ auto padded_out = quant_linear(leaf({3, 5120}, DType::kF32),
+                                leaf({17408, 640}, DType::kU32),
+                                leaf({17408, 80}, DType::kBF16),
+                                leaf({17408, 80}, DType::kBF16), 4, 64);
+ const NodePtr padded_roots[]{padded_out.node()};
+ FusionGroup padded_group;
+ for (auto& group : Partitioner::partition(padded_roots))
+   if (group.anchor == OpKind::kQuantMatMul) padded_group = group;
+ require(!padded_group.nodes.empty(), "padded row quant group absent");
+ for (IKernelEmitter* emitter : {static_cast<IKernelEmitter*>(&hip),
+                                 static_cast<IKernelEmitter*>(&loom)}) {
+   const auto intrinsics = emitter->sources();
+   device.lds_bytes_per_workgroup = 65536;
+   const auto padded_key = dispatch::specialization_cache_key(
+       0, padded_group, device, {}, intrinsics);
+   auto padded = emitter->emit(padded_group, device);
+   require(padded.ok() && padded->dims.workgroup_count[1] == 1,
+           "measured M3 padded row plan missing");
+   device.lds_bytes_per_workgroup = 33087;
+   const auto legacy_key = dispatch::specialization_cache_key(
+       0, padded_group, device, {}, intrinsics);
+   auto legacy = emitter->emit(padded_group, device);
+   require(legacy.ok() && legacy->dims.workgroup_count[1] == 2,
+           "unsupported M3 row capacity changed legacy plan");
+   require(padded_key != legacy_key,
+           "central padded row policy aliases specialization cache identity");
+   require(padded->source != legacy->source,
+           "padded row emission reused legacy body");
+   device.lds_bytes_per_workgroup = 65536;
+   auto replay = emitter->emit(padded_group, device);
+   require(replay.ok() && replay->source == padded->source,
+           "restored padded row policy missed cached emission");
  }
  std::puts("PASS HIP/Loom actual selected-implementation emission and persistent cache identities; no GPU");
 }catch(const std::exception&e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

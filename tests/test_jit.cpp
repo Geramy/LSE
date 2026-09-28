@@ -188,11 +188,12 @@ Result<EmittedKernel> emit_for(Array& root) {
 // The group that anchors on `kind`, not the first one: a root whose operands
 // are themselves computed contributes a group per operand, and those come
 // first in topological order.
-Result<EmittedKernel> emit_anchor(Array& root, OpKind kind) {
+Result<EmittedKernel> emit_anchor(
+    Array& root, OpKind kind, const backend::DeviceInfo& device = gfx1151()) {
   const NodePtr roots[] = {root.node()};
   auto groups = Partitioner::partition(roots);
   for (const FusionGroup& g : groups) {
-    if (g.anchor == kind) return kEmitter.emit(g, gfx1151());
+    if (g.anchor == kind) return kEmitter.emit(g, device);
   }
   return LSE_ERROR(kNotFound, "no group anchored on ", to_string(kind));
 }
@@ -1381,28 +1382,18 @@ LSE_TEST(the_traffic_split_prices_both_terms_of_a_contraction) {
   }
 }
 
-// THE DISAGREEMENT CHECK, on kernels this engine really emits.
-//
-// The failure it exists to catch is on record: a traffic model that priced the
-// weight and forgot the activation, which made a row tile look like a 26.6% win
-// that was never available. Here the same model is built both ways against the
-// same compiled object — correctly, and weight-only — and the object has to
-// contradict the second one.
-//
-// HOW BADLY IT CONTRADICTS IS THE ROW TILE'S OWN FACTOR, so which K clears the
-// instrument's measured 3x spread moves when the tile does. Weight-only
-// understates by the ratio of the whole workgroup's reads to its weight reads,
-// which is set by the rows the tile covers; at K=17408 the tile is two rows and
-// the object reads 4.1x the model, decidably more, while at K=5120 it is four
-// and the 2.5x sits inside the spread. So the assertion is in two parts: the
-// weight-only model must read high at EVERY shape — that part is a property of
-// the model and holds whatever the tile is — and it must be called a
-// disagreement wherever the gap clears what the instrument can resolve.
+// Compare the complete traffic model and a weight-only model against the
+// same compiled DOT4 object. At least one shape must exceed the census spread.
 LSE_TEST(a_traffic_model_that_forgets_a_term_disagrees_with_the_object) {
   if (!kCompiler.available()) return;
   constexpr std::int64_t kGroup = 64;
   constexpr std::int64_t kN = 16;
-  constexpr std::int64_t kRows = 8;
+  constexpr std::int64_t kRows = 512;
+  // Automatic INT8 starts at M512; isolate its DOT4 path from matrix tiling.
+  auto amd = gfx1151_amd();
+  amd.matrix_core = backend::MatrixCore::kNone;
+  auto device = gfx1151();
+  device.extension = &amd;
   int caught = 0;
 
   for (const std::int64_t k : {std::int64_t{5120}, std::int64_t{17408}}) {
@@ -1413,7 +1404,7 @@ LSE_TEST(a_traffic_model_that_forgets_a_term_disagrees_with_the_object) {
     Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
     Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
     Array y = quant_linear(x, packed, scales, biases, 4, kGroup);
-    auto e = emit_anchor(y, OpKind::kQuantMatMul);
+    auto e = emit_anchor(y, OpKind::kQuantMatMul, device);
     LSE_EXPECT(e.ok());
     if (!e.ok()) continue;
 

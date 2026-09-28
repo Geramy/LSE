@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,15 @@ struct HybridLMSpec {
   std::int32_t gdn_conv_width = 0;
 };
 
+// Zero-based block outputs before the final norm, concatenated as F32 [B,T,L*D].
+// The result follows the retained hidden-output lifetime: replay refreshes its
+// buffer, so consume it before the next pass using the same program.
+struct FeatureCapture {
+  // Borrowed for the call; nonempty, strictly increasing and within the stack.
+  std::span<const std::int32_t> layer_ids;
+  Array features;
+};
+
 class HybridLM {
  public:
   using BlockFactory =
@@ -148,7 +158,8 @@ class HybridLM {
   Result<Array> hidden(const Array& tokens, std::vector<MixerState>* states,
                        Array* aux_loss, std::vector<Array>* trace = nullptr,
                        const StepRows* rows = nullptr,
-                       bool replaces_previous = false);
+                       bool replaces_previous = false,
+                       FeatureCapture* capture = nullptr);
 
   // Puts every mixer's sequence cursor back to `position`. The paged
   // pool is overwritten in place by the pass that follows, so this plus a
@@ -208,6 +219,8 @@ class HybridLM {
     graph::Program program;
     Array tokens;
     Array hidden;
+    Array features;
+    std::vector<std::int32_t> feature_layers;
     Array meta;
     const void* states = nullptr;
     std::int64_t seq = -1;

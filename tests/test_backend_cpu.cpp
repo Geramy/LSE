@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <numeric>
+#include <limits>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -104,6 +106,63 @@ LSE_TEST(copies_are_bounds_checked) {
 
   be.deallocate(owned);
   be.shutdown();
+}
+
+LSE_TEST(cpu_device_copies_preserve_views_overlap_and_reject_invalid_ranges) {
+  BackendAdapter<CpuBackend> be;
+  BackendAdapter<CpuBackend> other;
+  LSE_EXPECT_OK(be.init(0));
+  LSE_EXPECT_OK(other.init(0));
+  auto source = be.allocate(64, MemoryClass::kDevice, kDefaultStream);
+  auto target = be.allocate(64, MemoryClass::kDevice, kDefaultStream);
+  auto foreign = other.allocate(64, MemoryClass::kDevice, kDefaultStream);
+  LSE_EXPECT(source.ok() && target.ok() && foreign.ok());
+  if (!source.ok() || !target.ok() || !foreign.ok()) return;
+  std::vector<std::uint8_t> initial(64), expected(64, 0xa5);
+  std::iota(initial.begin(), initial.end(), std::uint8_t{1});
+  LSE_EXPECT_OK(be.copy_h2d(initial.data(), *source, initial.size(), 0));
+  LSE_EXPECT_OK(be.copy_h2d(expected.data(), *target, expected.size(), 0));
+  auto src_view = *source;
+  src_view.offset = 7;
+  src_view.size_bytes = 24;
+  auto dst_view = *target;
+  dst_view.offset = 11;
+  dst_view.size_bytes = 16;
+  LSE_EXPECT_OK(be.copy({dst_view, 4}, {src_view, 3}, 8));
+  for (std::size_t i = 0; i < 8; ++i) expected[15 + i] = initial[10 + i];
+  std::vector<std::uint8_t> got(64);
+  LSE_EXPECT_OK(be.copy_d2h(*target, got.data(), got.size(), 0));
+  LSE_EXPECT(got == expected);
+
+  auto overlap = *source;
+  overlap.offset = 5;
+  overlap.size_bytes = 32;
+  LSE_EXPECT_OK(be.copy({overlap, 3}, {overlap, 0}, 16));
+  auto shifted = initial;
+  for (std::size_t i = 0; i < 16; ++i) shifted[8 + i] = initial[5 + i];
+  LSE_EXPECT_OK(be.copy_d2h(*source, got.data(), got.size(), 0));
+  LSE_EXPECT(got == shifted);
+
+  for (const auto& offsets :
+       std::vector<std::pair<std::size_t, std::size_t>>{
+           {24, 0}, {0, 16}, {std::numeric_limits<std::size_t>::max(), 0}}) {
+    const auto refused = be.copy_peer(src_view, dst_view, 1, offsets.first,
+                                      offsets.second);
+    LSE_EXPECT(refused.code() == StatusCode::kOutOfRange);
+  }
+  LSE_EXPECT(be.copy_peer(src_view, dst_view,
+                          std::numeric_limits<std::size_t>::max(), 0, 0)
+                 .code() == StatusCode::kOutOfRange);
+  LSE_EXPECT(be.copy_peer(*foreign, dst_view, 1, 0, 0).code() ==
+              StatusCode::kInvalidArgument);
+  LSE_EXPECT(be.copy_peer(src_view, *foreign, 1, 0, 0).code() ==
+              StatusCode::kInvalidArgument);
+  auto unmapped = src_view;
+  unmapped.ptr = nullptr;
+  LSE_EXPECT(be.copy_peer(unmapped, dst_view, 1, 0, 0).code() ==
+              StatusCode::kInvalidArgument);
+  LSE_EXPECT_OK(be.copy_d2h(*target, got.data(), got.size(), 0));
+  LSE_EXPECT(got == expected);
 }
 
 LSE_TEST(zero_size_allocation_is_an_error) {

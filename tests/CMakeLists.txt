@@ -13,6 +13,7 @@ function(lse_add_test name)
 endfunction()
 
 lse_add_test(test_generation_stats)
+lse_add_test(test_mtp_options)
 lse_add_test(test_http_timings)
 target_include_directories(test_http_timings PRIVATE
   ${CMAKE_SOURCE_DIR}/src/server ${CMAKE_SOURCE_DIR}/third_party/vendor)
@@ -75,6 +76,12 @@ target_sources(test_loom_flash PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+lse_add_test(test_loom_concat lse_graph lse_kernels lse_ir)
+target_sources(test_loom_concat PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_loom_cache lse_graph lse_kernels lse_ir)
 target_sources(test_loom_cache PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
@@ -108,6 +115,10 @@ add_test(NAME test_server_shutdown COMMAND test_server_shutdown)
 set_tests_properties(test_server_shutdown PROPERTIES TIMEOUT 15)
 
 lse_add_test(test_model lse_model lse_backends)
+lse_add_test(test_feature_taps lse_model lse_backends)
+lse_add_test(test_dflash2 lse_model lse_backends)
+set_tests_properties(test_dflash2 test_feature_taps PROPERTIES
+  ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 
 if(LSE_ENABLE_CPU)
   lse_add_test(test_reference lse_model lse_graph lse_backends)
@@ -182,7 +193,7 @@ find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND AND TARGET lse-server)
   add_test(NAME test_server_cli
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_server_cli.py
-            $<TARGET_FILE:lse-server>)
+            $<TARGET_FILE:lse-server> $<TARGET_FILE:lse>)
 endif()
 
 lse_add_test(test_probe_measurement)
@@ -296,6 +307,13 @@ if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
   lse_add_test(test_fp8_conversion_native lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
 
+lse_add_test(test_q8_matrix_dispatch lse_graph lse_kernels lse_ir)
+target_sources(test_q8_matrix_dispatch PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)
+
 lse_add_test(test_quant_dispatch lse_graph lse_kernels lse_ir)
 target_sources(test_quant_dispatch PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
@@ -378,3 +396,25 @@ else()
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 endif()
+
+lse_add_test(test_topk_parallel lse_graph lse_kernels lse_backends lse_ir)
+if(NOT TARGET lse_backend_hrx)
+  target_sources(test_topk_parallel PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
+set_tests_properties(test_topk_parallel PROPERTIES
+  ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
+if(LSE_ROCM_RUNTIME_DIR)
+  set_property(TEST test_topk_parallel APPEND PROPERTY ENVIRONMENT
+    "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
+endif()
+
+lse_add_test(test_attention_short lse_graph lse_kernels lse_ir)
+target_sources(test_attention_short PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)

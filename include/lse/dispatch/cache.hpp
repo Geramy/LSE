@@ -51,6 +51,10 @@ namespace lse::dispatch {
       mix(plan.rotate_decode_panel);
       mix(plan.decode_columns);
       mix(plan.prefill_rows);
+      if (plan.row_ladder_ceiling != 0) {
+        mix(implementation_id("quant.padded-row-ladder.v1"));
+        mix(plan.row_ladder_ceiling);
+      }
       if (plan.matrix) mix(implementation_id(plan.matrix->key));
     }
     const auto* chosen=primitive->specialize(probe);

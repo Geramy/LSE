@@ -77,7 +77,7 @@ LSE_TEST(decode_attention_specialization_reports_exact_resources) {
   }
 }
 
-LSE_TEST(decode_attention_declines_unqualified_contracts) {
+LSE_TEST(decode_attention_falls_back_to_flash_for_supported_contracts) {
   for (int variant = 0; variant < 9; ++variant) {
     Fixture fx;
     if (variant == 0)
@@ -103,8 +103,13 @@ LSE_TEST(decode_attention_declines_unqualified_contracts) {
     }
     const auto *base = fx.primitive();
     LSE_EXPECT(base != nullptr);
-    if (base)
-      LSE_EXPECT(base->specialize(shapes) == base);
+    if (base) {
+      const auto* selected = base->specialize(shapes);
+      if (variant == 4)
+        LSE_EXPECT(selected != nullptr && selected->name() == "attention.flash");
+      else
+        LSE_EXPECT(selected == base);
+    }
   }
 }
 
@@ -163,7 +168,7 @@ LSE_TEST(attention_dispatch_flash_tiles_follow_device_and_scratch_limits) {
   fx.shapes[0] = Shape{2, 24, 11, 256};
   LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
   fx.shapes[0] = Shape{2, 24, 7, 256};
-  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kScalar);
+  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
 }
 
 LSE_TEST(attention_dispatch_rejects_malformed_paged_input_contracts) {

@@ -5,6 +5,8 @@
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 #include "lse/graph/ops.hpp"
 #include <cstdio>
+#include <utility>
+#include <vector>
 #include <stdexcept>
 using namespace lse;
 using namespace lse::graph;
@@ -46,8 +48,11 @@ int main() {
     backend::LoomEmitter loom;
     backend::LoomcCompiler compiler;
     require(compiler.available(), "native Loom compiler unavailable");
+    std::vector<std::pair<int, int>> cases;
     for (int rows : {1, 32, 512})
-      for (int bits : {4, 6, 8}) {
+      for (int bits : {4, 6, 8}) cases.emplace_back(rows, bits);
+    for (int rows : {2, 3, 7, 8}) cases.emplace_back(rows, 4);
+    for (auto [rows, bits] : cases) {
         auto group = projection(rows, bits);
         const auto hip_key = hip.cache_key(group, device),
                    loom_key = loom.cache_key(group, device);
@@ -56,7 +61,7 @@ int main() {
           throw std::runtime_error(h.status().to_string());
         if (!l.ok())
           throw std::runtime_error(l.status().to_string());
-        const bool expected = bits == 4 && (rows == 1 || rows == 512);
+        const bool expected = bits == 4 && (rows <= 8 || rows == 512);
         const bool hip_dot =
             h->source.find("__builtin_amdgcn_sudot4") != std::string::npos;
         const bool hip_matrix =
@@ -72,8 +77,25 @@ int main() {
         require((loom_dot || loom_matrix) == expected,
                 "Loom activation-conversion selection mismatch");
         if (expected) {
-          require(rows == 1 ? hip_dot : hip_matrix, "HIP wrong INT8 route");
-          require(rows == 1 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
+          require(rows < 512 ? hip_dot : hip_matrix, "HIP wrong INT8 route");
+          require(rows < 512 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
+        }
+        for (unsigned axis = 0; axis < 3; ++axis) {
+          require(h->dims.workgroup_size[axis] == l->dims.workgroup_size[axis] &&
+                      h->dims.workgroup_count[axis] == l->dims.workgroup_count[axis],
+                  "HIP/Loom launch plans differ");
+        }
+        require(h->lds_bytes == l->lds_bytes, "HIP/Loom LDS plans differ");
+        auto declared = backend::HipEmitter::shared_bytes(h->source);
+        require(declared.ok() && *declared == h->lds_bytes &&
+                    h->lds_bytes <= device.lds_bytes_per_workgroup,
+                "declared LDS differs from launch plan");
+        if (rows >= 2 && rows <= 8 && bits == 4) {
+          amd.has_dot4_iu8 = false;
+          require(hip.cache_key(group, device) != hip_key &&
+                      loom.cache_key(group, device) != loom_key,
+                  "INT8 and FP32 specialization cache keys collide");
+          amd.has_dot4_iu8 = true;
         }
         auto cached = loom.emit(group, device);
         require(cached.ok() && cached->source == l->source,
@@ -92,7 +114,7 @@ int main() {
                 raw->text.find("vector.dot4i<s8u8>") != std::string::npos,
             "raw integer dot was disabled");
     std::puts("PASS quantization defaults, HIP/Loom selection, cached replay, and "
-              "nine native shaders; no GPU opened");
+              "thirteen native shaders; no GPU opened");
     return 0;
   } catch (const std::exception &error) {
     std::fprintf(stderr, "FAIL: %s\n", error.what());

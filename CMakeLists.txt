@@ -231,6 +231,7 @@ add_library(lse_kernels
   src/kernels/matmul.cpp
   src/kernels/quant_embedding.cpp
   src/dispatch/quant.cpp
+  src/dispatch/q8_matrix.cpp
   src/dispatch/attention.cpp
   src/kernels/quant_linear.cpp
   src/kernels/reduction.cpp
@@ -243,6 +244,9 @@ add_library(lse_kernels
   src/kernels/transpose.cpp
   src/kernels/wmma_linear.cpp
   src/kernels/wmma_quant_linear.cpp
+  src/kernels/wmma_q8_linear.cpp
+  src/kernels/dflash2_sdpa.cpp
+  src/kernels/dflash2_selector.cpp
   src/kernels/wmma_q6_linear.cpp
 )
 add_library(lse::kernels ALIAS lse_kernels)
@@ -323,6 +327,7 @@ add_library(lse_model
   src/model/config.cpp
   src/model/hybrid_lm.cpp
   src/model/mtp.cpp
+  src/model/dflash2.cpp
   src/model/layer.cpp
   src/model/registry.cpp
   src/model/weights.cpp

@@ -7,6 +7,8 @@
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
 #include "lse/dispatch/quant.hpp"
+#include "lse/dispatch/q8_matrix.hpp"
+#include "lse/kernels/wmma_q8_linear.hpp"
 #include "lse/kernels/quant_panel.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
@@ -310,12 +312,13 @@ std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
   if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
   if (s.device == nullptr) return 1;
   const auto m = static_cast<std::uint32_t>(d.m);
+  const auto row_limit = std::max(m, dispatch::quant_plan(s, indexed).row_ladder_ceiling);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);
 
   std::array<opt::Arrangement, 4> priced{};
   std::array<std::uint32_t, 4> rung{};
   std::size_t n = 0;
-  for (std::uint32_t r = 1; r <= kMaxRowsPerGroup && r <= m; r <<= 1) {
+  for (std::uint32_t r = 1; r <= kMaxRowsPerGroup && r <= row_limit; r <<= 1) {
     const std::uint32_t splits = dot_ksplits(d, r, budget);
     if (splits == 0) break;
     priced[n].traffic = traffic_at(s, d, indexed, r);
@@ -971,6 +974,9 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
             static_cast<std::uint32_t>(d.m)};
   }
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    if (const auto rows = dispatch::q8_matrix_rows(s); rows != 0) {
+      if (const KernelPrimitiveBase* w = wmma_q8_linear_for(s, rows)) return w;
+    }
     if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
     return this;

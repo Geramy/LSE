@@ -13,6 +13,7 @@
 #include "lse/core/status.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
+#include "lse/model/dflash2.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 
 namespace lse::server {
@@ -28,6 +29,7 @@ struct ServerOptions {
   std::string api_key;
   // Refused above this, so one request cannot take the whole KV pool.
   std::int32_t max_tokens_cap = 4096;
+  std::uint32_t mtp_depth = 2;
 };
 
 class HttpServer {
@@ -40,6 +42,7 @@ class HttpServer {
 
   // Speculative decoding, when the checkpoint shipped a module.
   void use_mtp(model::MtpModule& mtp) noexcept;
+  void use_dflash2(model::DFlash2Module& draft) noexcept;
 
   // Blocks until stop() is called or the listen fails.
   Status listen();

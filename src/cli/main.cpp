@@ -1,6 +1,7 @@
 // lse — load a checkpoint, tokenize a prompt, stream the continuation.
 #include <algorithm>
 #include <chrono>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include "lse/ir/pass/pass.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/mtp.hpp"
+#include "lse/model/dflash2.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/place/devices.hpp"
@@ -46,6 +48,8 @@ struct Options {
   // is where a release that has one puts it.
   std::string mtp;
   bool no_mtp = false;
+  bool dflash2 = false;
+  std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
   // Which source dialect this run would rather its kernels were written in.
@@ -90,6 +94,9 @@ void usage() {
       "      --mtp PATH         multi-token-prediction module: a directory, a\n"
       "                         .safetensors or an HF repo id. Default: the one\n"
       "                         beside the model, when the checkpoint has one\n"
+      "      --mtp-depth N      draft proposals per verifier pass (1..7, default 2)\n"
+      "      --dflash2=on       use the DFlash2 block drafter (default off)\n"
+      "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
       "      --no-mtp           decode one token per pass, ignoring any\n"
       "                         multi-token-prediction module\n"
       "      --list-models      print the registered model kernels and exit\n"
@@ -189,6 +196,28 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->sampling.repetition_penalty = std::strtof(v.c_str(), nullptr);
     } else if (a == "--mtp") {
       if (!take_value(argc, argv, i, "--mtp", &opt->mtp)) return false;
+    } else if (a == "--mtp-depth") {
+      if (!take_value(argc, argv, i, "--mtp-depth", &v)) return false;
+      const auto parsed = std::from_chars(v.data(), v.data() + v.size(),
+                                          opt->limits.mtp_depth);
+      if (parsed.ec != std::errc{} || parsed.ptr != v.data() + v.size() ||
+          !runtime::valid_mtp_depth(opt->limits.mtp_depth)) {
+        std::fputs("lse: MTP depth must be an integer from 1 to 7\n", stderr);
+        return false;
+      }
+    } else if (a == "--dflash2" || a.starts_with("--dflash2=")) {
+      if (a == "--dflash2") {
+        if (!take_value(argc, argv, i, "--dflash2", &v)) return false;
+      } else {
+        v = a.substr(std::string("--dflash2=").size());
+      }
+      if (v != "on" && v != "off") {
+        std::fputs("lse: --dflash2 must be on or off\n", stderr);
+        return false;
+      }
+      opt->dflash2 = v == "on";
+    } else if (a == "--dflash2-model") {
+      if (!take_value(argc, argv, i, "--dflash2-model", &opt->dflash2_model)) return false;
     } else if (a == "--no-mtp") {
       opt->no_mtp = true;
     } else if (a == "--arch") {
@@ -517,6 +546,10 @@ void report_pool(const Qualification& q) {
 int main(int argc, char** argv) {
   Options opt;
   if (!parse(argc, argv, &opt)) return 2;
+  if (opt.dflash2 && (opt.batch != 1 || !opt.prompts.empty())) {
+    std::fputs("lse: DFlash2 requires one sequence\n", stderr);
+    return 2;
+  }
   if (opt.list_devices) return list_devices();
   if (opt.list_cache) return list_cache();
   if (opt.debug) {
@@ -677,7 +710,7 @@ int main(int argc, char** argv) {
   // --no-mtp exists to measure that: the two paths must answer the same text,
   // and a run cannot be compared against itself.
   std::unique_ptr<model::MtpModule> mtp;
-  if (opt.no_mtp) {
+  if (opt.dflash2 || opt.no_mtp) {
     opt.mtp.clear();
   } else if (opt.mtp.empty() && cfg->mtp_layers > 0) {
     opt.mtp = model::MtpModule::find_beside(opt.model);
@@ -686,14 +719,24 @@ int main(int argc, char** argv) {
     auto opened = model::MtpModule::open(opt.mtp, *cfg, *lm);
     if (!opened.ok()) return fail(opened.status(), "loading the MTP module");
     mtp = opened.release();
-    std::fprintf(stderr, "mtp: %s\n", mtp->path().c_str());
-  } else if (cfg->mtp_layers > 0 && !opt.no_mtp) {
+    std::fprintf(stderr, "mtp: depth %u from %s\n",
+                 opt.limits.mtp_depth, mtp->path().c_str());
+  } else if (cfg->mtp_layers > 0 && !opt.no_mtp && !opt.dflash2) {
     std::fputs("lse: this checkpoint declares an MTP module but none was found "
                "beside it; pass --mtp to name one\n", stderr);
   }
 
+  std::unique_ptr<model::DFlash2Module> dflash2;
+  if (opt.dflash2) {
+    auto opened = model::DFlash2Module::open(opt.dflash2_model, *cfg, *lm);
+    if (!opened.ok()) return fail(opened.status(), "loading DFlash2");
+    dflash2 = opened.release();
+    std::fprintf(stderr, "dflash2: block %u from %s\n",
+                 dflash2->block_size(), opt.dflash2_model.c_str());
+  }
   runtime::Generator gen(*lm, opt.sampling);
   if (mtp != nullptr) gen.use_mtp(*mtp);
+  if (dflash2 != nullptr) gen.use_dflash2(*dflash2);
   auto stream = tok->stream();
 
   // Streamed through DecodeStream so a multi-byte character is never cut in
@@ -728,7 +771,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "prompt %d tokens, prefill %.2f s (%.2f tok/s) | generated %d tokens | "
                  "decode %d tokens in %.3f s (%.2f tok/s)\n"
-                 "spec steps %u accepted %u (%.1f%%) | %u verify pass(es) "
+                 "mtp depth %u | dflash2 depth %u | spec steps %u accepted %u/%u (%.1f%%) | %u verify pass(es) "
                  "%.1f ms each | draft %.1f ms each\n"
                  "launches %u | phases %u (ideal %u launch%s) | groups "
                  "device=%u host=%u views=%u fallbacks=%u\n"
@@ -741,7 +784,8 @@ int main(int argc, char** argv) {
                  s.prompt_tokens_per_second(), s.generated_tokens,
                  s.decoded_tokens(), static_cast<double>(s.decode_ns) / 1e9,
                  s.decode_tokens_per_second(),
-                 s.spec_steps, s.spec_accepted, s.acceptance_rate() * 100.0,
+                 s.mtp_depth, s.dflash2_depth, s.spec_steps, s.spec_accepted, s.spec_tested,
+                 s.acceptance_rate() * 100.0,
                  s.spec_verify_passes,
                  s.spec_verify_passes == 0
                      ? 0.0

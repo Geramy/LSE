@@ -126,6 +126,23 @@ Status CpuBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   return OkStatus();
 }
 
+Status CpuBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                                  std::size_t bytes, std::size_t src_offset,
+                                  std::size_t dst_offset) {
+  if (src.ptr == nullptr || dst.ptr == nullptr ||
+      src.residency != device_index() || dst.residency != device_index()) {
+    return LSE_ERROR(kInvalidArgument, "copy_peer requires this CPU's buffers");
+  }
+  if (src_offset > src.size_bytes || bytes > src.size_bytes - src_offset ||
+      dst_offset > dst.size_bytes || bytes > dst.size_bytes - dst_offset) {
+    return LSE_ERROR(kOutOfRange, "copy_peer exceeds a buffer view");
+  }
+  std::memmove(static_cast<std::byte*>(dst.ptr) + dst.offset + dst_offset,
+               static_cast<const std::byte*>(src.ptr) + src.offset + src_offset,
+               bytes);
+  return OkStatus();
+}
+
 Result<KernelHandle> CpuBackend::load_executable_impl(
     std::string_view name, std::span<const std::byte> code_object) {
   (void)name;

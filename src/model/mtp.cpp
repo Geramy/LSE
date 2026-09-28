@@ -203,6 +203,7 @@ void MtpModule::reset() {
   }
   state_ = MixerState{};
   pass_ = Pass{};
+  passes_.clear();
   position_ = 0;
 }
 

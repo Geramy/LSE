@@ -1,14 +1,15 @@
-// Tiled paged attention shares FP32 scores and carries online softmax state.
 #include <string_view>
 #include <string>
 #include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
-#include "lse/dispatch/attention.hpp"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
-#include "lse/kv/block.hpp"
+
 #include "lse/math.hpp"
 
 namespace lse::kernels {
@@ -19,10 +20,41 @@ namespace math = lse::math;
 namespace {
 
 constexpr std::uint32_t kThreads = 256;
-constexpr std::uint32_t kDefaultQTile = 8;
-constexpr std::uint32_t kPrefillQTile = 12;
+
 constexpr std::uint32_t kKWin = kThreads;
-using Dims = dispatch::FlashDims;
+struct Dims {
+  std::uint32_t bsz = 1, qh = 0, kvh = 0, tq = 0, dh = 0, dv = 0;
+  std::uint32_t group = 0, capacity = 0, length = 0, window = 0;
+  float scale = 0;
+  bool valid = false;
+};
+Dims dimensions(const KernelShapes& s) {
+  Dims d;
+  if (s.inputs.size() != 4 || s.inputs[0].rank() != 4 ||
+      s.inputs[1].rank() != 4 || s.inputs[2] != s.inputs[1] ||
+      s.inputs[3].elem_count() != 2 || s.inputs[0].dim(0) != 1 ||
+      s.inputs[1].dim(0) != 1 || s.inputs[0].dim(2) < 1 ||
+      s.inputs[0].dim(2) > 8 || s.inputs[1].dim(1) < 1 ||
+      s.inputs[0].dim(1) % s.inputs[1].dim(1) ||
+      s.inputs[0].dim(3) != s.inputs[1].dim(3) ||
+      s.inputs[1].dim(2) <= s.inputs[0].dim(2) || s.attrs[3] < 2) return d;
+  for (const Shape& shape : s.inputs)
+    for (std::size_t a = 0; a < shape.rank(); ++a)
+      if (shape.dim(a) <= 0 || shape.dim(a) > INT32_MAX) return d;
+  if (s.output_dtype != DType::kF32 || s.input_dtypes.size() != 4) return d;
+  for (DType type : s.input_dtypes) if (type != DType::kF32) return d;
+  d.qh = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+  d.kvh = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+  d.tq = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+  d.dh = d.dv = static_cast<std::uint32_t>(s.inputs[0].dim(3));
+  d.length = static_cast<std::uint32_t>(s.inputs[1].dim(2));
+  d.capacity = d.length - d.tq;
+  d.group = d.qh / d.kvh;
+  d.window = static_cast<std::uint32_t>(s.attrs[3]);
+  d.scale = 1.0f / std::sqrt(static_cast<float>(d.dh));
+  d.valid = true;
+  return d;
+}
 
 template <class E>
 struct FlashArgs {
@@ -30,32 +62,29 @@ struct FlashArgs {
   env::In<kir::f32, E> k;
   env::In<kir::f32, E> v;
   env::In<kir::f32, E> meta;
-  env::In<kir::f32, E> table;
   env::Out<kir::f32, E> out;
 };
 
-template <std::uint32_t QTile>
-struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
-  static constexpr std::string_view kName =
-      QTile == 12 ? "attention.flash.qtile12" : "attention.flash";
-  static constexpr std::string_view kEntry =
-      QTile == 12 ? "lse_sdpa_flash_qtile12" : "lse_sdpa_flash";
+struct DFlash2SdpaKernel final : KernelPrimitive<DFlash2SdpaKernel> {
+  static constexpr std::uint32_t QTile = 8;
+  static constexpr std::string_view kName = "dflash2.attention";
+  static constexpr std::string_view kEntry = "lse_dflash2_attention";
   static constexpr std::string_view kSource = {};
 
-  std::size_t arity() const noexcept override { return 3; }
+  std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    const Dims d = dispatch::flash_dimensions(s);
-    if (!dispatch::flash_supported(s, QTile) || s.types.scalar == nullptr || s.intrinsics == nullptr ||
+    const Dims d = dimensions(s);
+    if (!d.valid || !s.device || s.device->max_threads_per_workgroup < kThreads ||
+        static_cast<std::uint64_t>(QTile) * (d.dh + 2ull * kKWin + 4) * sizeof(float) > workgroup_lds_bytes(s.device) || s.types.scalar == nullptr || s.intrinsics == nullptr ||
         !s.store) {
       return {};
     }
     const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
     const std::uint32_t qchunks = (QTile * d.dh + kThreads - 1u) / kThreads;
     const std::uint32_t dpt = (d.dv + kThreads - 1u) / kThreads;
-    const std::uint32_t blocks_per_win = kKWin / d.ts;
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
@@ -64,9 +93,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
     env::Emit e{&k};
 
     const auto qs = e.lds<kir::f32>(QTile * d.dh);
-    // The window's scores, then the window's probabilities in place.
     const auto sc = e.lds<kir::f32>(QTile * kKWin);
-    // The tree reduction needs the scores intact while it consumes a copy.
     const auto red = e.lds<kir::f32>(QTile * kKWin);
     const auto mrow = e.lds<kir::f32>(QTile);
     const auto drow = e.lds<kir::f32>(QTile);
@@ -82,43 +109,17 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
     const auto q0 = e.let(qt * QTile);
     const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
 
-    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
-    // Padded rows write zero without reading a block-table row.
-    if (auto pad = e.when(b >= rows)) {
-      for (std::uint32_t r = 0; r < QTile; ++r) {
-        for (std::uint32_t p = 0; p < dpt; ++p) {
-          const auto qrow = e.let(q0 + r);
-          const auto dd = e.let(lid + p * kThreads);
-          if (auto g = e.when(qrow < d.tq && dd < d.dv)) {
-            e.store(obase + qrow * d.dv + dd, e.f32(0.0f));
-          }
-        }
-      }
-    }
-    (void)e.ret_if(b >= rows);
-
-    const auto mb =
-        e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
-              b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
-    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
-    // Clamp live metadata to the block-table capacity.
-    const auto capacity = e.u32(d.stride * d.ts);
-    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
-    const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
-    const auto tb = e.let(b * d.stride);
-
-    // The query tile, read once into LDS and then read by every key.
+    const auto loaded_live = e.let(kir::cast<kir::u32>(a.meta[0u]));
+    const auto context_live = e.let(select(loaded_live < d.capacity, loaded_live, e.u32(d.capacity)));
+    const auto begin = e.let(kir::cast<std::int64_t>(e.u32(d.capacity)) -
+                             kir::cast<std::int64_t>(context_live));
+    const auto row_len = e.u32(d.length);
     for (std::uint32_t c = 0; c < qchunks; ++c) {
       const auto idx = e.let(lid + c * kThreads);
-      // The tile is QTile * dh floats, which a narrow head leaves smaller
-      // than the workgroup. Without this the surplus threads write past `qs`
-      // and into the arrays behind it.
       if (auto inb = e.when(idx < QTile * d.dh)) {
         const auto r = e.let(idx / d.dh);
         const auto dd = e.let(idx % d.dh);
         const auto qrow = e.let(q0 + r);
-        // Recording guards have no C++ else arm: initialize the padding
-        // before conditionally loading a live query row.
         qs[idx] = e.f32(0.0f);
         if (auto g = e.when(qrow < d.tq)) {
           qs[idx] = a.q[e.let(((b * d.qh + h) * d.tq + qrow) * d.dh + dd)];
@@ -135,28 +136,18 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
     for (std::uint32_t i = 0; i < QTile * dpt; ++i) o.push_back(e.var(0.0f));
     e.barrier();
 
-    // The longest live KV in the pass sets the trip count -- an outermost one,
-    // which is the only place a runtime extent is legal. A shorter row spends
-    // the remaining windows on compares.
-    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
-    const auto kv_len = e.runtime_extent(
-        "kv_len", select(loaded_max < capacity, loaded_max, capacity));
-    const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
+    const auto nwin = e.u32((d.length + kKWin - 1u) / kKWin);
     for (auto w : e.range(nwin)) {
       const auto wbase = e.let(w * kKWin);
       const auto j = e.let(wbase + lid);
 
-      // One thread, one key, one score per query row of the tile.
       for (std::uint32_t r = 0; r < QTile; ++r) {
         sc[e.let(r * kKWin + lid)] = math::neg_inf();
       }
       if (auto live = e.when(j < row_len)) {
-        const auto blk =
-            e.let(kir::cast<kir::u32>(a.table[e.let(tb + j / d.ts)]));
-        const auto kb0 =
-            e.let(((blk * d.kvh + kh) * d.ts + j % d.ts) * d.dh);
+        const auto kb0 = e.let(((b * d.kvh + kh) * d.length + j) * d.dh);
         for (std::uint32_t r = 0; r < QTile; ++r) {
-          const auto abs_i = e.let(offset + (q0 + r));
+          const auto abs_i = e.let(e.u32(d.capacity) + q0 + r);
           auto score = e.var(0.0f);
           for (auto dd : e.range(d.dh)) {
             score = math::fma(qs[e.let(r * d.dh + dd)].read(),
@@ -164,24 +155,14 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
           }
           const auto sv = e.let(score.read() * d.scale);
           const auto at = e.let(r * kKWin + lid);
-          if (d.mask == 0) {
+          if (auto g = e.when(j >= d.capacity ||
+                              (kir::cast<std::int64_t>(j) >= begin && j + d.window > abs_i))) {
             sc[at] = sv;
-          } else if (d.mask == 1) {
-            if (auto g = e.when(j <= abs_i)) sc[at] = sv;
-          } else {
-            const auto distance = e.let(kir::cast<std::int64_t>(abs_i) -
-                                         kir::cast<std::int64_t>(j));
-            if (auto g = e.when(j <= abs_i &&
-                                distance < kir::cast<std::int64_t>(e.u32(d.window)))) {
-              sc[at] = sv;
-            }
           }
         }
       }
       e.barrier();
 
-      // Window max. Every row reduces on the same step, so the tree costs the
-      // barriers of one reduction rather than of QTile of them.
       for (std::uint32_t r = 0; r < QTile; ++r) {
         red[e.let(r * kKWin + lid)] = sc[e.let(r * kKWin + lid)].read();
       }
@@ -197,9 +178,6 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
         e.barrier();
       }
 
-      // A row whose keys are all masked has no max to subtract. Subtracting
-      // zero instead leaves exp(-inf) = 0, where subtracting -inf is a NaN
-      // that would poison the accumulator for every later window.
       if (auto g = e.when(lid < QTile)) {
         const auto wmax = e.let(red[e.let(lid * kKWin)].read());
         const auto mold = e.let(mrow[lid].read());
@@ -233,8 +211,6 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
                               red[e.let(lid * kKWin)].read());
       }
 
-      // The accumulator carries the old max; rescale it to the new one before
-      // this window's terms go in.
       for (std::uint32_t r = 0; r < QTile; ++r) {
         const auto al = e.let(arow[e.u32(r)].read());
         for (std::uint32_t p = 0; p < dpt; ++p) {
@@ -242,27 +218,17 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
         }
       }
 
-      // One table read per block, and the value it names is spent on every
-      // query row of the tile before it is dropped.
-      for (std::uint32_t bi = 0; bi < blocks_per_win; ++bi) {
-        const auto j0 = e.let(wbase + bi * d.ts);
-        if (auto held = e.when(j0 < row_len)) {
-          const auto blk =
-              e.let(kir::cast<kir::u32>(a.table[e.let(tb + j0 / d.ts)]));
-          const auto vb0 = e.let(((blk * d.kvh + kh) * d.ts) * d.dv);
-          for (std::uint32_t jj = 0; jj < d.ts; ++jj) {
-            const std::uint32_t slot = bi * d.ts + jj;
-            if (auto live_value = e.when(j0 + jj < row_len)) {
-              for (std::uint32_t p = 0; p < dpt; ++p) {
-                const auto dd = e.let(lid + p * kThreads);
-                if (auto g = e.when(dd < d.dv)) {
-                  const auto vv = e.let(a.v[e.let(vb0 + jj * d.dv + dd)]);
-                  for (std::uint32_t r = 0; r < QTile; ++r) {
-                    o[r * dpt + p] =
-                        math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
-                                  o[r * dpt + p].read());
-                  }
-                }
+      for (auto slot : e.range(kKWin)) {
+        const auto jv = e.let(wbase + slot);
+        if (auto held = e.when(jv < row_len && kir::cast<std::int64_t>(jv) >= begin)) {
+          const auto vb0 = e.let(((b * d.kvh + kh) * d.length + jv) * d.dv);
+          for (std::uint32_t p = 0; p < dpt; ++p) {
+            const auto dd = e.let(lid + p * kThreads);
+            if (auto g = e.when(dd < d.dv)) {
+              const auto vv = e.let(a.v[e.let(vb0 + dd)]);
+              for (std::uint32_t r = 0; r < QTile; ++r) {
+                o[r * dpt + p] = math::fma(
+                    sc[e.let(r * kKWin + slot)].read(), vv, o[r * dpt + p].read());
               }
             }
           }
@@ -288,42 +254,67 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
-    if (in.size() != 5) {
-      return LSE_ERROR(kInvalidArgument, "flash sdpa takes 5 inputs");
+    if (in.size() != 4 || in[0].rank() != 4 || in[1].rank() != 4 ||
+        in[2] != in[1] || in[0].dim(0) != 1 || in[1].dim(0) != 1 ||
+        in[0].dim(1) < 1 || in[1].dim(1) < 1 ||
+        in[0].dim(1) % in[1].dim(1) || in[0].dim(3) != in[1].dim(3) ||
+        in[0].dim(2) < 1 || in[0].dim(2) > 8 ||
+        in[1].dim(2) <= in[0].dim(2) || in[3].elem_count() != 2) {
+      return LSE_ERROR(kInvalidArgument, "invalid DFlash2 attention geometry");
     }
-    return Shape{in[0].dim(0), in[0].dim(1), in[0].dim(2), in[2].dim(3)};
+    return in[0];
   }
   DType infer_dtype(std::span<const DType> in) const override {
     return in.empty() ? DType::kF32 : in[0];
   }
 
+  bool has_host_impl() const noexcept override { return true; }
+  void eval_cpu(std::span<const float* const> in, float* out,
+                std::size_t count, const std::array<float, 4>& attrs) const override {
+    const auto heads = static_cast<std::size_t>(attrs[0]);
+    const auto kv_heads = static_cast<std::size_t>(attrs[1]);
+    const auto dim = static_cast<std::size_t>(attrs[2]);
+    const auto window = static_cast<std::size_t>(attrs[3]);
+    const auto queries = count / (heads * dim);
+    const auto capacity = static_cast<std::size_t>(in[3][1]);
+    const auto live = std::min(capacity, static_cast<std::size_t>(in[3][0]));
+    const auto length = capacity + queries;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    std::vector<float> scores(length);
+    for (std::size_t h = 0; h < heads; ++h) {
+      const auto kh = h / (heads / kv_heads);
+      for (std::size_t q = 0; q < queries; ++q) {
+        float maximum = -std::numeric_limits<float>::infinity();
+        for (std::size_t j = 0; j < length; ++j) {
+          scores[j] = -std::numeric_limits<float>::infinity();
+          if (j < capacity && (j < capacity - live || j + window <= capacity + q)) continue;
+          float score = 0;
+          for (std::size_t d = 0; d < dim; ++d)
+            score = std::fma(in[0][(h * queries + q) * dim + d],
+                             in[1][(kh * length + j) * dim + d], score);
+          scores[j] = score * scale;
+          maximum = std::max(maximum, scores[j]);
+        }
+        float denominator = 0;
+        for (float& score : scores) { score = std::exp(score - maximum); denominator += score; }
+        for (std::size_t d = 0; d < dim; ++d) {
+          float value = 0;
+          for (std::size_t j = 0; j < length; ++j)
+            if (scores[j] != 0.0f) value = std::fma(scores[j], in[2][(kh * length + j) * dim + d], value);
+          out[(h * queries + q) * dim + d] = value / denominator;
+        }
+      }
+    }
+  }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
-    const Dims d = dispatch::flash_dimensions(s);
-    const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
+    const Dims d = dimensions(s);
     tp.workgroup_size[0] = kThreads;
-    tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles : 1u;
-    tp.workgroup_count[1] = 1;
-    tp.workgroup_count[2] = 1;
+    tp.workgroup_count[0] = d.valid ? d.qh : 1u;
+    tp.lds_bytes = d.valid ? QTile * (d.dh + 2 * kKWin + 4) * sizeof(float) : 0;
     return tp;
   }
 };
-using FlashSdpaKernel8 = FlashSdpaKernel<kDefaultQTile>;
-using FlashSdpaKernel12 = FlashSdpaKernel<kPrefillQTile>;
-LSE_REGISTER_PRIMITIVE(FlashSdpaKernel8);
-LSE_REGISTER_PRIMITIVE(FlashSdpaKernel12);
-
-const FlashSdpaKernel8 kFlash8{};
-const FlashSdpaKernel12 kFlash12{};
-
+LSE_REGISTER_PRIMITIVE(DFlash2SdpaKernel);
 }  // namespace
-
-const KernelPrimitiveBase* flash_sdpa_for(const KernelShapes& s) {
-  switch (dispatch::attention_plan(s)) {
-    case dispatch::AttentionPlan::kFlash12: return &kFlash12;
-    case dispatch::AttentionPlan::kFlash8: return &kFlash8;
-    default: return nullptr;
-  }
-}
-
 }  // namespace lse::kernels

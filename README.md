@@ -169,7 +169,10 @@ selection. Check `--devices` before loading a model.
 | `--repeat-penalty F` | 1.0 | Above 1 discourages repeats |
 | `-s, --seed N` | 0 | Sampler seed |
 | `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
+| `--mtp-depth N` | 2 | Draft proposals per verifier pass (1–7) |
 | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
+| `--dflash2=on/off` | off | Use the DFlash2 block drafter instead of MTP |
+| `--dflash2-model PATH` | `incoai/Qwen3.8-27B-DFlash2` | Drafter checkpoint directory or HF repo id |
 | `--arch NAME` | detected | Force a model kernel instead of detecting one |
 | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json`, used only when the model directory has none |
 | `--kv-len N` | `max(2*train_seq, 2048)` | Allocate the KV cache for N tokens and keep that shape |
@@ -193,6 +196,35 @@ works by changing the base URL.
 ./lse-server -m mlx-community/Qwen3.8-27B-4bit --port 8080
 ```
 
+For Qwen3.8-27B, a separate [Q8 MTP head](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-8bit)
+is about 451 MB and shares the target model's embeddings and output head:
+
+```bash
+./lse-server -m /path/to/qwen38-27b-q4 \
+  --mtp mlx-community/Qwen3.8-27B-MTP-8bit --mtp-depth 2 --port 8080
+```
+
+Depth 2 proposes two tokens and verifies them in a three-row target pass.
+A completion request can override the server depth with `"mtp_depth": 1` through
+`7`. `/health` reports `mtp_enabled` and the configured depth; response `timings`
+reports the depth used and the draft acceptance rate. A target checkpoint without
+an MTP head uses ordinary decoding unless `--mtp` supplies one.
+
+### DFlash2 block drafting
+
+DFlash2 is opt-in and replaces MTP for that server. It drafts seven proposals
+in an eight-position block, then checks them with the target model:
+
+```bash
+./lse-server -m /path/to/qwen38-27b-q4 --pool hrx:0 --dialect loom \
+  --dflash2=on --dflash2-model /path/to/qwen38-27b-dflash2-q8 --port 8080
+```
+
+The Q8 drafter is about 2.045 GB. See [DFlash2](docs/DFLASH2.md) for its checkpoint,
+conversion command, and supported sampling behavior. `/health` reports
+`dflash2_enabled` and its depth; response `timings` identifies `spec_method`
+and reports compared and accepted proposals plus drafting and verification time.
+
 ### `lse-server` options
 
 | Option | Default | |
@@ -204,7 +236,10 @@ works by changing the base URL.
 | `--served-name ID` | the model argument | Model id reported by `/v1/models` |
 | `--max-tokens N` | 4096 | Refuse requests asking for more |
 | `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
+| `--mtp-depth N` | 2 | Draft proposals per verifier pass (1–7) |
 | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
+| `--dflash2=on/off` | off | Use the DFlash2 block drafter instead of MTP |
+| `--dflash2-model PATH` | `incoai/Qwen3.8-27B-DFlash2` | Drafter checkpoint directory or HF repo id |
 | `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
 | `--kv-len N` | from the config | Allocate the KV cache for N tokens |
 | `--pool LIST` | `$LSE_POOL` | Device selection, for example `hrx:0` |

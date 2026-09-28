@@ -1,0 +1,471 @@
+#include "lse/model/dflash2.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <utility>
+
+#include <nlohmann/json.hpp>
+
+#include "lse/graph/interpreter.hpp"
+#include "lse/graph/ops.hpp"
+#include "lse/graph/program.hpp"
+#include "lse/model/layer.hpp"
+#include "lse/model/qwen3_5_common.hpp"
+#include "lse/model/weights.hpp"
+#include "lse/ops/attention.hpp"
+#include "lse/ops/norm.hpp"
+#include "lse/ops/rope.hpp"
+
+namespace lse::model {
+namespace {
+using graph::Array;
+
+Result<Array> slot(Shape shape) {
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+  auto buffer = scheduler->backend().allocate(
+      dtype_storage_bytes(DType::kF32, shape.elem_count()), backend::MemoryClass::kDevice);
+  if (!buffer.ok()) return buffer.status();
+  return Array::from_buffer(buffer.release(), std::move(shape), DType::kF32);
+}
+Status poke(Array& array, std::span<const float> data) {
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler || !array.valid() || data.size() != array.shape().elem_count())
+    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 input slot");
+  LSE_RETURN_IF_ERROR(scheduler->drain());
+  LSE_RETURN_IF_ERROR(scheduler->backend().copy(array.node()->buffer, data.data(), data.size_bytes()));
+  array.node()->materialized = true;
+  array.node()->host_dirty = false;
+  array.node()->device_dirty = true;
+  return OkStatus();
+}
+Status copy_slot(Array& destination, Array source) {
+  if (!source.valid() || source.dtype() != DType::kF32 ||
+      source.shape() != destination.shape())
+    return LSE_ERROR(kInvalidArgument, "DFlash2 input shape or dtype mismatch");
+  LSE_RETURN_IF_ERROR(source.materialize());
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+  LSE_RETURN_IF_ERROR(scheduler->drain());
+  LSE_RETURN_IF_ERROR(scheduler->backend().copy(
+      destination.node()->buffer, source.node()->buffer, source.shape().elem_count() * sizeof(float)));
+  destination.node()->materialized = true;
+  destination.node()->device_dirty = true;
+  destination.node()->host_dirty = false;
+  return OkStatus();
+}
+Status evaluate(graph::Program& program, const std::vector<graph::NodePtr>& roots) {
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+  program.reset_compute();
+  return scheduler->eval(roots, false, &program);
+}
+std::vector<std::int64_t> rope_order(std::int32_t heads, std::int32_t dim) {
+  std::vector<std::int64_t> order;
+  order.reserve(static_cast<std::size_t>(heads) * static_cast<std::size_t>(dim));
+  for (std::int32_t h = 0; h < heads; ++h)
+    for (std::int32_t d = 0; d < dim; ++d)
+      order.push_back(static_cast<std::int64_t>(h) * dim + d / 2 + (d % 2) * (dim / 2));
+  return order;
+}
+Array norm(const Array& x, const Array& weight, float epsilon) {
+  return ops::rms_norm(x, weight, epsilon);
+}
+}
+
+Result<DFlash2Config> DFlash2Config::from_json_string(const std::string& text) {
+  DFlash2Config c;
+  try {
+    const auto j = nlohmann::json::parse(text);
+    const auto architectures = j.at("architectures").get<std::vector<std::string>>();
+    if (std::find(architectures.begin(), architectures.end(), "DFlash2DraftModel") == architectures.end())
+      return LSE_ERROR(kInvalidArgument, "checkpoint is not a DFlash2DraftModel");
+    if (j.at("is_causal").get<bool>())
+      return LSE_ERROR(kUnimplemented, "causal DFlash2 draft attention is unsupported");
+    c.hidden_size = j.at("hidden_size"); c.vocab_size = j.at("vocab_size");
+    c.num_layers = j.at("num_hidden_layers"); c.target_num_layers = j.at("num_target_layers");
+    c.q_heads = j.at("num_attention_heads"); c.kv_heads = j.at("num_key_value_heads");
+    c.head_dim = j.at("head_dim"); c.intermediate_size = j.at("intermediate_size");
+    c.sliding_window = j.at("sliding_window"); c.rms_eps = j.at("rms_norm_eps");
+    const auto& rope = j.at("rope_parameters");
+    if (rope.at("rope_type") != "default")
+      return LSE_ERROR(kUnimplemented, "DFlash2 requires default RoPE scaling");
+    c.rope_theta = rope.at("rope_theta");
+    const auto layers = j.at("layer_types").get<std::vector<std::string>>();
+    if (layers.size() != static_cast<std::size_t>(c.num_layers) ||
+        std::any_of(layers.begin(), layers.end(), [](const auto& s) { return s != "sliding_attention"; }))
+      return LSE_ERROR(kUnimplemented, "DFlash2 requires sliding attention in every draft layer");
+    const auto& d = j.at("dflash_config");
+    const auto block = d.at("block_size").get<std::int64_t>();
+    const auto mask = d.at("mask_token_id").get<std::int64_t>();
+    if (block < 2 || block > 8 || mask < 0 || mask >= c.vocab_size)
+      return LSE_ERROR(kInvalidArgument, "invalid DFlash2 block size or mask token");
+    c.block_size = static_cast<std::uint32_t>(block); c.mask_token = static_cast<std::uint32_t>(mask);
+    c.target_layers = d.at("target_layer_ids").get<std::vector<std::int32_t>>();
+    c.conv_group_size = d.at("conv_group_size");
+    if (d.at("conv_kernel_size").get<std::int32_t>() != 2)
+      return LSE_ERROR(kUnimplemented, "DFlash2 requires two-tap dynamic convolution");
+    c.selector_rank = d.at("selector_rank"); c.selector_top_k = d.at("selector_top_k");
+    if (d.value("input_embedding_scale", 1.0f) != 1.0f ||
+        d.value("output_multiplier", 1.0f) != 1.0f ||
+        d.value("final_logit_softcapping", 0.0f) != 0.0f)
+      return LSE_ERROR(kUnimplemented, "DFlash2 embedding or logit scaling is unsupported");
+  } catch (const nlohmann::json::exception& e) {
+    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 config: ", e.what());
+  }
+  LSE_ASSIGN_OR(c.quantization, quant::GroupAffineMap::from_config_json(text));
+  return c;
+}
+Status DFlash2Config::validate(const Config& target) const {
+  if (hidden_size != target.hidden_size || vocab_size != target.vocab_size ||
+      target_num_layers != target.num_layers)
+    return LSE_ERROR(kInvalidArgument, "DFlash2 checkpoint does not match target geometry");
+  if (hidden_size <= 0 || vocab_size <= 0 || num_layers <= 0 ||
+      q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads ||
+      head_dim <= 0 || head_dim % 2 || intermediate_size <= 0 ||
+      sliding_window < 2 || conv_group_size <= 0 || hidden_size % conv_group_size ||
+      selector_rank <= 0 || selector_top_k < 1 || selector_top_k > vocab_size ||
+      block_size < 2 || block_size > 8 || mask_token >= static_cast<std::uint32_t>(vocab_size) ||
+      !std::isfinite(rms_eps) || rms_eps <= 0 || !std::isfinite(rope_theta) || rope_theta <= 0)
+    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 dimensions");
+  if (target_layers.empty()) return LSE_ERROR(kInvalidArgument, "DFlash2 has no target feature taps");
+  std::int32_t previous = -1;
+  for (auto layer : target_layers) {
+    if (layer <= previous || layer < 0 || layer >= target_num_layers)
+      return LSE_ERROR(kInvalidArgument, "invalid DFlash2 target feature tap order");
+    previous = layer;
+  }
+  return OkStatus();
+}
+
+Result<std::vector<std::uint32_t>> dflash2_select_path(
+    std::span<const float> scores, std::span<const std::uint32_t> candidates,
+    std::uint32_t positions, std::uint32_t top_k) {
+  if (positions == 0 || top_k == 0 ||
+      candidates.size() != static_cast<std::size_t>(positions) * top_k ||
+      scores.size() != static_cast<std::size_t>(positions) * top_k * top_k)
+    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 candidate lattice");
+  std::vector<std::uint32_t> path;
+  path.reserve(positions);
+  std::uint32_t predecessor = 0;
+  for (std::uint32_t p = 0; p < positions; ++p) {
+    const auto row = scores.subspan((static_cast<std::size_t>(p) * top_k + predecessor) * top_k, top_k);
+    std::uint32_t winner = 0;
+    for (std::uint32_t k = 0; k < top_k; ++k) {
+      if (!std::isfinite(row[k])) return LSE_ERROR(kInvalidArgument, "nonfinite DFlash2 selector score");
+      if (row[k] > row[winner] || (row[k] == row[winner] &&
+          candidates[static_cast<std::size_t>(p) * top_k + k] <
+          candidates[static_cast<std::size_t>(p) * top_k + winner])) winner = k;
+    }
+    path.push_back(candidates[static_cast<std::size_t>(p) * top_k + winner]);
+    predecessor = winner;
+  }
+  return path;
+}
+
+Array dflash2_convolve(const Array& hidden, const Array& dynamic,
+                       const Array& base, std::int32_t group_size) {
+  if (!hidden.valid() || !dynamic.valid() || !base.valid() || hidden.shape().rank() != 3 ||
+      dynamic.shape().rank() != 4 || base.shape().rank() != 2 || group_size <= 0)
+    return {};
+  const auto b = hidden.shape().dim(0), t = hidden.shape().dim(1), d = hidden.shape().dim(2);
+  if (d % group_size || dynamic.shape() != Shape{b, t, 2, d / group_size} || base.shape() != Shape{2, d}) return {};
+  const auto groups = d / group_size;
+  Array output;
+  for (std::int64_t tap = 0; tap < 2; ++tap) {
+    Array values = hidden;
+    if (tap == 1) {
+      Array zero = Array::zeros(Shape{b, 1, d}, hidden.dtype());
+      values = t == 1 ? zero : graph::concat({zero, graph::slice(hidden, 1, 0, t - 1)}, 1);
+    }
+    Array coefficients = graph::add(
+        graph::reshape(graph::slice(base, 0, tap, tap + 1), Shape{1, 1, groups, group_size}),
+        graph::reshape(graph::slice(dynamic, 2, tap, tap + 1), Shape{b, t, groups, 1}));
+    Array term = graph::reshape(graph::mul(coefficients,
+        graph::reshape(values, Shape{b, t, groups, group_size})), hidden.shape());
+    output = tap == 0 ? term : graph::add(output, term);
+  }
+  return output;
+}
+
+struct DFlash2Module::Impl {
+  DFlash2Config config;
+  HybridLM* target = nullptr;
+  std::int32_t capacity = 0, position = 0, live = 0, max_position = 0;
+  Array fc, hidden_norm, final_norm, predecessor, successor, selector_projection;
+  ops::RopeTables rope;
+  struct Conv { Array base, projection; };
+  struct Layer {
+    Array input_norm, post_norm, q, k, v, o, q_norm, k_norm, gate, up, down;
+    Conv attention_conv, mlp_conv;
+    Array keys, values;
+  };
+  std::vector<Layer> layers;
+  struct ContextPass {
+    Array features, offset;
+    std::vector<Array> keys, values;
+    graph::Program program;
+    std::vector<graph::NodePtr> roots;
+  };
+  struct DraftPass {
+    Array tokens, anchor, offset, meta, indices, scores;
+    graph::Program program;
+    std::vector<graph::NodePtr> roots;
+  };
+  struct ShiftPass {
+    std::vector<Array> keys, values;
+    graph::Program program;
+    std::vector<graph::NodePtr> roots;
+  };
+  std::map<std::int64_t, ContextPass> contexts;
+  std::map<std::uint32_t, DraftPass> drafts;
+  std::map<std::int32_t, ShiftPass> shifts;
+
+  Status load(WeightBinder& binder);
+  Result<ContextPass> context_pass(std::int64_t rows);
+  Result<DraftPass> draft_pass(std::uint32_t proposals);
+  Result<ShiftPass> shift_pass(std::int32_t rows);
+  Result<Array> attention(Array x, Layer& layer, const DraftPass& pass);
+  std::pair<Array, Array> prepare(Array x, const Conv& conv) const;
+};
+
+Status DFlash2Module::Impl::load(WeightBinder& binder) {
+  const auto d = static_cast<std::int64_t>(config.hidden_size);
+  const auto feature_width = d * static_cast<std::int64_t>(config.target_layers.size());
+  const auto require = [&](Array& out, const std::string& name, Shape shape) -> Status {
+    LSE_ASSIGN_OR(out, binder.require(name));
+    return qwen3_5::expect_shape(out, name, shape);
+  };
+  LSE_RETURN_IF_ERROR(require(fc, "fc.weight", Shape{d, feature_width}));
+  LSE_RETURN_IF_ERROR(require(hidden_norm, "hidden_norm.weight", Shape{d}));
+  LSE_RETURN_IF_ERROR(require(final_norm, "norm.weight", Shape{d}));
+  LSE_RETURN_IF_ERROR(require(selector_projection, "candidate_selector.hidden_projection.weight", Shape{config.selector_rank, d}));
+  for (auto item : {std::pair(&predecessor, "candidate_selector.predecessor_codebook"),
+                    std::pair(&successor, "candidate_selector.successor_codebook")}) {
+    std::string name = item.second;
+    if (binder.weights().find(name + ".weight")) name += ".weight";
+    LSE_RETURN_IF_ERROR(require(*item.first, name, Shape{config.vocab_size, config.selector_rank}));
+  }
+  const auto q_rows = rope_order(config.q_heads, config.head_dim);
+  const auto k_rows = rope_order(config.kv_heads, config.head_dim);
+  const auto norm_rows = rope_order(1, config.head_dim);
+  layers.resize(static_cast<std::size_t>(config.num_layers));
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    Layer& l = layers[i]; const auto p = "layers." + std::to_string(i);
+    LSE_RETURN_IF_ERROR(require(l.input_norm, p + ".input_layernorm.weight", Shape{d}));
+    LSE_RETURN_IF_ERROR(require(l.post_norm, p + ".post_attention_layernorm.weight", Shape{d}));
+    LSE_ASSIGN_OR(l.q, binder.require_rows(p + ".self_attn.q_proj.weight", q_rows, Shape{config.q_heads * config.head_dim, d}));
+    LSE_ASSIGN_OR(l.k, binder.require_rows(p + ".self_attn.k_proj.weight", k_rows, Shape{config.kv_heads * config.head_dim, d}));
+    LSE_ASSIGN_OR(l.q_norm, binder.require_rows(p + ".self_attn.q_norm.weight", norm_rows, Shape{config.head_dim}));
+    LSE_ASSIGN_OR(l.k_norm, binder.require_rows(p + ".self_attn.k_norm.weight", norm_rows, Shape{config.head_dim}));
+    LSE_RETURN_IF_ERROR(require(l.v, p + ".self_attn.v_proj.weight", Shape{config.kv_heads * config.head_dim, d}));
+    LSE_RETURN_IF_ERROR(require(l.o, p + ".self_attn.o_proj.weight", Shape{d, config.q_heads * config.head_dim}));
+    LSE_RETURN_IF_ERROR(require(l.gate, p + ".mlp.gate_proj.weight", Shape{config.intermediate_size, d}));
+    LSE_RETURN_IF_ERROR(require(l.up, p + ".mlp.up_proj.weight", Shape{config.intermediate_size, d}));
+    LSE_RETURN_IF_ERROR(require(l.down, p + ".mlp.down_proj.weight", Shape{d, config.intermediate_size}));
+    for (auto item : {std::pair(&l.attention_conv, ".attention_conv"), std::pair(&l.mlp_conv, ".mlp_conv")}) {
+      LSE_RETURN_IF_ERROR(require(item.first->base, p + item.second + ".base_kernel", Shape{2, 2, d}));
+      item.first->base = graph::cast(item.first->base, DType::kF32);
+      LSE_RETURN_IF_ERROR(item.first->base.materialize());
+      LSE_RETURN_IF_ERROR(require(item.first->projection, p + item.second + ".kernel_projection.weight", Shape{4 * (d / config.conv_group_size), d}));
+    }
+    LSE_ASSIGN_OR(l.keys, slot(Shape{1, config.kv_heads, capacity, config.head_dim}));
+    LSE_ASSIGN_OR(l.values, slot(l.keys.shape()));
+    const std::vector<float> zero(l.keys.shape().elem_count(), 0.0f);
+    LSE_RETURN_IF_ERROR(poke(l.keys, zero));
+    LSE_RETURN_IF_ERROR(poke(l.values, zero));
+  }
+  LSE_ASSIGN_OR(rope, ops::build_rope(config.head_dim, max_position + static_cast<std::int32_t>(config.block_size) - 1, config.rope_theta));
+  const auto unused = binder.unclaimed();
+  if (!unused.empty()) return LSE_ERROR(kInvalidArgument, "DFlash2 left tensors unclaimed: ", unused.front());
+  return OkStatus();
+}
+
+Result<DFlash2Module::Impl::ContextPass> DFlash2Module::Impl::context_pass(std::int64_t rows) {
+  ContextPass p;
+  LSE_ASSIGN_OR(p.features, slot(Shape{1, rows, static_cast<std::int64_t>(config.hidden_size) * static_cast<std::int64_t>(config.target_layers.size())}));
+  LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
+  Array context = norm(graph::linear(p.features, fc), hidden_norm, config.rms_eps);
+  for (Layer& l : layers) {
+    Array k = ops::split_heads(graph::linear(context, l.k), config.kv_heads, config.head_dim);
+    k = norm(k, l.k_norm, config.rms_eps);
+    LSE_ASSIGN_OR(k, ops::apply_rope(k, rope, p.offset));
+    Array v = ops::split_heads(graph::linear(context, l.v), config.kv_heads, config.head_dim);
+    p.keys.push_back(rows == capacity ? k : graph::concat({graph::slice(l.keys, 2, rows, capacity), k}, 2));
+    p.values.push_back(rows == capacity ? v : graph::concat({graph::slice(l.values, 2, rows, capacity), v}, 2));
+    p.roots.push_back(p.keys.back().node()); p.roots.push_back(p.values.back().node());
+  }
+  return p;
+}
+std::pair<Array, Array> DFlash2Module::Impl::prepare(Array x, const Conv& conv) const {
+  const auto t = x.shape().dim(1);
+  const auto groups = config.hidden_size / config.conv_group_size;
+  Array dynamic = graph::reshape(graph::linear(x, conv.projection), Shape{1, t, 2, 2, groups});
+  Array before = graph::reshape(graph::slice(dynamic, 2, 0, 1), Shape{1, t, 2, groups});
+  Array after = graph::reshape(graph::slice(dynamic, 2, 1, 2), Shape{1, t, 2, groups});
+  Array base = graph::reshape(graph::slice(conv.base, 0, 0, 1), Shape{2, config.hidden_size});
+  return {dflash2_convolve(x, before, base, config.conv_group_size), after};
+}
+Result<Array> DFlash2Module::Impl::attention(Array x, Layer& l, const DraftPass& p) {
+  Array q = ops::split_heads(graph::linear(x, l.q), config.q_heads, config.head_dim);
+  Array k = ops::split_heads(graph::linear(x, l.k), config.kv_heads, config.head_dim);
+  Array v = ops::split_heads(graph::linear(x, l.v), config.kv_heads, config.head_dim);
+  q = norm(q, l.q_norm, config.rms_eps); k = norm(k, l.k_norm, config.rms_eps);
+  LSE_ASSIGN_OR(q, ops::apply_rope(q, rope, p.offset));
+  LSE_ASSIGN_OR(k, ops::apply_rope(k, rope, p.offset));
+  LSE_ASSIGN_OR(Array attended, graph::custom("dflash2.attention", {q, graph::concat({l.keys, k}, 2), graph::concat({l.values, v}, 2), p.meta},
+      {static_cast<float>(config.q_heads), static_cast<float>(config.kv_heads), static_cast<float>(config.head_dim), static_cast<float>(config.sliding_window)}));
+  return graph::linear(ops::merge_heads(attended), l.o);
+}
+Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint32_t proposals) {
+  DraftPass p;
+  const auto rows = static_cast<std::int64_t>(proposals + 1);
+  LSE_ASSIGN_OR(p.tokens, slot(Shape{1, rows}));
+  LSE_ASSIGN_OR(p.anchor, slot(Shape{1, 1}));
+  LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
+  LSE_ASSIGN_OR(p.meta, slot(Shape{2}));
+  LSE_ASSIGN_OR(Array x, target->embed(p.tokens));
+  for (Layer& l : layers) {
+    auto [prepared, after] = prepare(norm(x, l.input_norm, config.rms_eps), l.attention_conv);
+    LSE_ASSIGN_OR(Array attended, attention(prepared, l, p));
+    Array base = graph::reshape(graph::slice(l.attention_conv.base, 0, 1, 2), Shape{2, config.hidden_size});
+    x = graph::add(x, dflash2_convolve(attended, after, base, config.conv_group_size));
+    auto [mlp_input, mlp_after] = prepare(norm(x, l.post_norm, config.rms_eps), l.mlp_conv);
+    Array mlp = graph::linear(graph::mul(graph::silu(graph::linear(mlp_input, l.gate)), graph::linear(mlp_input, l.up)), l.down);
+    base = graph::reshape(graph::slice(l.mlp_conv.base, 0, 1, 2), Shape{2, config.hidden_size});
+    x = graph::add(x, dflash2_convolve(mlp, mlp_after, base, config.conv_group_size));
+  }
+  x = norm(graph::slice(x, 1, 1, rows), final_norm, config.rms_eps);
+  LSE_ASSIGN_OR(Array logits, target->lm_head(x));
+  Array unary = graph::topk(logits, config.selector_top_k, -1, &p.indices);
+  if (!unary.valid() || !p.indices.valid()) return LSE_ERROR(kInternal, "DFlash2 top-k failed");
+  const auto rank = static_cast<std::int64_t>(config.selector_rank), top = static_cast<std::int64_t>(config.selector_top_k);
+  const auto embed = [](const Array& table, const Array& ids) { return graph::embedding(table, ids); };
+  Array pred = embed(predecessor, p.indices), succ = embed(successor, p.indices);
+  Array anchor_embedding = graph::repeat(graph::reshape(embed(predecessor, p.anchor), Shape{1, 1, 1, rank}), config.selector_top_k, 2);
+  pred = proposals == 1 ? anchor_embedding : graph::concat({anchor_embedding, graph::slice(pred, 1, 0, proposals - 1)}, 1);
+  Array gate = graph::reshape(graph::linear(x, selector_projection), Shape{1, proposals, rank});
+  LSE_ASSIGN_OR(p.scores, graph::custom("dflash2.selector", {pred, gate, succ, unary},
+      {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(top), static_cast<float>(rank)}));
+  p.roots = {p.scores.node(), p.indices.node()};
+  return p;
+}
+Result<DFlash2Module::Impl::ShiftPass> DFlash2Module::Impl::shift_pass(std::int32_t rows) {
+  ShiftPass p;
+  Array zero = Array::zeros(Shape{1, config.kv_heads, rows, config.head_dim}, DType::kF32);
+  for (Layer& l : layers) {
+    p.keys.push_back(graph::concat({zero, graph::slice(l.keys, 2, 0, capacity - rows)}, 2));
+    p.values.push_back(graph::concat({zero, graph::slice(l.values, 2, 0, capacity - rows)}, 2));
+    p.roots.push_back(p.keys.back().node()); p.roots.push_back(p.values.back().node());
+  }
+  return p;
+}
+
+DFlash2Module::DFlash2Module(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+DFlash2Module::~DFlash2Module() = default;
+Result<std::unique_ptr<DFlash2Module>> DFlash2Module::open(const std::string& path, const Config& parent, HybridLM& model) {
+  LSE_ASSIGN_OR(const auto paths, resolve_model(path));
+  std::ifstream in(paths.config); std::ostringstream text; text << in.rdbuf();
+  if (!in) return LSE_ERROR(kNotFound, "DFlash2 config not readable at ", paths.config);
+  LSE_ASSIGN_OR(auto config, DFlash2Config::from_json_string(text.str()));
+  LSE_RETURN_IF_ERROR(config.validate(parent));
+  auto impl = std::make_unique<Impl>(); impl->config = std::move(config); impl->target = &model;
+  impl->capacity = impl->config.sliding_window - 1 + static_cast<std::int32_t>(impl->config.block_size);
+  impl->max_position = parent.kv_capacity();
+  LSE_ASSIGN_OR(SafeTensors weights, paths.weights.ends_with(".index.json") ? SafeTensors::open_sharded(paths.weights) : SafeTensors::open(paths.weights));
+  WeightBinder binder(weights, &impl->config.quantization);
+  const graph::ScopedSplitScheme unsplit(graph::SplitScheme::kNone);
+  LSE_RETURN_IF_ERROR(impl->load(binder));
+  return std::unique_ptr<DFlash2Module>(new DFlash2Module(std::move(impl)));
+}
+std::span<const std::int32_t> DFlash2Module::target_layers() const noexcept { return impl_->config.target_layers; }
+std::uint32_t DFlash2Module::block_size() const noexcept { return impl_->config.block_size; }
+std::int32_t DFlash2Module::context_position() const noexcept { return impl_->position; }
+void DFlash2Module::reset() { impl_->position = 0; impl_->live = 0; }
+Status DFlash2Module::rewind(std::int32_t position) {
+  if (position < 0 || position > impl_->position) return LSE_ERROR(kInvalidArgument, "invalid DFlash2 rewind position");
+  const auto drop = impl_->position - position;
+  if (drop == 0) return OkStatus();
+  if (drop > static_cast<std::int32_t>(impl_->config.block_size) || drop > impl_->live)
+    return LSE_ERROR(kInvalidArgument, "DFlash2 rewind exceeds retained speculative context");
+  auto it = impl_->shifts.find(drop);
+  if (it == impl_->shifts.end()) {
+    LSE_ASSIGN_OR(auto pass, impl_->shift_pass(drop));
+    it = impl_->shifts.emplace(drop, std::move(pass)).first;
+  }
+  auto& pass = it->second;
+  LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  for (std::size_t i = 0; i < impl_->layers.size(); ++i) {
+    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].keys, pass.keys[i]));
+    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].values, pass.values[i]));
+  }
+  impl_->position = position; impl_->live -= drop;
+  return OkStatus();
+}
+Status DFlash2Module::append_context(const Array& features, std::int32_t first) {
+  if (!features.valid() || features.dtype() != DType::kF32 || features.shape().rank() != 3 ||
+      features.shape().dim(0) != 1 || features.shape().dim(1) <= 0 ||
+      features.shape().dim(2) != static_cast<std::int64_t>(impl_->config.hidden_size) * static_cast<std::int64_t>(impl_->config.target_layers.size()) || first < 0)
+    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 target features");
+  auto rows = features.shape().dim(1);
+  if (static_cast<std::int64_t>(first) + rows > impl_->max_position)
+    return LSE_ERROR(kInvalidArgument, "DFlash2 context exceeds target KV capacity");
+  if (first < impl_->position) LSE_RETURN_IF_ERROR(rewind(first));
+  if (first != impl_->position && impl_->live != 0) return LSE_ERROR(kInvalidArgument, "DFlash2 context has a gap");
+  Array input = features;
+  if (rows > impl_->capacity) {
+    input = graph::slice(features, 1, rows - impl_->capacity, rows);
+    first += static_cast<std::int32_t>(rows - impl_->capacity); rows = impl_->capacity;
+  }
+  auto it = impl_->contexts.find(rows);
+  if (it == impl_->contexts.end()) {
+    LSE_ASSIGN_OR(auto pass, impl_->context_pass(rows));
+    it = impl_->contexts.emplace(rows, std::move(pass)).first;
+  }
+  auto& pass = it->second;
+  LSE_RETURN_IF_ERROR(copy_slot(pass.features, input));
+  const float offset = static_cast<float>(first); LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1)));
+  LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  for (std::size_t i = 0; i < impl_->layers.size(); ++i) {
+    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].keys, pass.keys[i]));
+    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].values, pass.values[i]));
+  }
+  impl_->position = first + static_cast<std::int32_t>(rows);
+  impl_->live = std::min(impl_->capacity, impl_->live + static_cast<std::int32_t>(rows));
+  return OkStatus();
+}
+Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals) {
+  if (anchor >= static_cast<std::uint32_t>(impl_->config.vocab_size) || first != impl_->position ||
+      impl_->live <= 0 || proposals == 0 || proposals >= impl_->config.block_size ||
+      static_cast<std::int64_t>(first) + proposals >= impl_->max_position)
+    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 draft request");
+  const auto full_proposals = impl_->config.block_size - 1;
+  auto it = impl_->drafts.find(full_proposals);
+  if (it == impl_->drafts.end()) {
+    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(full_proposals));
+    it = impl_->drafts.emplace(full_proposals, std::move(pass)).first;
+  }
+  auto& pass = it->second;
+  std::vector<float> tokens(impl_->config.block_size, static_cast<float>(impl_->config.mask_token)); tokens[0] = static_cast<float>(anchor);
+  const float offset = static_cast<float>(first), anchor_id = static_cast<float>(anchor);
+  const float meta[] = {static_cast<float>(impl_->live), static_cast<float>(impl_->capacity)};
+  LSE_RETURN_IF_ERROR(poke(pass.tokens, tokens)); LSE_RETURN_IF_ERROR(poke(pass.anchor, std::span(&anchor_id, 1)));
+  LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1))); LSE_RETURN_IF_ERROR(poke(pass.meta, meta));
+  LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  std::vector<float> scores(pass.scores.shape().elem_count()), indices(pass.indices.shape().elem_count());
+  LSE_RETURN_IF_ERROR(pass.scores.to_host(scores.data(), scores.size() * sizeof(float)));
+  LSE_RETURN_IF_ERROR(pass.indices.to_host(indices.data(), indices.size() * sizeof(float)));
+  std::vector<std::uint32_t> candidates; candidates.reserve(indices.size());
+  for (float id : indices) {
+    if (!std::isfinite(id) || id < 0 || id >= static_cast<float>(impl_->config.vocab_size) || std::floor(id) != id)
+      return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
+    candidates.push_back(static_cast<std::uint32_t>(id));
+  }
+  LSE_ASSIGN_OR(auto path, dflash2_select_path(scores, candidates, full_proposals, static_cast<std::uint32_t>(impl_->config.selector_top_k)));
+  path.resize(proposals);
+  return path;
+}
+}  // namespace lse::model

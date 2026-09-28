@@ -12,10 +12,12 @@
 #include "lse/graph/jit.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/mtp.hpp"
+#include "lse/model/dflash2.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/place/devices.hpp"
 #include "lse/model/weights.hpp"
 #include "lse/server/http_server.hpp"
+#include "lse/runtime/generator.hpp"
 #include "lse/server/shutdown.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 
@@ -43,6 +45,9 @@ void usage() {
       "      --shutdown-grace-seconds N  drain requests before failing (1..600, default 30)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
       "                       beside the model, when the checkpoint has one)\n"
+      "      --mtp-depth N    draft proposals per verifier pass (1..7, default 2)\n"
+      "      --dflash2=on     use the DFlash2 block drafter (default off)\n"
+      "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
       "      --no-mtp         decode one token per pass, ignoring any\n"
       "                       multi-token-prediction module\n"
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
@@ -69,6 +74,8 @@ int main(int argc, char** argv) {
   std::string model = std::getenv("LSE_MODEL") ? std::getenv("LSE_MODEL") : "";
   std::string mtp_path;
   bool no_mtp = false;
+  bool dflash2_on = false;
+  std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   std::string served_name;
   std::string pool;
@@ -103,6 +110,27 @@ int main(int argc, char** argv) {
       }
     }
     else if (a == "--mtp") mtp_path = value("--mtp");
+    else if (a == "--mtp-depth") {
+      const auto text = value("--mtp-depth");
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
+                                          opt.mtp_depth);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          !runtime::valid_mtp_depth(opt.mtp_depth)) {
+        std::fputs("lse-server: MTP depth must be an integer from 1 to 7\n", stderr);
+        return 2;
+      }
+    }
+    else if (a == "--dflash2" || a.starts_with("--dflash2=")) {
+      const std::string text = a == "--dflash2"
+                                  ? value("--dflash2")
+                                  : a.substr(std::string("--dflash2=").size());
+      if (text != "on" && text != "off") {
+        std::fputs("lse-server: --dflash2 must be on or off\n", stderr);
+        return 2;
+      }
+      dflash2_on = text == "on";
+    }
+    else if (a == "--dflash2-model") dflash2_model = value("--dflash2-model");
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
@@ -205,7 +233,7 @@ int main(int argc, char** argv) {
   // CLI resolves it.
   std::unique_ptr<model::MtpModule> mtp;
   const std::string mtp_where =
-      no_mtp ? std::string()
+      (no_mtp || dflash2_on) ? std::string()
              : (mtp_path.empty() ? model::MtpModule::find_beside(model)
                                  : mtp_path);
   if (!mtp_where.empty()) {
@@ -213,13 +241,26 @@ int main(int argc, char** argv) {
     if (opened.ok()) {
       mtp = opened.release();
       http.use_mtp(*mtp);
-      std::fprintf(stderr, "lse-server: speculative decoding from %s\n",
-                   mtp_where.c_str());
+      std::fprintf(stderr, "lse-server: MTP depth %u from %s\n",
+                   opt.mtp_depth, mtp_where.c_str());
     } else if (!mtp_path.empty()) {
       // Named explicitly and it did not load: that is an error, where a
       // module merely found beside the model is not.
       return fail(opened.status(), "loading the MTP module");
+    } else {
+      std::fprintf(stderr, "lse-server: MTP unavailable: %s\n",
+                   opened.status().to_string().c_str());
     }
+  }
+
+  std::unique_ptr<model::DFlash2Module> dflash2;
+  if (dflash2_on) {
+    auto opened = model::DFlash2Module::open(dflash2_model, *cfg, *lm);
+    if (!opened.ok()) return fail(opened.status(), "loading DFlash2");
+    dflash2 = opened.release();
+    http.use_dflash2(*dflash2);
+    std::fprintf(stderr, "lse-server: DFlash2 block %u from %s\n",
+                 dflash2->block_size(), dflash2_model.c_str());
   }
 
   std::signal(SIGINT, on_signal);
