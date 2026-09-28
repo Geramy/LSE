@@ -89,46 +89,6 @@ std::pair<std::string, std::string> split_thinking(const std::string& text) {
   return {std::move(answer), std::move(reasoning)};
 }
 
-std::vector<ThinkingStreamSplitter::Delta> ThinkingStreamSplitter::push_answer(
-    const std::string& piece) {
-  if (piece.empty()) return {};
-  if (!first_answer_) return {{"content", piece}};
-  const std::size_t start = piece.find_first_not_of(kWhitespace);
-  if (start == std::string::npos) return {};
-  first_answer_ = false;
-  return {{"content", piece.substr(start)}};
-}
-
-std::vector<ThinkingStreamSplitter::Delta> ThinkingStreamSplitter::push(
-    const std::string& piece) {
-  if (!expose_) return piece.empty() ? std::vector<Delta>{}
-                                   : std::vector<Delta>{{"content", piece}};
-  if (in_answer_) return push_answer(piece);
-
-  pending_ += piece;
-  const std::size_t end = pending_.find(kThinkClose);
-  if (end == std::string::npos) return {};
-
-  auto [answer, reasoning] = split_thinking(pending_);
-  pending_.clear();
-  in_answer_ = true;
-  std::vector<Delta> out;
-  if (!reasoning.empty()) out.emplace_back("reasoning", std::move(reasoning));
-  auto answer_deltas = push_answer(answer);
-  for (auto& delta : answer_deltas) out.push_back(std::move(delta));
-  return out;
-}
-
-std::vector<ThinkingStreamSplitter::Delta> ThinkingStreamSplitter::finish() {
-  if (!expose_ || in_answer_) return {};
-  auto [answer, reasoning] = split_thinking(pending_);
-  pending_.clear();
-  std::vector<Delta> out;
-  if (!reasoning.empty()) out.emplace_back("reasoning", std::move(reasoning));
-  if (!answer.empty()) out.emplace_back("content", std::move(answer));
-  return out;
-}
-
 }  // namespace detail
 
 }  // namespace lse::server

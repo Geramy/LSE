@@ -397,7 +397,7 @@ if(TARGET lse_tokenizer)
 
   # The OpenAI-shaped HTTP surface. httplib and nlohmann/json are vendored
   # headers, so this adds no package to find.
-  add_library(lse_server src/server/http_server.cpp src/server/chat.cpp)
+  add_library(lse_server src/server/http_server.cpp src/server/chat.cpp src/server/chat_protocol.cpp)
   target_link_libraries(lse_server PUBLIC lse_core lse_model lse_runtime lse_tokenizer)
   lse_apply_common_flags(lse_server)
   find_package(Threads REQUIRED)

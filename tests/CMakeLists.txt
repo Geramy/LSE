@@ -104,6 +104,9 @@ if(NOT TARGET lse_backend_hrx)
 endif()
 lse_add_test(test_shape)
 lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
+lse_add_test(test_chat_protocol lse_server lse_tokenizer lse_model lse_backends)
+target_include_directories(test_chat_protocol PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/server ${CMAKE_SOURCE_DIR}/third_party/vendor)
 # Socket lifecycle coverage never opens a model or device.
 find_package(Threads REQUIRED)
 add_executable(test_server_shutdown test_server_shutdown.cpp)

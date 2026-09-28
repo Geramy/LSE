@@ -1,6 +1,7 @@
 #include "lse/server/http_server.hpp"
 #include "lse/server/shutdown.hpp"
 #include "jit_timings.hpp"
+#include "chat_protocol.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -89,10 +90,8 @@ struct Request {
   std::vector<std::string> stop_strings;
   bool stream = false;
   std::string model;
-  // Thinking control for reasoning models (Qwen3.x). `thinking_enabled`
-  // defaults to the model's own behaviour (on for Qwen3.8); a client sets it
-  // false to suppress the <tool_call> pass. `thinking_budget` caps the reasoning
-  // tokens; 0 means the model decides.
+  detail::ChatRequest chat;
+  bool include_usage = false;
   bool thinking_enabled = true;
   std::string thinking_level;   // "" | low | medium | high | xhigh
 };
@@ -144,6 +143,12 @@ struct HttpServer::Impl {
     r.model = get_or<std::string>(body, "model", opt.model_id);
     r.stream = get_or<bool>(body, "stream", false);
     r.stop_strings = get_stop_strings(body);
+    if (!body.is_object()) {
+      send_error(res, 400, "request must be a JSON object");
+      return LSE_ERROR(kInvalidArgument, "request");
+    }
+    if (body.contains("stream_options") && body["stream_options"].is_object())
+      r.include_usage = get_or<bool>(body["stream_options"], "include_usage", false);
 
     // OpenAI's default temperature is 1.0, not this engine's 0.8: a client
     // that sends nothing must get what the API promises, not what the CLI does.
@@ -162,6 +167,12 @@ struct HttpServer::Impl {
     // (reasoning on at its own level). The level steers how hard the model
     // thinks via a system prompt (see reasoning_effort_instructions).
     r.thinking_enabled = true;
+    for (const char* field : {"enable_thinking", "thinking"}) {
+      if (body.contains(field) && body[field].is_boolean())
+        r.thinking_enabled = body[field].get<bool>();
+    }
+    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+      r.thinking_enabled = get_or<bool>(body["chat_template_kwargs"], "enable_thinking", r.thinking_enabled);
     if (body.contains("thinking")) {
       const json& t = body.at("thinking");
       if (t.is_boolean()) {
@@ -175,7 +186,13 @@ struct HttpServer::Impl {
       if (effort == "none") {
         r.thinking_enabled = false;
       } else if (!effort.empty()) {
-        r.thinking_level = effort;   // low | medium | high | xhigh
+        if (effort != "minimal" && effort != "low" && effort != "medium" &&
+            effort != "high" && effort != "xhigh") {
+          send_error(res, 400, "unsupported reasoning_effort", "invalid_request_error", "reasoning_effort");
+          return LSE_ERROR(kInvalidArgument, "reasoning_effort");
+        }
+        r.thinking_enabled = true;
+        r.thinking_level = effort == "minimal" ? "low" : effort;
       }
     }
     if (body.contains("thinking_level")) {
@@ -388,20 +405,13 @@ json timings_of(const Outcome& o) {
 }
 
 // text_completion and chat.completion differ only in the shape of a choice.
-json chat_choice(const std::string& text, bool hit_limit, bool expose_thinking) {
-  std::string reasoning;
-  std::string content = text;
-  if (expose_thinking) {
-    auto [answer, r] = detail::split_thinking(text);
-    content = answer;
-    reasoning = r;
-  }
-  json message{{"role", "assistant"}, {"content", content}};
-  if (!reasoning.empty()) message["reasoning_content"] = reasoning;
-  return json{{"index", 0},
-              {"message", std::move(message)},
-              {"logprobs", nullptr},
-              {"finish_reason", finish_reason(hit_limit)}};
+json chat_choice(const std::string& text, bool hit_limit, const Request& r,
+                 const std::string& id) {
+  detail::ChatResponseParser parser(r.thinking_enabled, r.chat, id);
+  parser.push(text);
+  parser.finish(hit_limit);
+  return json{{"index", 0}, {"message", parser.message()}, {"logprobs", nullptr},
+              {"finish_reason", parser.finish_reason(hit_limit)}};
 }
 
 json text_choice(const std::string& text, bool hit_limit, bool expose_thinking) {
@@ -517,60 +527,13 @@ Status HttpServer::listen() {
 
       std::string prompt_text;
       if (chat) {
-        if (!body.contains("messages") || !body.at("messages").is_array() ||
-            body.at("messages").empty()) {
-          send_error(res, 400, "messages must be a non-empty array",
-                     "invalid_request_error", "messages");
+        try {
+          r.chat = detail::prepare_chat(body, r.thinking_enabled, r.thinking_level);
+          prompt_text = r.chat.prompt;
+        } catch (const std::exception& e) {
+          send_error(res, 400, e.what(), "invalid_request_error", "messages/tools");
           return;
         }
-        std::vector<ChatMessage> messages;
-        for (const json& m : body.at("messages")) {
-          ChatMessage cm;
-          cm.role = get_or<std::string>(m, "role", "user");
-          // content is a string, or the array-of-parts form; the text parts
-          // are joined and anything else is refused rather than dropped.
-          if (m.contains("content") && m.at("content").is_array()) {
-            for (const json& part : m.at("content")) {
-              const std::string type = get_or<std::string>(part, "type", "");
-              if (type != "text") {
-                send_error(res, 400,
-                           "content part of type '" + type +
-                               "' is not supported; this build decodes text only",
-                           "invalid_request_error", "messages");
-                return;
-              }
-              cm.content += get_or<std::string>(part, "text", "");
-            }
-          } else {
-            cm.content = get_or<std::string>(m, "content", "");
-          }
-          messages.push_back(std::move(cm));
-        }
-        // A reasoning-effort level becomes the system-prompt instruction the
-        // checkpoint chat_template ships (verbatim; only low and xhigh/high
-        // carry text, medium is uninstructed). The template frames the whole
-        // turn with it: if the client already sent a system message the
-        // instruction is prepended to it, otherwise a system message holding
-        // just the instruction is added at the front.
-        //
-        // The template resolves a missing effort as its default: when thinking
-        // is on, `reasoning_effort|default('xhigh')`, so an absent/empty level
-        // means xhigh (the model's top depth) and carries that instruction. When
-        // thinking is off the template never computes the instruction at all, so
-        // the level is left empty and no system message is added.
-        std::string level = r.thinking_level;
-        if (r.thinking_enabled && level.empty()) level = "xhigh";
-        const std::string effort = reasoning_effort_instructions(level);
-        if (!effort.empty()) {
-          if (!messages.empty() && messages.front().role == "system") {
-            // Prepend to the existing system message, the way the template
-            // renders `reasoning_instructions + '\n\n' + content`.
-            messages.front().content = effort + "\n\n" + messages.front().content;
-          } else {
-            messages.insert(messages.begin(), ChatMessage{"system", effort});
-          }
-        }
-        prompt_text = render_chatml(messages, true, r.thinking_enabled);
       } else {
         if (!body.contains("prompt")) {
           send_error(res, 400, "prompt is required", "invalid_request_error", "prompt");
@@ -617,15 +580,19 @@ Status HttpServer::listen() {
                      std::string(out.status().message()), "server_error");
           return;
         }
-        json resp{{"id", id},
-                  {"object", object},
-                  {"created", created},
-                  {"model", impl.opt.model_id},
-                  {"choices", json::array({chat ? chat_choice(out->text, out->hit_limit, r.thinking_enabled)
-                                                : text_choice(out->text, out->hit_limit, r.thinking_enabled)})},
-                  {"usage", usage_of(*out)},
-                  {"timings", timings_of(*out)}};
-        res.set_content(resp.dump(), "application/json");
+        try {
+          json resp{{"id", id},
+                    {"object", object},
+                    {"created", created},
+                    {"model", impl.opt.model_id},
+                    {"choices", json::array({chat ? chat_choice(out->text, out->hit_limit, r, id)
+                                                  : text_choice(out->text, out->hit_limit, r.thinking_enabled)})},
+                    {"usage", usage_of(*out)},
+                    {"timings", timings_of(*out)}};
+          res.set_content(resp.dump(), "application/json");
+        } catch (const std::exception& e) {
+          send_error(res, 500, e.what(), "model_output_error");
+        }
         return;
       }
 
@@ -654,15 +621,10 @@ Status HttpServer::listen() {
                                                   {"finish_reason", nullptr}}})}});
             }
 
-            // A marker-free response is buffered until completion so its
-            // deltas match the non-stream response's content field.
-            detail::ThinkingStreamSplitter splitter(chat && r.thinking_enabled);
-
-            auto send_chat_deltas = [&](const std::vector<detail::ThinkingStreamSplitter::Delta>& deltas) {
-              for (const auto& [kind, text] : deltas) {
-                json delta = std::string_view(kind) == "reasoning"
-                    ? json{{"reasoning_content", text}}
-                    : json{{"content", text}};
+            detail::ChatResponseParser parser(r.thinking_enabled, r.chat, id);
+            std::string parser_error;
+            auto send_chat_deltas = [&](const std::vector<json>& deltas) {
+              for (const auto& delta : deltas) {
                 json choice{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}};
                 if (!send(json{{"id", id},
                                {"object", chunk_object},
@@ -683,7 +645,8 @@ Status HttpServer::listen() {
                                  {"model", impl.opt.model_id},
                                  {"choices", json::array({choice})}});
               }
-              return send_chat_deltas(splitter.push(piece));
+              try { return send_chat_deltas(parser.push(piece)); }
+              catch (const std::exception& e) { parser_error = e.what(); return false; }
             };
 
             auto out = HttpServer::Run::generate(impl, r, emit);
@@ -696,21 +659,29 @@ Status HttpServer::listen() {
               return true;
             }
 
-            if (chat && !send_chat_deltas(splitter.finish())) {
-              sink.done();
-              return true;
+            try {
+              if (!parser_error.empty()) throw std::invalid_argument(parser_error);
+              if (chat && !send_chat_deltas(parser.finish(out->hit_limit))) {
+                sink.done(); return true;
+              }
+            } catch (const std::exception& e) {
+              send(json{{"error", {{"message", e.what()}, {"type", "model_output_error"}}}});
+              sink.done(); return true;
             }
 
             json last = chat
-                ? json{{"index", 0}, {"delta", json::object()}, {"finish_reason", finish_reason(out->hit_limit)}}
+                ? json{{"index", 0}, {"delta", json::object()}, {"finish_reason", parser.finish_reason(out->hit_limit)}}
                 : json{{"index", 0}, {"text", ""}, {"finish_reason", finish_reason(out->hit_limit)}};
             send(json{{"id", id},
                       {"object", chunk_object},
                       {"created", created},
                       {"model", impl.opt.model_id},
                       {"choices", json::array({last})},
-                      {"usage", usage_of(*out)},
                       {"timings", timings_of(*out)}});
+            if (r.include_usage)
+              send(json{{"id", id}, {"object", chunk_object}, {"created", created},
+                        {"model", impl.opt.model_id}, {"choices", json::array()},
+                        {"usage", usage_of(*out)}});
             const std::string done = "data: [DONE]\n\n";
             sink.write(done.data(), done.size());
             sink.done();

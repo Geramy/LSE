@@ -60,52 +60,19 @@ LSE_TEST(chat_stop_tokens_skip_what_a_tokenizer_does_not_have) {
   LSE_EXPECT(std::find(stops.begin(), stops.end(), *im_end) != stops.end());
 }
 
-LSE_TEST(marker_free_stream_matches_nonstream_content) {
-  server::detail::ThinkingStreamSplitter stream(/*expose=*/true);
-  LSE_EXPECT(stream.push("Hello ").empty());
-  LSE_EXPECT(stream.push("world").empty());
-  const auto deltas = stream.finish();
-  LSE_EXPECT_EQ(deltas.size(), 1u);
-  LSE_EXPECT(std::string(deltas[0].first) == "content");
-  LSE_EXPECT(deltas[0].second == "Hello world");
-  const auto whole = server::detail::split_thinking("Hello world");
-  LSE_EXPECT(whole.first == deltas[0].second);
-  LSE_EXPECT(whole.second.empty());
+LSE_TEST(raw_completion_thinking_split_preserves_unframed_answers) {
+  const auto [answer, reasoning] = server::detail::split_thinking("Hello world");
+  LSE_EXPECT(answer == "Hello world");
+  LSE_EXPECT(reasoning.empty());
 }
 
-LSE_TEST(thinking_stream_handles_split_close_marker_and_answer) {
-  server::detail::ThinkingStreamSplitter stream(/*expose=*/true);
-  LSE_EXPECT(stream.push("<think>\nreason").empty());
-  LSE_EXPECT(stream.push("</thi").empty());
-  const auto boundary = stream.push("nk>\n\nanswer");
-  LSE_EXPECT_EQ(boundary.size(), 2u);
-  LSE_EXPECT(std::string(boundary[0].first) == "reasoning");
-  LSE_EXPECT(boundary[0].second == "reason");
-  LSE_EXPECT(std::string(boundary[1].first) == "content");
-  LSE_EXPECT(boundary[1].second == "answer");
-  const auto continuation = stream.push(" continues");
-  LSE_EXPECT_EQ(continuation.size(), 1u);
-  LSE_EXPECT(std::string(continuation[0].first) == "content");
-  LSE_EXPECT(continuation[0].second == " continues");
-  LSE_EXPECT(stream.finish().empty());
-}
-
-LSE_TEST(unclosed_explicit_thinking_marker_finishes_as_reasoning) {
-  server::detail::ThinkingStreamSplitter stream(/*expose=*/true);
-  LSE_EXPECT(stream.push("<think>unfinished").empty());
-  const auto deltas = stream.finish();
-  LSE_EXPECT_EQ(deltas.size(), 1u);
-  LSE_EXPECT(std::string(deltas[0].first) == "reasoning");
-  LSE_EXPECT(deltas[0].second == "unfinished");
-}
-
-LSE_TEST(non_thinking_stream_emits_content_immediately) {
-  server::detail::ThinkingStreamSplitter stream(/*expose=*/false);
-  const auto deltas = stream.push("direct answer");
-  LSE_EXPECT_EQ(deltas.size(), 1u);
-  LSE_EXPECT(std::string(deltas[0].first) == "content");
-  LSE_EXPECT(deltas[0].second == "direct answer");
-  LSE_EXPECT(stream.finish().empty());
+LSE_TEST(raw_completion_thinking_split_recognizes_explicit_markers) {
+  const auto [answer, reasoning] = server::detail::split_thinking("<think>reason</think>answer");
+  LSE_EXPECT(answer == "answer");
+  LSE_EXPECT(reasoning == "reason");
+  const auto truncated = server::detail::split_thinking("<think>unfinished");
+  LSE_EXPECT(truncated.first.empty());
+  LSE_EXPECT(truncated.second == "unfinished");
 }
 
 LSE_TEST_MAIN()

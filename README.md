@@ -225,6 +225,10 @@ conversion command, and supported sampling behavior. `/health` reports
 `dflash2_enabled` and its depth; response `timings` identifies `spec_method`
 and reports compared and accepted proposals plus drafting and verification time.
 
+Thinking and function tools work through Chat Completions. See
+[pi and client configuration](docs/CHAT-COMPATIBILITY.md) for the provider setup,
+streaming fields, tool-result round trips, and supported API boundaries.
+
 ### `lse-server` options
 
 | Option | Default | |

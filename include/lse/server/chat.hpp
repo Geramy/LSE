@@ -22,11 +22,7 @@ struct ChatMessage {
 // engine to evaluate; a checkpoint trained on some other framing would need
 // its own renderer rather than a different template string.
 //
-// Reasoning models (Qwen3.x) gate the
-// `enable_thinking` false, it instead emits an empty
-// "
-// answers directly with no hidden pass. A model that is not a reasoner
-// never emits these tokens either way, so the flag is inert for it.
+// The generation prefix opens a thinking block or supplies an empty block.
 [[nodiscard]] std::string render_chatml(const std::vector<ChatMessage>& messages,
                                         bool add_generation_prompt = true,
                                         bool enable_thinking = true);
@@ -48,22 +44,7 @@ namespace detail {
 [[nodiscard]] std::pair<std::string, std::string> split_thinking(
     const std::string& text);
 
-class ThinkingStreamSplitter {
- public:
-  using Delta = std::pair<const char*, std::string>;
 
-  explicit ThinkingStreamSplitter(bool expose) : expose_(expose) {}
-  [[nodiscard]] std::vector<Delta> push(const std::string& piece);
-  [[nodiscard]] std::vector<Delta> finish();
-
- private:
-  [[nodiscard]] std::vector<Delta> push_answer(const std::string& piece);
-
-  bool expose_;
-  bool in_answer_ = false;
-  bool first_answer_ = true;
-  std::string pending_;
-};
 
 }  // namespace detail
 

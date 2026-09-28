@@ -120,7 +120,7 @@ then pass "chat completions does arithmetic"; else fail "chat arithmetic: $(head
 
 stream=$(curl -sN -m 300 "http://$HOST:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":24,"temperature":0,"thinking":false,"stream":true}' || true)
+  -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":24,"temperature":0,"thinking":false,"stream":true,"stream_options":{"include_usage":true}}' || true)
 printf '%s' "$stream" > /tmp/lse-smoke-stream.txt
 if python3 - /tmp/lse-smoke-stream.txt <<'PY'
 import json, sys
@@ -129,9 +129,9 @@ assert frames, "no SSE frames"
 assert frames[-1].strip() == "[DONE]", frames[-1]
 chunks = [json.loads(f) for f in frames[:-1]]
 assert chunks[0]["choices"][0]["delta"].get("role") == "assistant", "no opening role chunk"
-assert any(c["choices"][0]["delta"].get("content") for c in chunks), "no content delta"
-assert chunks[-1]["choices"][0]["finish_reason"] in ("stop", "length"), "no finish_reason"
-assert "usage" in chunks[-1], "final chunk carries no usage"
+assert any(c["choices"] and c["choices"][0]["delta"].get("content") for c in chunks), "no content delta"
+assert chunks[-2]["choices"][0]["finish_reason"] in ("stop", "length"), "no finish_reason"
+assert chunks[-1]["choices"] == [] and "usage" in chunks[-1], "no final usage chunk"
 PY
 then pass "POST /v1/chat/completions (stream)"; else fail "POST /v1/chat/completions (stream)"; fi
 

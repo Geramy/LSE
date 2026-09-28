@@ -1,0 +1,26 @@
+{
+  "providers": {
+    "lse": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": {
+        "supportsStrictMode": false,
+        "supportsStore": false,
+        "thinkingFormat": "qwen"
+      },
+      "models": [
+        {
+          "id": "qwen38-q4",
+          "name": "Qwen3.8 27B Q4 (LSE)",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "contextWindow": 32768,
+          "maxTokens": 512
+        }
+      ]
+    }
+  }
+}
