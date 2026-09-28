@@ -118,7 +118,8 @@ tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_
   test_token_ids test_submission_tuner test_submission_constants test_submission_decode
   test_decode_sample test_loaded_runtime test_hrx_copy_route test_gdn_pair
   test_gdn_scheduler test_scheduler_epilogue test_inplace_owner test_loom_matrix test_loom_dot
-  test_fp8_conversion test_quant_dispatch test_sha256 test_cooperative_rms)
+  test_fp8_conversion test_quant_dispatch test_sha256 test_cooperative_rms
+  test_mtp_options test_prefix_commit test_dflash2 test_topk_parallel test_q8_matrix_dispatch test_attention_short)
 cmake --build "$work/lse-build" --target lse lse-server compile_loom_matrix --parallel "$jobs"
 # The host suite must not discover a real GPU on a developer's machine.
 # Some tests enumerate the default backend, so give them a CPU-only build.

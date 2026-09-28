@@ -169,7 +169,7 @@ selection. Check `--devices` before loading a model.
 | `--repeat-penalty F` | 1.0 | Above 1 discourages repeats |
 | `-s, --seed N` | 0 | Sampler seed |
 | `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
-| `--mtp-depth N` | 2 | Draft proposals per verifier pass (1–7) |
+| `--mtp-depth N` | 3 | Draft proposals per verifier pass (1–7) |
 | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
 | `--dflash2=on/off` | off | Use the DFlash2 block drafter instead of MTP |
 | `--dflash2-model PATH` | `incoai/Qwen3.8-27B-DFlash2` | Drafter checkpoint directory or HF repo id |
@@ -201,7 +201,7 @@ is about 451 MB and shares the target model's embeddings and output head:
 
 ```bash
 ./lse-server -m /path/to/qwen38-27b-q4 \
-  --mtp mlx-community/Qwen3.8-27B-MTP-8bit --mtp-depth 2 --port 8080
+  --mtp mlx-community/Qwen3.8-27B-MTP-8bit --mtp-depth 3 --port 8080
 ```
 
 Depth 2 proposes two tokens and verifies them in a three-row target pass.
@@ -213,7 +213,8 @@ an MTP head uses ordinary decoding unless `--mtp` supplies one.
 ### DFlash2 block drafting
 
 DFlash2 is opt-in and replaces MTP for that server. It drafts seven proposals
-in an eight-position block, then checks them with the target model:
+in an eight-position block. Each target pass checks the anchor and up to three
+proposals; rejected suffixes are discarded before the next draft:
 
 ```bash
 ./lse-server -m /path/to/qwen38-27b-q4 --pool hrx:0 --dialect loom \
@@ -240,7 +241,7 @@ streaming fields, tool-result round trips, and supported API boundaries.
 | `--served-name ID` | the model argument | Model id reported by `/v1/models` |
 | `--max-tokens N` | 4096 | Refuse requests asking for more |
 | `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
-| `--mtp-depth N` | 2 | Draft proposals per verifier pass (1–7) |
+| `--mtp-depth N` | 3 | Draft proposals per verifier pass (1–7) |
 | `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
 | `--dflash2=on/off` | off | Use the DFlash2 block drafter instead of MTP |
 | `--dflash2-model PATH` | `incoai/Qwen3.8-27B-DFlash2` | Drafter checkpoint directory or HF repo id |

@@ -38,9 +38,8 @@ struct Fixture {
 
 LSE_TEST(short_split_selects_measured_defaults_and_two_ordered_native_stages) {
   backend::LoomEmitter emitter;
-  for (int queries : {3, 4, 7}) {
+  for (int queries : {3, 4, 7, 8}) {
     for (int capacity : {1024, 2048}) {
-      if (queries == 7 && capacity == 2048) continue;
       Fixture fx(queries, capacity);
       auto baseline = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal,
                                  0, fx.meta, fx.table, 16);
@@ -80,7 +79,7 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
     if (variant == 2) fx.gpu.max_threads_per_workgroup = 127;
     if (variant == 3) fx.gpu.lds_bytes_per_workgroup = 511;
     if (variant == 4) fx.q = leaf({1, 24, 2, 256});
-    if (variant == 5) fx.q = leaf({1, 24, 8, 256});
+    if (variant == 5) fx.q = leaf({1, 24, 9, 256});
     if (variant == 6) fx.q = leaf({1, 24, 3, 128});
     if (variant == 7) fx.q = leaf({1, 25, 3, 256});
     if (variant == 8) fx.q = leaf(fx.q.shape(), DType::kBF16);
@@ -91,7 +90,7 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
       fx.meta = leaf({kv::step_meta_elems(2)});
       fx.table = leaf({2, 64});
     }
-    if (variant == 13) { fx.q = leaf({1, 24, 7, 256}); fx.table = leaf({1, 128}); }
+    if (variant == 13) { fx.q = leaf({1, 24, 7, 256}); fx.table = leaf({1, 256}); }
     if (variant == 14) fx.table = leaf({1, 32});
     if (variant == 15) fx.k = fx.v = leaf({65, 2, 16, 256});
     auto out = variant == 11 ? fx.split(MaskKind::kSlidingWindow, -1) : fx.split();
@@ -103,8 +102,8 @@ LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
   for (int queries : {2, 3, 4, 7, 8})
     for (int capacity : {512, 1024, 2048, 4096, 262100}) {
       const Shape q{1, 24, queries, 256};
-      const bool accepted = ((queries == 3 || queries == 4) && (capacity == 1024 || capacity == 2048)) ||
-                            (queries == 7 && capacity == 1024);
+      const bool accepted = ((queries == 3 || queries == 4 || queries == 7 || queries == 8) &&
+                             (capacity == 1024 || capacity == 2048));
       LSE_EXPECT(dispatch::split_short_scope(q, 512, capacity) == accepted);
       LSE_EXPECT(dispatch::split_short_scope(q, 1024, capacity) == accepted);
       LSE_EXPECT(!dispatch::split_short_scope(q, 511, capacity));
@@ -121,7 +120,7 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
   for (auto mask : {MaskKind::kNone, MaskKind::kCausal, MaskKind::kSlidingWindow}) {
     Fixture fx(3, 1024);
     auto inputs = std::vector<Array>{fx.q, fx.k, fx.v, fx.meta, fx.table};
-    auto partial = custom("attention.short_partial128.wg128c2.v1", inputs, {0.0625f, 0, 0, 0});
+    auto partial = custom("attention.short_partial128.wg128c2.v2", inputs, {0.0625f, 0, 0, 0});
     LSE_EXPECT(partial.ok());
     if (!partial.ok()) return;
     partial->node()->iattrs = {static_cast<int>(mask), 7, 0, 16};

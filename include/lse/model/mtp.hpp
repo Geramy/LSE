@@ -56,6 +56,11 @@ class MtpModule {
                               std::span<const std::uint32_t> tokens,
                               std::int32_t first);
 
+  // Device hidden rows are copied into the same retained input slot.
+  Result<std::uint32_t> draft(const graph::Array& hidden,
+                              std::span<const std::uint32_t> tokens,
+                              std::int32_t first);
+
   // A chain of `depth` proposals from one starting context. The first is the
   // pass above; each later one feeds the module its OWN last-row hidden for
   // the row it just drafted -- the decoder has not run there, so the module's
@@ -64,6 +69,10 @@ class MtpModule {
   // next chain, exactly as a rejected single draft is today.
   Result<std::vector<std::uint32_t>> draft_chain(
       std::span<const float> hidden, std::span<const std::uint32_t> tokens,
+      std::int32_t first, std::uint32_t depth);
+
+  Result<std::vector<std::uint32_t>> draft_chain(
+      const graph::Array& hidden, std::span<const std::uint32_t> tokens,
       std::int32_t first, std::uint32_t depth);
 
   // Drops the module's KV. The decoder's session and this must be cleared
@@ -78,10 +87,15 @@ class MtpModule {
   Status build(WeightBinder& binder);
   Result<graph::Array> record(std::int64_t rows);
   // One draft pass over `tokens.size()` rows; fills pass_ and returns the
-  // proposal. The module's last-row hidden is left readable in pass_.last.
+  // proposal. The last-row hidden stays on the device in pass_.last.
   Result<std::uint32_t> draft_pass(std::span<const float> hidden,
                                    std::span<const std::uint32_t> tokens,
-                                   std::int32_t first);
+                                   std::int32_t first,
+                                   const graph::Array* device_hidden = nullptr);
+  Result<std::vector<std::uint32_t>> draft_chain_impl(
+      std::span<const float> hidden, const graph::Array* device_hidden,
+      std::span<const std::uint32_t> tokens, std::int32_t first,
+      std::uint32_t depth);
 
   std::string path_;
   // The parent's config with the module's own one-layer stack in it: the
@@ -98,7 +112,7 @@ class MtpModule {
 
   struct Pass {
     graph::Program program;
-    graph::Array hidden;   // [1, T, D] leaf, poked
+    graph::Array hidden;   // [1, T, D] stable input slot
     graph::Array tokens;   // [1, T] leaf, poked
     graph::Array meta;     // kv::step_meta_elems(1) leaf, poked
     graph::Array pick;

@@ -57,6 +57,15 @@ Status copy_slot(Array& destination, Array source) {
   destination.node()->host_dirty = false;
   return OkStatus();
 }
+void accept_cache_write(Array& cache, const Array& written) {
+  auto& destination = *cache.node();
+  const auto& source = *written.node();
+  destination.buffer = source.buffer;
+  destination.host_mirror = source.host_mirror;
+  destination.host_dirty = source.host_dirty;
+  destination.device_dirty = source.device_dirty;
+  destination.materialized = true;
+}
 Status evaluate(graph::Program& program, const std::vector<graph::NodePtr>& roots) {
   auto* scheduler = graph::default_scheduler();
   if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
@@ -215,19 +224,12 @@ struct DFlash2Module::Impl {
     graph::Program program;
     std::vector<graph::NodePtr> roots;
   };
-  struct ShiftPass {
-    std::vector<Array> keys, values;
-    graph::Program program;
-    std::vector<graph::NodePtr> roots;
-  };
   std::map<std::int64_t, ContextPass> contexts;
   std::map<std::uint32_t, DraftPass> drafts;
-  std::map<std::int32_t, ShiftPass> shifts;
 
   Status load(WeightBinder& binder);
   Result<ContextPass> context_pass(std::int64_t rows);
   Result<DraftPass> draft_pass(std::uint32_t proposals);
-  Result<ShiftPass> shift_pass(std::int32_t rows);
   Result<Array> attention(Array x, Layer& layer, const DraftPass& pass);
   std::pair<Array, Array> prepare(Array x, const Conv& conv) const;
 };
@@ -294,8 +296,12 @@ Result<DFlash2Module::Impl::ContextPass> DFlash2Module::Impl::context_pass(std::
     k = norm(k, l.k_norm, config.rms_eps);
     LSE_ASSIGN_OR(k, ops::apply_rope(k, rope, p.offset));
     Array v = ops::split_heads(graph::linear(context, l.v), config.kv_heads, config.head_dim);
-    p.keys.push_back(rows == capacity ? k : graph::concat({graph::slice(l.keys, 2, rows, capacity), k}, 2));
-    p.values.push_back(rows == capacity ? v : graph::concat({graph::slice(l.values, 2, rows, capacity), v}, 2));
+    const std::array<float,4> geometry{static_cast<float>(config.kv_heads), static_cast<float>(capacity),
+        static_cast<float>(config.head_dim), static_cast<float>(rows)};
+    LSE_ASSIGN_OR(Array keys, graph::custom("dflash2.cache_write", {l.keys, k, p.offset}, geometry));
+    LSE_ASSIGN_OR(Array values, graph::custom("dflash2.cache_write", {l.values, v, p.offset}, geometry));
+    p.keys.push_back(std::move(keys));
+    p.values.push_back(std::move(values));
     p.roots.push_back(p.keys.back().node()); p.roots.push_back(p.values.back().node());
   }
   return p;
@@ -316,8 +322,10 @@ Result<Array> DFlash2Module::Impl::attention(Array x, Layer& l, const DraftPass&
   q = norm(q, l.q_norm, config.rms_eps); k = norm(k, l.k_norm, config.rms_eps);
   LSE_ASSIGN_OR(q, ops::apply_rope(q, rope, p.offset));
   LSE_ASSIGN_OR(k, ops::apply_rope(k, rope, p.offset));
-  LSE_ASSIGN_OR(Array attended, graph::custom("dflash2.attention", {q, graph::concat({l.keys, k}, 2), graph::concat({l.values, v}, 2), p.meta},
+  LSE_ASSIGN_OR(Array partial, graph::custom("dflash2.ring_partial256.v1", {q, l.keys, l.values, k, v, p.meta},
       {static_cast<float>(config.q_heads), static_cast<float>(config.kv_heads), static_cast<float>(config.head_dim), static_cast<float>(config.sliding_window)}));
+  LSE_ASSIGN_OR(Array attended, graph::custom("dflash2.ring_merge256.v1", {partial},
+      {static_cast<float>(config.q_heads), static_cast<float>(q.shape().dim(2)), static_cast<float>(config.head_dim), static_cast<float>(partial.shape().dim(2))}));
   return graph::linear(ops::merge_heads(attended), l.o);
 }
 Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint32_t proposals) {
@@ -326,7 +334,7 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint
   LSE_ASSIGN_OR(p.tokens, slot(Shape{1, rows}));
   LSE_ASSIGN_OR(p.anchor, slot(Shape{1, 1}));
   LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
-  LSE_ASSIGN_OR(p.meta, slot(Shape{2}));
+  LSE_ASSIGN_OR(p.meta, slot(Shape{3}));
   LSE_ASSIGN_OR(Array x, target->embed(p.tokens));
   for (Layer& l : layers) {
     auto [prepared, after] = prepare(norm(x, l.input_norm, config.rms_eps), l.attention_conv);
@@ -351,16 +359,6 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint
   LSE_ASSIGN_OR(p.scores, graph::custom("dflash2.selector", {pred, gate, succ, unary},
       {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(top), static_cast<float>(rank)}));
   p.roots = {p.scores.node(), p.indices.node()};
-  return p;
-}
-Result<DFlash2Module::Impl::ShiftPass> DFlash2Module::Impl::shift_pass(std::int32_t rows) {
-  ShiftPass p;
-  Array zero = Array::zeros(Shape{1, config.kv_heads, rows, config.head_dim}, DType::kF32);
-  for (Layer& l : layers) {
-    p.keys.push_back(graph::concat({zero, graph::slice(l.keys, 2, 0, capacity - rows)}, 2));
-    p.values.push_back(graph::concat({zero, graph::slice(l.values, 2, 0, capacity - rows)}, 2));
-    p.roots.push_back(p.keys.back().node()); p.roots.push_back(p.values.back().node());
-  }
   return p;
 }
 
@@ -391,17 +389,6 @@ Status DFlash2Module::rewind(std::int32_t position) {
   if (drop == 0) return OkStatus();
   if (drop > static_cast<std::int32_t>(impl_->config.block_size) || drop > impl_->live)
     return LSE_ERROR(kInvalidArgument, "DFlash2 rewind exceeds retained speculative context");
-  auto it = impl_->shifts.find(drop);
-  if (it == impl_->shifts.end()) {
-    LSE_ASSIGN_OR(auto pass, impl_->shift_pass(drop));
-    it = impl_->shifts.emplace(drop, std::move(pass)).first;
-  }
-  auto& pass = it->second;
-  LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
-  for (std::size_t i = 0; i < impl_->layers.size(); ++i) {
-    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].keys, pass.keys[i]));
-    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].values, pass.values[i]));
-  }
   impl_->position = position; impl_->live -= drop;
   return OkStatus();
 }
@@ -430,8 +417,8 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
   const float offset = static_cast<float>(first); LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1)));
   LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
   for (std::size_t i = 0; i < impl_->layers.size(); ++i) {
-    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].keys, pass.keys[i]));
-    LSE_RETURN_IF_ERROR(copy_slot(impl_->layers[i].values, pass.values[i]));
+    accept_cache_write(impl_->layers[i].keys, pass.keys[i]);
+    accept_cache_write(impl_->layers[i].values, pass.values[i]);
   }
   impl_->position = first + static_cast<std::int32_t>(rows);
   impl_->live = std::min(impl_->capacity, impl_->live + static_cast<std::int32_t>(rows));
@@ -451,7 +438,8 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, st
   auto& pass = it->second;
   std::vector<float> tokens(impl_->config.block_size, static_cast<float>(impl_->config.mask_token)); tokens[0] = static_cast<float>(anchor);
   const float offset = static_cast<float>(first), anchor_id = static_cast<float>(anchor);
-  const float meta[] = {static_cast<float>(impl_->live), static_cast<float>(impl_->capacity)};
+  const float meta[] = {static_cast<float>(impl_->live), static_cast<float>(impl_->capacity),
+                        static_cast<float>(impl_->position % impl_->capacity)};
   LSE_RETURN_IF_ERROR(poke(pass.tokens, tokens)); LSE_RETURN_IF_ERROR(poke(pass.anchor, std::span(&anchor_id, 1)));
   LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1))); LSE_RETURN_IF_ERROR(poke(pass.meta, meta));
   LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));

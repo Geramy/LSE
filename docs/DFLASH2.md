@@ -71,6 +71,9 @@ Target feature taps are post-block outputs at zero-based layers
 
 Every draft evaluates the complete trained block of eight positions: one anchor
 and seven mask tokens. Returning a shorter prefix preserves that computation.
+The default target verifier consumes the anchor plus up to three proposals,
+reducing work on rejected suffixes. Health and timing fields report this verifier
+depth of three; the trained draft block remains eight positions.
 Attention is noncausal within the draft block, including future mask positions;
 context keys obey the 2048-position sliding window. Learned dynamic convolutions
 have two taps and groups of 16 channels. The selector conditions each choice on

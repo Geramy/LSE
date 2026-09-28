@@ -212,42 +212,25 @@ Result<std::uint32_t> Generator::greedy_step(Session& session,
   return static_cast<std::uint32_t>(id);
 }
 
-Status Generator::read_hidden(const Array& hidden, std::vector<float>* out) {
-  if (!hidden.valid() || hidden.dtype() != DType::kF32) {
-    return LSE_ERROR(kInternal,
-                     "the MTP module reads hidden states as f32; this pass "
-                     "produced another dtype");
-  }
-  graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend to read from");
-  // The pass left the value on the device; nothing has asked for it on the
-  // host, so the mirror is where it has to be moved to.
-  LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(*hidden.node(),
-                                                           sched->backend()));
-  out->resize(hidden.shape().elem_count());
-  return graph::interpreter::read_raw(*hidden.node(), out->data(),
-                                      out->size() * sizeof(float));
-}
-
-// Fills the module's cache for one prefill chunk. Row j of the chunk sits at
-// absolute position `first + j`, carries the token there, and takes the
-// decoder's hidden state from the position before it — so row 0 needs the
-// previous chunk's last row, which `carry` holds (zeros before the first
-// chunk, which is the one position with no predecessor).
+// Shift target rows by one position, retaining the previous chunk's last row.
 Status Generator::mtp_prefill_chunk(const Array& hidden,
                                     std::span<const std::uint32_t> tokens,
-                                    std::int32_t first,
-                                    std::vector<float>* carry) {
-  LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
-  const std::size_t width = spec_hidden_.size() / tokens.size();
-  std::vector<float> shifted(spec_hidden_.size());
-  std::copy(carry->begin(), carry->end(), shifted.begin());
-  std::copy(spec_hidden_.begin(),
-            spec_hidden_.end() - static_cast<std::ptrdiff_t>(width),
-            shifted.begin() + static_cast<std::ptrdiff_t>(width));
-  carry->assign(spec_hidden_.end() - static_cast<std::ptrdiff_t>(width),
-                spec_hidden_.end());
-  return mtp_->draft(shifted, tokens, first).status();
+                                    std::int32_t first, Array* carry) {
+  if (!hidden.valid() || hidden.dtype() != DType::kF32 ||
+      hidden.shape().rank() != 3 || hidden.shape().dim(0) != 1 ||
+      hidden.shape().dim(1) != static_cast<std::int64_t>(tokens.size())) {
+    return LSE_ERROR(kInvalidArgument, "invalid target hidden rows for MTP");
+  }
+  const auto rows = static_cast<std::int64_t>(tokens.size());
+  Array shifted = rows == 1 ? *carry
+                            : graph::concat(
+                                  {*carry, graph::slice(hidden, 1, 0, rows - 1)}, 1);
+  LSE_RETURN_IF_ERROR(mtp_->draft(shifted, tokens, first).status());
+  Array last = graph::slice(hidden, 1, rows - 1, rows);
+  LSE_RETURN_IF_ERROR(last.materialize());
+  // Detach the retained value from a target graph that the next chunk replays.
+  *carry = Array::from_buffer(last.node()->buffer, last.shape(), last.dtype());
+  return OkStatus();
 }
 
 Result<std::vector<float>> Generator::step(
@@ -267,9 +250,9 @@ Result<std::vector<float>> Generator::step(
   // the attention masks all read the shared device position slot, which counts
   // absolute tokens, not tokens within a pass.
   const auto base = static_cast<std::int32_t>(session.position());
-  std::vector<float> carry;
+  Array carry;
   if (mtp_ != nullptr) {
-    carry.assign(static_cast<std::size_t>(model_.config().hidden_size), 0.0f);
+    carry = Array::zeros(Shape{1, 1, model_.config().hidden_size}, DType::kF32);
   }
   Array hidden;
   std::size_t at = 0;
@@ -342,7 +325,8 @@ Status Generator::verify(Session& session,
   LSE_ASSIGN_OR(Array hidden,
                 model_.hidden(spec_ids_, &session.states(), nullptr, nullptr,
                               nullptr, replaces_previous,
-                              dflash2_ != nullptr ? &capture : nullptr));
+                              dflash2_ != nullptr ? &capture : nullptr,
+                              m > 1));
   spec_features_ = std::move(capture.features);
 
   const SamplingParams& sp = sampler_.params();
@@ -383,9 +367,6 @@ Status Generator::verify(Session& session,
         *spec_.logits.node(), spec_logits_.data(),
         spec_logits_.size() * sizeof(float)));
   }
-  if (mtp_ != nullptr) {
-    LSE_RETURN_IF_ERROR(read_hidden(hidden, &spec_hidden_));
-  }
   stats_.spec_verify_ns += now_ns() - started;
   ++stats_.spec_verify_passes;
   return OkStatus();
@@ -407,8 +388,7 @@ Status Generator::append_draft_context(std::size_t rows, std::int32_t first) {
   return OkStatus();
 }
 
-// The target answers each input row. Rejected suffixes are overwritten by a
-// same-width replacement pass whose carry inputs remain at the original cursor.
+// Commit valid verifier inputs and discard the unaccepted suffix's state.
 Result<std::vector<std::uint32_t>> Generator::speculate(
     Session& session, std::vector<float>& prefill_logits,
     const GenerationLimits& limits, const TokenCallback& on_token) {
@@ -417,7 +397,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   if (limits.max_tokens <= 0) return generated;
 
   const std::uint32_t depth = dflash2_ != nullptr
-                                  ? dflash2_->block_size() - 1
+                                  ? dflash2_verify_depth(dflash2_->block_size())
                                   : limits.mtp_depth;
   std::size_t m = 0;
   const auto next_width = [&] {
@@ -425,7 +405,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         depth, static_cast<std::uint64_t>(limits.max_tokens) - generated.size(),
         static_cast<std::int64_t>(model_.config().kv_capacity()) - session.position());
   };
-  const auto draft_for_width = [&](std::span<const float> hidden,
+  const auto draft_for_width = [&](const Array& hidden,
                                     std::span<const std::uint32_t> tokens,
                                     std::int32_t first, std::uint32_t proposals)
       -> Result<std::vector<std::uint32_t>> {
@@ -471,7 +451,6 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   std::uint64_t decode_start = 0;
 
   std::vector<std::uint32_t> row_in;   // the m tokens the next pass consumes
-  std::size_t already = 0;             // leading answers already emitted
   if (running) {
     const std::uint32_t width = next_width();
     if (width == 0) {
@@ -488,24 +467,16 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     }
   }
 
-  bool replaces = false;
   while (running) {
     m = row_in.size();
     const auto at = static_cast<std::int32_t>(session.position());
-    LSE_RETURN_IF_ERROR(verify(session, row_in, replaces));
+    LSE_RETURN_IF_ERROR(verify(session, row_in, false));
     ++stats_.spec_steps;
 
-    // Harvest: emit answers while the chain keeps being right. Rows below
-    // `already` re-derive tokens a previous harvest emitted; skip them.
-    std::size_t emitted_to = already;   // rows whose answers are now emitted
+    std::size_t emitted_to = 0;
     bool mismatch = false;
     std::vector<std::uint32_t> answers(m, 0);
-    // Rows below `already` re-derive tokens a previous harvest emitted; their
-    // answers are the inputs the splice put in the NEXT rows. Recording them
-    // here keeps every later consumer of `answers` -- a second splice, the
-    // module's catch-up chain -- honest. Leaving them zero corrupted both.
-    for (std::size_t i = 0; i < already; ++i) answers[i] = row_in[i + 1];
-    for (std::size_t i = already; i < m; ++i) {
+    for (std::size_t i = 0; i < m; ++i) {
       answers[i] = answer(i);
       running = give(answers[i]);
       emitted_to = i + 1;
@@ -539,42 +510,34 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       }
       const std::uint64_t drafted = now_ns();
       LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
-                    draft_for_width(spec_hidden_, caught, at + 1, width - 1));
+                    draft_for_width(spec_.hidden, caught, at + 1, width - 1));
       stats_.spec_draft_ns += now_ns() - drafted;
       row_in.assign(1, pending);
       row_in.insert(row_in.end(), chain.begin(), chain.end());
-      already = 0;
-      replaces = false;
       continue;
     }
 
-    // Rows past the disagreement consumed wrong inputs. Rewind, splice the
-    // corrected prefix, chain fresh drafts for the tail, and let the redo be
-    // the next round: its leading rows re-derive what was already emitted.
-    model_.rewind(session.states(), at);
-    const std::size_t good = emitted_to;   // answers[0..good-1] are emitted
-    std::vector<std::uint32_t> next;
-    next.reserve(m);
-    next.push_back(row_in[0]);
-    for (std::size_t i = 0; i < good; ++i) next.push_back(answers[i]);
-    const std::uint32_t need =
-        static_cast<std::uint32_t>(m - next.size());
-    if (need > 0) {
-      const auto width = static_cast<std::size_t>(
-          spec_hidden_.size() / m);
-      const std::uint64_t drafted = now_ns();
-      LSE_ASSIGN_OR(
-          std::vector<std::uint32_t> chain,
-          draft_for_width(
-              std::span<const float>(spec_hidden_.data(), good * width),
-              std::span<const std::uint32_t>(answers.data(), good), at + 1,
-              need));
-      stats_.spec_draft_ns += now_ns() - drafted;
-      next.insert(next.end(), chain.begin(), chain.end());
+    const std::size_t good = emitted_to;
+    const auto commit_started = now_ns();
+    LSE_RETURN_IF_ERROR(model_.commit_prefix(session.states(), good));
+    stats_.spec_verify_ns += now_ns() - commit_started;
+    session.advance(static_cast<std::int32_t>(good));
+    pending = answers[good - 1];
+    const std::uint32_t width = next_width();
+    if (width == 0) {
+      running = false;
+      break;
     }
-    row_in = std::move(next);
-    already = good;
-    replaces = true;
+    const auto drafted = now_ns();
+    LSE_ASSIGN_OR(
+        std::vector<std::uint32_t> chain,
+        draft_for_width(
+            graph::slice(spec_.hidden, 1, 0, static_cast<std::int64_t>(good)),
+            std::span<const std::uint32_t>(answers.data(), good), at + 1,
+            width - 1));
+    stats_.spec_draft_ns += now_ns() - drafted;
+    row_in.assign(1, pending);
+    row_in.insert(row_in.end(), chain.begin(), chain.end());
   }
 
   // Stopping within a verifier pass can leave uncommitted rows in the cache.
@@ -612,7 +575,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   }
   stats_ = GenerationStats{};
   stats_.mtp_depth = mtp_ != nullptr ? limits.mtp_depth : 0;
-  stats_.dflash2_depth = dflash2_ != nullptr ? dflash2_->block_size() - 1 : 0;
+  stats_.dflash2_depth = dflash2_ != nullptr ? dflash2_verify_depth(dflash2_->block_size()) : 0;
   host_reasons_.clear();
   if (graph::Scheduler* sched = graph::default_scheduler()) {
     sched->reset_accumulated_trace();

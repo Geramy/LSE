@@ -118,8 +118,17 @@ add_test(NAME test_server_shutdown COMMAND test_server_shutdown)
 set_tests_properties(test_server_shutdown PROPERTIES TIMEOUT 15)
 
 lse_add_test(test_model lse_model lse_backends)
+lse_add_test(test_prefix_commit lse_model lse_backends)
+set_tests_properties(test_prefix_commit PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 lse_add_test(test_feature_taps lse_model lse_backends)
 lse_add_test(test_dflash2 lse_model lse_backends)
+if(NOT TARGET lse_backend_hrx)
+  target_sources(test_dflash2 PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
 set_tests_properties(test_dflash2 test_feature_taps PROPERTIES
   ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 

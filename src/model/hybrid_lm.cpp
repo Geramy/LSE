@@ -311,6 +311,225 @@ Status poke_tokens(Array& slot, const Array& incoming) {
 
 }  // namespace
 
+Status PrefixStateCommit::retain(std::span<const MixerState> states,
+                                  std::int64_t sequence_rows,
+                                  std::vector<graph::NodePtr>& roots) {
+  if (sequence_rows <= 1)
+    return LSE_ERROR(kInvalidArgument, "a retained prefix needs multiple rows");
+  std::vector<Entry> entries;
+  for (const MixerState& state : states) {
+    if (state.gdn_state.valid()) {
+      const auto& out = state.gdn_state.node();
+      if (out->kind != graph::OpKind::kGDNChunkScan || out->iattrs[0] != 1 ||
+          out->inputs.size() != 6 || out->shape.rank() != 4 ||
+          out->shape.dim(0) != 1 || out->dtype != DType::kF32)
+        return LSE_ERROR(kUnimplemented, "prefix recurrence is not a pure GDN state");
+      const Shape vector{1, sequence_rows, out->shape.dim(1), out->shape.dim(2)};
+      const Shape scalar{1, sequence_rows, out->shape.dim(1)};
+      if (out->shape.dim(2) != out->shape.dim(3) ||
+          out->inputs[1]->shape != vector || out->inputs[2]->shape != vector ||
+          out->inputs[3]->shape != scalar || out->inputs[4]->shape != scalar ||
+          out->inputs[5]->shape != out->shape)
+        return LSE_ERROR(kInvalidArgument, "prefix recurrence geometry differs");
+      entries.push_back({out, {out->inputs[1], out->inputs[2], out->inputs[3],
+                                out->inputs[4], out->inputs[5]}, true});
+    }
+    for (const Array* tail : {&state.gdn_conv_q, &state.gdn_conv_k,
+                              &state.gdn_conv_v, &state.gdn_conv_qkv}) {
+      if (!tail->valid()) continue;
+      const auto& out = tail->node();
+      if (out->kind != graph::OpKind::kConvTailShift || out->inputs.size() != 2 ||
+          out->shape.rank() != 3 || out->shape.dim(0) != 1 ||
+          out->inputs[0]->shape != out->shape ||
+          out->inputs[1]->shape != Shape{1, sequence_rows, out->shape.dim(2)} ||
+          out->dtype != DType::kF32)
+        return LSE_ERROR(kUnimplemented, "prefix convolution is not a pure tail shift");
+      entries.push_back({out, {out->inputs[0], out->inputs[1]}, false});
+    }
+  }
+  for (const Entry& entry : entries)
+    for (const auto& source : entry.sources) {
+      if (source->dtype != DType::kF32)
+        return LSE_ERROR(kUnimplemented, "prefix inputs must be FP32");
+      roots.push_back(source);
+    }
+  sequence_rows_ = sequence_rows;
+  entries_ = std::move(entries);
+  replays_.clear();
+  replays_.resize(static_cast<std::size_t>(sequence_rows));
+  return OkStatus();
+}
+
+Status PrefixStateCommit::commit(std::size_t rows, graph::Scheduler& scheduler) {
+  if (!ready() || rows == 0 || rows >= static_cast<std::size_t>(sequence_rows_))
+    return LSE_ERROR(kInvalidArgument, "prefix rows must be inside the retained pass");
+  LSE_RETURN_IF_ERROR(scheduler.drain());
+  auto overlaps = [](const backend::DeviceBuffer& a, const backend::DeviceBuffer& b) {
+    if (!a.valid() || !b.valid() || a.residency != b.residency) return false;
+    const bool same = (a.handle != 0 && a.handle == b.handle) ||
+                      (a.ptr != nullptr && a.ptr == b.ptr);
+    if (!same) return false;
+    return a.offset <= b.offset ? b.offset - a.offset < a.size_bytes
+                               : a.offset - b.offset < b.size_bytes;
+  };
+  auto has_bytes = [](const graph::Node& node) {
+    return node.buffer.valid() && node.buffer.size_bytes >=
+        dtype_storage_bytes(node.dtype, node.element_count());
+  };
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    const Entry& entry = entries_[i];
+    if (!has_bytes(*entry.output) || !entry.output->materialized)
+      return LSE_ERROR(kInvalidArgument, "prefix output ", std::to_string(i),
+                       " has not finished verification");
+    for (std::size_t j = 0; j < entry.sources.size(); ++j) {
+      const auto& source = entry.sources[j];
+      if (!source->materialized)
+        return LSE_ERROR(kInvalidArgument, "prefix source ", std::to_string(i),
+                         ":", std::to_string(j), " ", graph::to_string(source->kind),
+                         " is not materialized, shape ", source->shape.to_string());
+      if (!has_bytes(*source) ||
+          (source->buffer.ptr == nullptr && source->host_dirty &&
+           source->host_mirror.size() < dtype_storage_bytes(source->dtype, source->element_count())))
+        return LSE_ERROR(kInvalidArgument, "prefix source ", std::to_string(i),
+                         ":", std::to_string(j), " ", graph::to_string(source->kind),
+                         " has ", std::to_string(source->buffer.size_bytes),
+                         " bytes for ", source->shape.to_string());
+    }
+  }
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    const auto& output = entries_[i].output->buffer;
+    for (std::size_t j = 0; j < entries_.size(); ++j) {
+      if (i != j && overlaps(output, entries_[j].output->buffer))
+        return LSE_ERROR(kInvalidArgument, "prefix carries ", std::to_string(i),
+                         " and ", std::to_string(j), " overlap");
+      for (std::size_t k = 0; k < entries_[j].sources.size(); ++k) {
+        const auto& source = entries_[j].sources[k];
+        if (overlaps(output, source->buffer))
+          return LSE_ERROR(kInvalidArgument, "prefix carry ", std::to_string(i),
+                           " overlaps source ", std::to_string(j), ":", std::to_string(k),
+                           " ", graph::to_string(source->kind), " windows ",
+                           std::to_string(output.offset), "+", std::to_string(output.size_bytes),
+                           " and ", std::to_string(source->buffer.offset), "+",
+                           std::to_string(source->buffer.size_bytes));
+      }
+    }
+  }
+  Replay& replay = replays_[rows];
+  if (replay.outputs.empty() && !entries_.empty()) {
+    for (const Entry& entry : entries_) {
+      const auto member = entry.output->member != graph::Node::kAnyMember
+          ? static_cast<std::size_t>(entry.output->member)
+          : scheduler.devices().member_of(entry.output->buffer.residency);
+      const graph::ScopedMember on(member < scheduler.devices().size()
+                                      ? member : scheduler.devices().primary());
+      std::vector<Array> inputs;
+      for (std::size_t i = 0; i < entry.sources.size(); ++i) {
+        const auto& source = entry.sources[i];
+        auto node = std::make_shared<graph::Node>();
+        node->kind = graph::OpKind::kBuffer;
+        node->fclass = graph::FusionClass::kLeaf;
+        // B1 prefixes are contiguous windows; no activation copies are needed.
+        const bool sequence = entry.recurrent ? i < 4 : i == 1;
+        for (std::size_t axis = 0; axis < source->shape.rank(); ++axis)
+          node->shape.push_back(sequence && axis == 1
+              ? static_cast<std::int64_t>(rows) : source->shape.dim(axis));
+        node->dtype = source->dtype;
+        node->member = source->member;
+        inputs.emplace_back(node);
+        replay.inputs.emplace_back(node);
+      }
+      Array output;
+      if (entry.recurrent) {
+        // Q affects only discarded outputs; the state reads K/V/alpha/beta.
+        (void)graph::gated_delta_step(inputs[0], inputs[0], inputs[1], inputs[2],
+                                      inputs[3], inputs[4], &output);
+      } else {
+        output = graph::conv_tail(inputs[0], inputs[1]);
+      }
+      replay.outputs.push_back(output);
+    }
+  }
+  replay.program.reset_compute();
+  std::size_t input_index = 0;
+  std::vector<graph::NodePtr> roots;
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    const Entry& entry = entries_[i];
+    for (const auto& source : entry.sources) {
+      auto& leaf = *replay.inputs[input_index++].node();
+      const auto member = scheduler.devices().member_of(source->buffer.residency);
+      auto& owner = member < scheduler.devices().size()
+                        ? scheduler.devices().device(member) : scheduler.backend();
+      LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(*source, owner));
+      leaf.buffer = source->buffer;
+      leaf.buffer.size_bytes = dtype_storage_bytes(leaf.dtype, leaf.element_count());
+      leaf.materialized = true;
+      leaf.device_dirty = source->buffer.ptr == nullptr;
+      leaf.host_dirty = false;
+      leaf.host_mirror.clear();
+    }
+    auto& output = *replay.outputs[i].node();
+    output.buffer = entry.output->buffer;
+    output.materialized = false;
+    output.device_dirty = false;
+    output.host_dirty = false;
+    roots.push_back(replay.outputs[i].node());
+  }
+  if (!roots.empty()) LSE_RETURN_IF_ERROR(scheduler.eval(roots, false, &replay.program));
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    auto& output = *replay.outputs[i].node();
+    const auto member = scheduler.devices().member_of(output.buffer.residency);
+    auto& owner = member < scheduler.devices().size()
+                      ? scheduler.devices().device(member) : scheduler.backend();
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(output, owner));
+    const Entry& entry = entries_[i];
+    entry.output->device_dirty = entry.output->buffer.ptr == nullptr;
+    entry.output->host_dirty = false;
+    entry.output->materialized = true;
+  }
+  return OkStatus();
+}
+
+Status HybridLM::commit_prefix(std::vector<MixerState>& states, std::size_t rows) {
+  for (ForwardCache& cache : caches_) {
+    if (cache.pass_id == 0 || cache.pass_id != last_pass_id_) continue;
+    if (cache.states != &states || cache.state_stamp.size() != states.size() ||
+        !cache.retains_prefix_state || cache.prefix_committed || !cache.prefix.ready())
+      return LSE_ERROR(kInvalidArgument, "the latest pass retained no prefix state");
+    if (states.empty() || cache.seq <= 1 || rows == 0 ||
+        rows >= static_cast<std::size_t>(cache.seq) ||
+        states.front().position != cache.prefix_end ||
+        states.front().position < cache.seq)
+      return LSE_ERROR(kInvalidArgument, "prefix rows or cursor are outside the pass");
+    const auto after = states.front().position;
+    for (std::size_t i = 0; i < states.size(); ++i) {
+      const auto& s = states[i];
+      const auto& saved = cache.state_stamp[i];
+      if (s.position != after || s.gdn_state.node() != saved.gdn.node() ||
+          s.gdn_conv_q.node() != saved.cq.node() || s.gdn_conv_k.node() != saved.ck.node() ||
+          s.gdn_conv_v.node() != saved.cv.node() || s.gdn_conv_qkv.node() != saved.cqkv.node())
+        return LSE_ERROR(kInvalidArgument, "prefix state no longer matches verification");
+    }
+    graph::Scheduler* scheduler = graph::default_scheduler();
+    if (!scheduler) return LSE_ERROR(kInternal, "no scheduler for prefix state");
+    if (!cache.meta.valid() || cache.meta.node()->element_count() < 5 ||
+        !cache.meta.node()->buffer.valid())
+      return LSE_ERROR(kInvalidArgument, "prefix descriptor is unavailable");
+    LSE_RETURN_IF_ERROR(cache.prefix.commit(rows, *scheduler));
+    const auto first = after - static_cast<std::int32_t>(cache.seq);
+    const auto cursor = first + static_cast<std::int32_t>(rows);
+    const float meta[] = {static_cast<float>(first), static_cast<float>(cursor), 1.0f,
+                          static_cast<float>(first), static_cast<float>(cursor)};
+    LSE_RETURN_IF_ERROR(poke_values(cache.meta, meta));
+    for (MixerState& state : states) {
+      state.position = cursor;
+      if (state.paged.valid()) state.paged.row_tokens.assign(1, cursor);
+    }
+    cache.prefix_committed = true;
+    return OkStatus();
+  }
+  return LSE_ERROR(kInvalidArgument, "there is no verifier pass to commit");
+}
+
 void HybridLM::rewind(std::vector<MixerState>& states,
                       std::int32_t position) const {
   for (MixerState& s : states) {
@@ -322,7 +541,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                                std::vector<MixerState>* states, Array* aux_loss,
                                std::vector<Array>* trace, const StepRows* rows,
                                bool replaces_previous,
-                               FeatureCapture* capture) {
+                               FeatureCapture* capture,
+                               bool retain_prefix_state) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -355,15 +575,20 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   };
   const std::int64_t t_now =
       tokens.valid() ? tokens.shape().dim(tokens.shape().rank() - 1) : 0;
+  if (retain_prefix_state && (states == nullptr || !tokens.valid() ||
+                              tokens.shape().dim(0) != 1 || t_now <= 1 || rows != nullptr)) {
+    return LSE_ERROR(kInvalidArgument, "prefix retention needs one multi-token sequence");
+  }
   // A replacement must keep the original roots and carry inputs. Check before
   // allocating state, extending pools or changing any retention slot.
   if (replaces_previous) {
     for (const ForwardCache& cache : caches_) {
       if ((cache.t_key == t_now ||
            (last_pass_id_ != 0 && cache.pass_id == last_pass_id_)) &&
-          !feature_layers_match(cache)) {
+          (!feature_layers_match(cache) ||
+           cache.retains_prefix_state != retain_prefix_state)) {
         return LSE_ERROR(kInvalidArgument,
-                         "a replacement pass cannot change feature layers");
+                         "a replacement pass cannot change feature or prefix retention");
       }
     }
   }
@@ -599,6 +824,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                               replaces_previous || kv_len >= 512;
   const bool can_reuse =
       chain_ok && split_scope_ok && feature_layers_match(cache_) &&
+      cache_.retains_prefix_state == retain_prefix_state &&
       (capture == nullptr || cache_.features.valid()) &&
       aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
       cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
@@ -682,6 +908,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       for (MixerState& s : *states) s.position = kv_len;
     }
     last_pass_id_ = cache_.pass_id;
+    cache_.prefix_committed = false;
+    cache_.prefix_end = kv_len;
     if (capture != nullptr) capture->features = cache_.features;
     return cache_.hidden;
   }
@@ -821,6 +1049,11 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   // 128. Without this the planner hands the state a slot six live activations
   // also hold, and the next pass reads its recurrence out of bytes it
   // overwrites before the scan runs.
+  cache_.prefix = PrefixStateCommit{};
+  cache_.retains_prefix_state = retain_prefix_state;
+  cache_.prefix_committed = false;
+  if (retain_prefix_state)
+    LSE_RETURN_IF_ERROR(cache_.prefix.retain(*states, t_now, roots));
   std::vector<graph::NodePtr> carried;
   if (states != nullptr) {
     auto add = [&](const Array& a, bool is_carry) {
@@ -876,7 +1109,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     for (const auto& node : group.nodes)
       if (node->prim && (node->prim->name() == "attention.decode_partial128.v1" ||
                          node->prim->name() == "attention.decode_partial128.wg128c2.v2" ||
-                         node->prim->name() == "attention.short_partial128.wg128c2.v1"))
+                         node->prim->name() == "attention.short_partial128.wg128c2.v2"))
         cache_.split_decode_attention = true;
   cache_.tokens = tokens;
   cache_.hidden = y;
@@ -884,6 +1117,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.feature_layers.assign(feature_layers.begin(), feature_layers.end());
   cache_.states = states;
   cache_.seq = t_now;
+  cache_.prefix_end = kv_len;
   cache_.pass_id = ++pass_counter_;
   cache_.prev_pass = prev_pass_run;
   last_pass_id_ = cache_.pass_id;

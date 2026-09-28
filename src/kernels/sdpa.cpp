@@ -8,6 +8,7 @@
 #include "lse/backends/hrx/device_info.hpp"
 
 #include <string>
+#include <vector>
 
 namespace lse::kernels {
 
@@ -357,9 +358,9 @@ LSE_REGISTER_PRIMITIVE(SplitDecodeMerge);
 template <bool ShortQuery>
 struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuery>> {
   static constexpr std::string_view kName = ShortQuery
-      ? "attention.short_partial128.wg128c2.v1" : "attention.decode_partial128.wg128c2.v2";
+      ? "attention.short_partial128.wg128c2.v2" : "attention.decode_partial128.wg128c2.v2";
   static constexpr std::string_view kEntry = ShortQuery
-      ? "lse_sdpa_short_partial128_wg128c2_v1" : "lse_sdpa_decode_partial128_wg128c2_v2";
+      ? "lse_sdpa_short_partial128_wg128c2_v2" : "lse_sdpa_decode_partial128_wg128c2_v2";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
@@ -421,16 +422,40 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
         return j <= offset && j + static_cast<std::uint32_t>(s.iattrs[1]) > offset;
       }
     };
-    if (auto owns = e.when(lane < kSplitKeys)) {
-      const auto j = e.let(begin + lane);
-      scores[lane] = math::neg_inf();
-      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
-        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
-        const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
+    if constexpr (ShortQuery) {
+      const auto wl = e.let(lane % 32u);
+      const auto wi = e.let(lane / 32u);
+      std::vector<kir::Val<kir::f32>> query_values;
+      for (std::uint32_t d = 0; d < 8u; ++d)
+        query_values.push_back(e.let(a.q[qb + wl + d * 32u]));
+      for (auto tile : e.range(kSplitKeys / 4u)) {
+        const auto key_lane = e.let(tile * 4u + wi);
+        const auto j = e.let(begin + key_lane);
         auto score = e.var(0.0f);
-        for (auto dd : e.range(256u))
-          score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
-        scores[lane] = score.read() * s.attrs[0];
+        const auto valid = e.let(b < rows && j < kv_len && j < row_len && allowed(j));
+        if (auto live = e.when(valid)) {
+          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+          const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
+          for (std::uint32_t d = 0; d < 8u; ++d)
+            score = math::fma(query_values[d], a.k[kb + wl + d * 32u], score.read());
+        }
+        for (std::uint32_t shift = 16u; shift; shift >>= 1u)
+          score = score.read() + math::shfl_xor(score.read(), e.u32(shift));
+        if (auto first = e.when(wl == 0u))
+          scores[key_lane] = select(valid, score.read() * s.attrs[0], math::neg_inf());
+      }
+    } else {
+      if (auto owns = e.when(lane < kSplitKeys)) {
+        const auto j = e.let(begin + lane);
+        scores[lane] = math::neg_inf();
+        if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
+          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+          const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
+          auto score = e.var(0.0f);
+          for (auto dd : e.range(256u))
+            score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
+          scores[lane] = score.read() * s.attrs[0];
+        }
       }
     }
     e.barrier();

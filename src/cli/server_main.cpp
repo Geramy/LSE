@@ -45,7 +45,7 @@ void usage() {
       "      --shutdown-grace-seconds N  drain requests before failing (1..600, default 30)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
       "                       beside the model, when the checkpoint has one)\n"
-      "      --mtp-depth N    draft proposals per verifier pass (1..7, default 2)\n"
+      "      --mtp-depth N    draft proposals per verifier pass (1..7, default 3)\n"
       "      --dflash2=on     use the DFlash2 block drafter (default off)\n"
       "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
       "      --no-mtp         decode one token per pass, ignoring any\n"

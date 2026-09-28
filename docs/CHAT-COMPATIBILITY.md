@@ -11,7 +11,7 @@ Start an HTTP server with the Q4 target and Q8 MTP module:
 
 ```sh
 ./build/lse-server --model /path/to/qwen38-27b-q4 \
-  --mtp /path/to/qwen38-27b-mtp-q8 --mtp-depth 2 \
+  --mtp /path/to/qwen38-27b-mtp-q8 --mtp-depth 3 \
   --pool hrx:0 --dialect loom --kv-len 32768 \
   --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```

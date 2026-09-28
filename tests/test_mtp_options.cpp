@@ -9,7 +9,7 @@ using namespace lse;
 LSE_TEST(mtp_depth_defaults_and_bounds) {
   runtime::GenerationLimits limits;
   server::ServerOptions options;
-  LSE_EXPECT_EQ(limits.mtp_depth, 2u);
+  LSE_EXPECT_EQ(limits.mtp_depth, 3u);
   LSE_EXPECT_EQ(options.mtp_depth, limits.mtp_depth);
   for (std::uint32_t depth = 1; depth <= 7; ++depth)
     LSE_EXPECT(runtime::valid_mtp_depth(depth));

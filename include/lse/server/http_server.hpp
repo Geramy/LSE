@@ -29,7 +29,7 @@ struct ServerOptions {
   std::string api_key;
   // Refused above this, so one request cannot take the whole KV pool.
   std::int32_t max_tokens_cap = 4096;
-  std::uint32_t mtp_depth = 2;
+  std::uint32_t mtp_depth = 3;
 };
 
 class HttpServer {

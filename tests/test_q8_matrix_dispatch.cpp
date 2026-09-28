@@ -7,6 +7,7 @@
 #include "lse/graph/ops.hpp"
 #include "lse/kernels/wmma_q8_linear.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 
@@ -65,6 +66,13 @@ LSE_TEST(q8_matrix_dispatch_selects_measured_small_shapes_and_prefill_boundary) 
       Case{64, 17408, 5120, 64}, Case{65, 17408, 5120, 64},
       Case{512, 5120, 10240, 64}, Case{512, 5120, 17408, 64},
       Case{3, 5120, 5120, 0}, Case{3, 129, 128, 0},
+      Case{7, 4096, 5120, 0}, Case{8, 4096, 5120, 16},
+      Case{7, 5120, 4096, 0}, Case{8, 5120, 4096, 16},
+      Case{7, 1024, 5120, 0}, Case{8, 1024, 5120, 16},
+      Case{7, 1280, 5120, 0}, Case{8, 1280, 5120, 16},
+      Case{1, 5120, 25600, 0}, Case{2, 5120, 25600, 0},
+      Case{3, 5120, 25600, 16}, Case{7, 5120, 25600, 16},
+      Case{8, 5120, 25600, 0},
       Case{64, 127, 128, 0}, Case{64, 128, 128, 64},
   };
   for (const auto& c : cases) {
@@ -78,7 +86,7 @@ LSE_TEST(q8_matrix_dispatch_selects_measured_small_shapes_and_prefill_boundary) 
     LSE_EXPECT_EQ(plan.workgroup_size[0], 256u);
     LSE_EXPECT_EQ(plan.workgroup_count[0],
         static_cast<std::uint32_t>((c.m + c.rows - 1) / c.rows * ((c.n + 127) / 128)));
-    LSE_EXPECT_EQ(plan.lds_bytes, c.rows == 16 ? 1664u : 6656u);
+    LSE_EXPECT_EQ(plan.lds_bytes, 6656u);
     const auto matrix = dispatch::q8_matrix_plan(f.shapes, c.rows);
     LSE_EXPECT(matrix.matrix != nullptr);
     if (matrix.matrix) {
@@ -113,8 +121,8 @@ LSE_TEST(q8_matrix_dispatch_refuses_invalid_formats_shapes_and_device_resources)
   f.device.wavefront_size = 64; LSE_EXPECT_EQ(f.rows(), 0u); f.device.wavefront_size = 32;
   f.device.max_threads_per_workgroup = 255; LSE_EXPECT_EQ(f.rows(), 0u);
   f.device.max_threads_per_workgroup = 256; LSE_EXPECT_EQ(f.rows(), 16u);
-  f.device.lds_bytes_per_workgroup = 1663; LSE_EXPECT_EQ(f.rows(), 0u);
-  f.device.lds_bytes_per_workgroup = 1664; LSE_EXPECT_EQ(f.rows(), 16u);
+  f.device.lds_bytes_per_workgroup = 6655; LSE_EXPECT_EQ(f.rows(), 0u);
+  f.device.lds_bytes_per_workgroup = 6656; LSE_EXPECT_EQ(f.rows(), 16u);
   f.amd.matrix_core = backend::MatrixCore::kNone; LSE_EXPECT_EQ(f.rows(), 0u);
   f.amd.matrix_core = backend::MatrixCore::kWMMA;
   const auto* intrinsics = f.shapes.intrinsics;
@@ -129,13 +137,31 @@ LSE_TEST(q8_matrix_dispatch_refuses_invalid_formats_shapes_and_device_resources)
   LSE_EXPECT_EQ(packed_overflow.rows(), 0u);
 }
 
+LSE_TEST(q8_matrix_round_preparation_tracks_group_count_and_preserves_prefill) {
+  for (std::uint32_t groups : {1u, 2u, 3u, 4u, 7u}) {
+    Fixture f(7,129,static_cast<std::int64_t>(groups)*64);
+    const auto plan=dispatch::q8_matrix_plan(f.shapes,16);
+    LSE_EXPECT(plan.matrix!=nullptr);
+    LSE_EXPECT_EQ(plan.round_groups,std::min(groups,4u));
+    LSE_EXPECT_EQ(plan.lds_bytes,1664u*std::min(groups,4u));
+    f.device.lds_bytes_per_workgroup=plan.lds_bytes-1;
+    LSE_EXPECT(dispatch::q8_matrix_plan(f.shapes,16).matrix==nullptr);
+    f.device.lds_bytes_per_workgroup=plan.lds_bytes;
+    LSE_EXPECT(dispatch::q8_matrix_plan(f.shapes,16).matrix!=nullptr);
+  }
+  Fixture prefill(512,17408,5120);
+  const auto plan=dispatch::q8_matrix_plan(prefill.shapes,64);
+  LSE_EXPECT_EQ(plan.round_groups,1u);
+  LSE_EXPECT_EQ(plan.lds_bytes,6656u);
+}
+
 LSE_TEST(q8_matrix_selection_and_same_shape_variants_change_cache_identity) {
   Fixture f(3, 17408, 5120); GraphFixture graph(f);
   const auto* scalar = dynamic_cast<const KernelPrimitiveBase*>(graph.output.node()->prim);
   LSE_EXPECT(scalar != nullptr);
   if (!scalar) return;
   const auto* selected = scalar->specialize(f.shapes);
-  LSE_EXPECT(selected != nullptr && selected->name() == "quant_linear.q8.wmma16.iu8_affine.v1");
+  LSE_EXPECT(selected != nullptr && selected->name() == "quant_linear.q8.wmma16.iu8_affine.v2");
   backend::LoomEmitter emitter;
   const auto policy = dispatch::specialization_cache_key(0, graph.group,
       f.device, f.shapes.types, f.intrinsics);

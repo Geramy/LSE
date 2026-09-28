@@ -246,6 +246,9 @@ add_library(lse_kernels
   src/kernels/wmma_quant_linear.cpp
   src/kernels/wmma_q8_linear.cpp
   src/kernels/dflash2_sdpa.cpp
+  src/kernels/dflash2_ring_sdpa.cpp
+  src/kernels/dflash2_ring_split.cpp
+  src/kernels/dflash2_cache.cpp
   src/kernels/dflash2_selector.cpp
   src/kernels/wmma_q6_linear.cpp
 )

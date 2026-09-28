@@ -3394,6 +3394,69 @@ LSE_TEST(the_mtp_module_loads_beside_a_checkpoint_and_is_not_one_itself) {
   LSE_EXPECT(!arch.ok());
 }
 
+LSE_TEST(mtp_device_hidden_matches_host_input_across_depth3_and_width_reuse) {
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  const auto run = [&](bool device_input) {
+    fx.mtp->reset();
+    std::vector<std::uint32_t> proposals;
+    for (std::int64_t rows : {3, 1, 3, 1, 7, 1}) {
+      std::vector<float> values(static_cast<std::size_t>(rows * fx.config.hidden_size));
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        values[i] = filler(i + static_cast<std::size_t>(fx.mtp->position()) * 17);
+      }
+      std::vector<std::uint32_t> ids(static_cast<std::size_t>(rows));
+      for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = 2u + static_cast<std::uint32_t>(i);
+      graph::Array input = graph::Array::zeros(
+          Shape{1, rows, fx.config.hidden_size}, DType::kF32);
+      LSE_EXPECT_OK(input.materialize());
+      auto* sched = graph::default_scheduler();
+      if (sched == nullptr) return std::vector<std::uint32_t>{};
+      for (std::size_t i = 0; i < values.size(); ++i) {
+        graph::interpreter::store_element(*input.node(), i, values[i]);
+      }
+      input.node()->host_dirty = true;
+      LSE_EXPECT_OK(graph::interpreter::sync_to_device(*input.node(), sched->backend()));
+      const auto first = fx.mtp->position();
+      auto got = device_input
+                     ? fx.mtp->draft_chain(input, ids, first, 3)
+                     : fx.mtp->draft_chain(std::span<const float>(values), ids, first, 3);
+      LSE_EXPECT(got.ok());
+      if (!got.ok()) return std::vector<std::uint32_t>{};
+      proposals.insert(proposals.end(), got->begin(), got->end());
+      LSE_EXPECT_EQ(fx.mtp->position(), first + rows + 2);
+      LSE_EXPECT(array_to_host(input) == values);
+    }
+    return proposals;
+  };
+  const auto host = run(false);
+  const auto device = run(true);
+  LSE_EXPECT_EQ(host.size(), 18u);
+  LSE_EXPECT(device == host);
+  LSE_EXPECT(run(true) == device);
+}
+
+LSE_TEST(mtp_device_hidden_rejects_invalid_inputs_before_changing_position) {
+  MtpFixture fx = build_mtp_fixture();
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  const std::uint32_t token = 2;
+  const std::span<const std::uint32_t> ids(&token, 1);
+  for (const graph::Array& bad : {
+           graph::Array{},
+           graph::Array::zeros(Shape{1, 1, fx.config.hidden_size}, DType::kBF16),
+           graph::Array::zeros(Shape{1, 2, fx.config.hidden_size}, DType::kF32)}) {
+    auto got = fx.mtp->draft(bad, ids, 0);
+    LSE_EXPECT(!got.ok());
+    LSE_EXPECT(got.status().code() == StatusCode::kInvalidArgument);
+    LSE_EXPECT_EQ(fx.mtp->position(), 0);
+  }
+  auto empty = fx.mtp->draft_chain(graph::Array{}, ids, 0, 0);
+  LSE_EXPECT(empty.ok() && empty->empty());
+  LSE_EXPECT_EQ(fx.mtp->position(), 0);
+}
+
 LSE_TEST(a_rejected_draft_leaves_the_caches_where_a_clean_pass_would) {
   // A replacement pass needs the device's held carry inputs. The CPU
   // interpreter mutates its carry in place and correctly refuses that pass.

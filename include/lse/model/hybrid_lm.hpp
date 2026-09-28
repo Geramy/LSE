@@ -20,6 +20,7 @@
 #include "lse/graph/program.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/layer.hpp"
+#include "lse/model/prefix_state.hpp"
 
 namespace lse::model {
 
@@ -159,12 +160,16 @@ class HybridLM {
                        Array* aux_loss, std::vector<Array>* trace = nullptr,
                        const StepRows* rows = nullptr,
                        bool replaces_previous = false,
-                       FeatureCapture* capture = nullptr);
+                       FeatureCapture* capture = nullptr,
+                       bool retain_prefix_state = false);
 
   // Puts every mixer's sequence cursor back to `position`. The paged
   // pool is overwritten in place by the pass that follows, so this plus a
   // `replaces_previous` pass is what un-does a speculative step.
   void rewind(std::vector<MixerState>& states, std::int32_t position) const;
+
+  // Commit valid input rows from the latest retained verifier, without its FFNs.
+  Status commit_prefix(std::vector<MixerState>& states, std::size_t rows);
 
   // [.., D] -> [.., vocab]. Applied to only the positions a caller needs: at
   // long context the full [B,T,vocab] tensor does not fit.
@@ -244,6 +249,10 @@ class HybridLM {
       Array gdn, cq, ck, cv, cqkv, keys, values, meta;
     };
     std::vector<StateStamp> state_stamp;
+    PrefixStateCommit prefix;
+    bool retains_prefix_state = false;
+    bool prefix_committed = false;
+    std::int32_t prefix_end = 0;
   };
   // One slot per pass shape, so decode retention (T=1) stops evicting the
   // prefill program (T=N) — with one slot every server request rebuilt its

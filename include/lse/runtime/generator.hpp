@@ -28,8 +28,14 @@ namespace lse::runtime {
 
 using model::HybridLM;
 
-inline constexpr std::uint32_t kDefaultMtpDepth = 2;
+inline constexpr std::uint32_t kDefaultMtpDepth = 3;
 inline constexpr std::uint32_t kMaxMtpDepth = 7;
+
+[[nodiscard]] constexpr std::uint32_t dflash2_verify_depth(
+    std::uint32_t draft_block_size) noexcept {
+  return draft_block_size > 4 ? 3 : draft_block_size > 1 ? draft_block_size - 1 : 0;
+}
+
 [[nodiscard]] constexpr bool valid_mtp_depth(std::uint32_t depth) noexcept {
   return depth >= 1 && depth <= kMaxMtpDepth;
 }
@@ -226,13 +232,11 @@ class Generator {
   // Preserve recorded heads and token slots when the verifier width changes.
   std::unordered_map<std::size_t, SpecHead> spec_by_m_;
   std::unordered_map<std::size_t, graph::Array> spec_ids_by_m_;
-  // Host copies the module reads: the pass's hidden rows, and its logits
-  // when the sampler needs more than an argmax.
-  std::vector<float> spec_hidden_;
+  // Logits reach the host only when the sampler needs more than an argmax.
   std::vector<float> spec_logits_;
   // The decoder's hidden state for the last prompt position, which is the
   // module's input for the first proposal of the generation.
-  std::vector<float> prefill_tail_;
+  graph::Array prefill_tail_;
 
   model::MtpModule* mtp_ = nullptr;
   model::DFlash2Module* dflash2_ = nullptr;
@@ -241,18 +245,16 @@ class Generator {
 
   // Runs row tokens at the session cursor and leaves the
   // per-row answers readable: the greedy picks in spec_, the raw logits in
-  // spec_logits_ otherwise, and every row's hidden in spec_hidden_.
+  // spec_logits_ otherwise, and every row's hidden on the device in spec_.hidden.
   // `replaces_previous` says this pass stands in for the one that just ran
   // rather than following it, which is how a rejected proposal is undone: the
   // decoder's carried state is re-derived from the same starting point with
   // the corrected tokens in place.
   Status verify(Session& session, std::span<const std::uint32_t> rows,
                 bool replaces_previous);
-  static Status read_hidden(const graph::Array& hidden,
-                            std::vector<float>* out);
   Status mtp_prefill_chunk(const graph::Array& hidden,
                            std::span<const std::uint32_t> tokens,
-                           std::int32_t first, std::vector<float>* carry);
+                           std::int32_t first, graph::Array* carry);
   Result<std::vector<std::uint32_t>> speculate(
       Session& session, std::vector<float>& prefill_logits,
       const GenerationLimits& limits, const TokenCallback& on_token);

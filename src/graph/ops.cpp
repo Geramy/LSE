@@ -568,7 +568,7 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     request.iattrs = n->iattrs;
     request.device = device;
     if (dispatch::split_short_default_supported(request))
-      return split_paged_attention(n, "attention.short_partial128.wg128c2.v1",
+      return split_paged_attention(n, "attention.short_partial128.wg128c2.v2",
                                      "attention.short_merge128.wg128c2.v1", true);
     if (dispatch::split_decode_supported(request))
       return split_paged_attention(n, "attention.decode_partial128.wg128c2.v2",

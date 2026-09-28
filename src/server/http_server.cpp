@@ -482,7 +482,7 @@ Status HttpServer::listen() {
                           {"mtp_depth", impl.mtp != nullptr ? impl.opt.mtp_depth : 0},
                           {"dflash2_enabled", impl.dflash2 != nullptr},
                           {"dflash2_depth", impl.dflash2 != nullptr
-                                               ? impl.dflash2->block_size() - 1 : 0}}
+                                               ? runtime::dflash2_verify_depth(impl.dflash2->block_size()) : 0}}
                         .dump(), "application/json");
   });
 

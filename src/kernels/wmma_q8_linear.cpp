@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <string>
+#include <optional>
 #include <vector>
 
 #include "lse/dispatch/q8_matrix.hpp"
@@ -60,9 +61,7 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
   const auto groups = static_cast<std::uint32_t>(d.groups);
   const auto gsize = static_cast<std::uint32_t>(64u);
   const std::uint32_t slices = gsize / kTileK;
-  const std::uint32_t kGroupsPerRound = 1u;
-  const std::uint32_t round_groups =
-      groups < kGroupsPerRound ? groups : kGroupsPerRound;
+  const std::uint32_t round_groups = d.round_groups;
   const std::uint32_t round_slices = slices * round_groups;
   const std::uint32_t words = gsize * round_groups / 4u;
   const std::uint32_t waves = kBlock / kWave;
@@ -158,10 +157,13 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
     st_gbase.push_back(e.let(sr * round_groups + gl));
     st_in.push_back(e.let(si < items));
   }
-  for (auto rnd : e.range(0u, groups / round_groups, 1u)) {
+  for (auto rnd : e.range(0u, RowBlocks == 1 ? (groups + round_groups - 1u) / round_groups : groups / round_groups, 1u)) {
     for (std::uint32_t c = 0; c < chunks; ++c) {
       if (auto stager = e.when(st_in[c])) {
-        if (auto in_rows = e.when(st_row[c] < m)) {
+        auto row_live = st_row[c] < m;
+        if constexpr (RowBlocks == 1)
+          row_live = row_live && rnd * round_groups + st_t[c] / slices < groups;
+        if (auto in_rows = e.when(row_live)) {
           const auto base = e.let(st_xbase[c] +
                                   (rnd * (gsize * round_groups) +
                                    st_t[c] * static_cast<std::uint32_t>(kTileK)));
@@ -221,6 +223,8 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
 
     for (std::uint32_t gi = 0; gi < round_groups; ++gi) {
       const auto g = e.let(rnd * round_groups + gi);
+      std::optional<env::Emit::Guard> live_group;
+      if constexpr (RowBlocks == 1) live_group.emplace(e.k, g < groups);
       std::vector<kir::Val<kir::f32>> gscale, gbias;
       for (std::uint32_t j = 0; j < kColBlocks; ++j) {
         const auto at = e.let(col_scales[j] + g);
@@ -307,9 +311,9 @@ template <int Bits, std::uint32_t RowBlocks>
 struct AffineWmmaKernel final : graph::KernelPrimitive<AffineWmmaKernel<Bits, RowBlocks>> {
   static constexpr std::uint32_t kRows = kTileM * RowBlocks;
   static constexpr std::string_view kName = Bits == 4
-      ? "quant_linear.q4.wmma16.iu8_affine.v1"
+      ? "quant_linear.q4.wmma16.iu8_affine.v2"
       : RowBlocks == 1
-      ? "quant_linear.q8.wmma16.iu8_affine.v1"
+      ? "quant_linear.q8.wmma16.iu8_affine.v2"
       : "quant_linear.q8.wmma64.iu8_affine.v1";
   static constexpr std::string_view kEntry = "lse_quant_linear_affine_wmma";
   static constexpr std::string_view kSource = {};

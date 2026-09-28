@@ -5,6 +5,10 @@
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#if defined(LSE_HRX_LINKED) && LSE_HAVE_LOOMC
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -417,9 +421,481 @@ int gpu_attention() {
   }
   return lse::test::Registry::get().failures ? 1 : 0;
 }
+LSE_TEST(ring_cache_writes_only_new_rows_and_keeps_rewind_context) {
+  constexpr std::size_t heads=2,capacity=11,dim=5,queries=4,window=8;
+  auto cache_k=filled({1,heads,capacity,dim},std::vector<float>(heads*capacity*dim,0));
+  auto cache_v=filled(cache_k.shape(),std::vector<float>(heads*capacity*dim,0));
+  std::vector<float> expected_k(heads*capacity*dim,0),expected_v(expected_k.size(),0);
+  std::int32_t position=0,live=0;
+  const auto value=[](std::size_t h,std::int32_t t,std::size_t d,bool key) {
+    const auto at=static_cast<float>(h*1000+static_cast<std::size_t>(t)*17+d);
+    return key ? std::sin(at*.037f)*.3f : std::cos(at*.019f)*.7f;
+  };
+  const auto check_attention=[&] {
+    std::vector<float> q(4*queries*dim),prop_k(heads*queries*dim),prop_v(prop_k.size());
+    for(std::size_t i=0;i<q.size();++i)q[i]=std::sin(static_cast<float>(i)*.071f)*.4f;
+    for(std::size_t h=0;h<heads;++h)for(std::size_t t=0;t<queries;++t)for(std::size_t d=0;d<dim;++d) {
+      prop_k[(h*queries+t)*dim+d]=value(h,position+static_cast<std::int32_t>(t),d,true);
+      prop_v[(h*queries+t)*dim+d]=value(h,position+static_cast<std::int32_t>(t),d,false);
+    }
+    std::vector<float> linear_k(heads*(capacity+queries)*dim,0),linear_v(linear_k.size(),0);
+    for(std::size_t h=0;h<heads;++h) {
+      for(std::size_t t=capacity-static_cast<std::size_t>(live);t<capacity;++t)
+        for(std::size_t d=0;d<dim;++d) {
+          const auto absolute=position-static_cast<std::int32_t>(capacity-t);
+          linear_k[(h*(capacity+queries)+t)*dim+d]=value(h,absolute,d,true);
+          linear_v[(h*(capacity+queries)+t)*dim+d]=value(h,absolute,d,false);
+        }
+      for(std::size_t t=0;t<queries;++t)for(std::size_t d=0;d<dim;++d) {
+        linear_k[(h*(capacity+queries)+capacity+t)*dim+d]=prop_k[(h*queries+t)*dim+d];
+        linear_v[(h*(capacity+queries)+capacity+t)*dim+d]=prop_v[(h*queries+t)*dim+d];
+      }
+    }
+    auto output=graph::custom("dflash2.ring_attention.v2",{filled({1,4,queries,dim},q),cache_k,cache_v,
+        filled({1,heads,queries,dim},prop_k),filled({1,heads,queries,dim},prop_v),
+        filled({3},{static_cast<float>(live),static_cast<float>(capacity),static_cast<float>(position%static_cast<std::int32_t>(capacity))})},
+        {4,static_cast<float>(heads),static_cast<float>(dim),static_cast<float>(window)});
+    LSE_EXPECT(output.ok());if(!output.ok())return;
+    const auto actual=read(output.release());
+    const auto expected=attention_reference(q,linear_k,linear_v,{static_cast<float>(live),static_cast<float>(capacity)},4,heads,dim,queries,window);
+    LSE_EXPECT(actual==expected);
+  };
+  const auto append=[&](std::size_t rows) {
+    std::vector<float> update_k(heads*rows*dim),update_v(update_k.size());
+    for(std::size_t h=0;h<heads;++h)for(std::size_t t=0;t<rows;++t)for(std::size_t d=0;d<dim;++d) {
+      const auto absolute=position+static_cast<std::int32_t>(t);
+      update_k[(h*rows+t)*dim+d]=value(h,absolute,d,true);
+      update_v[(h*rows+t)*dim+d]=value(h,absolute,d,false);
+      const auto at=(h*capacity+static_cast<std::size_t>(absolute)%capacity)*dim+d;
+      expected_k[at]=update_k[(h*rows+t)*dim+d];expected_v[at]=update_v[(h*rows+t)*dim+d];
+    }
+    auto first=filled({1},{static_cast<float>(position)});
+    auto keys=graph::custom("dflash2.cache_write",{cache_k,filled({1,heads,static_cast<std::int64_t>(rows),dim},update_k),first},
+        {static_cast<float>(heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(rows)});
+    auto values=graph::custom("dflash2.cache_write",{cache_v,filled({1,heads,static_cast<std::int64_t>(rows),dim},update_v),first},
+        {static_cast<float>(heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(rows)});
+    LSE_EXPECT(keys.ok());LSE_EXPECT(values.ok());if(!keys.ok()||!values.ok())return;
+    LSE_EXPECT(read(*keys)==expected_k);LSE_EXPECT(read(*values)==expected_v);
+    LSE_EXPECT(keys->node()->buffer.handle==cache_k.node()->buffer.handle);
+    LSE_EXPECT(values->node()->buffer.handle==cache_v.node()->buffer.handle);
+    position+=static_cast<std::int32_t>(rows);live=std::min(static_cast<std::int32_t>(capacity),live+static_cast<std::int32_t>(rows));
+    check_attention();
+  };
+  append(11);
+  for(int round=0;round<6;++round) {
+    append(4);
+    const auto drop=round%4+1;
+    position-=drop;live-=drop;
+    check_attention();
+    append(static_cast<std::size_t>(drop));
+    append(2);
+  }
+}
+LSE_TEST(ring_cache_and_attention_emit_native_loom_without_context_concatenation) {
+  const auto leaf=[](Shape shape) {
+    auto node=std::make_shared<graph::Node>();node->shape=shape;node->dtype=DType::kF32;node->materialized=true;
+    return graph::Array(node);
+  };
+  auto cache=leaf({1,8,2055,128}),update=leaf({1,8,8,128});
+  auto written=graph::custom("dflash2.cache_write",{cache,update,leaf({1})},{8,2055,128,8});
+  auto attention=graph::custom("dflash2.ring_attention.v2",{leaf({1,32,8,128}),cache,cache,update,update,leaf({3})},{32,8,128,2048});
+  LSE_EXPECT(written.ok());LSE_EXPECT(attention.ok());if(!written.ok()||!attention.ok())return;
+  backend::DeviceInfo device;device.arch="gfx1201";device.wavefront_size=32;
+  device.max_threads_per_workgroup=1024;device.lds_bytes_per_workgroup=65536;
+  backend::LoomEmitter emitter;
+  for(const auto& output:{*written,*attention}) {
+    const graph::NodePtr roots[]={output.node()};
+    const auto groups=graph::Partitioner::partition(roots);LSE_EXPECT_EQ(groups.size(),1u);
+    for(const auto& group:groups) {
+      auto emitted=emitter.emit(group,device);LSE_EXPECT(emitted.ok());
+      if(!emitted.ok())std::fprintf(stderr,"%s\n",emitted.status().to_string().c_str());
+    }
+  }
+}
+int gpu_ring_cache() {
+  auto* scheduler=graph::default_scheduler();
+  if(!scheduler)return 1;
+  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(graph::Dialect::kLoom);
+  constexpr std::size_t heads=4,kv_heads=2,capacity=2055,dim=128,queries=8;
+  std::vector<float> q(heads*queries*dim),initial_k(kv_heads*capacity*dim),initial_v(initial_k.size());
+  std::vector<float> update_k(kv_heads*queries*dim),update_v(update_k.size());
+  for(std::size_t i=0;i<q.size();++i)q[i]=std::sin(static_cast<float>(i)*.013f)*.35f;
+  for(std::size_t i=0;i<initial_k.size();++i) {
+    initial_k[i]=std::cos(static_cast<float>(i)*.019f)*.2f;
+    initial_v[i]=std::sin(static_cast<float>(i)*.017f);
+  }
+  for(std::size_t i=0;i<update_k.size();++i) {
+    update_k[i]=std::sin(static_cast<float>(i)*.023f)*.31f;
+    update_v[i]=std::cos(static_cast<float>(i)*.029f)*.43f;
+  }
+  const std::size_t first=capacity-2,end=(first+queries)%capacity;
+  auto expected_k=initial_k,expected_v=initial_v;
+  for(std::size_t h=0;h<kv_heads;++h)for(std::size_t r=0;r<queries;++r)for(std::size_t d=0;d<dim;++d) {
+    expected_k[(h*capacity+(first+r)%capacity)*dim+d]=update_k[(h*queries+r)*dim+d];
+    expected_v[(h*capacity+(first+r)%capacity)*dim+d]=update_v[(h*queries+r)*dim+d];
+  }
+  auto cache_k=filled({1,kv_heads,capacity,dim},initial_k),cache_v=filled(cache_k.shape(),initial_v);
+  auto key_update=filled({1,kv_heads,queries,dim},update_k),value_update=filled(key_update.shape(),update_v);
+  auto offset=filled({1},{static_cast<float>(first)});
+  auto written_k=graph::custom("dflash2.cache_write",{cache_k,key_update,offset},
+      {static_cast<float>(kv_heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(queries)});
+  auto written_v=graph::custom("dflash2.cache_write",{cache_v,value_update,offset},
+      {static_cast<float>(kv_heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(queries)});
+  LSE_EXPECT(written_k.ok());LSE_EXPECT(written_v.ok());if(!written_k.ok()||!written_v.ok())return 1;
+  scheduler->reset_accumulated_trace();
+  const graph::NodePtr write_roots[]={written_k->node(),written_v->node()};
+  LSE_EXPECT_OK(scheduler->eval(write_roots,false));
+  LSE_EXPECT_OK(scheduler->drain());
+  LSE_EXPECT(written_k->node()->buffer.handle==cache_k.node()->buffer.handle);
+  LSE_EXPECT(written_v->node()->buffer.handle==cache_v.node()->buffer.handle);
+  LSE_EXPECT(read(*written_k)==expected_k);LSE_EXPECT(read(*written_v)==expected_v);
+  float maximum=0;
+  for(std::size_t live:{17u,2055u})for(std::size_t rewind:{0u,3u}) {
+    const auto visible=live-rewind,ring_end=(end+capacity-rewind)%capacity;
+    std::vector<float> linear_k(kv_heads*(capacity+queries)*dim),linear_v(linear_k.size());
+    for(std::size_t h=0;h<kv_heads;++h) {
+      for(std::size_t j=0;j<capacity;++j)for(std::size_t d=0;d<dim;++d) {
+        linear_k[(h*(capacity+queries)+j)*dim+d]=expected_k[(h*capacity+(ring_end+j)%capacity)*dim+d];
+        linear_v[(h*(capacity+queries)+j)*dim+d]=expected_v[(h*capacity+(ring_end+j)%capacity)*dim+d];
+      }
+      for(std::size_t j=0;j<queries;++j)for(std::size_t d=0;d<dim;++d) {
+        linear_k[(h*(capacity+queries)+capacity+j)*dim+d]=update_k[(h*queries+j)*dim+d];
+        linear_v[(h*(capacity+queries)+capacity+j)*dim+d]=update_v[(h*queries+j)*dim+d];
+      }
+    }
+    const auto expected=attention_reference(q,linear_k,linear_v,{static_cast<float>(visible),static_cast<float>(capacity)},
+        heads,kv_heads,dim,queries,2048);
+    auto output=graph::custom("dflash2.ring_attention.v2",{filled({1,heads,queries,dim},q),*written_k,*written_v,key_update,value_update,
+        filled({3},{static_cast<float>(visible),static_cast<float>(capacity),static_cast<float>(ring_end)})},
+        {static_cast<float>(heads),static_cast<float>(kv_heads),static_cast<float>(dim),2048});
+    LSE_EXPECT(output.ok());if(!output.ok())return 1;
+    const auto actual=read(output.release());
+    LSE_EXPECT_EQ(actual.size(),expected.size());if(actual.size()!=expected.size())return 1;
+    for(std::size_t i=0;i<actual.size();++i) {
+      LSE_EXPECT(std::isfinite(actual[i]));
+      if(std::isfinite(actual[i]))maximum=std::max(maximum,std::fabs(actual[i]-expected[i]));
+    }
+  }
+  const auto trace=scheduler->accumulated_trace();
+  LSE_EXPECT(trace.device_groups>=6u);LSE_EXPECT(trace.kernels_launched>=6u);
+  LSE_EXPECT_EQ(trace.host_groups,0u);LSE_EXPECT_EQ(trace.host_fallbacks,0u);
+  LSE_EXPECT(maximum<2e-5f);
+  std::printf("DFlash2 ring cache wrapped_write=8 live=17,2055 rewind=0,3 max_absolute_error=%g device_groups=%u host_groups=%u host_fallbacks=%u\n",
+      static_cast<double>(maximum),trace.device_groups,trace.host_groups,trace.host_fallbacks);
+  return lse::test::Registry::get().failures?1:0;
+}
+
+namespace {
+constexpr const char *kPartial = "dflash2.ring_partial256.v1";
+constexpr const char *kMerge = "dflash2.ring_merge256.v1";
+graph::Array split_ring_output(std::vector<graph::Array> inputs,
+                               std::size_t heads, std::size_t kvheads,
+                               std::size_t queries, std::size_t dim,
+                               std::size_t window) {
+  auto partial =
+      graph::custom(kPartial, inputs,
+                    {static_cast<float>(heads), static_cast<float>(kvheads),
+                     static_cast<float>(dim), static_cast<float>(window)});
+  LSE_EXPECT(partial.ok());
+  if (!partial.ok())
+    return {};
+  const auto parts = partial->shape().dim(2);
+  auto output =
+      graph::custom(kMerge, {*partial},
+                    {static_cast<float>(heads), static_cast<float>(queries),
+                     static_cast<float>(dim), static_cast<float>(parts)});
+  LSE_EXPECT(output.ok());
+  return output.ok() ? output.release() : graph::Array{};
+}
+LSE_TEST(
+    split_ring_cpu_preserves_wrapped_cache_masks_rewinds_and_empty_partitions) {
+  constexpr std::size_t heads = 2, kvheads = 1, capacity = 515, dim = 5,
+                        queries = 4, window = 508;
+  std::vector<float> q(heads * queries * dim), keys(kvheads * capacity * dim),
+      values(keys.size()), pk(kvheads * queries * dim), pv(pk.size());
+  for (std::size_t i = 0; i < q.size(); ++i)
+    q[i] = std::sin(static_cast<float>(i) * .13f) * .37f;
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    keys[i] = std::cos(static_cast<float>(i) * .19f) * .2f;
+    values[i] = std::sin(static_cast<float>(i) * .17f);
+  }
+  for (std::size_t i = 0; i < pk.size(); ++i) {
+    pk[i] = std::sin(static_cast<float>(i) * .23f) * .31f;
+    pv[i] = std::cos(static_cast<float>(i) * .29f) * .43f;
+  }
+  auto ck = filled({1, kvheads, capacity, dim}, keys),
+       cv = filled(ck.shape(), values),
+       kp = filled({1, kvheads, queries, dim}, pk), vp = filled(kp.shape(), pv);
+  const std::size_t first = capacity - 2, end = (first + queries) % capacity;
+  auto offset = filled({1}, {static_cast<float>(first)});
+  auto wk =
+      graph::custom("dflash2.cache_write", {ck, kp, offset},
+                    {1, static_cast<float>(capacity), static_cast<float>(dim),
+                     static_cast<float>(queries)});
+  auto wv =
+      graph::custom("dflash2.cache_write", {cv, vp, offset},
+                    {1, static_cast<float>(capacity), static_cast<float>(dim),
+                     static_cast<float>(queries)});
+  LSE_EXPECT(wk.ok());
+  LSE_EXPECT(wv.ok());
+  if (!wk.ok() || !wv.ok())
+    return;
+  for (std::size_t r = 0; r < queries; ++r)
+    for (std::size_t d = 0; d < dim; ++d) {
+      keys[((first + r) % capacity) * dim + d] = pk[r * dim + d];
+      values[((first + r) % capacity) * dim + d] = pv[r * dim + d];
+    }
+  LSE_EXPECT(read(*wk) == keys);
+  LSE_EXPECT(read(*wv) == values);
+  for (std::size_t live : {7u, 515u})
+    for (std::size_t rewind : {0u, 3u}) {
+      const auto visible = live - rewind,
+                 ringend = (end + capacity - rewind) % capacity;
+      std::vector<float> linear_k(kvheads * (capacity + queries) * dim),
+          linear_v(linear_k.size());
+      for (std::size_t j = 0; j < capacity; ++j)
+        for (std::size_t d = 0; d < dim; ++d) {
+          linear_k[j * dim + d] = keys[((ringend + j) % capacity) * dim + d];
+          linear_v[j * dim + d] = values[((ringend + j) % capacity) * dim + d];
+        }
+      std::copy(pk.begin(), pk.end(),
+                linear_k.begin() + static_cast<std::ptrdiff_t>(capacity * dim));
+      std::copy(pv.begin(), pv.end(),
+                linear_v.begin() + static_cast<std::ptrdiff_t>(capacity * dim));
+      std::vector<graph::Array> inputs{
+          filled({1, heads, queries, dim}, q),
+          *wk,
+          *wv,
+          kp,
+          vp,
+          filled({3},
+                 {static_cast<float>(visible), static_cast<float>(capacity),
+                  static_cast<float>(ringend)})};
+      auto partial =
+          graph::custom(kPartial, inputs,
+                        {static_cast<float>(heads), static_cast<float>(kvheads),
+                         static_cast<float>(dim), static_cast<float>(window)});
+      LSE_EXPECT(partial.ok());
+      if (!partial.ok())
+        return;
+      LSE_EXPECT((partial->shape() == Shape{1, heads, 3, queries, dim + 2}));
+      const auto parts = read(*partial);
+      if (live == 7)
+        for (std::size_t h = 0; h < heads; ++h)
+          for (std::size_t row = 0; row < queries; ++row) {
+            const auto base = (h * 3 * queries + row) * (dim + 2);
+            LSE_EXPECT(parts[base] == -std::numeric_limits<float>::infinity());
+            for (std::size_t d = 1; d < dim + 2; ++d)
+              LSE_EXPECT_EQ(parts[base + d], 0.0f);
+          }
+      auto result =
+          graph::custom(kMerge, {*partial},
+                        {static_cast<float>(heads), static_cast<float>(queries),
+                         static_cast<float>(dim), 3});
+      LSE_EXPECT(result.ok());
+      if (!result.ok())
+        return;
+      auto actual = read(result.release()),
+           expected = attention_reference(
+               q, linear_k, linear_v,
+               {static_cast<float>(visible), static_cast<float>(capacity)},
+               heads, kvheads, dim, queries, window);
+      LSE_EXPECT_EQ(actual.size(), expected.size());
+      for (std::size_t i = 0; i < actual.size(); ++i) {
+        LSE_EXPECT(std::isfinite(actual[i]));
+        LSE_EXPECT_NEAR(actual[i], expected[i], 2e-6);
+      }
+    }
+}
+LSE_TEST(split_ring_merge_all_empty_records_return_finite_zero) {
+  std::vector<float> data(2 * 3 * 4 * 7, 0);
+  for (std::size_t row = 0; row < data.size() / 7; ++row)
+    data[row * 7] = -std::numeric_limits<float>::infinity();
+  auto output =
+      graph::custom(kMerge, {filled({1, 2, 3, 4, 7}, data)}, {2, 4, 5, 3});
+  LSE_EXPECT(output.ok());
+  if (!output.ok())
+    return;
+  const auto actual = read(output.release());
+  for (float v : actual) {
+    LSE_EXPECT(std::isfinite(v));
+    LSE_EXPECT_EQ(v, 0.0f);
+  }
+}
+LSE_TEST(split_ring_partial_and_merge_emit_native_loom_at_actual_geometry) {
+  const auto leaf = [](Shape shape) {
+    auto n = std::make_shared<graph::Node>();
+    n->shape = shape;
+    n->dtype = DType::kF32;
+    n->materialized = true;
+    return graph::Array(n);
+  };
+  std::vector<graph::Array> inputs{
+      leaf({1, 32, 8, 128}), leaf({1, 8, 2055, 128}), leaf({1, 8, 2055, 128}),
+      leaf({1, 8, 8, 128}),  leaf({1, 8, 8, 128}),    leaf({3})};
+  auto out = split_ring_output(inputs, 32, 8, 8, 128, 2048);
+  LSE_EXPECT(out.node() != nullptr);
+  if (!out.node())
+    return;
+  const graph::NodePtr roots[]{out.node()};
+  auto groups = graph::Partitioner::partition(roots);
+  LSE_EXPECT_EQ(groups.size(), 2u);
+  backend::DeviceInfo device;
+  device.arch = "gfx1201";
+  device.wavefront_size = 32;
+  device.max_threads_per_workgroup = 1024;
+  device.lds_bytes_per_workgroup = 65536;
+  backend::LoomEmitter emitter;
+  for (std::size_t i = 0; i < groups.size(); ++i) {
+    auto emitted = emitter.emit(groups[i], device);
+    LSE_EXPECT(emitted.ok());
+    if (!emitted.ok()) {
+      std::fprintf(stderr, "%s\n", emitted.status().to_string().c_str());
+      return;
+    }
+    std::ofstream("/private/tmp/lse-dflash2-split-ring-" + std::to_string(i) +
+                  ".loom")
+        << emitted->source;
+#if defined(LSE_HRX_LINKED) && LSE_HAVE_LOOMC
+    backend::LoomcCompiler compiler;
+    auto compiled = compiler.compile(emitted->source, "gfx1201");
+    if (!compiled.ok())
+      std::fprintf(stderr, "split_stage%zu: %s\n", i,
+                   compiled.status().to_string().c_str());
+    LSE_EXPECT(compiled.ok());
+#endif
+    LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], i == 0 ? 288u : 256u);
+  }
+}
+int gpu_ring_split() {
+  auto *scheduler = graph::default_scheduler();
+  if (!scheduler)
+    return 1;
+  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(graph::Dialect::kLoom);
+  constexpr std::size_t heads = 32, kvheads = 8, capacity = 2055, dim = 128,
+                        queries = 8, window = 2048;
+  std::vector<float> q(heads * queries * dim), keys(kvheads * capacity * dim),
+      values(keys.size()), pk(kvheads * queries * dim), pv(pk.size());
+  for (std::size_t i = 0; i < q.size(); ++i)
+    q[i] = std::sin(static_cast<float>(i) * .013f) * .35f;
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    keys[i] = std::cos(static_cast<float>(i) * .019f) * .2f;
+    values[i] = std::sin(static_cast<float>(i) * .017f);
+  }
+  for (std::size_t i = 0; i < pk.size(); ++i) {
+    pk[i] = std::sin(static_cast<float>(i) * .023f) * .31f;
+    pv[i] = std::cos(static_cast<float>(i) * .029f) * .43f;
+  }
+  const std::size_t first = capacity - 2, end = (first + queries) % capacity;
+  auto qleaf = filled({1, heads, queries, dim}, q),
+       ck = filled({1, kvheads, capacity, dim}, keys),
+       cv = filled(ck.shape(), values),
+       kp = filled({1, kvheads, queries, dim}, pk), vp = filled(kp.shape(), pv),
+       offset = filled({1}, {static_cast<float>(first)});
+  auto wk =
+      graph::custom("dflash2.cache_write", {ck, kp, offset},
+                    {static_cast<float>(kvheads), static_cast<float>(capacity),
+                     static_cast<float>(dim), static_cast<float>(queries)});
+  auto wv =
+      graph::custom("dflash2.cache_write", {cv, vp, offset},
+                    {static_cast<float>(kvheads), static_cast<float>(capacity),
+                     static_cast<float>(dim), static_cast<float>(queries)});
+  LSE_EXPECT(wk.ok());
+  LSE_EXPECT(wv.ok());
+  if (!wk.ok() || !wv.ok())
+    return 1;
+  scheduler->reset_accumulated_trace();
+  for (std::size_t h = 0; h < kvheads; ++h)
+    for (std::size_t r = 0; r < queries; ++r)
+      for (std::size_t d = 0; d < dim; ++d) {
+        keys[(h * capacity + (first + r) % capacity) * dim + d] =
+            pk[(h * queries + r) * dim + d];
+        values[(h * capacity + (first + r) % capacity) * dim + d] =
+            pv[(h * queries + r) * dim + d];
+      }
+  LSE_EXPECT(read(*wk) == keys);
+  LSE_EXPECT(read(*wv) == values);
+  auto frozen_k = graph::Array::from_buffer(wk->node()->buffer, wk->shape(),
+                                            DType::kF32),
+       frozen_v = graph::Array::from_buffer(wv->node()->buffer, wv->shape(),
+                                            DType::kF32);
+  float maximum = 0;
+  const std::vector<std::size_t> live_cases{17, 1024, 2055};
+  for (std::size_t live : live_cases)
+    for (std::size_t rewind : {0u, 3u}) {
+      const auto visible = live - rewind,
+                 ringend = (end + capacity - rewind) % capacity;
+      std::vector<float> linear_k(kvheads * (capacity + queries) * dim),
+          linear_v(linear_k.size());
+      for (std::size_t h = 0; h < kvheads; ++h) {
+        for (std::size_t j = 0; j < capacity; ++j)
+          for (std::size_t d = 0; d < dim; ++d) {
+            linear_k[(h * (capacity + queries) + j) * dim + d] =
+                keys[(h * capacity + (ringend + j) % capacity) * dim + d];
+            linear_v[(h * (capacity + queries) + j) * dim + d] =
+                values[(h * capacity + (ringend + j) % capacity) * dim + d];
+          }
+        for (std::size_t r = 0; r < queries; ++r)
+          for (std::size_t d = 0; d < dim; ++d) {
+            linear_k[(h * (capacity + queries) + capacity + r) * dim + d] =
+                pk[(h * queries + r) * dim + d];
+            linear_v[(h * (capacity + queries) + capacity + r) * dim + d] =
+                pv[(h * queries + r) * dim + d];
+          }
+      }
+      std::vector<graph::Array> inputs{
+          qleaf,
+          frozen_k,
+          frozen_v,
+          kp,
+          vp,
+          filled({3},
+                 {static_cast<float>(visible), static_cast<float>(capacity),
+                  static_cast<float>(ringend)})};
+      auto output =
+          split_ring_output(inputs, heads, kvheads, queries, dim, window);
+      if (!output.node())
+        return 1;
+      const auto actual = read(output),
+                 expected =
+                     attention_reference(q, linear_k, linear_v,
+                                         {static_cast<float>(visible),
+                                          static_cast<float>(capacity)},
+                                         heads, kvheads, dim, queries, window);
+      LSE_EXPECT_EQ(actual.size(), expected.size());
+      if (actual.size() != expected.size())
+        return 1;
+      for (std::size_t i = 0; i < actual.size(); ++i) {
+        LSE_EXPECT(std::isfinite(actual[i]));
+        if (std::isfinite(actual[i]))
+          maximum = std::max(maximum, std::fabs(actual[i] - expected[i]));
+      }
+      LSE_EXPECT(read(frozen_k) == keys);
+      LSE_EXPECT(read(frozen_v) == values);
+    }
+  const auto trace = scheduler->accumulated_trace();
+  LSE_EXPECT(trace.device_groups >= 2u + 4u * live_cases.size());
+  LSE_EXPECT(trace.kernels_launched >= 2u + 4u * live_cases.size());
+  LSE_EXPECT_EQ(trace.host_groups, 0u);
+  LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+  LSE_EXPECT(maximum < 2e-5f);
+  std::printf("DFlash2 split ring32Q/8KV live17,1024,2055 rewind0/3 "
+              "max_absolute_error=%g device_groups=%u host_groups=%u "
+              "host_fallbacks=%u\n",
+              static_cast<double>(maximum), trace.device_groups,
+              trace.host_groups, trace.host_fallbacks);
+  std::fflush(stdout);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+} // namespace
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--gpu-attention") return gpu_attention();
   if (argc == 2 && std::string(argv[1]) == "--gpu-selector") return gpu_selector();
+  if (argc == 2 && std::string(argv[1]) == "--gpu-ring-cache") return gpu_ring_cache();
+  if (argc == 2 && std::string(argv[1]) == "--gpu-ring-split") return gpu_ring_split();
   if (auto* scheduler = graph::default_scheduler()) scheduler->set_mode(graph::Scheduler::Mode::kHostOnly);
   return lse::test::run_all();
 }

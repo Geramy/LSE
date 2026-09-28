@@ -39,7 +39,8 @@ struct SplitShortDefaultRule {
 constexpr std::array kSplitShortDefaultRules{
     SplitShortDefaultRule{3, 1024}, SplitShortDefaultRule{3, 2048},
     SplitShortDefaultRule{4, 1024}, SplitShortDefaultRule{4, 2048},
-    SplitShortDefaultRule{7, 1024},
+    SplitShortDefaultRule{7, 1024}, SplitShortDefaultRule{7, 2048},
+    SplitShortDefaultRule{8, 1024}, SplitShortDefaultRule{8, 2048},
 };
 
 bool short_default_shape(const Shape& query, std::int64_t capacity) {
@@ -182,7 +183,7 @@ bool split_short_default_supported(const KernelShapes& s) {
 
 bool split_short_supported(const KernelShapes& s) {
   if (!paged_inputs(s) || !s.device || !attention_ops(s) ||
-      s.inputs[0].dim(3) != 256 || s.inputs[1] != s.inputs[2] ||
+      !has_ops(s, {"wave.shfl_xor"}) || s.inputs[0].dim(3) != 256 || s.inputs[1] != s.inputs[2] ||
       !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return false;
   const auto capacity = s.inputs[4].dim(1) * s.inputs[1].dim(2);
   for (const auto& rule : kSplitShortRules)
