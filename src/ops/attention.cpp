@@ -115,6 +115,7 @@ Result<Array> regrow_pool(const Array& old, const Shape& want, DType dtype) {
                      " wants ", std::to_string(bytes), " bytes but its buffer holds ",
                      std::to_string(src.buffer.size_bytes));
   }
+  LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(src, sched->backend()));
   // One statement: move the used prefix into the bigger pool. Both ends are
   // device memory, so this is the copy engine and the bytes never touch the
   // host -- it used to stage them down and back up, which is two transfers and

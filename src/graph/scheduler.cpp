@@ -791,6 +791,15 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     // The kernel overwrote whatever the mirror held, so there is nothing left
     // to push. Leaving this set would upload stale bytes on the next dispatch.
     n->host_dirty = false;
+    const int inplace = n->prim != nullptr ? n->prim->inplace_input() : -1;
+    if (inplace >= 0 && static_cast<std::size_t>(inplace) < n->inputs.size()) {
+      const NodePtr& owner = n->inputs[static_cast<std::size_t>(inplace)];
+      if (owner && owner->buffer.handle == n->buffer.handle &&
+          owner->buffer.offset == n->buffer.offset) {
+        owner->device_dirty = true;
+        owner->host_dirty = false;
+      }
+    }
   }
   return OkStatus();
 }

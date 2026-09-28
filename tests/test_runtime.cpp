@@ -1923,6 +1923,118 @@ LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {
   }
 }
 
+namespace {
+class OpaqueHostBackend final : public backend::Backend<OpaqueHostBackend> {
+ public:
+  static constexpr std::string_view kName = "opaque-host-test";
+  Status init_impl(int ordinal) {
+    if (ordinal != 0) return LSE_ERROR(kInvalidArgument, "invalid test ordinal");
+    info_.arch = "host";
+    info_.compute_units = 1;
+    info_.max_threads_per_workgroup = 1;
+    return OkStatus();
+  }
+  void shutdown_impl() noexcept {}
+  const backend::DeviceInfo& device_info_impl() const noexcept { return info_; }
+  Result<backend::DeviceBuffer> allocate_impl(std::size_t bytes,
+      backend::MemoryClass, backend::Stream) {
+    if (!bytes) return LSE_ERROR(kInvalidArgument, "empty test buffer");
+    backend::DeviceBuffer buffer;
+    buffer.storage = std::shared_ptr<void>(new std::byte[bytes],
+        [](void* p) { delete[] static_cast<std::byte*>(p); });
+    buffer.handle = reinterpret_cast<std::uint64_t>(buffer.storage.get());
+    buffer.size_bytes = bytes;
+    return buffer;
+  }
+  void deallocate_impl(backend::DeviceBuffer& b) noexcept { b = {}; }
+  Status copy_h2d_impl(const void* source, backend::DeviceBuffer& target,
+                      std::size_t bytes, std::size_t offset) {
+    if (offset > target.size_bytes || bytes > target.size_bytes - offset)
+      return LSE_ERROR(kOutOfRange, "test upload exceeds buffer");
+    std::memcpy(static_cast<std::byte*>(target.storage.get()) + target.offset + offset,
+                source, bytes);
+    return OkStatus();
+  }
+  Status copy_d2h_impl(const backend::DeviceBuffer& source, void* target,
+                      std::size_t bytes, std::size_t offset) {
+    if (offset > source.size_bytes || bytes > source.size_bytes - offset)
+      return LSE_ERROR(kOutOfRange, "test download exceeds buffer");
+    std::memcpy(target, static_cast<std::byte*>(source.storage.get()) + source.offset + offset,
+                bytes);
+    return OkStatus();
+  }
+  Status copy_peer_impl(const backend::DeviceBuffer& source,
+      backend::DeviceBuffer& target, std::size_t bytes,
+      std::size_t source_offset, std::size_t target_offset) {
+    if (source_offset > source.size_bytes || bytes > source.size_bytes - source_offset ||
+        target_offset > target.size_bytes || bytes > target.size_bytes - target_offset)
+      return LSE_ERROR(kOutOfRange, "test device copy exceeds buffer");
+    std::memmove(static_cast<std::byte*>(target.storage.get()) + target.offset + target_offset,
+                 static_cast<std::byte*>(source.storage.get()) + source.offset + source_offset,
+                 bytes);
+    return OkStatus();
+  }
+  Result<backend::KernelHandle> load_executable_impl(std::string_view,
+      std::span<const std::byte>) { return LSE_ERROR(kUnimplemented, "host test only"); }
+  Status launch_impl(const backend::KernelHandle&, const backend::LaunchDims&,
+      const backend::DispatchArgs&) { return LSE_ERROR(kUnimplemented, "host test only"); }
+  Status synchronize_impl() { return OkStatus(); }
+  std::span<const graph::KernelToolchain> toolchains_impl() const noexcept { return {}; }
+ private:
+  backend::DeviceInfo info_;
+};
+}
+
+LSE_TEST(host_inplace_writes_preserve_opaque_pool_contents_and_owner_mirrors) {
+  backend::BackendAdapter<OpaqueHostBackend> be;
+  LSE_EXPECT_OK(be.init(0));
+  graph::Scheduler scheduler(be);
+  scheduler.set_mode(graph::Scheduler::Mode::kHostOnly);
+  const auto upload = [&](Shape shape, const std::vector<float>& values) {
+    auto allocated = be.allocate(values.size() * sizeof(float), backend::MemoryClass::kDevice,
+                                 backend::kDefaultStream);
+    if (!allocated.ok()) return graph::Array{};
+    auto buffer = allocated.release();
+    if (!be.copy(buffer, values.data(), values.size() * sizeof(float)).ok()) return graph::Array{};
+    auto array = graph::Array::from_buffer(std::move(buffer), std::move(shape), DType::kF32);
+    array.node()->device_dirty = true;
+    return array;
+  };
+  const auto read = [&](graph::Array array) {
+    const graph::NodePtr roots[] = {array.node()};
+    LSE_EXPECT_OK(scheduler.eval(roots, true));
+    std::vector<float> values(array.shape().elem_count());
+    for (std::size_t i = 0; i < values.size(); ++i)
+      values[i] = graph::interpreter::load_element(*array.node(), i);
+    return values;
+  };
+  std::vector<float> expected(32);
+  for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<float>(i + 1);
+  auto pool = upload({1, 1, 16, 2}, expected);
+  auto table = upload({1, 1}, {0});
+  auto first = graph::kv_page_write(pool, upload({1, 1, 2, 2}, {101, 102, 103, 104}),
+                                  upload({5}, {0, 2, 1, 0, 2}), table, 16);
+  expected[0] = 101; expected[1] = 102; expected[2] = 103; expected[3] = 104;
+  LSE_EXPECT(read(first) == expected);
+  LSE_EXPECT(read(pool) == expected);
+  auto next = graph::kv_page_write(pool, upload({1, 1, 1, 2}, {201, 202}),
+                                  upload({5}, {3, 4, 1, 3, 4}), table, 16);
+  expected[6] = 201; expected[7] = 202;
+  LSE_EXPECT(read(next) == expected);
+  LSE_EXPECT(read(pool) == expected);
+  LSE_EXPECT_OK(graph::interpreter::sync_to_device(*pool.node(), be));
+  std::vector<float> device(expected.size());
+  LSE_EXPECT_OK(be.copy(device.data(), pool.node()->buffer, device.size() * sizeof(float)));
+  LSE_EXPECT(device == expected);
+
+  auto owner = upload({6}, {1, 2, 3, 4, 5, 6});
+  auto overwrite = graph::overwrite_slice(owner, upload({2}, {10, 20}), 0,
+                                         upload({1}, {2}));
+  const std::vector<float> sliced{1, 2, 10, 20, 5, 6};
+  LSE_EXPECT(read(overwrite) == sliced);
+  LSE_EXPECT(read(owner) == sliced);
+}
+
 LSE_TEST(a_large_context_uses_small_paged_tables_and_grows_without_losing_keys) {
   if (std::getenv("LSE_KV_PREALLOC") != nullptr)
     LSE_SKIP("requires the default growing KV pool");

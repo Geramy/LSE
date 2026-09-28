@@ -117,8 +117,6 @@ jobs:
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
           echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
           export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
-          # Names the reuse gate a replay tripped, and which pass replayed.
-          export LSE_DEBUG_REUSE=1
           ctest --test-dir build --output-on-failure
 
       - name: Smoke test the engine and the HTTP API

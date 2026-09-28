@@ -2427,7 +2427,8 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
                         const SafeTensors& ckpt,
                         const quant::GroupAffineMap* quant,
                         const std::string& prefix, std::int32_t layer,
-                        bool attn, double* out_decode) {
+                        bool attn, double* out_decode,
+                        double* out_reference_peak = nullptr) {
   WeightBinder bw(ckpt, quant);
   LayerContext cw{&cfg, layer, false, 1};
   if (!whole->load(bw, prefix, cw).ok()) return -1.0;
@@ -2456,6 +2457,7 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
     absmax = std::max(absmax, std::abs(static_cast<double>(a[i])));
     worst = std::max(worst, std::abs(static_cast<double>(a[i]) - b[i]));
   }
+  if (out_reference_peak != nullptr) *out_reference_peak = absmax;
   const double prefill = absmax > 0.0 ? worst / absmax : 0.0;
 
   // One decode token against the carried state -- the recurrence and the KV
@@ -2523,4 +2525,21 @@ LSE_TEST(a_split_mixer_carries_state_the_way_the_whole_one_does) {
     LSE_EXPECT(prefill < 1e-4);
     LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
   }
+}
+
+LSE_TEST(a_small_split_attention_carries_prefill_and_decode_state_without_a_checkpoint) {
+  Config cfg = tiny_qwen_config(false);
+  cfg.attn_q_heads = 4;
+  cfg.attn_kv_heads = 2;
+  auto checkpoint = SafeTensors::open(write_shaped_fixture(
+      "split_attention_state", qwen_checkpoint(cfg)));
+  LSE_EXPECT_OK(checkpoint.status());
+  if (!checkpoint.ok()) return;
+  double decode = -1.0, peak = 0.0;
+  const double prefill = shard_state_step(
+      qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
+      nullptr, "language_model.model.layers.3", 3, true, &decode, &peak);
+  LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
+  LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
+  LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
 }

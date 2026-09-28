@@ -562,16 +562,6 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                            ? (*states)[i].value_cache.node().get()
                            : nullptr;
       if (cache_.kv_leaves[2 * i] != k || cache_.kv_leaves[2 * i + 1] != v) {
-        if (std::getenv("LSE_DEBUG_REUSE") != nullptr) {
-          std::fprintf(stderr,
-                       "[reuse] kv mismatch i=%zu cachedK=%p curK=%p "
-                       "cachedV=%p curV=%p poolK=%p\n",
-                       i, (void*)cache_.kv_leaves[2 * i], (void*)k,
-                       (void*)cache_.kv_leaves[2 * i + 1], (void*)v,
-                       (void*)((*states)[i].paged.keys.valid()
-                                   ? (*states)[i].paged.keys.node().get()
-                                   : nullptr));
-        }
         return false;
       }
     }
@@ -615,21 +605,6 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
       cache_.states == states && !cache_.program.empty() &&
       !cache_.program.groups().empty() && kv_leaves_match();
-  if (std::getenv("LSE_DEBUG_REUSE") != nullptr) {
-    std::fprintf(
-        stderr,
-        "[reuse] t=%lld can=%d aux=%d tr=%d pool=%d meta=%d hid=%d ctok=%d "
-        "tok=%d shp=%d st=%d prog=%d grp=%d kv=%d\n",
-        static_cast<long long>(t_now), (int)can_reuse,
-        (int)(aux_loss == nullptr), (int)(trace == nullptr),
-        (int)!pool_moved, (int)!meta_moved, (int)cache_.hidden.valid(),
-        (int)cache_.tokens.valid(), (int)tokens.valid(),
-        (int)(cache_.tokens.valid() && tokens.valid() &&
-              tokens.shape().elem_count() ==
-                  cache_.tokens.shape().elem_count()),
-        (int)(cache_.states == states), (int)!cache_.program.empty(),
-        (int)!cache_.program.groups().empty(), (int)kv_leaves_match());
-  }
   if (replaces_previous && last_pass_host_groups_ != 0) {
     return LSE_ERROR(kUnimplemented, "the pass being replaced put ",
                      std::to_string(last_pass_host_groups_),

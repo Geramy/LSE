@@ -23,6 +23,22 @@ std::size_t broadcast_index(const Shape& src, const Shape& out,
   return BroadcastMap::build(src, out).apply(out_index);
 }
 
+void finish_host_write(Node& n) {
+  n.materialized = true;
+  if (n.buffer.ptr != nullptr || n.prim == nullptr) return;
+  const int at = n.prim->inplace_input();
+  if (at < 0 || static_cast<std::size_t>(at) >= n.inputs.size() ||
+      !n.inputs[static_cast<std::size_t>(at)]) return;
+  Node& owner = *n.inputs[static_cast<std::size_t>(at)];
+  if (!n.buffer.valid() || n.buffer.handle != owner.buffer.handle ||
+      n.buffer.offset != owner.buffer.offset ||
+      n.buffer.size_bytes != owner.buffer.size_bytes) return;
+  // Opaque allocations share device storage, but each node owns its mirror.
+  owner.host_mirror = n.host_mirror;
+  owner.host_dirty = n.host_dirty;
+  owner.device_dirty = n.device_dirty;
+}
+
 Status ensure_buffer(Node& n, backend::IBackend& backend,
                      backend::Stream stream = backend::kDefaultStream) {
   if (n.buffer.valid()) return OkStatus();
@@ -943,8 +959,9 @@ Status eval_kv_page_write(Node& n) {
   }
 
   const bool aliased =
-      n.buffer.valid() && dst.buffer.valid() &&
-      n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr;
+      n.buffer.ptr != nullptr && dst.buffer.valid() &&
+      n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr &&
+      n.buffer.offset == dst.buffer.offset;
   if (!aliased) {
     for (std::size_t i = 0; i < n.element_count(); ++i) {
       store_element(n, i, load_element(dst, i));
@@ -1009,8 +1026,9 @@ Status eval_overwrite_slice(Node& n) {
                      std::to_string(d.axis_len));
   }
   const bool aliased =
-      n.buffer.valid() && dst.buffer.valid() &&
-      n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr;
+      n.buffer.ptr != nullptr && dst.buffer.valid() &&
+      n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr &&
+      n.buffer.offset == dst.buffer.offset;
   if (!aliased) {
     for (std::size_t i = 0; i < n.element_count(); ++i) {
       store_element(n, i, load_element(dst, i));
@@ -1340,7 +1358,7 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
     std::vector<float> result(count);
     n.prim->eval_cpu(ptrs, result.data(), count, n.attrs);
     for (std::size_t e = 0; e < count; ++e) store_element(n, e, result[e]);
-    n.materialized = true;
+    finish_host_write(n);
     return OkStatus();
   }
 
@@ -1470,7 +1488,7 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
                        std::string(to_string(n.kind)));
   }
 
-  n.materialized = true;
+  finish_host_write(n);
   return OkStatus();
 }
 
