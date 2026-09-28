@@ -40,6 +40,7 @@ add_library(lse_core
   src/core/debug.cpp
   src/core/dtype.cpp
   src/core/shape.cpp
+  src/core/sha256.cpp
   src/core/status.cpp
   src/quant/group_affine.cpp
 )
@@ -229,6 +230,7 @@ add_library(lse_kernels
   src/kernels/linked.cpp
   src/kernels/matmul.cpp
   src/kernels/quant_embedding.cpp
+  src/kernels/int8_policy.cpp
   src/kernels/quant_linear.cpp
   src/kernels/reduction.cpp
   src/kernels/rope.cpp
@@ -322,6 +324,7 @@ add_library(lse_model
   src/model/mtp.cpp
   src/model/layer.cpp
   src/model/registry.cpp
+  src/model/compute_profile.cpp
   src/model/weights.cpp
   src/models/lemonseed.cpp
   src/models/qwen3_5.cpp

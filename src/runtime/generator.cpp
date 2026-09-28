@@ -75,9 +75,22 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 // The row axis is bucketed the same way (model::kBatchRungs) and for the same
 // reason, and the two share the ladder: a decode pass of B sequences and a
 // prefill pass of B tokens present the same row count to every GEMM.
-constexpr std::size_t kPrefillChunk = 1024;
+//
+// 512, not 1024: on gfx1201 / driver 201 a full sweep at a fixed 2821-token
+// prompt gives warm PP/s of 128->74.8, 256->80.1, 384->78.0, 512->126.0,
+// 768 and 1024->RESOURCE_EXHAUSTED (the buffer slab OOMs on a repeat prefill
+// pass at those widths), so 512 is both the fastest and the largest chunk that
+// survives repeated long prompts. See build/lse-prefill-q4.md.
+constexpr std::size_t kPrefillChunk = 512;
 
-std::size_t prefill_chunk() { return kPrefillChunk; }
+// LSE_PREFILL_CHUNK overrides the compiled default for tuning runs: it relaunches
+// the engine at another pass width without a rebuild. 0 restores one-pass.
+std::size_t prefill_chunk() {
+  const char* v = std::getenv("LSE_PREFILL_CHUNK");
+  if (v == nullptr) return kPrefillChunk;
+  const long n = std::strtol(v, nullptr, 10);
+  return n > 0 ? static_cast<std::size_t>(n) : 0;
+}
 
 // Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
 // two below it}, so the whole engine only ever compiles that many prefill

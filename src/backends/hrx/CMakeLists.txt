@@ -8,6 +8,7 @@
 
 add_library(lse_backend_hrx
   hrx_backend.cpp
+  sq_profiler.cpp
   code_object.cpp
   code_census.cpp
   hipc/hip_emitter.cpp

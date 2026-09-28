@@ -21,6 +21,7 @@
 // `dot_ok` below carries what a device must have for it.
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <span>
 #include <string>
 
@@ -300,7 +301,7 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
 // where the emitted kernel does not compile at all.
 bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
             std::uint32_t cpl) {
-  if (!activation_int8_enabled()) return false;
+  if (!activation_int8_enabled(s)) return false;
   if (!d.valid || d.spec.bits != quant::kDot4Bits) return false;
   if (s.device == nullptr || s.intrinsics == nullptr) return false;
   const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*s.device);
@@ -338,8 +339,14 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
 // either output's chunk order, fused rounding points, or wave reduction.
 std::uint32_t q6_decode_columns(const KernelShapes& s, const QuantDims& d,
                                 bool indexed) {
+  // The opted-in Q4 signed/unsigned dot4 decoder measured faster on gfx1201
+  // and passed the 1024-token M1 perplexity gate. Keep the exact-FP32 quad
+  // as the default without INT8 opt-in and as a diagnostic override.
+  const bool q4_quad = d.spec.bits == 4 &&
+                       (!activation_int8_enabled(s) || q4_decode_exact_enabled());
   return d.valid && !indexed && d.m == 1 && d.n % 4 == 0 &&
-      d.spec.bits == 6 && d.spec.group_size == 64 && s.device != nullptr &&
+      (d.spec.bits == 6 || q4_quad) && d.spec.group_size == 64 &&
+      s.device != nullptr &&
       s.device->arch == "gfx1201" && wave_of(s.device) == 32 &&
       s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16 &&
       s.staged.name.empty() && s.staged_quant.codes.empty() ? 4u : 1u;
@@ -893,7 +900,12 @@ std::string emit_q6_decode_quad(const KernelShapes& s, const QuantDims& d) {
   const auto k = static_cast<std::uint32_t>(d.k);
   const auto lanes = static_cast<std::uint32_t>(d.lanes);
   const auto groups = static_cast<std::uint32_t>(d.groups);
-  constexpr std::uint32_t wave = 32, columns = 4, vals = 16, words = 3;
+  constexpr std::uint32_t wave = 32, columns = 4;
+  const std::uint32_t vals = static_cast<std::uint32_t>(d.spec.values_per_chunk());
+  const std::uint32_t words = static_cast<std::uint32_t>(d.spec.words_per_chunk());
+  const std::uint32_t chunks_per_group =
+      static_cast<std::uint32_t>(d.spec.group_size) / vals;
+  const std::uint32_t mask = 1u << d.spec.bits;
   const auto chunks = k / vals;
   const auto aligned = chunks / wave * wave;
   kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
@@ -914,10 +926,10 @@ std::string emit_q6_decode_quad(const KernelShapes& s, const QuantDims& d) {
   if (auto live = e.when(col < n)) {
     auto accumulate = [&](const kir::Val<kir::u32>& chunk) {
       std::array<kir::Val<kir::f32>, columns> scales, biases;
-      std::array<std::array<kir::Val<kir::u32>, words>, columns> packed;
+      std::array<std::array<kir::Val<kir::u32>, 3>, columns> packed;
       for (std::uint32_t output = 0; output < columns; ++output) {
         const auto current = e.let(col + output);
-        const auto group = e.let(current * groups + chunk / 4u);
+        const auto group = e.let(current * groups + chunk / chunks_per_group);
         scales[output] = e.let(math::widen(a.scales[group]));
         biases[output] = e.let(math::widen(a.biases[group]));
         const auto first = e.let(current * lanes + chunk * words);
@@ -934,7 +946,7 @@ std::string emit_q6_decode_quad(const KernelShapes& s, const QuantDims& d) {
           auto value = packed[output][word] / (1u << offset);
           if (carry > 0)
             value = value + (packed[output][word + 1] % (1u << carry)) * (1u << (32 - offset));
-          else value = value % 64u;
+          else value = value % mask;
           const auto weight = math::fma(math::cast<kir::f32>(e.let(value)), scales[output], biases[output]);
           acc[output] = math::fma(x, weight, acc[output].read());
         }

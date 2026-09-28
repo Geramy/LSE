@@ -99,7 +99,8 @@ const KernelPrimitiveBase* phase_spec(const KernelPrimitiveBase* kp,
   if (spec == nullptr) return kp;
   if (spec != kp &&
       (spec->name() == "linear.wmma" || is_linked_name(spec->name()) ||
-       (kp->name() == "rms_norm" && spec->owns_indexing()))) {
+       ((kp->name() == "rms_norm" || kp->name() == "l2_normalize") &&
+        spec->owns_indexing()))) {
     return kp;
   }
   return spec;

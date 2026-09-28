@@ -56,16 +56,16 @@ and `long-comparison.log` in the same local qualification directory.
 
 ## Experiments that did not pass
 
-Two-pass Q6 passes the unchanged 0.005 full-logit relative-L2 gate on the fixed
-code, math and story contexts, with all 248,320 logits finite, matching argmax,
-and bit-identical repeats. Its numerical suite passes 37 cases with nine
-repeats. Correctness does not compensate for its measured prefill slowdown.
+Two-pass Q6 passed its 37-case arithmetic suite with nine repeats and produced
+finite results on the fixed contexts. It has no matched 1,024–2,048-token
+perplexity qualification. Its measured prefill slowdown already keeps it
+experimental.
 
-The INT8 prefetch candidate passes its 71-case numerical suite and the corrected
-same-buffer FP32/INT8 comparison. Its full-model speed screen fails. The complete
-multi-context, early/late decode-logit gate remains unqualified; matching this
-one benchmark response does not replace it. The released `LSE_HRX_INT8=1`
-policy continues to cover the existing Q4 path, not this Q6 experiment.
+The INT8 prefetch candidate passes its 71-case arithmetic suite and the
+corrected same-buffer comparison. Its full-model speed screen fails, and no
+matched 1,024–2,048-token perplexity qualification is attached to it. The
+released `LSE_HRX_INT8=1` policy continues to cover the existing Q4 path,
+not this Q6 experiment.
 
 ## Reproduction and evidence
 

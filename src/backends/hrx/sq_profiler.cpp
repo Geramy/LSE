@@ -17,13 +17,10 @@
 //    counter set {SQ_BUSY_CYCLES}. The AMDGPU driver routes dispatch events
 //    on every queue and emits counter samples per dispatch
 //    (profile_counters.c: write_profile_counter_samples on the flush path).
-//  - Watcher thread: every window (500 ms) it calls
-//    iree_hal_device_profiling_flush (which drives the host-queue flush that
-//    retires dispatch events and writes the sample chunks to the sink), then
-//    re-reads the profile file from the start (it is bounded by the discard
-//    loop: after every window we truncate-and-restart it via a fresh fd
-//    rewrite of the same file), sums SQ_BUSY_CYCLES values and tick ranges,
-//    and publishes {seq, sq_busy, ref_cyc, clock_hz} to the shared VRAM slot.
+//  - Watcher thread: every window (500 ms) it flushes retired dispatch events,
+//    reads only newly appended complete records from the profile file, sums
+//    SQ_BUSY_CYCLES values and tick ranges, and publishes
+//    {seq, sq_busy, ref_cyc, clock_hz} to the shared slot.
 
 #include "lse/backends/hrx/hrx_backend.hpp"
 
@@ -42,6 +39,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "lse/backends/hrx/hrx_backend.hpp"
@@ -244,6 +242,118 @@ std::uint64_t read_u64(const std::uint8_t* p) {
 
 }  // namespace
 
+bool parse_sq_profile_bytes(const std::uint8_t* bytes, std::size_t size,
+                            bool includes_file_header, SqProfileParseState& state,
+                            SqProfileWindow& window, std::size_t& consumed) {
+  consumed = 0;
+  window = {};
+  if (!bytes && size != 0) return false;
+  SqProfileParseState next_state = state;
+  SqProfileWindow next_window;
+  std::size_t offset = 0;
+  if (includes_file_header) {
+    if (size < sizeof(irpf_file_header_t)) return false;
+    const std::uint32_t header_length = read_u32(bytes + 8);
+    if (read_u32(bytes) != 0x46505249u ||
+        header_length < sizeof(irpf_file_header_t) || header_length > size)
+      return false;
+    offset = header_length;
+  }
+
+  while (size - offset >= sizeof(irpf_record_header_t)) {
+    const std::uint8_t* record = bytes + offset;
+    const std::uint64_t record_length = read_u64(record);
+    const std::uint64_t payload_length = read_u64(record + 8);
+    const std::uint32_t header_length = read_u32(record + 56);
+    const std::uint32_t content_type_length = read_u32(record + 60);
+    const std::uint32_t name_length = read_u32(record + 64);
+    const std::uint16_t record_type = static_cast<std::uint16_t>(
+        std::uint16_t(record[100]) | (std::uint16_t(record[101]) << 8));
+    if (record_length < sizeof(irpf_record_header_t) ||
+        header_length < sizeof(irpf_record_header_t) ||
+        header_length > record_length)
+      return false;
+    if (record_length > size - offset) break;  // writer has not finished it
+    const std::uint64_t body_length = record_length - header_length;
+    if (content_type_length > body_length ||
+        name_length > body_length - content_type_length ||
+        payload_length != body_length - content_type_length - name_length)
+      return false;
+
+    if (record_type == 2 /*CHUNK*/) {
+      const char* content_type =
+          reinterpret_cast<const char*>(record + header_length);
+      const std::uint8_t* payload =
+          record + header_length + content_type_length + name_length;
+      const std::size_t payload_size = static_cast<std::size_t>(payload_length);
+      if (content_type_length == std::strlen(kCountersContentType) &&
+          std::memcmp(content_type, kCountersContentType,
+                      content_type_length) == 0) {
+        std::size_t pos = 0;
+        while (payload_size - pos >= sizeof(irpf_counter_record_t)) {
+          const std::uint8_t* counter = payload + pos;
+          const std::uint32_t counter_length = read_u32(counter);
+          const std::uint32_t block_name_length = read_u32(counter + 36);
+          const std::uint32_t counter_name_length = read_u32(counter + 40);
+          const std::uint32_t description_length = read_u32(counter + 44);
+          if (counter_length < sizeof(irpf_counter_record_t) ||
+              counter_length > payload_size - pos)
+            return false;
+          const std::size_t trailing = counter_length - sizeof(irpf_counter_record_t);
+          if (block_name_length > trailing ||
+              counter_name_length > trailing - block_name_length ||
+              description_length > trailing - block_name_length - counter_name_length)
+            return false;
+          const char* counter_name = reinterpret_cast<const char*>(
+              counter + sizeof(irpf_counter_record_t) + block_name_length);
+          if (counter_name_length == std::strlen(kBusyCounter) &&
+              std::memcmp(counter_name, kBusyCounter, counter_name_length) == 0) {
+            next_state.busy_value_offset = read_u32(counter + 28);
+            next_state.have_busy_counter = true;
+          }
+          pos += counter_length;
+        }
+        if (pos != payload_size) return false;
+      } else if (content_type_length ==
+                     std::strlen(kCounterSamplesContentType) &&
+                 std::memcmp(content_type, kCounterSamplesContentType,
+                             content_type_length) == 0) {
+        std::size_t pos = 0;
+        while (payload_size - pos >=
+               sizeof(iree_hal_profile_counter_sample_record_t)) {
+          const std::uint8_t* sample = payload + pos;
+          const std::uint32_t sample_length = read_u32(sample);
+          const std::uint32_t value_count = read_u32(sample + 104);
+          if (sample_length < sizeof(iree_hal_profile_counter_sample_record_t) ||
+              sample_length > payload_size - pos ||
+              value_count > (sample_length -
+                  sizeof(iree_hal_profile_counter_sample_record_t)) /
+                  sizeof(std::uint64_t))
+            return false;
+          const std::uint32_t index = next_state.busy_value_offset;
+          if (next_state.have_busy_counter && index < value_count) {
+            next_window.busy += read_u64(sample +
+                sizeof(iree_hal_profile_counter_sample_record_t) +
+                std::size_t(index) * sizeof(std::uint64_t));
+            const std::uint64_t start_tick = read_u64(sample + 72);
+            const std::uint64_t end_tick = read_u64(sample + 80);
+            if ((read_u32(sample + 4) & kTickRangeFlag) && end_tick > start_tick)
+              next_window.reference_ticks += end_tick - start_tick;
+            ++next_window.sample_count;
+          }
+          pos += sample_length;
+        }
+        if (pos != payload_size) return false;
+      }
+    }
+    offset += static_cast<std::size_t>(record_length);
+  }
+  state = next_state;
+  window = next_window;
+  consumed = offset;
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 // Impl
 //===----------------------------------------------------------------------===//
@@ -278,6 +388,7 @@ struct SqProfiler::Impl {
   std::atomic<bool> active{false};
   std::string status_text = "not started";
   std::uint64_t last_drained_bytes = 0;
+  SqProfileParseState parse_state;
 
   ~Impl() {
     stop_flag.store(true);
@@ -404,10 +515,15 @@ struct SqProfiler::Impl {
     out_busy = 0;
     out_ref = 0;
     out_sample_count = 0;
-    std::uint32_t value_offset = 0;  // resolved below; 0 = assume first slot
-    bool have_offset = false;
     int fd = ::open(profile_path.c_str(), O_RDONLY);
     if (fd < 0) return false;
+    struct stat statbuf {};
+    if (::fstat(fd, &statbuf) != 0 || statbuf.st_size < 0 ||
+        static_cast<std::uint64_t>(statbuf.st_size) < last_drained_bytes ||
+        ::lseek(fd, static_cast<off_t>(last_drained_bytes), SEEK_SET) < 0) {
+      ::close(fd);
+      return false;
+    }
     std::vector<std::uint8_t> bytes;
     std::vector<std::uint8_t> buffer(64 * 1024);
     ssize_t n;
@@ -415,92 +531,17 @@ struct SqProfiler::Impl {
       bytes.insert(bytes.end(), buffer.data(), buffer.data() + n);
     }
     ::close(fd);
-    const std::uint8_t* base = bytes.data();
-    std::size_t size = bytes.size();
-    if (size < sizeof(irpf_file_header_t)) return false;
-    const irpf_file_header_t* header =
-        reinterpret_cast<const irpf_file_header_t*>(base);
-    if (header->magic != 0x46505249u) return false;
-    std::size_t offset = header->header_length;
-    while (offset + sizeof(irpf_record_header_t) <= size) {
-      const irpf_record_header_t* record =
-          reinterpret_cast<const irpf_record_header_t*>(base + offset);
-      std::size_t record_len = record->record_length;
-      if (record_len < sizeof(irpf_record_header_t) ||
-          offset + record_len > size) break;  // partial write in progress
-      if (record->record_type == 2 /*CHUNK*/) {
-        const std::uint8_t* body = base + offset + sizeof(irpf_record_header_t);
-        const char* content_type =
-            reinterpret_cast<const char*>(body + record->header_length);
-        const std::uint8_t* payload =
-            body + record->header_length + record->content_type_length +
-            record->name_length;
-        std::size_t payload_size = record->payload_length;
-        if (record->content_type_length ==
-                std::strlen(kCountersContentType) &&
-            std::memcmp(content_type, kCountersContentType,
-                        record->content_type_length) == 0) {
-          // Find the SQ_BUSY_CYCLES counter record and its value offset.
-          std::size_t pos = 0;
-          while (pos + sizeof(irpf_counter_record_t) <= payload_size) {
-            const irpf_counter_record_t* counter =
-                reinterpret_cast<const irpf_counter_record_t*>(payload + pos);
-            std::size_t rec_len = counter->record_length;
-            if (rec_len < sizeof(irpf_counter_record_t) ||
-                pos + rec_len > payload_size)
-              break;
-            const char* name =
-                reinterpret_cast<const char*>(payload + pos + rec_len +
-                                              counter->block_name_length);
-            if (counter->name_length == std::strlen(kBusyCounter) &&
-                std::memcmp(name, kBusyCounter, counter->name_length) == 0) {
-              value_offset = counter->sample_value_offset;
-              have_offset = true;
-              break;
-            }
-            pos += rec_len;
-          }
-        } else if (record->content_type_length ==
-                       std::strlen(kCounterSamplesContentType) &&
-                   std::memcmp(content_type, kCounterSamplesContentType,
-                               record->content_type_length) == 0) {
-          const std::uint8_t* values = payload;
-          std::size_t values_size = payload_size;
-          std::size_t record_pos = 0;
-          while (record_pos +
-                     sizeof(iree_hal_profile_counter_sample_record_t) <=
-                 values_size) {
-            const iree_hal_profile_counter_sample_record_t* sample =
-                reinterpret_cast<const iree_hal_profile_counter_sample_record_t*>(
-                    values + record_pos);
-            std::size_t record_size = sample->record_length;
-            if (record_size <
-                    sizeof(iree_hal_profile_counter_sample_record_t) ||
-                record_pos + record_size > values_size)
-              break;
-            const std::uint8_t* sample_values =
-                values + record_pos +
-                sizeof(iree_hal_profile_counter_sample_record_t);
-            // With metadata: use the resolved offset; without it (metadata
-            // chunk missed) fall back to slot 0, which is correct for a
-            // single-counter set.
-            std::uint32_t index = have_offset ? value_offset : 0;
-            if (sample->sample_value_count > index) {
-              out_busy += read_u64(sample_values + index * sizeof(std::uint64_t));
-            }
-            // IREE_HAL_PROFILE_COUNTER_SAMPLE_FLAG_DEVICE_TICK_RANGE = 1u<<2:
-            // start_tick/end_tick are valid only when it is set.
-            if ((sample->flags & kTickRangeFlag) &&
-                sample->end_tick > sample->start_tick) {
-              out_ref += sample->end_tick - sample->start_tick;
-            }
-            out_sample_count += 1;
-            record_pos += record_size;
-          }
-        }
-      }
-      offset += record_len;
-    }
+    if (n < 0) return false;
+    SqProfileWindow window;
+    std::size_t consumed = 0;
+    if (!parse_sq_profile_bytes(bytes.data(), bytes.size(),
+                                last_drained_bytes == 0, parse_state,
+                                window, consumed))
+      return false;
+    last_drained_bytes += consumed;
+    out_busy = window.busy;
+    out_ref = window.reference_ticks;
+    out_sample_count = window.sample_count;
     return true;
   }
 
@@ -539,33 +580,20 @@ struct SqProfiler::Impl {
         // busy % still means something (sum of busy cycles over the window).
         ref_ticks = g_window_ns.load();
       }
-      std::uint32_t* w = slot;
-      std::uint32_t seq = __atomic_load_n(&w[0], __ATOMIC_ACQUIRE) + 1;
-      if (ok && (busy != 0 || sample_count != 0)) {
-        __atomic_store_n(&w[1], static_cast<std::uint32_t>(busy % 4294967295u),
-                         __ATOMIC_RELAXED);
-        __atomic_store_n(&w[2], static_cast<std::uint32_t>(ref_ticks % 4294967295u),
-                         __ATOMIC_RELAXED);
-        __atomic_store_n(&w[3], __atomic_load_n(&w[3], __ATOMIC_RELAXED),
-                         __ATOMIC_RELAXED);
-        __atomic_store_n(&w[0], seq, __ATOMIC_RELEASE);
-        active.store(true);
-      } else if (ok && sample_count == 0) {
-        // Idle window: advance seq with zero busy so consumers see "recent,
-        // no work" rather than a stale seq.
-        __atomic_store_n(&w[1], 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&w[2], 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&w[0], seq, __ATOMIC_RELEASE);
+      if (ok) {
+        std::uint32_t* w = slot;
+        const std::uint32_t seq = __atomic_load_n(&w[0], __ATOMIC_RELAXED);
+        // Mark the slot busy before changing either payload word. Readers
+        // accept only equal, even sequence values around their snapshot.
+        __atomic_store_n(&w[0], seq + 1u, __ATOMIC_RELEASE);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        __atomic_store_n(&w[1], sample_count == 0 ? 0u :
+            static_cast<std::uint32_t>(busy % 4294967295u), __ATOMIC_RELAXED);
+        __atomic_store_n(&w[2], sample_count == 0 ? 0u :
+            static_cast<std::uint32_t>(ref_ticks % 4294967295u), __ATOMIC_RELAXED);
+        __atomic_store_n(&w[0], seq + 2u, __ATOMIC_RELEASE);
         active.store(true);
       }
-      // Rotate the profile file so it cannot grow unbounded: close the
-      // session's sink view is NOT required — the file sink appends, so we
-      // truncate in place (the writer keeps its file offset; truncating
-      // under an active appender is not safe on all filesystems, so instead
-      // we keep the file and cap it by recreating the sink on overflow).
-      // For a 500 ms window of decode dispatches the file stays well under
-      // the cap; the overflow path just reports unsupported-safe n/a.
-      (void)last_drained_bytes;
     }
   }
 };
@@ -581,8 +609,10 @@ std::unique_ptr<SqProfiler> SqProfiler::start(const SqProfilerParams& params) {
   std::unique_ptr<SqProfiler> profiler(new SqProfiler(std::move(impl)));
   if (!profiler->impl_->resolve(params.library_path)) return nullptr;
   if (!profiler->impl_->setup_sink_and_session()) return nullptr;
-  // Publish the clock word once (caller may have pre-filled it; if not,
-  // leave 0 and consumers treat the window as wall-clock-bounded).
+  // New sessions begin with a stable even sequence and an empty window.
+  __atomic_store_n(&params.slot_host[1], 0u, __ATOMIC_RELAXED);
+  __atomic_store_n(&params.slot_host[2], 0u, __ATOMIC_RELAXED);
+  __atomic_store_n(&params.slot_host[0], 0u, __ATOMIC_RELEASE);
   profiler->impl_->thread = std::thread([p = profiler.get()] { p->impl_->run(); });
   return profiler;
 }
@@ -607,11 +637,16 @@ std::uint32_t* g_slot_host = nullptr;
 
 void sq_profiler_set_slot(std::uint32_t* slot_host) { g_slot_host = slot_host; }
 
-std::unique_ptr<SqProfiler> make_sq_profiler() {
-  if (!g_slot_host) return nullptr;
-  // The device is obtained by the backend (it owns the hrx_device_t);
-  // this seam receives it through the params below via start_with_device.
-  return nullptr;
+std::unique_ptr<SqProfiler> make_sq_profiler(void* hrx_device, std::uint32_t* slot_host) {
+  if (!hrx_device || !slot_host) return nullptr;
+  // This path is env-gated (LSE_SQ_PROFILER_SLOT) and the aqlprofile counter is
+  // not available on gfx1201 (verified: the SQ busy-cycles counter is armed only
+  // by the closed aqlprofile CP-perfmon PM4, not a simple register read). Keep the
+  // seam compiling and returning null so the observer panel shows n/a.
+  SqProfilerParams params;
+  params.device = hrx_device;
+  params.slot_host = slot_host;
+  return SqProfiler::start(params);
 }
 
 void destroy_sq_profiler(std::unique_ptr<SqProfiler>& profiler) {

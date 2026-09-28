@@ -151,9 +151,11 @@ class WeightBinder {
                                const std::vector<std::int64_t>* order,
                                Shape logical, TensorWindow window = {});
 
+  friend class HybridLM;
   const SafeTensors* weights_;
   const quant::GroupAffineMap* quantization_ = nullptr;
   std::vector<std::string> claimed_;
+  std::int32_t compute_profile_revision_ = 0;
 };
 
 template <typename Derived>

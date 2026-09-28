@@ -43,8 +43,10 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
     key.append(value);
   };
   text("loom");
-  number(3);  // identity includes the shared compute-operand policy
-  number(kernels::activation_int8_enabled());
+  number(4);  // identity includes the shared compute-operand and Q4 decode policies
+  number(static_cast<std::uint64_t>(kernels::activation_int8_policy()));
+  number(0x696e7438706f6c33ull);
+  number(kernels::q4_decode_exact_enabled());
   number(kernels::quant_operand_cache_key(0));
   number(kernels::quant_operand_specialization_key(0, group, device,
                                                   loom_types(), loom_sources()));
@@ -864,7 +866,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
       if (chosen == nullptr) chosen = kp;
       // A multi-output RMS group cannot use the single-output store hook.
       // Keep its original per-element implementation, as the HIP scaffold does.
-      if (n->kind == graph::OpKind::kRMS && chosen->owns_indexing() &&
+      if ((n->kind == graph::OpKind::kRMS ||
+           n->kind == graph::OpKind::kL2Norm) && chosen->owns_indexing() &&
           !kp->owns_indexing()) chosen = kp;
       if (chosen->owns_indexing()) {
         return LSE_ERROR(kUnimplemented, "primitive '",

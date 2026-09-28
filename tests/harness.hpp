@@ -16,6 +16,7 @@ struct Registry {
   };
   std::vector<Case> cases;
   int failures = 0;
+  std::string skip_reason;
   std::string current;
 
   static Registry& get() {
@@ -37,22 +38,39 @@ inline void fail(const char* file, int line, const std::string& what) {
                file, line, what.c_str());
 }
 
+inline void skip(const char* reason) {
+  Registry::get().skip_reason = reason;
+}
+
 inline int run_all() {
   Registry& r = Registry::get();
   int passed = 0;
+  int skipped = 0;
   for (const auto& c : r.cases) {
     if (std::getenv("LSE_TEST_TRACE") != nullptr) {
       std::fprintf(stderr, "[test] start %s\n", c.name.c_str());
     }
     r.current = c.name;
+    r.skip_reason.clear();
     const int before = r.failures;
     c.fn();
-    if (r.failures == before) {
+    if (r.failures != before) {
+      continue;
+    }
+    if (!r.skip_reason.empty()) {
+      ++skipped;
+      std::printf("  skip %s (%s)\n", c.name.c_str(), r.skip_reason.c_str());
+    } else {
       ++passed;
       std::printf("  ok   %s\n", c.name.c_str());
     }
   }
-  std::printf("\n%d/%zu passed\n", passed, r.cases.size());
+  if (skipped == 0) {
+    std::printf("\n%d/%zu passed\n", passed, r.cases.size());
+  } else {
+    std::printf("\n%d passed, %d skipped / %zu\n", passed, skipped,
+                r.cases.size());
+  }
   return r.failures == 0 ? 0 : 1;
 }
 
@@ -62,6 +80,12 @@ inline int run_all() {
   static void name();                                             \
   static ::lse::test::Registrar _lse_reg_##name{#name, name};      \
   static void name()
+
+#define LSE_SKIP(reason)            \
+  do {                              \
+    ::lse::test::skip(reason);       \
+    return;                         \
+  } while (0)
 
 // Variadic: an argument like `Shape{1, 64}.is_broadcastable_to(x)` contains a
 // comma at preprocessor level, so a single-parameter macro would split it.

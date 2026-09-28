@@ -1,3 +1,5 @@
+#include "lse/model/compute_profile.hpp"
+#include "lse/kernels/int8_policy.hpp"
 #include "lse/model/hybrid_lm.hpp"
 
 #include <algorithm>
@@ -148,6 +150,13 @@ Status HybridLM::load(WeightBinder& binder) {
     }
     graph::set_split_scheme(scheme);
   }
+  // Qualification is local to this model/binder, never a process-wide activation policy.
+  const auto* policy_scheduler=graph::default_scheduler();
+  const auto device_count=policy_scheduler==nullptr ? 1u : policy_scheduler->devices().size();
+  binder.compute_profile_revision_=kernels::activation_int8_policy()==kernels::ActivationInt8Policy::kAutomatic &&
+      qualified_q4_load_scope(device_count,graph::split_scheme()!=graph::SplitScheme::kNone)
+      ? qualified_q4_compute(config_,binder.weights()) : 0;
+  std::fprintf(stderr,"lse: quant compute profile revision=%d (automatic M1/M512 admission)\n",binder.compute_profile_revision_);
   LSE_ASSIGN_OR(embed_weight_, binder.require(spec_.embed_name));
   LSE_ASSIGN_OR(final_norm_weight_, binder.require(spec_.final_norm_name));
   if (!spec_.lm_head_name.empty()) {
@@ -576,8 +585,17 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                          cache_.prev_pass == prev_pass_run) ||
                         (cache_.pass_id != 0 &&
                          cache_.pass_id == prev_pass_run);
+  static const bool broad_split_decode = [] {
+    const char* value = std::getenv("LSE_SPLIT_KEY_SDPA");
+    return value && std::string_view(value) == "1";
+  }();
+  // Batch row replacement may shorten the live descriptor while retaining all
+  // buffer identities. Re-record an ordinary short pass to honor default scope;
+  // speculative replacement must retain its rollback program instead.
+  const bool split_scope_ok = !cache_.split_decode_attention || broad_split_decode ||
+                              replaces_previous || kv_len >= 512;
   const bool can_reuse =
-      !no_replay && chain_ok &&
+      !no_replay && chain_ok && split_scope_ok &&
       aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
       cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
@@ -834,6 +852,12 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   }
   last_pass_host_groups_ = host_groups_so_far() - host_before;
 
+  cache_.split_decode_attention = false;
+  for (const auto& group : cache_.program.groups())
+    for (const auto& node : group.nodes)
+      if (node->prim && (node->prim->name() == "attention.decode_partial128.v1" ||
+                         node->prim->name() == "attention.decode_partial128.wg128c2.v2"))
+        cache_.split_decode_attention = true;
   cache_.tokens = tokens;
   cache_.hidden = y;
   cache_.states = states;

@@ -1,5 +1,6 @@
 #include "lse/graph/program.hpp"
 
+#include <cstdlib>
 #include <unordered_map>
 
 namespace lse::graph {
@@ -58,6 +59,8 @@ void Program::retain(std::span<const NodePtr> roots,
   for (const NodePtr& r : roots_) collect_reachable(r, nodes_, seen);
   phases_ = std::move(phases);
   groups_ = std::move(groups);
+  emissions_.clear();
+  emissions_.resize(groups_.size());
   compute_nodes_ = static_cast<std::uint32_t>(compute_order.size());
   sig_ = program_signature(compute_order);
 
@@ -128,10 +131,44 @@ void Program::destroy() noexcept {
   nodes_.clear();
   phases_.clear();
   groups_.clear();
+  emissions_.clear();
   carries_.clear();
   cuts_.clear();
   sig_ = 0;
   compute_nodes_ = 0;
+}
+
+const EmittedKernel* Program::cached_emission(
+    std::size_t index, const FusionGroup& group,
+    const backend::IBackend* backend, const IKernelEmitter* emitter,
+    std::string_view arch, std::uint64_t* key) const noexcept {
+  if (index >= emissions_.size()) return nullptr;
+  const EmissionCache& cached = emissions_[index];
+  const char* wmma = std::getenv("LSE_WMMA");
+  const std::string_view override = wmma != nullptr ? std::string_view(wmma)
+                                                    : std::string_view{};
+  if (cached.group != &group || cached.backend != backend ||
+      cached.emitter != emitter || cached.arch != arch ||
+      cached.wmma_override != override || !cached.kernel.has_value()) return nullptr;
+  *key = cached.key;
+  return &*cached.kernel;
+}
+
+const EmittedKernel* Program::cache_emission(
+    std::size_t index, const FusionGroup& group,
+    const backend::IBackend* backend, const IKernelEmitter* emitter,
+    std::uint64_t key, std::string_view arch, EmittedKernel kernel) {
+  if (index >= emissions_.size()) return nullptr;
+  EmissionCache& cached = emissions_[index];
+  cached.group = &group;
+  cached.backend = backend;
+  cached.emitter = emitter;
+  cached.key = key;
+  cached.arch = arch;
+  const char* wmma = std::getenv("LSE_WMMA");
+  cached.wmma_override = wmma != nullptr ? wmma : "";
+  cached.kernel.emplace(std::move(kernel));
+  return &*cached.kernel;
 }
 
 bool Program::holds(std::span<const NodePtr> roots) const noexcept {

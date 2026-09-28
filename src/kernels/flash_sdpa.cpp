@@ -35,7 +35,9 @@ namespace {
 constexpr std::uint32_t kThreads = 256;
 // Query rows a workgroup carries. Every one of them reuses the key the window
 // already loaded, so this is what amortizes the KV read.
-constexpr std::uint32_t kQTile = 8;
+// Query rows are a compile-time kernel property; gfx1201 prefill can use 12.
+constexpr std::uint32_t kDefaultQTile = 8;
+constexpr std::uint32_t kGfx1201PrefillQTile = 12;
 // Keys a window covers, one per thread: a thread owns a key for the score and
 // a channel for the accumulation, and neither mapping needs a cross-lane
 // primitive this IR does not have.
@@ -92,8 +94,9 @@ Dims dims_of(const KernelShapes& s) {
   return d;
 }
 
+template <std::uint32_t QTile>
 std::uint32_t lds_floats(const Dims& d) {
-  return kQTile * d.dh + 2u * kQTile * kKWin + 4u * kQTile;
+  return QTile * d.dh + 2u * QTile * kKWin + 4u * QTile;
 }
 
 template <class E>
@@ -106,9 +109,12 @@ struct FlashArgs {
   env::Out<kir::f32, E> out;
 };
 
-struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
-  static constexpr std::string_view kName = "attention.flash";
-  static constexpr std::string_view kEntry = "lse_sdpa_flash";
+template <std::uint32_t QTile>
+struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
+  static constexpr std::string_view kName =
+      QTile == 12 ? "attention.flash.qtile12" : "attention.flash";
+  static constexpr std::string_view kEntry =
+      QTile == 12 ? "lse_sdpa_flash_qtile12" : "lse_sdpa_flash";
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return 3; }
@@ -121,8 +127,8 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
         !s.store) {
       return {};
     }
-    const std::uint32_t ntiles = (d.tq + kQTile - 1u) / kQTile;
-    const std::uint32_t qchunks = (kQTile * d.dh + kThreads - 1u) / kThreads;
+    const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
+    const std::uint32_t qchunks = (QTile * d.dh + kThreads - 1u) / kThreads;
     const std::uint32_t dpt = (d.dv + kThreads - 1u) / kThreads;
     const std::uint32_t blocks_per_win = kKWin / d.ts;
 
@@ -132,15 +138,15 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
-    const auto qs = e.lds<kir::f32>(kQTile * d.dh);
+    const auto qs = e.lds<kir::f32>(QTile * d.dh);
     // The window's scores, then the window's probabilities in place.
-    const auto sc = e.lds<kir::f32>(kQTile * kKWin);
+    const auto sc = e.lds<kir::f32>(QTile * kKWin);
     // The tree reduction needs the scores intact while it consumes a copy.
-    const auto red = e.lds<kir::f32>(kQTile * kKWin);
-    const auto mrow = e.lds<kir::f32>(kQTile);
-    const auto drow = e.lds<kir::f32>(kQTile);
-    const auto arow = e.lds<kir::f32>(kQTile);
-    const auto srow = e.lds<kir::f32>(kQTile);
+    const auto red = e.lds<kir::f32>(QTile * kKWin);
+    const auto mrow = e.lds<kir::f32>(QTile);
+    const auto drow = e.lds<kir::f32>(QTile);
+    const auto arow = e.lds<kir::f32>(QTile);
+    const auto srow = e.lds<kir::f32>(QTile);
 
     const auto lid = e.let(math::local_id());
     const auto wg = e.let(math::workgroup_id_x());
@@ -148,7 +154,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     const auto h = e.let((wg / ntiles) % d.qh);
     const auto b = e.let(wg / (ntiles * d.qh));
     const auto kh = e.let(h / d.group);
-    const auto q0 = e.let(qt * kQTile);
+    const auto q0 = e.let(qt * QTile);
     const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
 
     const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
@@ -156,7 +162,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     // answer zero, the same as the kernel this replaces, rather than reading a
     // block table row that belongs to nobody.
     if (auto pad = e.when(b >= rows)) {
-      for (std::uint32_t r = 0; r < kQTile; ++r) {
+      for (std::uint32_t r = 0; r < QTile; ++r) {
         for (std::uint32_t p = 0; p < dpt; ++p) {
           const auto qrow = e.let(q0 + r);
           const auto dd = e.let(lid + p * kThreads);
@@ -183,10 +189,10 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     // The query tile, read once into LDS and then read by every key.
     for (std::uint32_t c = 0; c < qchunks; ++c) {
       const auto idx = e.let(lid + c * kThreads);
-      // The tile is kQTile * dh floats, which a narrow head leaves smaller
+      // The tile is QTile * dh floats, which a narrow head leaves smaller
       // than the workgroup. Without this the surplus threads write past `qs`
       // and into the arrays behind it.
-      if (auto inb = e.when(idx < kQTile * d.dh)) {
+      if (auto inb = e.when(idx < QTile * d.dh)) {
         const auto r = e.let(idx / d.dh);
         const auto dd = e.let(idx % d.dh);
         const auto qrow = e.let(q0 + r);
@@ -198,14 +204,14 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
         }
       }
     }
-    if (auto g = e.when(lid < kQTile)) {
+    if (auto g = e.when(lid < QTile)) {
       mrow[lid] = math::neg_inf();
       drow[lid] = e.f32(0.0f);
     }
 
     std::vector<kir::LValue<kir::f32>> o;
-    o.reserve(kQTile * dpt);
-    for (std::uint32_t i = 0; i < kQTile * dpt; ++i) o.push_back(e.var(0.0f));
+    o.reserve(QTile * dpt);
+    for (std::uint32_t i = 0; i < QTile * dpt; ++i) o.push_back(e.var(0.0f));
     e.barrier();
 
     // The longest live KV in the pass sets the trip count -- an outermost one,
@@ -220,7 +226,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
       const auto j = e.let(wbase + lid);
 
       // One thread, one key, one score per query row of the tile.
-      for (std::uint32_t r = 0; r < kQTile; ++r) {
+      for (std::uint32_t r = 0; r < QTile; ++r) {
         sc[e.let(r * kKWin + lid)] = math::neg_inf();
       }
       if (auto live = e.when(j < row_len)) {
@@ -228,7 +234,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
             e.let(kir::cast<kir::u32>(a.table[e.let(tb + j / d.ts)]));
         const auto kb0 =
             e.let(((blk * d.kvh + kh) * d.ts + j % d.ts) * d.dh);
-        for (std::uint32_t r = 0; r < kQTile; ++r) {
+        for (std::uint32_t r = 0; r < QTile; ++r) {
           const auto abs_i = e.let(offset + (q0 + r));
           auto score = e.var(0.0f);
           for (auto dd : e.range(d.dh)) {
@@ -251,14 +257,14 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
       e.barrier();
 
       // Window max. Every row reduces on the same step, so the tree costs the
-      // barriers of one reduction rather than of kQTile of them.
-      for (std::uint32_t r = 0; r < kQTile; ++r) {
+      // barriers of one reduction rather than of QTile of them.
+      for (std::uint32_t r = 0; r < QTile; ++r) {
         red[e.let(r * kKWin + lid)] = sc[e.let(r * kKWin + lid)].read();
       }
       e.barrier();
       for (std::uint32_t half = kKWin / 2u; half >= 1u; half /= 2u) {
         if (auto g = e.when(lid < half)) {
-          for (std::uint32_t r = 0; r < kQTile; ++r) {
+          for (std::uint32_t r = 0; r < QTile; ++r) {
             const auto at = e.let(r * kKWin + lid);
             red[at] = math::max(red[at].read(),
                                 red[e.let(at + half)].read());
@@ -270,7 +276,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
       // A row whose keys are all masked has no max to subtract. Subtracting
       // zero instead leaves exp(-inf) = 0, where subtracting -inf is a NaN
       // that would poison the accumulator for every later window.
-      if (auto g = e.when(lid < kQTile)) {
+      if (auto g = e.when(lid < QTile)) {
         const auto wmax = e.let(red[e.let(lid * kKWin)].read());
         const auto mold = e.let(mrow[lid].read());
         const auto newm = e.let(math::max(mold, wmax));
@@ -282,7 +288,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
       }
       e.barrier();
 
-      for (std::uint32_t r = 0; r < kQTile; ++r) {
+      for (std::uint32_t r = 0; r < QTile; ++r) {
         const auto at = e.let(r * kKWin + lid);
         const auto p = e.let(math::exp(sc[at].read() - srow[e.u32(r)].read()));
         sc[at] = p;
@@ -291,21 +297,21 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
       e.barrier();
       for (std::uint32_t half = kKWin / 2u; half >= 1u; half /= 2u) {
         if (auto g = e.when(lid < half)) {
-          for (std::uint32_t r = 0; r < kQTile; ++r) {
+          for (std::uint32_t r = 0; r < QTile; ++r) {
             const auto at = e.let(r * kKWin + lid);
             red[at] = red[at].read() + red[e.let(at + half)].read();
           }
         }
         e.barrier();
       }
-      if (auto g = e.when(lid < kQTile)) {
+      if (auto g = e.when(lid < QTile)) {
         drow[lid] = math::fma(drow[lid].read(), arow[lid].read(),
                               red[e.let(lid * kKWin)].read());
       }
 
       // The accumulator carries the old max; rescale it to the new one before
       // this window's terms go in.
-      for (std::uint32_t r = 0; r < kQTile; ++r) {
+      for (std::uint32_t r = 0; r < QTile; ++r) {
         const auto al = e.let(arow[e.u32(r)].read());
         for (std::uint32_t p = 0; p < dpt; ++p) {
           o[r * dpt + p] = o[r * dpt + p].read() * al;
@@ -327,7 +333,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
                 const auto dd = e.let(lid + p * kThreads);
                 if (auto g = e.when(dd < d.dv)) {
                   const auto vv = e.let(a.v[e.let(vb0 + jj * d.dv + dd)]);
-                  for (std::uint32_t r = 0; r < kQTile; ++r) {
+                  for (std::uint32_t r = 0; r < QTile; ++r) {
                     o[r * dpt + p] =
                         math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
                                   o[r * dpt + p].read());
@@ -341,7 +347,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
       e.barrier();
     }
 
-    for (std::uint32_t r = 0; r < kQTile; ++r) {
+    for (std::uint32_t r = 0; r < QTile; ++r) {
       const auto qrow = e.let(q0 + r);
       const auto den = e.let(drow[e.u32(r)].read());
       const auto inv =
@@ -370,7 +376,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     const Dims d = dims_of(s);
-    const std::uint32_t ntiles = d.valid ? (d.tq + kQTile - 1u) / kQTile : 1u;
+    const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
     tp.workgroup_size[0] = kThreads;
     tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles : 1u;
     tp.workgroup_count[1] = 1;
@@ -378,9 +384,13 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel> {
     return tp;
   }
 };
-LSE_REGISTER_PRIMITIVE(FlashSdpaKernel);
+using FlashSdpaKernel8 = FlashSdpaKernel<kDefaultQTile>;
+using FlashSdpaKernel12 = FlashSdpaKernel<kGfx1201PrefillQTile>;
+LSE_REGISTER_PRIMITIVE(FlashSdpaKernel8);
+LSE_REGISTER_PRIMITIVE(FlashSdpaKernel12);
 
-const FlashSdpaKernel kFlash{};
+const FlashSdpaKernel8 kFlash8{};
+const FlashSdpaKernel12 kFlash12{};
 
 }  // namespace
 
@@ -397,12 +407,17 @@ const KernelPrimitiveBase* flash_sdpa_for(const KernelShapes& s) {
     const char* v = std::getenv("LSE_FLASH_SDPA");
     return v == nullptr || std::string_view(v) != "0";
   }();
-  if (!enabled) return nullptr;
-  if (d.tq < kQTile) return nullptr;
-  if (s.device == nullptr) return nullptr;
-  if (s.device->max_threads_per_workgroup < kThreads) return nullptr;
-  if (lds_floats(d) * 4u > workgroup_lds_bytes(s.device)) return nullptr;
-  return &kFlash;
+  if (!enabled || s.device == nullptr ||
+      s.device->max_threads_per_workgroup < kThreads) return nullptr;
+  const auto lds_bytes = workgroup_lds_bytes(s.device);
+  if (s.device->arch == "gfx1201" &&
+      d.tq >= kGfx1201PrefillQTile &&
+      lds_floats<kGfx1201PrefillQTile>(d) * 4u <= lds_bytes) {
+    return &kFlash12;
+  }
+  if (d.tq < kDefaultQTile ||
+      lds_floats<kDefaultQTile>(d) * 4u > lds_bytes) return nullptr;
+  return &kFlash8;
 }
 
 }  // namespace lse::kernels

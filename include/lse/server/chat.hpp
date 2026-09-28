@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "lse/core/status.hpp"
@@ -21,7 +22,7 @@ struct ChatMessage {
 // engine to evaluate; a checkpoint trained on some other framing would need
 // its own renderer rather than a different template string.
 //
-// Reasoning models (Qwen3.x) gate the 
+// Reasoning models (Qwen3.x) gate the
 // `enable_thinking` false, it instead emits an empty
 // "
 // answers directly with no hidden pass. A model that is not a reasoner
@@ -39,5 +40,31 @@ struct ChatMessage {
 // runs to the token limit.
 [[nodiscard]] std::vector<std::uint32_t> chat_stop_tokens(
     const tokenizer::Tokenizer& tok);
+
+namespace detail {
+
+// Returns {answer, reasoning}. An output without a thinking marker is an
+// ordinary answer, even when thinking was requested in the prompt.
+[[nodiscard]] std::pair<std::string, std::string> split_thinking(
+    const std::string& text);
+
+class ThinkingStreamSplitter {
+ public:
+  using Delta = std::pair<const char*, std::string>;
+
+  explicit ThinkingStreamSplitter(bool expose) : expose_(expose) {}
+  [[nodiscard]] std::vector<Delta> push(const std::string& piece);
+  [[nodiscard]] std::vector<Delta> finish();
+
+ private:
+  [[nodiscard]] std::vector<Delta> push_answer(const std::string& piece);
+
+  bool expose_;
+  bool in_answer_ = false;
+  bool first_answer_ = true;
+  std::string pending_;
+};
+
+}  // namespace detail
 
 }  // namespace lse::server

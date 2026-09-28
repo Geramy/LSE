@@ -1,8 +1,10 @@
 #include "lse/graph/ops.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <cmath>
+#include "lse/graph/kernel_primitive.hpp"
 #include <string_view>
 
 namespace lse::graph {
@@ -273,6 +275,12 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                 {x.node(), packed.node(), scales.node(), biases.node()});
   n->iattrs[0] = bits;
   n->iattrs[1] = group_size;
+  if (packed.valid() && packed.node()->quant) {
+    const auto& q = *packed.node()->quant;
+    if (q.bits == bits && q.group_size == group_size &&
+        q.scales == scales.node() && q.biases == biases.node())
+      n->iattrs[2] = q.compute_profile_revision;
+  }
   n->prim = find_primitive("quant_linear");
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
@@ -487,7 +495,8 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 
 Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  MaskKind mask, int window, const Array& meta,
-                 const Array& table, int block_size) {
+                 const Array& table, int block_size,
+                 const backend::DeviceInfo* device) {
   const Shape& sq = q.shape();
   Shape out{sq.dim(0), sq.dim(1), sq.dim(2), v.shape().dim(3)};
   auto n = make(OpKind::kAttention, out, q.dtype(),
@@ -498,6 +507,47 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
   n->iattrs[2] = 0;
   n->iattrs[3] = block_size;
   n->prim = find_primitive("attention");
+  if (device != nullptr) {
+    // An explicit context opts into the experiment after the portable shape
+    // gates. Both barrier nodes remain ordinary ordered graph dependencies.
+    const Shape shapes[] = {q.shape(), k.shape(), v.shape(), meta.shape(), table.shape()};
+    const DType dtypes[] = {q.dtype(), k.dtype(), v.dtype(), meta.dtype(), table.dtype()};
+    KernelShapes ks;
+    ks.inputs = shapes;
+    ks.input_dtypes = dtypes;
+    ks.output = out;
+    ks.output_dtype = q.dtype();
+    ks.attrs = n->attrs;
+    ks.iattrs = n->iattrs;
+    ks.device = device;
+    static const bool wg128 = [] {
+      const char* value = std::getenv("LSE_SPLIT_KEY_WG128");
+      return value == nullptr || std::string_view(value) == "1";
+    }();
+    const auto* partial_prim = find_primitive(wg128
+        ? "attention.decode_partial128.wg128c2.v2" : "attention.decode_partial128.v1");
+    const auto* merge_prim = find_primitive(wg128
+        ? "attention.decode_merge128.wg128c2.v2" : "attention.decode_merge128.v1");
+    const auto* partial_kernel = dynamic_cast<const KernelPrimitiveBase*>(partial_prim);
+    if (partial_kernel && merge_prim && partial_kernel->specialize(ks) != nullptr) {
+      const auto capacity = k.shape().dim(2) * table.shape().dim(1);
+      auto partial = make(OpKind::kCustom,
+          Shape{sq.dim(0), sq.dim(1), (capacity + 127) / 128, 258},
+          DType::kF32, n->inputs);
+      partial->prim = partial_prim;
+      partial->fclass = partial_prim->fusion_class();
+      partial->attrs = n->attrs;
+      partial->iattrs = n->iattrs;
+      auto merged = make(OpKind::kCustom, out, DType::kF32, {partial});
+      merged->prim = merge_prim;
+      merged->fclass = merge_prim->fusion_class();
+      // The unused baseline node added one consumer to each input.
+      for (std::size_t i = 0; i < n->inputs.size(); ++i)
+        if (std::find(n->inputs.begin(), n->inputs.begin() + static_cast<std::ptrdiff_t>(i), n->inputs[i]) == n->inputs.begin() + static_cast<std::ptrdiff_t>(i))
+          --n->inputs[i]->consumer_count;
+      return Array(merged);
+    }
+  }
   return Array(n);
 }
 

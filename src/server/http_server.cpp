@@ -348,147 +348,12 @@ json timings_of(const Outcome& o) {
   return t;
 }
 
-// Splits a reasoning model's output into the <think> pass and the
-// answer that follows it. Returns the answer (empty if the model emitted only
-// thinking) and, via `reasoning`, the hidden pass.
-//
-// The open <think> tag lives in the *prompt*, not the output: the chat
-// template appends it to the assistant generation prompt when thinking is on,
-// and the model then emits its reasoning as plain prose followed by a single
-// closing </think> tag and the answer. So the output's </think> tag is what
-// delimits the two regions. (If a model does emit an explicit open tag too, the
-// text before the close tag is still the hidden pass, so this stays correct.)
-static std::pair<std::string, std::string> split_thinking(const std::string& text) {
-  const std::string open = "<think>";
-  const std::string close = "</think>";
-
-  const std::size_t end = text.find(close);
-  if (end == std::string::npos) {
-    // No close tag: the model never ended a thinking block. If it emitted an
-    // explicit open tag, treat everything after it as the hidden pass with no
-    // answer; otherwise it is a non-reasoning answer and passes through whole.
-    const std::size_t at = text.find(open);
-    if (at != std::string::npos) return {"", text.substr(at + open.size())};
-    return {text, ""};
-  }
-  std::string reasoning = text.substr(0, end);
-  std::string answer = text.substr(end + close.size());
-  // Trim the whitespace each side of the boundary: the model writes the pass
-  // and the answer as plain text separated by the tag, with newlines around it.
-  const std::size_t rl = reasoning.find_first_not_of(" \t\r\n");
-  if (rl != std::string::npos) reasoning = reasoning.substr(rl);
-  else reasoning.clear();
-  const std::size_t first = answer.find_first_not_of(" \t\r\n");
-  if (first != std::string::npos) answer = answer.substr(first);
-  return {answer, reasoning};
-}
-
-// Streaming counterpart to split_thinking. The non-stream path sees the whole
-// text at once; the stream path sees decoded pieces as they resolve. This
-// state machine classifies each incoming piece so the deltas agree with what
-// split_thinking would produce on the concatenated text: everything up to and
-// including the close tag is the hidden reasoning pass, everything after is the
-// answer. The open/close marker text itself is consumed and never reaches the
-// client (the prompt already supplies the open tag, and the close tag is the
-// boundary). Feeding pieces through it yields the same (reasoning, content)
-// partition as split_thinking on the joined text.
-class ThinkingStreamSplitter {
- public:
-  ThinkingStreamSplitter(bool expose) : expose_(expose) {}
-
-  // Push one decoded piece. Returns the (kind, text) deltas to emit, in order.
-  // kind is "reasoning" or "content". Markers are stripped; an empty text is
-  // never returned. When expose_ is false every piece is content.
-  using Delta = std::pair<const char*, std::string>;
-  std::vector<Delta> push(const std::string& piece) {
-    std::vector<Delta> out;
-    if (!expose_) {
-      if (!piece.empty()) out.push_back({"content", piece});
-      return out;
-    }
-    // Scan the running buffer, which holds any tail from the previous piece
-    // that could still be part of an in-progress marker (e.g. a close tag split
-    // across token boundaries). pending_close_ means we have seen the close tag
-    // and everything from here on is content.
-    buffer_ += piece;
-    while (!buffer_.empty()) {
-      if (!pending_close_) {
-        const std::size_t close = buffer_.find(kClose);
-        if (close == std::string::npos) {
-          // No complete close tag yet. Keep a tail that could still grow into
-          // one: the longest proper suffix of buffer_ that is a prefix of the
-          // close tag. Flush the rest as reasoning (with the open tag, if the
-          // very first text carries one, stripped).
-          const std::size_t keep = max_marker_suffix(buffer_);
-          std::string flush = buffer_.substr(0, buffer_.size() - keep);
-          buffer_ = buffer_.substr(buffer_.size() - keep);
-          if (reasoning_first_) {
-            const std::size_t at = flush.find(kOpen);
-            if (at != std::string::npos) flush = flush.substr(at + std::strlen(kOpen));
-            reasoning_first_ = false;
-          }
-          if (!flush.empty()) out.push_back({"reasoning", flush});
-          break;  // the remaining buffer_ is a marker prefix; wait for more
-        }
-        // A close tag is present: everything before it is reasoning, and we
-        // cross into the content side at the tag.
-        std::string reasoning = buffer_.substr(0, close);
-        if (reasoning_first_) {
-          const std::size_t at = reasoning.find(kOpen);
-          if (at != std::string::npos) reasoning = reasoning.substr(at + std::strlen(kOpen));
-          reasoning_first_ = false;
-        }
-        if (!reasoning.empty()) out.push_back({"reasoning", reasoning});
-        buffer_ = buffer_.substr(close + std::strlen(kClose));
-        pending_close_ = true;
-        // Loop: the remainder of this piece (post-tag) is content; flush it.
-      } else {
-        std::string flush = buffer_;
-        // The first content flush is the answer's head; trim the whitespace the
-        // model writes around the close tag so the stream's content matches the
-        // non-stream path, which trims the same boundary in split_thinking.
-        if (content_first_) {
-          const std::size_t at = flush.find_first_not_of(" \t\r\n");
-          if (at != std::string::npos) flush = flush.substr(at);
-          else flush.clear();
-          content_first_ = false;
-        }
-        if (!flush.empty()) out.push_back({"content", flush});
-        buffer_.clear();
-        break;
-      }
-    }
-    return out;
-  }
-
- private:
-  static const char* const kOpen;   // think
-  static const char* const kClose;  // think_end
-  // Longest suffix of s that is a proper prefix of kClose. A piece may split
-  // the close tag across token boundaries, so we hold back that much.
-  static std::size_t max_marker_suffix(const std::string& s) {
-    const std::string close = kClose;
-    for (std::size_t len = std::min(close.size() - 1, s.size()); len >= 1; --len) {
-      if (s.compare(s.size() - len, len, close, 0, len) == 0) return len;
-    }
-    return 0;
-  }
-
-  bool expose_;
-  bool pending_close_ = false;
-  bool reasoning_first_ = true;
-  bool content_first_ = true;
-  std::string buffer_;
-};
-const char* const ThinkingStreamSplitter::kOpen = "<think>";
-const char* const ThinkingStreamSplitter::kClose = "</think>";
-
 // text_completion and chat.completion differ only in the shape of a choice.
 json chat_choice(const std::string& text, bool hit_limit, bool expose_thinking) {
   std::string reasoning;
   std::string content = text;
   if (expose_thinking) {
-    auto [answer, r] = split_thinking(text);
+    auto [answer, r] = detail::split_thinking(text);
     content = answer;
     reasoning = r;
   }
@@ -504,7 +369,7 @@ json text_choice(const std::string& text, bool hit_limit, bool expose_thinking) 
   std::string reasoning;
   std::string out = text;
   if (expose_thinking) {
-    auto [answer, r] = split_thinking(text);
+    auto [answer, r] = detail::split_thinking(text);
     out = answer;
     reasoning = r;
   }
@@ -739,24 +604,12 @@ Status HttpServer::listen() {
                                                   {"finish_reason", nullptr}}})}});
             }
 
-            // For chat with thinking, split the stream into a reasoning pass
-            // and the answer so the deltas match the non-stream path: everything
-            // up to the close tag streams as reasoning_content, everything after
-            // as content. The splitter reuses split_thinking's partition.
-            ThinkingStreamSplitter splitter(chat && r.thinking_enabled);
+            // A marker-free response is buffered until completion so its
+            // deltas match the non-stream response's content field.
+            detail::ThinkingStreamSplitter splitter(chat && r.thinking_enabled);
 
-            auto emit = [&](const std::string& piece) -> bool {
-              if (!chat) {
-                json choice{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
-                return send(json{{"id", id},
-                                 {"object", chunk_object},
-                                 {"created", created},
-                                 {"model", impl.opt.model_id},
-                                 {"choices", json::array({choice})}});
-              }
-              // Chat: route each piece through the splitter so reasoning and
-              // answer deltas stay consistent with the non-stream response.
-              for (const auto& [kind, text] : splitter.push(piece)) {
+            auto send_chat_deltas = [&](const std::vector<detail::ThinkingStreamSplitter::Delta>& deltas) {
+              for (const auto& [kind, text] : deltas) {
                 json delta = std::string_view(kind) == "reasoning"
                     ? json{{"reasoning_content", text}}
                     : json{{"content", text}};
@@ -771,12 +624,29 @@ Status HttpServer::listen() {
               return true;
             };
 
+            auto emit = [&](const std::string& piece) -> bool {
+              if (!chat) {
+                json choice{{"index", 0}, {"text", piece}, {"finish_reason", nullptr}};
+                return send(json{{"id", id},
+                                 {"object", chunk_object},
+                                 {"created", created},
+                                 {"model", impl.opt.model_id},
+                                 {"choices", json::array({choice})}});
+              }
+              return send_chat_deltas(splitter.push(piece));
+            };
+
             auto out = HttpServer::Run::generate(impl, r, emit);
             if (!out.ok()) {
               // The status line is long gone, so the error rides the stream.
               send(json{{"error",
                          {{"message", std::string(out.status().message())},
                           {"type", "server_error"}}}});
+              sink.done();
+              return true;
+            }
+
+            if (chat && !send_chat_deltas(splitter.finish())) {
               sink.done();
               return true;
             }

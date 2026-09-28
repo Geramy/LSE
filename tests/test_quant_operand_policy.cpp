@@ -118,14 +118,11 @@ int main() {
     p.run_qualification_candidate = false;
     rejected(r, k, OperandReason::kUnqualified, p);
     p = {};
-    p.relative_l2_limit_ppm = 5001;
-    rejected(r, k, OperandReason::kAccuracy, p);
-    p = {};
     p.qualification = OperandQualification::kAccepted;
     rejected(r, k, OperandReason::kAccuracy, p);
     p.measured_cases = 60;
-    p.measured_relative_l2_ppm = 900;
-    p.absolute_error_pass = p.nonfinite_pass = p.model_quality_pass =
+    p.ppl_scored_tokens = 1024;
+    p.absolute_error_pass = p.nonfinite_pass = p.perplexity_pass =
         p.performance_pass = true;
     require(select_quant_operand(r, k, p).operand == QuantOperand::kE4M3,
             "accepted evidence rejected");
@@ -134,17 +131,48 @@ int main() {
       if (missing == 0)
         q.measured_cases = 0;
       if (missing == 1)
-        q.measured_relative_l2_ppm = 5001;
+        q.ppl_scored_tokens = 1023;
       if (missing == 2)
         q.absolute_error_pass = false;
       if (missing == 3)
         q.nonfinite_pass = false;
       if (missing == 4)
-        q.model_quality_pass = false;
+        q.perplexity_pass = false;
       if (missing == 5)
         q.performance_pass = false;
       rejected(r, k, OperandReason::kAccuracy, q);
     }
+    auto too_long = p;
+    too_long.ppl_scored_tokens = 2049;
+    rejected(r, k, OperandReason::kAccuracy, too_long);
+    auto upper_bound = p;
+    upper_bound.ppl_scored_tokens = 2048;
+    require(select_quant_operand(r, k, upper_bound).operand == QuantOperand::kE4M3,
+            "2048-token perplexity evidence rejected");
+    auto historical = p;
+    historical.preferred = QuantOperand::kBF16;
+    historical.strategy = QuantOperandStrategy::kNative;
+    historical.min_m = historical.max_m = 512;
+    historical.ppl_scored_tokens = 1022;
+    historical.historical_bf16_ppl_1022_accepted = true;
+    auto hk = k;
+    hk.operand = QuantOperand::kBF16;
+    hk.strategy = QuantOperandStrategy::kNative;
+    require(select_quant_operand(r, hk, historical).operand == QuantOperand::kBF16,
+            "accepted historical BF16 record rejected");
+    auto hr = r;
+    hr.n = 5120;
+    hr.k = 17408;
+    require(select_quant_operand(hr, hk, historical).operand == QuantOperand::kBF16,
+            "accepted historical BF16 down projection rejected");
+    hr.n = 5120;
+    hr.k = 5120;
+    rejected(hr, hk, OperandReason::kAccuracy, historical);
+    historical.ppl_scored_tokens = 1023;
+    rejected(r, hk, OperandReason::kAccuracy, historical);
+    historical.ppl_scored_tokens = 1022;
+    historical.historical_bf16_ppl_1022_accepted = false;
+    rejected(r, hk, OperandReason::kAccuracy, historical);
     // BF8 is an independently qualified strategy, not a fallback inferred from
     // exponent range or Q6's storage bit count.
     auto bf = p;
@@ -180,37 +208,37 @@ int main() {
         ++q.k_multiple;
         break;
       case 7:
-        --q.relative_l2_limit_ppm;
+        ++q.ppl_scored_tokens;
         break;
       case 8:
         ++q.measured_cases;
         break;
       case 9:
-        ++q.measured_relative_l2_ppm;
-        break;
-      case 10:
         q.absolute_error_pass = true;
         break;
-      case 11:
+      case 10:
         q.nonfinite_pass = true;
         break;
-      case 12:
-        q.model_quality_pass = true;
+      case 11:
+        q.perplexity_pass = true;
         break;
-      case 13:
+      case 12:
         q.performance_pass = true;
         break;
-      case 14:
+      case 13:
         q.run_qualification_candidate = true;
         break;
-      case 15:
+      case 14:
         ++q.max_m;
         break;
-      case 16:
+      case 15:
         ++q.max_n;
         break;
-      case 17:
+      case 16:
         ++q.max_k;
+        break;
+      case 17:
+        q.historical_bf16_ppl_1022_accepted = true;
         break;
       }
       require(quant_operand_cache_key(42, q) != id,
@@ -298,7 +326,7 @@ int main() {
     auto text = quant_operand_diagnostic(r, d);
     for (auto part :
          {"operand=fp8-e4m3", "residual-three-product", "512x17408x5120",
-          "candidate-unvalidated", "target_relative_l2_ppm=5000"})
+          "candidate-unvalidated", "ppl_scored_tokens=0"})
       require(text.find(part) != std::string::npos,
               "automatic diagnostic incomplete");
     std::puts(

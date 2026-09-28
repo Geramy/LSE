@@ -19,6 +19,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "lse/backends/hrx/arch_database.hpp"
@@ -79,7 +80,12 @@ bool trace_sync() noexcept {
 #define LSE_SYNC_TRACE(...)                        \
   do {                                             \
     if (trace_sync()) {                            \
-      std::fprintf(stderr, "[sync] " __VA_ARGS__); \
+      auto _st_now = std::chrono::steady_clock::now(); \
+      static thread_local auto _st_last = _st_now; \
+      auto _st_delta_us = std::chrono::duration_cast<std::chrono::microseconds>(_st_now - _st_last).count(); \
+      _st_last = _st_now;                            \
+      std::fprintf(stderr, "[sync] +%lldus ", (long long)_st_delta_us); \
+      std::fprintf(stderr, " " __VA_ARGS__); \
       std::fprintf(stderr, "\n");                  \
       std::fflush(stderr);                         \
     }                                              \
@@ -780,6 +786,15 @@ bool HrxBackend::available() noexcept {
 #endif
 }
 
+HrxBackend::HrxBackend() {
+  // The first declared toolchain is the default for an unqualified run.
+  // A build without COMGR must not route every model operation to the host
+  // interpreter when its Loom compiler is available.
+  if (!compiler_.available() && loom_compiler_.available()) {
+    std::swap(toolchains_[0], toolchains_[1]);
+  }
+}
+
 HrxBackend::~HrxBackend() { shutdown_impl(); }
 
 #if defined(__APPLE__)
@@ -820,8 +835,7 @@ void HrxBackend::start_sq_profiler() {
 }
 
 void HrxBackend::stop_sq_profiler() noexcept {
-  lse::hrx::destroy_sq_profiler(
-      reinterpret_cast<std::unique_ptr<lse::hrx::SqProfiler>&>(sq_profiler_));
+  sq_profiler_.reset();
 }
 #endif  // __APPLE__
 

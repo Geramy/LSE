@@ -338,9 +338,8 @@ const std::vector<MatrixSpelling>& matrix_spellings() {
     std::vector<MatrixSpelling> out;
     for (const auto& r : math::matrix_core_table()) {
       if (r.target != math::MatrixTarget::kRdna4 || !r.emittable() ||
-          r.chained != 1 || r.m != 16 || r.n != 16 || r.k != 16 ||
-          r.wave != 32 || r.operands != math::OperandLayout::kLaneRowSplitK ||
-          r.acc_layout != math::AccLayout::kRowBlockHalfWave) continue;
+          r.chained != 1 || r.m != 16 || r.n != 16 ||
+          (r.k != 16 && r.k != 32) || r.wave != 32) continue;
       std::string a_format, b_format;
       switch (r.operand) {
         case math::MatrixElem::kF16: a_format = b_format = "f16"; break;
@@ -349,6 +348,7 @@ const std::vector<MatrixSpelling>& matrix_spellings() {
         case math::MatrixElem::kSU8: a_format = "i8"; b_format = "u8"; break;
         case math::MatrixElem::kFp8: a_format = b_format = "f8e4m3"; break;
         case math::MatrixElem::kBf8: a_format = b_format = "f8e5m2"; break;
+        case math::MatrixElem::kI4: a_format = b_format = "u4"; break;
         default: continue;
       }
       const std::string a = loom_vector_type(r.a_elem, static_cast<std::uint32_t>(r.a_len));

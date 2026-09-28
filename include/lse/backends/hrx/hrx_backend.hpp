@@ -39,6 +39,7 @@ class HrxBackend : public Backend<HrxBackend> {
   static constexpr std::string_view kName = "hrx";
   static void prepare_runtime();
 
+  HrxBackend();
   ~HrxBackend();
 
   Status init_impl(int device_ordinal);
@@ -143,10 +144,9 @@ class HrxBackend : public Backend<HrxBackend> {
   // object, which is why the backend is constructed in place and never moved —
   // the same reason DeviceInfo::extension can point at amd_.
   //
-  // kHip stays first, so nothing that asks the device for "its" emitter sees a
-  // change. Loom is declared beside it rather than chosen by a flag: a caller
-  // that wants it looks the dialect up and either finds it or does not, which
-  // is the whole of the negotiation.
+  // HIP is preferred when COMGR is available. The constructor moves Loom
+  // first when this build has no COMGR but does have loomc, so an unspecified
+  // dialect still selects an available compiler.
   std::array<graph::KernelToolchain, 2> toolchains_{
       graph::KernelToolchain{graph::Dialect::kHip, &emitter_, &compiler_},
       graph::KernelToolchain{graph::Dialect::kLoom, &loom_emitter_,

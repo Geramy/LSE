@@ -57,8 +57,19 @@ function(_lse_rust_native_libs crate_dir out_var)
       endif()
     endforeach()
   else()
-    message(WARNING "could not query rustc for native libs; falling back")
+    message(WARNING "could not query rustc for native libs; resolving known host dependencies")
     set(_libs pthread dl)
+    # Cargo's lock file can make the query unavailable in a read-only source
+    # checkout even when the static archive has already been built. fastokens
+    # uses the system PCRE2 library; omitting it leaves unresolved pcre2_* C
+    # symbols at the final executable link.
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(LSE_FASTOKENS_PCRE2 QUIET IMPORTED_TARGET libpcre2-8)
+      if(LSE_FASTOKENS_PCRE2_FOUND)
+        list(APPEND _libs PkgConfig::LSE_FASTOKENS_PCRE2)
+      endif()
+    endif()
   endif()
   set(${out_var} "${_libs}" PARENT_SCOPE)
 endfunction()

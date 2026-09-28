@@ -370,10 +370,32 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
     }
   }
 
+  const backend::DeviceInfo* split_device = nullptr;
+  // Default scope matches the measured initial live contexts and capacities.
+  // Explicit 1 admits the broader supported experiment; 0 keeps shared-exp.
+  enum class SplitPolicy { kDisabled, kQualified, kExperimental };
+  static const SplitPolicy split_policy = [] {
+    const char* value = std::getenv("LSE_SPLIT_KEY_SDPA");
+    if (value && std::string_view(value) == "0") return SplitPolicy::kDisabled;
+    if (value && std::string_view(value) == "1") return SplitPolicy::kExperimental;
+    return SplitPolicy::kQualified;
+  }();
+  const bool split_scope = split_policy == SplitPolicy::kExperimental ||
+      (offset >= 511 && paged && cache->table.shape().dim(1) * kv::kBlockSize <= 4096);
+  // Paged allocation already established a device context. Pass it explicitly
+  // to the experimental graph builder; pure graph construction never opens one.
+  if (paged && split_policy != SplitPolicy::kDisabled && split_scope &&
+      q.shape().dim(2) == 1) {
+    if (auto* scheduler = graph::default_scheduler()) {
+      const auto member = graph::preferred_member();
+      if (member < scheduler->devices().size())
+        split_device = &scheduler->devices().device(member).device_info();
+    }
+  }
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
   Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale, spec.mask,
                                       spec.window, cache->meta, cache->table,
-                                      kv::kBlockSize)
+                                      kv::kBlockSize, split_device)
                   : graph::sdpa(q, k_attn, v_attn, scale, spec.mask, spec.window,
                                 offset);
 

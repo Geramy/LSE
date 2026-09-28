@@ -376,7 +376,8 @@ Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
 
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
-                                     std::size_t member) {
+                                     std::size_t member, Program* replay,
+                                     std::size_t group_index) {
   backend::IBackend& be = devices_.device(member);
   // The dialect this run asked for if this member declares it, and this
   // member's own first choice otherwise. Both halves come from the one
@@ -390,14 +391,35 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   }
   LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member, *tc));
 
-  const std::uint64_t ident =
-      emitter->cache_key(group, be.device_info());
-
   const auto t_emit = SpanClock::now();
-  auto emitted = emitter->emit(group, be.device_info());
+  std::uint64_t ident = 0;
+  const EmittedKernel* emitted = replay != nullptr
+      ? replay->cached_emission(group_index, group, &be, emitter,
+                                be.device_info().arch, &ident)
+      : nullptr;
+  std::optional<EmittedKernel> transient;
+  if (emitted == nullptr) {
+    ident = emitter->cache_key(group, be.device_info());
+    auto generated = emitter->emit(group, be.device_info());
+    if (!generated.ok()) {
+      trace_.spans.emit.add(elapsed_ns(t_emit, SpanClock::now()));
+      return generated.status();
+    }
+    EmittedKernel kernel = generated.release();
+    if (replay != nullptr) {
+      emitted = replay->cache_emission(group_index, group, &be, emitter,
+                                       ident, be.device_info().arch,
+                                       std::move(kernel));
+      if (emitted == nullptr) {
+        return LSE_ERROR(kInternal, "replay emission index is outside its program");
+      }
+    } else {
+      transient.emplace(std::move(kernel));
+      emitted = &*transient;
+    }
+  }
   const auto t_emitted = SpanClock::now();
   trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
-  if (!emitted.ok()) return emitted.status();
 
   // Compile only when this kernel is not already loaded for this device.
   // Disk miss / source change / arch change still go through get_or_compile.
@@ -1400,6 +1422,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
   }
 
+  // Slot planning and backend allocation may wait for earlier stream work.
+  // Keep that time out of graph partitioning, which has finished by now.
+  SpanTimer slot_bind_span(trace_.spans.bind, build_span.close());
   if (device_first && !replayed) {
     for (Workgroup& wg : planned) {
       // Kernel epilogues and pointwise chains above can remove boundaries
@@ -1430,7 +1455,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
 
   std::vector<FusionGroup> ran;
   // Back to per-step setup: the stream plan and the entry barriers.
-  SpanTimer place_span(trace_.spans.schedule, build_span.close());
+  SpanTimer place_span(trace_.spans.schedule, slot_bind_span.close());
   // Replays run the retained groups in place: no copy of the group list, and
   // no re-retain afterwards — retain() re-walks the whole reachable graph and
   // was most of the host-side churn of a decode token.
@@ -1622,7 +1647,8 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           if (!st.ok()) break;
           if (seen != nullptr) *seen = j;
         }
-        if (st.ok()) st = try_dispatch_group(g, on, gm);
+        if (st.ok()) st = try_dispatch_group(
+            g, on, gm, replayed ? &rec : nullptr, gi);
         // A joined run the emitter cannot express is not a reason to abandon
         // the phase: its members are independent by construction, so each one
         // still dispatches alone. Splitting costs one launch per member;

@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace lse {
 namespace hrx {
@@ -40,6 +41,26 @@ struct SqProfilerParams {
   // Poll cadence; 0 = default (500 ms).
   std::uint64_t window_ms = 0;
 };
+
+// Incremental IRPF parsing state. The file sink appends records; callers pass
+// only bytes not consumed by a prior call and retain this state across windows.
+struct SqProfileParseState {
+  std::uint32_t busy_value_offset = 0;
+  bool have_busy_counter = false;
+};
+
+struct SqProfileWindow {
+  std::uint64_t busy = 0;
+  std::uint64_t reference_ticks = 0;
+  std::uint32_t sample_count = 0;
+};
+
+// Parses complete IRPF records from a byte span. On success, consumed is the
+// number of bytes safe to skip next time; an incomplete trailing record is left
+// untouched. A malformed complete record returns false without changing state.
+bool parse_sq_profile_bytes(const std::uint8_t* bytes, std::size_t size,
+                            bool includes_file_header, SqProfileParseState& state,
+                            SqProfileWindow& window, std::size_t& consumed);
 
 class SqProfiler {
  public:

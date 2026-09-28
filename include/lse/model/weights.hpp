@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "lse/core/dtype.hpp"
@@ -65,6 +66,7 @@ class SafeTensors {
       const quant::GroupAffineMap* quant) const noexcept;
 
   [[nodiscard]] const std::string& path() const noexcept { return path_; }
+  [[nodiscard]] bool content_sha256_matches(std::span<const std::string_view> digests) const;
 
  private:
   // Each shard stays mapped for the lifetime of the reader; TensorView::data

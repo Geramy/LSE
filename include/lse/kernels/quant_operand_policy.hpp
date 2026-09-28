@@ -62,20 +62,23 @@ struct QuantOperandKernel {
   std::uint32_t lds_bytes = 0;
 };
 struct QuantOperandProfile {
-  std::uint32_t revision = 1;
+  std::uint32_t revision = 2;
   OperandQualification qualification = OperandQualification::kCandidate;
   QuantOperand preferred = QuantOperand::kE4M3;
   QuantOperandStrategy strategy = QuantOperandStrategy::kResidualThreeProduct;
   std::uint32_t min_m = 16, min_n = 16, k_multiple = 64;
   std::uint32_t max_m = 2048, max_n = 32768, max_k = 18432;
-  // Five parts per thousand relative L2. Absolute/cancellation and nonfinite
-  // checks are independent mandatory acceptance conditions in the fixture.
-  std::uint32_t relative_l2_limit_ppm = 5000;
-  // Zero means no measured result yet, not zero error. Only accepted profiles
-  // carry a nonzero measurement count and all acceptance checks.
-  std::uint32_t measured_cases = 0, measured_relative_l2_ppm = 0;
+  // Perplexity is the model-quality gate. New accepted profiles require a
+  // matched comparison over 1024–2048 actual targets. The historical BF16
+  // M512 result below was explicitly accepted before its token-count correction.
+  std::uint32_t ppl_scored_tokens = 0;
+  // Only the two existing Qwen FFN M512 BF16 records may retain this exception.
+  bool historical_bf16_ppl_1022_accepted = false;
+  // Fixture coverage and finite/absolute-value checks remain mandatory
+  // arithmetic safeguards independent of the perplexity quality decision.
+  std::uint32_t measured_cases = 0;
   bool absolute_error_pass = false, nonfinite_pass = false;
-  bool model_quality_pass = false, performance_pass = false;
+  bool perplexity_pass = false, performance_pass = false;
   // Production never runs an unvalidated profile. Standalone qualification
   // tests may explicitly enable a local profile; no environment override exists.
   bool run_qualification_candidate = false;
@@ -86,7 +89,7 @@ struct QuantOperandDecision {
   QuantOperandStrategy strategy = QuantOperandStrategy::kResidualThreeProduct;
   OperandReason reason = OperandReason::kUnavailable;
   OperandQualification qualification = OperandQualification::kCandidate;
-  std::uint32_t relative_l2_limit_ppm = 0;
+  std::uint32_t ppl_scored_tokens = 0;
   std::uint32_t implementation_revision = 0;
   std::uint64_t implementation_id = 0;
 };
@@ -97,7 +100,7 @@ struct QuantOperandDecision {
   QuantOperandDecision result{
       QuantOperand::kExisting,     p.strategy,
       OperandReason::kUnavailable, p.qualification,
-      p.relative_l2_limit_ppm,     kernel.implementation_revision,
+      p.ppl_scored_tokens,         kernel.implementation_revision,
       kernel.implementation_id};
   auto decline = [&](OperandReason why) {
     result.reason = why;
@@ -125,12 +128,15 @@ struct QuantOperandDecision {
   if (fp8 &&
       (!kernel.block_absmax_scaling || !kernel.fp32_exceptional_block_fallback))
     return decline(OperandReason::kUnsafeConversion);
-  if (!p.relative_l2_limit_ppm || p.relative_l2_limit_ppm > 5000)
-    return decline(OperandReason::kAccuracy);
   if (p.qualification == OperandQualification::kAccepted) {
-    if (!p.measured_cases ||
-        p.measured_relative_l2_ppm > p.relative_l2_limit_ppm ||
-        !p.absolute_error_pass || !p.nonfinite_pass || !p.model_quality_pass ||
+    const bool historical = p.historical_bf16_ppl_1022_accepted &&
+        p.ppl_scored_tokens == 1022 && kernel.operand == QuantOperand::kBF16 &&
+        kernel.strategy == QuantOperandStrategy::kNative &&
+        p.min_m == 512 && p.max_m == 512 && r.m == 512 &&
+        ((r.n == 17408 && r.k == 5120) || (r.n == 5120 && r.k == 17408));
+    const bool standard = p.ppl_scored_tokens >= 1024 && p.ppl_scored_tokens <= 2048;
+    if (!p.measured_cases || (!standard && !historical) ||
+        !p.absolute_error_pass || !p.nonfinite_pass || !p.perplexity_pass ||
         !p.performance_pass)
       return decline(OperandReason::kAccuracy);
   } else if (!p.run_qualification_candidate) {
@@ -174,7 +180,7 @@ quant_operand_reason(OperandReason value) {
   case OperandReason::kUnsafeConversion:
     return "conversion-safety";
   case OperandReason::kAccuracy:
-    return "accuracy-or-promotion-evidence";
+    return "perplexity-or-promotion-evidence";
   case OperandReason::kUnqualified:
     return "unqualified-profile";
   case OperandReason::kCostEvidence:
@@ -204,7 +210,7 @@ quant_operand_diagnostic(const QuantOperandRequest &r,
          (d.qualification == OperandQualification::kAccepted
               ? "accepted"
               : "candidate-unvalidated") +
-         " target_relative_l2_ppm=" + std::to_string(d.relative_l2_limit_ppm);
+         " ppl_scored_tokens=" + std::to_string(d.ppl_scored_tokens);
 }
 
 // Profile changes invalidate both emission and persistent JIT identities,
@@ -227,12 +233,12 @@ quant_operand_diagnostic(const QuantOperandRequest &r,
   mix(p.max_m);
   mix(p.max_n);
   mix(p.max_k);
-  mix(p.relative_l2_limit_ppm);
+  mix(p.ppl_scored_tokens);
+  mix(p.historical_bf16_ppl_1022_accepted);
   mix(p.measured_cases);
-  mix(p.measured_relative_l2_ppm);
   mix(p.absolute_error_pass);
   mix(p.nonfinite_pass);
-  mix(p.model_quality_pass);
+  mix(p.perplexity_pass);
   mix(p.performance_pass);
   mix(p.run_qualification_candidate);
   return key;

@@ -7,11 +7,16 @@
 // the produced buffer onto the input node the next step reads.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
+#include "lse/graph/codegen.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/workgroup.hpp"
 
@@ -49,6 +54,18 @@ class Program {
   }
   [[nodiscard]] std::vector<Workgroup>& phases() noexcept { return phases_; }
 
+  // A retained group has the same nodes, shapes and source across replays.
+  // Keep its identity, generated source and binding order with the Program.
+  // A different backend, emitter, target or live WMMA override misses.
+  [[nodiscard]] const EmittedKernel* cached_emission(
+      std::size_t index, const FusionGroup& group,
+      const backend::IBackend* backend, const IKernelEmitter* emitter,
+      std::string_view arch, std::uint64_t* key) const noexcept;
+  [[nodiscard]] const EmittedKernel* cache_emission(
+      std::size_t index, const FusionGroup& group,
+      const backend::IBackend* backend, const IKernelEmitter* emitter,
+      std::uint64_t key, std::string_view arch, EmittedKernel kernel);
+
   // Replay launch cuts onto a newly built isomorphic DAG.
   [[nodiscard]] std::vector<FusionGroup> remap(
       std::span<const NodePtr> compute_order) const;
@@ -74,6 +91,16 @@ class Program {
   std::vector<NodePtr> nodes_;
   std::vector<Workgroup> phases_;
   std::vector<FusionGroup> groups_;
+  struct EmissionCache {
+    const FusionGroup* group = nullptr;
+    const backend::IBackend* backend = nullptr;
+    const IKernelEmitter* emitter = nullptr;
+    std::uint64_t key = 0;
+    std::string arch;
+    std::string wmma_override;
+    std::optional<EmittedKernel> kernel;
+  };
+  std::vector<EmissionCache> emissions_;
   std::vector<Carry> carries_;
   struct Cut {
     std::vector<std::uint32_t> nodes;

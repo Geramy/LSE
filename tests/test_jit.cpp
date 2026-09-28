@@ -36,6 +36,7 @@
 #include "lse/backends/hrx/hipc/hip_types.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
+#include "lse/kernels/int8_policy.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -327,7 +328,8 @@ LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
 
   const std::string four = emit_at(4);
   LSE_EXPECT(!four.empty());
-  LSE_EXPECT(four.find(kDot) != std::string::npos);
+  const bool int8_opted_in = kernels::activation_int8_enabled();
+  LSE_EXPECT((four.find(kDot) != std::string::npos) == int8_opted_in);
 
   // 8 bits stays on the float codec — its packed word is already four unsigned
   // bytes, so the win there is a different change and is not made here.
@@ -345,7 +347,8 @@ LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
   // grows with K.
   constexpr std::size_t kRows = 2;
   LSE_EXPECT(count(eight, "fmaf(") >= 32);
-  LSE_EXPECT(count(four, "fmaf(") < 8 * kRows);
+  if (int8_opted_in) LSE_EXPECT(count(four, "fmaf(") < 8 * kRows);
+  else LSE_EXPECT(count(four, "fmaf(") >= 32);
 
   // And a device without the capability takes the float codec at 4 bits too.
   // A fresh emitter, because the emit cache keys on the group and the wave
@@ -2160,25 +2163,29 @@ LSE_TEST(emitted_source_carries_the_dialect_of_its_emitter) {
   LSE_EXPECT(e->dialect == Dialect::kHip);
 }
 
-LSE_TEST(the_hrx_device_declares_two_dialects_with_hip_in_front) {
+LSE_TEST(the_hrx_device_prefers_an_available_compiler) {
   backend::BackendAdapter<backend::HrxBackend> hrx;
   LSE_EXPECT_EQ(hrx.toolchains().size(), 2u);
-  // kHip stays the front entry, which is the whole of what keeps every caller
-  // that asks the device for "its" emitter unchanged.
-  LSE_EXPECT(hrx.toolchains().front().dialect == Dialect::kHip);
+  const KernelToolchain* hip = hrx.toolchain_for(Dialect::kHip);
+  const KernelToolchain* loom = hrx.toolchain_for(Dialect::kLoom);
+  LSE_EXPECT(hip != nullptr && loom != nullptr);
+  if (hip == nullptr || loom == nullptr) return;
+  const Dialect preferred = !hip->compiler->available() &&
+                                    loom->compiler->available()
+                                ? Dialect::kLoom
+                                : Dialect::kHip;
+  LSE_EXPECT(hrx.toolchains().front().dialect == preferred);
   LSE_EXPECT(hrx.emitter() != nullptr);
   LSE_EXPECT(hrx.compiler() != nullptr);
-  LSE_EXPECT(hrx.emitter()->dialect() == Dialect::kHip);
-  LSE_EXPECT(hrx.toolchain_for(Dialect::kHip) == &hrx.toolchains().front());
+  LSE_EXPECT(hrx.emitter()->dialect() == preferred);
+  LSE_EXPECT(hip->emitter != nullptr && hip->compiler != nullptr);
+  LSE_EXPECT(hip->emitter->dialect() == Dialect::kHip);
 
-  const KernelToolchain* loom = hrx.toolchain_for(Dialect::kLoom);
-  LSE_EXPECT(loom != nullptr);
-  if (loom == nullptr) return;
   LSE_EXPECT(loom->emitter != nullptr && loom->compiler != nullptr);
   LSE_EXPECT(loom->emitter->dialect() == Dialect::kLoom);
   // Both halves of one dialect, and neither is the other dialect's.
-  LSE_EXPECT(loom->emitter != hrx.emitter());
-  LSE_EXPECT(loom->compiler != hrx.compiler());
+  LSE_EXPECT(loom->emitter != hip->emitter);
+  LSE_EXPECT(loom->compiler != hip->compiler);
   LSE_EXPECT(hrx.toolchain_for(Dialect::kCuda) == nullptr);
 }
 
@@ -2214,7 +2221,7 @@ LSE_TEST(a_run_that_names_a_dialect_is_given_that_dialects_emitter) {
   const KernelToolchain* front = sched.toolchain(0);
   LSE_EXPECT(front != nullptr);
   if (front == nullptr) return;
-  LSE_EXPECT(front->dialect == Dialect::kHip);
+  LSE_EXPECT(front == &hrx.toolchains().front());
 
   sched.set_dialect(Dialect::kLoom);
   const KernelToolchain* chosen = sched.toolchain(0);
@@ -2224,15 +2231,18 @@ LSE_TEST(a_run_that_names_a_dialect_is_given_that_dialects_emitter) {
   LSE_EXPECT(chosen->emitter != nullptr &&
              chosen->emitter->dialect() == Dialect::kLoom);
   LSE_EXPECT(chosen->compiler != nullptr);
-  LSE_EXPECT(chosen->emitter != hrx.emitter());
-  LSE_EXPECT(chosen->compiler != hrx.compiler());
+  const KernelToolchain* hip = hrx.toolchain_for(Dialect::kHip);
+  LSE_EXPECT(hip != nullptr);
+  if (hip == nullptr) return;
+  LSE_EXPECT(chosen->emitter != hip->emitter);
+  LSE_EXPECT(chosen->compiler != hip->compiler);
 
   sched.set_dialect(Dialect::kSpirv);
   const KernelToolchain* degraded = sched.toolchain(0);
-  LSE_EXPECT(degraded != nullptr && degraded->dialect == Dialect::kHip);
+  LSE_EXPECT(degraded == front);
   sched.clear_dialect();
   const KernelToolchain* none = sched.toolchain(0);
-  LSE_EXPECT(none != nullptr && none->dialect == Dialect::kHip);
+  LSE_EXPECT(none == front);
 }
 
 // Two dialects, one member, one signature. The cache must build both and hand

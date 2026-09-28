@@ -127,6 +127,15 @@ endif()
 # Codegen belongs to the backend now, so its test needs one that has codegen.
 if(TARGET lse_backend_hrx)
   lse_add_test(test_jit lse_graph lse_backends)
+  lse_add_test(test_sq_profiler lse_backend_hrx)
+  lse_add_test(test_automatic_q4 lse_model lse_backend_hrx lse_graph lse_kernels lse_ir)
+  foreach(policy IN ITEMS 0 1 true)
+    add_test(NAME test_automatic_q4_${policy} COMMAND ${CMAKE_COMMAND} -E env
+      LSE_HRX_INT8=${policy} LSE_Q4_DECODE_EXACT=0 $<TARGET_FILE:test_automatic_q4>)
+  endforeach()
+  add_test(NAME test_automatic_q4_exact_override COMMAND ${CMAKE_COMMAND} -E env
+    --unset=LSE_HRX_INT8 LSE_Q4_DECODE_EXACT=1 $<TARGET_FILE:test_automatic_q4>)
+
   # The measured kernel-occupancy census over the real decode GEMV shapes.
   # Host-only: loomc compiles for gfx1201 without a device, and the census is
   # occupancy arithmetic over the code object's measured resources.
@@ -379,3 +388,18 @@ if(TARGET lse_backend_hrx)
 endif()
 
 lse_add_test(test_inplace_owner lse_graph lse_backend_cpu lse_kernels lse_ir)
+
+lse_add_test(test_wave32_l2 lse_graph lse_kernels lse_ir)
+if(TARGET lse_backend_hrx)
+  target_link_libraries(test_wave32_l2 PRIVATE lse_backend_hrx)
+else()
+  target_sources(test_wave32_l2 PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()

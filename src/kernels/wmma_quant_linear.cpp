@@ -42,7 +42,10 @@ using graph::ThreadPlan;
 
 namespace {
 
-// One wave owns one 16x16 output tile.
+// One wave owns one 16x16 output tile. This specialization quantizes the
+// activation to signed int8 and leaves the group-affine Q4 code unsigned, so
+// it must select the signed/unsigned INT8 row. On gfx1201 that row has K=16;
+// the K=32 row is INT4 and cannot consume the activation representation here.
 constexpr int kTileM = 16;
 constexpr int kTileN = 16;
 constexpr int kTileK = 16;
@@ -101,6 +104,9 @@ Dims dims_of(const KernelShapes& s) {
   // An 8-bit weight belongs on a float operand class (bf16/f16), which is a
   // different row of the same table, not this one.
   if (d.spec.bits != 4) return d;
+  // Keep the specialization to groups spanning at least two full K slices.
+  // The scale and bias must stay constant across each matrix instruction.
+  if (d.spec.group_size % (2 * kTileK) != 0) return d;
   if (d.spec.group_size <= 0) return d;
   const Shape& w = s.inputs[1];
   if (w.rank() != 2) return d;
@@ -148,7 +154,7 @@ void fill_weights(env::Emit& e, const A& a, const kir::Val<kir::u32>& col,
   }
 }
 
-template <class A, math::MatrixTarget G>
+template <class A, math::MatrixTarget G, bool ActsLayout>
 std::string emit_body(const KernelShapes& s, const Dims& d) {
   using Mma = MmaFor<G>;
   constexpr math::MatrixCoreRow kRow = Mma::kRow;
@@ -211,6 +217,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto lane = e.let(lid % kWave);
   const auto lane_lo = e.let(lane % static_cast<std::uint32_t>(kTileN));
   const auto lane_hi = e.let(lane / static_cast<std::uint32_t>(kTileN));
+  std::optional<kir::Val<kir::u32>> lane_rot;
+  if constexpr (ActsLayout) lane_rot = e.let((lane_lo / 4u) * 4u);
 
   const auto wg = e.let(math::workgroup_id_x());
   const auto m0 = e.let((wg / nblocks) * kRowsPerGroup);
@@ -293,7 +301,14 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     st_t.push_back(stt);
     st_row.push_back(e.let(m0 + sr));
     st_xbase.push_back(e.let(st_row[c] * k));
-    st_qbase.push_back(e.let(sr * words + stt * 4u));
+    if constexpr (ActsLayout) {
+      // Quarter rotations preserve each aligned four-word store and
+      // two-word fragment load within its activation row.
+      const auto rot = e.let(((sr / 4u) % 4u) * 4u);
+      st_qbase.push_back(e.let(sr * words + (stt * 4u + rot) % words));
+    } else {
+      st_qbase.push_back(e.let(sr * words + stt * 4u));
+    }
     st_sbase.push_back(e.let(sr * round_slices + stt));
     st_slice0.push_back(e.let(sr * round_slices + gl * slices));
     st_gbase.push_back(e.let(sr * round_groups + gl));
@@ -358,6 +373,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         xstep[st_gbase[c]] = gmax * (1.0f / 127.0f);
         xtot[st_gbase[c]] = gsum;
         const auto inv = e.let(127.0f / math::max(gmax, e.f32(kAmaxFloor)));
+        std::optional<kir::Local<kir::u32, 4>> packed_words;
+        if constexpr (ActsLayout) packed_words = e.local<kir::u32, 4>();
         for (std::uint32_t w = 0; w < 4u; ++w) {
           auto word = e.let(e.u32(0));
           for (std::uint32_t b = 0; b < 4u; ++b) {
@@ -367,7 +384,16 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
                 e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
             word = e.let(word + byte * (1u << (8 * b)));
           }
-          xq[e.let(st_qbase[c] + w)] = word;
+          if constexpr (ActsLayout) {
+            (*packed_words)[w] = word;
+          } else {
+            xq[e.let(st_qbase[c] + w)] = word;
+          }
+        }
+        if constexpr (ActsLayout) {
+          const auto value = packed_words->value();
+          kb.store_pack<kir::u32>(xq.id(), st_qbase[c],
+              kir::Pack<kir::u32>(value.types(), value.body(), value.id(), 4), 16u);
         }
       }
     }
@@ -402,6 +428,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
           for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][c] = e.u32(0);
           if (auto gd = e.when(live[j] && bcol[j] < n)) {
             fill_weights(e, a, bcol[j], k0, lane_k, lanes, d.spec.bits, bf[j]);
+          } else {
+            // A lane outside its tile still owns the fragment registers; the
+            // guard above leaves them at the zero init only while the fill is
+            // the first write, so a row block below reads zeros, not the
+            // previous slice's codes.
+            for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][c] = e.u32(0);
           }
         }
         // The unpacked fragments feed every row block, and each row block's A
@@ -410,17 +442,24 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         const std::uint32_t slot = gi * slices + t;
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
           const auto af = e.local<kir::u32, kFragI>();
-          for (std::uint32_t c = 0; c < kFrag; ++c) {
-            // Four words hold a whole sixteen-value step; a split-K lane takes
-            // the half of them its own half of the wave is responsible for.
-            af[c] = xq[e.let(lane_words[i] + lane_word +
-                             (slot * (static_cast<std::uint32_t>(kRow.k) / 4u) +
-                              c))]
-                        .read();
+          if constexpr (ActsLayout) {
+            const auto abase = e.let(lane_words[i] +
+                (lane_word + slot * (static_cast<std::uint32_t>(kRow.k) / 4u) +
+                 *lane_rot) % words);
+            const auto av = xq.load(abase, 8u);
+            for (std::uint32_t c = 0; c < kFrag; ++c) af[c] = av[c];
+          } else {
+            for (std::uint32_t c = 0; c < kFrag; ++c) {
+              // Four words hold a whole sixteen-value step; a split-K lane takes
+              // the half of them its own half of the wave is responsible for.
+              af[c] = xq[e.let(lane_words[i] + lane_word +
+                               (slot * (static_cast<std::uint32_t>(kRow.k) / 4u) +
+                                c))]
+                          .read();
+            }
           }
-          // One issue takes the whole K slice: the row declares A and B four
-          // registers wide and chained=1, so a lane hands over its sixteen
-          // contiguous K values at once.
+          // One issue takes the whole K slice. Each half-wave contributes
+          // its two packed registers for eight K values on this split-K row.
           for (std::uint32_t j = 0; j < kColBlocks; ++j) {
             const std::uint32_t ij = i * kColBlocks + j;
             acc[ij] = math::mma<Mma>(af.value(), bf[j].value(),
@@ -464,8 +503,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   return kb.str();
 }
 
-struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel> {
-  static constexpr std::string_view kName = "quant_linear.wmma";
+template <bool ActsLayout>
+struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel<ActsLayout>> {
+  static constexpr std::string_view kName = ActsLayout
+      ? "quant_linear.wmma.acts_swizzle_v2.v1" : "quant_linear.wmma";
   static constexpr std::string_view kEntry = "lse_quant_linear_wmma";
   static constexpr std::string_view kSource = {};
 
@@ -505,7 +546,7 @@ struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel> {
             return {};
           } else {
             return with_elem(s.input_dtypes[2], [&]<class S>() -> std::string {
-              return emit_body<Args<S>, G>(s, d);
+              return emit_body<Args<S>, G, ActsLayout>(s, d);
             });
           }
         });
@@ -530,7 +571,8 @@ struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel> {
   }
 };
 
-const QuantWmmaKernel kQuantWmma;
+const QuantWmmaKernel<false> kQuantWmma;
+const QuantWmmaKernel<true> kQuantWmmaActs;
 
 }  // namespace
 
@@ -539,24 +581,23 @@ const QuantWmmaKernel kQuantWmma;
 // disagree on their expert -- a routed row picks its own matrix and there is
 // no shared operand for a tile to hold.
 const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
-  if (!activation_int8_enabled()) return nullptr;
+  if (!activation_int8_enabled(s)) return nullptr;
   const Dims d = dims_of(s);
   if (!d.valid || s.device == nullptr || s.intrinsics == nullptr) return nullptr;
 
-  // One row is decode, and a 16x16 tile would mask fifteen of its rows to
-  // move the same weights -- but the dot4 path's cost is the dequant and dot
-  // ALU per ROW, not the weight stream (measured: its GEMVs double from m=2
-  // to m=4), so the crossover to the matrix core sits well below a full
-  // tile. LSE_WMMA_MIN_M overrides the threshold for measurement.
+  // The matrix path covers sixteen rows at once. Keep smaller row counts on
+  // the scalar dot4 path until the masked-tile cost is measured; the
+  // LSE_WMMA_MIN_M override allows a controlled crossover sweep.
   static const std::uint32_t min_m = [] {
     const char* v = std::getenv("LSE_WMMA_MIN_M");
     const long n = v != nullptr ? std::strtol(v, nullptr, 10) : kTileM;
     return static_cast<std::uint32_t>(std::clamp(n, 1L, 1024L));
   }();
-  if (d.m < min_m) return nullptr;
+  const std::optional<math::MatrixTarget> gate_target = matrix_target(*s.device);
+  const auto crossover=activation_int8_policy()==ActivationInt8Policy::kAutomatic ? 512u : min_m;
+  if (d.m < crossover) return nullptr;
 
-  const std::optional<math::MatrixTarget> target = matrix_target(*s.device);
-  if (!target.has_value()) return nullptr;
+  if (!gate_target.has_value()) return nullptr;
 
   // The row the device's generation selects, and whether it may be emitted at
   // all. A row whose lane mapping was never measured on the part is not a
@@ -564,7 +605,7 @@ const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
   // it and so does this. Nothing here names a generation: a part joins by
   // having its layout measured into the table.
   return with_matrix_target<const graph::KernelPrimitiveBase*>(
-      *target, [&]<math::MatrixTarget G>() -> const graph::KernelPrimitiveBase* {
+      *gate_target, [&]<math::MatrixTarget G>() -> const graph::KernelPrimitiveBase* {
         // CDNA's MFMA int8 has no signedness immediates, so there is no mixed
         // row to name: unsigned codes there need the algebra shifted, not a
         // different spelling. It declines here rather than pretending.
@@ -583,11 +624,27 @@ const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
           if (s.intrinsics->find(kRow.key).empty()) return nullptr;
           // The tile stages one K slice per lane and drains kTileM rows, so a
           // row whose instruction does not have that shape needs the staging
-          // rewritten, not just a different spelling.
+          // rewritten, not just a different spelling. kRow.n is the
+          // instruction's own tile width; the pair-row accumulator's per-wave
+          // N coverage (wave/halves) is a mapping fact, not a tile dimension.
           if (kRow.m != kTileM || kRow.n != kTileN || kRow.k != kTileK) {
             return nullptr;
           }
           if (kRow.chained != 1) return nullptr;
+          static const bool acts_layout = [] {
+            const char* value = std::getenv("LSE_Q4_WMMA_ACTS_SWIZZLE");
+            return value == nullptr || std::string_view(value) == "1";
+          }();
+          const bool qualified_ffn = (d.n == 17408 && d.k == 5120) ||
+                                     (d.n == 5120 && d.k == 17408);
+          if (acts_layout && qualified_ffn && d.m == 512 &&
+              d.spec.bits == 4 && d.spec.group_size == 64 &&
+              s.device->arch == "gfx1201" && s.device->wavefront_size == 32 &&
+              s.input_dtypes.size() >= 4 && s.input_dtypes[0] == DType::kF32 &&
+              s.input_dtypes[2] == DType::kBF16 && s.input_dtypes[3] == DType::kBF16 &&
+              s.output_dtype == DType::kF32) {
+            return &kQuantWmmaActs;
+          }
           return &kQuantWmma;
         }
         }

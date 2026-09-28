@@ -550,9 +550,11 @@ std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
       probe.device = &device;
       probe.types = type_table;
       probe.intrinsics = &spellings;
-      // phase_spec uses the base RMS under its virtual row walk.
+      // phase_spec uses base normalizations under its virtual row walk.
       const KernelPrimitiveBase* chosen =
-          group.is_phase && n->kind == OpKind::kRMS ? kp : kp->specialize(probe);
+          group.is_phase && (n->kind == OpKind::kRMS ||
+                             n->kind == OpKind::kL2Norm)
+              ? kp : kp->specialize(probe);
       if (chosen == nullptr || !chosen->owns_indexing()) continue;
       if (group.outputs.size() != 1) break;
       self = chosen;

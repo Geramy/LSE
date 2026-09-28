@@ -3,6 +3,9 @@
 // scratch and barriers; the scalar forms remain the general fallback.
 #include <string>
 #include <limits>
+#include <array>
+#include <cmath>
+#include <cstdlib>
 
 #include "lse/backends/hrx/device_info.hpp"
 
@@ -213,6 +216,89 @@ struct L2NormArgs {
   env::Out<kir::f32, E> out;
 };
 
+namespace {
+constexpr std::uint32_t kL2Wave = 32;
+constexpr std::uint32_t kL2Head = 128;
+constexpr std::uint32_t kL2Block = 128;
+constexpr std::uint32_t kL2Rows = 16;
+
+bool wave32_l2_usable(const KernelShapes& s) {
+  static const bool enabled = [] {
+    const char* value = std::getenv("LSE_GDN_L2_WAVE32");
+    return value == nullptr || std::string_view(value) == "1";
+  }();
+  if (!enabled || !usable(s) || s.device == nullptr ||
+      s.device->arch != "gfx1201" || s.device->wavefront_size != kL2Wave ||
+      s.device->max_threads_per_workgroup < kL2Block ||
+      s.inputs.size() != 1 || s.input_dtypes.size() != 1 ||
+      s.input_dtypes[0] != DType::kF32 || s.output_dtype != DType::kF32 ||
+      s.inputs[0] != Shape{1, 1, kL2Rows, kL2Head} ||
+      s.output != s.inputs[0] || !std::isfinite(s.attrs[0]) ||
+      s.attrs[0] <= 0.0f || !s.staged.name.empty() ||
+      !s.staged_quant.codes.empty()) return false;
+  for (std::string_view op : {"thread.local_id", "thread.workgroup_id.x",
+                              "wave.shfl_xor", "fma", "sqrt", "max"}) {
+    if (s.intrinsics->find(op).empty()) return false;
+  }
+  return true;
+}
+}  // namespace
+
+// Each complete wave owns one head. Read all four elements per lane before
+// storing so input/output aliasing cannot expose a partially rewritten row.
+struct Wave32L2NormKernel final : KernelPrimitive<Wave32L2NormKernel> {
+  static constexpr std::string_view kName = "l2_normalize.wave32.d128.m1.v1";
+  static constexpr std::string_view kEntry = "lse_l2_normalize_wave32_d128_m1_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 1; }
+  FusionClass fusion_class() const noexcept override { return FusionClass::kReduction; }
+  bool owns_indexing() const noexcept override { return true; }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!wave32_l2_usable(s) || !s.store) return {};
+    kir::KernelBody k(s.types, *s.intrinsics);
+    k.set_store(s.store);
+    L2NormArgs<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto local = e.let(math::local_id());
+    const auto lane = e.let(local % kL2Wave);
+    const auto head = e.let(math::workgroup_id_x() * (kL2Block / kL2Wave) +
+                           local / kL2Wave);
+    const auto row = e.let(head * kL2Head);
+    std::array<kir::Val<kir::f32>, kL2Head / kL2Wave> values;
+    auto partial = e.var(0.0f);
+    for (std::uint32_t j = 0; j < values.size(); ++j) {
+      values[j] = e.let(a.x[row + lane + j * kL2Wave]);
+      partial = math::fma(values[j], values[j], partial.read());
+    }
+    auto sum = e.let(partial.read());
+    for (std::uint32_t mask = 1; mask < kL2Wave; mask <<= 1) {
+      sum = e.let(sum + math::shfl_xor(sum, e.u32(mask)));
+    }
+    const auto inv = e.let(
+        e.f32(1.0f) / math::max(math::sqrt(sum), e.f32(s.attrs[0])));
+    for (std::uint32_t j = 0; j < values.size(); ++j) {
+      e.store(e.let(row + lane + j * kL2Wave), values[j] * inv);
+    }
+    return k.str();
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 1) return LSE_ERROR(kInvalidArgument, "l2_normalize takes 1 input");
+    return in[0];
+  }
+  DType infer_dtype(std::span<const DType> in) const override {
+    return in.empty() ? DType::kF32 : in[0];
+  }
+  static ThreadPlan plan_impl(const KernelShapes&) {
+    ThreadPlan tp;
+    tp.workgroup_size[0] = kL2Block;
+    tp.workgroup_count[0] = kL2Rows / (kL2Block / kL2Wave);
+    return tp;
+  }
+};
+LSE_REGISTER_PRIMITIVE(Wave32L2NormKernel);
+
 // out = x / max(||x||, eps). eps floors the norm, it does not sit under the
 // sqrt — see the note in the host implementation.
 struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
@@ -223,6 +309,11 @@ struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
   std::size_t arity() const noexcept override { return 1; }
   FusionClass fusion_class() const noexcept override {
     return FusionClass::kReduction;
+  }
+  const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    static const Wave32L2NormKernel wave32;
+    if (wave32_l2_usable(s)) return &wave32;
+    return this;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {

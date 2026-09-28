@@ -7,7 +7,7 @@
 namespace lse::kernels {
 // Selection runs before the cache lookup: a generic quant_matmul node can
 // specialize to different registered implementations under one graph shape.
-// RMSNorm also specializes its launch geometry, so its selected implementation
+// Normalization also specializes its launch geometry, so its selected implementation
 // must invalidate both persistent kernels and cached emission metadata.
 // Names are registered implementation identities; a new strategy/revision must
 // have a distinct name. Cost samples themselves never enter this fingerprint.
@@ -19,7 +19,9 @@ namespace lse::kernels {
   std::vector<DType> dtypes;
   for (const auto& node : group.nodes) {
     if (node->kind != graph::OpKind::kQuantMatMul &&
-        node->kind != graph::OpKind::kRMS) continue;
+        node->kind != graph::OpKind::kRMS &&
+        node->kind != graph::OpKind::kL2Norm &&
+        node->kind != graph::OpKind::kAttention) continue;
     const auto* primitive = dynamic_cast<const graph::KernelPrimitiveBase*>(node->prim);
     if (!primitive) continue;
     inputs.clear(); dtypes.clear();
@@ -39,9 +41,18 @@ namespace lse::kernels {
       key *= 1099511628211ull;
       continue;
     }
+    // Standalone wave-indexed normalization cannot consume virtual phase rows.
+    if (node->kind == graph::OpKind::kL2Norm && group.is_phase) {
+      key ^= quant_operand_implementation_id("l2_normalize.phase-scalar.v1");
+      key *= 1099511628211ull;
+      continue;
+    }
     const auto* chosen=primitive->specialize(probe);
-    if (node->kind == graph::OpKind::kRMS && group.outputs.size() != 1)
+    if ((node->kind == graph::OpKind::kRMS ||
+         node->kind == graph::OpKind::kL2Norm) && group.outputs.size() != 1)
       chosen=primitive;
+    // Attention implementations can change with process-latched policy
+    // without changing the graph signature. Fingerprint the selected body.
     key ^= quant_operand_implementation_id(chosen ? chosen->name() : "unavailable");
     key *= 1099511628211ull;
   }

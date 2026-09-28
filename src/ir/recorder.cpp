@@ -102,6 +102,15 @@ std::string KernelBody::str() {
   if (const Status s = default_pipeline().run(ir_, &stats); !s.ok()) {
     std::fprintf(stderr, "lse: kernel IR pass pipeline failed: %s\n",
                  s.message().c_str());
+    if (const char* dbg = std::getenv("LSE_DEBUG_KERNEL_BODY")) {
+      std::FILE* f = std::fopen(dbg, "a");
+      if (f) {
+        std::fprintf(f, "=== FAILED BODY (%s) ===\n", s.message().c_str());
+        std::fputs(lower(ir_).c_str(), f);
+        std::fputs("\n=== END ===\n", f);
+        std::fclose(f);
+      }
+    }
     return {};
   }
   record_pass_totals(stats);

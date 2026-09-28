@@ -2956,6 +2956,11 @@ LSE_TEST(the_mtp_module_loads_beside_a_checkpoint_and_is_not_one_itself) {
 }
 
 LSE_TEST(a_rejected_draft_leaves_the_caches_where_a_clean_pass_would) {
+  // A replacement pass needs the device's held carry inputs. The CPU
+  // interpreter mutates its carry in place and correctly refuses that pass.
+  if (graph::default_scheduler()->backend().emitter() == nullptr) {
+    LSE_SKIP("speculative rollback requires device replay");
+  }
   // The paged KV rolls back by cursor — the redo overwrites the same slots —
   // but the Gated DeltaNet state does not: it is a value the pass replaces.
   // What makes that safe is that a `replaces_previous` pass starts from the
@@ -3041,6 +3046,9 @@ LSE_TEST(a_pass_that_ran_on_the_host_cannot_be_replaced) {
 }
 
 LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
+  if (graph::default_scheduler()->backend().emitter() == nullptr) {
+    LSE_SKIP("speculative rollback requires device replay");
+  }
   // The exhaustive form of this is a diff of a full continuation on a trained
   // checkpoint. What a synthetic fixture can say is narrower, because its
   // untrained logits decide some greedy steps by the last bit of an f32 sum
@@ -3104,6 +3112,9 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
 }
 
 LSE_TEST(an_accepted_draft_still_gives_the_decoders_own_tokens) {
+  if (graph::default_scheduler()->backend().emitter() == nullptr) {
+    LSE_SKIP("speculative rollback requires device replay");
+  }
   // The other half of the loop: a proposal the decoder agrees with is taken
   // without a second pass, and the token that rides along with it is the one
   // the decoder's own second row produced.

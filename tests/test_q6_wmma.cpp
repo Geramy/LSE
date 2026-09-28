@@ -51,10 +51,16 @@ struct Fixture {
  }
 };
 }
-LSE_TEST(q6_ranked_selection_uses_measured_bf16_winners_in_both_dialects) {
+LSE_TEST(q6_ranked_selection_uses_only_qualified_m512_ffn_shapes) {
  unsetenv("LSE_WMMA");LSE_EXPECT(!kernels::kQuantOperandProfile.run_qualification_candidate);
  Fixture f;
- for(int m:{64,512}){f.check(m,17408,5120,true);f.check(m,5120,17408,true);}
+ for(int m:{64,512,1024}){
+  const bool matrix = m == 512;
+  f.check(m,17408,5120,matrix);
+  f.check(m,5120,17408,matrix);
+ }
+ f.check(512,10240,5120,false);
+ f.check(512,248320,5120,false);
 }
 LSE_TEST(q6_unknown_decode_and_unsupported_device_keep_scalar_without_old_override) {
  unsetenv("LSE_WMMA");Fixture f;

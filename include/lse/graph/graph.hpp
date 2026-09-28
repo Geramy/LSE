@@ -121,6 +121,8 @@ struct QuantPlanes {
   // Weights per row. The packed plane's own last axis counts lanes, so this is
   // the only place the logical width survives.
   std::int64_t in_features = 0;
+  // Immutable checkpoint qualification copied into quantized contraction nodes.
+  std::int32_t compute_profile_revision = 0;
 };
 
 class Node {
@@ -343,7 +345,8 @@ class Scheduler {
   Status eval_step(std::span<const NodePtr> roots, bool pull_host,
                    Program* plan);
   Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
-                            std::size_t member);
+                            std::size_t member, Program* replay = nullptr,
+                            std::size_t group_index = 0);
   // Which member of the set runs this group: the one already holding its
   // operands. Not a cost decision — a group whose inputs are resident on one
   // device has nowhere else to run until something moves them, and moving them

@@ -40,9 +40,12 @@ struct SdpaArgs {
 // key, then each output channel walks the same keys for max, denominator, and
 // value accumulation. Sharing only the completed scores removes 2*Dv repeated
 // dots without narrowing operands or reassociating a reduction.
-struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel> {
-  static constexpr std::string_view kName = "attention.decode_shared";
-  static constexpr std::string_view kEntry = "lse_sdpa_decode_shared";
+template <bool SharedExp>
+struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
+  static constexpr std::string_view kName = SharedExp
+      ? "attention.decode_shared_exp" : "attention.decode_shared";
+  static constexpr std::string_view kEntry = SharedExp
+      ? "lse_sdpa_decode_shared_exp" : "lse_sdpa_decode_shared";
   static constexpr std::string_view kSource = {};
   static constexpr std::uint32_t kThreads = 256;
   std::size_t arity() const noexcept override { return 5; }
@@ -149,6 +152,21 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel> {
               maximum = math::max(maximum.read(), scores[j].read());
         }
       }
+    if constexpr (SharedExp) {
+      // The maximum is identical in every lane. Each key's exponential is
+      // therefore identical too: compute it once, then share the result with
+      // the output channels while retaining their serial FP32 sum order.
+      // All lanes must finish reading the scores for max before any lane
+      // overwrites them with probabilities.
+      e.barrier();
+      for (auto j : e.range(lane, kv_len, kThreads)) {
+        auto weight = e.var(0.0f);
+        if (auto live = e.when(j < row_len && allowed(j)))
+          weight = math::exp(scores[j].read() - maximum.read());
+        scores[j] = weight.read();
+      }
+      e.barrier();
+    }
     auto denom = e.var(0.0f), acc = e.var(0.0f);
     for (auto bi : e.range(nblk))
       if (auto mine = e.when(bi < row_blk)) {
@@ -158,8 +176,12 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel> {
           const auto j = e.let(bi * block + jj);
           if (auto live = e.when(j < row_len && j < kv_len)) {
             auto weight = e.var(0.0f);
-            if (auto mask = e.when(allowed(j)))
-              weight = math::exp(scores[j].read() - maximum.read());
+            if constexpr (SharedExp) {
+              weight = scores[j].read();
+            } else {
+              if (auto mask = e.when(allowed(j)))
+                weight = math::exp(scores[j].read() - maximum.read());
+            }
             denom = denom.read() + weight.read();
             acc = math::fma(weight.read(), a.v[vb + jj * 256u], acc.read());
           }
@@ -188,8 +210,375 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel> {
     return tp;
   }
 };
-LSE_REGISTER_PRIMITIVE(DecodeSdpaKernel);
-const DecodeSdpaKernel kDecodeShared{};
+using DecodeSdpaKernelBase = DecodeSdpaKernel<false>;
+using DecodeSdpaKernelSharedExp = DecodeSdpaKernel<true>;
+LSE_REGISTER_PRIMITIVE(DecodeSdpaKernelBase);
+LSE_REGISTER_PRIMITIVE(DecodeSdpaKernelSharedExp);
+const DecodeSdpaKernelBase kDecodeShared{};
+const DecodeSdpaKernelSharedExp kDecodeSharedExp{};
+
+
+// Opt-in decode partitions retain FP32 operands and local sums. Each output
+// record holds (maximum, denominator, unnormalized value numerator[256]); a
+// separate barrier primitive rescales and combines those records stably.
+constexpr std::uint32_t kSplitKeys = 128;
+constexpr std::uint32_t kSplitRecord = 258;
+
+static bool split_decode_sdpa_supported(const KernelShapes& s) {
+  return DecodeSdpaKernelBase::supported(s) && s.device->wavefront_size == 32 &&
+         s.output_dtype == DType::kF32;
+}
+
+struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
+  static constexpr std::string_view kName = "attention.decode_partial128.v1";
+  static constexpr std::string_view kEntry = "lse_sdpa_decode_partial128_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 5; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    return split_decode_sdpa_supported(s) ? this : nullptr;
+  }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!split_decode_sdpa_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
+      return {};
+    const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+    const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+    const auto block = static_cast<std::uint32_t>(s.inputs[1].dim(2));
+    const auto stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
+    const auto capacity = stride * block;
+    const auto parts = (capacity + kSplitKeys - 1u) / kSplitKeys;
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    SdpaArgs<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto scores = e.lds<kir::f32>(kSplitKeys);
+    const auto lane = e.let(math::local_id());
+    const auto wg = e.let(math::workgroup_id_x());
+    const auto part = e.let(wg % parts);
+    const auto h = e.let((wg / parts) % heads), b = e.let(wg / (parts * heads));
+    const auto kh = e.let(h / (heads / kvheads));
+    const auto output = e.let(wg * kSplitRecord);
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
+    const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
+    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    const auto row_len = e.let(select(loaded_len < capacity, loaded_len, e.u32(capacity)));
+    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
+    const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
+    const auto begin = e.let(part * kSplitKeys);
+    const auto tb = e.let(b * stride), qb = e.let((b * heads + h) * 256u);
+    auto allowed = [&](auto j) {
+      if (s.iattrs[0] == 0) return e.u32(1) == e.u32(1);
+      if (s.iattrs[0] == 1) return j <= offset;
+      return j <= offset && j + static_cast<std::uint32_t>(s.iattrs[1]) > offset;
+    };
+    if (auto owns = e.when(lane < kSplitKeys)) {
+      const auto j = e.let(begin + lane);
+      scores[lane] = math::neg_inf();
+      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
+        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
+        auto score = e.var(0.0f);
+        for (auto dd : e.range(256u))
+          score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
+        scores[lane] = score.read() * s.attrs[0];
+      }
+    }
+    e.barrier();
+    auto maximum = e.var(math::neg_inf());
+    for (auto jj : e.range(kSplitKeys))
+      maximum = math::max(maximum.read(), scores[jj].read());
+    e.barrier();
+    if (auto owns = e.when(lane < kSplitKeys)) {
+      const auto j = e.let(begin + lane);
+      auto weight = e.var(0.0f);
+      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j)))
+        weight = math::exp(scores[lane].read() - maximum.read());
+      scores[lane] = weight.read();
+    }
+    e.barrier();
+    auto denom = e.var(0.0f), acc = e.var(0.0f);
+    for (auto jj : e.range(kSplitKeys)) {
+      const auto j = e.let(begin + jj);
+      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
+        const auto weight = e.let(scores[jj].read());
+        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane);
+        denom = denom.read() + weight;
+        acc = math::fma(weight, a.v[vb], acc.read());
+      }
+    }
+    e.store(output + 2u + lane, acc.read());
+    if (auto first = e.when(lane == 0u)) {
+      e.store(output, maximum.read());
+      e.store(output + 1u, denom.read());
+    }
+    return k.lds().ok() ? k.str() : std::string{};
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 5 || in[0].rank() != 4 || in[1].rank() != 4 || in[4].rank() != 2)
+      return LSE_ERROR(kInvalidArgument, "split decode attention takes five paged inputs");
+    const auto capacity = in[1].dim(2) * in[4].dim(1);
+    return Shape{in[0].dim(0), in[0].dim(1), (capacity + kSplitKeys - 1) / kSplitKeys, kSplitRecord};
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    tp.workgroup_size[0] = 256;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1) * s.output.dim(2));
+    tp.lds_bytes = kSplitKeys * sizeof(float);
+    return tp;
+  }
+};
+
+template<class E> struct SplitMergeArgs {
+  env::In<kir::f32, E> partial;
+  env::Out<kir::f32, E> out;
+};
+struct SplitDecodeMerge final : KernelPrimitive<SplitDecodeMerge> {
+  static constexpr std::string_view kName = "attention.decode_merge128.v1";
+  static constexpr std::string_view kEntry = "lse_sdpa_decode_merge128_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 1 || s.inputs[0].rank() != 4 ||
+        s.inputs[0].dim(0) <= 0 || s.inputs[0].dim(1) <= 0 ||
+        s.inputs[0].dim(2) <= 0 || s.inputs[0].dim(2) > 64 || s.inputs[0].dim(3) != kSplitRecord ||
+        s.input_dtypes.size() != 1 || s.input_dtypes[0] != DType::kF32 ||
+        s.output_dtype != DType::kF32 || !s.device || s.device->arch != "gfx1201" ||
+        s.device->max_threads_per_workgroup < 256 || !s.types.scalar || !s.intrinsics || !s.store)
+      return {};
+    const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    SplitMergeArgs<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto weights = e.lds<kir::f32>(parts);
+    const auto lane = e.let(math::local_id()), wg = e.let(math::workgroup_id_x());
+    const auto base = e.let(wg * parts * kSplitRecord);
+    auto maximum = e.var(math::neg_inf());
+    for (auto p : e.range(parts))
+      if (auto valid = e.when(a.partial[base + p * kSplitRecord + 1u] > 0.0f))
+        maximum = math::max(maximum.read(), a.partial[base + p * kSplitRecord]);
+    if (auto owns = e.when(lane < parts)) {
+      const auto pb = e.let(base + lane * kSplitRecord);
+      auto weight = e.var(0.0f);
+      // A zero denominator marks empty and padded partitions; skip their
+      // sentinel maximum so an all-empty row never subtracts two infinities.
+      if (auto valid = e.when(a.partial[pb + 1u] > 0.0f))
+        weight = math::exp(a.partial[pb] - maximum.read());
+      weights[lane] = weight.read();
+    }
+    e.barrier();
+    auto denom = e.var(0.0f), acc = e.var(0.0f);
+    for (auto p : e.range(parts)) {
+      const auto pb = e.let(base + p * kSplitRecord);
+      const auto weight = e.let(weights[p].read());
+      denom = math::fma(weight, a.partial[pb + 1u], denom.read());
+      acc = math::fma(weight, a.partial[pb + 2u + lane], acc.read());
+    }
+    e.store(wg * 256u + lane, acc.read() / select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
+    return k.lds().ok() ? k.str() : std::string{};
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 1 || in[0].rank() != 4 || in[0].dim(3) != kSplitRecord)
+      return LSE_ERROR(kInvalidArgument, "split decode merge takes one partial record array");
+    return Shape{in[0].dim(0), in[0].dim(1), 1, 256};
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    tp.workgroup_size[0] = 256;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1));
+    tp.lds_bytes = static_cast<std::uint32_t>(s.inputs[0].dim(2)) * sizeof(float);
+    return tp;
+  }
+};
+LSE_REGISTER_PRIMITIVE(SplitDecodePartial);
+LSE_REGISTER_PRIMITIVE(SplitDecodeMerge);
+
+struct SplitDecodePartialWg128C2 final : KernelPrimitive<SplitDecodePartialWg128C2> {
+  static constexpr std::string_view kName = "attention.decode_partial128.wg128c2.v2";
+  static constexpr std::string_view kEntry = "lse_sdpa_decode_partial128_wg128c2_v2";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 5; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
+    return split_decode_sdpa_supported(s) ? this : nullptr;
+  }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!split_decode_sdpa_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
+      return {};
+    const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+    const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+    const auto block = static_cast<std::uint32_t>(s.inputs[1].dim(2));
+    const auto stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
+    const auto capacity = stride * block;
+    const auto parts = (capacity + kSplitKeys - 1u) / kSplitKeys;
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    SdpaArgs<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto scores = e.lds<kir::f32>(kSplitKeys);
+    const auto lane = e.let(math::local_id());
+    const auto wg = e.let(math::workgroup_id_x());
+    const auto part = e.let(wg % parts);
+    const auto h = e.let((wg / parts) % heads), b = e.let(wg / (parts * heads));
+    const auto kh = e.let(h / (heads / kvheads));
+    const auto output = e.let(wg * kSplitRecord);
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
+    const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
+    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    const auto row_len = e.let(select(loaded_len < capacity, loaded_len, e.u32(capacity)));
+    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
+    const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
+    const auto begin = e.let(part * kSplitKeys);
+    const auto tb = e.let(b * stride), qb = e.let((b * heads + h) * 256u);
+    auto allowed = [&](auto j) {
+      if (s.iattrs[0] == 0) return e.u32(1) == e.u32(1);
+      if (s.iattrs[0] == 1) return j <= offset;
+      return j <= offset && j + static_cast<std::uint32_t>(s.iattrs[1]) > offset;
+    };
+    if (auto owns = e.when(lane < kSplitKeys)) {
+      const auto j = e.let(begin + lane);
+      scores[lane] = math::neg_inf();
+      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
+        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
+        auto score = e.var(0.0f);
+        for (auto dd : e.range(256u))
+          score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
+        scores[lane] = score.read() * s.attrs[0];
+      }
+    }
+    e.barrier();
+    auto maximum = e.var(math::neg_inf());
+    for (auto jj : e.range(kSplitKeys))
+      maximum = math::max(maximum.read(), scores[jj].read());
+    e.barrier();
+    if (auto owns = e.when(lane < kSplitKeys)) {
+      const auto j = e.let(begin + lane);
+      auto weight = e.var(0.0f);
+      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j)))
+        weight = math::exp(scores[lane].read() - maximum.read());
+      scores[lane] = weight.read();
+    }
+    e.barrier();
+    auto denom = e.var(0.0f), acc0 = e.var(0.0f), acc1 = e.var(0.0f);
+    for (auto jj : e.range(kSplitKeys)) {
+      const auto j = e.let(begin + jj);
+      if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
+        const auto weight = e.let(scores[jj].read());
+        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane * 2u);
+        denom = denom.read() + weight;
+        const auto values = e.load(a.v, vb, 8u);
+        acc0 = math::fma(weight, values[0], acc0.read());
+        acc1 = math::fma(values[1], weight, acc1.read());
+      }
+    }
+    e.store(output + 2u + lane * 2u, acc0.read());
+    e.store(output + 3u + lane * 2u, acc1.read());
+    if (auto first = e.when(lane == 0u)) {
+      e.store(output, maximum.read());
+      e.store(output + 1u, denom.read());
+    }
+    return k.lds().ok() ? k.str() : std::string{};
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 5 || in[0].rank() != 4 || in[1].rank() != 4 || in[4].rank() != 2)
+      return LSE_ERROR(kInvalidArgument, "split decode attention takes five paged inputs");
+    const auto capacity = in[1].dim(2) * in[4].dim(1);
+    return Shape{in[0].dim(0), in[0].dim(1), (capacity + kSplitKeys - 1) / kSplitKeys, kSplitRecord};
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    tp.workgroup_size[0] = 128;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1) * s.output.dim(2));
+    tp.lds_bytes = kSplitKeys * sizeof(float);
+    return tp;
+  }
+};
+
+
+struct SplitDecodeMergeWg128C2 final : KernelPrimitive<SplitDecodeMergeWg128C2> {
+  static constexpr std::string_view kName = "attention.decode_merge128.wg128c2.v2";
+  static constexpr std::string_view kEntry = "lse_sdpa_decode_merge128_wg128c2_v2";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 1 || s.inputs[0].rank() != 4 ||
+        s.inputs[0].dim(0) <= 0 || s.inputs[0].dim(1) <= 0 ||
+        s.inputs[0].dim(2) <= 0 || s.inputs[0].dim(2) > 64 || s.inputs[0].dim(3) != kSplitRecord ||
+        s.input_dtypes.size() != 1 || s.input_dtypes[0] != DType::kF32 ||
+        s.output_dtype != DType::kF32 || !s.device || s.device->arch != "gfx1201" ||
+        s.device->max_threads_per_workgroup < 256 || !s.types.scalar || !s.intrinsics || !s.store)
+      return {};
+    const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    SplitMergeArgs<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto weights = e.lds<kir::f32>(parts);
+    const auto lane = e.let(math::local_id()), wg = e.let(math::workgroup_id_x());
+    const auto base = e.let(wg * parts * kSplitRecord);
+    auto maximum = e.var(math::neg_inf());
+    for (auto p : e.range(parts))
+      if (auto valid = e.when(a.partial[base + p * kSplitRecord + 1u] > 0.0f))
+        maximum = math::max(maximum.read(), a.partial[base + p * kSplitRecord]);
+    if (auto owns = e.when(lane < parts)) {
+      const auto pb = e.let(base + lane * kSplitRecord);
+      auto weight = e.var(0.0f);
+      // A zero denominator marks empty and padded partitions; skip their
+      // sentinel maximum so an all-empty row never subtracts two infinities.
+      if (auto valid = e.when(a.partial[pb + 1u] > 0.0f))
+        weight = math::exp(a.partial[pb] - maximum.read());
+      weights[lane] = weight.read();
+    }
+    e.barrier();
+    auto denom = e.var(0.0f), acc0 = e.var(0.0f), acc1 = e.var(0.0f);
+    for (auto p : e.range(parts)) {
+      const auto pb = e.let(base + p * kSplitRecord);
+      const auto weight = e.let(weights[p].read());
+      denom = math::fma(weight, a.partial[pb + 1u], denom.read());
+      const auto values = e.load(a.partial, e.let(pb + 2u + lane * 2u), 8u);
+      acc0 = math::fma(weight, values[0], acc0.read());
+      acc1 = math::fma(values[1], weight, acc1.read());
+    }
+    const auto divisor = e.let(select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
+    e.store(wg * 256u + lane * 2u, acc0.read() / divisor);
+    e.store(wg * 256u + lane * 2u + 1u, acc1.read() / divisor);
+    return k.lds().ok() ? k.str() : std::string{};
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 1 || in[0].rank() != 4 || in[0].dim(3) != kSplitRecord)
+      return LSE_ERROR(kInvalidArgument, "split decode merge takes one partial record array");
+    return Shape{in[0].dim(0), in[0].dim(1), 1, 256};
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    tp.workgroup_size[0] = 128;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1));
+    tp.lds_bytes = static_cast<std::uint32_t>(s.inputs[0].dim(2)) * sizeof(float);
+    return tp;
+  }
+};
+
+LSE_REGISTER_PRIMITIVE(SplitDecodePartialWg128C2);
+LSE_REGISTER_PRIMITIVE(SplitDecodeMergeWg128C2);
 
 // One thread per output [B, Hq, Tq, Dv]. Recomputes the key dots for softmax;
 // S is small on the generate path (prefill tokens or cached length).
@@ -220,7 +609,14 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
       const char* value = std::getenv("LSE_SHARED_SCORE_SDPA");
       return value == nullptr || std::string_view(value) != "0";
     }();
-    if (shared && DecodeSdpaKernel::supported(s)) return &kDecodeShared;
+    static const bool shared_exp = [] {
+      const char* value = std::getenv("LSE_SHARED_EXP_SDPA");
+      return value == nullptr || std::string_view(value) != "0";
+    }();
+    if (shared && DecodeSdpaKernelBase::supported(s)) {
+      if (shared_exp) return &kDecodeSharedExp;
+      return &kDecodeShared;
+    }
     if (const KernelPrimitiveBase* f = flash_sdpa_for(s)) return f;
     return this;
   }

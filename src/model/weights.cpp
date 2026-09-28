@@ -1,3 +1,4 @@
+#include "lse/core/sha256.hpp"
 #include "lse/model/weights.hpp"
 
 #include <fcntl.h>
@@ -949,3 +950,14 @@ Result<std::vector<CacheModel>> list_cached_models() {
 }
 
 }  // namespace lse::model
+
+namespace lse::model {
+bool SafeTensors::content_sha256_matches(std::span<const std::string_view> digests) const {
+  if (mappings_.size() != digests.size()) return false;
+  for (std::size_t i=0;i<mappings_.size();++i) {
+    const auto& mapping=mappings_[i];
+    if (sha256(std::span(static_cast<const std::byte*>(mapping.ptr),mapping.size)) != digests[i]) return false;
+  }
+  return true;
+}
+}

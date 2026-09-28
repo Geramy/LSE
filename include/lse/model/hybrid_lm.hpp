@@ -215,6 +215,8 @@ class HybridLM {
     // The pass shape this slot serves: the token count of its retained
     // program. -1 is an empty slot.
     std::int64_t t_key = -1;
+    // Actual retained schedule, stamped once after partition/evaluation.
+    bool split_decode_attention = false;
     // Chain identity. pass_id names the build that retained this slot;
     // prev_pass names the pass that ran immediately before it. A replay whose
     // carry-ins are another pass's out-nodes is only coherent when that exact

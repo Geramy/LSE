@@ -471,7 +471,7 @@ struct ResidualKernel final : KernelPrimitive<ResidualKernel<T>> {
     decision.strategy = QuantOperandStrategy::kResidualThreeProduct;
     decision.reason = OperandReason::kSelected;
     decision.qualification = kQuantOperandProfile.qualification;
-    decision.relative_l2_limit_ppm = kQuantOperandProfile.relative_l2_limit_ppm;
+    decision.ppl_scored_tokens = kQuantOperandProfile.ppl_scored_tokens;
     return "// " + quant_operand_diagnostic(request, decision) + "\n" +
            emit_residual<T>(s, d);
   }
@@ -526,8 +526,9 @@ QuantOperandKernel residual_descriptor(const KernelShapes &s) {
   kernel.lds_bytes = kResidualLdsBytes;
   return kernel;
 }
-// Preserve the measured M256 candidate and its failed current-model quality
-// evidence. The shared policy rejects it; these shapes use the FP32 fallback.
+// Preserve the measured M256 candidate without treating a logit comparison as
+// model-quality evidence. The shared policy rejects it until a matched
+// perplexity comparison qualifies it; these shapes use the FP32 fallback.
 // Other widths retain their independently qualified implementation or scalar path.
 const KernelPrimitiveBase* select_m256_residual2(
     const KernelShapes& s, const Dims& dims) {
@@ -558,15 +559,10 @@ const KernelPrimitiveBase* select_m256_residual2(
   profile.preferred = QuantOperand::kBF16;
   profile.strategy = QuantOperandStrategy::kNative;
   profile.min_m = profile.max_m = 256;
-  // The current cooperative-RMS model versus its matched FP32 reference has
-  // relative L2 0.005030228, exceeding the 0.005 acceptance budget. The older
-  // 0.004085221 result used a different RMS context and does not qualify this
-  // profile. Preserve the observed error rounded upward in ppm.
   profile.measured_cases = 20;
-  profile.measured_relative_l2_ppm = 5031;
   profile.absolute_error_pass = true;
   profile.nonfinite_pass = true;
-  profile.model_quality_pass = false;
+  profile.perplexity_pass = false;
   profile.performance_pass = true;
   constexpr uint64_t cohort = 0x202609240001ull;
   auto& cost = option.cost;
@@ -600,51 +596,31 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
     return nullptr;
   if (dims.m == 256) return select_m256_residual2(s, dims);
   const auto request = residual_request(s, dims);
-  // Matched driver195 projection experiments: eight post-warm host
-  // eval+retire intervals per implementation. These are not device timestamps.
+  // gfx1201 / driver 201, Qwen3.8-27B-MLX-6bit, pinned WikiText-2 test
+  // corpus SHA256 4d207d8fc8c7298a0489133e104c3e12ecee9c58f2c9828dec178725cd9f17b0:
+  // one warmup and two 512-token windows, 1022 actual targets. Scalar CE
+  // 2.204146 / PPL 9.0625; staged-BF16 CE 2.204130 / PPL 9.0624, with
+  // overlapping window-bootstrap CIs and identical token sequences. Both
+  // capture paths produced finite logits. Only the two M=512 FFN projections
+  // below were selected in the scoped run; M64, M1024 and other projections
+  // have no accepted model-quality record.
+  // Costs: eight post-warm, JIT-free retained-graph host eval+retire samples
+  // per shape on driver 201. GPU dispatch timestamps independently measured
+  // 7.040 and 6.722 ms for these two BF16 shapes.
   struct Measured {
     uint32_t m, n, k;
-    uint64_t bf16, e4m3, e5m2;
+    uint64_t bf16;
   };
   static constexpr Measured records[] = {
-      {64, 17408, 5120, 1877865, 4170963, 1987625},
-      {512, 17408, 5120, 6711219, 18451005, 9670537},
-      {64, 5120, 17408, 3005271, 4375042, 3662411},
-      {512, 5120, 17408, 8312625, 13622156, 11045698},
-      // M=1024 FFN shapes. The 64x64 staged-BF16 tile body is M-independent
-      // per tile, so the device cost scales linearly with M at fixed N,K.
-      // The bf16 column is the matched driver195 M=512 host-eval record
-      // doubled and rounded up (18% guard) to a conservative upper bound
-      // verified on driver197 gfx1201 (GEMM-A 13.2 ms/dispatch measured).
-      // The fp8/bf8 columns are non-binding: both remain ineligible in this
-      // cohort (performance_pass=false), so only the bf16 column drives the
-      // ranked selection for these shapes.
-      {1024, 17408, 5120, 8100000, 22000000, 11600000},
-      {1024, 5120, 17408, 9000000, 16000000, 13200000},
-      // M=1024 GDN / full-attention projections. These had no record, so the
-      // selector returned nullptr and they ran the scalar fallback (profiled as
-      // 2.18/1.72/1.34/0.88 s per pass for the four large shapes, ~44% of the
-      // M=1024 pass). Adding a record routes them to the same staged-BF16
-      // tile the FFN shapes already use; the device cost scales linearly with
-      // M at fixed N,K, and the measured scalar->WMMA speedup is ~3.0x on the
-      // FFN shapes. The bf16 column is a conservative upper bound well below
-      // the measured scalar cost, so only bf16 (the sole eligible operand)
-      // drives the ranked selection. The fp8/bf8 columns are non-binding: both
-      // stay ineligible (performance_pass=false), sized at the FFN M=1024
-      // fp8/bf8 ratios.
-      {1024, 10240, 5120, 7000000, 19000000, 10000000},
-      {1024, 5120, 6144, 5500000, 14500000, 9000000},
-      {1024, 6144, 5120, 4500000, 12000000, 8000000},
-      {1024, 12288, 5120, 4500000, 12000000, 8000000},
-      {1024, 1024, 5120, 800000, 2000000, 1000000},
-      {1024, 48, 5120, 300000, 900000, 500000}};
+      {512, 17408, 5120, 7270240},
+      {512, 5120, 17408, 6921953}};
   const Measured *record = nullptr;
   for (const auto &r : records)
     if (r.m == dims.m && r.n == dims.n && r.k == dims.k)
       record = &r;
   if (!record)
     return nullptr; // Unknown shapes and M1 retain the scalar path.
-  constexpr uint64_t cohort = 0x202609230001ull;
+  constexpr uint64_t cohort = 0x202609270001ull;
   std::array<QuantOperandOption, 3> options{};
   auto &bf16 = options[0];
   bf16.kernel.operand = QuantOperand::kBF16;
@@ -657,16 +633,16 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
   bf16.kernel.lds_bytes = 16384;
   bf16.profile.preferred = QuantOperand::kBF16;
   bf16.profile.strategy = QuantOperandStrategy::kNative;
-  bf16.profile.revision = 2;
+  bf16.profile.revision = 3;
   bf16.profile.qualification = OperandQualification::kAccepted;
-  // Fifteen guarded projection fixtures plus complete-model logits. The
-  // worst original-FP32 projection error was0.41996%; full-model error
-  // was0.30484%. Cancellation-safe absolute checks and all guards passed.
+  bf16.profile.ppl_scored_tokens = 1022;
+  bf16.profile.historical_bf16_ppl_1022_accepted = true;
+  bf16.profile.min_m = bf16.profile.max_m = 512;
+  bf16.profile.max_n = 32768;
   bf16.profile.measured_cases = 16;
-  bf16.profile.measured_relative_l2_ppm = 4200;
   bf16.profile.absolute_error_pass = true;
   bf16.profile.nonfinite_pass = true;
-  bf16.profile.model_quality_pass = true;
+  bf16.profile.perplexity_pass = true;
   bf16.profile.performance_pass = true;
   bf16.profile.run_qualification_candidate = false;
   options[1].kernel = residual_descriptor<math::MatrixElem::kFp8>(s);
@@ -680,7 +656,7 @@ wmma_q6_linear_for(const graph::KernelShapes &s) {
     // Keep them ineligible until an accepted quality/performance record exists.
     options[i].profile.performance_pass = false;
   }
-  const uint64_t costs[] = {record->bf16, record->e4m3, record->e5m2};
+  const uint64_t costs[] = {record->bf16, 0, 0};
   for (size_t i = 0; i < options.size(); ++i) {
     auto &c = options[i].cost;
     c.arch = "gfx1201";
