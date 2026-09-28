@@ -38,7 +38,7 @@ struct Fixture {
 
 LSE_TEST(short_split_selects_measured_defaults_and_two_ordered_native_stages) {
   backend::LoomEmitter emitter;
-  for (int queries : {3, 4, 7, 8}) {
+  for (int queries : {2, 3, 4, 5, 6, 7, 8}) {
     for (int capacity : {1024, 2048}) {
       Fixture fx(queries, capacity);
       auto baseline = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal,
@@ -78,7 +78,7 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
     if (variant == 1) fx.gpu.wavefront_size = 64;
     if (variant == 2) fx.gpu.max_threads_per_workgroup = 127;
     if (variant == 3) fx.gpu.lds_bytes_per_workgroup = 511;
-    if (variant == 4) fx.q = leaf({1, 24, 2, 256});
+    if (variant == 4) fx.q = leaf({1, 24, 1, 256});
     if (variant == 5) fx.q = leaf({1, 24, 9, 256});
     if (variant == 6) fx.q = leaf({1, 24, 3, 128});
     if (variant == 7) fx.q = leaf({1, 25, 3, 256});
@@ -94,15 +94,16 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
     if (variant == 14) fx.table = leaf({1, 32});
     if (variant == 15) fx.k = fx.v = leaf({65, 2, 16, 256});
     auto out = variant == 11 ? fx.split(MaskKind::kSlidingWindow, -1) : fx.split();
-    LSE_EXPECT(out.node()->prim->name() == "attention");
+    LSE_EXPECT(out.node()->prim->name() ==
+               (variant == 4 ? "attention.decode_merge128.wg128c2.v2" : "attention"));
   }
 }
 
 LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
-  for (int queries : {2, 3, 4, 7, 8})
+  for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
     for (int capacity : {512, 1024, 2048, 4096, 262100}) {
       const Shape q{1, 24, queries, 256};
-      const bool accepted = ((queries == 3 || queries == 4 || queries == 7 || queries == 8) &&
+      const bool accepted = ((queries >= 2 && queries <= 8) &&
                              (capacity == 1024 || capacity == 2048));
       LSE_EXPECT(dispatch::split_short_scope(q, 512, capacity) == accepted);
       LSE_EXPECT(dispatch::split_short_scope(q, 1024, capacity) == accepted);

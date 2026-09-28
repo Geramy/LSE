@@ -33,22 +33,10 @@ constexpr std::array kSplitShortRules{
     SplitShortRule{"gfx1201", 32, 2, 8, 128, 8192},
 };
 
-struct SplitShortDefaultRule {
-  std::uint32_t queries, capacity;
-};
-constexpr std::array kSplitShortDefaultRules{
-    SplitShortDefaultRule{3, 1024}, SplitShortDefaultRule{3, 2048},
-    SplitShortDefaultRule{4, 1024}, SplitShortDefaultRule{4, 2048},
-    SplitShortDefaultRule{7, 1024}, SplitShortDefaultRule{7, 2048},
-    SplitShortDefaultRule{8, 1024}, SplitShortDefaultRule{8, 2048},
-};
-
 bool short_default_shape(const Shape& query, std::int64_t capacity) {
-  if (query.rank() != 4 || query.dim(0) != 1 || query.dim(1) != 24 ||
-      query.dim(3) != 256) return false;
-  for (const auto& rule : kSplitShortDefaultRules)
-    if (query.dim(2) == rule.queries && capacity == rule.capacity) return true;
-  return false;
+  return query.rank() == 4 && query.dim(0) == 1 && query.dim(1) == 24 &&
+         query.dim(2) >= 2 && query.dim(2) <= 8 && query.dim(3) == 256 &&
+         (capacity == 1024 || capacity == 2048);
 }
 
 bool power_of_two(std::int64_t n) { return n >= 2 && (n & (n - 1)) == 0; }

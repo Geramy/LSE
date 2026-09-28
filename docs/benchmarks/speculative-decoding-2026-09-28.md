@@ -96,3 +96,18 @@ The same rows-eight consumer now covers all seven measured six-row projections i
 | 248,320 / 5,120 | 4.233792 | 2.438142 | 42.41% |
 
 These component wins do not establish a wider-verification throughput win. A preliminary five-proposal HTTP candidate reached 32.81 / 32.67 TPS versus 38.16 / 38.42 at three proposals. It required 18 rather than 22 verifier passes, but six-row target attention fell through to Flash8 because the short-attention default table omitted that width. The profiler attributed 303.7 ms (22.9% of verifier GPU execution) to those six-row attention calls. This schedule remains under investigation; the six-row kernel improvement is independent of selecting it as the default. No new perplexity sweep was run.
+
+## Complete short-attention width coverage
+
+The short-verifier routing table no longer enumerates selected query counts. It admits the continuous supported range of two through eight rows for the existing target geometry and 1,024/2,048-key capacities. The omitted widths therefore cannot fall through to Flash8 in this scope. One-row decoding retains its existing optimized decode kernel.
+
+| Queries / capacity | Flash8 GPU ms | Split + merge GPU ms | Reduction |
+|---|---:|---:|---:|
+| 2 / 1,024 | 0.964462 | 0.079893 | 91.72% |
+| 2 / 2,048 | 2.015485 | 0.158861 | 92.12% |
+| 5 / 1,024 | 0.988058 | 0.158902 | 83.92% |
+| 5 / 2,048 | 1.974116 | 0.297555 | 84.93% |
+| 6 / 1,024 | 0.988858 | 0.281579 | 71.52% |
+| 6 / 2,048 | 1.970753 | 0.377763 | 80.83% |
+
+Native ABBA20 measurements exclude three initial warmups per arm and the final empty replay. All six cases passed full independent double-precision component references, empty replay, input preservation and allocation guards: 792 device dispatches, zero host fallback. The focused host routing/emission suite passed. This change reuses the existing short-attention implementation; no new quantization arithmetic or perplexity sweep was introduced. Integrated throughput is reported separately from these component measurements.
