@@ -202,6 +202,11 @@ jobs:
           cp README.md LICENSE.md "dist/$name/"
           mkdir -p "dist/$name/docs"
           cp docs/CHAT-COMPATIBILITY.md docs/pi-models.example.json docs/DFLASH2.md "dist/$name/docs/"
+          cmake -DLSE_PACKAGE_DIR="$PWD/dist/$name" -P .github/scripts/package-linux.cmake
+          RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
+          export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          "dist/$name/lse" --help >/dev/null
+          "dist/$name/lse-server" --help >/dev/null
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
