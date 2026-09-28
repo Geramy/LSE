@@ -1835,39 +1835,51 @@ Status HrxBackend::copy_peer_ordered_impl(const DeviceBuffer& src,
     return LSE_ERROR(kOutOfRange, "ordered peer copy names a stream the device "
                                   "does not have");
   }
-  LSE_ASSIGN_OR(void* from_stream, stream_at(producer.index));
-  LSE_ASSIGN_OR(void* to_stream, stream_at(consumer.index));
+  LSE_RETURN_IF_ERROR(stream_at(producer.index).status());
+  LSE_RETURN_IF_ERROR(stream_at(consumer.index).status());
 
-  // Everything the producer has already queued.
-  hrx_timeline_point_t after{};
-  LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_stream_get_timeline_position(static_cast<hrx_stream_t>(from_stream),
-                                       &after),
-      "hrx_stream_get_timeline_position"));
-  // A point on the consumer that this copy, and nothing else, will signal.
-  hrx_timeline_point_t on{};
-  LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_stream_get_timeline_position(static_cast<hrx_stream_t>(to_stream),
-                                       &on),
-      "hrx_stream_get_timeline_position(consumer)"));
-  std::uint64_t reserved = 0;
-  LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_stream_advance_timeline(static_cast<hrx_stream_t>(to_stream),
-                                  &reserved),
-      "hrx_stream_advance_timeline"));
-
-  hrx_semaphore_list_t waits{&after.semaphore, &after.value, 1};
-  hrx_semaphore_list_t signals{&on.semaphore, &reserved, 1};
-  return from_hrx(
-      hrx_queue_copy(static_cast<hrx_device_t>(device_),
-                     static_cast<hrx_queue_affinity_t>(
-                         stream_affinity_[consumer.index]),
-                     &waits, &signals,
-                     reinterpret_cast<hrx_buffer_t>(src.handle),
-                     src.offset + src_offset,
-                     reinterpret_cast<hrx_buffer_t>(dst.handle),
-                     dst.offset + dst_offset, bytes),
-      "hrx_queue_copy");
+  return detail::submit_ordered_copy<hrx_timeline_point_t>(
+      producer.index, consumer.index,
+      [&](std::uint32_t index) { return flush_stream(index); },
+      [&](std::uint32_t index) -> Result<hrx_timeline_point_t> {
+        hrx_timeline_point_t point{};
+        LSE_RETURN_IF_ERROR(from_hrx(
+            hrx_stream_get_timeline_position(
+                static_cast<hrx_stream_t>(streams_[index]), &point),
+            "hrx_stream_get_timeline_position"));
+        return point;
+      },
+      [&](std::uint32_t index) -> Result<std::uint64_t> {
+        std::uint64_t value = 0;
+        LSE_RETURN_IF_ERROR(from_hrx(
+            hrx_stream_advance_timeline(
+                static_cast<hrx_stream_t>(streams_[index]), &value),
+            "hrx_stream_advance_timeline"));
+        return value;
+      },
+      [&](std::span<const hrx_timeline_point_t> dependencies,
+          const hrx_timeline_point_t& on, std::uint64_t reserved) {
+        std::array<hrx_semaphore_t, 2> semaphores{};
+        std::array<std::uint64_t, 2> values{};
+        for (std::size_t i = 0; i < dependencies.size(); ++i) {
+          semaphores[i] = dependencies[i].semaphore;
+          values[i] = dependencies[i].value;
+        }
+        hrx_semaphore_list_t waits{
+            semaphores.data(), values.data(), dependencies.size()};
+        auto semaphore = on.semaphore;
+        hrx_semaphore_list_t signals{&semaphore, &reserved, 1};
+        return from_hrx(
+            hrx_queue_copy(static_cast<hrx_device_t>(device_),
+                           static_cast<hrx_queue_affinity_t>(
+                               stream_affinity_[consumer.index]),
+                           &waits, &signals,
+                           reinterpret_cast<hrx_buffer_t>(src.handle),
+                           src.offset + src_offset,
+                           reinterpret_cast<hrx_buffer_t>(dst.handle),
+                           dst.offset + dst_offset, bytes),
+            "hrx_queue_copy");
+      });
 #endif
 }
 

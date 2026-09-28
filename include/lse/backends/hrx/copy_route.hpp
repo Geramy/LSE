@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include "lse/backend/backend.hpp"
 namespace lse::backend::detail {
 // Residency is the non-recycled token Backend::init assigns to this instance,
@@ -12,5 +13,22 @@ inline bool own_single_device_copy(DeviceIndex owner, unsigned physical_count,
   return owner.bound() && physical_count == 1 && src.residency == owner &&
          dst.residency == owner && src.member < stream_count &&
          dst.member < stream_count;
+}
+
+// A timeline covers submitted work, not the stream's open command buffer.
+// Submit both sides before reserving the copy's consumer point.
+template <class Point, class Flush, class Read, class Reserve, class Copy>
+Status submit_ordered_copy(std::uint32_t producer, std::uint32_t consumer,
+                           Flush&& flush, Read&& read, Reserve&& reserve,
+                           Copy&& copy) {
+  LSE_RETURN_IF_ERROR(flush(producer));
+  if (consumer != producer) LSE_RETURN_IF_ERROR(flush(consumer));
+  LSE_ASSIGN_OR(Point after, read(producer));
+  LSE_ASSIGN_OR(Point on, read(consumer));
+  LSE_ASSIGN_OR(std::uint64_t reserved, reserve(consumer));
+  const std::array<Point, 2> waits{after, on};
+  return copy(std::span<const Point>(waits.data(),
+                                    consumer == producer ? 1u : 2u),
+              on, reserved);
 }
 } // namespace lse::backend::detail
