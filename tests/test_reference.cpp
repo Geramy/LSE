@@ -780,7 +780,8 @@ LSE_TEST(an_elementwise_chain_becomes_one_kernel) {
 }
 
 int main() {
-  // f32 lemonseed dumps. WMMA multiplies in f16 and would miss 1e-5.
-  ::setenv("LSE_WMMA", "0", 1);
+  // The reference dumps use FP32 arithmetic.
+  if (auto* scheduler = default_scheduler())
+    scheduler->set_mode(Scheduler::Mode::kHostOnly);
   return ::lse::test::run_all();
 }

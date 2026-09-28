@@ -59,7 +59,7 @@ inline std::string kernel(const backend::LoomBody& b) {
 inline Result<graph::EmittedKernel> projection(const char* arch,int bits,bool disable_mixed=false) {
  using namespace graph;
  auto leaf=[](Shape shape,DType dtype){auto n=std::make_shared<Node>();n->shape=shape;n->dtype=dtype;return Array(n);};
- auto result=quant_linear(leaf({3,64},DType::kF32),leaf({17,64*bits/32},DType::kU32),leaf({17,1},DType::kBF16),leaf({17,1},DType::kBF16),bits,64);
+ auto result=quant_linear(leaf({1,64},DType::kF32),leaf({17,64*bits/32},DType::kU32),leaf({17,1},DType::kBF16),leaf({17,1},DType::kBF16),bits,64);
  backend::DeviceInfo device;device.arch=arch;device.compute_units=64;device.max_threads_per_workgroup=1024;device.wavefront_size=32;device.lds_bytes_per_workgroup=65536;
  backend::AmdDeviceInfo amd;backend::apply_arch_defaults(device,amd);if(disable_mixed)amd.has_dot4_iu8=false;
  device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;

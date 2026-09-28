@@ -92,7 +92,7 @@ LSE_TEST(q6_prefill_fallback_preserves_architecture_and_staging_contracts) {
       f.inputs[2] = f.inputs[3] = Shape{17, 32};
     }
     if (reason == 7) f.device.lds_bytes_per_workgroup = 0;
-    LSE_EXPECT_EQ(p->plan(f.shapes).workgroup_count[1], 5u);
+    LSE_EXPECT_EQ(p->plan(f.shapes).workgroup_count[1], reason == 2 ? 3u : 5u);
   }
   // Indexed rows can select different matrices, so they cannot share weights.
   const auto* indexed = dynamic_cast<const KernelPrimitiveBase*>(

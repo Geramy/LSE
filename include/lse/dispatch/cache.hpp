@@ -1,20 +1,19 @@
 #pragma once
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
-#include "lse/kernels/quant_operand_policy.hpp"
+#include "lse/dispatch/quant.hpp"
+#include "lse/dispatch/attention.hpp"
 #include <vector>
 
-namespace lse::kernels {
-// Selection runs before the cache lookup: a generic quant_matmul node can
-// specialize to different registered implementations under one graph shape.
-// Normalization also specializes its launch geometry, so its selected implementation
-// must invalidate both persistent kernels and cached emission metadata.
-// Names are registered implementation identities; a new strategy/revision must
-// have a distinct name. Cost samples themselves never enter this fingerprint.
-[[nodiscard]] inline std::uint64_t quant_operand_specialization_key(
+namespace lse::dispatch {
+[[nodiscard]] inline std::uint64_t specialization_cache_key(
     std::uint64_t key, const graph::FusionGroup& group,
     const backend::DeviceInfo& device, graph::kir::TypeTable types,
     const graph::DialectSourceTable& intrinsics) {
+  key ^= implementation_id("dispatch.tables.v1");
+  key *= 1099511628211ull;
+  key ^= kTableRevision;
+  key *= 1099511628211ull;
   std::vector<Shape> inputs;
   std::vector<DType> dtypes;
   for (const auto& node : group.nodes) {
@@ -33,29 +32,34 @@ namespace lse::kernels {
     probe.output=node->shape; probe.output_dtype=node->dtype;
     probe.attrs=node->attrs; probe.iattrs=node->iattrs;
     probe.device=&device; probe.types=types; probe.intrinsics=&intrinsics;
-    // A phase owns a virtual row walk, unlike the standalone cooperative
-    // RMS launch. Version its identity independently so previously cached
-    // physical-block-indexed phase bodies cannot be reused after this fix.
     if (node->kind == graph::OpKind::kRMS && group.is_phase) {
-      key ^= quant_operand_implementation_id("rms_norm.phase-row-walk.v1");
+      key ^= implementation_id(phase_cooperative_rms_supported(probe)
+          ? "rms_norm.phase-cooperative.v1" : "rms_norm.phase-scalar.v1");
       key *= 1099511628211ull;
       continue;
     }
-    // Standalone wave-indexed normalization cannot consume virtual phase rows.
     if (node->kind == graph::OpKind::kL2Norm && group.is_phase) {
-      key ^= quant_operand_implementation_id("l2_normalize.phase-scalar.v1");
+      key ^= implementation_id("l2_normalize.phase-scalar.v1");
       key *= 1099511628211ull;
       continue;
+    }
+    if (node->kind == graph::OpKind::kQuantMatMul) {
+      const auto plan = quant_plan(probe, inputs.size() != 4);
+      auto mix = [&](std::uint64_t value) { key ^= value; key *= 1099511628211ull; };
+      mix(static_cast<std::uint64_t>(plan.implementation));
+      mix(plan.int8_activations);
+      mix(plan.rotate_decode_panel);
+      mix(plan.decode_columns);
+      mix(plan.prefill_rows);
+      if (plan.matrix) mix(implementation_id(plan.matrix->key));
     }
     const auto* chosen=primitive->specialize(probe);
     if ((node->kind == graph::OpKind::kRMS ||
          node->kind == graph::OpKind::kL2Norm) && group.outputs.size() != 1)
       chosen=primitive;
-    // Attention implementations can change with process-latched policy
-    // without changing the graph signature. Fingerprint the selected body.
-    key ^= quant_operand_implementation_id(chosen ? chosen->name() : "unavailable");
+    key ^= implementation_id(chosen ? chosen->name() : "unavailable");
     key *= 1099511628211ull;
   }
   return key;
 }
-}  // namespace lse::kernels
+}  // namespace lse::dispatch

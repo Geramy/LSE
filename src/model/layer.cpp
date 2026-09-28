@@ -527,11 +527,6 @@ Result<Array> WeightBinder::bind_quantized(
   planes->bits = spec.bits;
   planes->group_size = spec.group_size;
   planes->in_features = sliced_in;
-  // Whole output-row selections/reorders apply the same order to all three
-  // planes, preserving K/groups and the per-output affine dot. Feature windows
-  // and expert stacks are outside this profile.
-  if (rank == 2 && window.empty() && spec.bits == 4 && spec.group_size == 64)
-    planes->compute_profile_revision = compute_profile_revision_;
   a.node()->quant = std::move(planes);
 
   claimed_.emplace_back(name);

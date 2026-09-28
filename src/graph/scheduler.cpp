@@ -1242,49 +1242,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           const opt::DeviceCapacity cap =
               opt::DeviceCapacity::of(backend().device_info());
           const opt::FusionVerdict v = opt::admit_fusion(cap, cand);
-          // OCCUPANCY YOU CANNOT REACH IS NOT OCCUPANCY YOU LOSE.
-          //
-          // admit_fusion refuses a merge that seats fewer workgroups per LDS
-          // pool, and for a contraction it is right: profiled, the two big
-          // ones run 640- and 2176-workgroup grids, which fill every seat the
-          // part has several times over, so halving the seats halves the work
-          // in flight. That is the prefill regression the gate was built for.
-          //
-          // It is NOT right for a grid too small to fill the seats once. The
-          // small phase kernels here run 20 workgroups at 4.8-8.2 us, against
-          // a 6.44 us launch -- the launch costs more than the kernel -- and
-          // the seats a merge would give up are seats nothing was ever going
-          // to sit in.
-          //
-          // The grid comes from the emitter's own ThreadPlan, never from
-          // element counts: guessing outputs/threads read 20 workgroups for a
-          // kernel that launches 640, which let exactly the wrong merges
-          // through.
-          // OFF BY DEFAULT, and here is what it costs when it is on.
-          // Measured: 16 merges admitted this way, launches UNCHANGED at
-          // 37141, and throughput 20.8 -> 1.55 tok/s with `jit compile=0` and
-          // host scheduling at 0.295 s -- so the loss is pure execution, about
-          // 13x per merged kernel. Seats are not the only thing the refusal
-          // protects: the emitter may decline to give the merged body a GRID,
-          // and then every stage in the chunk runs on ONE workgroup. That
-          // property is not observable here, so until it is, this stays off.
-          static const bool seat_merge =
-              std::getenv("LSE_SEAT_MERGE") != nullptr;
-          bool admit = v.admit;
-          if (seat_merge && !admit && v.fused.workgroups_per_pool > 0 &&
-              cost.workgroups != 0) {
-            const backend::DeviceInfo& di = backend().device_info();
-            const std::uint32_t pools =
-                di.cus_per_lds_pool > 0
-                    ? static_cast<std::uint32_t>(di.compute_units) /
-                          di.cus_per_lds_pool
-                    : static_cast<std::uint32_t>(di.compute_units);
-            const std::uint64_t seats =
-                static_cast<std::uint64_t>(pools) *
-                v.fused.workgroups_per_pool;
-            if (seats != 0 && cost.workgroups <= seats) admit = true;
-          }
-          if (!admit) return false;
+          if (!v.admit) return false;
         }
         prev.nodes.push_back(n);
         prev.outputs.push_back(n);
@@ -1697,16 +1655,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           break;
         }
         alias_ready_reshapes(g);
-        // LSE_SERIAL_STREAMS=1: drain the device after every group — the
-        // bluntest possible ordering, for separating a cross-stream ordering
-        // hole from everything else. Diagnostic only.
-        static const bool serial_streams =
-            std::getenv("LSE_SERIAL_STREAMS") != nullptr;
-        if (serial_streams) {
-          if (const Status drained = backend().synchronize(); !drained.ok()) {
-            return drained;
-          }
-        }
         if (on.index < stream_count) impl_->outstanding[on.index] = 1;
         if (split.empty()) {
           ++trace_.device_groups;

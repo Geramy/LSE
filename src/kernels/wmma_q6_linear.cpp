@@ -1,7 +1,7 @@
 // Measured floating-operand matrix contraction over unchanged MLX affine Q6.
 // Weight storage remains packed; staged operands feed the measured matrix core.
 #include "lse/graph/kernel_args.hpp"
-#include "lse/kernels/quant_operand_policy.hpp"
+#include "lse/dispatch/quant.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/math/fp8.hpp"
 #include "lse/quant/group_affine_codec.hpp"
@@ -60,9 +60,6 @@ struct Args {
   env::In<lse::bf16, env::Emit> scales, biases;
   env::Out<kir::f32, env::Emit> out;
 };
-// A workgroup covers64x64 output values. Four waves each retain a32x32
-// quadrant, reusing two A and two B fragments across four accumulators.
-// Packed model storage is unchanged; only the staged operands are narrowed.
 std::string emit_staged_bf16(const KernelShapes &s, const Dims &d) {
   using Tile = Base<math::MatrixElem::kBF16>;
   using F = typename Tile::AFrag;
@@ -381,14 +378,6 @@ struct StagedBF16Kernel final : KernelPrimitive<StagedBF16Kernel> {
     return p;
   }
 };
-const KernelPrimitiveBase *select_staged_bf16(const KernelShapes &s) {
-  constexpr auto r = Base<math::MatrixElem::kBF16>::kRow;
-  if (!r.emittable() || !math::has_cap(device_matrix_caps(*s.device), r.cap) ||
-      s.intrinsics->find(r.key).empty())
-    return nullptr;
-  static const StagedBF16Kernel kernel;
-  return &kernel;
-}
 
 struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kernel> {
   static constexpr std::string_view kName = "quant_linear.q6_wmma_bf16_weight_residual2_vector_lds_v4";
@@ -426,29 +415,7 @@ struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kern
     return p;
   }
 };
-const KernelPrimitiveBase *select_staged_bf16_residual2(const KernelShapes &s) {
-  constexpr auto r = Base<math::MatrixElem::kBF16>::kRow;
-  if (!r.emittable() || !math::has_cap(device_matrix_caps(*s.device), r.cap) ||
-      s.intrinsics->find(r.key).empty())
-    return nullptr;
-  static const StagedBF16Residual2Kernel kernel;
-  return &kernel;
-}
 
-QuantOperandRequest residual_request(const KernelShapes &s, const Dims &d) {
-  return {s.device->arch,
-          s.device->wavefront_size,
-          6,
-          d.group,
-          d.m,
-          d.n,
-          d.k,
-          workgroup_lds_bytes(s.device),
-          true,
-          true,
-          false,
-          !s.staged.name.empty() || !s.staged_quant.codes.empty()};
-}
 template <math::MatrixElem T>
 struct ResidualKernel final : KernelPrimitive<ResidualKernel<T>> {
   static constexpr std::string_view kName =
@@ -464,16 +431,7 @@ struct ResidualKernel final : KernelPrimitive<ResidualKernel<T>> {
     const auto d = dims_of(s);
     if (!d.valid || !s.store || !s.types.scalar || !s.intrinsics)
       return {};
-    const auto request = residual_request(s, d);
-    QuantOperandDecision decision;
-    decision.operand =
-        T == math::MatrixElem::kFp8 ? QuantOperand::kE4M3 : QuantOperand::kE5M2;
-    decision.strategy = QuantOperandStrategy::kResidualThreeProduct;
-    decision.reason = OperandReason::kSelected;
-    decision.qualification = kQuantOperandProfile.qualification;
-    decision.ppl_scored_tokens = kQuantOperandProfile.ppl_scored_tokens;
-    return "// " + quant_operand_diagnostic(request, decision) + "\n" +
-           emit_residual<T>(s, d);
+    return emit_residual<T>(s, d);
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
     if (in.size() != 4 || in[1].rank() != 2 || !in[0].rank())
@@ -500,192 +458,18 @@ struct ResidualKernel final : KernelPrimitive<ResidualKernel<T>> {
     return p;
   }
 };
-template <math::MatrixElem T>
-QuantOperandKernel residual_descriptor(const KernelShapes &s) {
-  constexpr auto row = Base<T>::kRow;
-  const auto operand =
-      T == math::MatrixElem::kFp8 ? QuantOperand::kE4M3 : QuantOperand::kE5M2;
-  const bool matrix = row.emittable() &&
-                      math::has_cap(device_matrix_caps(*s.device), row.cap) &&
-                      !s.intrinsics->find(row.key).empty();
-  // The backend supplies the same conversion semantics to both dialects.
-  bool conversion = !s.intrinsics->find(math::Fp8Format<T>::pack_key).empty();
-  for (const auto key : math::Fp8Format<T>::value_keys)
-    conversion = conversion && !s.intrinsics->find(key).empty();
-  QuantOperandKernel kernel;
-  kernel.operand = operand;
-  kernel.strategy = QuantOperandStrategy::kResidualThreeProduct;
-  kernel.implementation_id =
-      quant_operand_implementation_id(ResidualKernel<T>::kName);
-  kernel.implementation_revision = 2;
-  kernel.implemented = true;
-  kernel.matrix_intrinsic = matrix;
-  kernel.conversion_intrinsic = conversion;
-  kernel.block_absmax_scaling = true;
-  kernel.fp32_exceptional_block_fallback = true;
-  kernel.lds_bytes = kResidualLdsBytes;
-  return kernel;
-}
-// Preserve the measured M256 candidate without treating a logit comparison as
-// model-quality evidence. The shared policy rejects it until a matched
-// perplexity comparison qualifies it; these shapes use the FP32 fallback.
-// Other widths retain their independently qualified implementation or scalar path.
-const KernelPrimitiveBase* select_m256_residual2(
-    const KernelShapes& s, const Dims& dims) {
-  struct Measured { uint32_t n, k; uint64_t vector_ns, residual2_ns; };
-  // Matched driver195 fixed-compiler host eval+retire means, eight samples.
-  static constexpr Measured records[] = {
-      {17408, 5120, 4958328, 6668635},
-      {5120, 17408, 4441641, 6269651}};
-  const Measured* record = nullptr;
-  for (const auto& row : records)
-    if (dims.m == 256 && row.n == dims.n && row.k == dims.k) record = &row;
-  if (!record || record->vector_ns >= record->residual2_ns) return nullptr;
-  QuantOperandOption option;
-  auto& kernel = option.kernel;
-  kernel.operand = QuantOperand::kBF16;
-  kernel.strategy = QuantOperandStrategy::kNative;
-  kernel.implementation_id =
-      quant_operand_implementation_id(StagedBF16Residual2Kernel::kName);
-  kernel.implementation_revision = 4;
-  kernel.implemented = true;
-  kernel.matrix_intrinsic = select_staged_bf16_residual2(s) != nullptr;
-  kernel.conversion_intrinsic = true;
-  kernel.fp32_exceptional_block_fallback = true;
-  kernel.lds_bytes = 24592;
-  auto& profile = option.profile;
-  profile.revision = 2;
-  profile.qualification = OperandQualification::kCandidate;
-  profile.preferred = QuantOperand::kBF16;
-  profile.strategy = QuantOperandStrategy::kNative;
-  profile.min_m = profile.max_m = 256;
-  profile.measured_cases = 20;
-  profile.absolute_error_pass = true;
-  profile.nonfinite_pass = true;
-  profile.perplexity_pass = false;
-  profile.performance_pass = true;
-  constexpr uint64_t cohort = 0x202609240001ull;
-  auto& cost = option.cost;
-  cost.arch = "gfx1201";
-  cost.wave = 32;
-  cost.bits = 6;
-  cost.group = 64;
-  cost.m = dims.m;
-  cost.n = dims.n;
-  cost.k = dims.k;
-  cost.cohort = cohort;
-  cost.samples = 8;
-  cost.cost_ns = record->vector_ns;
-  cost.accepted_profile_revision = profile.revision;
-  cost.implementation_id = kernel.implementation_id;
-  cost.implementation_revision = kernel.implementation_revision;
-  const std::array options{option};
-  const auto winner = rank_quant_operands(residual_request(s, dims), options,
-                                         cohort, OperandCostClock::kHostEvalRetire);
-  return winner.option == 0 ? select_staged_bf16_residual2(s) : nullptr;
-}
-} // namespace
-const graph::KernelPrimitiveBase *
-wmma_q6_linear_for(const graph::KernelShapes &s) {
-  const auto dims = dims_of(s);
-  const auto *global = std::getenv("LSE_WMMA");
-  if (!s.device || !s.intrinsics || !dims.valid ||
-      s.device->max_threads_per_workgroup < 128 ||
-      s.device->compute_units != 64 ||
-      (global && std::strcmp(global, "0") == 0))
+LSE_REGISTER_PRIMITIVE(StagedBF16Residual2Kernel);
+using Fp8ResidualKernel = ResidualKernel<math::MatrixElem::kFp8>;
+using Bf8ResidualKernel = ResidualKernel<math::MatrixElem::kBf8>;
+LSE_REGISTER_PRIMITIVE(Fp8ResidualKernel);
+LSE_REGISTER_PRIMITIVE(Bf8ResidualKernel);
+}  // namespace
+
+const graph::KernelPrimitiveBase* wmma_q6_linear_for(const graph::KernelShapes& s) {
+  if (dispatch::quant_plan(s).implementation != dispatch::QuantMatrix::kBF16)
     return nullptr;
-  if (dims.m == 256) return select_m256_residual2(s, dims);
-  const auto request = residual_request(s, dims);
-  // gfx1201 / driver 201, Qwen3.8-27B-MLX-6bit, pinned WikiText-2 test
-  // corpus SHA256 4d207d8fc8c7298a0489133e104c3e12ecee9c58f2c9828dec178725cd9f17b0:
-  // one warmup and two 512-token windows, 1022 actual targets. Scalar CE
-  // 2.204146 / PPL 9.0625; staged-BF16 CE 2.204130 / PPL 9.0624, with
-  // overlapping window-bootstrap CIs and identical token sequences. Both
-  // capture paths produced finite logits. Only the two M=512 FFN projections
-  // below were selected in the scoped run; M64, M1024 and other projections
-  // have no accepted model-quality record.
-  // Costs: eight post-warm, JIT-free retained-graph host eval+retire samples
-  // per shape on driver 201. GPU dispatch timestamps independently measured
-  // 7.040 and 6.722 ms for these two BF16 shapes.
-  struct Measured {
-    uint32_t m, n, k;
-    uint64_t bf16;
-  };
-  static constexpr Measured records[] = {
-      {512, 17408, 5120, 7270240},
-      {512, 5120, 17408, 6921953}};
-  const Measured *record = nullptr;
-  for (const auto &r : records)
-    if (r.m == dims.m && r.n == dims.n && r.k == dims.k)
-      record = &r;
-  if (!record)
-    return nullptr; // Unknown shapes and M1 retain the scalar path.
-  constexpr uint64_t cohort = 0x202609270001ull;
-  std::array<QuantOperandOption, 3> options{};
-  auto &bf16 = options[0];
-  bf16.kernel.operand = QuantOperand::kBF16;
-  bf16.kernel.strategy = QuantOperandStrategy::kNative;
-  bf16.kernel.implementation_id =
-      quant_operand_implementation_id(StagedBF16Kernel::kName);
-  bf16.kernel.implemented = true;
-  bf16.kernel.matrix_intrinsic = select_staged_bf16(s) != nullptr;
-  bf16.kernel.conversion_intrinsic = true; // Shared F32→BF16 cast lowering.
-  bf16.kernel.lds_bytes = 16384;
-  bf16.profile.preferred = QuantOperand::kBF16;
-  bf16.profile.strategy = QuantOperandStrategy::kNative;
-  bf16.profile.revision = 3;
-  bf16.profile.qualification = OperandQualification::kAccepted;
-  bf16.profile.ppl_scored_tokens = 1022;
-  bf16.profile.historical_bf16_ppl_1022_accepted = true;
-  bf16.profile.min_m = bf16.profile.max_m = 512;
-  bf16.profile.max_n = 32768;
-  bf16.profile.measured_cases = 16;
-  bf16.profile.absolute_error_pass = true;
-  bf16.profile.nonfinite_pass = true;
-  bf16.profile.perplexity_pass = true;
-  bf16.profile.performance_pass = true;
-  bf16.profile.run_qualification_candidate = false;
-  options[1].kernel = residual_descriptor<math::MatrixElem::kFp8>(s);
-  options[2].kernel = residual_descriptor<math::MatrixElem::kBf8>(s);
-  for (size_t i = 1; i < options.size(); ++i) {
-    options[i].profile.preferred = options[i].kernel.operand;
-    options[i].profile.strategy = QuantOperandStrategy::kResidualThreeProduct;
-    options[i].profile.run_qualification_candidate = false;
-    // Both implementations exist, but neither wins the measured throughput
-    // comparison. BF8 additionally fails the outlier quality qualification.
-    // Keep them ineligible until an accepted quality/performance record exists.
-    options[i].profile.performance_pass = false;
-  }
-  const uint64_t costs[] = {record->bf16, 0, 0};
-  for (size_t i = 0; i < options.size(); ++i) {
-    auto &c = options[i].cost;
-    c.arch = "gfx1201";
-    c.wave = 32;
-    c.bits = 6;
-    c.group = 64;
-    c.m = dims.m;
-    c.n = dims.n;
-    c.k = dims.k;
-    c.cohort = cohort;
-    c.samples = 8;
-    c.cost_ns = costs[i];
-    c.accepted_profile_revision = options[i].profile.revision;
-    c.implementation_id = options[i].kernel.implementation_id;
-    c.implementation_revision = options[i].kernel.implementation_revision;
-  }
-  const auto winner = rank_quant_operands(request, options, cohort,
-                                          OperandCostClock::kHostEvalRetire);
-  if (winner.option == 0)
-    return select_staged_bf16(s);
-  if (winner.option == 1) {
-    static const ResidualKernel<math::MatrixElem::kFp8> kernel;
-    return &kernel;
-  }
-  if (winner.option == 2) {
-    static const ResidualKernel<math::MatrixElem::kBf8> kernel;
-    return &kernel;
-  }
-  return nullptr;
+  static const StagedBF16Kernel kernel;
+  return &kernel;
 }
 
-} // namespace lse::kernels
+}  // namespace lse::kernels

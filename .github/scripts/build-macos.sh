@@ -127,7 +127,7 @@ tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_
   test_token_ids test_submission_tuner test_submission_constants test_submission_decode
   test_decode_sample test_loaded_runtime test_hrx_copy_route test_gdn_pair
   test_gdn_scheduler test_scheduler_epilogue test_inplace_owner test_loom_matrix test_loom_dot
-  test_fp8_conversion test_quant_operand_policy test_cooperative_rms)
+  test_fp8_conversion test_quant_dispatch test_sha256 test_cooperative_rms)
 cmake --build "$work/lse-build" --target lse lse-server compile_loom_matrix --parallel "$jobs"
 # The host suite must not discover a real GPU on a developer's machine.
 # Some tests enumerate the default backend, so give them a CPU-only build.
@@ -139,11 +139,11 @@ cmake -S "$work/source" -B "$work/host-tests" -G Ninja \
 cmake --build "$work/host-tests" --target "${tests[@]}" --parallel "$jobs"
 regex="$(IFS='|'; echo "${tests[*]}")"
 ctest --test-dir "$work/host-tests" --output-on-failure -R "^($regex)$"
-# This HRX-linked test uses CpuBackend allocations and simulated kernel results;
-# it never opens a GPU. It is not available in the CPU-only CMake configuration.
-cmake --build "$work/lse-build" --target test_matrix_probe_lifecycle test_q6_m256_profile test_tile_vector_load --parallel "$jobs"
+# These HRX-linked fixtures use CPU allocations or compile native shaders;
+# they do not open a GPU.
+cmake --build "$work/lse-build" --target test_matrix_probe_lifecycle test_quant_defaults test_q6_wmma test_tile_vector_load --parallel "$jobs"
 LSE_BACKEND=cpu ctest --test-dir "$work/lse-build" --output-on-failure \
-  -R '^test_(matrix_probe_lifecycle|q6_m256_profile|tile_vector_load)$'
+  -R '^test_(matrix_probe_lifecycle|quant_defaults|q6_wmma|tile_vector_load)$'
 python3 "$work/source/tests/test_server_cli.py" "$work/lse-build/lse-server"
 mkdir -p "$work/native-fixtures"
 "$work/lse-build/tests/compile_loom_matrix" "$work/native-fixtures"

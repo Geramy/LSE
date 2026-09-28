@@ -54,14 +54,31 @@ int main(){try{
  backend::HipEmitter hip;backend::LoomEmitter loom;
  for(IKernelEmitter* e:{static_cast<IKernelEmitter*>(&hip),static_cast<IKernelEmitter*>(&loom)}){
   selector.second=false;auto k1=e->cache_key(group,device);auto a=e->emit(group,device);require(a.ok(),"first emit failed");
-  // Same graph/profile, changed winner. These wrappers use the real Q6 body;
-  // this is a cache test, not FP8 execution or a performance measurement.
+  // Changing a selected implementation must invalidate cached emission.
   selector.second=true;auto k2=e->cache_key(group,device);auto b=e->emit(group,device);require(b.ok(),"second emit failed");
   require(k1!=k2,"persistent keys alias different selected implementation");
   require(a->dims.workgroup_size[0]!=b->dims.workgroup_size[0],"emission cache returned prior implementation plan");
   auto again=e->emit(group,device);require(again.ok()&&again->source==b->source,"same winner unstable");
   require(e->cache_key(group,device)==k2,"same winner persistent key unstable");
   selector.second=false;auto back=e->emit(group,device);require(back.ok()&&back->source==a->source,"return to first winner missed identity");
+ }
+ auto scalar_out=quant_linear(leaf({32,5120},DType::kF32),leaf({32,960},DType::kU32),
+                       leaf({32,80},DType::kBF16),leaf({32,80},DType::kBF16),6,64);
+ const NodePtr scalar_roots[]{scalar_out.node()};FusionGroup scalar_group;
+ for(auto& g:Partitioner::partition(scalar_roots))if(g.anchor==OpKind::kQuantMatMul)scalar_group=g;
+ require(!scalar_group.nodes.empty(),"scalar quant group absent");
+ for(IKernelEmitter* e:{static_cast<IKernelEmitter*>(&hip),static_cast<IKernelEmitter*>(&loom)}){
+  device.lds_bytes_per_workgroup=65536;
+  auto wide_key=e->cache_key(scalar_group,device);auto wide=e->emit(scalar_group,device);
+  require(wide.ok(),"wide scalar emit failed");
+  device.lds_bytes_per_workgroup=8192;
+  auto small_key=e->cache_key(scalar_group,device);auto small=e->emit(scalar_group,device);
+  require(small.ok(),"small scalar emit failed");
+  require(wide_key!=small_key,"scalar row plan aliases cache identity");
+  require(wide->source!=small->source,"scalar row plan returned old source");
+  device.lds_bytes_per_workgroup=65536;
+  auto replay=e->emit(scalar_group,device);
+  require(replay.ok()&&replay->source==wide->source,"restored scalar row plan missed identity");
  }
  std::puts("PASS HIP/Loom actual selected-implementation emission and persistent cache identities; no GPU");
 }catch(const std::exception&e){std::fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

@@ -1,8 +1,5 @@
 #include <array>
 #include <cmath>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <limits>
 
 #include "harness.hpp"
@@ -12,14 +9,10 @@
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
-#include "lse/kernels/quant_operand_cache.hpp"
+#include "lse/dispatch/cache.hpp"
 using namespace lse;
 using namespace lse::graph;
 namespace {
-bool enabled() {
-  const char* p = std::getenv("LSE_GDN_L2_WAVE32");
-  return p == nullptr || std::string_view(p) == "1";
-}
 Array leaf(Shape s, DType d = DType::kF32) {
   auto n = std::make_shared<Node>();
   n->shape = s;
@@ -51,7 +44,7 @@ struct Fixture {
     d.extension_id = backend::AmdDeviceInfo::kExtensionId;
     d.extension = &amd;
   }
-  void check(const FusionGroup& g, bool wave, std::string label = {}) {
+  void check(const FusionGroup& g, bool wave) {
     auto h = hip.emit(g, d), l = loom.emit(g, d);
     LSE_EXPECT(h.ok());
     LSE_EXPECT(l.ok());
@@ -68,28 +61,17 @@ struct Fixture {
         LSE_EXPECT_EQ(e->lds_bytes, 0u);
       }
     }
-    if (!label.empty())
-      if (const char* p = std::getenv("LSE_L2_DUMP_DIR")) {
-        std::filesystem::create_directories(p);
-        std::ofstream(std::filesystem::path(p) / (label + ".hip")) << h->source;
-        std::ofstream(std::filesystem::path(p) / (label + ".loom")) << l->source;
-        std::ofstream(std::filesystem::path(p) / (label + ".identity"))
-            << hip.cache_key(g, d) << '\n'
-            << loom.cache_key(g, d) << '\n'
-            << kernels::quant_operand_specialization_key(0, g, d, backend::loom_types(),
-                                                         backend::loom_sources())
-            << '\n';
-      }
+
   }
 };
 }  // namespace
 LSE_TEST(wave32_l2_exact_selection_and_fallback_contract) {
   Fixture f;
   auto g = solo(l2_normalize(leaf({1, 1, 16, 128}), 1e-6f));
-  f.check(g, enabled(), "key");
+  f.check(g, true);
   auto generic = l2_normalize(leaf({1, 1, 16, 128}));
   LSE_EXPECT(generic.node()->attrs[0] == 1e-12f);
-  f.check(solo(generic), enabled());
+  f.check(solo(generic), true);
   for (auto sh : {Shape{1, 1, 16, 127}, Shape{1, 1, 16, 129}, Shape{1, 1, 15, 128},
                   Shape{1, 2, 16, 128}, Shape{16, 128}})
     f.check(solo(l2_normalize(leaf(sh))), false);
@@ -136,7 +118,7 @@ LSE_TEST(wave32_l2_query_scale_epilogue_and_live_outputs) {
   for (auto& g : gs)
     if (g.anchor == OpKind::kL2Norm) {
       found = true;
-      f.check(g, enabled(), "query");
+      f.check(g, true);
       LSE_EXPECT(g.outputs.size() == 1 && g.outputs[0] == q.node());
       g.outputs = {n.node(), q.node()};
       f.check(g, false);
@@ -162,15 +144,6 @@ LSE_TEST(wave32_l2_phase_keeps_virtual_scalar_indexing) {
         auto l = f.loom.emit(g, f.d);
         LSE_EXPECT(!l.ok());
         if (!l.ok()) LSE_EXPECT(l.status().code() == StatusCode::kUnimplemented);
-        if (const char* path = std::getenv("LSE_L2_DUMP_DIR")) {
-          std::ofstream(std::filesystem::path(path) / "phase.identity")
-              << f.hip.cache_key(g, f.d) << '\n'
-              << f.loom.cache_key(g, f.d) << '\n'
-              << kernels::quant_operand_specialization_key(0, g, f.d, backend::loom_types(),
-                                                           backend::loom_sources())
-              << '\n';
-          if (h.ok()) std::ofstream(std::filesystem::path(path) / "phase.hip") << h->source;
-        }
         break;
       }
   }

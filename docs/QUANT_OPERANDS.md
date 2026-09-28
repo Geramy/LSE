@@ -22,19 +22,17 @@ operands must pass matched 1,024–2,048-scored-token perplexity qualification.
 No BF32 accumulator type is defined in this backend; existing floating-point
 accumulation remains FP32.
 
-Selection combines the affine storage contract, device capabilities, available
-intrinsics, workgroup resources, matched costs, and perplexity qualification.
-The measured gfx1201/64 CU profile covers group64 Q6 with F32 activations and
-output, and BF16 scale/bias metadata. Four exact shapes have cost records:
-M64 or M512 with (N,K)=(17408,5120) or (5120,17408). Staged BF16 was fastest
-in those measurements. The two M512 FFN shapes select staged BF16 by default;
-M64 and other unaccepted profiles remain inactive. The accepted historical
-Qwen3.8-27B comparison measured PPL 9.062509 versus 9.062366 on 1,022 actual
-next-token targets; its original 1,024-target label counted input tokens. That
-historical result was explicitly accepted and is retained without rerunning it.
-New qualification uses 1,024–2,048 actual targets. Unknown shapes and
-single-token decode retain the existing floating-point implementation. No
-manual Q6 precision switch is needed.
+Selection lives in `src/dispatch/quant.cpp`, alongside the hardware and
+shape tables. The two gfx1201/wave32 M512 FFN shapes with group64 Q6, F32
+activations/output, and BF16 scale/bias use staged BF16. Q6 decode uses the
+four-column scalar body; scalar prefill reuses an eight-row activation panel
+at M32 or larger. Storage, intrinsics, and resource requirements are checked
+in dispatch. Model identity and quality measurements are not runtime inputs.
+
+The accepted historical Qwen3.8-27B comparison measured PPL 9.062509 versus
+9.062366 on 1,022 actual next-token targets; its original 1,024-target label
+counted input tokens. This accepted result is retained without another run.
+The standard for new model-quality comparisons is 1,024–2,048 actual targets.
 
 | M / N / K | FP8 E4M3 | BF8 E5M2 | Staged BF16 |
 |---|---:|---:|---:|
@@ -59,11 +57,9 @@ both the original scalar GPU path and the exceptional-block fallback. Its
 cause remains unverified despite the code object's requested NO_FLUSH mode.
 It is not counted as a passing arithmetic safety test.
 
-The selected implementation name participates in HIP/Loom emission and JIT
-identity. A profile cannot reuse a different operand implementation's cached
-code. Timing updates that preserve the selected implementation do not change
-that identity. The old manual `LSE_Q6_WMMA` qualification switch is retired.
+The selected implementation and dispatch table revision participate in
+HIP/Loom emission and JIT identity. FP8/BF8 and the BF16 residual body remain
+registered, without a default route or temporary precision switch.
 
-Q4 activation INT8 uses a separate qualified automatic checkpoint policy,
-with explicit diagnostic and exact overrides; see [INT8 policy](INT8_POLICY.md). Full model timings and reproduction
-details are in the [Mac performance report](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md).
+Q4 dispatch is documented in [INT8_POLICY.md](INT8_POLICY.md). Full model
+measurements are in the [Mac performance report](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_PERFORMANCE.md).

@@ -1,8 +1,6 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/epilogue_input.hpp"
-#include "lse/kernels/int8_policy.hpp"
-#include "lse/kernels/quant_operand_policy.hpp"
-#include "lse/kernels/quant_operand_cache.hpp"
+#include "lse/dispatch/cache.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -43,20 +41,10 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
     key.append(value);
   };
   text("loom");
-  number(4);  // identity includes the shared compute-operand and Q4 decode policies
-  number(static_cast<std::uint64_t>(kernels::activation_int8_policy()));
-  number(0x696e7438706f6c33ull);
-  number(kernels::q4_decode_exact_enabled());
-  number(kernels::quant_operand_cache_key(0));
-  number(kernels::quant_operand_specialization_key(0, group, device,
-                                                  loom_types(), loom_sources()));
+  number(5);
+  number(dispatch::specialization_cache_key(0, group, device,
+                                           loom_types(), loom_sources()));
   text(device.arch);
-  // Kernel selection overrides also distinguish persistent JIT identities.
-  // FLASH_SDPA and WMMA_MIN_M are latched by their kernels for the process.
-  for (const char* name : {"LSE_WMMA", "LSE_FLASH_SDPA", "LSE_WMMA_MIN_M"}) {
-    const char* value = std::getenv(name);
-    text(value != nullptr ? std::string_view(value) : std::string_view{});
-  }
   number(device.lds_bytes_per_workgroup);
   number(device.compute_units);
   number(device.max_threads_per_workgroup);

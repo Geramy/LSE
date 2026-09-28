@@ -3,9 +3,9 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/kernels/sdpa.hpp"
+#include "lse/dispatch/attention.hpp"
 #include "lse/math.hpp"
 #include "lse/backends/hrx/device_info.hpp"
-#include <cstdlib>
 
 #include <string>
 
@@ -36,10 +36,7 @@ struct SdpaArgs {
   env::Out<kir::f32, E> out;
 };
 
-// Decode keeps the baseline arithmetic order: one sequential Q.K FMA chain per
-// key, then each output channel walks the same keys for max, denominator, and
-// value accumulation. Sharing only the completed scores removes 2*Dv repeated
-// dots without narrowing operands or reassociating a reduction.
+// Shared scores preserve the sequential FP32 QK and value accumulation order.
 template <bool SharedExp>
 struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
   static constexpr std::string_view kName = SharedExp
@@ -51,38 +48,8 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
 
-  static bool supported(const KernelShapes &s) {
-    if (s.inputs.size() != 5 || !s.device || s.device->arch != "gfx1201" ||
-        s.device->max_threads_per_workgroup < kThreads ||
-        s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
-        s.inputs[2].rank() != 4 || s.inputs[4].rank() != 2)
-      return false;
-    if (s.input_dtypes.size() != 5 ||
-        (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0))
-      return false;
-    for (auto dtype : s.input_dtypes)
-      if (dtype != DType::kF32)
-        return false;
-    const auto &q = s.inputs[0];
-    const auto &keys = s.inputs[1];
-    const auto &values = s.inputs[2];
-    const auto &table = s.inputs[4];
-    const auto block = keys.dim(2), stride = table.dim(1);
-    if (q.dim(0) <= 0 || q.dim(1) <= 0 || q.dim(2) != 1 || q.dim(3) != 256 ||
-        keys.dim(0) <= 0 || keys.dim(1) <= 0 || keys.dim(3) != 256 ||
-        values != keys || q.dim(1) % keys.dim(1) || table.dim(0) < q.dim(0) ||
-        block < 2 || block > 256 ||
-        !is_pow2(static_cast<std::uint32_t>(block)) || stride <= 0 ||
-        stride > 8192 / block || s.iattrs[3] != block ||
-        s.inputs[3].elem_count() < static_cast<std::size_t>(kv::step_meta_elems(
-                                       static_cast<std::int32_t>(q.dim(0)))))
-      return false;
-    return static_cast<std::uint64_t>(stride * block) * sizeof(float) <=
-           workgroup_lds_bytes(s.device);
-  }
-
   std::string emit_kernel(const KernelShapes &s) const override {
-    if (!supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
+    if (!dispatch::shared_decode_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
     const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
@@ -137,9 +104,7 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
         return e.u32(1) == e.u32(1);
       if (s.iattrs[0] == 1)
         return j <= offset;
-      // j < capacity <= 8192, and supported() requires a nonnegative i32
-      // window, so this equivalent addition cannot overflow u32. Subtracting
-      // indices instead exposes wrap to Loom despite the causal guard.
+      // Dispatch bounds make key + window nonwrapping.
       return j <= offset &&
              j + static_cast<std::uint32_t>(s.iattrs[1]) > offset;
     };
@@ -214,20 +179,12 @@ using DecodeSdpaKernelBase = DecodeSdpaKernel<false>;
 using DecodeSdpaKernelSharedExp = DecodeSdpaKernel<true>;
 LSE_REGISTER_PRIMITIVE(DecodeSdpaKernelBase);
 LSE_REGISTER_PRIMITIVE(DecodeSdpaKernelSharedExp);
-const DecodeSdpaKernelBase kDecodeShared{};
 const DecodeSdpaKernelSharedExp kDecodeSharedExp{};
 
 
-// Opt-in decode partitions retain FP32 operands and local sums. Each output
-// record holds (maximum, denominator, unnormalized value numerator[256]); a
-// separate barrier primitive rescales and combines those records stably.
+// Partition records contain (maximum, denominator, FP32 value numerator[256]).
 constexpr std::uint32_t kSplitKeys = 128;
 constexpr std::uint32_t kSplitRecord = 258;
-
-static bool split_decode_sdpa_supported(const KernelShapes& s) {
-  return DecodeSdpaKernelBase::supported(s) && s.device->wavefront_size == 32 &&
-         s.output_dtype == DType::kF32;
-}
 
 struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
   static constexpr std::string_view kName = "attention.decode_partial128.v1";
@@ -237,11 +194,11 @@ struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
-    return split_decode_sdpa_supported(s) ? this : nullptr;
+    return dispatch::split_decode_supported(s) ? this : nullptr;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!split_decode_sdpa_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
+    if (!dispatch::split_decode_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
     const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
@@ -345,12 +302,7 @@ struct SplitDecodeMerge final : KernelPrimitive<SplitDecodeMerge> {
   std::size_t arity() const noexcept override { return 1; }
   bool owns_indexing() const noexcept override { return true; }
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (s.inputs.size() != 1 || s.inputs[0].rank() != 4 ||
-        s.inputs[0].dim(0) <= 0 || s.inputs[0].dim(1) <= 0 ||
-        s.inputs[0].dim(2) <= 0 || s.inputs[0].dim(2) > 64 || s.inputs[0].dim(3) != kSplitRecord ||
-        s.input_dtypes.size() != 1 || s.input_dtypes[0] != DType::kF32 ||
-        s.output_dtype != DType::kF32 || !s.device || s.device->arch != "gfx1201" ||
-        s.device->max_threads_per_workgroup < 256 || !s.types.scalar || !s.intrinsics || !s.store)
+    if (!dispatch::split_decode_merge_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(2));
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
@@ -410,11 +362,11 @@ struct SplitDecodePartialWg128C2 final : KernelPrimitive<SplitDecodePartialWg128
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
-    return split_decode_sdpa_supported(s) ? this : nullptr;
+    return dispatch::split_decode_supported(s) ? this : nullptr;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!split_decode_sdpa_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
+    if (!dispatch::split_decode_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
     const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
@@ -518,12 +470,7 @@ struct SplitDecodeMergeWg128C2 final : KernelPrimitive<SplitDecodeMergeWg128C2> 
   std::size_t arity() const noexcept override { return 1; }
   bool owns_indexing() const noexcept override { return true; }
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (s.inputs.size() != 1 || s.inputs[0].rank() != 4 ||
-        s.inputs[0].dim(0) <= 0 || s.inputs[0].dim(1) <= 0 ||
-        s.inputs[0].dim(2) <= 0 || s.inputs[0].dim(2) > 64 || s.inputs[0].dim(3) != kSplitRecord ||
-        s.input_dtypes.size() != 1 || s.input_dtypes[0] != DType::kF32 ||
-        s.output_dtype != DType::kF32 || !s.device || s.device->arch != "gfx1201" ||
-        s.device->max_threads_per_workgroup < 256 || !s.types.scalar || !s.intrinsics || !s.store)
+    if (!dispatch::split_decode_merge_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(2));
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
@@ -580,21 +527,7 @@ struct SplitDecodeMergeWg128C2 final : KernelPrimitive<SplitDecodeMergeWg128C2> 
 LSE_REGISTER_PRIMITIVE(SplitDecodePartialWg128C2);
 LSE_REGISTER_PRIMITIVE(SplitDecodeMergeWg128C2);
 
-// One thread per output [B, Hq, Tq, Dv]. Recomputes the key dots for softmax;
-// S is small on the generate path (prefill tokens or cached length).
-//
-// Two forms, chosen by the input count:
-//
-//   3 or 4 inputs — k/v are one contiguous [B, Hkv, S, Dh] span per sequence.
-//   5 inputs      — k/v are pools [blocks, Hkv, block_size, Dh] and the block
-//                   table says which block holds each position.
-//
-// The paged form is what takes the sequence length out of the address
-// arithmetic: the row stride becomes `block_size`, a literal, and the varying
-// part becomes a looked-up origin. The length survives only as the softmax trip
-// count, which is an outermost loop bound — the one place ir::verify lets a
-// runtime extent appear. The scan order over positions is unchanged, so a paged
-// read and a contiguous read of the same logical KV produce the same bits.
+// Scalar attention supports contiguous (3/4 inputs) and paged (5 inputs) KV.
 struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
   static constexpr std::string_view kName = "attention";
   static constexpr std::string_view kEntry = "lse_sdpa";
@@ -602,22 +535,13 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
 
   std::size_t arity() const noexcept override { return 3; }
 
-  // A prefill pass has query rows to share a key across; this one does not,
-  // and recomputing the score per output channel is what it costs.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
-    static const bool shared = [] {
-      const char* value = std::getenv("LSE_SHARED_SCORE_SDPA");
-      return value == nullptr || std::string_view(value) != "0";
-    }();
-    static const bool shared_exp = [] {
-      const char* value = std::getenv("LSE_SHARED_EXP_SDPA");
-      return value == nullptr || std::string_view(value) != "0";
-    }();
-    if (shared && DecodeSdpaKernelBase::supported(s)) {
-      if (shared_exp) return &kDecodeSharedExp;
-      return &kDecodeShared;
+    switch (dispatch::attention_plan(s)) {
+      case dispatch::AttentionPlan::kSharedExp: return &kDecodeSharedExp;
+      case dispatch::AttentionPlan::kFlash8:
+      case dispatch::AttentionPlan::kFlash12: return flash_sdpa_for(s);
+      case dispatch::AttentionPlan::kScalar: return this;
     }
-    if (const KernelPrimitiveBase* f = flash_sdpa_for(s)) return f;
     return this;
   }
 
@@ -653,10 +577,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     std::uint32_t stride = 0;
     if (paged) {
       if (s.inputs[4].rank() < 2) return {};
-      // The descriptor carries a pair per row of this pass. A narrower one is a
-      // caller that built it for a different batch, which would silently read
-      // another row's position, so it is a mismatch rather than a shape to
-      // adapt to.
+      // The descriptor must contain each row's offset and length.
       if (s.inputs[3].elem_count() <
           static_cast<std::size_t>(
               kv::step_meta_elems(static_cast<std::int32_t>(bsz)))) {
@@ -664,13 +585,9 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
       }
       stride = static_cast<std::uint32_t>(s.inputs[4].dim(s.inputs[4].rank() - 1));
       const auto want = static_cast<std::uint32_t>(s.iattrs[3]);
-      // The pool's own third dimension is the authority on the block size; a
-      // node that disagrees with the buffer it points at is a mismatch, not a
-      // reason to pick one.
+      // The node block size must agree with its pool.
       if (stride == 0 || want != ts) return {};
-      // Power of two required: `pos / block_size` and `pos % block_size` are
-      // then a shift and a mask rather than an integer divide in the address
-      // chain. See kv/block.hpp.
+      // Paged addressing requires a power-of-two block size.
       if (!is_pow2(ts)) return {};
     }
 
@@ -686,14 +603,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     const auto kh = e.let(h / group);
     const auto qb0 = e.let(((b * qh + h) * tq + qi) * dh);
 
-    // Where this row's queries sit and how much KV is behind them.
-    //
-    // Paged: the row's own pair out of the step descriptor. A batch is a set of
-    // sequences at different absolute positions, so one shared offset would put
-    // the causal mask and the softmax bound of every row but one somewhere
-    // else. Both values are ordinary loads reaching only guards.
-    //
-    // Contiguous: one offset for the pass, which is all a single sequence has.
+    // Paged metadata is per row; contiguous metadata is one pass offset.
     kir::Val<kir::u32> offset = e.u32(baked_off);
     kir::Val<kir::u32> row_len = e.u32(0);
     if (paged) {
@@ -860,7 +770,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     const std::uint32_t threads =
-        s.device && s.device->max_threads_per_workgroup >= 256 ? 256u : 64u;
+        dispatch::scalar_threads(s);
     const auto elems = static_cast<std::uint32_t>(s.output.elem_count());
     tp.workgroup_size[0] = threads;
     tp.workgroup_count[0] = elems == 0 ? 1u : (elems + threads - 1) / threads;
@@ -878,13 +788,7 @@ struct KvPageWriteArgs {
   env::Out<kir::f32, E> out;
 };
 
-// Writes src [rows, Hkv, T, W] into the pool dst [blocks, Hkv, block_size, W]
-// at each row's own absolute position, following that row's block table.
-// Threads cover src only; pool bytes outside the positions written stay put.
-//
-// The paged counterpart of overwrite_slice: there the destination offset was
-// `pos` with coefficient 1 against a baked capacity stride; here the capacity
-// stride is gone and `pos` selects both a block and a slot inside it.
+// Write each row to its absolute paged KV position; leave other pool bytes intact.
 struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
   static constexpr std::string_view kName = "kv_page_write";
   static constexpr std::string_view kEntry = "lse_kv_page_write";
@@ -974,7 +878,7 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     const std::uint32_t threads =
-        s.device && s.device->max_threads_per_workgroup >= 256 ? 256u : 64u;
+        dispatch::scalar_threads(s);
     const auto elems = s.inputs.size() > 1
                            ? static_cast<std::uint32_t>(s.inputs[1].elem_count())
                            : 1u;

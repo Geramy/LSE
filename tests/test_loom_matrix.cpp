@@ -1,4 +1,3 @@
-#include "lse/kernels/int8_policy.hpp"
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_print.hpp"
@@ -144,7 +143,7 @@ LSE_TEST(loom_matrix_availability_does_not_requantize_q6_or_q8) {
   const auto types = backend::loom_types();
   const DType dtypes[] = {DType::kF32, DType::kU32, DType::kBF16, DType::kBF16};
   for (int bits : {4, 6, 8})
-    for (int m : {16, 64}) {
+    for (int m : {1, 32, 512}) {
       const Shape inputs[] = {Shape{m, 64}, Shape{32, 64 * bits / 32},
                               Shape{32, 1}, Shape{32, 1}};
       graph::KernelShapes s;
@@ -157,7 +156,7 @@ LSE_TEST(loom_matrix_availability_does_not_requantize_q6_or_q8) {
       s.intrinsics = &sources;
       s.types = types;
       const auto *specialized = kernels::wmma_quant_linear_for(s);
-      if (bits == 4 && kernels::activation_int8_enabled())
+      if (bits == 4 && m == 512)
         LSE_EXPECT(specialized != nullptr);
       else
         LSE_EXPECT(specialized == nullptr);

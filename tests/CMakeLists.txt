@@ -128,14 +128,6 @@ endif()
 if(TARGET lse_backend_hrx)
   lse_add_test(test_jit lse_graph lse_backends)
   lse_add_test(test_sq_profiler lse_backend_hrx)
-  lse_add_test(test_automatic_q4 lse_model lse_backend_hrx lse_graph lse_kernels lse_ir)
-  foreach(policy IN ITEMS 0 1 true)
-    add_test(NAME test_automatic_q4_${policy} COMMAND ${CMAKE_COMMAND} -E env
-      LSE_HRX_INT8=${policy} LSE_Q4_DECODE_EXACT=0 $<TARGET_FILE:test_automatic_q4>)
-  endforeach()
-  add_test(NAME test_automatic_q4_exact_override COMMAND ${CMAKE_COMMAND} -E env
-    --unset=LSE_HRX_INT8 LSE_Q4_DECODE_EXACT=1 $<TARGET_FILE:test_automatic_q4>)
-
   # The measured kernel-occupancy census over the real decode GEMV shapes.
   # Host-only: loomc compiles for gfx1201 without a device, and the census is
   # occupancy arithmetic over the code object's measured resources.
@@ -295,35 +287,21 @@ if(TARGET lse_backend_cpu)
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 endif()
 
-# Tests of the existing approximate Q4 algorithms explicitly opt in. The
-# independent policy suite below exercises the default and both flag values.
-if(TEST test_jit)
-  set_property(TEST test_jit APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
+if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
+  lse_add_test(test_quant_defaults lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
-set_property(TEST test_loom_dot APPEND PROPERTY ENVIRONMENT "LSE_HRX_INT8=1")
-
-find_package(Python3 QUIET COMPONENTS Interpreter)
-if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC AND Python3_Interpreter_FOUND)
-  add_executable(test_int8_policy test_int8_policy.cpp)
-  target_link_libraries(test_int8_policy PRIVATE lse_backend_hrx lse_graph lse_kernels lse_ir)
-  target_include_directories(test_int8_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  lse_apply_common_flags(test_int8_policy)
-  add_test(NAME test_int8_policy COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_int8_policy.py $<TARGET_FILE:test_int8_policy>)
-endif()
-
-add_test(NAME test_loom_matrix_int8 COMMAND ${CMAKE_COMMAND} -E env
-  LSE_HRX_INT8=1 $<TARGET_FILE:test_loom_matrix>)
 
 lse_add_test(test_fp8_conversion lse_ir lse_graph)
 if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
   lse_add_test(test_fp8_conversion_native lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
 
-add_executable(test_quant_operand_policy test_quant_operand_policy.cpp)
-target_include_directories(test_quant_operand_policy PRIVATE ${PROJECT_SOURCE_DIR}/include)
-lse_apply_common_flags(test_quant_operand_policy)
-add_test(NAME test_quant_operand_policy COMMAND test_quant_operand_policy)
+lse_add_test(test_quant_dispatch lse_graph lse_kernels lse_ir)
+target_sources(test_quant_dispatch PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)
+lse_add_test(test_sha256)
 if(TARGET lse_backend_hrx)
   add_executable(test_quant_operand_cache test_quant_operand_cache.cpp)
   target_link_libraries(test_quant_operand_cache PRIVATE lse_backend_hrx lse_graph lse_kernels lse_ir)
@@ -331,9 +309,7 @@ if(TARGET lse_backend_hrx)
   add_test(NAME test_quant_operand_cache COMMAND test_quant_operand_cache)
 endif()
 
-# The Q6 WMMA suite only links the emitter when no HRX backend is built; it
-# needs a loomc compiler at runtime for its native compile checks, so it is
-# registered alongside the other LSE_HAVE_LOOMC-gated native tests.
+# Native compiler fixtures emit shaders without opening a GPU.
 if(TARGET lse_backend_hrx AND LSE_HAVE_LOOMC)
   lse_add_test(test_q6_wmma lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
@@ -383,7 +359,6 @@ else()
 endif()
 
 if(TARGET lse_backend_hrx)
-  lse_add_test(test_q6_m256_profile lse_backend_hrx lse_graph lse_kernels lse_ir)
   lse_add_test(test_tile_vector_load lse_backend_hrx lse_graph lse_kernels lse_ir)
 endif()
 

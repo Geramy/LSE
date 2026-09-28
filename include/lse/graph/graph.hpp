@@ -121,8 +121,6 @@ struct QuantPlanes {
   // Weights per row. The packed plane's own last axis counts lanes, so this is
   // the only place the logical width survives.
   std::int64_t in_features = 0;
-  // Immutable checkpoint qualification copied into quantized contraction nodes.
-  std::int32_t compute_profile_revision = 0;
 };
 
 class Node {

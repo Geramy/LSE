@@ -1,24 +1,10 @@
+// Tiled paged attention shares FP32 scores and carries online softmax state.
 #include <string_view>
-// Attention with the score computed once.
-//
-// The thread-per-output kernel beside this one gives every one of the Dv
-// threads of a row its own copy of the whole score vector, and a two-pass
-// softmax makes it compute that copy twice: the same Q.K dot is evaluated
-// 2*Dv times. At Dv 256 that is a five-hundred-fold arithmetic overhead, which
-// does not show on the generate path -- one query, a handful of keys -- and is
-// the entire prefill on a long prompt.
-//
-// Here a workgroup owns one (sequence, head, query tile). A score is computed
-// by one thread, published in LDS, and read by every thread that needs it, so
-// the arithmetic is the 2*S*Dh the algebra actually calls for. The softmax is
-// the running form: one pass over the keys carrying a max and a denominator,
-// rescaling the accumulator when a window raises the max.
-#include <cstdlib>
-#include <limits>
 #include <string>
 #include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/dispatch/attention.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -33,71 +19,10 @@ namespace math = lse::math;
 namespace {
 
 constexpr std::uint32_t kThreads = 256;
-// Query rows a workgroup carries. Every one of them reuses the key the window
-// already loaded, so this is what amortizes the KV read.
-// Query rows are a compile-time kernel property; gfx1201 prefill can use 12.
 constexpr std::uint32_t kDefaultQTile = 8;
-constexpr std::uint32_t kGfx1201PrefillQTile = 12;
-// Keys a window covers, one per thread: a thread owns a key for the score and
-// a channel for the accumulation, and neither mapping needs a cross-lane
-// primitive this IR does not have.
+constexpr std::uint32_t kPrefillQTile = 12;
 constexpr std::uint32_t kKWin = kThreads;
-
-constexpr bool is_pow2(std::uint32_t v) noexcept {
-  return v >= 2 && (v & (v - 1)) == 0;
-}
-
-struct Dims {
-  std::uint32_t bsz = 0, qh = 0, tq = 0, dh = 0, kvh = 0, ts = 0, dv = 0;
-  std::uint32_t group = 0, stride = 0, window = 0;
-  float scale = 0.0f;
-  int mask = 0;
-  bool valid = false;
-};
-
-Dims dims_of(const KernelShapes& s) {
-  Dims d;
-  // The paged form only. The contiguous form is the single-sequence path and
-  // carries no block table to walk.
-  if (s.inputs.size() != 5) return d;
-  if (s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
-      s.inputs[2].rank() != 4 || s.inputs[4].rank() < 2) {
-    return d;
-  }
-  const Shape& q = s.inputs[0];
-  const Shape& ksh = s.inputs[1];
-  const Shape& vsh = s.inputs[2];
-  d.bsz = static_cast<std::uint32_t>(q.dim(0));
-  d.qh = static_cast<std::uint32_t>(q.dim(1));
-  d.tq = static_cast<std::uint32_t>(q.dim(2));
-  d.dh = static_cast<std::uint32_t>(q.dim(3));
-  d.kvh = static_cast<std::uint32_t>(ksh.dim(1));
-  d.ts = static_cast<std::uint32_t>(ksh.dim(2));
-  d.dv = static_cast<std::uint32_t>(vsh.dim(3));
-  if (d.qh == 0 || d.kvh == 0 || d.qh % d.kvh != 0) return d;
-  if (d.dh == 0 || d.ts == 0 || d.dv == 0 || d.tq == 0) return d;
-  if (!is_pow2(d.ts) || kKWin % d.ts != 0) return d;
-  d.group = d.qh / d.kvh;
-  d.stride = static_cast<std::uint32_t>(s.inputs[4].dim(s.inputs[4].rank() - 1));
-  if (d.stride == 0 ||
-      d.stride > std::numeric_limits<std::uint32_t>::max() / d.ts) return d;
-  if (static_cast<std::uint32_t>(s.iattrs[3]) != d.ts) return d;
-  if (s.inputs[3].elem_count() <
-      static_cast<std::size_t>(
-          kv::step_meta_elems(static_cast<std::int32_t>(d.bsz)))) {
-    return d;
-  }
-  d.scale = s.attrs[0];
-  d.mask = s.iattrs[0];
-  d.window = static_cast<std::uint32_t>(s.iattrs[1]);
-  d.valid = true;
-  return d;
-}
-
-template <std::uint32_t QTile>
-std::uint32_t lds_floats(const Dims& d) {
-  return QTile * d.dh + 2u * QTile * kKWin + 4u * QTile;
-}
+using Dims = dispatch::FlashDims;
 
 template <class E>
 struct FlashArgs {
@@ -122,8 +47,8 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
   bool supports_epilogue() const noexcept override { return false; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    const Dims d = dims_of(s);
-    if (!d.valid || s.types.scalar == nullptr || s.intrinsics == nullptr ||
+    const Dims d = dispatch::flash_dimensions(s);
+    if (!dispatch::flash_supported(s, QTile) || s.types.scalar == nullptr || s.intrinsics == nullptr ||
         !s.store) {
       return {};
     }
@@ -158,9 +83,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
     const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
 
     const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
-    // A pass widened to a bucket carries rows that are not in the batch. They
-    // answer zero, the same as the kernel this replaces, rather than reading a
-    // block table row that belongs to nobody.
+    // Padded rows write zero without reading a block-table row.
     if (auto pad = e.when(b >= rows)) {
       for (std::uint32_t r = 0; r < QTile; ++r) {
         for (std::uint32_t p = 0; p < dpt; ++p) {
@@ -178,9 +101,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
         e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
               b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
     const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
-    // Metadata cannot extend a row beyond its bound block-table view.
-    // Clamp the loaded lengths, rather than asserting a bound they may not
-    // satisfy. This also makes dead windows provable to structured lowering.
+    // Clamp live metadata to the block-table capacity.
     const auto capacity = e.u32(d.stride * d.ts);
     const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
     const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
@@ -375,7 +296,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
-    const Dims d = dims_of(s);
+    const Dims d = dispatch::flash_dimensions(s);
     const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
     tp.workgroup_size[0] = kThreads;
     tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles : 1u;
@@ -385,7 +306,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
   }
 };
 using FlashSdpaKernel8 = FlashSdpaKernel<kDefaultQTile>;
-using FlashSdpaKernel12 = FlashSdpaKernel<kGfx1201PrefillQTile>;
+using FlashSdpaKernel12 = FlashSdpaKernel<kPrefillQTile>;
 LSE_REGISTER_PRIMITIVE(FlashSdpaKernel8);
 LSE_REGISTER_PRIMITIVE(FlashSdpaKernel12);
 
@@ -394,30 +315,12 @@ const FlashSdpaKernel12 kFlash12{};
 
 }  // namespace
 
-// Prefill only. One query row per workgroup would leave the key it loaded
-// unshared, so the tile has to be worth filling; the generate path is one row
-// against a long cache and stays on the kernel that streams it.
 const KernelPrimitiveBase* flash_sdpa_for(const KernelShapes& s) {
-  const Dims d = dims_of(s);
-  if (!d.valid) return nullptr;
-  // LSE_FLASH_SDPA=0: take the base kernel on a device that would have run
-  // flash — the path a smaller LDS budget takes for free, so a difference
-  // between the two is reproducible on the bigger part.
-  static const bool enabled = [] {
-    const char* v = std::getenv("LSE_FLASH_SDPA");
-    return v == nullptr || std::string_view(v) != "0";
-  }();
-  if (!enabled || s.device == nullptr ||
-      s.device->max_threads_per_workgroup < kThreads) return nullptr;
-  const auto lds_bytes = workgroup_lds_bytes(s.device);
-  if (s.device->arch == "gfx1201" &&
-      d.tq >= kGfx1201PrefillQTile &&
-      lds_floats<kGfx1201PrefillQTile>(d) * 4u <= lds_bytes) {
-    return &kFlash12;
+  switch (dispatch::attention_plan(s)) {
+    case dispatch::AttentionPlan::kFlash12: return &kFlash12;
+    case dispatch::AttentionPlan::kFlash8: return &kFlash8;
+    default: return nullptr;
   }
-  if (d.tq < kDefaultQTile ||
-      lds_floats<kDefaultQTile>(d) * 4u > lds_bytes) return nullptr;
-  return &kFlash8;
 }
 
 }  // namespace lse::kernels

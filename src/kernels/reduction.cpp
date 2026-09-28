@@ -1,13 +1,9 @@
-// Row-wise normalizations shared by device backends. RMSNorm specializes to
-// one cooperative workgroup per row where the target supports the required
-// scratch and barriers; the scalar forms remain the general fallback.
+// Row-wise normalization with cooperative and scalar implementations.
 #include <string>
-#include <limits>
 #include <array>
-#include <cmath>
-#include <cstdlib>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/dispatch/attention.hpp"
 
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
@@ -23,11 +19,6 @@ namespace math = lse::math;
 namespace {
 
 std::int64_t last_dim(const Shape& s) { return s.dim(s.rank() - 1); }
-
-bool usable(const KernelShapes& s) {
-  return !s.inputs.empty() && s.types.scalar != nullptr &&
-         s.intrinsics != nullptr && last_dim(s.inputs[0]) > 0;
-}
 
 // Sum of squares over the row this thread's element belongs to. Extents are
 // literals: shapes are already part of the JIT cache key.
@@ -45,8 +36,7 @@ kir::LValue<kir::f32> sum_of_squares(env::Emit& e,
 
 }  // namespace
 
-// These kernels are not self-indexing: they hand their element back through
-// `ret` and the emitter stores it, so `out` is bound but never written here.
+// Scalar kernels return an element through the emitter store hook.
 template <class E, class G = kir::f32>
 struct RmsNormArgs {
   env::In<kir::f32, E> x;
@@ -58,28 +48,6 @@ namespace {
 constexpr std::uint32_t kRmsBlock = 256;
 constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
 
-bool cooperative_rms_usable(const KernelShapes& s) {
-  if (s.inputs.size() != 2 || s.inputs[0].rank() == 0 || !usable(s) ||
-      s.input_dtypes.size() != 2 || s.inputs[1].rank() != 1 ||
-      s.output != s.inputs[0] || s.input_dtypes[0] != DType::kF32 ||
-      s.output_dtype != DType::kF32 || s.device == nullptr ||
-      s.device->max_threads_per_workgroup < kRmsBlock ||
-      backend::workgroup_lds_bytes(s.device) < kRmsScratch ||
-      !s.staged.name.empty() || !s.staged_quant.codes.empty()) return false;
-  const auto dtype = s.input_dtypes[1];
-  if (dtype != DType::kF32 && dtype != DType::kF16 && dtype != DType::kBF16)
-    return false;
-  const auto d = last_dim(s.inputs[0]);
-  if (d < 32 || s.inputs[1].elem_count() != static_cast<std::size_t>(d) ||
-      s.output.elem_count() == 0 ||
-      s.output.elem_count() > std::numeric_limits<std::uint32_t>::max() / sizeof(float))
-    return false;
-  for (std::string_view op : {"thread.local_id", "thread.workgroup_id.x",
-                              "barrier", "fma", "rsqrt"}) {
-    if (s.intrinsics->find(op).empty()) return false;
-  }
-  return true;
-}
 }  // namespace
 
 struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel> {
@@ -91,7 +59,7 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
   bool owns_indexing() const noexcept override { return true; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!cooperative_rms_usable(s) || !s.store) return {};
+    if (!dispatch::cooperative_rms_supported(s) || !s.store) return {};
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
     return with_elem(s.input_dtypes[1], [&]<class G>() -> std::string {
       kir::KernelBody k(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
@@ -116,9 +84,7 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
         }
         e.barrier();
       }
-      // Every lane has finished reading the row before any output store.
-      // Stores pass through the emitter hook so trailing elementwise work
-      // keeps its original index and the normal buffer-alias contract.
+      // All row reads precede stores; the hook preserves fused epilogues.
       const auto scale = e.let(math::rsqrt(
           sums[0].read() / static_cast<float>(d) + s.attrs[0]));
       for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
@@ -149,9 +115,7 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
 };
 LSE_REGISTER_PRIMITIVE(CooperativeRmsNormKernel);
 
-// scale = rsqrt(mean(x^2) + eps); out = x * scale * (bias + w[col]).
-// The host reference accumulates in fp64 and this in fp32; over 1024 terms
-// that stays inside the 1e-5 relative bound the differential tests hold to.
+// FP32 RMS reduction; zero-centered gains add one before scaling.
 struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
   static constexpr std::string_view kName = "rms_norm";
   static constexpr std::string_view kEntry = "lse_rms_norm";
@@ -163,12 +127,12 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
   }
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
     static const CooperativeRmsNormKernel cooperative;
-    if (cooperative_rms_usable(s)) return &cooperative;
+    if (dispatch::cooperative_rms_supported(s)) return &cooperative;
     return this;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!usable(s) || s.input_dtypes.size() < 2) return {};
+    if (!dispatch::reduction_row_supported(s) || s.input_dtypes.size() < 2) return {};
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
 
     return with_elem(s.input_dtypes[1], [&]<class G>() -> std::string {
@@ -201,7 +165,7 @@ struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     const std::uint32_t threads =
-        s.device && s.device->max_threads_per_workgroup >= 256 ? 256u : 64u;
+        dispatch::scalar_threads(s);
     const auto elems = static_cast<std::uint32_t>(s.output.elem_count());
     tp.workgroup_size[0] = threads;
     tp.workgroup_count[0] = (elems + threads - 1) / threads;
@@ -222,26 +186,6 @@ constexpr std::uint32_t kL2Head = 128;
 constexpr std::uint32_t kL2Block = 128;
 constexpr std::uint32_t kL2Rows = 16;
 
-bool wave32_l2_usable(const KernelShapes& s) {
-  static const bool enabled = [] {
-    const char* value = std::getenv("LSE_GDN_L2_WAVE32");
-    return value == nullptr || std::string_view(value) == "1";
-  }();
-  if (!enabled || !usable(s) || s.device == nullptr ||
-      s.device->arch != "gfx1201" || s.device->wavefront_size != kL2Wave ||
-      s.device->max_threads_per_workgroup < kL2Block ||
-      s.inputs.size() != 1 || s.input_dtypes.size() != 1 ||
-      s.input_dtypes[0] != DType::kF32 || s.output_dtype != DType::kF32 ||
-      s.inputs[0] != Shape{1, 1, kL2Rows, kL2Head} ||
-      s.output != s.inputs[0] || !std::isfinite(s.attrs[0]) ||
-      s.attrs[0] <= 0.0f || !s.staged.name.empty() ||
-      !s.staged_quant.codes.empty()) return false;
-  for (std::string_view op : {"thread.local_id", "thread.workgroup_id.x",
-                              "wave.shfl_xor", "fma", "sqrt", "max"}) {
-    if (s.intrinsics->find(op).empty()) return false;
-  }
-  return true;
-}
 }  // namespace
 
 // Each complete wave owns one head. Read all four elements per lane before
@@ -255,7 +199,7 @@ struct Wave32L2NormKernel final : KernelPrimitive<Wave32L2NormKernel> {
   bool owns_indexing() const noexcept override { return true; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!wave32_l2_usable(s) || !s.store) return {};
+    if (!dispatch::wave32_l2_supported(s) || !s.store) return {};
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
     L2NormArgs<env::Emit> a;
@@ -312,12 +256,12 @@ struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
   }
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
     static const Wave32L2NormKernel wave32;
-    if (wave32_l2_usable(s)) return &wave32;
+    if (dispatch::wave32_l2_supported(s)) return &wave32;
     return this;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!usable(s)) return {};
+    if (!dispatch::reduction_row_supported(s)) return {};
     const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
 
     kir::KernelBody k(s.types, *s.intrinsics);
@@ -365,7 +309,7 @@ struct SoftmaxKernel final : KernelPrimitive<SoftmaxKernel> {
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!usable(s)) return {};
+    if (!dispatch::reduction_row_supported(s)) return {};
     if (static_cast<std::size_t>(s.iattrs[0]) + 1 != s.inputs[0].rank()) {
       return {};
     }

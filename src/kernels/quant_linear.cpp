@@ -1,24 +1,3 @@
-// `quant_linear`: x [.., K] against a group-affine weight [N, K] that is never
-// materialized. One wave owns one output column and walks the packed plane in
-// chunks; each chunk's codes become weights in register through
-// quant::dequant_chunk and are consumed by the accumulator immediately. The
-// only global traffic is the packed lanes and one scale/bias pair per group,
-// which is the whole reason the weight is not widened at load.
-//
-// `quant_linear_indexed`: the same contraction against one matrix of a stack
-// [E, N, K], picked per token by `idx[row, slot]`. It is the quantized twin of
-// linear_indexed and shares every line of the body below — the expert only
-// moves where the plane is read from, exactly as it does in lds_linear.cpp,
-// where `linear` and `linear_indexed` differ by a single base term. MLX's
-// SwitchGLU stores 256 experts as one stacked tensor per projection, so
-// without this op a routed FFN has no contraction at all.
-//
-// Both ops carry two inner loops and pick between them on the live device.
-// The float codec turns every code into a weight with an fma; the integer path
-// (4 bits only) quantizes the activation once per workgroup and contracts the
-// codes with v_dot4_i32_iu8, spending no per-weight instruction on the scale
-// or the bias at all. quant/group_affine_codec.hpp carries the algebra, and
-// `dot_ok` below carries what a device must have for it.
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -27,7 +6,7 @@
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
-#include "lse/kernels/int8_policy.hpp"
+#include "lse/dispatch/quant.hpp"
 #include "lse/kernels/quant_panel.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
@@ -78,12 +57,6 @@ struct QuantDims {
   std::uint32_t slot = 0;
   bool valid = false;
 };
-
-// `indexed` selects the stacked form: five inputs, rank-3 planes, and the
-// geometry one place further along the int attrs because iattrs[0] is the
-// expert slot there. Every one of those attrs is mixed into the emitter's
-// device_fn_name, so a 6-bit expert and an 8-bit router in the same checkpoint
-// get different device functions without this file doing anything about it.
 QuantDims dims_of(const KernelShapes& s, bool indexed) {
   QuantDims d;
   const std::size_t want = indexed ? 5u : 4u;
@@ -140,9 +113,6 @@ QuantDims dims_of(const KernelShapes& s, bool indexed) {
     // One index row per output row, or `row * keep` walks off the end of a
     // buffer whose extent nothing else here constrains.
     if (static_cast<std::int64_t>(ix.elem_count()) != d.m * d.keep) return d;
-    // Buffer subscripts are u32 the whole way down. The 35B's down_proj stack
-    // is 2.7e8 lanes, comfortably inside; a stack that is not would silently
-    // wrap into another expert's codes.
     const std::int64_t plane_elems = d.experts * d.n * d.lanes;
     if (plane_elems > static_cast<std::int64_t>(0xffffffffll)) return d;
   }
@@ -158,18 +128,7 @@ bool device_fits(const KernelShapes& s) {
   }
   return device_extension<AmdDeviceInfo>(*s.device) != nullptr;
 }
-
-// No row cap, unlike linear.lds: that one hands shapes above a tile to WMMA,
-// and a packed plane has no matrix-core operand form to hand off to. Declining
-// here would put the contraction on the host, so the wave-per-column schedule
-// covers every row count — one workgroup row per token, which is a GEMV per
-// token during prefill. A tiled form that shares a decoded chunk across
-// several tokens is the improvement; correctness does not wait for it.
 bool shape_ok(const QuantDims& d) { return d.valid; }
-
-// Chunks a lane decodes per iteration. Consecutive weight rows start at
-// multiples of `lanes`, so the run has to divide that too or some row's block
-// straddles its natural alignment.
 std::uint32_t chunks_per_step(const QuantDims& d, std::uint32_t max_bytes) {
   const auto words = static_cast<std::uint32_t>(d.spec.words_per_chunk());
   const auto vals = static_cast<std::uint32_t>(d.spec.values_per_chunk());
@@ -219,30 +178,11 @@ struct QuantLinearIndexedArgs {
 
 template <class A>
 concept Indexed = requires(A& a) { a.idx; };
-
-// The activation, quantized, as the integer path reads it.
-//
-// `codes` is two dot4 operand words per chunk — one int8 per activation,
-// against the largest magnitude in the activation's own group. `scale` is that
-// group's step and `sum` the exact f32 sum of its activations, which is what
-// the weight's bias multiplies. 1.125 bytes per activation against the float
-// panel's 4, so this stages rows the float path has to read from global.
 struct DotActs {
   kir::Tile<kir::u32> codes;
   kir::Tile<kir::f32> scale;
   kir::Tile<kir::f32> sum;
 };
-
-// BANK-SWIZZLED indexing for the staged activation arrays.
-//
-// In the contraction each LANE owns a column and walks its own chunk, so
-// adjacent lanes read code words 8 apart and scale words 4 apart -- 4 and 8
-// of the 32 LDS banks, an 8-way and 4-way conflict on every read, once per
-// ROW. That serialization is the whole reason a 4-row pass cost double a
-// 2-row one (replicated standalone: 86/101/195 us for rows 1/2/4 unswizzled
-// against 86/87/87 swizzled, the weights at 512 GB/s throughout). Spreading
-// index i to i + i/32 staggers the banks; it costs one add per access and
-// one pad word per 32.
 inline std::uint32_t swz_words(std::uint32_t n) { return n + n / 32u + 1u; }
 inline kir::Val<kir::u32> swz(env::Emit& e, const kir::Val<kir::u32>& i) {
   return e.let(i + i / 32u);
@@ -259,16 +199,6 @@ std::uint32_t dot_lds_bytes(const QuantDims& d) {
       static_cast<std::uint32_t>(d.k / d.spec.values_per_chunk()),
       static_cast<std::uint32_t>(d.groups));
 }
-
-// How many K-SPLITS the staging runs in, or 0 when no split fits. The row
-// rung used to be capped by staging the WHOLE k per row -- at k=17408 four
-// rows of codes cannot exist in LDS at once, so m=4 fell to two rows per
-// workgroup and a second grid slice re-read all 44.6 MB of down-proj weights
-// every pass. Staging the chunks in halves (or quarters) keeps the register
-// accumulators across splits, restages between them, and reads the weights
-// once. The split must land on group boundaries so the per-group sum and
-// bias stay whole. Plan and body call this with the same arguments and must
-// agree exactly: it sets the scratch and the barrier count.
 std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
                           std::uint32_t budget) {
   const auto nchunks =
@@ -286,42 +216,14 @@ std::uint32_t dot_ksplits(const QuantDims& d, std::uint32_t rows,
   }
   return 0;
 }
-
-// Whether this device and this shape take the integer path.
-//
-// has_dot4_iu8 is the arch database's answer for the live device, so a part
-// without the instruction runs the float codec. Converting activations to
-// int8 also requires explicit process-wide accuracy-policy opt-in; hardware
-// support alone does not authorize the additional rounding.
-//
-// It has to be has_dot4_iu8 and not has_dot4_i8: the latter is the
-// same-signedness v_dot4_i32_i8, which RDNA2 and every CDNA also have, but
-// the mixed form this path emits is dot8-insts and exists only from RDNA3 on.
-// Gating on the wrong one opens the path on gfx1030/gfx90a/gfx942/gfx950,
-// where the emitted kernel does not compile at all.
 bool dot_ok(const KernelShapes& s, const QuantDims& d, std::uint32_t wave,
             std::uint32_t cpl) {
-  if (!activation_int8_enabled(s)) return false;
+  if (!dispatch::quant_plan(s).int8_activations) return false;
   if (!d.valid || d.spec.bits != quant::kDot4Bits) return false;
-  if (s.device == nullptr || s.intrinsics == nullptr) return false;
-  const AmdDeviceInfo* amd = device_extension<AmdDeviceInfo>(*s.device);
-  if (amd == nullptr || !amd->has_dot4_iu8) return false;
-  for (std::string_view sym : quant::kGroupAffineDotSymbols) {
-    if (s.intrinsics->find(sym).empty()) return false;
-  }
   const auto cpg = static_cast<std::uint32_t>(d.spec.group_size) /
                    static_cast<std::uint32_t>(d.spec.values_per_chunk());
-  // Two invariants the staging and the accumulator rest on: a lane's run of
-  // `cpl` chunks carries one integer accumulator and so must sit inside one
-  // group, and a group's chunks must be lanes of one wave for the shuffle
-  // reduction that finds its largest magnitude.
   return cpl <= cpg && cpg % cpl == 0 && cpg <= wave && kBlock % cpg == 0;
 }
-
-// Whether this body takes the integer path. Not the same question as
-// dot_ok(): reading a run's hoisted int8 panel costs this body no scratch at
-// all, so a shape whose own staging would not fit still takes the path when
-// the run staged it. emit_body decides it exactly this way.
 bool body_dot(const KernelShapes& s, const QuantDims& d) {
   if (!d.valid) return false;
   const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
@@ -332,24 +234,9 @@ bool body_dot(const KernelShapes& s, const QuantDims& d) {
   return quant_hoisted || budget == 0 || dot_lds_bytes(d) <= budget;
 }
 
-// Exact-FP32 prefill schedule for the validated gfx1201 layout. Indexed rows may name different
-// matrices, and externally staged panels have a caller-owned layout, so neither
-// can participate in this reuse path.
-// Four independent output columns reuse the activation stream without changing
-// either output's chunk order, fused rounding points, or wave reduction.
-std::uint32_t q6_decode_columns(const KernelShapes& s, const QuantDims& d,
+std::uint32_t q6_decode_columns(const KernelShapes& s, const QuantDims&,
                                 bool indexed) {
-  // The opted-in Q4 signed/unsigned dot4 decoder measured faster on gfx1201
-  // and passed the 1024-token M1 perplexity gate. Keep the exact-FP32 quad
-  // as the default without INT8 opt-in and as a diagnostic override.
-  const bool q4_quad = d.spec.bits == 4 &&
-                       (!activation_int8_enabled(s) || q4_decode_exact_enabled());
-  return d.valid && !indexed && d.m == 1 && d.n % 4 == 0 &&
-      (d.spec.bits == 6 || q4_quad) && d.spec.group_size == 64 &&
-      s.device != nullptr &&
-      s.device->arch == "gfx1201" && wave_of(s.device) == 32 &&
-      s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16 &&
-      s.staged.name.empty() && s.staged_quant.codes.empty() ? 4u : 1u;
+  return dispatch::quant_plan(s, indexed).decode_columns;
 }
 
 std::uint32_t q6_prefill_tile(std::uint32_t k, std::uint32_t rows) {
@@ -358,33 +245,10 @@ std::uint32_t q6_prefill_tile(std::uint32_t k, std::uint32_t rows) {
   return std::min(rows >= 8 ? 512u : 1024u, k);
 }
 
-std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims& d,
+std::uint32_t q6_prefill_rows(const KernelShapes& s, const QuantDims&,
                               bool indexed) {
-  if (!d.valid || indexed || d.m < 2 || d.spec.bits != 6 ||
-      d.spec.group_size != 64 || s.device == nullptr ||
-      s.device->arch != "gfx1201" || wave_of(s.device) != 32 ||
-      s.input_dtypes[0] != DType::kF32 ||
-      s.input_dtypes[2] != DType::kBF16 || !s.staged.name.empty() ||
-      !s.staged_quant.codes.empty()) return 1;
-  const auto k = static_cast<std::uint32_t>(d.k);
-  const auto budget = workgroup_lds_bytes(s.device);
-  if (d.m >= 32 && budget >= 8u * q6_prefill_tile(k, 8u) * 4u) return 8u;
-  const std::uint32_t rows = d.m >= 4 ? 4u : 2u;
-  return budget >= rows * q6_prefill_tile(k, rows) * 4u ? rows : 1u;
+  return dispatch::quant_plan(s, indexed).prefill_rows;
 }
-
-// Exactly the workgroup-shared arrays emit_body declares when it covers `rows`
-// rows, under exactly the same conditions and in the same order of decision.
-// The plan and the body cannot be allowed to disagree: this is the number a
-// fusion's residency is counted from, so a body that declares more than this is
-// admitted against a launch that never happens.
-//
-// A run that hoists the activation row — or the row's int8 form — ahead of
-// every sibling leaves this body nothing of its own to declare. `s.staged` and
-// `s.staged_quant` are how a caller states that, so pricing an arrangement is
-// asking this with them set the way that arrangement would set them, and
-// pricing the same stage ALONE is asking with them clear. One quantity, two
-// arrangements.
 std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
                                 std::uint32_t rows) {
   if (!d.valid || rows == 0) return 0;
@@ -412,16 +276,6 @@ std::uint32_t body_lds_bytes_at(const KernelShapes& s, const QuantDims& d,
       kir::Lds::align(k * kir::pack_elem_bytes<kir::f32>());
   return (budget == 0 || need <= budget) ? need : 0;
 }
-
-// What one workgroup of this contraction reads off the device when it covers
-// `rows` rows, and how many workgroups the launch would then dispatch.
-//
-// The two terms do not divide each other, which is the whole reason they are
-// counted apart: the weight term is set by the COLUMNS a workgroup owns — one
-// per wave — and the activation term by the ROWS it covers, and a row tile
-// leaves the column term untouched. The activation is counted at f32 because
-// that is what crosses the bus: the integer path quantizes it AFTER staging, so
-// the packing saves scratch and instructions, never DRAM.
 opt::TrafficModel traffic_at(const KernelShapes& s, const QuantDims& d,
                              bool indexed, std::uint32_t rows) {
   if (!shape_ok(d) || !device_fits(s) || rows == 0) return {};
@@ -448,51 +302,7 @@ opt::TrafficModel traffic_at(const KernelShapes& s, const QuantDims& d,
   m.workgroup_threads = plan.workgroup_size[0];
   return m;
 }
-
-// Rows one workgroup covers, so the weight tile it reads is spent on more than
-// one of them.
-//
-// The weight index does not depend on the row, so a grid of one workgroup per
-// row streams the whole matrix once per row: a 128 token prefill pass moved 128
-// times the weight bytes of a single token and cost exactly 128 times as much,
-// which is the whole of the prefill gap. R rows in one workgroup cut that to
-// m/R passes over the matrix.
-//
-// Only on the integer path: it is the one that stages activations small enough
-// for several rows to share the scratch, at about an eighth of the float panel.
-// The ladder is powers of two so the JIT sees a bounded set of shapes, the same
-// reason the prefill chunk ladder exists.
 constexpr std::uint32_t kMaxRowsPerGroup = 8;
-
-// THE RULE: the rung of that ladder whose launch traffic, charged at the share
-// of the memory system its own residency collects, is least.
-// opt/arrangement.hpp owns the arithmetic; this enumerates the rungs and states
-// what each one would move and ask for.
-//
-// It is not a fit test, which is what stood here before and which asked only
-// whether R rows fit the per-workgroup cap. Fitting is not the question: eight
-// rows fit 64000 bytes under a 65536-byte cap and seat two workgroups per pool
-// where two rows seat eight. Nor is it a residency test, which answers one row
-// at every shape and would undo multi-token prediction, whose speedup is
-// exactly two rows at m=2 verifying two tokens for one token of weight traffic.
-// Both terms are counted, and the arithmetic that combines them is engine
-// policy, not this file's.
-//
-// WHY IT TERMINATES, and why nothing here reads a measurement. Every rung is
-// priced from the shape and the device's own facts: the scratch is what
-// body_lds_bytes_at says the body will declare, which is a count and not a
-// prediction, and the register arm drops out of the occupancy answer because no
-// kernel has been compiled — identically for every rung, so it cannot order
-// them. A measured register count WOULD order them, and it is deliberately not
-// consulted: a measurement is filed under the entry name of the fused group,
-// which does not carry the row tile, so the only measurement reachable here is
-// the one belonging to the kernel this decision is about to replace. Reading it
-// would let a decision change the measurement that justified it. See the note
-// on identity in opt/measurements.hpp.
-//
-// `indexed` rows route to their own expert, so the weight matrix a row reads is
-// chosen by that row and there is no shared tile to spend twice. Reuse is only
-// available where the rows agree on the matrix.
 std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
                              bool indexed) {
   const auto exact_rows = q6_prefill_rows(s, d, indexed);
@@ -506,9 +316,6 @@ std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
   std::array<std::uint32_t, 4> rung{};
   std::size_t n = 0;
   for (std::uint32_t r = 1; r <= kMaxRowsPerGroup && r <= m; r <<= 1) {
-    // A workgroup cannot ask the pool for more than one workgroup may address,
-    // so a rung past that is not an arrangement to be priced against the
-    // others — it is one the device would refuse to launch.
     const std::uint32_t splits = dot_ksplits(d, r, budget);
     if (splits == 0) break;
     priced[n].traffic = traffic_at(s, d, indexed, r);
@@ -533,10 +340,6 @@ std::uint32_t dot_rows(const KernelShapes& s, const QuantDims& d,
   if (!d.valid) return 1;
   return rows_per_group(s, d, indexed);
 }
-
-// The scratch and the traffic of the arrangement this shape actually gets. Both
-// are the parametrized forms above asked at the chosen row tile, so the plan,
-// the body and the price cannot drift apart.
 std::uint32_t body_lds_bytes(const KernelShapes& s, const QuantDims& d,
                              bool indexed) {
   if (!d.valid) return 0;
@@ -548,10 +351,6 @@ opt::TrafficModel quant_traffic(const KernelShapes& s, bool indexed) {
   if (!shape_ok(d) || !device_fits(s)) return {};
   return traffic_at(s, d, indexed, dot_rows(s, d, indexed));
 }
-
-// x -> int8, one scale per group of `group_size`, staged for the whole
-// workgroup. `xs` is the float panel a fused run already staged, or null when
-// the row is read from global.
 template <class Fetch>
 void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
                          const kir::Val<kir::u32>& lid, std::uint32_t nchunks,
@@ -569,16 +368,6 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
       amax = e.let(math::max(amax, math::abs(v[j])));
       sum = e.let(sum + v[j]);
     }
-    // The step is the chunk's own amax and needs no reduction. The int8 range
-    // is spent per 8 activations rather than per group, because one activation
-    // far above its neighbours otherwise takes most of the range and the rest
-    // of the group quantizes into the noise — measured at 3.7x the error, and
-    // enough to change generated text on Qwen3.5-0.8B-4bit.
-    //
-    // The group's activation sum still is a reduction: it multiplies the
-    // group's bias, and consecutive chunks are consecutive lanes here, so it
-    // is a shuffle over the low lane bits. cpg divides the wave and the chunk
-    // count both, so every lane of a group is live whenever any of them is.
     for (std::uint32_t bit = 1; bit < cpg; bit <<= 1) {
       sum = e.let(sum + math::shfl_xor(sum, e.u32(bit)));
     }
@@ -603,15 +392,6 @@ void stage_dot_acts_from(env::Emit& e, const Fetch& fetch, const DotActs& q,
   }
   e.barrier();
 }
-
-// All rows in ONE loop, loads first. Staging the rows one call each gave the
-// scheduler a fetch immediately consumed by its own quantization, and the ISA
-// showed what that costs: two loads in flight, then a full stop
-// (s_wait_loadcnt 0x0) once per chunk per row. Fetching every row\'s vector
-// before any of the math issues rows-times the loads back to back, which is
-// the latency hiding a DRAM-cold pass actually needs -- the standalone
-// replica\'s fill, written exactly this way, keeps eight loads in flight and
-// costs nothing. One barrier at the end instead of one per row.
 template <class A>
 void stage_dot_acts_all(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                         const kir::Val<kir::u32>& row,
@@ -679,10 +459,6 @@ void stage_dot_acts_all(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
   }
   e.barrier();
 }
-
-// The body's own staging: out of the staged row when a run hoisted one, out of
-// global otherwise. `x_base` carries the row term on the global arm and is
-// zero on the staged one, which is already row-relative.
 template <class A>
 void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                     const kir::Val<kir::u32>& x_base, const DotActs& q,
@@ -710,14 +486,6 @@ void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
       },
       q, lid, nchunks, cpg);
 }
-
-// acc += the codes of one lane's run of `count` chunks.
-//
-// The codes are consumed as an integer dot product, one accumulator per chunk
-// because each chunk carries its own activation step. The weight scale is per
-// group and a run lies inside one group, so it still applies once at the end.
-// The bias half of `code * scale + bias` is not here at all: it multiplies the
-// group's activation sum and is added once per group, in `emit_bias`.
 template <class A>
 void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
                   const kir::Val<kir::u32>& row_base,
@@ -728,28 +496,12 @@ void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
   std::vector<kir::LValue<kir::f32>> facc;
   facc.reserve(acc.size());
   for (std::size_t r = 0; r < acc.size(); ++r) facc.push_back(e.var(e.f32(0.0f)));
-  // ONE WIDE LOAD, not `count` scalar ones.
-  //
-  // `count` is already chunks_per_step(d, device_load_bytes) -- the unroll was
-  // sized to the device's widest load -- but the body then read
-  // packed[row_base + chunk0 + u] once per u, and the emitter has no way to
-  // merge four dword loads after the fact. The addresses are contiguous and
-  // 4-aligned by construction (row_base is a multiple of the row stride and
-  // chunk0 steps by the same count), so this is exactly one dwordx4.
-  //
-  // It matters because these ARE the kernel's global traffic: decode reached
-  // ~219 GB/s of a measured 1147 GB/s part, and scalar dword loads cap around
-  // that fraction of peak on this hardware whatever the occupancy -- an LDS
-  // budget sweep moved nothing, which is what ruled occupancy out.
   const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
   for (auto uu : e.unroll(count)) {
     const auto chunk = e.let(chunk0 + uu);
     // Weights and the global scale index by the ABSOLUTE chunk; the staged
     // arrays hold one k-split and index relative to it.
     const auto srel = e.let(chunk - stage_begin);
-    // Read once, spend on every row this workgroup owns. This is the whole
-    // point of the row tile: the weight word and its two unpacked planes do
-    // not depend on the row, and they are the only global traffic in here.
     const auto word = e.let(words[uu]);
     const auto slot = e.let(srel * 2u);
     std::array<kir::Val<kir::u32>, 2> planes;
@@ -775,10 +527,6 @@ void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
     acc[r] = math::fma(wscale, facc[r].read(), acc[r].read());
   }
 }
-
-// acc += bias_g * sum of group g's activations, over the groups this lane
-// owns. One global load and one fma per group of `group_size` weights, where
-// the float path pays an fma per weight for the same term.
 template <class A>
 void emit_bias(env::Emit& e, const A& a, std::span<const DotActs> q,
                const kir::Val<kir::u32>& scale_base,
@@ -820,10 +568,6 @@ void emit_chunk(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
         acc = math::fma(xe, w, acc.read());
       });
 }
-
-// Every lane visits the same K indices, in the same order, as the one-row
-// kernel. Only the decoded weight's lifetime changes: it feeds several FP32
-// accumulators before being discarded. No activation or weight is narrowed.
 template <class A>
 std::string emit_q6_prefill(const KernelShapes& s, const QuantDims& d,
                             std::uint32_t rows) {
@@ -997,36 +741,16 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   const auto lane = e.let(lid % wave);
   const auto tile = e.let(math::workgroup_id_x());
   const auto col = e.let(tile * waves + wave_id);
-
-  // The integer path, when the device has the instruction and the quantized
-  // activation fits in scratch. It reads no float panel of its own.
-  // Reading the run's hoisted int8 panel costs this body no scratch of its
-  // own, so the fit question is only about the tiles it would allocate itself.
   const bool quant_hoisted =
       s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
   const bool dot = body_dot(s, d);
-  // Exactly what plan_impl sized the grid and the scratch for, and it cannot
-  // depend on anything plan_impl does not see. Deciding it from the hoisted
-  // panel instead left the grid covering m/R rows while each workgroup wrote
-  // one, so most rows were never computed at all.
   const std::uint32_t rows = dot_rows(s, d, Indexed<A>);
-  // K-splits of the staging, chosen exactly as the plan priced them. One
-  // means the old shape; more means the same registers accumulate across
-  // restaged spans and the weights are still read once.
   const std::uint32_t ksplits =
       body_dot(s, d) ? dot_ksplits(d, rows, workgroup_lds_bytes(s.device))
                      : 1u;
   if (ksplits == 0) return {};
-  // A hoisted panel, of either kind, holds the one row its workgroup owned. A
-  // workgroup covering several cannot read its siblings' activations out of
-  // it, so it reads them from global and stages its own.
   const bool use_hoisted = quant_hoisted && rows == 1;
   const auto row = e.let(math::workgroup_id_y() * rows);
-
-  // A fused run stages the shared row once, ahead of every sibling's body;
-  // `s.staged` is that panel. Otherwise this body owns the staging — except on
-  // the integer path, which quantizes straight out of global memory rather
-  // than widening the row into scratch first.
   kir::Tile<kir::f32> xs;
   bool fill = false;
   if (rows == 1 && s.staged.count == k && !s.staged.name.empty()) {
@@ -1038,14 +762,7 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
   const bool stage = static_cast<bool>(xs);
   // A caller-owned panel retains its declared linear layout. Decode can rotate
   // only the panel this body fills, using the same map for stores and reads.
-  const bool rotate_panel = fill && d.spec.bits == 6 && d.m == 1 &&
-      d.spec.group_size == 64 && s.device != nullptr &&
-      s.device->arch == "gfx1201" && wave == 32 &&
-      s.input_dtypes[0] == DType::kF32 && s.input_dtypes[2] == DType::kBF16;
-
-  // A run whose stages all quantize this row the same way hoists the int8 form
-  // once, the way it already hoists the float row. Reading it costs this body
-  // nothing: no tiles, no reduction, no barrier.
+  const bool rotate_panel = fill && dispatch::quant_plan(s).rotate_decode_panel;
   std::vector<DotActs> q;
   if (dot) {
     const auto& sq = s.staged_quant;
@@ -1059,9 +776,6 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
           kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.sum), groups);
       q.push_back(one);
     } else {
-      // One allocation per kind, one view per row. The views share the
-      // declaration, so the scratch is what plan_impl sized and the rows sit
-      // contiguously rather than in `rows` separate arrays.
       const std::uint32_t nchunk_t = nchunks / ksplits;
       const std::uint32_t groups_t = groups / ksplits;
       const auto codes = e.lds<kir::u32>(swz_words(2 * nchunk_t) * rows);
@@ -1094,10 +808,6 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
     for (std::uint32_t ks = 0; ks < ksplits; ++ks) {
     const std::uint32_t cb = ks * (nchunks / ksplits);
     const std::uint32_t ce = cb + nchunks / ksplits;
-    // Outside the column guard: every thread of the workgroup stages, and the
-    // waves that own a column all read what they wrote. From the second split
-    // on, a barrier keeps the refill from landing under the previous split's
-    // readers.
     if (dot && !use_hoisted) {
       if (ks > 0) e.barrier();
       stage_dot_acts_all<A>(e, a, stage ? &xs : nullptr, row, rows,
@@ -1106,9 +816,6 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
                             static_cast<std::uint32_t>(d.k), stage);
     }
     if (auto in_cols = e.when(col < n)) {
-      // The expert's matrix within the stack. `linear` and `linear_indexed`
-      // differ by exactly this term too; nothing downstream of it knows which
-      // op it is in. topk writes float ids, and 256 experts are exact in f32.
       auto plane = e.u32(0);
       if constexpr (Indexed<A>) {
         plane = e.let(
@@ -1116,10 +823,6 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
       }
       const auto row_base = e.let((plane + col) * lanes);
       const auto scale_base = e.let((plane + col) * groups);
-      // Zero on the staged arm: the panel is already row-relative, so adding
-      // the row back would make every row read row workgroup_id_y * K of it.
-      // On the global arm the row term is the only thing separating token r
-      // from token 0 — dropping it produces fluent, uniformly wrong output.
       const auto x_base = e.let(stage ? e.u32(0) : row * k);
       const std::uint32_t ntile = ce - cb;
       const std::uint32_t aligned_t = (ntile / span) * span;
@@ -1232,9 +935,6 @@ StagedQuantNames emit_staged_dot_acts(kir::KernelBody& k, std::string_view row,
 
   const auto lid = e.let(math::local_id());
   const auto wg_row = e.let(math::workgroup_id_y());
-  // The same guard emit_staged_row fills under, for the same reason: the row
-  // this quantizes only exists for a workgroup that has one. It is workgroup
-  // uniform, so the barrier inside is taken by all of the workgroup or none.
   if (auto in_rows = e.when(wg_row < rows)) {
     stage_dot_acts_from(
         e,
@@ -1270,10 +970,6 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
     return {0, static_cast<std::uint32_t>(d.k),
             static_cast<std::uint32_t>(d.m)};
   }
-
-  // Prefill has full tiles and is compute bound; the scalar loop spends two
-  // thirds of its vector instructions unpacking nibbles. Decode is one row and
-  // bandwidth bound, and the gate below leaves it here.
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
     if (const KernelPrimitiveBase* w = wmma_q6_linear_for(s)) return w;
     if (const KernelPrimitiveBase* w = wmma_quant_linear_for(s)) return w;
@@ -1320,10 +1016,6 @@ struct QuantLinearKernel final : KernelPrimitive<QuantLinearKernel> {
 };
 
 LSE_REGISTER_PRIMITIVE(QuantLinearKernel);
-
-// out[t, j] = x[t] · dequant(W[idx[t, slot]])[j], W stacked [E, N, K] as three
-// planes. The stack is read in place — no expert is ever gathered out of it,
-// and no code is widened outside a register.
 struct QuantLinearIndexedKernel final
     : KernelPrimitive<QuantLinearIndexedKernel> {
   static constexpr std::string_view kName = "quant_linear_indexed";

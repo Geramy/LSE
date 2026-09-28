@@ -230,7 +230,8 @@ add_library(lse_kernels
   src/kernels/linked.cpp
   src/kernels/matmul.cpp
   src/kernels/quant_embedding.cpp
-  src/kernels/int8_policy.cpp
+  src/dispatch/quant.cpp
+  src/dispatch/attention.cpp
   src/kernels/quant_linear.cpp
   src/kernels/reduction.cpp
   src/kernels/rope.cpp
@@ -324,7 +325,6 @@ add_library(lse_model
   src/model/mtp.cpp
   src/model/layer.cpp
   src/model/registry.cpp
-  src/model/compute_profile.cpp
   src/model/weights.cpp
   src/models/lemonseed.cpp
   src/models/qwen3_5.cpp

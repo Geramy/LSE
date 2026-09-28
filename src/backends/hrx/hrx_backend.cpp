@@ -662,33 +662,11 @@ StreamCapabilities derive_stream_capabilities(const DeviceInfo& info,
     n = std::min(n, static_cast<std::uint32_t>(info.compute_units));
   }
   caps.stream_count = std::max(n, 1u);
-  // Every stream this backend hands out has its own AQL ring, so every one of
-  // them can run at the same time as the others. That is the probe's answer,
-  // not a promise from the header, and rocprofv3 agrees: spreading a decode
-  // step across two rings produced 1.73 ms of genuinely concurrent kernel time
-  // per token on two distinct Queue_Ids, where the single-ring path produced
-  // 0.000 ms.
+  // Each stream owns an AQL ring; dependencies require explicit events.
   caps.concurrent_streams = caps.stream_count;
   caps.needs_explicit_events = true;
-  // Still false, but for a new reason. The original reason is gone: since
-  // hrx 2082d042 a stream's command buffer is recorded and submitted with the
-  // stream's own queue affinity, so the batched path reaches every ring and a
-  // launch costs the same wherever it goes. What remains is that the spread
-  // path itself is not safe to enable: with spreading on, a single gfx1201
-  // either emits corrupted logits (mojibake, a stop token as the first
-  // prediction) or deadlocks after the first token — one correct token, then
-  // the host parked on a stream drain forever — while the same build with
-  // spreading off decodes correctly at 20.5 tok/s. The hole is in the
-  // cross-stream ordering somewhere between plan_streams' dependency edges
-  // and the event machinery, and until it is found and tested, spreading is a
-  // correctness bug and not a performance question. (It also never paid on
-  // memory-bound decode: 93.7 -> 80.9 tok/s measured on gfx1151.)
-  //
-  // Pinned plans — a spanning device placing by member — do not read this
-  // flag; their ordering is emitted regardless (see plan_streams).
-  // LSE_SPREAD=1 is the experiment gate for hunting the ordering hole; it is
-  // not a supported mode until the hole is found.
-  caps.uniform_launch_cost = std::getenv("LSE_SPREAD") != nullptr;
+  // Automatic spreading is disabled until cross-stream ordering is supported.
+  caps.uniform_launch_cost = false;
   // A dispatch is a grid, and a grid cannot be cut. Flips when a kernel
   // declares work items instead; nothing else about the seam changes.
   caps.splittable_work = false;
@@ -1210,15 +1188,6 @@ Status HrxBackend::init_impl(int device_ordinal) {
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_MAX_SHARED_MEMORY, &u32).ok()) {
     info_.lds_bytes_per_workgroup = u32;
-    // LSE_LDS_BUDGET=<bytes>: cap the budget the emitters plan against, so a
-    // smaller part's phase declines (and their host fallbacks) reproduce on a
-    // bigger one. Diagnostic; never raises the real limit.
-    if (const char* cap = std::getenv("LSE_LDS_BUDGET")) {
-      const auto want = static_cast<std::uint32_t>(std::atoi(cap));
-      if (want != 0 && want < info_.lds_bytes_per_workgroup) {
-        info_.lds_bytes_per_workgroup = want;
-      }
-    }
   }
   if (query_property(device, HRX_DEVICE_PROPERTY_CLOCK_RATE, &u32).ok()) {
     amd_.clock_khz = u32;
@@ -2276,31 +2245,8 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
   const std::uint32_t index = target.stream.index;
   auto* s = static_cast<hrx_stream_t>(*stream);
 
-  // Every stream on one physical device takes the batched path. It used to be
-  // stream 0 alone: a command buffer was submitted with
-  // IREE_HAL_QUEUE_AFFINITY_ANY, which this HAL resolves by first-set-bit to
-  // ring 0, so a batched stream could not name a queue and every other stream
-  // paid hrx_queue_dispatch's completion-signal round trip per kernel
-  // (measured ~3 us on gfx1151). Since hrx 2082d042 a stream's command buffer
-  // is recorded AND submitted with the stream's own affinity (libhrx stream.c
-  // begin_cb/flush), and every stream here is created on its own affinity
-  // bit, so the cheap path reaches every ring — verified end-to-end on a
-  // single gfx1201 (22.3 tok/s, 30k dispatches, planner spreading enabled).
-  //
-  // A SPANNING device's non-first members stay on the queue path: dispatch
-  // command buffers executing on a second physical device hang mid-prefill
-  // (~400 dispatches in, host parked in kfd_wait_on_events, reproduced on two
-  // GPU pairs and at LSE_FLUSH_INTERVAL=1, while a single CB and a
-  // cross-GPU event edge in isolation both pass), and the queue path is the
-  // configuration the spanning device was built against. Lift this guard when
-  // the runtime's multi-device CB path is proven under load.
-  // LSE_BATCH_ALL=1 batches every member's stream. The hang that forced the
-  // spanning guard was the cross-GPU device-wait deadlock, which the host-join
-  // policy has since removed; this gate is for measuring the difference and
-  // becomes the default once the batched spanning path survives soak.
-  static const bool batch_all = std::getenv("LSE_BATCH_ALL") != nullptr;
-  const bool batched =
-      physical_count_ <= 1 || batch_all || index % physical_count_ == 0;
+  // Batch all streams on one device; spanning non-first members use queues.
+  const bool batched = physical_count_ <= 1 || index % physical_count_ == 0;
   if (batched) {
     LSE_RETURN_IF_ERROR(from_hrx(
         hrx_stream_dispatch(s,

@@ -1,10 +1,12 @@
 #include "harness.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/dispatch/attention.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/block.hpp"
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 namespace {
 using namespace lse;
@@ -67,6 +69,7 @@ LSE_TEST(decode_attention_specialization_reports_exact_resources) {
     if (!selected)
       return;
     LSE_EXPECT(selected->owns_indexing());
+    LSE_EXPECT(selected->name() == "attention.decode_shared_exp");
     const auto plan = selected->plan(shapes);
     LSE_EXPECT_EQ(plan.workgroup_size[0], 256u);
     LSE_EXPECT_EQ(plan.workgroup_count[0], 48u);
@@ -137,6 +140,54 @@ LSE_TEST(decode_attention_masks_keep_binding_and_launch_abi) {
       LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       LSE_EXPECT(emitted->source.find("index.sub") == std::string::npos);
     }
+}
+
+LSE_TEST(attention_dispatch_flash_tiles_follow_device_and_scratch_limits) {
+  Fixture fx;
+  fx.shapes[0] = Shape{2, 24, 512, 256};
+  auto request = fx.request();
+  using dispatch::AttentionPlan;
+  for (const auto [bytes, expected] : {
+       std::pair{37056u, AttentionPlan::kFlash12},
+       std::pair{37055u, AttentionPlan::kFlash8},
+       std::pair{24704u, AttentionPlan::kFlash8},
+       std::pair{24703u, AttentionPlan::kScalar}}) {
+    fx.gpu.lds_bytes_per_workgroup = bytes;
+    LSE_EXPECT(dispatch::attention_plan(request) == expected);
+    LSE_EXPECT(dispatch::flash_supported(request, 12) == (bytes >= 37056u));
+  }
+  fx.gpu.lds_bytes_per_workgroup = 65536;
+  fx.gpu.arch = "gfx1100";
+  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
+  fx.gpu.arch = "gfx1201";
+  fx.shapes[0] = Shape{2, 24, 11, 256};
+  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
+  fx.shapes[0] = Shape{2, 24, 7, 256};
+  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kScalar);
+}
+
+LSE_TEST(attention_dispatch_rejects_malformed_paged_input_contracts) {
+  using dispatch::AttentionPlan;
+  for (int variant = 0; variant < 10; ++variant) {
+    Fixture fx;
+    fx.shapes[0] = Shape{2, 24, 512, 256};
+    if (variant == 0) fx.dtypes[1] = DType::kF16;
+    if (variant == 1) fx.shapes[0] = Shape{-1, 24, 512, 256};
+    if (variant == 2) fx.shapes[1] = Shape{9, 4, 16, 128};
+    if (variant == 3) fx.shapes[2] = Shape{8, 4, 16, 256};
+    if (variant == 4) fx.shapes[4] = Shape{1, 8};
+    if (variant == 5) fx.shapes[4] = Shape{2, 1, 8};
+    if (variant == 6) fx.shapes[3] = Shape{1};
+    if (variant == 7) fx.shapes[4] = Shape{2, std::int64_t{UINT32_MAX} / 16 + 1};
+    if (variant == 8) fx.shapes[0] = Shape{2, 24, 512, std::int64_t{UINT32_MAX} + 1};
+    auto request = fx.request();
+    if (variant == 9) request.output_dtype = DType::kBF16;
+    LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kScalar);
+    LSE_EXPECT(!dispatch::flash_dimensions(request).valid);
+    LSE_EXPECT(!dispatch::flash_supported(request, 8));
+    LSE_EXPECT(!dispatch::shared_decode_supported(request));
+    LSE_EXPECT(!dispatch::split_decode_supported(request));
+  }
 }
 
 LSE_TEST(decode_attention_sliding_mask_equivalence_at_integer_boundaries) {

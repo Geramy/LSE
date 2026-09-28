@@ -97,7 +97,6 @@ class Program {
     const IKernelEmitter* emitter = nullptr;
     std::uint64_t key = 0;
     std::string arch;
-    std::string wmma_override;
     std::optional<EmittedKernel> kernel;
   };
   std::vector<EmissionCache> emissions_;

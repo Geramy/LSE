@@ -5,7 +5,7 @@
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
-#include "lse/kernels/quant_operand_cache.hpp"
+#include "lse/dispatch/cache.hpp"
 #include <array>
 #include <bit>
 #include <cmath>
@@ -113,12 +113,23 @@ LSE_TEST(cooperative_rms_phase_uses_virtual_rows_instead_of_physical_blocks) {
 LSE_TEST(cooperative_rms_implementation_identity_changes_cache_keys) {
  Fixture f;auto g=solo(rms_norm(leaf({1,5120}),leaf({5120},DType::kBF16),1e-6f));
  auto types=backend::loom_types();auto intr=backend::loom_sources();
- const auto cooperative=kernels::quant_operand_specialization_key(0,g,f.d,types,intr);
+ const auto cooperative=dispatch::specialization_cache_key(0,g,f.d,types,intr);
  f.d.lds_bytes_per_workgroup=512;
- const auto scalar=kernels::quant_operand_specialization_key(0,g,f.d,types,intr);
+ const auto scalar=dispatch::specialization_cache_key(0,g,f.d,types,intr);
  LSE_EXPECT(cooperative!=scalar);
  f.d.lds_bytes_per_workgroup=65536;g.outputs.push_back(g.outputs[0]);
- LSE_EXPECT_EQ(kernels::quant_operand_specialization_key(0,g,f.d,types,intr),scalar);
+ LSE_EXPECT_EQ(dispatch::specialization_cache_key(0,g,f.d,types,intr),scalar);
+}
+LSE_TEST(phase_rms_implementation_identity_changes_with_scratch) {
+ Fixture f;auto g=solo(rms_norm(leaf({1,5120}),leaf({5120},DType::kBF16),1e-6f));
+ g.is_phase=true;
+ auto types=backend::loom_types();auto intr=backend::loom_sources();
+ const auto cooperative=dispatch::specialization_cache_key(0,g,f.d,types,intr);
+ f.d.lds_bytes_per_workgroup=512;
+ const auto scalar=dispatch::specialization_cache_key(0,g,f.d,types,intr);
+ LSE_EXPECT(cooperative!=scalar);
+ f.d.lds_bytes_per_workgroup=65536;
+ LSE_EXPECT_EQ(dispatch::specialization_cache_key(0,g,f.d,types,intr),cooperative);
 }
 LSE_TEST(cooperative_rms_parallel_association_and_index_coverage) {
  for(size_t d:{32u,127u,128u,129u,256u,513u,1024u,5120u})for(int pattern=0;pattern<5;++pattern){

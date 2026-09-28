@@ -1,19 +1,3 @@
-// The group-affine contraction on the matrix core.
-//
-// The scalar path spends most of its vector instructions unpacking nibbles:
-// measured on a 27B projection, 98 shifts and masks feed 48 dot products. One
-// wmma.i32.16x16x16.iu8 replaces sixteen of those dots, so the unpack is paid
-// once per fragment instead of once per dot.
-//
-// The algebra is the one the scalar path already uses. A weight is
-// `code * scale + bias` with scale and bias per group of K, so
-//
-//   sum_k x_k (c_k s + b) = s * sum_k x_k c_k + b * sum_k x_k
-//
-// and the matrix core computes the left sum in integers. The activation is
-// quantized per WMMA K slice rather than per group: the step has to be
-// constant across the sixteen values one instruction consumes or it cannot be
-// factored out of the integer accumulator at all.
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -26,7 +10,7 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/kernels/wmma.hpp"
-#include "lse/kernels/int8_policy.hpp"
+#include "lse/dispatch/quant.hpp"
 #include "lse/math.hpp"
 #include "lse/quant/group_affine_codec.hpp"
 
@@ -41,41 +25,13 @@ using graph::KernelShapes;
 using graph::ThreadPlan;
 
 namespace {
-
-// One wave owns one 16x16 output tile. This specialization quantizes the
-// activation to signed int8 and leaves the group-affine Q4 code unsigned, so
-// it must select the signed/unsigned INT8 row. On gfx1201 that row has K=16;
-// the K=32 row is INT4 and cannot consume the activation representation here.
 constexpr int kTileM = 16;
 constexpr int kTileN = 16;
 constexpr int kTileK = 16;
 constexpr std::uint32_t kBlock = 256;
-
-// Row blocks a workgroup owns. More of them let one unpacked weight fragment
-// feed several row blocks. On gfx1151 that never paid (measured 10.37 s,
-// 10.50 s, 10.62 s at 1601 tokens for 1/2/4). On gfx1201 it pays outright:
-// measured 3.29 s, 3.03 s, 2.68 s at 277 tokens for 1/2/4, the dominant
-// prefill matmul 3.2x faster, verified correct on one device and on a
-// two-member tensor split, short and long context. (Four was once falsely
-// convicted of corrupting the split by a test prompt made of one sentence
-// repeated — a correct greedy model continues the repetition, and the
-// "corruption" was the model doing its job. Judge correctness on natural
-// prompts.) Eight measured 319.9 warm prefill tokens/s against four's 381.3
-// on the same day — its 46 KB of LDS per workgroup halves occupancy, and
-// the sweep is closed: 1 < 2 < 4 > 8.
 constexpr std::uint32_t kRowBlocks = 4u;  // measured champion (see sweep note)
-// Column blocks a wave owns. The symmetric twin of the row blocking above:
-// every A fragment a lane reads from LDS feeds kColBlocks different B
-// columns before it is discarded. Measured on gfx1201 at 124 prompt tokens:
-// 2.32 s at rb4/cb1, 2.44 s at rb4/cb2, 2.47 s at rb2/cb2 — the A reuse does
-// not buy back the doubled B fills and register pressure, so one. The
-// machinery stays because double-buffering may change the balance.
 constexpr std::uint32_t kColBlocks = 1u;
 constexpr std::uint32_t kRowsPerGroup = kTileM * kRowBlocks;
-
-// The instruction this invocation gets. `G` is the generation the device
-// reported; every width below is read off the row that selects, so nothing
-// here names a generation or a register count of its own.
 template <math::MatrixTarget G>
 using MmaFor = math::op::Mma<G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
                              kTileM, kTileN, kTileK>;
@@ -95,14 +51,6 @@ Dims dims_of(const KernelShapes& s) {
   if (s.inputs.size() < 4) return d;
   d.spec.bits = s.iattrs[0];
   d.spec.group_size = s.iattrs[1];
-  // 4-bit only, and not because 8-bit cannot be spelled -- PackedCodes has the
-  // arm and the tile runs it correctly. It is what the integer path costs: the
-  // activation has to become int8 for the matrix core to take it, and against
-  // an 8-bit weight that rounding is several times the weight's own error, so
-  // the contraction comes out worse than the scalar float decode it replaced.
-  // At 4 bits the weight error already dominates and the activation is free.
-  // An 8-bit weight belongs on a float operand class (bf16/f16), which is a
-  // different row of the same table, not this one.
   if (d.spec.bits != 4) return d;
   // Keep the specialization to groups spanning at least two full K slices.
   // The scale and bias must stay constant across each matrix instruction.
@@ -133,14 +81,6 @@ struct Args {
   env::In<S, env::Emit> biases;
   env::Out<kir::f32, env::Emit> out;
 };
-
-
-// The weight fragment comes from the operand layer, which owns the stored
-// width. This kernel names a column and a K slice and nothing about nibbles.
-// `k_lane` is where this lane's own slice of the instruction's K starts. It is
-// zero when a lane holds the whole step, and (lane / n) * k / halves when the
-// wave splits the step between its halves -- the difference between the two
-// generations, taken from the row rather than assumed.
 template <int Frag, class A>
 void fill_weights(env::Emit& e, const A& a, const kir::Val<kir::u32>& col,
                   const kir::Val<kir::u32>& k0,
@@ -158,11 +98,6 @@ template <class A, math::MatrixTarget G, bool ActsLayout>
 std::string emit_body(const KernelShapes& s, const Dims& d) {
   using Mma = MmaFor<G>;
   constexpr math::MatrixCoreRow kRow = Mma::kRow;
-  // Lanes that cooperate on one tile, and how many accumulator slots a lane
-  // holds -- wave32 with eight is RDNA, wave64 with four is CDNA, and neither
-  // is spelled here.
-  // Every width and every index rule comes from the row, through the one place
-  // that reads a layout. Nothing below names a generation.
   constexpr TileGeometry kGeo = geometry_of(kRow);
   constexpr std::uint32_t kWave = kGeo.wave;
   constexpr std::uint32_t kSlots = kGeo.slots;
@@ -177,11 +112,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto groups = static_cast<std::uint32_t>(d.groups);
   const auto gsize = static_cast<std::uint32_t>(d.spec.group_size);
   const std::uint32_t slices = gsize / kTileK;
-  // Groups a staging round covers, which is also how many K slices the body
-  // unrolls. Widening it trades barriers for live fragments and the fragments
-  // cost more: measured on gfx1151, one group holds the tile at 140 VGPRs with
-  // no spill, two reaches 239, and four hits the 256 ceiling and spills 85
-  // times, which is 1.88 s against 1.64 s at 401 prompt tokens.
   const std::uint32_t kGroupsPerRound = 1u;
   const std::uint32_t round_groups =
       groups < kGroupsPerRound ? groups : kGroupsPerRound;
@@ -198,12 +128,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   A a;
   if (!env::bind(kb, a, s)) return {};
   env::Emit e{&kb};
-
-  // A workgroup owns one row block and `waves` column blocks of it, so the
-  // sixteen rows are quantized once here and every wave reads them. Doing it
-  // per wave repeated the amax, the rounding and the loads once per column
-  // tile, which is what made the correct kernel three hundred times slower
-  // than the loop it replaces.
   const auto xq = e.lds<kir::u32>(kRowsPerGroup * words);
   const auto xamax = e.lds<kir::f32>(kRowsPerGroup * round_slices);
   const auto xssum = e.lds<kir::f32>(kRowsPerGroup * round_slices);
@@ -222,9 +146,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
   const auto wg = e.let(math::workgroup_id_x());
   const auto m0 = e.let((wg / nblocks) * kRowsPerGroup);
-  // Column tile j of this wave: the workgroup's tiles are laid out so the
-  // waves stay adjacent within each block, keeping their weight reads beside
-  // each other, and a wave's own j-tiles stride by `waves`.
   std::vector<kir::Val<kir::u32>> ntile, n0, bcol;
   std::vector<kir::Val<kir::boolean>> live;
   for (std::uint32_t j = 0; j < kColBlocks; ++j) {
@@ -239,10 +160,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   for (std::uint32_t i = 0; i < kRowBlocks * kColBlocks * kSlots; ++i) {
     out.push_back(e.var(0.0f));
   }
-
-  // One base per row block: the accumulator slot's own offset is a constant,
-  // so folding it in at the use costs an add the scheduler hides, where
-  // hoisting all of them costs a live register each.
   std::vector<kir::Val<kir::u32>> slot_g;
   std::vector<kir::Val<kir::u32>> slot_out;
   std::vector<kir::Val<kir::u32>> lane_words;
@@ -256,11 +173,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     slot_g.push_back(e.let((rb + half) * round_groups));
     slot_out.push_back(e.let(m0 + rb + half));
   }
-  // A column past the end still indexes the scales, because the group loop
-  // reads them before it knows whether the lane will store anything. Its
-  // result is discarded either way, so it reads column zero rather than off
-  // the end of the plane: n only has to miss a multiple of waves * kTileN for
-  // the last workgroup to carry lanes that are not columns at all.
   std::vector<kir::Val<kir::u32>> safe_col;
   for (std::uint32_t j = 0; j < kColBlocks; ++j) {
     safe_col.push_back(e.let(select(bcol[j] < n, bcol[j], e.u32(0))));
@@ -277,11 +189,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
   const std::uint32_t chunks = (items + kBlock - 1u) / kBlock;
-  // The raw activations of the round stay in the stager thread's own
-  // registers across the amax barrier: the same thread quantizes the slice it
-  // loaded, so nothing else ever reads them, and the 16 KB of LDS the old
-  // staging plane cost was the difference between two workgroups per CU and
-  // several. Declared outside the guards so the values scope across them.
   std::vector<std::vector<kir::LValue<kir::f32>>> vraw;
   vraw.reserve(chunks);
   for (std::uint32_t c = 0; c < chunks; ++c) {
@@ -314,14 +221,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     st_gbase.push_back(e.let(sr * round_groups + gl));
     st_in.push_back(e.let(si < items));
   }
-
-  // Measured and reverted: software-pipelining this loop two rounds deep
-  // (staging round r+1 into a second LDS plane while round r's matrix work
-  // runs) emitted correctly and lost — 369.8 warm prefill tokens/s against
-  // 475.4 for this sequential order. Overlapping the stages keeps the staged
-  // raws, the amax sums and the accumulators live at once, and the spills
-  // cost more than the hidden load latency saved: this kernel is bound by
-  // occupancy, not by memory latency.
   for (auto rnd : e.range(0u, groups / round_groups, 1u)) {
     for (std::uint32_t c = 0; c < chunks; ++c) {
       if (auto stager = e.when(st_in[c])) {
@@ -358,10 +257,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       }
     }
     e.barrier();
-
-    // The group's own step, reduced from the slice amaxes the pass above left.
-    // Every slice of a group computes it and writes the same value, which is
-    // cheaper than electing one thread to.
     for (std::uint32_t c = 0; c < chunks; ++c) {
       if (auto stager = e.when(st_in[c])) {
         auto gmax = e.let(xamax[st_slice0[c]].read());
@@ -407,10 +302,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         gscale.push_back(e.let(math::widen(a.scales[at])));
         gbias.push_back(e.let(math::widen(a.biases[at])));
       }
-
-      // One accumulator per row block, spanning every slice of the group: the
-      // step is constant across it, so the integer sum can run to the end
-      // before anything is scaled.
       std::vector<kir::Local<kir::i32, 8>> acc;
       acc.reserve(kRowBlocks * kColBlocks);
       for (std::uint32_t i = 0; i < kRowBlocks * kColBlocks; ++i) {
@@ -429,16 +320,9 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
           if (auto gd = e.when(live[j] && bcol[j] < n)) {
             fill_weights(e, a, bcol[j], k0, lane_k, lanes, d.spec.bits, bf[j]);
           } else {
-            // A lane outside its tile still owns the fragment registers; the
-            // guard above leaves them at the zero init only while the fill is
-            // the first write, so a row block below reads zeros, not the
-            // previous slice's codes.
             for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][c] = e.u32(0);
           }
         }
-        // The unpacked fragments feed every row block, and each row block's A
-        // fragment feeds every column block, before either is discarded —
-        // that is what both blockings buy.
         const std::uint32_t slot = gi * slices + t;
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
           const auto af = e.local<kir::u32, kFragI>();
@@ -536,10 +420,10 @@ struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel<ActsLayout
         s.intrinsics == nullptr) {
       return {};
     }
-    const std::optional<math::MatrixTarget> target = matrix_target(*s.device);
-    if (!target.has_value()) return {};
+    const auto* row = dispatch::quant_plan(s).matrix;
+    if (row == nullptr) return {};
     return with_matrix_target<std::string>(
-        *target, [&]<math::MatrixTarget G>() -> std::string {
+        row->target, [&]<math::MatrixTarget G>() -> std::string {
           if constexpr (!math::has_matrix_core_row(
                             G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
                             kTileM, kTileN, kTileK)) {
@@ -566,7 +450,7 @@ struct QuantWmmaKernel final : graph::KernelPrimitive<QuantWmmaKernel<ActsLayout
         ((m + kRowsPerGroup - 1u) / kRowsPerGroup) * nblocks;
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
-    tp.lds_bytes = waves * kTileM * 5u * kir::pack_elem_bytes<kir::f32>();
+    tp.lds_bytes = dispatch::kQ4MatrixLdsBytes;
     return tp;
   }
 };
@@ -576,79 +460,12 @@ const QuantWmmaKernel<true> kQuantWmmaActs;
 
 }  // namespace
 
-// The matrix-core form of the group-affine contraction, or null when the
-// device has no int8 row, the shape has no full tile to fill, or the rows
-// disagree on their expert -- a routed row picks its own matrix and there is
-// no shared operand for a tile to hold.
 const graph::KernelPrimitiveBase* wmma_quant_linear_for(const KernelShapes& s) {
-  if (!activation_int8_enabled(s)) return nullptr;
-  const Dims d = dims_of(s);
-  if (!d.valid || s.device == nullptr || s.intrinsics == nullptr) return nullptr;
-
-  // The matrix path covers sixteen rows at once. Keep smaller row counts on
-  // the scalar dot4 path until the masked-tile cost is measured; the
-  // LSE_WMMA_MIN_M override allows a controlled crossover sweep.
-  static const std::uint32_t min_m = [] {
-    const char* v = std::getenv("LSE_WMMA_MIN_M");
-    const long n = v != nullptr ? std::strtol(v, nullptr, 10) : kTileM;
-    return static_cast<std::uint32_t>(std::clamp(n, 1L, 1024L));
-  }();
-  const std::optional<math::MatrixTarget> gate_target = matrix_target(*s.device);
-  const auto crossover=activation_int8_policy()==ActivationInt8Policy::kAutomatic ? 512u : min_m;
-  if (d.m < crossover) return nullptr;
-
-  if (!gate_target.has_value()) return nullptr;
-
-  // The row the device's generation selects, and whether it may be emitted at
-  // all. A row whose lane mapping was never measured on the part is not a
-  // slower path, it is a wrong answer that looks right, so the table declines
-  // it and so does this. Nothing here names a generation: a part joins by
-  // having its layout measured into the table.
-  return with_matrix_target<const graph::KernelPrimitiveBase*>(
-      *gate_target, [&]<math::MatrixTarget G>() -> const graph::KernelPrimitiveBase* {
-        // CDNA's MFMA int8 has no signedness immediates, so there is no mixed
-        // row to name: unsigned codes there need the algebra shifted, not a
-        // different spelling. It declines here rather than pretending.
-        if constexpr (!math::has_matrix_core_row(
-                          G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
-                          kTileM, kTileN, kTileK)) {
-          return nullptr;
-        } else {
-        constexpr math::MatrixCoreRow kRow = MmaFor<G>::kRow;
-        if constexpr (!kRow.emittable()) {
-          return nullptr;
-        } else {
-          if (!math::has_cap(device_matrix_caps(*s.device), kRow.cap)) {
-            return nullptr;
-          }
-          if (s.intrinsics->find(kRow.key).empty()) return nullptr;
-          // The tile stages one K slice per lane and drains kTileM rows, so a
-          // row whose instruction does not have that shape needs the staging
-          // rewritten, not just a different spelling. kRow.n is the
-          // instruction's own tile width; the pair-row accumulator's per-wave
-          // N coverage (wave/halves) is a mapping fact, not a tile dimension.
-          if (kRow.m != kTileM || kRow.n != kTileN || kRow.k != kTileK) {
-            return nullptr;
-          }
-          if (kRow.chained != 1) return nullptr;
-          static const bool acts_layout = [] {
-            const char* value = std::getenv("LSE_Q4_WMMA_ACTS_SWIZZLE");
-            return value == nullptr || std::string_view(value) == "1";
-          }();
-          const bool qualified_ffn = (d.n == 17408 && d.k == 5120) ||
-                                     (d.n == 5120 && d.k == 17408);
-          if (acts_layout && qualified_ffn && d.m == 512 &&
-              d.spec.bits == 4 && d.spec.group_size == 64 &&
-              s.device->arch == "gfx1201" && s.device->wavefront_size == 32 &&
-              s.input_dtypes.size() >= 4 && s.input_dtypes[0] == DType::kF32 &&
-              s.input_dtypes[2] == DType::kBF16 && s.input_dtypes[3] == DType::kBF16 &&
-              s.output_dtype == DType::kF32) {
-            return &kQuantWmmaActs;
-          }
-          return &kQuantWmma;
-        }
-        }
-      });
+  switch (dispatch::quant_plan(s).implementation) {
+    case dispatch::QuantMatrix::kInt8Lds: return &kQuantWmmaActs;
+    case dispatch::QuantMatrix::kInt8: return &kQuantWmma;
+    default: return nullptr;
+  }
 }
 
 }  // namespace lse::kernels

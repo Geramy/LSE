@@ -144,12 +144,9 @@ const EmittedKernel* Program::cached_emission(
     std::string_view arch, std::uint64_t* key) const noexcept {
   if (index >= emissions_.size()) return nullptr;
   const EmissionCache& cached = emissions_[index];
-  const char* wmma = std::getenv("LSE_WMMA");
-  const std::string_view override = wmma != nullptr ? std::string_view(wmma)
-                                                    : std::string_view{};
   if (cached.group != &group || cached.backend != backend ||
       cached.emitter != emitter || cached.arch != arch ||
-      cached.wmma_override != override || !cached.kernel.has_value()) return nullptr;
+      !cached.kernel.has_value()) return nullptr;
   *key = cached.key;
   return &*cached.kernel;
 }
@@ -165,8 +162,6 @@ const EmittedKernel* Program::cache_emission(
   cached.emitter = emitter;
   cached.key = key;
   cached.arch = arch;
-  const char* wmma = std::getenv("LSE_WMMA");
-  cached.wmma_override = wmma != nullptr ? wmma : "";
   cached.kernel.emplace(std::move(kernel));
   return &*cached.kernel;
 }

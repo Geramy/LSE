@@ -275,12 +275,6 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                 {x.node(), packed.node(), scales.node(), biases.node()});
   n->iattrs[0] = bits;
   n->iattrs[1] = group_size;
-  if (packed.valid() && packed.node()->quant) {
-    const auto& q = *packed.node()->quant;
-    if (q.bits == bits && q.group_size == group_size &&
-        q.scales == scales.node() && q.biases == biases.node())
-      n->iattrs[2] = q.compute_profile_revision;
-  }
   n->prim = find_primitive("quant_linear");
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
@@ -520,14 +514,8 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     ks.attrs = n->attrs;
     ks.iattrs = n->iattrs;
     ks.device = device;
-    static const bool wg128 = [] {
-      const char* value = std::getenv("LSE_SPLIT_KEY_WG128");
-      return value == nullptr || std::string_view(value) == "1";
-    }();
-    const auto* partial_prim = find_primitive(wg128
-        ? "attention.decode_partial128.wg128c2.v2" : "attention.decode_partial128.v1");
-    const auto* merge_prim = find_primitive(wg128
-        ? "attention.decode_merge128.wg128c2.v2" : "attention.decode_merge128.v1");
+    const auto* partial_prim = find_primitive("attention.decode_partial128.wg128c2.v2");
+    const auto* merge_prim = find_primitive("attention.decode_merge128.wg128c2.v2");
     const auto* partial_kernel = dynamic_cast<const KernelPrimitiveBase*>(partial_prim);
     if (partial_kernel && merge_prim && partial_kernel->specialize(ks) != nullptr) {
       const auto capacity = k.shape().dim(2) * table.shape().dim(1);

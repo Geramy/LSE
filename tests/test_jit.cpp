@@ -36,7 +36,6 @@
 #include "lse/backends/hrx/hipc/hip_types.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
-#include "lse/kernels/int8_policy.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -294,12 +293,8 @@ LSE_TEST(quant_linear_indexes_the_activation_by_its_row) {
   }
 }
 
-// A 4-bit contraction on a device whose arch database reports the mixed-
-// signedness dot product must emit it. This is the path's only static proof
-// that it is reachable: the numerics tests pass whichever inner loop ran, and
-// a capability check that quietly never fires would leave the integer path as
-// code that cannot execute.
-LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
+// Small prefill rows retain the FP32 codec.
+LSE_TEST(quant_linear_small_prefill_uses_the_float_codec) {
   constexpr std::int64_t kGroup = 64;
   constexpr std::int64_t kN = 16;
   constexpr std::int64_t kK = 1024;
@@ -328,8 +323,7 @@ LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
 
   const std::string four = emit_at(4);
   LSE_EXPECT(!four.empty());
-  const bool int8_opted_in = kernels::activation_int8_enabled();
-  LSE_EXPECT((four.find(kDot) != std::string::npos) == int8_opted_in);
+  LSE_EXPECT(four.find(kDot) == std::string::npos);
 
   // 8 bits stays on the float codec — its packed word is already four unsigned
   // bytes, so the win there is a different change and is not made here.
@@ -337,18 +331,8 @@ LSE_TEST(quant_linear_4bit_contracts_with_the_dot_product) {
   LSE_EXPECT(!eight.empty());
   LSE_EXPECT(eight.find(kDot) == std::string::npos);
 
-  // The structural claim, not just the presence of a builtin: the float codec
-  // spends two fmaf per weight — one to place the code, one to accumulate it —
-  // and the integer path spends none. A lane decodes 16 codes per step at 8
-  // bits, so that side is 32 of them; the integer side keeps only the group
-  // scale, the group bias and the per-chunk activation step, and it keeps one
-  // of each for every row the workgroup covers. This x is two rows, so the
-  // bound is per row — what the claim rests on is that neither side of it
-  // grows with K.
-  constexpr std::size_t kRows = 2;
   LSE_EXPECT(count(eight, "fmaf(") >= 32);
-  if (int8_opted_in) LSE_EXPECT(count(four, "fmaf(") < 8 * kRows);
-  else LSE_EXPECT(count(four, "fmaf(") >= 32);
+  LSE_EXPECT(count(four, "fmaf(") >= 32);
 
   // And a device without the capability takes the float codec at 4 bits too.
   // A fresh emitter, because the emit cache keys on the group and the wave
@@ -610,21 +594,12 @@ LSE_TEST(rdna_is_wave32_cdna_is_wave64_rdna4_can_be_either) {
   LSE_EXPECT(backend::wavefront_legal("gfx942", 64));
   LSE_EXPECT(backend::wavefront_legal("gfx950", 64));
 
-  const char* prev = std::getenv("LSE_WAVEFRONT");
-  const std::string saved = prev ? prev : "";
-  ::unsetenv("LSE_WAVEFRONT");
   LSE_EXPECT_EQ(backend::select_wavefront("gfx1151", 32), 32);
   LSE_EXPECT_EQ(backend::select_wavefront("gfx942", 64), 64);
   LSE_EXPECT_EQ(backend::select_wavefront("gfx1201", 32), 32);
-  ::setenv("LSE_WAVEFRONT", "64", 1);
-  LSE_EXPECT_EQ(backend::select_wavefront("gfx1201", 32), 64);
-  LSE_EXPECT_EQ(backend::select_wavefront("gfx1151", 32), 32);
-  LSE_EXPECT_EQ(backend::select_wavefront("gfx942", 64), 64);
-  ::setenv("LSE_WAVEFRONT", "32", 1);
-  LSE_EXPECT_EQ(backend::select_wavefront("gfx942", 64), 64);
-  LSE_EXPECT_EQ(backend::select_wavefront("gfx1201", 64), 32);
-  if (!saved.empty()) ::setenv("LSE_WAVEFRONT", saved.c_str(), 1);
-  else ::unsetenv("LSE_WAVEFRONT");
+  LSE_EXPECT_EQ(backend::select_wavefront("gfx1201", 64), 64);
+  LSE_EXPECT_EQ(backend::select_wavefront("gfx1151", 64), 32);
+  LSE_EXPECT_EQ(backend::select_wavefront("gfx942", 32), 64);
 }
 
 LSE_TEST(hrx_reported_cus_are_not_overwritten_by_the_table) {
@@ -653,22 +628,15 @@ LSE_TEST(unknown_family_still_gets_isa_from_the_arch_string) {
   LSE_EXPECT(amd.matrix_core == backend::MatrixCore::kWMMA);
 }
 
-LSE_TEST(rdna4_profile_honours_lse_wavefront) {
-  const char* prev = std::getenv("LSE_WAVEFRONT");
-  const std::string saved = prev ? prev : "";
-  ::unsetenv("LSE_WAVEFRONT");
-  backend::DeviceInfo info;
-  info.arch = "gfx1201";
-  backend::AmdDeviceInfo amd;
-  backend::apply_arch_defaults(info, amd);
-  LSE_EXPECT_EQ(info.wavefront_size, 32);
-  ::setenv("LSE_WAVEFRONT", "64", 1);
-  amd = {};
-  info.wavefront_size = 0;
-  backend::apply_arch_defaults(info, amd);
-  LSE_EXPECT_EQ(info.wavefront_size, 64);
-  if (!saved.empty()) ::setenv("LSE_WAVEFRONT", saved.c_str(), 1);
-  else ::unsetenv("LSE_WAVEFRONT");
+LSE_TEST(rdna4_profile_preserves_a_legal_runtime_wavefront) {
+  for (int wave : {0, 32, 64}) {
+    backend::DeviceInfo info;
+    info.arch = "gfx1201";
+    info.wavefront_size = static_cast<std::uint16_t>(wave);
+    backend::AmdDeviceInfo amd;
+    backend::apply_arch_defaults(info, amd);
+    LSE_EXPECT_EQ(info.wavefront_size, wave == 0 ? 32 : wave);
+  }
 }
 
 LSE_TEST(emitter_chooses_a_legal_workgroup_size) {
@@ -955,7 +923,6 @@ std::size_t count_of(const std::string& hay, std::string_view needle) {
 // every group member materialized, so the next group would read a buffer
 // nothing ever wrote. Refusing costs one launch; guessing costs an argmax.
 LSE_TEST(sibling_fusion_is_refused_when_stages_do_not_cover_the_group) {
-  ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{1, 64}, DType::kF32, 1.0f);
   Array wa = Array::full(Shape{128, 64}, DType::kF32, 0.5f);
   Array wb = Array::full(Shape{64, 64}, DType::kF32, 0.25f);
@@ -1009,22 +976,21 @@ LSE_TEST(sibling_fusion_is_refused_when_stages_do_not_cover_the_group) {
 // the body specialized for N=128 — a read far past the end of its weight — and
 // made the slot-1 expert run the slot-0 body.
 LSE_TEST(device_helper_identity_carries_shapes_and_attrs) {
-  ::setenv("LSE_WMMA", "0", 1);
-  // M >= 16 keeps both off the decode GEMV, and LSE_WMMA=0 keeps them off the
-  // matrix core, so both land in the scaffold as device functions.
+  // An unsupported matrix target exercises the scalar helper scaffold.
+  auto scalar_device = gfx1151();
+  scalar_device.arch = "unsupported";
   Array x = Array::full(Shape{16, 64}, DType::kF32, 1.0f);
   Array wa = Array::full(Shape{128, 64}, DType::kF32, 0.5f);
   Array wb = Array::full(Shape{32, 64}, DType::kF32, 0.25f);
   auto shapes = kEmitter.emit(sibling_group({linear(x, wa), linear(x, wb)}),
-                              gfx1151());
+                              scalar_device);
 
   // Same shapes, same dtypes, different expert slot.
   Array w = Array::full(Shape{4, 32, 64}, DType::kF32, 0.5f);
   Array idx = Array::full(Shape{16, 2}, DType::kF32, 1.0f);
   auto attrs = kEmitter.emit(
       sibling_group({linear_indexed(x, w, idx, 0), linear_indexed(x, w, idx, 1)}),
-      gfx1151());
-  ::unsetenv("LSE_WMMA");
+      scalar_device);
 
   LSE_EXPECT(shapes.ok());
   if (!shapes.ok()) {
@@ -3093,11 +3059,12 @@ LSE_TEST_MAIN()
 
 // linear is a barrier, so its operands materialize as their own groups first;
 // the kernel under test is the last one.
-static Result<EmittedKernel> emit_last_for(Array& root) {
+static Result<EmittedKernel> emit_last_for(
+    Array& root, const backend::DeviceInfo& device = gfx1151()) {
   const NodePtr roots[] = {root.node()};
   auto groups = Partitioner::partition(roots);
   if (groups.empty()) return LSE_ERROR(kInternal, "no groups");
-  return kEmitter.emit(groups.back(), gfx1151());
+  return kEmitter.emit(groups.back(), device);
 }
 
 // The matrix-core kernel is authored in C++ against kir, so this asserts on
@@ -3132,7 +3099,6 @@ LSE_TEST(live_arch_picks_the_widest_load) {
 // Decode-shaped (M=1): still WMMA. One wave owns a 16-wide N tile;
 // padding the M side is cheaper than a scalar column walk.
 LSE_TEST(decode_linear_uses_coalesced_gemv_not_wmma) {
-  ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{64, 32}, DType::kF32, 1.0f);
   Array y = linear(x, w);
@@ -3159,7 +3125,6 @@ LSE_TEST(decode_linear_uses_coalesced_gemv_not_wmma) {
 }
 
 LSE_TEST(linear_emits_the_devices_widest_f32_load) {
-  ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{4, 16}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{8, 16}, DType::kF32, 1.0f);
   Array y = linear(x, w);
@@ -3171,7 +3136,6 @@ LSE_TEST(linear_emits_the_devices_widest_f32_load) {
 }
 
 LSE_TEST(matrix_core_linear_is_authored_in_cpp_and_spelled_by_the_tables) {
-  ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{32, 64}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{48, 64}, DType::kF32, 1.0f);
   Array y = linear(x, w);
@@ -3208,7 +3172,6 @@ LSE_TEST(matrix_core_linear_is_authored_in_cpp_and_spelled_by_the_tables) {
 }
 
 LSE_TEST(matrix_core_linear_defaults_on_for_gfx11) {
-  ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{32, 64}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{48, 64}, DType::kF32, 1.0f);
   Array y = linear(x, w);
@@ -3219,14 +3182,13 @@ LSE_TEST(matrix_core_linear_defaults_on_for_gfx11) {
              std::string::npos);
 }
 
-// LSE_WMMA=0 is the f32 oracle. The lemonseed differential uses it.
-LSE_TEST(matrix_core_linear_is_off_when_disabled) {
-  ::setenv("LSE_WMMA", "0", 1);
+LSE_TEST(matrix_core_linear_declines_an_unsupported_device) {
+  auto device = gfx1151();
+  device.arch = "unsupported";
   Array x = Array::full(Shape{32, 64}, DType::kF32, 1.0f);
   Array w = Array::full(Shape{48, 64}, DType::kF32, 1.0f);
   Array y = linear(x, w);
-  auto e = emit_last_for(y);
-  ::unsetenv("LSE_WMMA");
+  auto e = emit_last_for(y, device);
   LSE_EXPECT(e.ok());
   if (!e.ok()) return;
   LSE_EXPECT(e->source.find("wmma") == std::string::npos);
@@ -3245,7 +3207,6 @@ LSE_TEST(matrix_core_linear_fuses_its_epilogue_into_one_kernel) {
   if (!act.ok()) return;
   Array y = *act * scale;
 
-  ::unsetenv("LSE_WMMA");
   const NodePtr roots[] = {y.node()};
   auto groups = Partitioner::partition(roots);
   const FusionGroup* fused = nullptr;
@@ -3259,7 +3220,6 @@ LSE_TEST(matrix_core_linear_fuses_its_epilogue_into_one_kernel) {
   // The linear and the two elementwise ops are in one group, not three.
   LSE_EXPECT(fused->nodes.size() == 3u);
   auto e = kEmitter.emit(*fused, gfx1151());
-  ::unsetenv("LSE_WMMA");
 
   LSE_EXPECT(e.ok());
   if (!e.ok()) {
@@ -3556,7 +3516,6 @@ std::vector<std::vector<float>> run_emitted(
 // the surviving barriers behind and depended on the widest stage happening to
 // come first — a narrow stage first and the fills could not be folded at all.
 LSE_TEST(one_staging_serves_every_sibling_that_shares_the_row) {
-  ::unsetenv("LSE_WMMA");
   Array x = Array::full(Shape{1, 256}, DType::kF32, 1.0f);
   Array wa = Array::full(Shape{128, 256}, DType::kF32, 0.5f);
   // Narrower N first: this one covers 2 tiles where the others cover 16, so a
@@ -3608,7 +3567,6 @@ LSE_TEST(one_staging_serves_every_sibling_that_shares_the_row) {
 // merely agrees — so two runs over two different buffers of the same K get one
 // panel each and the run is priced for both.
 LSE_TEST(siblings_over_different_rows_get_their_own_staging) {
-  ::unsetenv("LSE_WMMA");
   Array x0 = Array::full(Shape{1, 256}, DType::kF32, 1.0f);
   Array x1 = Array::full(Shape{1, 256}, DType::kF32, 2.0f);
   Array wa = Array::full(Shape{128, 256}, DType::kF32, 0.5f);
@@ -4236,7 +4194,6 @@ LSE_TEST(a_measured_verdict_needs_both_sides_measured) {
 // seats 16, which the wave slots cap at 8. Four times the residency, and the
 // model was being told it was a tie.
 LSE_TEST(a_merged_run_is_priced_by_what_it_declares_not_by_its_panel) {
-  ::unsetenv("LSE_WMMA");
   const backend::DeviceInfo dev = gfx1151();
   constexpr std::int64_t kK = 5120;
   constexpr std::int64_t kN = 640;
@@ -4295,7 +4252,6 @@ LSE_TEST(a_merged_run_is_priced_by_what_it_declares_not_by_its_panel) {
 // admitted against a launch that never happens, which is the whole failure
 // this area exists for, so it is pinned rather than trusted.
 LSE_TEST(the_run_price_is_the_bytes_the_merged_body_declares) {
-  ::unsetenv("LSE_WMMA");
   const backend::DeviceInfo dev = gfx1151();
 
   // Dense f32 siblings over one 512-wide activation: small enough that the
@@ -4354,7 +4310,6 @@ LSE_TEST(the_run_price_is_the_bytes_the_merged_body_declares) {
 // shape as the 64000-byte family still sitting in this machine's kernel cache,
 // and the 141-token prefill that went 9.4 s to 126.8 s.
 LSE_TEST(a_sibling_run_is_admitted_and_refused_on_residency_not_on_fitting) {
-  ::unsetenv("LSE_WMMA");
   const backend::DeviceInfo dev = gfx1151();
   const std::uint32_t budget = dev.lds_bytes_per_workgroup;
   LSE_EXPECT_EQ(budget, 65536u);
@@ -4488,7 +4443,6 @@ LSE_TEST(a_phase_is_priced_for_every_row_its_stages_stage) {
 // defect this whole path can reproduce, so it is checked by running the fused
 // kernel at four widths against a host reference rather than by reading source.
 LSE_TEST(a_shared_staged_row_holds_its_own_row_at_every_pass_width) {
-  ::unsetenv("LSE_WMMA");
   backend::IBackend* be = live_hrx();
   if (be == nullptr || !kCompiler.available()) return;
   const backend::DeviceInfo& dev = be->device_info();
@@ -4584,7 +4538,6 @@ LSE_TEST(a_shared_staged_row_holds_its_own_row_at_every_pass_width) {
 // which is fluent and wrong, so both are checked by running the fused kernel
 // against a host reference at four widths with a different expert per row.
 LSE_TEST(a_shared_row_and_a_per_row_expert_agree_at_every_pass_width) {
-  ::unsetenv("LSE_WMMA");
   backend::IBackend* be = live_hrx();
   if (be == nullptr || !kCompiler.available()) return;
   const backend::DeviceInfo& dev = be->device_info();
@@ -4834,7 +4787,6 @@ LSE_TEST(unmeasured_rows_are_described_but_never_emitted) {
 // step and the accumulator mapping all come from the row — so this exercises
 // the same body the bf16 prefill uses, against a host integer reference.
 LSE_TEST(matrix_core_int8_linear_matches_a_host_integer_reference) {
-  ::unsetenv("LSE_WMMA");
   constexpr int kM = 32;
   constexpr int kN = 48;
   constexpr int kLanes = 16;              // i32 lanes per row
@@ -5385,7 +5337,6 @@ LSE_TEST(loom_matmul_with_an_epilogue_matches_hip) {
     std::printf("       (skipped: no hrx device)\n");
     return;
   }
-  ::unsetenv("LSE_WMMA");
   std::vector<float> xs(4 * 64);
   std::vector<float> ws(64 * 32);
   for (std::size_t i = 0; i < xs.size(); ++i) {
@@ -5489,7 +5440,6 @@ LSE_TEST(loom_differential_over_every_kernel_primitive) {
                          {{x.node().get(), ha}, {y.node().get(), hb}}});
   };
 
-  ::unsetenv("LSE_WMMA");
   two_in("elementwise", Shape{256}, Shape{256},
          [](Array& a, Array& b) { return a * b + a; });
   two_in("matmul", Shape{4, 64}, Shape{64, 32},
@@ -5594,7 +5544,6 @@ LSE_TEST(loom_compiles_the_same_group_far_faster_than_comgr) {
   const backend::DeviceInfo& dev = be->device_info();
   const std::string arch(dev.arch);
 
-  ::unsetenv("LSE_WMMA");
   std::vector<float> xs(4 * 64, 1.0f);
   std::vector<float> ws(64 * 32, 0.5f);
   Array x = device_input(*be, Shape{4, 64}, xs);

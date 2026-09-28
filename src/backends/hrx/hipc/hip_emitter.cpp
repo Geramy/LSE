@@ -1,8 +1,6 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/graph/epilogue_input.hpp"
-#include "lse/kernels/int8_policy.hpp"
-#include "lse/kernels/quant_operand_policy.hpp"
-#include "lse/kernels/quant_operand_cache.hpp"
+#include "lse/dispatch/cache.hpp"
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
@@ -517,7 +515,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
 
 std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
-  std::uint64_t h = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
+  std::uint64_t h = dispatch::specialization_cache_key(group.signature(), group, device, hip_types(), hip_sources());
   const KernelPrimitiveBase* self = nullptr;
   if (kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
@@ -607,7 +605,7 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   g.anchor = run.front()->kind;
   g.anchor_class = run.front()->fclass;
 
-  const std::uint64_t key = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(g.signature())), g, device, hip_types(), hip_sources());
+  const std::uint64_t key = dispatch::specialization_cache_key(g.signature(), g, device, hip_types(), hip_sources());
   if (const auto it = run_scratch_cache_.find(key);
       it != run_scratch_cache_.end()) {
     return it->second;
@@ -712,9 +710,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   const std::uint32_t lds_budget = workgroup_lds_bytes(&device);
   // Scratch admission and emission must use the same policy-specialized
   // name, so measured launch costs are looked up for the body we emit.
-  const std::uint64_t run_key = kernels::quant_operand_specialization_key(
-      kernels::quant_operand_cache_key(
-          kernels::activation_int8_cache_key(group.signature())),
+  const std::uint64_t run_key = dispatch::specialization_cache_key(
+      group.signature(),
       group, device, hip_types(), hip_sources());
   const std::string run_entry = "lse_fused_" + std::to_string(run_key);
 
@@ -1124,7 +1121,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   // specialize() picks a different body (LDS vs WMMA vs scalar) for the same
   // graph node; the group hash only sees the generic primitive name.
-  std::uint64_t sig = kernels::quant_operand_specialization_key(kernels::quant_operand_cache_key(kernels::activation_int8_cache_key(group.signature())), group, device, hip_types(), hip_sources());
+  std::uint64_t sig = dispatch::specialization_cache_key(group.signature(), group, device, hip_types(), hip_sources());
   if (self_indexed != nullptr) {
     sig ^= 0x9e3779b97f4a7c15ull;
     for (char c : self_indexed->name()) {

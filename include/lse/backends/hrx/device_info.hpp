@@ -9,7 +9,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
 #include <string_view>
 
 #include "lse/backend/backend.hpp"
@@ -80,20 +79,11 @@ enum class ArchFamily : std::uint8_t {
   return false;
 }
 
-// LSE_WAVEFRONT=32|64 wins on RDNA4. Other families ignore an illegal ask.
+// Keep a legal runtime width; otherwise use the architecture default.
 [[nodiscard]] inline std::uint8_t select_wavefront(
     std::string_view arch, std::uint8_t runtime_wave) noexcept {
   const std::uint8_t fallback = family_is_cdna(arch_family(arch)) ? 64 : 32;
-  std::uint8_t chosen =
-      wavefront_legal(arch, runtime_wave) ? runtime_wave : fallback;
-  if (const char* env = std::getenv("LSE_WAVEFRONT")) {
-    const int want = std::atoi(env);
-    if (want == 32 || want == 64) {
-      const auto wave = static_cast<std::uint8_t>(want);
-      if (wavefront_legal(arch, wave)) chosen = wave;
-    }
-  }
-  return chosen;
+  return wavefront_legal(arch, runtime_wave) ? runtime_wave : fallback;
 }
 
 enum class MatrixCore : std::uint8_t {

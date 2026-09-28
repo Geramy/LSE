@@ -2,8 +2,8 @@
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/hip_types.hpp"
-#include <cstdlib>
 
+#include "lse/dispatch/attention.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
@@ -15,7 +15,6 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 #include <vector>
 
 namespace lse::backend {
@@ -87,11 +86,7 @@ bool is_linked_name(std::string_view n) {
   return n.find("linked") != std::string_view::npos;
 }
 
-// The primitive the phase actually stages. WMMA owns a grid we cannot share
-// and a linked pipeline owns the whole kernel. Standalone cooperative RMS
-// maps physical blockIdx.x to rows; a phase advances virtual rows inside its
-// own grid walk. Keep the base RMS here so the phase-specific reduction below
-// or its per-element function owns that walk.
+// Phases keep their virtual row walk; standalone indexed kernels own a grid.
 const KernelPrimitiveBase* phase_spec(const KernelPrimitiveBase* kp,
                                       const KernelShapes& sh) {
   if (kp == nullptr) return nullptr;
@@ -334,23 +329,8 @@ bool lane_stage_node(const Node& n) noexcept {
 // grid instead of buying grid-wide ordering they never use with a launch
 // boundary. Anything gathering, reducing or owning its indexing fails here and
 // still pays for the split.
-// Thread i STORES element i, into its own binding. Nothing about the read.
-bool lane_writes_node(const Node& n) noexcept {
-  if (n.kind == OpKind::kReshape) return true;   // metadata: element i IS i
-  const StageUse u = stage_use(n);
-  return u.write == LaneUse::kLane && u.elems != 0 && written_buf(n) == &n;
-}
-
-// Only with slot recycling off -- see IPhaseStaging::lane_writes.
-bool fusion_unlocked() noexcept {
-  static const bool on = std::getenv("LSE_NO_SLOT_REUSE") != nullptr;
-  return on;
-}
-
 bool lane_aligned_edge(const Node& producer, const Node& consumer) noexcept {
-  const bool producer_ok = fusion_unlocked() ? lane_writes_node(producer)
-                                             : lane_stage_node(producer);
-  if (!producer_ok || !lane_stage_node(consumer)) return false;
+  if (!lane_stage_node(producer) || !lane_stage_node(consumer)) return false;
   if (producer.element_count() != consumer.element_count()) return false;
   return BroadcastMap::build(producer.shape, consumer.shape).identity;
 }
@@ -362,30 +342,6 @@ bool node_can_stage(const Node& n) noexcept {
     return true;
   }
   if (is_elementwise(n.kind)) return true;
-  // A reduction staged into a phase is re-derived per output element — the
-  // whole reduced row is walked again for every lane, width× the loads the
-  // answer needs. L1 absorbs that for a head-width row (the gdn q/k norms at
-  // 128); a hidden-width row pays it from L2 thousands of times over —
-  // profiled at ~200× the bandwidth floor for a 5120-wide rms_norm, 150 ms of
-  // a 1.07 s prefill. Wide rows keep their own cooperative kernel, and the
-  // launch that costs is bought back fifty-fold.
-  // Excluding wide reductions from phases is measured BOTH ways: the naive
-  // per-element form wastes ~150 ms of a single-GPU prefill re-walking rows,
-  // but peeling reductions out shatters the member-split phase structure
-  // (20,827 phases against 3,467 ideal on two members, 9,472 host joins, a
-  // 30.7 s prefill) and costs more than it saves everywhere it was tried. The
-  // real fix is a cooperative in-phase reduction — one LDS row sum per
-  // workgroup — not exclusion; until that lands the gate stays opt-in.
-  static const bool split_wide =
-      std::getenv("LSE_SPLIT_WIDE_REDUCTIONS") != nullptr;
-  if (is_reduction(n.kind) && split_wide) {
-    const Node* in = n.inputs.empty() ? nullptr : n.inputs[0].get();
-    const std::int64_t width =
-        in != nullptr && in->shape.rank() > 0
-            ? in->shape.dim(in->shape.rank() - 1)
-            : 0;
-    if (width > 512) return false;
-  }
   if (n.prim == nullptr) return false;
   const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
   if (kp == nullptr) return false;
@@ -528,7 +484,7 @@ bool HipEmitter::lane_stage(const Node& n) const noexcept {
 }
 
 bool HipEmitter::lane_writes(const Node& n) const noexcept {
-  return fusion_unlocked() ? lane_writes_node(n) : lane_stage_node(n);
+  return lane_stage_node(n);
 }
 
 bool HipEmitter::lane_aligned(const Node& producer,
@@ -658,35 +614,12 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
     if (N > max_n) max_n = N;
     if (M > max_m) max_m = M;
   }
-  // Independent stages can use a fat grid, and so does a lane chunk: its
-  // dependences are intra-thread, so __syncthreads carries them at any grid
-  // width. Every other dependent group shares one workgroup, where
-  // __syncthreads is the whole grid. A multi-WG software barrier deadlocks
-  // here: this launch path does not keep the whole grid resident.
-  // PERSISTENT GRID: the alternative to a launch boundary for grid-wide
-  // ordering, and the only one that does not need a new HRX entry point.
-  //
-  // It was off because "a multi-WG software barrier deadlocks here: this
-  // launch path does not keep the whole grid resident" -- true, and the
-  // precondition is now checkable rather than assumed. lse_grid_sync spins on
-  // a ticket, so every workgroup it waits for must ALREADY be resident;
-  // persist_wgs is capped at compute_units below, and the part seats
-  // pools * workgroups_per_pool >= compute_units for any body that fits a
-  // pool at all. Under that cap the barrier cannot deadlock.
-  //
-  // Enabled ONLY where the alternative is the one-workgroup fallback. A
-  // dependent group that is neither a fat GEMV nor a lane chunk runs today on
-  // a SINGLE workgroup -- one CU of sixty-four -- because __syncthreads is
-  // then the whole grid. Profiled: 856 of 4204 dispatches in a two-token run
-  // are single-workgroup. Those are what this is for; everything that already
-  // has a grid keeps it.
+  // Independent stages and lane-local chains use a grid; other dependencies
+  // share one workgroup so their barriers cannot wait on unresident groups.
   const bool would_gemv = only_linears && compute > 0 && max_n >= 256;
   const bool would_elem =
       !would_gemv && (!dependent || lane_chunk) && max_threads >= 512;
-  static const bool persist_allowed = std::getenv("LSE_PERSIST") != nullptr;
-  const bool persist = persist_allowed && !would_gemv && !would_elem &&
-                       dependent && device.compute_units > 0 &&
-                       max_threads > 256;
+  constexpr bool persist = false;
   const bool grid_gemv = !persist && would_gemv;
   const bool grid_elem = !persist && would_elem;
   // A grid launch orders independent stages by having nothing to order. Only
@@ -864,34 +797,13 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       continue;
     }
 
-    // A wide rms_norm re-derives its row sum per output element — width x the
-    // loads the answer needs, ~200x the bandwidth floor at hidden width. When
-    // the workgroup's 256 lanes provably share one row (width and count both
-    // multiples of 256), the sum is computed once cooperatively: each lane
-    // strides a 1/256 slice, an LDS tree folds it, and every lane scales its
-    // own element. Head-width rows (128) keep the per-element form, which L1
-    // absorbs; the measured verdicts on the alternatives live in
-    // node_can_stage above.
-    // LSE_COOP_NORM=0 is the kill switch for bisects; LSE_COOP_NORM_MIN raises
-    // the width floor. Verified exact against the definition at every shipped
-    // row shape and against the serial form inside the model (identical
-    // inputs, 1.4e-6 worst delta) — a greedy token that flips between the two
-    // on a 0.8B 4-bit model is that model's sensitivity, not this kernel.
-    static const bool coop_norm = [] {
-      const char* v = std::getenv("LSE_COOP_NORM");
-      return v == nullptr || std::string_view(v) != "0";
-    }();
-    if (coop_norm && n->kind == OpKind::kRMS && n->inputs.size() == 2 &&
-        n->inputs[0] != nullptr && n->inputs[0]->dtype == DType::kF32 &&
-        n->inputs[0]->shape.rank() > 0) {
-      const auto D = static_cast<std::uint32_t>(
-          n->inputs[0]->shape.dim(n->inputs[0]->shape.rank() - 1));
-      const auto count = static_cast<std::uint32_t>(n->element_count());
-      static const std::uint32_t coop_min = [] {
-        const char* v = std::getenv("LSE_COOP_NORM_MIN");
-        return v != nullptr ? static_cast<std::uint32_t>(std::atoi(v)) : 256u;
-      }();
-      if (D >= coop_min && D % 256u == 0u && count % 256u == 0u) {
+    // A complete 256-lane row slice shares one FP32 RMS sum.
+    if (n->kind == OpKind::kRMS) {
+      const auto norm_shapes = shapes_for(n);
+      if (dispatch::phase_cooperative_rms_supported(norm_shapes)) {
+        const auto D = static_cast<std::uint32_t>(
+            n->inputs[0]->shape.dim(n->inputs[0]->shape.rank() - 1));
+        const auto count = static_cast<std::uint32_t>(n->element_count());
         const std::string xb = bname(n->inputs[0].get());
         const std::string gb = bname(n->inputs[1].get());
         const std::string ob = bname(n.get());

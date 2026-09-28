@@ -1,29 +1,4 @@
-// Loom spellings for the built-in primitives — the mirror of hipc/hip_sources.
-//
-// A HIP row is an INFIX EXPRESSION spliced into a larger one. Loom is SSA, so a
-// row here is one or more complete STATEMENTS: `$r` names the result, `$0`..
-// name the operands, `$a0`.. the node's float attrs (already materialized as
-// constants by the caller, because Loom takes no inline literal operand), and
-// `$t0`.. are fresh temporaries so a row that needs several instructions can
-// say so without inventing a name that collides.
-//
-// Rows that are NOT here are the point of the file. A primitive whose row is
-// absent declines for this dialect and the group falls back visibly, which is
-// the same contract a device missing a matrix-core capability already has:
-//
-//   * `shared` — a storage-class keyword in HIP; in Loom workgroup scratch is
-//     a `buffer.alloca` + `buffer.view` pair the printer synthesizes from the
-//     allocation's own type. A row would let something text-scan for a keyword
-//     that has no Loom form.
-//   * Unqualified matrix rows remain absent. The measured RDNA4 wave32
-//     rows below join the shared matrix contract to Loom fragment schemas;
-//     the register payload and lane mapping remain owned by that contract.
-//
-// Where Loom offers a NAMED op for something HIP spells as a formula —
-// `siluf`, `logisticf`, `softplusf`, `geluf` — the formula is spelled out here
-// anyway. The named ops are a different function until measured against the
-// HIP row, and this table's job is to reproduce the engine's arithmetic, not
-// to improve it.
+// Loom dialect spellings for the shared primitive and matrix tables.
 #include "lse/backends/hrx/loomc/loom_sources.hpp"
 
 #include <array>
