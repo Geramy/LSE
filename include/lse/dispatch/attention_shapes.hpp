@@ -9,17 +9,25 @@
 namespace lse::dispatch::attention_shapes {
 
 inline constexpr std::uint32_t kFlashThreads = 256, kFlashKeyWindow = 256;
+inline constexpr std::uint32_t kFlashDefaultQueryTile = 8, kFlashPrefillQueryTile = 12;
 inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;
 
 struct FlashRule {
   std::string_view arch;
   std::uint32_t min_rows, tile_rows;
   AttentionPlan plan;
+  bool reuse_keys;
 };
 inline constexpr std::array kFlashRules{
-    FlashRule{"gfx1201", 12, 12, AttentionPlan::kFlash12},
-    FlashRule{{}, 2, 8, AttentionPlan::kFlash8},
+    FlashRule{"gfx1201", kFlashPrefillQueryTile, kFlashPrefillQueryTile, AttentionPlan::kFlash12, true},
+    FlashRule{{}, 2, kFlashDefaultQueryTile, AttentionPlan::kFlash8, false},
 };
+
+[[nodiscard]] constexpr bool flash_reuses_keys(std::uint32_t tile_rows) noexcept {
+  for (const auto& rule : kFlashRules)
+    if (rule.tile_rows == tile_rows) return rule.reuse_keys;
+  return false;
+}
 
 struct DecodeRule {
   std::string_view arch;

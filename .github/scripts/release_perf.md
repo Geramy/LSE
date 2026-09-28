@@ -22,6 +22,18 @@ See [the long-context report](https://github.com/Geramy/LSE/blob/master/docs/ben
 for workload boundaries, isolated GPU timings, CPU diagnosis and validation.
 No new model perplexity or logits-L2 sweep was run for these changes.
 
+## Flash12 key reuse
+
+The accepted Flash12 implementation reuses each key load across twelve query
+rows. At query batch 512, isolated attention GPU time fell from
+**99.457 to 25.202 ms** at 5,610 live keys and from **232.793 to 93.772 ms**
+at 14,000 live keys. Complete output arrays match bit for bit; allocated
+registers and LDS are unchanged in those cases, with zero scratch. These are
+component timings, not end-to-end engine speedups.
+
+See [the Flash12 report](https://github.com/Geramy/LSE/blob/master/docs/benchmarks/flash12-key-reuse-2026-09-28.md)
+for matched GPU timings, independent reference checks and emitted-code details.
+
 ## Earlier short-context qualification
 
 Recorded on **gfx1201 / AMD R9700**, Apple Silicon with Thunderbolt 5,

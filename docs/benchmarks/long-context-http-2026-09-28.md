@@ -75,3 +75,10 @@ A dependency backport tracks memo entries touched by each symbolic proof and res
 | Total | 117.065 s | 71.542 s |
 
 These are isolated cold compiles of the six exact retained-KV attention sources, using the same machine and build configuration, with one matched pair per source. Compile time fell 38.89%; all six emitted code objects are byte-identical to the original compiler output. The candidate passed 33 symbolic-expression tests, including sparse reset, opposite-branch fact isolation and allocation failure. This is a compiler latency improvement, not a measured increase in GPU execution speed. The HTTP timings above predate this compiler change.
+
+## Follow-up attention implementation
+
+[Flash12 key reuse](flash12-key-reuse-2026-09-28.md) subsequently reduced isolated
+M512 attention GPU time by 74.66% at 5,610 live keys and 59.72% at 14,000 keys,
+with bit-identical complete outputs. The HTTP measurements in this report
+predate that kernel change as well as the compiler backport.

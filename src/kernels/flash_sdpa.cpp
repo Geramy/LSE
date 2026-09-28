@@ -5,6 +5,7 @@
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/attention_shapes.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -18,10 +19,10 @@ namespace math = lse::math;
 
 namespace {
 
-constexpr std::uint32_t kThreads = 256;
-constexpr std::uint32_t kDefaultQTile = 8;
-constexpr std::uint32_t kPrefillQTile = 12;
-constexpr std::uint32_t kKWin = kThreads;
+constexpr std::uint32_t kThreads = dispatch::attention_shapes::kFlashThreads;
+constexpr std::uint32_t kDefaultQTile = dispatch::attention_shapes::kFlashDefaultQueryTile;
+constexpr std::uint32_t kPrefillQTile = dispatch::attention_shapes::kFlashPrefillQueryTile;
+constexpr std::uint32_t kKWin = dispatch::attention_shapes::kFlashKeyWindow;
 using Dims = dispatch::FlashDims;
 
 template <class E>
@@ -155,25 +156,56 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
             e.let(kir::cast<kir::u32>(a.table[e.let(tb + j / d.ts)]));
         const auto kb0 =
             e.let(((blk * d.kvh + kh) * d.ts + j % d.ts) * d.dh);
-        for (std::uint32_t r = 0; r < QTile; ++r) {
-          const auto abs_i = e.let(offset + (q0 + r));
-          auto score = e.var(0.0f);
+        if constexpr (dispatch::attention_shapes::flash_reuses_keys(QTile)) {
+          // Reuse each key across rows; each row keeps ascending FP32 FMA order.
+          std::vector<kir::LValue<kir::f32>> scores;
+          scores.reserve(QTile);
+          for (std::uint32_t r = 0; r < QTile; ++r) scores.push_back(e.var(0.0f));
           for (auto dd : e.range(d.dh)) {
-            score = math::fma(qs[e.let(r * d.dh + dd)].read(),
-                              a.k[e.let(kb0 + dd)], score.read());
+            const auto kval = e.let(a.k[e.let(kb0 + dd)]);
+            for (std::uint32_t r = 0; r < QTile; ++r) {
+              scores[r] = math::fma(qs[e.let(r * d.dh + dd)].read(),
+                                    kval, scores[r].read());
+            }
           }
-          const auto sv = e.let(score.read() * d.scale);
-          const auto at = e.let(r * kKWin + lid);
-          if (d.mask == 0) {
-            sc[at] = sv;
-          } else if (d.mask == 1) {
-            if (auto g = e.when(j <= abs_i)) sc[at] = sv;
-          } else {
-            const auto distance = e.let(kir::cast<std::int64_t>(abs_i) -
-                                         kir::cast<std::int64_t>(j));
-            if (auto g = e.when(j <= abs_i &&
-                                distance < kir::cast<std::int64_t>(e.u32(d.window)))) {
+          for (std::uint32_t r = 0; r < QTile; ++r) {
+            const auto abs_i = e.let(offset + (q0 + r));
+            const auto sv = e.let(scores[r].read() * d.scale);
+            const auto at = e.let(r * kKWin + lid);
+            if (d.mask == 0) {
               sc[at] = sv;
+            } else if (d.mask == 1) {
+              if (auto g = e.when(j <= abs_i)) sc[at] = sv;
+            } else {
+              const auto distance = e.let(kir::cast<std::int64_t>(abs_i) -
+                                           kir::cast<std::int64_t>(j));
+              if (auto g = e.when(j <= abs_i &&
+                                  distance < kir::cast<std::int64_t>(e.u32(d.window)))) {
+                sc[at] = sv;
+              }
+            }
+          }
+        } else {
+          for (std::uint32_t r = 0; r < QTile; ++r) {
+            const auto abs_i = e.let(offset + (q0 + r));
+            auto score = e.var(0.0f);
+            for (auto dd : e.range(d.dh)) {
+              score = math::fma(qs[e.let(r * d.dh + dd)].read(),
+                                a.k[e.let(kb0 + dd)], score.read());
+            }
+            const auto sv = e.let(score.read() * d.scale);
+            const auto at = e.let(r * kKWin + lid);
+            if (d.mask == 0) {
+              sc[at] = sv;
+            } else if (d.mask == 1) {
+              if (auto g = e.when(j <= abs_i)) sc[at] = sv;
+            } else {
+              const auto distance = e.let(kir::cast<std::int64_t>(abs_i) -
+                                           kir::cast<std::int64_t>(j));
+              if (auto g = e.when(j <= abs_i &&
+                                  distance < kir::cast<std::int64_t>(e.u32(d.window)))) {
+                sc[at] = sv;
+              }
             }
           }
         }
