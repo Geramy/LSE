@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=fde050c1b8a98a73ffa3cdc8ea2c1c95fe8a6531
+mac_rev=bf1fa17c1fea2f84ee4f6d9beb2286dd6b976707
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
@@ -79,15 +79,6 @@ git -C "$work/hrx-source" init -q
 # needs its coarse-host-adapter patch.
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
-# The committed Cargo.lock determines transitive tokenizer dependencies.
-python3 - "$work/source/cmake/LSERust.cmake" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1]); s = p.read_text()
-s = s.replace('COMMAND ${LSE_CARGO} rustc --release', 'COMMAND ${LSE_CARGO} rustc --locked --release')
-s = s.replace('COMMAND ${LSE_CARGO} build --release', 'COMMAND ${LSE_CARGO} build --locked --release')
-p.write_text(s)
-PY
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
@@ -122,7 +113,7 @@ cmake -S "$work/source" -B "$work/lse-build" -G Ninja \
 tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu
   test_primitive test_trace test_loom_print test_loom_repeat test_loom_gdn
   test_loom_extent test_loom_conv test_loom_words test_loom_flash
-  test_generation_stats test_http_timings test_server_shutdown test_dispatch_profile test_loom_cache
+  test_generation_stats test_http_timings test_server_shutdown test_chat_protocol test_dispatch_profile test_loom_cache
   test_pointwise_fusion test_probe_measurement test_probe_policy test_quant_prefill
   test_token_ids test_submission_tuner test_submission_constants test_submission_decode
   test_decode_sample test_loaded_runtime test_hrx_copy_route test_gdn_pair

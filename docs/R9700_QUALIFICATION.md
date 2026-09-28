@@ -64,8 +64,7 @@ experimental.
 The INT8 prefetch candidate passes its 71-case arithmetic suite and the
 corrected same-buffer comparison. Its full-model speed screen fails, and no
 matched 1,024–2,048-token perplexity qualification is attached to it. The
-released `LSE_HRX_INT8=1` policy continues to cover the existing Q4 path,
-not this Q6 experiment.
+current Q4 INT8 dispatch is selected automatically; this Q6 experiment remains inactive.
 
 ## Reproduction and evidence
 

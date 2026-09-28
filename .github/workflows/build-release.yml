@@ -199,7 +199,9 @@ jobs:
           cp build/lse "dist/$name/"
           cp build/lse-server "dist/$name/"
           find build -maxdepth 2 -name '*.a' -exec cp {} "dist/$name/" \;
-          cp README.md LICENSE.md "dist/$name/" 2>/dev/null || true
+          cp README.md LICENSE.md "dist/$name/"
+          mkdir -p "dist/$name/docs"
+          cp docs/CHAT-COMPATIBILITY.md docs/pi-models.example.json docs/DFLASH2.md "dist/$name/docs/"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 

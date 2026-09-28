@@ -154,6 +154,9 @@ def main():
                 shutil.copy2(license_file, target)
     (package / 'licenses/rust-dependencies.json').write_text(json.dumps(rust_notices, indent=2) + '\n')
     shutil.copy2(root / 'README.md', package / 'README.md')
+    (package / 'docs').mkdir()
+    for name in ('CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md'):
+        shutil.copy2(root / 'docs' / name, package / 'docs' / name)
     manifest = {
         'lse_revision': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
         'mac_amdgpu_revision': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),

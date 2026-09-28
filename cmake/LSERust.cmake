@@ -41,7 +41,7 @@ endfunction()
 # list instead of hardcoding it — the set changes with fastokens' dependencies.
 function(_lse_rust_native_libs crate_dir out_var)
   execute_process(
-    COMMAND ${LSE_CARGO} rustc --release --lib
+    COMMAND ${LSE_CARGO} rustc --locked --release --lib
             --manifest-path "${crate_dir}/Cargo.toml"
             -- --print native-static-libs
     OUTPUT_VARIABLE _out ERROR_VARIABLE _err RESULT_VARIABLE _rc)
@@ -88,7 +88,7 @@ function(lse_add_rust_staticlib target crate_dir lib_name)
 
   add_custom_command(
     OUTPUT "${_lib}"
-    COMMAND ${LSE_CARGO} build --release --manifest-path "${crate_dir}/Cargo.toml"
+    COMMAND ${LSE_CARGO} build --locked --release --manifest-path "${crate_dir}/Cargo.toml"
     DEPENDS ${_srcs}
     COMMENT "cargo build --release (${lib_name})"
     VERBATIM)
