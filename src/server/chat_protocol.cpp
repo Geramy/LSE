@@ -146,7 +146,9 @@ ChatRequest prepare_chat(const ChatJson& body, bool thinking, const std::string&
     else if (role == "assistant") {
       const auto reasoning = m.contains("reasoning_content") && !m["reasoning_content"].is_null()
           ? m.at("reasoning_content").get<std::string>() : std::string{};
-      std::string rendered = "<think>\n" + reasoning + "\n</think>\n\n" + content;
+      std::string rendered = "<think>\n" + reasoning;
+      if (reasoning.empty() || !reasoning.ends_with('\n')) rendered += '\n';
+      rendered += "</think>\n\n" + content;
       if (m.contains("tool_calls")) {
         if (!m["tool_calls"].is_array()) bad("tool_calls must be an array");
         for (const auto& call : m["tool_calls"]) {

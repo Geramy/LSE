@@ -151,4 +151,27 @@ LSE_TEST(nullable_and_referenced_string_parameters_keep_numeric_text) {
     LSE_EXPECT(args["key"] == "42");
   }
 }
+
+LSE_TEST(assistant_reasoning_round_trip_preserves_the_cached_prompt_prefix) {
+  const json initial{{"messages", json::array({
+      {{"role", "user"}, {"content", "First turn"}}})}};
+  const auto first = prepare_chat(initial, true, "low");
+  for (const std::string tail : {std::string("\n"), std::string("\n\n")}) {
+    const std::string raw = "Consider it." + tail + "</think>\n\nDone.";
+    for (std::size_t split = 0; split <= raw.size(); ++split) {
+      ChatResponseParser parser(true, first, "roundtrip");
+      parser.push(raw.substr(0, split));
+      parser.push(raw.substr(split));
+      parser.finish(false);
+      const auto assistant = parser.message();
+      LSE_EXPECT(assistant["reasoning_content"] == "Consider it." + tail);
+      json next = initial;
+      next["messages"].push_back(assistant);
+      next["messages"].push_back({{"role", "user"}, {"content", "Next turn"}});
+      const auto second = prepare_chat(next, true, "low");
+      LSE_EXPECT(second.prompt.starts_with(first.prompt + raw + "<|im_end|>\n"));
+    }
+  }
+}
+
 LSE_TEST_MAIN()
