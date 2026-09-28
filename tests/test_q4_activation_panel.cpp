@@ -22,6 +22,12 @@ using namespace lse::graph;
 namespace {
 constexpr auto kProducer = "quant_activation.q4_shared_panel.v1";
 constexpr auto kConsumer = "quant_linear.q4_global_panel.v1";
+using Projection = std::array<std::size_t, 2>;
+constexpr std::array kFFNProjections{Projection{17408, 5120},
+                                     Projection{5120, 17408}};
+constexpr std::array kAdditionalProjections{
+    Projection{10240, 5120}, Projection{6144, 5120}, Projection{12288, 5120},
+    Projection{5120, 6144}, Projection{248320, 5120}};
 Array leaf(Shape shape, DType type) {
   auto node = std::make_shared<Node>();
   node->shape = shape;
@@ -128,6 +134,26 @@ LSE_TEST(q4_panel_graph_keeps_unmeasured_shapes_and_formats_on_legacy_route) {
                           leaf({17408, 80}, DType::kF32),
                           leaf({17408, 80}, DType::kF32), 4, 64);
   LSE_EXPECT_EQ(f32.node()->inputs.size(), 4u);
+}
+LSE_TEST(
+    q4_panel_additional_projection_routes_are_M4_only_and_share_input_panels) {
+  auto x = leaf({1, 4, 5120}, DType::kF32);
+  const auto ffn = contraction(x, 17408, 5120);
+  for (const auto &pair : kAdditionalProjections) {
+    const auto n = static_cast<std::int64_t>(pair[0]);
+    const auto k = static_cast<std::int64_t>(pair[1]);
+    const auto input = k == 5120 ? x : leaf({1, 4, k}, DType::kF32);
+    const auto output = contraction(input, n, k);
+    LSE_EXPECT_EQ(output.node()->inputs.size(), 5u);
+    LSE_EXPECT(output.node()->prim && output.node()->prim->name() == kConsumer);
+    LSE_EXPECT(output.node()->inputs[4]->shape == Shape{4, k * 25 / 64});
+    if (k == 5120)
+      LSE_EXPECT(output.node()->inputs[4] == ffn.node()->inputs[4]);
+    const auto fewer = contraction(leaf({1, 3, k}, DType::kF32), n, k);
+    const auto wider = contraction(leaf({1, 8, k}, DType::kF32), n, k);
+    LSE_EXPECT_EQ(fewer.node()->inputs.size(), 4u);
+    LSE_EXPECT_EQ(wider.node()->inputs.size(), 4u);
+  }
 }
 LSE_TEST(q4_panel_typed_host_codec_and_retained_replay_are_exact) {
   auto *scheduler = default_scheduler();
@@ -239,13 +265,19 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     const auto expected = legacy->plan(original), actual = consumer->plan(full);
     for (std::size_t axis = 0; axis < 3; ++axis) {
       LSE_EXPECT_EQ(actual.workgroup_size[axis], expected.workgroup_size[axis]);
-      LSE_EXPECT_EQ(actual.workgroup_count[axis], expected.workgroup_count[axis]);
+      LSE_EXPECT_EQ(actual.workgroup_count[axis],
+                    expected.workgroup_count[axis]);
     }
     LSE_EXPECT_EQ(actual.lds_bytes, expected.lds_bytes);
     LSE_EXPECT_EQ(emitted.lds_bytes, expected.lds_bytes);
   };
-  for (const auto dimensions :
-       {std::array<std::int64_t, 2>{17408, 5120}, {5120, 17408}}) {
+  for (const auto dimensions : {std::array<std::int64_t, 2>{17408, 5120},
+                                {5120, 17408},
+                                {10240, 5120},
+                                {6144, 5120},
+                                {12288, 5120},
+                                {5120, 6144},
+                                {248320, 5120}}) {
     auto out = contraction(leaf({1, 4, dimensions[1]}, DType::kF32),
                            dimensions[0], dimensions[1]);
     const NodePtr roots[]{out.node()};
@@ -299,14 +331,13 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
   }
 }
 
-int gpu_panel() {
+int gpu_panel(std::span<const Projection> projections) {
   auto *scheduler = default_scheduler();
   if (!scheduler)
     return 1;
   scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
   scheduler->set_dialect(Dialect::kLoom);
-  for (const auto dims :
-       {std::array<std::size_t, 2>{17408, 5120}, {5120, 17408}}) {
+  for (const auto &dims : projections) {
     struct Guarded {
       backend::DeviceBuffer allocation;
       std::vector<std::byte> bytes;
@@ -448,6 +479,8 @@ int gpu_panel() {
 }
 int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel")
-    return gpu_panel();
+    return gpu_panel(kFFNProjections);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-extensions")
+    return gpu_panel(kAdditionalProjections);
   return lse::test::run_all();
 }

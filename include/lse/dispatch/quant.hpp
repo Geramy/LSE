@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "lse/graph/kernel_primitive.hpp"
@@ -20,6 +21,16 @@ struct QuantPlan {
   std::uint32_t row_ladder_ceiling = 0;
 };
 
+struct Q4PanelShape {
+  std::int64_t n, k;
+};
+inline constexpr std::array kQ4PanelShapes{
+    Q4PanelShape{17408, 5120}, Q4PanelShape{5120, 17408},
+    Q4PanelShape{10240, 5120}, Q4PanelShape{6144, 5120},
+    Q4PanelShape{12288, 5120}, Q4PanelShape{5120, 6144},
+    Q4PanelShape{248320, 5120},
+};
+
 // Shape eligibility is shared by graph construction and device dispatch.
 [[nodiscard]] inline bool q4_shared_panel_shape(const graph::KernelShapes& s) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
@@ -29,7 +40,10 @@ struct QuantPlan {
       !s.inputs[0].rank() || s.inputs[1].rank() != 2) return false;
   const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
   const auto n = s.inputs[1].dim(0);
-  if (!((n == 17408 && k == 5120) || (n == 5120 && k == 17408)) ||
+  bool measured = false;
+  for (const auto& shape : kQ4PanelShapes)
+    measured = measured || (n == shape.n && k == shape.k);
+  if (!measured ||
       s.inputs[0].elem_count() != static_cast<std::uint64_t>(4 * k) ||
       s.inputs[1] != Shape{n, k / 8} ||
       s.inputs[2] != Shape{n, k / 64} || s.inputs[3] != s.inputs[2]) return false;
