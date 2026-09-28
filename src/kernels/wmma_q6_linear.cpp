@@ -418,12 +418,9 @@ struct StagedBF16Residual2Kernel final : KernelPrimitive<StagedBF16Residual2Kern
 
 template <math::MatrixElem T>
 struct ResidualKernel final : KernelPrimitive<ResidualKernel<T>> {
-  static constexpr std::string_view kName =
-      T == math::MatrixElem::kFp8 ? "quant_linear.q6_fp8_residual3_v2"
-                                  : "quant_linear.q6_bf8_residual3_v2";
-  static constexpr std::string_view kEntry = T == math::MatrixElem::kFp8
-                                                 ? "lse_q6_fp8_residual3_v2"
-                                                 : "lse_q6_bf8_residual3_v2";
+  static constexpr math::MatrixElem kMatrixElem = T;
+  static constexpr std::string_view kName = "quant_linear.q6_(MatrixElem)_residual3_v2";
+  static constexpr std::string_view kEntry = "lse_q6_(MatrixElem)_residual3_v2";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 4; }
   bool owns_indexing() const noexcept override { return true; }

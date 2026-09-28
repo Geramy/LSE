@@ -106,4 +106,46 @@ LSE_TEST(q6_other_shapes_and_unsupported_devices_keep_scalar) {
   fixture.device.max_threads_per_workgroup = 127;
   fixture.check(512, 17408, 5120, false, false);
 }
+LSE_TEST(q6_matrix_names_and_caches_follow_selected_operand) {
+  Fixture fixture;
+  auto group = make_group(64, 64, 64);
+  std::uint64_t hip_keys[2]{}, loom_keys[2]{};
+  std::string hip_sources[2], loom_sources[2];
+  int index = 0;
+  for (const char* format : {"fp8", "bf8"}) {
+    const auto name = std::string("quant_linear.q6_") + format + "_residual3_v2";
+    const auto* primitive = dynamic_cast<const graph::KernelPrimitiveBase*>(
+        graph::find_primitive(name));
+    LSE_EXPECT(primitive != nullptr);
+    if (!primitive) return;
+    LSE_EXPECT(primitive->name() == name);
+    LSE_EXPECT(primitive->entry_name() ==
+               std::string("lse_q6_") + format + "_residual3_v2");
+    group.outputs[0]->prim = primitive;
+    hip_keys[index] = fixture.hip.cache_key(group, fixture.device);
+    loom_keys[index] = fixture.loom.cache_key(group, fixture.device);
+    auto hip = fixture.hip.emit(group, fixture.device);
+    auto loom = fixture.loom.emit(group, fixture.device);
+    LSE_EXPECT(hip.ok() && loom.ok());
+    if (!hip.ok() || !loom.ok()) return;
+    hip_sources[index] = hip->source;
+    loom_sources[index] = loom->source;
+    LSE_EXPECT(hip->source.find(std::string("wmma_f32_16x16x16_") + format) !=
+               std::string::npos);
+    LSE_EXPECT(loom->source.find(index == 0 ? "element_format=f8e4m3"
+                                            : "element_format=f8e5m2") !=
+               std::string::npos);
+    LSE_EXPECT(hip->source.find("(MatrixElem)") == std::string::npos);
+    LSE_EXPECT(loom->source.find("(MatrixElem)") == std::string::npos);
+    ++index;
+  }
+  LSE_EXPECT(hip_keys[0] != hip_keys[1]);
+  LSE_EXPECT(loom_keys[0] != loom_keys[1]);
+  group.outputs[0]->prim = graph::find_primitive("quant_linear.q6_fp8_residual3_v2");
+  auto hip = fixture.hip.emit(group, fixture.device);
+  auto loom = fixture.loom.emit(group, fixture.device);
+  LSE_EXPECT(hip.ok() && loom.ok());
+  if (hip.ok()) LSE_EXPECT(hip->source == hip_sources[0]);
+  if (loom.ok()) LSE_EXPECT(loom->source == loom_sources[0]);
+}
 LSE_TEST_MAIN()

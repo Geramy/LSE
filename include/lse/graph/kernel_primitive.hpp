@@ -34,6 +34,7 @@
 #include "lse/graph/kernel_ir.hpp"
 #include "lse/graph/primitive.hpp"
 #include "lse/opt/traffic.hpp"
+#include "lse/opt/kernel_name.hpp"
 
 namespace lse::graph {
 
@@ -204,8 +205,24 @@ class KernelPrimitiveBase : public Primitive {
 template <typename Derived>
 class KernelPrimitive : public KernelPrimitiveBase {
  public:
-  std::string_view name() const noexcept override { return Derived::kName; }
-  std::string_view entry_name() const noexcept override { return Derived::kEntry; }
+  std::string_view name() const noexcept override {
+    if constexpr (requires { Derived::kMatrixElem; }) {
+      static constexpr auto resolved = opt::specialize_kernel_name<
+          Derived::kName.size()>(Derived::kName, Derived::kMatrixElem);
+      return {resolved.data()};
+    } else {
+      return Derived::kName;
+    }
+  }
+  std::string_view entry_name() const noexcept override {
+    if constexpr (requires { Derived::kMatrixElem; }) {
+      static constexpr auto resolved = opt::specialize_kernel_name<
+          Derived::kEntry.size()>(Derived::kEntry, Derived::kMatrixElem);
+      return {resolved.data()};
+    } else {
+      return Derived::kEntry;
+    }
+  }
 
   // Per-element kernels (slice, rope, …) override `kClass` so the generator
   // can fold them into a neighbour instead of launching them alone.
