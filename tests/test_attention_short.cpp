@@ -224,4 +224,11 @@ LSE_TEST(short_split_query_tile_has_measured_scope_and_matching_lds_contract) {
           (lds >= 2048u ? "attention.short_merge128.wg128c2.v1" : "attention"));
     }
 }
+LSE_TEST(short_split_empty_partition_shortcut_has_measured_scope) {
+  for (std::uint32_t queries : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u})
+    for (std::uint32_t capacity : {1024u, 2048u, 4096u, 8192u, 8208u, 16384u, 32768u})
+      LSE_EXPECT(dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity) ==
+                 (queries == 4u && capacity == 8192u));
+}
+
 LSE_TEST_MAIN()

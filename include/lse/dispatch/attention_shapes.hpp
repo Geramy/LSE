@@ -54,9 +54,11 @@ inline constexpr std::array kSplitShortRules{
 
 struct ShortTileRule {
   std::uint32_t min_rows, max_rows, capacity, query_tile;
+  bool skip_empty_partitions = false;
 };
 inline constexpr std::array kShortTileRules{
-    ShortTileRule{4, 8, 8192, 4},
+    ShortTileRule{4, 4, 8192, 4, true},
+    ShortTileRule{5, 8, 8192, 4},
     ShortTileRule{4, 8, 16384, 4},
 };
 
@@ -66,6 +68,14 @@ inline constexpr std::array kShortTileRules{
     if (rows >= rule.min_rows && rows <= rule.max_rows && capacity == rule.capacity)
       return rule.query_tile;
   return 1;
+}
+
+[[nodiscard]] constexpr bool short_skips_empty_partitions(std::uint32_t rows,
+                                                         std::uint32_t capacity) noexcept {
+  for (const auto& rule : kShortTileRules)
+    if (rows >= rule.min_rows && rows <= rule.max_rows && capacity == rule.capacity)
+      return rule.skip_empty_partitions;
+  return false;
 }
 
 struct ShortDefaultRule {
