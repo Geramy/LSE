@@ -188,7 +188,9 @@ bool split_short_supported(const KernelShapes& s) {
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         capacity <= rule.max_keys() && s.inputs[0].dim(3) == rule.head_dim &&
-        backend::workgroup_lds_bytes(s.device) >= rule.threads * sizeof(float)) {
+        backend::workgroup_lds_bytes(s.device) >= rule.threads * sizeof(float) *
+            shapes::short_query_tile(static_cast<std::uint32_t>(s.inputs[0].dim(2)),
+                                     static_cast<std::uint32_t>(capacity))) {
       const Shape partial{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2),
                           (capacity + shapes::kShortKeyWindow - 1) / shapes::kShortKeyWindow,

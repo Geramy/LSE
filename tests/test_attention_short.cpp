@@ -1,6 +1,7 @@
 #include "harness.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/attention_shapes.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/block.hpp"
 #include <utility>
@@ -58,9 +59,12 @@ LSE_TEST(short_split_selects_bounded_capacity_range_and_two_ordered_native_stage
         if (!emitted.ok()) return;
         const bool partial = i == 0;
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
-        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],
-                      static_cast<unsigned>(24 * queries * (partial ? capacity / 128 : 1)));
-        LSE_EXPECT_EQ(emitted->lds_bytes, partial ? 512u : static_cast<unsigned>(capacity / 32));
+        const auto tile = dispatch::attention_shapes::short_query_tile(
+            static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
+        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], partial
+                      ? 24u * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
+                      : 24u * static_cast<unsigned>(queries));
+        LSE_EXPECT_EQ(emitted->lds_bytes, partial ? tile * 512u : static_cast<unsigned>(capacity / 32));
         LSE_EXPECT_EQ(emitted->binding_order.size(), partial ? 6u : 2u);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       }
@@ -201,5 +205,20 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
         const auto signed_distance = static_cast<std::int64_t>(position) - static_cast<std::int64_t>(key);
         LSE_EXPECT(sliding == (causal && signed_distance < 7));
       }
+}
+LSE_TEST(short_split_long_tile_has_measured_scope_and_matching_lds_contract) {
+  for (int queries : {2, 3, 4, 5, 6, 7, 8})
+    for (int capacity : {8192, 8208, 16384}) {
+      const auto tile = dispatch::attention_shapes::short_query_tile(
+          static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
+      LSE_EXPECT_EQ(tile, capacity == 16384 && queries >= 4 ? 4u : 1u);
+    }
+  for (unsigned lds : {512u, 2047u, 2048u}) {
+    Fixture fx(4, 16384);
+    fx.gpu.lds_bytes_per_workgroup = lds;
+    auto out = fx.split();
+    LSE_EXPECT(out.node()->prim->name() ==
+        (lds >= 2048u ? "attention.short_merge128.wg128c2.v1" : "attention"));
+  }
 }
 LSE_TEST_MAIN()

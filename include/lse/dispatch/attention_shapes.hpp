@@ -52,6 +52,21 @@ inline constexpr std::array kSplitShortRules{
     SplitShortRule{"gfx1201", 32, 2, 8, 128, 256},
 };
 
+struct ShortTileRule {
+  std::uint32_t min_rows, max_rows, capacity, query_tile;
+};
+inline constexpr std::array kShortTileRules{
+    ShortTileRule{4, 8, 16384, 4},
+};
+
+[[nodiscard]] constexpr std::uint32_t short_query_tile(std::uint32_t rows,
+                                                      std::uint32_t capacity) noexcept {
+  for (const auto& rule : kShortTileRules)
+    if (rows >= rule.min_rows && rows <= rule.max_rows && capacity == rule.capacity)
+      return rule.query_tile;
+  return 1;
+}
+
 struct ShortDefaultRule {
   std::uint32_t batch, query_heads, key_heads, block;
   std::int64_t min_keys, min_offset;
