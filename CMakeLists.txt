@@ -196,6 +196,7 @@ target_link_libraries(lse_trace PUBLIC lse_core lse_backend_registry)
 lse_apply_common_flags(lse_trace)
 
 add_library(lse_graph
+  src/dispatch/attention.cpp
   src/graph/graph.cpp
   src/graph/ops.cpp
   src/graph/partitioner.cpp
@@ -232,7 +233,6 @@ add_library(lse_kernels
   src/kernels/quant_embedding.cpp
   src/dispatch/quant.cpp
   src/dispatch/q8_matrix.cpp
-  src/dispatch/attention.cpp
   src/kernels/quant_linear.cpp
   src/kernels/reduction.cpp
   src/kernels/rope.cpp
