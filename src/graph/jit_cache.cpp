@@ -417,14 +417,25 @@ void purge_kernel_artifacts() {
 }
 
 std::string default_cache_dir() {
-  if (const char* env = std::getenv("LSE_CACHE_DIR")) return env;
-  if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
-    return std::string(xdg) + "/lse/kernels";
+  if (const char* env = std::getenv("LSE_CACHE_DIR"); env && *env) return env;
+  if (const char* home = std::getenv("HOME"); home && *home) {
+    return std::string(home) + "/.lse/cache";
   }
-  if (const char* home = std::getenv("HOME")) {
-    return std::string(home) + "/.cache/lse/kernels";
+  return ".lse/cache";
+}
+
+Status prepare_cache_dir(std::string_view requested) {
+  const std::string path = requested.empty() ? default_cache_dir()
+                                              : std::string(requested);
+  std::error_code ec;
+  fs::create_directories(path, ec);
+  if (ec || ::access(path.c_str(), W_OK | X_OK) != 0) {
+    return LSE_ERROR(kInvalidArgument, "cannot create or write kernel cache '",
+                     path, "'", ec ? ": " + ec.message() : "");
   }
-  return ".lse-cache";
+  if (::setenv("LSE_CACHE_DIR", path.c_str(), 1) != 0)
+    return LSE_ERROR(kInternal, "cannot configure kernel cache '", path, "'");
+  return OkStatus();
 }
 
 struct JitCache::Impl {

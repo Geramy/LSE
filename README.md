@@ -14,6 +14,14 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 [Performance](#measured-performance) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
+## Kernel cache
+
+The CLI and HTTP server create `~/.lse/cache/` automatically and reuse compiled
+kernels across launches. Use `--cache-dir /path/to/cache` to select another
+location. The startup log prints the selected directory. The flag takes precedence
+over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
+required. Cache entries check compiler identity, device properties and kernel source.
+
 ## v0.4.8: lower VRAM use
 
 KV growth previously kept obsolete recurrent-state graphs and their buffers alive.

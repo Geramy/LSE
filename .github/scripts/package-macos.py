@@ -101,8 +101,7 @@ def main():
         for dep in dependencies(dst):
             if not dep.startswith(('/System/', '/usr/lib/', '@rpath/')):
                 raise RuntimeError(f'Nonportable dependency in package: {dst}: {dep}')
-    # The original compiler library path is unavailable after relocation.
-    # Isolate the default JIT cache by immutable source/toolchain identity.
+    # Record immutable build inputs; runtime cache keys identify the loaded compiler.
     build_inputs = {
         'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
         'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
@@ -116,7 +115,6 @@ def main():
         wrapper.write_text('#!/bin/sh\nset -eu\n'
             'package_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"\n'
             'export DYLD_LIBRARY_PATH="$package_root/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"\n'
-            'export LSE_CACHE_DIR="${LSE_CACHE_DIR:-$HOME/Library/Caches/lse/' + cache_identity + '}"\n'
             f'exec "$package_root/libexec/{binary}" "$@"\n')
         wrapper.chmod(0o755)
     for src, dst in ((root / 'LICENSE.md', 'LSE.md'),
@@ -184,9 +182,9 @@ def main():
         './bin/lse --model /path/to/model --pool hrx:0 --dialect loom --prompt "Hello"\n'
         './bin/lse-server --model /path/to/model --pool hrx:0 --dialect loom\n\n'
         'Use the bin wrappers so HRX finds the bundled HSA runtime.\n'
-        'Default JIT cache: ~/Library/Caches/lse/<build identity>.\n'
-        'This prevents stale kernel reuse between relocated release packages.\n'
-        'An explicit LSE_CACHE_DIR overrides that default.\n'
+        'Default JIT cache: ~/.lse/cache (created automatically).\n'
+        'Cache entries validate the loaded compiler, device and emitted source.\n'
+        'Use --cache-dir PATH to select another kernel cache directory.\n'
         'HIPC/comgr is unavailable in this macOS package.\n'
         'CI checks host behavior, relocation, and native kernel compilation;\n'
         'CI runners do not have an external AMD GPU and do not execute GPU kernels.\n'

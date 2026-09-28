@@ -20,8 +20,11 @@
 
 namespace lse::graph {
 
-// $LSE_CACHE_DIR, else $XDG_CACHE_HOME/lse/kernels, else ~/.cache/lse/kernels.
+// $LSE_CACHE_DIR when set, otherwise ~/.lse/cache.
 std::string default_cache_dir();
+
+// Called at startup; an explicit path takes precedence over the environment.
+Status prepare_cache_dir(std::string_view requested = {});
 
 // $LSE_HIP_DUMP, else ${CMAKE_BINARY_DIR}/hip.
 std::string hip_dump_directory();

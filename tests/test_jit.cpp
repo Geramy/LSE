@@ -5654,3 +5654,30 @@ LSE_TEST(the_device_publishes_its_capacity_facts) {
   }
   std::printf("       %s\n%s", info.arch.c_str(), f.describe().c_str());
 }
+
+LSE_TEST(kernel_cache_defaults_and_startup_override) {
+  const char* old_home = std::getenv("HOME");
+  const char* old_cache = std::getenv("LSE_CACHE_DIR");
+  const std::string saved_home = old_home ? old_home : "";
+  const std::string saved_cache = old_cache ? old_cache : "";
+  const bool had_home = old_home != nullptr, had_cache = old_cache != nullptr;
+  const auto root = std::filesystem::temp_directory_path() /
+      ("lse-cache-path-" + std::to_string(::getpid()));
+  ::setenv("HOME", root.c_str(), 1);
+  ::unsetenv("LSE_CACHE_DIR");
+  LSE_EXPECT(default_cache_dir() == (root / ".lse/cache").string());
+  LSE_EXPECT_OK(prepare_cache_dir());
+  LSE_EXPECT(std::filesystem::is_directory(root / ".lse/cache"));
+  const auto explicit_dir = root / "explicit/nested";
+  LSE_EXPECT_OK(prepare_cache_dir(explicit_dir.string()));
+  LSE_EXPECT(default_cache_dir() == explicit_dir.string());
+  LSE_EXPECT(std::filesystem::is_directory(explicit_dir));
+  const auto file = root / "not-a-directory";
+  { std::ofstream out(file); out << "occupied"; }
+  LSE_EXPECT(!prepare_cache_dir(file.string()).ok());
+  LSE_EXPECT(default_cache_dir() == explicit_dir.string());
+  if (had_home) ::setenv("HOME", saved_home.c_str(), 1); else ::unsetenv("HOME");
+  if (had_cache) ::setenv("LSE_CACHE_DIR", saved_cache.c_str(), 1); else ::unsetenv("LSE_CACHE_DIR");
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+}

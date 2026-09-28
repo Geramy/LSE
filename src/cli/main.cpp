@@ -56,6 +56,7 @@ struct Options {
   // Empty means the device's own first choice, which is what every run that
   // does not say gets.
   std::string dialect;
+  std::string cache_dir;
   bool show_stats = false;
   bool token_ids = false;
   bool list_devices = false;
@@ -100,6 +101,7 @@ void usage() {
       "      --no-mtp           decode one token per pass, ignoring any\n"
       "                         multi-token-prediction module\n"
       "      --list-models      print the registered model kernels and exit\n"
+      "      --cache-dir PATH  kernel cache directory (default ~/.lse/cache)\n"
       "      --list-cache       list the models in the HF cache and whether\n"
       "                         this build can load each one, and exit\n"
       "      --kv-len N         allocate the KV cache for N tokens and keep\n"
@@ -155,6 +157,14 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->list_cache = true;
     } else if (a == "--pool") {
       if (!take_value(argc, argv, i, "--pool", &opt->pool)) return false;
+    } else if (a == "--cache-dir" || a.starts_with("--cache-dir=")) {
+      if (a == "--cache-dir") {
+        if (!take_value(argc, argv, i, "--cache-dir", &opt->cache_dir)) return false;
+      } else opt->cache_dir = a.substr(12);
+      if (opt->cache_dir.empty()) {
+        std::fputs("lse: --cache-dir needs a nonempty path\n", stderr);
+        return false;
+      }
     } else if (a == "--dialect") {
       if (!take_value(argc, argv, i, "--dialect", &opt->dialect)) return false;
       if (!graph::dialect_from_name(opt->dialect).has_value()) {
@@ -568,6 +578,9 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  const Status cache_status = graph::prepare_cache_dir(opt.cache_dir);
+  if (!cache_status.ok()) return fail(cache_status, "kernel cache");
+  std::fprintf(stderr, "lse: kernel cache %s\n", graph::default_cache_dir().c_str());
   auto paths = model::resolve_model(opt.model);
   if (!paths.ok()) return fail(paths.status(), "resolving the model");
 

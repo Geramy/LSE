@@ -53,6 +53,7 @@ void usage() {
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
       "      --kv-len N       allocate the KV cache for N tokens\n"
+      "      --cache-dir PATH kernel cache directory (default ~/.lse/cache)\n"
       "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
       "      --dialect NAME   source dialect: hip or loom\n"
       "  -h, --help           this message\n"
@@ -80,6 +81,7 @@ int main(int argc, char** argv) {
   std::string served_name;
   std::string pool;
   std::string dialect;
+  std::string cache_dir;
   std::int32_t kv_len = 0;
   int shutdown_grace_seconds = 30;
 
@@ -134,6 +136,13 @@ int main(int argc, char** argv) {
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
+    else if (a == "--cache-dir" || a.starts_with("--cache-dir=")) {
+      cache_dir = a == "--cache-dir" ? value("--cache-dir") : a.substr(12);
+      if (cache_dir.empty()) {
+        std::fputs("lse-server: --cache-dir needs a nonempty path\n", stderr);
+        return 2;
+      }
+    }
     else if (a == "--pool") pool = value("--pool");
     else if (a == "--dialect") {
       dialect = value("--dialect");
@@ -202,6 +211,9 @@ int main(int argc, char** argv) {
   }
 
   std::fprintf(stderr, "lse-server: loading %s\n", model.c_str());
+  const Status cache_status = graph::prepare_cache_dir(cache_dir);
+  if (!cache_status.ok()) return fail(cache_status, "kernel cache");
+  std::fprintf(stderr, "lse-server: kernel cache %s\n", graph::default_cache_dir().c_str());
   auto paths = model::resolve_model(model);
   if (!paths.ok()) return fail(paths.status(), "resolving the model");
 
