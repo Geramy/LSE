@@ -93,7 +93,7 @@ fi
 
 body=$(curl -sf -m 300 "http://$HOST:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":32,"temperature":0}' || true)
+  -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":32,"temperature":0,"thinking":false}' || true)
 if python3 - "$body" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1])
@@ -110,7 +110,7 @@ then pass "POST /v1/chat/completions"; else fail "POST /v1/chat/completions: $(h
 
 body=$(curl -sf -m 300 "http://$HOST:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"What is 4 + 4? Answer with just the number."}],"max_tokens":48,"temperature":0}' || true)
+  -d '{"messages":[{"role":"user","content":"What is 4 + 4? Answer with just the number."}],"max_tokens":48,"temperature":0,"thinking":false}' || true)
 if python3 - "$body" <<'ARITH'
 import json, sys
 c = json.loads(sys.argv[1])["choices"][0]["message"]["content"]
@@ -120,7 +120,7 @@ then pass "chat completions does arithmetic"; else fail "chat arithmetic: $(head
 
 stream=$(curl -sN -m 300 "http://$HOST:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":24,"temperature":0,"stream":true}' || true)
+  -d '{"messages":[{"role":"user","content":"Say hello."}],"max_tokens":24,"temperature":0,"thinking":false,"stream":true}' || true)
 printf '%s' "$stream" > /tmp/lse-smoke-stream.txt
 if python3 - /tmp/lse-smoke-stream.txt <<'PY'
 import json, sys
