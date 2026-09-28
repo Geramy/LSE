@@ -31,7 +31,7 @@ constexpr std::array kAdditionalProjections{
     Projection{10240, 5120}, Projection{6144, 5120}, Projection{12288, 5120},
     Projection{5120, 6144}, Projection{248320, 5120}};
 constexpr std::array<Projection, 1> kM7Head{Projection{248320, 5120}};
-constexpr std::array kM6Projections{
+constexpr std::array kWidePanelProjections{
     Projection{17408, 5120}, Projection{5120, 17408}, Projection{10240, 5120},
     Projection{6144, 5120},  Projection{12288, 5120}, Projection{5120, 6144},
     Projection{248320, 5120}};
@@ -129,7 +129,7 @@ LSE_TEST(q4_panel_graph_shares_siblings_but_rejects_cloned_input_cache) {
   LSE_EXPECT(weak.expired());
 }
 LSE_TEST(q4_panel_graph_keeps_unmeasured_shapes_and_formats_on_legacy_route) {
-  for (auto m : {1, 3, 7, 8, 512}) {
+  for (auto m : {1, 3, 7, 9, 512}) {
     auto y = contraction(leaf({m, 5120}, DType::kF32), 17408, 5120);
     LSE_EXPECT_EQ(y.node()->inputs.size(), 4u);
     LSE_EXPECT(y.node()->prim && y.node()->prim->name() == "quant_linear");
@@ -157,7 +157,7 @@ LSE_TEST(
     if (k == 5120)
       LSE_EXPECT(output.node()->inputs[4] == ffn.node()->inputs[4]);
     const auto fewer = contraction(leaf({1, 3, k}, DType::kF32), n, k);
-    const auto wider = contraction(leaf({1, 8, k}, DType::kF32), n, k);
+    const auto wider = contraction(leaf({1, 9, k}, DType::kF32), n, k);
     LSE_EXPECT_EQ(fewer.node()->inputs.size(), 4u);
     LSE_EXPECT_EQ(wider.node()->inputs.size(), 4u);
   }
@@ -177,7 +177,7 @@ LSE_TEST(
     LSE_EXPECT(unmeasured.node()->prim &&
                unmeasured.node()->prim->name() == "quant_linear");
   }
-  for (const auto m : {1, 3, 5, 8}) {
+  for (const auto m : {1, 3, 5, 9}) {
     const auto unmeasured =
         contraction(leaf({1, m, 5120}, DType::kF32), 248320, 5120);
     LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
@@ -186,7 +186,7 @@ LSE_TEST(
 LSE_TEST(q4_panel_M6_measured_projections_share_six_row_panels) {
   auto x = leaf({1, 6, 5120}, DType::kF32);
   const auto ffn = contraction(x, 17408, 5120);
-  for (const auto &pair : kM6Projections) {
+  for (const auto &pair : kWidePanelProjections) {
     const auto n = static_cast<std::int64_t>(pair[0]);
     const auto k = static_cast<std::int64_t>(pair[1]);
     const auto input = k == 5120 ? x : leaf({1, 6, k}, DType::kF32);
@@ -196,10 +196,31 @@ LSE_TEST(q4_panel_M6_measured_projections_share_six_row_panels) {
     LSE_EXPECT(output.node()->inputs[4]->shape == Shape{6, (k / 64) * 25});
     if (k == 5120)
       LSE_EXPECT(output.node()->inputs[4] == ffn.node()->inputs[4]);
-    for (const auto m : {3, 5, 8}) {
+    for (const auto m : {3, 5, 9}) {
       const auto unmeasured = contraction(leaf({1, m, k}, DType::kF32), n, k);
       LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
     }
+  }
+  const auto unmeasured = contraction(x, 4096, 5120);
+  LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+}
+LSE_TEST(q4_panel_M8_measured_projections_share_eight_row_panels) {
+  auto x = leaf({1, 8, 5120}, DType::kF32);
+  const auto ffn = contraction(x, 17408, 5120);
+  for (const auto &pair : kWidePanelProjections) {
+    const auto n = static_cast<std::int64_t>(pair[0]);
+    const auto k = static_cast<std::int64_t>(pair[1]);
+    const auto input = k == 5120 ? x : leaf({1, 8, k}, DType::kF32);
+    const auto output = contraction(input, n, k);
+    LSE_EXPECT_EQ(output.node()->inputs.size(), 5u);
+    LSE_EXPECT(output.node()->prim && output.node()->prim->name() == kConsumer);
+    LSE_EXPECT(output.node()->inputs[4]->shape == Shape{8, (k / 64) * 25});
+    if (k == 5120)
+      LSE_EXPECT(output.node()->inputs[4] == ffn.node()->inputs[4]);
+    const auto unmeasured = contraction(leaf({1, 9, k}, DType::kF32), n, k);
+    LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+    LSE_EXPECT(unmeasured.node()->prim &&
+               unmeasured.node()->prim->name() == "quant_linear");
   }
   const auto unmeasured = contraction(x, 4096, 5120);
   LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
@@ -580,6 +601,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m7")
     return gpu_panel(7, kM7Head);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m6")
-    return gpu_panel(6, kM6Projections);
+    return gpu_panel(6, kWidePanelProjections);
   return lse::test::run_all();
 }
