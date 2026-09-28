@@ -31,17 +31,46 @@ struct Args {
   env::In<S, env::Emit> biases;
   env::Out<kir::f32, env::Emit> out;
 };
-template <int Bits, int Frag, class A>
+struct PackedArgs {
+  env::In<kir::f32, env::Emit> x;
+  env::In<std::uint32_t, env::Emit> original_words;
+  env::In<lse::bf16, env::Emit> original_scales;
+  env::In<lse::bf16, env::Emit> original_biases;
+  env::In<std::uint32_t, env::Emit> packed;
+  env::In<lse::bf16, env::Emit> scales;
+  env::In<lse::bf16, env::Emit> biases;
+  env::Out<kir::f32, env::Emit> out;
+};
+KernelShapes original_shapes(const KernelShapes& s) {
+  auto original = s;
+  original.inputs = s.inputs.first(4);
+  original.input_dtypes = s.input_dtypes.first(4);
+  return original;
+}
+const graph::KernelPrimitiveBase* original_kernel(const KernelShapes& s) {
+  const auto* kernel = dynamic_cast<const graph::KernelPrimitiveBase*>(
+      graph::find_primitive("quant_linear"));
+  return kernel ? kernel->specialize(s) : nullptr;
+}
+template <bool Packed, int Frag, class A>
 void fill_weights(env::Emit& e, const A& a, const kir::Val<kir::u32>& col,
                   const kir::Val<kir::u32>& k0,
                   const kir::Val<kir::u32>& k_lane, std::uint32_t lanes,
                   const kir::Local<kir::u32, Frag>& frag) {
-  const auto base = e.let(col * lanes + (k0 + k_lane) / (32u / Bits));
-  for (std::uint32_t f = 0; f < static_cast<std::uint32_t>(Frag); ++f)
-    frag[static_cast<int>(f)] = PackedCodes<Bits>::word(e, a.packed, base, f);
+  if constexpr (Packed) {
+    static_assert(Frag == 2);
+    const auto base = e.let((col / 16u) * (lanes * 16u) +
+                           (k0 / 16u) * 64u + (k_lane / 8u) * 16u + col % 16u);
+    for (std::uint32_t f = 0; f < static_cast<std::uint32_t>(Frag); ++f)
+      frag[static_cast<int>(f)] = e.let(a.packed[e.let(base + f * 32u)]);
+  } else {
+    const auto base = e.let(col * lanes + (k0 + k_lane) / 4u);
+    for (std::uint32_t f = 0; f < static_cast<std::uint32_t>(Frag); ++f)
+      frag[static_cast<int>(f)] = PackedCodes<8>::word(e, a.packed, base, f);
+  }
 }
 
-template <class A, math::MatrixTarget G, std::uint32_t RowBlocks, int Bits>
+template <class A, math::MatrixTarget G, std::uint32_t RowBlocks, bool Packed>
 std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d) {
   constexpr std::uint32_t kRowBlocks = RowBlocks;
   constexpr std::uint32_t kRowsPerGroup = kTileM * RowBlocks;
@@ -127,7 +156,10 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
       e.let(lane_hi * (kGeo.split_k ? kGeo.lane_k / 4u : 0u));
   std::vector<kir::Val<kir::u32>> col_scales;
   for (std::uint32_t j = 0; j < kColBlocks; ++j) {
-    col_scales.push_back(e.let(safe_col[j] * groups));
+    if constexpr (Packed)
+      col_scales.push_back(e.let((safe_col[j] / 16u) * (groups * 16u) + safe_col[j] % 16u));
+    else
+      col_scales.push_back(e.let(safe_col[j] * groups));
   }
 
   const std::uint32_t items = kRowsPerGroup * round_slices;
@@ -227,7 +259,10 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
       if constexpr (RowBlocks == 1) live_group.emplace(e.k, g < groups);
       std::vector<kir::Val<kir::f32>> gscale, gbias;
       for (std::uint32_t j = 0; j < kColBlocks; ++j) {
-        const auto at = e.let(col_scales[j] + g);
+        const auto at = e.let([&] {
+          if constexpr (Packed) return col_scales[j] + g * 16u;
+          else return col_scales[j] + g;
+        }());
         gscale.push_back(e.let(math::widen(a.scales[at])));
         gbias.push_back(e.let(math::widen(a.biases[at])));
       }
@@ -247,7 +282,7 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
           bf.push_back(e.local<kir::u32, kFragI>());
           for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][static_cast<int>(c)] = e.u32(0);
           if (auto gd = e.when(live[j] && bcol[j] < n)) {
-            fill_weights<Bits>(e, a, bcol[j], k0, lane_k, lanes, bf[j]);
+            fill_weights<Packed>(e, a, bcol[j], k0, lane_k, lanes, bf[j]);
           } else {
             for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][static_cast<int>(c)] = e.u32(0);
           }
@@ -302,25 +337,25 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
   return kb.str();
 }
 
-template <int Bits>
+template <bool Packed>
 dispatch::AffineMatrixPlan selected_plan(const KernelShapes& s, std::uint32_t rows) {
-  if constexpr (Bits == 4) return dispatch::q4_small_matrix_plan(s);
+  if constexpr (Packed) return dispatch::q8_packed_matrix_plan(s);
   return dispatch::q8_matrix_plan(s, rows);
 }
-template <int Bits, std::uint32_t RowBlocks>
-struct AffineWmmaKernel final : graph::KernelPrimitive<AffineWmmaKernel<Bits, RowBlocks>> {
+template <std::uint32_t RowBlocks, bool Packed = false>
+struct AffineWmmaKernel final : graph::KernelPrimitive<AffineWmmaKernel<RowBlocks, Packed>> {
   static constexpr std::uint32_t kRows = kTileM * RowBlocks;
-  static constexpr std::string_view kName = Bits == 4
-      ? "quant_linear.q4.wmma16.iu8_affine.v2"
+  static constexpr std::string_view kName = Packed
+      ? "quant_linear.q8.wmma16.packed.v1"
       : RowBlocks == 1
       ? "quant_linear.q8.wmma16.iu8_affine.v2"
       : "quant_linear.q8.wmma64.iu8_affine.v1";
   static constexpr std::string_view kEntry = "lse_quant_linear_affine_wmma";
   static constexpr std::string_view kSource = {};
-  std::size_t arity() const noexcept override { return 4; }
+  std::size_t arity() const noexcept override { return Packed ? 7 : 4; }
   bool owns_indexing() const noexcept override { return true; }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
-    if (in.size() != 4 || !in[0].rank() || in[1].rank() != 2)
+    if (in.size() != (Packed ? 7 : 4) || !in[0].rank() || in[1].rank() != 2)
       return LSE_ERROR(kInvalidArgument, "affine WMMA requires x, packed, scales, biases");
     Shape out;
     for (std::size_t i = 0; i + 1 < in[0].rank(); ++i) out.push_back(in[0].dim(i));
@@ -329,31 +364,54 @@ struct AffineWmmaKernel final : graph::KernelPrimitive<AffineWmmaKernel<Bits, Ro
   }
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
   std::string emit_kernel(const KernelShapes& s) const override {
-    const auto d = selected_plan<Bits>(s, kRows);
-    if (!d.matrix || !s.store || !s.types.scalar) return {};
+    const auto d = selected_plan<Packed>(s, kRows);
+    if (!s.store || !s.types.scalar) return {};
+    if (!d.matrix) {
+      if constexpr (Packed) {
+        if (s.inputs.size() != 7 || s.input_dtypes.size() != 7) return {};
+        const auto original = original_shapes(s);
+        const auto* kernel = original_kernel(original);
+        return kernel ? kernel->emit_kernel(original) : std::string{};
+      }
+      return {};
+    }
     return with_matrix_target<std::string>(d.matrix->target,
         [&]<math::MatrixTarget G>() -> std::string {
           if constexpr (math::has_matrix_core_row(G, math::MatrixElem::kI32,
-                  math::MatrixElem::kSU8, kTileM, kTileN, kTileK))
-            return emit_body<Args<lse::bf16>, G, RowBlocks, Bits>(s, d);
+                  math::MatrixElem::kSU8, kTileM, kTileN, kTileK)) {
+            if constexpr (Packed) {
+              if constexpr (MmaFor<G>::kRow.a_len / MmaFor<G>::kRow.chained == 2)
+                return emit_body<PackedArgs, G, RowBlocks, true>(s, d);
+            } else {
+              return emit_body<Args<lse::bf16>, G, RowBlocks, false>(s, d);
+            }
+          }
           return {};
         });
   }
   static ThreadPlan plan_impl(const KernelShapes& s) {
-    const auto d = selected_plan<Bits>(s, kRows);
+    const auto d = selected_plan<Packed>(s, kRows);
     ThreadPlan tp;
-    if (!d.matrix) return tp;
+    if (!d.matrix) {
+      if constexpr (Packed) {
+        if (s.inputs.size() != 7 || s.input_dtypes.size() != 7) return tp;
+        const auto original = original_shapes(s);
+        const auto* kernel = original_kernel(original);
+        return kernel ? kernel->plan(original) : ThreadPlan{};
+      }
+      return tp;
+    }
     tp.workgroup_size[0] = kBlock;
     tp.workgroup_count[0] = ((d.m + kRows - 1u) / kRows) * ((d.n + 127u) / 128u);
     tp.lds_bytes = d.lds_bytes;
     return tp;
   }
 };
-const AffineWmmaKernel<8, 1> kQ8Wmma16;
-const AffineWmmaKernel<8, 4> kQ8Wmma64;
-const AffineWmmaKernel<4, 1> kQ4Wmma16;
-const graph::PrimitiveRegistrar kRegisterQ4{&kQ4Wmma16};
+const AffineWmmaKernel<1> kQ8Wmma16;
+const AffineWmmaKernel<1, true> kQ8PackedWmma16;
+const AffineWmmaKernel<4> kQ8Wmma64;
 const graph::PrimitiveRegistrar kRegister16{&kQ8Wmma16};
+const graph::PrimitiveRegistrar kRegisterPacked{&kQ8PackedWmma16};
 const graph::PrimitiveRegistrar kRegister64{&kQ8Wmma64};
 }  // namespace
 
@@ -362,8 +420,5 @@ const graph::KernelPrimitiveBase* wmma_q8_linear_for(
   if (!dispatch::q8_matrix_plan(s, rows).matrix) return nullptr;
   return rows == 16 ? static_cast<const graph::KernelPrimitiveBase*>(&kQ8Wmma16)
                     : static_cast<const graph::KernelPrimitiveBase*>(&kQ8Wmma64);
-}
-const graph::KernelPrimitiveBase* wmma_q4_small_linear_for(const KernelShapes& s) {
-  return dispatch::q4_small_matrix_plan(s).matrix ? &kQ4Wmma16 : nullptr;
 }
 }  // namespace lse::kernels

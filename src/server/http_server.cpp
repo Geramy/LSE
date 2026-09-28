@@ -261,6 +261,7 @@ struct Outcome {
   std::uint64_t prefill_ns = 0;
   std::uint64_t decode_ns = 0;
   detail::JitTotals jit;
+  std::uint32_t device_groups = 0, host_groups = 0, host_fallbacks = 0;
   std::uint32_t mtp_depth = 0;
   std::uint32_t dflash2_depth = 0;
   std::uint32_t spec_steps = 0, spec_tested = 0, spec_accepted = 0;
@@ -285,17 +286,13 @@ struct HttpServer::Run {
     if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
     if (impl.dflash2 != nullptr) gen.use_dflash2(*impl.dflash2);
 
-    // The resident session: same state arrays every request, so the model's
-    // shape checks see the graph it already retained. restart() zeroes the
-    // recurrence and releases the KV rows; a failure falls back to a fresh
-    // session for this request rather than refusing it.
-    bool resident = false;
+    // Generator checks the exact token prefix before reusing resident state.
+    bool resident = true;
     if (!impl.session_live) {
       impl.session = runtime::Session{"resident", impl.model.state_slots()};
       impl.session_live = true;
-      resident = true;
-    } else if (impl.session.restart().ok()) {
-      resident = true;
+    } else if (impl.mtp != nullptr) {
+      resident = impl.session.restart().ok();
     }
 
     tokenizer::DecodeStream stream(impl.tok);
@@ -330,13 +327,22 @@ struct HttpServer::Run {
     auto ids = resident
                    ? gen.generate(impl.session, r.prompt, r.limits, on_token)
                    : gen.generate(r.prompt, r.limits, on_token);
-    if (!ids.ok()) return ids.status();
+    if (!ids.ok()) {
+      impl.session.clear();
+      impl.session_live = false;
+      if (impl.mtp != nullptr) impl.mtp->reset();
+      if (impl.dflash2 != nullptr) impl.dflash2->reset();
+      return ids.status();
+    }
     out.completion_tokens = static_cast<int>(ids->size());
     out.hit_limit = !stopped_by_string &&
                     out.completion_tokens >= r.limits.max_tokens;
 
     const runtime::GenerationStats& st = gen.stats();
     out.jit = detail::JitTotals::from(st);
+    out.device_groups = st.device_groups;
+    out.host_groups = st.host_groups;
+    out.host_fallbacks = st.host_fallbacks;
     out.mtp_depth = st.mtp_depth;
     out.dflash2_depth = st.dflash2_depth;
     out.spec_steps = st.spec_steps;
@@ -393,6 +399,9 @@ json timings_of(const Outcome& o) {
   t["spec_method"] = o.dflash2_depth != 0 ? "dflash2"
                        : o.mtp_depth != 0 ? "mtp" : "none";
   o.jit.append_to(t);
+  t["device_groups"] = o.device_groups;
+  t["host_groups"] = o.host_groups;
+  t["host_fallbacks"] = o.host_fallbacks;
   if (o.mtp_depth != 0 || o.dflash2_depth != 0) {
     t["spec_steps"] = o.spec_steps;
     t["spec_tested"] = o.spec_tested;

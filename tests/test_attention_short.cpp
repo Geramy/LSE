@@ -36,10 +36,10 @@ struct Fixture {
 };
 }  // namespace
 
-LSE_TEST(short_split_selects_measured_defaults_and_two_ordered_native_stages) {
+LSE_TEST(short_split_selects_bounded_capacity_range_and_two_ordered_native_stages) {
   backend::LoomEmitter emitter;
   for (int queries : {2, 3, 4, 5, 6, 7, 8}) {
-    for (int capacity : {1024, 2048}) {
+    for (int capacity : {1024, 2048, 4096, 8192, 16384}) {
       Fixture fx(queries, capacity);
       auto baseline = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal,
                                  0, fx.meta, fx.table, 16);
@@ -83,14 +83,14 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
     if (variant == 6) fx.q = leaf({1, 24, 3, 128});
     if (variant == 7) fx.q = leaf({1, 25, 3, 256});
     if (variant == 8) fx.q = leaf(fx.q.shape(), DType::kBF16);
-    if (variant == 9) fx.table = leaf({1, 513});
+    if (variant == 9) fx.table = leaf({1, 1025});
     if (variant == 10) fx.meta = leaf({1});
     if (variant == 12) {
       fx.q = leaf({2, 24, 3, 256});
       fx.meta = leaf({kv::step_meta_elems(2)});
       fx.table = leaf({2, 64});
     }
-    if (variant == 13) { fx.q = leaf({1, 24, 7, 256}); fx.table = leaf({1, 256}); }
+    if (variant == 13) fx.v = leaf({65, 4, 16, 128});
     if (variant == 14) fx.table = leaf({1, 32});
     if (variant == 15) fx.k = fx.v = leaf({65, 2, 16, 256});
     auto out = variant == 11 ? fx.split(MaskKind::kSlidingWindow, -1) : fx.split();
@@ -101,10 +101,10 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
 
 LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
   for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
-    for (int capacity : {512, 1024, 2048, 4096, 262100}) {
+    for (int capacity : {512, 1024, 2048, 4096, 8192, 16384, 16385, 32768, 262100}) {
       const Shape q{1, 24, queries, 256};
       const bool accepted = ((queries >= 2 && queries <= 8) &&
-                             (capacity == 1024 || capacity == 2048));
+                             (capacity >= 1024 && capacity <= 16384));
       LSE_EXPECT(dispatch::split_short_scope(q, 512, capacity) == accepted);
       LSE_EXPECT(dispatch::split_short_scope(q, 1024, capacity) == accepted);
       LSE_EXPECT(!dispatch::split_short_scope(q, 511, capacity));
@@ -114,6 +114,60 @@ LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
                                    std::pair{MaskKind::kSlidingWindow, 7},
                                    std::pair{MaskKind::kCausal, 7}})
     LSE_EXPECT(fx.split(mask, window).node()->prim->name() == "attention");
+}
+
+LSE_TEST(short_split_merge_rejects_more_partitions_than_weight_writers) {
+  backend::LoomEmitter emitter;
+  Fixture fx(6, 16384);
+  for (int partitions : {64, 65, 128, 129, 256}) {
+    auto partial = leaf({1, 24, 6, partitions, 258});
+    auto merged = custom("attention.short_merge128.wg128c2.v1", {partial});
+    LSE_EXPECT(merged.ok());
+    if (!merged.ok()) return;
+    const NodePtr roots[]{merged->node()};
+    auto groups = Partitioner::partition(roots, &fx.gpu);
+    LSE_EXPECT_EQ(groups.size(), 1u);
+    if (groups.size() != 1) return;
+    auto emitted = emitter.emit(groups[0], fx.gpu);
+    LSE_EXPECT(emitted.ok() == (partitions <= 128));
+    if (emitted.ok()) {
+      LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
+      LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u * 6u);
+      LSE_EXPECT_EQ(emitted->lds_bytes, static_cast<unsigned>(((partitions * 4 + 15) / 16) * 16));
+    }
+  }
+}
+
+LSE_TEST(short_split_large_declared_limit_uses_actual_table_geometry) {
+  backend::LoomEmitter emitter;
+  constexpr int declared_limit = 262100;
+  for (const auto [live, capacity] : {std::pair{5610, 8192}, std::pair{14000, 16384}}) {
+    LSE_EXPECT(kv::blocks_for(live, 16) <= capacity / 16);
+    LSE_EXPECT(capacity < declared_limit);
+    Fixture fx(4, capacity);
+    LSE_EXPECT(dispatch::split_short_scope(fx.q.shape(), live - 4, capacity));
+    LSE_EXPECT(!dispatch::split_short_scope(fx.q.shape(), live - 4, declared_limit));
+    auto split = fx.split();
+    LSE_EXPECT(split.node()->prim->name() == "attention.short_merge128.wg128c2.v1");
+    const auto partial = split.node()->inputs[0];
+    LSE_EXPECT(partial->shape == Shape({1, 24, 4, capacity / 128, 258}));
+    LSE_EXPECT_EQ(partial->element_count() * sizeof(float),
+                  static_cast<std::size_t>(24 * 4 * (capacity / 128) * 258 * 4));
+  }
+  Fixture ragged(6, 8208);
+  auto split = ragged.split();
+  LSE_EXPECT(split.node()->prim->name() == "attention.short_merge128.wg128c2.v1");
+  LSE_EXPECT(split.node()->inputs[0]->shape == Shape({1, 24, 6, 65, 258}));
+  const NodePtr roots[]{split.node()};
+  auto groups = Partitioner::partition(roots, &ragged.gpu);
+  LSE_EXPECT_EQ(groups.size(), 2u);
+  if (groups.size() != 2) return;
+  auto partial = emitter.emit(groups[0], ragged.gpu);
+  auto merge = emitter.emit(groups[1], ragged.gpu);
+  LSE_EXPECT(partial.ok() && merge.ok());
+  if (!partial.ok() || !merge.ok()) return;
+  LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 24u * 6u * 65u);
+  LSE_EXPECT_EQ(merge->lds_bytes, 272u);
 }
 
 LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
@@ -140,7 +194,7 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
   }
   for (std::uint64_t offset : {0ull, 511ull, 0xffffffffull})
     for (std::uint64_t query : {0ull, 2ull, 7ull})
-      for (std::uint64_t key : {0ull, 511ull, 8191ull}) {
+      for (std::uint64_t key : {0ull, 511ull, 8191ull, 16383ull}) {
         const auto position = offset + query;
         const bool causal = key <= position;
         const bool sliding = causal && position - key < 7;

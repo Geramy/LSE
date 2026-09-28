@@ -151,6 +151,16 @@ class WeightBinder {
                                const std::vector<std::int64_t>* order,
                                Shape logical, TensorWindow window = {});
 
+  struct UploadedOriginal {
+    std::string name;
+    backend::DeviceIndex residency;
+    std::uint16_t member;
+  };
+  void record_original_upload(std::string_view name, const Array& value);
+  [[nodiscard]] std::vector<std::size_t> remaining_original_bytes(
+      const backend::DeviceBuffer& placement) const;
+  std::vector<UploadedOriginal> original_uploads_;
+
   const SafeTensors* weights_;
   const quant::GroupAffineMap* quantization_ = nullptr;
   std::vector<std::string> claimed_;

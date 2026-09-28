@@ -61,7 +61,7 @@ int main() {
           throw std::runtime_error(h.status().to_string());
         if (!l.ok())
           throw std::runtime_error(l.status().to_string());
-        const bool expected = bits == 4 && (rows <= 8 || rows == 512);
+        const bool expected = bits == 4 && (rows <= 8 || rows >= 16);
         const bool hip_dot =
             h->source.find("__builtin_amdgcn_sudot4") != std::string::npos;
         const bool hip_matrix =
@@ -77,8 +77,8 @@ int main() {
         require((loom_dot || loom_matrix) == expected,
                 "Loom activation-conversion selection mismatch");
         if (expected) {
-          require(rows < 512 ? hip_dot : hip_matrix, "HIP wrong INT8 route");
-          require(rows < 512 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
+          require(rows < 16 ? hip_dot : hip_matrix, "HIP wrong INT8 route");
+          require(rows < 16 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
         }
         for (unsigned axis = 0; axis < 3; ++axis) {
           require(h->dims.workgroup_size[axis] == l->dims.workgroup_size[axis] &&

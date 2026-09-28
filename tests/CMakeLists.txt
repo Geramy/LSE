@@ -122,6 +122,10 @@ lse_add_test(test_prefix_commit lse_model lse_backends)
 set_tests_properties(test_prefix_commit PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 lse_add_test(test_feature_taps lse_model lse_backends)
 lse_add_test(test_dflash2 lse_model lse_kernels lse_backends lse_ir)
+if(TARGET lse_runtime)
+  target_link_libraries(test_dflash2 PRIVATE lse_runtime)
+  target_compile_definitions(test_dflash2 PRIVATE LSE_DFLASH2_RUNTIME_TESTS=1)
+endif()
 if(NOT TARGET lse_backend_hrx)
   target_sources(test_dflash2 PRIVATE
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
@@ -434,10 +438,11 @@ target_sources(test_attention_short PRIVATE
 # Typed storage/emission contracts run on CPU; no GPU or model is opened.
 lse_add_test(test_typed_kernel lse_graph lse_kernels lse_backends lse_ir)
 lse_add_test(test_q4_activation_panel lse_graph lse_kernels lse_backends lse_ir)
-set_tests_properties(test_typed_kernel test_q4_activation_panel PROPERTIES
+lse_add_test(test_q8_matrix_pack lse_graph lse_kernels lse_backends lse_ir)
+set_tests_properties(test_typed_kernel test_q4_activation_panel test_q8_matrix_pack PROPERTIES
   ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 if(NOT TARGET lse_backend_hrx)
-  foreach(target test_typed_kernel test_q4_activation_panel)
+  foreach(target test_typed_kernel test_q4_activation_panel test_q8_matrix_pack)
     target_sources(${target} PRIVATE
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
@@ -448,4 +453,24 @@ if(NOT TARGET lse_backend_hrx)
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
   endforeach()
+endif()
+
+
+lse_add_test(test_dflash2_walk lse_model lse_kernels lse_backends lse_ir)
+set_tests_properties(test_dflash2_walk PROPERTIES
+  ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
+if(LSE_ROCM_RUNTIME_DIR)
+  set_property(TEST test_dflash2_walk APPEND PROPERTY ENVIRONMENT
+    "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
+endif()
+if(NOT TARGET lse_backend_hrx)
+  target_sources(test_dflash2_walk PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 endif()

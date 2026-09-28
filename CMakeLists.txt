@@ -43,6 +43,7 @@ add_library(lse_core
   src/core/sha256.cpp
   src/core/status.cpp
   src/quant/group_affine.cpp
+  src/quant/q8_matrix_pack.cpp
 )
 add_library(lse::core ALIAS lse_core)
 

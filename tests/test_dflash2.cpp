@@ -2,6 +2,9 @@
 #include "lse/model/dflash2.hpp"
 #include "lse/model/layer.hpp"
 #include "lse/model/weights.hpp"
+#if defined(LSE_DFLASH2_RUNTIME_TESTS)
+#include "lse/runtime/generator.hpp"
+#endif
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
@@ -128,7 +131,11 @@ class ZeroFfn final : public model::IFeedForward {
   std::string_view name() const noexcept override { return "fixture.zero_ffn"; }
 };
 struct Named { std::string name; std::vector<std::int64_t> shape; };
-void write_weights(const std::filesystem::path& path, const std::vector<Named>& names) {
+enum class FixtureWeights {
+  kDefault, kConstantTokens, kStopTransition, kRejectedTokens, kRejectedStopTransition
+};
+void write_weights(const std::filesystem::path& path, const std::vector<Named>& names,
+                   FixtureWeights mode = FixtureWeights::kDefault) {
   nlohmann::json header;
   std::vector<float> payload;
   for (std::size_t t = 0; t < names.size(); ++t) {
@@ -140,6 +147,29 @@ void write_weights(const std::filesystem::path& path, const std::vector<Named>& 
       float value = std::sin(static_cast<float>((i + 1) * (t + 3)) * 0.371f) * 0.13f;
       if (normalizer) value = 1.0f;
       if (tensor.name.ends_with("base_kernel")) value = (i / 8) % 2 == 0 ? 1.0f : 0.17f;
+      if (mode != FixtureWeights::kDefault) {
+        value = normalizer ? 1.0f : 0.0f;
+        const bool constant = mode == FixtureWeights::kConstantTokens ||
+                              mode == FixtureWeights::kRejectedTokens;
+        if (tensor.name == "embed.weight") {
+          const auto token = i / 8;
+          const auto dimension = mode == FixtureWeights::kRejectedStopTransition
+              ? std::min<std::size_t>(token, 3) : (token == 0 ? 0u : 1u);
+          value = constant ? 0.25f : (i % 8 == dimension ? 1.0f : 0.0f);
+        } else if (tensor.name == "lm_head.weight") {
+          const auto token = i / 8, dimension = i % 8;
+          const bool transition = mode == FixtureWeights::kRejectedStopTransition
+              ? ((token == 1 && dimension == 0) || (token == 2 && dimension == 1) ||
+                 (token == 3 && (dimension == 2 || dimension == 3)))
+              : ((token == 1 && dimension == 0) || (token == 2 && dimension == 1));
+          value = transition ? 1.0f : 0.0f;
+        } else if (mode == FixtureWeights::kRejectedTokens) {
+          if (tensor.name == "candidate_selector.hidden_projection.weight" ||
+              tensor.name == "candidate_selector.predecessor_codebook") value = 1.0f;
+          if (tensor.name == "candidate_selector.successor_codebook")
+            value = i / 4 == 1 ? 1.0f : 0.0f;
+        }
+      }
       payload.push_back(value);
     }
     header[tensor.name] = {{"dtype", "F32"}, {"shape", tensor.shape},
@@ -157,13 +187,23 @@ struct Fixture {
   std::unique_ptr<model::HybridLM> target;
   std::unique_ptr<model::DFlash2Module> draft;
   ~Fixture() { std::error_code ec; std::filesystem::remove_all(directory, ec); }
-  Status open() {
-    directory = std::filesystem::temp_directory_path() / ("lse-dflash2-fixture-" + std::to_string(getpid()));
+  Status open(FixtureWeights mode = FixtureWeights::kDefault) {
+    // ZeroMixer has no recurrence for the generator to retain.
+    if (mode != FixtureWeights::kDefault) config.full_attention_interval = 1;
+    static unsigned serial = 0;
+    directory = std::filesystem::temp_directory_path() /
+        ("lse-dflash2-fixture-" + std::to_string(getpid()) + "-" + std::to_string(++serial));
     std::filesystem::create_directories(directory / "draft");
-    write_weights(directory / "model.safetensors", {{"embed.weight", {16, 8}}, {"final_norm.weight", {8}},
-                  {"blocks.0.norm1.weight", {8}}, {"blocks.0.norm2.weight", {8}}});
+    std::vector<Named> target_names{{"embed.weight", {16, 8}}, {"final_norm.weight", {8}},
+                                  {"blocks.0.norm1.weight", {8}}, {"blocks.0.norm2.weight", {8}}};
+    if (mode == FixtureWeights::kStopTransition || mode == FixtureWeights::kRejectedStopTransition) {
+      config.tie_word_embeddings = false;
+      target_names.push_back({"lm_head.weight", {16, 8}});
+    }
+    write_weights(directory / "model.safetensors", target_names, mode);
     LSE_ASSIGN_OR(weights, model::SafeTensors::open((directory / "model.safetensors").string()));
     model::HybridLMSpec spec; spec.zero_centered_norm = false;
+    if (mode == FixtureWeights::kStopTransition || mode == FixtureWeights::kRejectedStopTransition) spec.lm_head_name = "lm_head.weight";
     target = std::make_unique<model::HybridLM>(config, spec,
         [](std::int32_t) -> Result<std::unique_ptr<model::HybridBlock>> {
           return std::make_unique<model::HybridBlock>(std::make_unique<ZeroMixer>(), std::make_unique<ZeroFfn>(), false);
@@ -181,7 +221,7 @@ struct Fixture {
       {"layers.0.mlp.down_proj.weight", {8,12}}, {"layers.0.attention_conv.base_kernel", {2,2,8}},
       {"layers.0.attention_conv.kernel_projection.weight", {16,8}}, {"layers.0.mlp_conv.base_kernel", {2,2,8}},
       {"layers.0.mlp_conv.kernel_projection.weight", {16,8}}};
-    write_weights(directory / "draft" / "model.safetensors", names);
+    write_weights(directory / "draft" / "model.safetensors", names, mode);
     std::ofstream(directory / "draft" / "config.json") << config_json().dump();
     LSE_ASSIGN_OR(draft, model::DFlash2Module::open((directory / "draft").string(), config, *target));
     return OkStatus();
@@ -312,6 +352,197 @@ LSE_TEST(dflash2_context_overwrite_matches_fresh_prefix_and_does_not_alias_featu
   if (fresh.ok()) LSE_EXPECT((*fresh) == (*before));
   LSE_EXPECT(!fixture.draft->rewind(3).ok());
 }
+
+
+#if defined(LSE_DFLASH2_RUNTIME_TESTS)
+namespace {
+runtime::SamplingParams greedy_sampling() {
+  runtime::SamplingParams params;
+  params.temperature = 0.0f;
+  return params;
+}
+void expect_retained_dflash(const Fixture& fixture, runtime::Session& session,
+                           std::int32_t covered) {
+  LSE_EXPECT_EQ(session.position(), covered);
+  LSE_EXPECT_EQ(fixture.draft->context_position(), covered);
+  LSE_EXPECT(static_cast<std::size_t>(covered) <= session.history().size());
+  LSE_EXPECT(session.history().size() - static_cast<std::size_t>(covered) <= 1u);
+  for (const auto& state : session.states()) {
+    LSE_EXPECT(!state.gdn_state.valid());
+    LSE_EXPECT_EQ(state.position, covered);
+  }
+}
+void terminal_and_next_turn(FixtureWeights mode, std::int32_t max_tokens,
+                            std::size_t cancel_after,
+                            const std::vector<std::uint32_t>& stops,
+                            const std::vector<std::uint32_t>& expected,
+                            std::int32_t covered, std::uint32_t passes,
+                            std::uint32_t accepted, std::uint32_t tested) {
+  Fixture fixture;
+  const auto opened = fixture.open(mode);
+  LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+  runtime::Session session("retained", 1);
+  const std::vector<std::uint32_t> prompt =
+      (mode == FixtureWeights::kStopTransition || mode == FixtureWeights::kRejectedStopTransition)
+      ? std::vector<std::uint32_t>{0} : std::vector<std::uint32_t>{1, 2};
+  runtime::GenerationLimits limits;
+  limits.max_tokens = max_tokens;
+  limits.stop_tokens = stops;
+  std::vector<std::uint32_t> delivered;
+  {
+    runtime::Generator request(*fixture.target, greedy_sampling());
+    request.use_dflash2(*fixture.draft);
+    const auto output = request.generate(session, prompt, limits, [&](std::uint32_t token) {
+      delivered.push_back(token);
+      return cancel_after == 0 || delivered.size() < cancel_after;
+    });
+    LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+    LSE_EXPECT(*output == expected);
+    LSE_EXPECT(delivered == expected);
+    LSE_EXPECT_EQ(request.stats().generated_tokens, static_cast<std::int32_t>(expected.size()));
+    LSE_EXPECT_EQ(request.stats().prompt_tokens, static_cast<std::int32_t>(prompt.size()));
+    LSE_EXPECT_EQ(request.stats().spec_verify_passes, passes);
+    LSE_EXPECT_EQ(request.stats().spec_accepted, accepted);
+    LSE_EXPECT_EQ(request.stats().spec_tested, tested);
+  }
+  auto history = prompt;
+  history.insert(history.end(), expected.begin(), expected.end());
+  LSE_EXPECT(session.history() == history);
+  expect_retained_dflash(fixture, session, covered);
+
+  auto next_prompt = history;
+  next_prompt.insert(next_prompt.end(), {4, 5});
+  runtime::GenerationLimits next_limits;
+  next_limits.max_tokens = 4;
+  std::vector<std::uint32_t> continued;
+  {
+    // HTTP creates a Generator for each request while retaining model and session.
+    runtime::Generator request(*fixture.target, greedy_sampling());
+    request.use_dflash2(*fixture.draft);
+    auto output = request.generate(session, next_prompt, next_limits);
+    LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+    continued = output.release();
+    LSE_EXPECT_EQ(request.stats().prompt_tokens,
+                  static_cast<std::int32_t>(next_prompt.size()) - covered);
+    LSE_EXPECT(request.stats().prompt_tokens < static_cast<std::int32_t>(next_prompt.size()));
+    LSE_EXPECT_EQ(request.stats().generated_tokens, 4);
+  }
+  history = next_prompt;
+  history.insert(history.end(), continued.begin(), continued.end());
+  LSE_EXPECT(session.history() == history);
+  expect_retained_dflash(fixture, session, static_cast<std::int32_t>(next_prompt.size()) + 3);
+
+  Fixture cold;
+  const auto cold_opened = cold.open(mode);
+  LSE_EXPECT_OK(cold_opened); if (!cold_opened.ok()) return;
+  runtime::Session fresh("fresh", 1);
+  runtime::Generator request(*cold.target, greedy_sampling());
+  request.use_dflash2(*cold.draft);
+  const auto output = request.generate(fresh, next_prompt, next_limits);
+  LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+  LSE_EXPECT(*output == continued);
+  LSE_EXPECT_EQ(request.stats().prompt_tokens, static_cast<std::int32_t>(next_prompt.size()));
+  LSE_EXPECT(fresh.history() == session.history());
+  expect_retained_dflash(cold, fresh, session.position());
+}
+}
+LSE_TEST(dflash2_generator_retains_full_terminal_pass_for_next_request) {
+  terminal_and_next_turn(FixtureWeights::kConstantTokens, 4, 0, {}, {0, 0, 0, 0}, 5, 1, 2, 2);
+}
+LSE_TEST(dflash2_generator_commits_one_terminal_row_after_callback_cancel) {
+  terminal_and_next_turn(FixtureWeights::kConstantTokens, 6, 2, {}, {0, 0}, 3, 1, 0, 0);
+}
+LSE_TEST(dflash2_generator_commits_two_terminal_rows_after_callback_cancel) {
+  terminal_and_next_turn(FixtureWeights::kConstantTokens, 6, 3, {}, {0, 0, 0}, 4, 1, 1, 1);
+}
+LSE_TEST(dflash2_generator_retains_prefill_after_first_callback_cancel) {
+  terminal_and_next_turn(FixtureWeights::kConstantTokens, 6, 1, {}, {0}, 2, 0, 0, 0);
+}
+LSE_TEST(dflash2_generator_stop_inside_verifier_commits_only_consumed_prefix) {
+  terminal_and_next_turn(FixtureWeights::kStopTransition, 6, 0, {2}, {1}, 2, 1, 0, 0);
+}
+LSE_TEST(dflash2_generator_callback_after_rejection_preserves_next_turn) {
+  terminal_and_next_turn(FixtureWeights::kRejectedTokens, 6, 3, {}, {0, 0, 0}, 4, 2, 0, 1);
+}
+LSE_TEST(dflash2_generator_stop_after_rejection_preserves_next_turn) {
+  terminal_and_next_turn(FixtureWeights::kRejectedStopTransition, 6, 0, {3}, {1, 2}, 3, 2, 0, 1);
+}
+LSE_TEST(dflash2_generator_prefill_stop_retains_fully_covered_history) {
+  terminal_and_next_turn(FixtureWeights::kConstantTokens, 6, 0, {0}, {}, 2, 0, 0, 0);
+}
+LSE_TEST(dflash2_generator_repeated_fully_cached_stop_request_coldstarts) {
+  Fixture fixture;
+  const auto opened = fixture.open(FixtureWeights::kConstantTokens);
+  LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+  runtime::Session session("repeated-stop", 1);
+  const std::vector<std::uint32_t> prompt{1, 2};
+  runtime::GenerationLimits limits;
+  limits.max_tokens = 6;
+  limits.stop_tokens = {0};
+  for (unsigned turn = 0; turn < 2; ++turn) {
+    runtime::Generator request(*fixture.target, greedy_sampling());
+    request.use_dflash2(*fixture.draft);
+    std::size_t callbacks = 0;
+    const auto output = request.generate(session, prompt, limits, [&](std::uint32_t) {
+      ++callbacks;
+      return true;
+    });
+    LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+    LSE_EXPECT(output->empty());
+    LSE_EXPECT_EQ(callbacks, 0u);
+    LSE_EXPECT_EQ(request.stats().prompt_tokens, 2);
+    LSE_EXPECT_EQ(request.stats().spec_verify_passes, 0u);
+    LSE_EXPECT(session.history() == prompt);
+    expect_retained_dflash(fixture, session, 2);
+  }
+  limits.stop_tokens.clear();
+  limits.max_tokens = 4;
+  runtime::Generator request(*fixture.target, greedy_sampling());
+  request.use_dflash2(*fixture.draft);
+  const auto output = request.generate(session, prompt, limits);
+  LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+  LSE_EXPECT(*output == std::vector<std::uint32_t>({0, 0, 0, 0}));
+  LSE_EXPECT_EQ(request.stats().prompt_tokens, 2);
+  expect_retained_dflash(fixture, session, 5);
+}
+LSE_TEST(dflash2_generator_unrelated_prefix_coldstarts_retained_request) {
+  Fixture fixture;
+  const auto opened = fixture.open(FixtureWeights::kConstantTokens);
+  LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+  runtime::Session session("unrelated", 1);
+  runtime::GenerationLimits limits;
+  limits.max_tokens = 4;
+  {
+    runtime::Generator first(*fixture.target, greedy_sampling());
+    first.use_dflash2(*fixture.draft);
+    const auto output = first.generate(session, {1, 2}, limits);
+    LSE_EXPECT(output.ok()); if (!output.ok()) return;
+  }
+  expect_retained_dflash(fixture, session, 5);
+  const std::vector<std::uint32_t> unrelated{7, 6, 5, 4, 3, 2, 1};
+  runtime::Generator next(*fixture.target, greedy_sampling());
+  next.use_dflash2(*fixture.draft);
+  const auto output = next.generate(session, unrelated, limits);
+  LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+  LSE_EXPECT_EQ(next.stats().prompt_tokens, static_cast<std::int32_t>(unrelated.size()));
+  auto expected_history = unrelated;
+  expected_history.insert(expected_history.end(), output->begin(), output->end());
+  LSE_EXPECT(session.history() == expected_history);
+  expect_retained_dflash(fixture, session, 10);
+
+  Fixture cold;
+  const auto cold_opened = cold.open(FixtureWeights::kConstantTokens);
+  LSE_EXPECT_OK(cold_opened); if (!cold_opened.ok()) return;
+  runtime::Session fresh("fresh-unrelated", 1);
+  runtime::Generator reference(*cold.target, greedy_sampling());
+  reference.use_dflash2(*cold.draft);
+  const auto expected_output = reference.generate(fresh, unrelated, limits);
+  LSE_EXPECT(expected_output.ok()); if (!expected_output.ok()) return;
+  LSE_EXPECT(*output == *expected_output);
+  LSE_EXPECT(fresh.history() == session.history());
+  expect_retained_dflash(cold, fresh, session.position());
+}
+#endif
 
 std::vector<float> selector_reference(const std::vector<float>& predecessor, const std::vector<float>& gate,
     const std::vector<float>& successor, const std::vector<float>& unary,

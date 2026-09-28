@@ -74,15 +74,15 @@ LSE_TEST(quant_ffn_m512_uses_architecture_defaults) {
   }
 }
 
-LSE_TEST(quant_scalar_defaults_are_shape_specific) {
+LSE_TEST(quant_defaults_are_shape_specific) {
   for (bool loom : {false, true}) {
     for (int m : {1, 2, 3, 7, 8, 9, 32, 512}) {
       for (int bits : {4, 6, 8}) {
         Fixture f(m, 17, 64, bits, loom);
         const auto p = f.plan();
-        LSE_EXPECT_EQ(p.int8_activations, bits == 4 && (m <= 8 || m == 512));
-        LSE_EXPECT_EQ(p.matrix != nullptr, bits == 4 && m == 512);
-        if (bits != 4 || m != 512) scalar(p);
+        LSE_EXPECT_EQ(p.int8_activations, bits == 4 && (m <= 8 || m >= 16));
+        LSE_EXPECT_EQ(p.matrix != nullptr, bits == 4 && m >= 16);
+        if (bits != 4 || m < 16) scalar(p);
       }
     }
     Fixture decode(1, 17408, 5120, 6, loom);
@@ -265,4 +265,55 @@ LSE_TEST(quant_dispatch_checks_index_capacity_and_scale_formats) {
     }
   }
 }
+
+LSE_TEST(q4_prefill_range_uses_existing_matrix_tile_continuously) {
+  for (bool loom : {false, true}) {
+    for (int m : {16, 17, 32, 64, 128, 256, 257, 511, 512, 513}) {
+      for (auto [n, k] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
+        Fixture f(m, n, k, 4, loom);
+        const auto p = f.plan();
+        LSE_EXPECT(p.int8_activations && p.matrix != nullptr);
+        LSE_EXPECT(p.implementation == (m <= 512 ? dispatch::QuantMatrix::kInt8Lds
+                                               : dispatch::QuantMatrix::kInt8));
+        LSE_EXPECT(p.matrix && p.matrix->acc == math::MatrixElem::kI32);
+      }
+    }
+    for (int m : {9, 15}) {
+      Fixture f(m, 17408, 5120, 4, loom);
+      baseline(f.plan());
+    }
+    for (int fault = 0; fault < 9; ++fault) {
+      Fixture f(64, 17408, 5120, 4, loom);
+      if (fault == 0) f.device.arch = "gfx1200";
+      if (fault == 1) f.device.wavefront_size = 64;
+      if (fault == 2) f.shapes.device = nullptr;
+      if (fault == 3) f.dtypes[0] = DType::kBF16;
+      if (fault == 4) f.dtypes[3] = DType::kF32;
+      if (fault == 5) f.intrinsics = {};
+      if (fault == 6) f.device.lds_bytes_per_workgroup = dispatch::kQ4MatrixLdsBytes - 1;
+      if (fault == 7) f.device.max_threads_per_workgroup = 255;
+      LSE_EXPECT(f.plan(fault == 8).matrix == nullptr);
+    }
+    Fixture q6(64, 17408, 5120, 6, loom);
+    scalar(q6.plan());
+  }
+}
+
+LSE_TEST(q4_generic_prefill_projections_use_the_same_continuous_range) {
+  for (bool loom : {false, true}) {
+    for (int m : {16, 32, 64, 128, 256, 511}) {
+      for (auto [n, k] : {std::pair{10240, 5120}, std::pair{6144, 5120},
+                          std::pair{12288, 5120}, std::pair{1024, 5120},
+                          std::pair{5120, 6144}}) {
+        Fixture f(m, n, k, 4, loom);
+        const auto plan = f.plan();
+        LSE_EXPECT(plan.int8_activations);
+        LSE_EXPECT(plan.matrix != nullptr);
+        LSE_EXPECT(plan.implementation == dispatch::QuantMatrix::kInt8);
+        if (plan.matrix) LSE_EXPECT(plan.matrix->acc == math::MatrixElem::kI32);
+      }
+    }
+  }
+}
+
 LSE_TEST_MAIN()

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <vector>
 
 // host_bytes / sync_to_device: a checkpoint tensor is host data and Array has
@@ -15,6 +16,8 @@
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/ops/norm.hpp"
+#include "lse/dispatch/q8_matrix.hpp"
+#include "lse/quant/q8_matrix_pack.hpp"
 
 namespace lse::model {
 
@@ -65,11 +68,7 @@ struct WeightSlab {
   std::size_t used = 0;
 };
 
-Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
-                                          backend::IBackend& be,
-                                          backend::Stream at) {
-  // 4 KiB keeps every window page-aligned, which is the strictest alignment
-  // any kernel here asks of a binding.
+std::size_t weight_slab_bytes(const backend::IBackend& be) {
   constexpr std::size_t kAlign = 4096;
   std::size_t kSlab = std::size_t{512} << 20;
 #if defined(__APPLE__)
@@ -82,6 +81,14 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
     kSlab = std::clamp(budget & ~(kAlign - 1), kSlab, std::size_t{2} << 30);
   }
 #endif
+  return kSlab;
+}
+
+Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
+                                        backend::IBackend& be,
+                                        backend::Stream at) {
+  constexpr std::size_t kAlign = 4096;
+  const auto kSlab = weight_slab_bytes(be);
   static std::mutex mu;
   static std::vector<WeightSlab> slabs;
   const std::size_t need = (bytes + kAlign - 1) & ~(kAlign - 1);
@@ -367,13 +374,35 @@ Result<std::array<const TensorView*, 2>> WeightBinder::quant_planes(
   return planes;
 }
 
+void WeightBinder::record_original_upload(std::string_view name, const Array& value) {
+  original_uploads_.push_back({std::string(name), value.node()->buffer.residency,
+                               value.node()->buffer.member});
+}
+
+std::vector<std::size_t> WeightBinder::remaining_original_bytes(
+    const backend::DeviceBuffer& placement) const {
+  std::vector<std::size_t> remaining;
+  for (const auto& [name, tensor] : weights_->tensors()) {
+    const auto complete = std::any_of(original_uploads_.begin(), original_uploads_.end(),
+        [&](const UploadedOriginal& uploaded) {
+          return uploaded.name == name && uploaded.residency == placement.residency &&
+                 uploaded.member == placement.member;
+        });
+    if (!complete)
+      remaining.push_back(dtype_storage_bytes(device_storage(tensor.dtype), tensor.element_count()));
+  }
+  return remaining;
+}
+
 Result<Array> WeightBinder::optional(std::string_view name) {
-  const TensorView* v = weights_->find(name);
-  if (v == nullptr) return LSE_ERROR(kNotFound, std::string(name));
+  const TensorView *v = weights_->find(name);
+  if (v == nullptr)
+    return LSE_ERROR(kNotFound, std::string(name));
 
   LSE_ASSIGN_OR(const auto planes, quant_planes(name));
   if (planes[0] == nullptr) {
     LSE_ASSIGN_OR(Array a, upload(*v, v->shape, nullptr));
+    record_original_upload(name, a);
     claimed_.emplace_back(name);
     return a;
   }
@@ -381,7 +410,7 @@ Result<Array> WeightBinder::optional(std::string_view name) {
 }
 
 Result<Array> WeightBinder::require_rows(std::string_view name,
-                                         const std::vector<std::int64_t>& order,
+                                         const std::vector<std::int64_t> &order,
                                          Shape shape) {
   const TensorView* v = weights_->find(name);
   if (v == nullptr) {
@@ -422,6 +451,7 @@ Result<Array> WeightBinder::require_as(std::string_view name, Shape shape) {
                      shape.to_string(), " read differently");
   }
   LSE_ASSIGN_OR(Array a, upload(*v, shape, nullptr));
+  record_original_upload(name, a);
   claimed_.emplace_back(name);
   return a;
 }
@@ -521,12 +551,118 @@ Result<Array> WeightBinder::bind_quantized(
   LSE_ASSIGN_OR(Array b,
                 upload(biases, group_shape, order, grp_first, grp_count));
 
+  if (order == nullptr && window.empty()) {
+    record_original_upload(name, a);
+    record_original_upload(scales.name, s);
+    record_original_upload(biases.name, b);
+  }
   auto planes = std::make_shared<graph::QuantPlanes>();
   planes->scales = s.node();
   planes->biases = b.node();
   planes->bits = spec.bits;
   planes->group_size = spec.group_size;
   planes->in_features = sliced_in;
+  if (spec.bits == 8 && spec.group_size == 64 && rank == 2 &&
+      order == nullptr && window.empty() && scales.dtype == DType::kBF16 &&
+      packed_shape.dim(0) > 0 && packed_shape.dim(0) <= UINT32_MAX &&
+      sliced_in > 0 && sliced_in <= UINT32_MAX &&
+      dispatch::q8_packed_weight_shape(
+          static_cast<std::uint32_t>(packed_shape.dim(0)),
+          static_cast<std::uint32_t>(sliced_in))) {
+    auto *scheduler = graph::default_scheduler();
+    if (scheduler == nullptr)
+      return LSE_ERROR(kInternal, "no backend for packed Q8 weights");
+    auto &devices = scheduler->devices();
+    const auto member = graph::preferred_member();
+    auto &be =
+        member < devices.size() ? devices.device(member) : scheduler->backend();
+    const auto stream =
+        member < devices.size()
+            ? devices.stream_for(member).value_or(backend::kDefaultStream)
+            : backend::kDefaultStream;
+    try {
+      if (dispatch::q8_packed_weight_device(be.device_info())) {
+        constexpr std::size_t alignment = 4096;
+        const auto align = [](std::size_t bytes) {
+          return (bytes + alignment - 1) & ~(alignment - 1);
+        };
+        const auto columns = static_cast<std::uint32_t>(packed_shape.dim(0));
+        const auto features = static_cast<std::uint32_t>(sliced_in);
+        const auto padded = (columns + 15u) / 16u * 16u;
+        const std::array<Shape, 3> shapes{Shape{padded, features / 4u},
+                                          Shape{padded, features / 64u},
+                                          Shape{padded, features / 64u}};
+        const std::array<DType, 3> dtypes{DType::kU32, DType::kBF16,
+                                          DType::kBF16};
+        std::array<std::size_t, 3> offsets{}, sizes{};
+        std::size_t allocation_bytes = 0;
+        for (std::size_t i = 0; i < shapes.size(); ++i) {
+          offsets[i] = allocation_bytes;
+          sizes[i] = dtype_storage_bytes(dtypes[i], shapes[i].elem_count());
+          allocation_bytes += align(sizes[i]);
+        }
+        const auto free = be.sample_free_memory();
+        const auto remaining = remaining_original_bytes(a.node()->buffer);
+        if (quant::q8_packed_memory_admitted(
+                free.ok() ? std::optional<std::size_t>(*free) : std::nullopt,
+                remaining, weight_slab_bytes(be), allocation_bytes)) {
+          const auto upload_matrix =
+              [&]() -> Result<std::shared_ptr<graph::PackedQuantMatrix>> {
+            std::array<std::vector<std::byte>, 3> staged;
+            const std::array<const TensorView *, 3> views{&packed, &scales,
+                                                          &biases};
+            std::array<std::span<const std::byte>, 3> bytes;
+            for (std::size_t i = 0; i < views.size(); ++i) {
+              const auto want = dtype_storage_bytes(views[i]->dtype,
+                                                    views[i]->element_count());
+              if (views[i]->data.size() >= want) {
+                bytes[i] = views[i]->data.first(want);
+              } else {
+                staged[i].resize(want);
+                LSE_RETURN_IF_ERROR(
+                    views[i]->read_native(staged[i].data(), want));
+                bytes[i] = staged[i];
+              }
+            }
+            LSE_ASSIGN_OR(auto matrix,
+                          quant::pack_q8_matrix(columns, features, bytes[0],
+                                                bytes[1], bytes[2]));
+            const std::array<const void *, 3> data{matrix.words.data(),
+                                                   matrix.scales.data(),
+                                                   matrix.biases.data()};
+            LSE_ASSIGN_OR(auto base,
+                          be.allocate(allocation_bytes,
+                                      backend::MemoryClass::kDevice, stream));
+            if (!base.storage) {
+              be.deallocate(base);
+              return LSE_ERROR(kUnimplemented,
+                               "packed Q8 allocation needs managed storage");
+            }
+            const std::array<graph::NodePtr, 3> sources{a.node(), s.node(),
+                                                        b.node()};
+            auto storage = std::make_shared<graph::PackedQuantMatrix>();
+            for (std::size_t i = 0; i < data.size(); ++i) {
+              auto view = base;
+              view.offset += offsets[i];
+              view.size_bytes = sizes[i];
+              LSE_RETURN_IF_ERROR(be.copy({view}, data[i], sizes[i]));
+              storage->packed[i] =
+                  Array::from_buffer(std::move(view), shapes[i], dtypes[i])
+                      .node();
+              storage->sources[i] = sources[i];
+              storage->source_buffers[i] = sources[i]->buffer;
+            }
+            return storage;
+          };
+          auto storage = upload_matrix();
+          if (storage.ok())
+            planes->matrix_storage = storage.release();
+        }
+      }
+    } catch (const std::bad_alloc &) {
+      // Packing is optional; the original planes remain usable.
+    }
+  }
   a.node()->quant = std::move(planes);
 
   claimed_.emplace_back(name);
@@ -538,7 +674,7 @@ Result<Array> WeightBinder::bind_quantized(
 Result<Array> WeightBinder::require_columns(std::string_view name,
                                             std::int64_t first,
                                             std::int64_t count, Shape shape) {
-  const TensorView* v = weights_->find(name);
+  const TensorView *v = weights_->find(name);
   if (v == nullptr) {
     return LSE_ERROR(kNotFound, "checkpoint has no tensor '", std::string(name),
                      "'");

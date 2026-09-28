@@ -492,7 +492,17 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       }
     }
     if (!running) {
-      session.advance(static_cast<std::int32_t>(m));
+      if (dflash2_ != nullptr) {
+        if (emitted_to < m) {
+          const auto started = now_ns();
+          LSE_RETURN_IF_ERROR(model_.commit_prefix(session.states(), emitted_to));
+          stats_.spec_verify_ns += now_ns() - started;
+        }
+        LSE_RETURN_IF_ERROR(append_draft_context(emitted_to, at));
+        session.advance(static_cast<std::int32_t>(emitted_to));
+      } else {
+        session.advance(static_cast<std::int32_t>(m));
+      }
       break;
     }
 
@@ -540,12 +550,12 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     row_in.insert(row_in.end(), chain.begin(), chain.end());
   }
 
-  // Stopping within a verifier pass can leave uncommitted rows in the cache.
-  // Restart before a subsequent turn consumes that speculative suffix.
   const auto draft_position = mtp_ != nullptr ? mtp_->position()
                                               : dflash2_->context_position();
-  if (static_cast<std::size_t>(session.position()) + 1 !=
-          session.history().size() || draft_position != session.position()) {
+  const auto covered = static_cast<std::size_t>(session.position());
+  const bool history_matches = covered + 1 == session.history().size() ||
+      (dflash2_ != nullptr && covered == session.history().size());
+  if (!history_matches || draft_position != session.position()) {
     if (!session.restart().ok()) session.clear();
     if (mtp_ != nullptr) mtp_->reset();
     if (dflash2_ != nullptr) dflash2_->reset();
@@ -586,7 +596,8 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   // conversation; anything else is a cold start.
   const auto covered = static_cast<std::size_t>(session.position());
   const bool continues =
-      covered > 0 && covered <= prompt.size() &&
+      covered > 0 && covered < prompt.size() &&
+      covered <= session.history().size() &&
       std::equal(session.history().begin(),
                  session.history().begin() + static_cast<std::ptrdiff_t>(covered),
                  prompt.begin());

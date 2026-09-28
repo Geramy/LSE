@@ -1433,6 +1433,14 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     }
 
     if (const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim)) {
+      std::vector<Shape> shapes;
+      std::vector<DType> dtypes;
+      const auto probe = shapes_for(n, shapes, dtypes);
+      const auto* chosen = kp->specialize(probe);
+      if ((chosen ? chosen : kp)->owns_indexing())
+        return LSE_ERROR(kUnimplemented, "primitive '",
+                         std::string(kp->name()),
+                         "' owns its indexing but cannot emit in this group");
       const std::string var = "t" + std::to_string(temp++);
       // The helper turns the flat thread id into a row and a column of *its*
       // output, so calling it past its own extent walks the activation off the

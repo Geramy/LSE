@@ -220,7 +220,7 @@ struct DFlash2Module::Impl {
     std::vector<graph::NodePtr> roots;
   };
   struct DraftPass {
-    Array tokens, anchor, offset, meta, indices, scores;
+    Array tokens, anchor, offset, meta, indices, scores, path;
     graph::Program program;
     std::vector<graph::NodePtr> roots;
   };
@@ -358,7 +358,9 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint
   Array gate = graph::reshape(graph::linear(x, selector_projection), Shape{1, proposals, rank});
   LSE_ASSIGN_OR(p.scores, graph::custom("dflash2.selector", {pred, gate, succ, unary},
       {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(top), static_cast<float>(rank)}));
-  p.roots = {p.scores.node(), p.indices.node()};
+  LSE_ASSIGN_OR(p.path, graph::custom("dflash2.selector_walk.v1", {p.scores, p.indices},
+      {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(config.vocab_size), 0.0f}));
+  p.roots = {p.path.node()};
   return p;
 }
 
@@ -443,16 +445,12 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, st
   LSE_RETURN_IF_ERROR(poke(pass.tokens, tokens)); LSE_RETURN_IF_ERROR(poke(pass.anchor, std::span(&anchor_id, 1)));
   LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1))); LSE_RETURN_IF_ERROR(poke(pass.meta, meta));
   LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
-  std::vector<float> scores(pass.scores.shape().elem_count()), indices(pass.indices.shape().elem_count());
-  LSE_RETURN_IF_ERROR(pass.scores.to_host(scores.data(), scores.size() * sizeof(float)));
-  LSE_RETURN_IF_ERROR(pass.indices.to_host(indices.data(), indices.size() * sizeof(float)));
-  std::vector<std::uint32_t> candidates; candidates.reserve(indices.size());
-  for (float id : indices) {
-    if (!std::isfinite(id) || id < 0 || id >= static_cast<float>(impl_->config.vocab_size) || std::floor(id) != id)
-      return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
-    candidates.push_back(static_cast<std::uint32_t>(id));
-  }
-  LSE_ASSIGN_OR(auto path, dflash2_select_path(scores, candidates, full_proposals, static_cast<std::uint32_t>(impl_->config.selector_top_k)));
+  std::vector<std::uint32_t> path(full_proposals + 1);
+  LSE_RETURN_IF_ERROR(pass.path.to_host(path.data(), path.size() * sizeof(std::uint32_t)));
+  const auto validation = path.back();
+  if (validation & 2u) return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
+  if (validation & 1u) return LSE_ERROR(kInvalidArgument, "nonfinite DFlash2 selector score");
+  if (validation != 0) return LSE_ERROR(kInternal, "invalid DFlash2 selector validation");
   path.resize(proposals);
   return path;
 }

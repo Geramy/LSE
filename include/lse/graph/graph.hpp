@@ -113,6 +113,14 @@ using NodePtr = std::shared_ptr<Node>;
 // Trace-time metadata only. The op builders read it and pass all three planes
 // as ordinary inputs, so the partitioner, the emitter and the scheduler never
 // see it and the packed plane stays a leaf buffer to all of them.
+struct PackedQuantMatrix {
+  std::array<std::weak_ptr<Node>, 3> sources;
+  std::array<backend::DeviceBuffer, 3> source_buffers;
+  std::array<NodePtr, 3> packed;
+
+  [[nodiscard]] bool matches(std::span<const NodePtr> inputs) const noexcept;
+};
+
 struct QuantPlanes {
   NodePtr scales;
   NodePtr biases;
@@ -121,6 +129,7 @@ struct QuantPlanes {
   // Weights per row. The packed plane's own last axis counts lanes, so this is
   // the only place the logical width survives.
   std::int64_t in_features = 0;
+  std::shared_ptr<const PackedQuantMatrix> matrix_storage;
 };
 
 class Node {
@@ -184,6 +193,34 @@ class Node {
   [[nodiscard]] std::uint64_t recompute_cost() const noexcept;
   [[nodiscard]] std::size_t element_count() const noexcept { return shape.elem_count(); }
 };
+
+inline bool PackedQuantMatrix::matches(std::span<const NodePtr> inputs) const noexcept {
+  if (inputs.size() != 3) return false;
+  const auto same_buffer = [](const backend::DeviceBuffer& a,
+                              const backend::DeviceBuffer& b) {
+    return a.ptr == b.ptr && a.handle == b.handle && a.offset == b.offset &&
+           a.size_bytes == b.size_bytes && a.residency == b.residency &&
+           a.member == b.member && a.storage == b.storage &&
+           !a.storage.owner_before(b.storage) && !b.storage.owner_before(a.storage);
+  };
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    const auto& source = inputs[i];
+    const auto& leaf = packed[i];
+    if (!source || sources[i].lock() != source || !source->materialized ||
+        source->host_dirty || !source->buffer.valid() ||
+        !source->buffer.residency.bound() ||
+        !same_buffer(source->buffer, source_buffers[i]) || !leaf ||
+        leaf->kind != OpKind::kBuffer || !leaf->materialized || leaf->host_dirty ||
+        !leaf->buffer.valid() || leaf->buffer.residency != source->buffer.residency ||
+        leaf->buffer.member != source->buffer.member ||
+        leaf->buffer.size_bytes < dtype_storage_bytes(leaf->dtype, leaf->element_count()))
+      return false;
+    if (source->buffer.residency != inputs[0]->buffer.residency ||
+        source->buffer.member != inputs[0]->buffer.member)
+      return false;
+  }
+  return true;
+}
 
 class Array {
  public:

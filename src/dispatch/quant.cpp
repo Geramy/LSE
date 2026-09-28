@@ -1,8 +1,6 @@
 #include "lse/dispatch/quant.hpp"
 
 #include <algorithm>
-#include <array>
-#include <limits>
 
 #include "lse/kernels/wmma.hpp"
 #include "lse/quant/group_affine_codec.hpp"
@@ -10,41 +8,6 @@
 namespace lse::dispatch {
 namespace {
 using graph::KernelShapes;
-
-struct ShapeRule {
-  std::string_view arch;
-  std::uint32_t wave, bits, group;
-  std::uint64_t min_m, max_m, n, k;
-  QuantMatrix implementation;
-  std::uint32_t lds, threads;
-};
-
-constexpr std::array kMatrixRules{
-    ShapeRule{"gfx1201", 32, 4, 64, 512, 512, 17408, 5120, QuantMatrix::kInt8Lds, kQ4MatrixLdsBytes, 256},
-    ShapeRule{"gfx1201", 32, 4, 64, 512, 512, 5120, 17408, QuantMatrix::kInt8Lds, kQ4MatrixLdsBytes, 256},
-    ShapeRule{"gfx1201", 32, 6, 64, 512, 512, 17408, 5120, QuantMatrix::kBF16, 16384, 128},
-    ShapeRule{"gfx1201", 32, 6, 64, 512, 512, 5120, 17408, QuantMatrix::kBF16, 16384, 128},
-};
-
-struct ScalarRule {
-  std::string_view arch;
-  std::uint32_t wave, bits, group, columns, prefill_rows;
-};
-constexpr std::array kScalarRules{
-    ScalarRule{"gfx1201", 32, 6, 64, 4, 8},
-};
-
-struct RowLadderRule {
-  std::string_view arch;
-  std::uint32_t wave, m, ceiling, lds;
-  std::uint64_t n, k;
-};
-constexpr std::array kRowLadderRules{
-    RowLadderRule{"gfx1201", 32, 3, 4, 33088, 17408, 5120},
-    RowLadderRule{"gfx1201", 32, 3, 4, 56128, 5120, 17408},
-    RowLadderRule{"gfx1201", 32, 7, 8, 33152, 17408, 5120},
-    RowLadderRule{"gfx1201", 32, 7, 8, 56192, 5120, 17408},
-};
 
 const math::MatrixCoreRow* matrix_row(const KernelShapes& s,
                                     math::MatrixElem acc,
@@ -112,21 +75,28 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
   const auto budget = backend::workgroup_lds_bytes(s.device);
   const bool staged = !s.staged.name.empty() || !s.staged_quant.codes.empty();
   const auto* amd = backend::device_extension<backend::AmdDeviceInfo>(*s.device);
-  const bool small_batch = s.device->arch == "gfx1201" &&
-                              s.device->wavefront_size == 32 && m >= 2 && m <= 8;
-  if (s.iattrs[0] == 4 && s.iattrs[1] == 64 && amd && amd->has_dot4_iu8 &&
-      (m == 1 || small_batch || m >= 512)) {
+  bool int8_shape = false;
+  for (const auto& rule : kQuantInt8Rows)
+    int8_shape |= quant_row_range(rule, s.device->arch, s.device->wavefront_size,
+                                 static_cast<std::uint32_t>(s.iattrs[0]),
+                                 static_cast<std::uint32_t>(s.iattrs[1]), m);
+  if (int8_shape && amd && amd->has_dot4_iu8) {
     plan.int8_activations = true;
     for (const auto symbol : quant::kGroupAffineDotSymbols)
       if (s.intrinsics->find(symbol).empty()) plan.int8_activations = false;
   }
+  bool panel_device = false;
+  for (const auto& rule : kQuantPanelDevices)
+    panel_device |= quant_shape_device(rule, s.device->arch, s.device->wavefront_size) &&
+        static_cast<std::uint32_t>(s.iattrs[0]) == rule.bits &&
+        static_cast<std::uint32_t>(s.iattrs[1]) == rule.group &&
+        s.device->max_threads_per_workgroup >= rule.threads;
   plan.shared_activation_panel = !staged && plan.int8_activations &&
-      q4_shared_panel_shape(s) && s.device->arch == "gfx1201" &&
-      s.device->wavefront_size == 32 && s.device->max_threads_per_workgroup >= 256;
+      q4_shared_panel_shape(s) && panel_device;
   if (!staged && plan.int8_activations && s.input_dtypes[2] == DType::kBF16 &&
       s.device->max_threads_per_workgroup >= 256) {
-    for (const auto& rule : kRowLadderRules) {
-      if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+    for (const auto& rule : kQuantRowLadderShapes) {
+      if (quant_shape_device(rule, s.device->arch, s.device->wavefront_size) &&
           m == rule.m && n == rule.n && k == rule.k && budget >= rule.lds) {
         plan.row_ladder_ceiling = rule.ceiling;
         break;
@@ -134,8 +104,8 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
     }
   }
   if (!staged) {
-    for (const auto& rule : kMatrixRules) {
-      if (s.device->arch != rule.arch || s.device->wavefront_size != rule.wave ||
+    for (const auto& rule : kQuantMatrixShapes) {
+      if (!quant_shape_device(rule, s.device->arch, s.device->wavefront_size) ||
           static_cast<std::uint32_t>(s.iattrs[0]) != rule.bits || static_cast<std::uint32_t>(s.iattrs[1]) != rule.group ||
           m < rule.min_m || m > rule.max_m || n != rule.n || k != rule.k ||
           budget < rule.lds || s.device->max_threads_per_workgroup < rule.threads ||
@@ -149,20 +119,27 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
       plan.implementation = rule.implementation;
       return plan;
     }
-    if (plan.int8_activations && m >= 512 && budget >= kQ4MatrixLdsBytes &&
-        s.device->max_threads_per_workgroup >= 256) {
-      if (const auto* row = matrix_row(s, math::MatrixElem::kI32, math::MatrixElem::kSU8);
-          row && row->chained == 1) {
-        plan.matrix = row;
-        plan.implementation = QuantMatrix::kInt8;
-        return plan;
+    if (plan.int8_activations) {
+      for (const auto& rule : kQuantMatrixRanges) {
+        if (!quant_row_range(rule, s.device->arch, s.device->wavefront_size,
+                             static_cast<std::uint32_t>(s.iattrs[0]),
+                             static_cast<std::uint32_t>(s.iattrs[1]), m) ||
+            budget < rule.lds || s.device->max_threads_per_workgroup < rule.threads)
+          continue;
+        if (const auto* row = matrix_row(s, math::MatrixElem::kI32,
+                                         math::MatrixElem::kSU8);
+            row && row->chained == 1) {
+          plan.matrix = row;
+          plan.implementation = QuantMatrix::kInt8;
+          return plan;
+        }
       }
     }
   }
   if (!staged && s.input_dtypes[2] == DType::kBF16 &&
       s.device->max_threads_per_workgroup >= 256) {
-    for (const auto& rule : kScalarRules) {
-      if (s.device->arch != rule.arch || s.device->wavefront_size != rule.wave ||
+    for (const auto& rule : kQuantScalarShapes) {
+      if (!quant_shape_device(rule, s.device->arch, s.device->wavefront_size) ||
           static_cast<std::uint32_t>(s.iattrs[0]) != rule.bits || static_cast<std::uint32_t>(s.iattrs[1]) != rule.group) continue;
       if (m == 1) {
         plan.rotate_decode_panel = true;

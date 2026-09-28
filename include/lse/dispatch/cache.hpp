@@ -2,6 +2,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/dispatch/quant.hpp"
+#include "lse/dispatch/q8_matrix.hpp"
 #include "lse/dispatch/attention.hpp"
 #include <vector>
 
@@ -56,6 +57,13 @@ namespace lse::dispatch {
       if (inputs.size() == 5) {
         mix(implementation_id("quant.shared_activation_panel.v1"));
         mix(plan.shared_activation_panel);
+      }
+      if (inputs.size() == 7) {
+        const auto packed = q8_packed_matrix_plan(probe);
+        mix(implementation_id("quant.q8.packed-weights.v1"));
+        mix(packed.matrix ? implementation_id(packed.matrix->key) : 0);
+        mix(packed.round_groups);
+        mix(packed.lds_bytes);
       }
       mix(plan.rotate_decode_panel);
       mix(plan.decode_columns);

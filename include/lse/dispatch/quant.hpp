@@ -1,14 +1,12 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
 
+#include "lse/dispatch/quant_shapes.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 
 namespace lse::dispatch {
-
-enum class QuantMatrix : std::uint8_t { kNone, kInt8, kInt8Lds, kBF16 };
 
 struct QuantPlan {
   const math::MatrixCoreRow* matrix = nullptr;
@@ -19,21 +17,6 @@ struct QuantPlan {
   std::uint32_t decode_columns = 1;
   std::uint32_t prefill_rows = 1;
   std::uint32_t row_ladder_ceiling = 0;
-};
-
-struct Q4PanelShape {
-  std::int64_t m, n, k;
-  std::uint32_t rows = 0;
-};
-inline constexpr std::array kQ4PanelShapes{
-    Q4PanelShape{4, 17408, 5120},  Q4PanelShape{4, 5120, 17408},
-    Q4PanelShape{4, 10240, 5120},  Q4PanelShape{4, 6144, 5120},
-    Q4PanelShape{4, 12288, 5120},  Q4PanelShape{4, 5120, 6144},
-    Q4PanelShape{4, 248320, 5120}, Q4PanelShape{7, 248320, 5120, 8},
-    Q4PanelShape{6, 17408, 5120, 8}, Q4PanelShape{6, 5120, 17408, 8},
-    Q4PanelShape{6, 10240, 5120, 8}, Q4PanelShape{6, 6144, 5120, 8},
-    Q4PanelShape{6, 12288, 5120, 8}, Q4PanelShape{6, 5120, 6144, 8},
-    Q4PanelShape{6, 248320, 5120, 8},
 };
 
 // Shape eligibility is shared by graph construction and device dispatch.
@@ -73,7 +56,6 @@ inline constexpr std::array kQ4PanelShapes{
 [[nodiscard]] QuantPlan quant_plan(const graph::KernelShapes&, bool indexed = false);
 [[nodiscard]] const math::MatrixCoreRow* linear_matrix_row(const graph::KernelShapes&);
 
-inline constexpr std::uint32_t kQ4MatrixLdsBytes = 6656;
 inline constexpr std::uint32_t kTableRevision = 1;
 [[nodiscard]] constexpr std::uint64_t implementation_id(std::string_view name) noexcept {
   std::uint64_t hash = 1469598103934665603ull;

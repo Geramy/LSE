@@ -9,5 +9,9 @@ struct AffineMatrixPlan {
 [[nodiscard]] std::uint32_t q8_matrix_rows(const graph::KernelShapes&);
 [[nodiscard]] AffineMatrixPlan q8_matrix_plan(const graph::KernelShapes&,
                                         std::uint32_t rows);
-[[nodiscard]] AffineMatrixPlan q4_small_matrix_plan(const graph::KernelShapes&);
+[[nodiscard]] bool q8_packed_matrix_shape(const graph::KernelShapes&);
+[[nodiscard]] bool q8_packed_weight_shape(std::uint32_t columns,
+                                          std::uint32_t features);
+[[nodiscard]] bool q8_packed_weight_device(const backend::DeviceInfo&);
+[[nodiscard]] AffineMatrixPlan q8_packed_matrix_plan(const graph::KernelShapes&);
 }  // namespace lse::dispatch

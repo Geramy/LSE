@@ -1,5 +1,6 @@
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/quant.hpp"
+#include "lse/dispatch/q8_matrix.hpp"
 #include "lse/graph/ops.hpp"
 
 #include <algorithm>
@@ -284,7 +285,17 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   geometry.input_dtypes = dtypes;
   geometry.output = out;
   geometry.iattrs = n->iattrs;
-  if (dispatch::q4_shared_panel_shape(geometry)) {
+  const auto matrix_storage = packed.node()->quant
+      ? packed.node()->quant->matrix_storage : nullptr;
+  const std::array<NodePtr, 3> sources{packed.node(), scales.node(), biases.node()};
+  if (dispatch::q8_packed_matrix_shape(geometry) && matrix_storage &&
+      matrix_storage->matches(sources)) {
+    for (const auto& leaf : matrix_storage->packed) {
+      n->inputs.push_back(leaf);
+      ++leaf->consumer_count;
+    }
+    n->prim = find_primitive("quant_linear.q8.wmma16.packed.v1");
+  } else if (dispatch::q4_shared_panel_shape(geometry)) {
     const auto k = sx.dim(sx.rank() - 1);
     const auto m = static_cast<std::int64_t>(sx.elem_count() / static_cast<std::uint64_t>(k));
     const Shape panel_shape{m, (k / 64) * 25};
