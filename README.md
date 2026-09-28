@@ -14,6 +14,20 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 [Performance](#measured-performance) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
+## v0.4.8: lower VRAM use
+
+KV growth previously kept obsolete recurrent-state graphs and their buffers alive.
+The fix releases those graphs while keeping the current state and compiled kernels.
+On one 14K Q4 + Q8 DFlash2 request, live allocations fell from **30.72 to 22.33 GiB**.
+Sampled peak driver reservations fell from **30.93 to 24.86 GiB**.
+
+The performance check measured 323.41 prompt tokens/s and 42.41 decode tokens/s
+on the second identical request, with temperature 0 and 100% proposal acceptance.
+**These are warmed synthetic results, not expected Pi or coding-session rates.**
+The first request measured 15.51 decode tokens/s even without new kernel compilation;
+request setup and reuse remain under investigation.
+See the [memory report](docs/benchmarks/kv-growth-memory-2026-09-28.md).
+
 ## Supported platforms
 
 | Platform | GPU requirements | Kernel source |
@@ -34,7 +48,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.7`.
+The examples below use `v0.4.8`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -43,7 +57,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.7
+   lse_tag=v0.4.8
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -76,7 +90,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.7
+   lse_tag=v0.4.8
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -278,7 +292,7 @@ Both rates below use tokens per second.
 
 ### Current long-context result
 
-The v0.4.7 source reached these rates on an R9700 (`gfx1201`) with Qwen3.8-27B Q4 and a Q8 DFlash2 draft.
+The v0.4.8 source reached these rates on an R9700 (`gfx1201`) with Qwen3.8-27B Q4 and a Q8 DFlash2 draft.
 
 | Mode | Prompt tokens | Prefill | Decode |
 |---|---:|---:|---:|

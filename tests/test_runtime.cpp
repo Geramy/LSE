@@ -3239,9 +3239,11 @@ struct MtpFixture {
 // weights.
 MtpFixture build_mtp_fixture(bool passthrough = false,
                              std::int32_t gdn_head_dim = 16,
-                             bool recurrent_only = false) {
+                             bool recurrent_only = false,
+                             std::int32_t kv_length = 64) {
   MtpFixture fx;
   fx.config = mtp_test_config(gdn_head_dim);
+  fx.config.kv_length = kv_length;
   if (recurrent_only) fx.config.full_attention_interval = fx.config.num_layers + 1;
   const std::int64_t h = fx.config.hidden_size;
   std::error_code ec;
@@ -3820,4 +3822,30 @@ LSE_TEST(recurrent_carries_own_mutable_buffers_and_restart_severs_old_graphs) {
     LSE_EXPECT(c.in->inputs.empty());
     for (const auto& old : old_outputs) LSE_EXPECT(c.in.get() != old.get());
   }
+}
+
+LSE_TEST(kv_growth_releases_obsolete_recurrent_graphs) {
+  if (std::getenv("LSE_KV_PREALLOC")) LSE_SKIP("requires growing KV storage");
+  MtpFixture fx = build_mtp_fixture(false, 16, false, 512);
+  LSE_EXPECT(fx.ok);
+  if (!fx.ok) return;
+  Session session("growth-ownership", fx.lm->state_slots());
+  std::vector<std::uint32_t> prompt(128, 2);
+  std::weak_ptr<graph::Node> previous;
+  for (int pass = 0; pass < 3; ++pass) {
+    auto hidden = fx.lm->hidden(ids_array(prompt), &session.states(), nullptr);
+    LSE_EXPECT_OK(hidden.status());
+    if (!hidden.ok()) return;
+    // Each pass exceeds the previous pool rung. The old state computation
+    // must no longer be owned through retained programs or the new state.
+    if (pass > 0) LSE_EXPECT(previous.expired());
+    previous = session.states().front().gdn_state.node();
+    for (const auto& state : session.states())
+      LSE_EXPECT_EQ(state.position, (pass + 1) * 128);
+  }
+  auto decode = fx.lm->hidden(ids_array({3}), &session.states(), nullptr);
+  LSE_EXPECT_OK(decode.status());
+  LSE_EXPECT_OK(session.restart());
+  auto restarted = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
+  LSE_EXPECT_OK(restarted.status());
 }

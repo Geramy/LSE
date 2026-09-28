@@ -775,6 +775,25 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     }
   }
 
+  if (pool_moved && !replaces_previous) {
+    if (graph::Scheduler* sched = graph::default_scheduler()) {
+      LSE_RETURN_IF_ERROR(sched->drain());
+    }
+    // All retained programs name the old KV allocation. Keep the current
+    // recurrent state, then release the graphs that can no longer replay.
+    for (MixerState& st : *states) {
+      detach_state(st.gdn_state);
+      detach_state(st.gdn_conv_q);
+      detach_state(st.gdn_conv_k);
+      detach_state(st.gdn_conv_v);
+      detach_state(st.gdn_conv_qkv);
+    }
+    for (ForwardCache& c : caches_) c = ForwardCache{};
+    cache_.t_key = t_now;
+    next_cache_ = 0;
+    last_pass_id_ = 0;
+  }
+
   const std::uint64_t prev_pass_run = last_pass_id_;
   auto kv_leaves_match = [&]() -> bool {
     if (states == nullptr) return cache_.kv_leaves.empty();
