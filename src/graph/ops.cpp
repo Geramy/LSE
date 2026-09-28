@@ -1,4 +1,5 @@
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/quant.hpp"
 #include "lse/graph/ops.hpp"
 
 #include <algorithm>
@@ -276,7 +277,30 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                 {x.node(), packed.node(), scales.node(), biases.node()});
   n->iattrs[0] = bits;
   n->iattrs[1] = group_size;
-  n->prim = find_primitive("quant_linear");
+  const std::array<Shape, 4> shapes{sx, packed.shape(), scales.shape(), biases.shape()};
+  const std::array<DType, 4> dtypes{x.dtype(), packed.dtype(), scales.dtype(), biases.dtype()};
+  KernelShapes geometry;
+  geometry.inputs = shapes;
+  geometry.input_dtypes = dtypes;
+  geometry.output = out;
+  geometry.iattrs = n->iattrs;
+  if (dispatch::q4_shared_panel_shape(geometry)) {
+    const auto k = sx.dim(sx.rank() - 1);
+    const Shape panel_shape{4, k * 25 / 64};
+    auto panel = x.node()->quant_activation_panel.lock();
+    if (!panel || panel->inputs.size() != 1 || panel->inputs[0] != x.node() ||
+        panel->shape != panel_shape || panel->dtype != DType::kU32) {
+      panel = make(OpKind::kCustom, panel_shape, DType::kU32, {x.node()});
+      panel->prim = find_primitive("quant_activation.q4_shared_panel.v1");
+      if (panel->prim) panel->fclass = panel->prim->fusion_class();
+      x.node()->quant_activation_panel = panel;
+    }
+    n->inputs.push_back(panel);
+    ++panel->consumer_count;
+    n->prim = find_primitive("quant_linear.q4_global_panel.v1");
+  } else {
+    n->prim = find_primitive("quant_linear");
+  }
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
 }

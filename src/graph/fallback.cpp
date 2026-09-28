@@ -15,7 +15,8 @@ class HostInterpreterFallback final : public FallbackHandler {
   std::string_view name() const noexcept override { return "host-interpreter"; }
 
   bool can_handle(const Node& node, const backend::IBackend&) const override {
-    return node.prim == nullptr || node.prim->has_host_impl();
+    return node.prim == nullptr || node.prim->has_host_impl() ||
+           node.prim->has_typed_host_impl() || node.kind == OpKind::kQuantMatMul;
   }
 
   Status execute(Node& node, backend::IBackend& backend) const override {

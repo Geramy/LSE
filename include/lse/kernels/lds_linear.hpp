@@ -90,6 +90,15 @@ struct DotStagingPlan {
 [[nodiscard]] DotStagingPlan dot_staging_plan(const graph::KernelShapes& s,
                                               bool indexed);
 
+struct Dot4Schedule {
+  std::uint32_t rows = 0;
+  std::uint32_t chunks_per_lane = 0;
+  std::uint32_t k_splits = 0;
+  std::uint32_t wave = 0;
+  [[nodiscard]] bool valid() const noexcept { return rows && k_splits; }
+};
+[[nodiscard]] Dot4Schedule dot4_schedule(const graph::KernelShapes& s);
+
 // Declare the int8 form of an already-staged row in workgroup scratch and fill
 // it: codes, one step per chunk, and one activation sum per group, then the
 // barrier that publishes them. The other half of the KernelShapes::staged_quant

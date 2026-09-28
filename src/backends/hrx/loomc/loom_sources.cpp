@@ -10,7 +10,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 47> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 49> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -118,6 +118,8 @@ constexpr std::array<graph::PrimitiveSource, 47> kLoomSources{{
     // separates the value conversion from the reinterpretation from the width
     // change; the conversion itself is still the hardware's round-to-nearest-
     // even. The i32 result is a WORD, not an index — see loom_types.
+    {"bits.f32", "$r = scalar.bitcast $0 : f32 to i32"},
+    {"value.f32", "$r = scalar.bitcast $0 : i32 to f32"},
     {"bits.f16",
      "$t0 = scalar.fptrunc $0 : f32 to f16\n"
      "$t1 = scalar.bitcast $t0 : f16 to i16\n"
@@ -287,7 +289,8 @@ struct ResultType {
 };
 
 // Everything not listed produces f32, which is what every arithmetic row does.
-constexpr std::array<ResultType, 11> kNonFloatResults{{
+constexpr std::array<ResultType, 12> kNonFloatResults{{
+    {"bits.f32", "i32"},
     {"bits.f16", "i32"},
     {"pack4.fp8.ocp", "i32"},
     {"pack4.bf8.ocp", "i32"},

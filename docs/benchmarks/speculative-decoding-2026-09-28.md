@@ -7,12 +7,14 @@ Native gfx1201 on macOS, 64 CUs, wave32, 32,367 MiB reported device memory. Loca
 | Mode | Earlier release TPS | Current warm TPS | Mean TPS | Final prompt tokens/s |
 |---|---:|---:|---:|---:|
 | Plain Q4 | 24.22 / 24.18 | Not rerun | 24.20 baseline | 466.26 baseline |
-| MTP, three proposals | 23.12 / 23.18 | 26.82 / 26.65 | 26.74 | 452.62 |
-| DFlash2, four-row target verification | 15.15 / 15.16 | 28.07 / 28.02 | 28.04 | 464.14 |
+| MTP, three proposals | 23.12 / 23.18 | 33.10 / 33.18 | 33.14 | 462.39 |
+| DFlash2, four-row target verification | 15.15 / 15.16 | 33.86 / 34.02 | 33.94 | 468.41 |
 
-The MTP measurement predates the later draft-only attention/top-k changes and the general scheduler fix replacing equivalent model-local view refresh. The DFlash measurement includes those changes. Earlier release and current continuations differ, so these are fixed-input measurements rather than claims of identical-output speedup. The four-row DFlash continuation matches current MTP for these 64 generated tokens.
+Both current measurements include shared Q4 activation panels. The panel change preserved the complete generated continuation and acceptance counters in both modes. Relative to the immediately preceding snapshots, MTP improved from 26.74 to 33.14 TPS (+24.0%) and DFlash from 28.04 to 33.94 TPS (+21.0%). Earlier release and current continuations differ, so comparison to the earlier-release column is a fixed-input measurement rather than an identical-output claim. The current MTP and DFlash continuations match for these 64 generated tokens.
 
-For DFlash, reducing target verification from eight rows to four lowered verification time from 3,251 ms to 1,807 ms. The trained drafter still evaluates all eight positions; only the returned proposal prefix is shorter. Both measured schedules used 22 target passes and accepted 41 proposals. The final split-attention change preserved the continuation and acceptance counters, reducing draft time from 440 ms to 400 ms. Final verification time was 1,809 ms; 41 of 53 compared proposals were accepted.
+The final requests are fully warm. The intermediate MTP request incurred three additional prefill compilations; its decode rate is included, but the prompt column reports only the final warm request. This run loaded the installed `/Library/MacAMDGPU/runtime/libhsa-runtime64.dylib` without a `DYLD_LIBRARY_PATH` override.
+
+For DFlash, reducing target verification from eight rows to four lowered verification time from 3,251 ms to 1,807 ms. The trained drafter still evaluates all eight positions; only the returned proposal prefix is shorter. Both measured schedules used 22 target passes and accepted 41 proposals. The final split-attention change preserved the continuation and acceptance counters, reducing draft time from 440 ms to 400 ms. The shared-panel change then reduced verification from 1,809 to 1,406 ms, preserving 41 of 53 accepted proposals and 22 target passes. MTP verification fell from 2,030 to 1,558 ms, preserving 38 of 54 accepted proposals and 25 target passes.
 
 The requested 43 TPS MTP and 88–105 TPS DFlash targets have not been achieved.
 
@@ -27,6 +29,8 @@ The requested 43 TPS MTP and 88–105 TPS DFlash targets have not been achieved.
 - Reuse Q8 matrix fragments across draft rows and stage four quantization groups per preparation round where measured faster.
 - Transpose top-k scratch storage to distribute neighboring lanes across shared-memory banks.
 - Default MTP to three proposals and DFlash to three verified proposals plus the anchor.
+- Prepare exact Q4 activation codes once per shared input and reuse them across M4 FFN projections. Paired global code-word loads remove repeated local staging while preserving DOT4 and FP32 restoration order.
+- Preserve packed U32 storage through typed terminal output and CPU references, with capability-dependent dispatch cache keys.
 
 Floating-point accumulation remains FP32. Integer matrix and DOT4 products use INT32 with FP32 scale/bias restoration. Q8 matrix activation quantization can change draft proposals; the target verifier remains authoritative.
 
@@ -39,13 +43,18 @@ Floating-point accumulation remains FP32. Integer matrix and DOT4 products use I
 | Draft attention, 2,055 live keys | 0.812 ms | 0.443 ms | Partial plus merge, retained replay |
 | Q8 query projection, M8/N4096/K5120 | 0.764 ms | 0.092 ms | Native dispatch wall time |
 | Q8 output projection, M8/N5120/K4096 | 0.772 ms | 0.093 ms | Native dispatch wall time |
+| Q4 up, M4/N17408/K5120 | 0.1930 ms | 0.1444 ms | Original vs shared-panel preparation plus consumer |
+| Q4 down, M4/N5120/K17408 | 0.2326 ms | 0.1388 ms | Original vs shared-panel preparation plus consumer |
+| Shared-panel down, paired code-word loads | 0.1397 ms | 0.1132 ms | Scalar vs paired loads, including preparation |
 
 Kernel measurements exclude compilation and validation from warm timing. Native fixtures checked independent component references, complete outputs, allocation guards and input preservation, with zero host fallback. Top-k selected values and indices matched exactly, including ties, NaNs, infinities and ragged chunks. Split draft attention covered wrapped caches, live counts 17/1,024/2,055 and rewinds, with maximum absolute component error below 9e-8.
 
 Focused host gates passed: prefix recovery 6/6, scheduler 5/5, Q8 dispatch 4/4, target attention 4/4, top-k 4/4, DFlash 12/12, MTP options 3/3, server 7/7. Runtime tests recorded 56 passed and 5 skipped. No new perplexity sweep or L2 model-quality test was run for this checkpoint.
 
+The production panel gate compared both actual FFN shapes and fused residual epilogues against the registered original kernel bit for bit. Independent activation-code references, complete outputs, input preservation and allocation guards passed with zero host fallback. Typed-storage and panel host fixtures each passed 5/5 in GPU-enabled and CPU-only builds. The CPU-only macOS DFlash fixture passed 9/9 after its linker dependency repair. No new perplexity sweep was run for this exact-arithmetic change.
+
 ## Remaining cost
 
 LSE submission/step timing and GPU dispatch timestamps show FFN projections still consume about 55% of target GPU execution time. GPU timestamps measure dispatch duration, not occupancy. The requested 32-microsecond policy is a blocked completion-observation interval; it is not a fixed delay inserted after every kernel. Active spinning did not improve the earlier end-to-end comparison.
 
-Private activation-panel and alternate matrix experiments are not active defaults in this checkpoint. The macOS release dependency pin includes the committed 32-microsecond HSA policy; existing release archives retain their previously bundled libraries.
+The shared-panel path is active for the measured M4 FFN shapes. Alternate matrix, weight-layout and workgroup experiments remain inactive; additional projection shapes are not enabled without measurement. The macOS release dependency pin includes the committed 32-microsecond HSA policy; existing release archives retain their previously bundled libraries.

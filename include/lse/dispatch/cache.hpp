@@ -44,10 +44,19 @@ namespace lse::dispatch {
       continue;
     }
     if (node->kind == graph::OpKind::kQuantMatMul) {
-      const auto plan = quant_plan(probe, inputs.size() != 4);
+      auto quant_probe = probe;
+      if (inputs.size() >= 4) {
+        quant_probe.inputs = probe.inputs.first(4);
+        quant_probe.input_dtypes = probe.input_dtypes.first(4);
+      }
+      const auto plan = quant_plan(quant_probe, false);
       auto mix = [&](std::uint64_t value) { key ^= value; key *= 1099511628211ull; };
       mix(static_cast<std::uint64_t>(plan.implementation));
       mix(plan.int8_activations);
+      if (inputs.size() == 5) {
+        mix(implementation_id("quant.shared_activation_panel.v1"));
+        mix(plan.shared_activation_panel);
+      }
       mix(plan.rotate_decode_panel);
       mix(plan.decode_columns);
       mix(plan.prefill_rows);

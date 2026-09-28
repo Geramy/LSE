@@ -144,6 +144,8 @@ class Node {
   // Non-null only on the packed plane of a group-affine weight.
   std::shared_ptr<const QuantPlanes> quant;
 
+  std::weak_ptr<Node> quant_activation_panel;
+
   // Host copy of `buffer`, for nodes the host has to read or write. Device
   // memory has no host address, so this is the only way the interpreter can
   // touch a value a kernel produced. It is allocated on first host access and

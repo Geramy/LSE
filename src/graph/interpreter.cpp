@@ -1331,6 +1331,30 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
   }
   const std::size_t count = n.element_count();
 
+  if (n.prim != nullptr && n.prim->has_typed_host_impl()) {
+    std::vector<HostTensorView> inputs;
+    inputs.reserve(n.inputs.size());
+    for (const NodePtr& input : n.inputs) {
+      const Node& source = *input;
+      const std::size_t bytes = dtype_storage_bytes(source.dtype, source.element_count());
+      const auto* data = static_cast<const std::byte*>(host_bytes(source));
+      if (data == nullptr || bytes == 0 || bytes > source.buffer.size_bytes ||
+          (source.buffer.ptr == nullptr && source.host_mirror.size() < bytes))
+        return LSE_ERROR(kInvalidArgument, "typed host input has no complete buffer");
+      inputs.push_back({{data, bytes}, source.shape, source.dtype});
+    }
+    const std::size_t bytes = dtype_storage_bytes(n.dtype, count);
+    auto* data = static_cast<std::byte*>(host_bytes(n));
+    if (data == nullptr || bytes == 0 || bytes > n.buffer.size_bytes)
+      return LSE_ERROR(kInvalidArgument, "typed host output has no complete buffer");
+    LSE_RETURN_IF_ERROR(n.prim->eval_cpu_typed(
+        inputs, {{data, bytes}, n.shape, n.dtype}, n.attrs, n.iattrs));
+    n.host_dirty = true;
+    n.device_dirty = false;
+    finish_host_write(n);
+    return OkStatus();
+  }
+
   // Anything with a registered primitive evaluates through it. Built-in
   // elementwise ops attach one too, so there is a single path.
   // A primitive without a host body is not automatically fatal: the

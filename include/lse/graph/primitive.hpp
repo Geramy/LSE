@@ -48,6 +48,18 @@ enum class FusionClass : std::uint8_t {
   kCollective,
 };
 
+struct HostTensorView {
+  std::span<const std::byte> bytes;
+  Shape shape;
+  DType dtype = DType::kF32;
+};
+
+struct HostOutputView {
+  std::span<std::byte> bytes;
+  Shape shape;
+  DType dtype = DType::kF32;
+};
+
 struct EmitContext {
   // Expressions naming each input's value in the generated scope.
   std::span<const std::string> inputs;
@@ -98,6 +110,13 @@ class Primitive {
   // only one: device-only source has no host body, and a host-only primitive
   // makes a GPU backend fall back to the CPU for that node rather than fail.
   virtual bool has_host_impl() const noexcept { return true; }
+  virtual bool has_typed_host_impl() const noexcept { return false; }
+  // Raw storage reference for packed outputs and inputs; no float conversion.
+  virtual Status eval_cpu_typed(std::span<const HostTensorView>, HostOutputView,
+                               const std::array<float, 4>&,
+                               const std::array<std::int32_t, 4>&) const {
+    return LSE_ERROR(kUnimplemented, "primitive has no typed host reference");
+  }
   virtual bool has_device_impl() const noexcept { return true; }
 
   // When >= 0 the output is the same allocation as inputs[i]. The kernel

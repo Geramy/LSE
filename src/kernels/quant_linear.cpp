@@ -884,6 +884,14 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
 
 }  // namespace
 
+Dot4Schedule dot4_schedule(const graph::KernelShapes& s) {
+  const auto d = dims_of(s, false);
+  if (!d.valid || !body_dot(s, d)) return {};
+  const auto rows = dot_rows(s, d, false);
+  return {rows, chunks_per_step(d, device_load_bytes(s.device)),
+          dot_ksplits(d, rows, workgroup_lds_bytes(s.device)), wave_of(s.device)};
+}
+
 DotStagingPlan dot_staging_plan(const KernelShapes& s, bool indexed) {
   const QuantDims d = dims_of(s, indexed);
   if (!d.valid) return {};

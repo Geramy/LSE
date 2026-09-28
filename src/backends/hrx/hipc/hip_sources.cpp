@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 71> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 73> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -61,6 +61,8 @@ constexpr std::array<graph::PrimitiveSource, 71> kHipSources{{
     // header and holds on any AMD target; the conversion itself is the
     // hardware's round-to-nearest-even, which is what float16_t::from_float
     // implements. A bf16 wire format would be two more rows here.
+    {"bits.f32", "__float_as_uint($0)"},
+    {"value.f32", "__uint_as_float($0)"},
     {"bits.f16",
      "((unsigned int)__builtin_bit_cast(unsigned short, (_Float16)($0)))"},
     {"value.f16",

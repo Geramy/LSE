@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -203,6 +204,13 @@ namespace detail {
 // fallthrough to whichever width happened to be there first.
 template <typename T>
 struct bit_codec;
+template <>
+struct bit_codec<lse::f32> {
+  static constexpr std::string_view bits_key = "bits.f32";
+  static constexpr std::string_view value_key = "value.f32";
+  static std::uint32_t bits(float x) noexcept { return std::bit_cast<std::uint32_t>(x); }
+  static float value(std::uint32_t x) noexcept { return std::bit_cast<float>(x); }
+};
 template <>
 struct bit_codec<lse::f16> {
   static constexpr std::string_view bits_key = "bits.f16";

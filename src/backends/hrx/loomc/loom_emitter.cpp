@@ -1,5 +1,6 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/epilogue_input.hpp"
+#include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
 
 #include <algorithm>
@@ -741,9 +742,14 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                        "' declined to emit for this invocation");
     }
     if (!stored) {
-      return LSE_ERROR(kInternal, "primitive '",
-                       std::string(self_indexed->name()),
-                       "' owns its indexing but never stored through the hook");
+      if (gdn_pair || group.nodes.size() != 1 || group.outputs.size() != 1 ||
+          sink != anchor || self_indexed->supports_epilogue() ||
+          self_indexed->inplace_input() >= 0)
+        return LSE_ERROR(kInternal, "primitive '",
+                         std::string(self_indexed->name()),
+                         "' owns its indexing but never stored through the hook");
+      LSE_RETURN_IF_ERROR(validate_terminal_stores(
+          cap.body(), names[binding_of.at(sink.get())], sink->dtype));
     }
 
     LoomPrintOptions popts;

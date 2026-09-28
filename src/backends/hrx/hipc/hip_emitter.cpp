@@ -1,5 +1,6 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/graph/epilogue_input.hpp"
+#include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
 
 #include "lse/backends/hrx/device_info.hpp"
@@ -1292,6 +1293,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
     si_shapes.store = epilogue_store;
     const KernelShapes& shapes = si_shapes;
+    ir::KernelBody::Capture cap;
     const std::string self_body = self_indexed->emit_kernel(shapes);
     if (!epilogue_error.ok()) return epilogue_error;
     // An empty body would compile into a kernel that silently writes nothing.
@@ -1304,9 +1306,13 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     // A primitive that wrote the output buffer itself would drop the epilogue
     // on the floor and produce quietly wrong results, so require the hook.
     if (!stored) {
-      return LSE_ERROR(kInternal, "primitive '",
-                       std::string(self_indexed->name()),
-                       "' owns its indexing but never stored through the hook");
+      if (!cap.has() || group.nodes.size() != 1 || group.outputs.size() != 1 ||
+          sink != anchor || self_indexed->supports_epilogue() ||
+          self_indexed->inplace_input() >= 0)
+        return LSE_ERROR(kInternal, "primitive '",
+                         std::string(self_indexed->name()),
+                         "' owns its indexing but never stored through the hook");
+      LSE_RETURN_IF_ERROR(validate_terminal_stores(cap.body(), "out", sink->dtype));
     }
 
     // The thread map is the primitive's, not choose_dims': a tile-per-workgroup

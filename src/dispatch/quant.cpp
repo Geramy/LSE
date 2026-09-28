@@ -120,6 +120,9 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
     for (const auto symbol : quant::kGroupAffineDotSymbols)
       if (s.intrinsics->find(symbol).empty()) plan.int8_activations = false;
   }
+  plan.shared_activation_panel = !staged && plan.int8_activations &&
+      q4_shared_panel_shape(s) && s.device->arch == "gfx1201" &&
+      s.device->wavefront_size == 32 && s.device->max_threads_per_workgroup >= 256;
   if (!staged && plan.int8_activations && s.input_dtypes[2] == DType::kBF16 &&
       s.device->max_threads_per_workgroup >= 256) {
     for (const auto& rule : kRowLadderRules) {
