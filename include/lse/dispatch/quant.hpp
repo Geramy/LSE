@@ -30,6 +30,10 @@ inline constexpr std::array kQ4PanelShapes{
     Q4PanelShape{4, 10240, 5120},  Q4PanelShape{4, 6144, 5120},
     Q4PanelShape{4, 12288, 5120},  Q4PanelShape{4, 5120, 6144},
     Q4PanelShape{4, 248320, 5120}, Q4PanelShape{7, 248320, 5120, 8},
+    Q4PanelShape{6, 17408, 5120, 8}, Q4PanelShape{6, 5120, 17408, 8},
+    Q4PanelShape{6, 10240, 5120, 8}, Q4PanelShape{6, 6144, 5120, 8},
+    Q4PanelShape{6, 12288, 5120, 8}, Q4PanelShape{6, 5120, 6144, 8},
+    Q4PanelShape{6, 248320, 5120, 8},
 };
 
 // Shape eligibility is shared by graph construction and device dispatch.

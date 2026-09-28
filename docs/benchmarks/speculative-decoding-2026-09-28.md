@@ -80,3 +80,19 @@ ABBA20 native measurements, including preparation, reduced GPU execution from 5.
 RMS normalization preserves its 256-lane FP32 tree while using two workgroup barriers instead of nine. Six native shapes passed exact outputs and guards across 516 device dispatches; focused production tests passed 7/7. GPU median time changed from 6.52 to 6.26 microseconds for M4/K5120 and from 35.20 to 33.44 microseconds for M512/K5120. The small-shape wall measurements were noisy; these component results are distinct from the HTTP measurements above.
 
 These changes are newer than the v0.4.5 release archive. No additional perplexity sweep was run.
+
+## Six-row panel coverage
+
+The same rows-eight consumer now covers all seven measured six-row projections in the central shape table. The original K partitions, activation codec and FP32 restoration order are preserved. Across 1,251 private native device dispatches, full outputs, independent component references, panel codes, input preservation and guards passed with zero host fallback. The integrated graph/emission/cache fixture passed 8/8.
+
+| Six-row projection N/K | Original GPU ms | Panel + consumer GPU ms | Reduction |
+|---|---:|---:|---:|
+| 17,408 / 5,120 | 0.279111 | 0.147690 | 47.09% |
+| 5,120 / 17,408 | 0.434995 | 0.162687 | 62.60% |
+| 10,240 / 5,120 | 0.173718 | 0.099233 | 42.88% |
+| 6,144 / 5,120 | 0.102697 | 0.059113 | 42.44% |
+| 12,288 / 5,120 | 0.195377 | 0.105805 | 45.85% |
+| 5,120 / 6,144 | 0.104534 | 0.061012 | 41.63% |
+| 248,320 / 5,120 | 4.233792 | 2.438142 | 42.41% |
+
+These component wins do not establish a wider-verification throughput win. A preliminary five-proposal HTTP candidate reached 32.81 / 32.67 TPS versus 38.16 / 38.42 at three proposals. It required 18 rather than 22 verifier passes, but six-row target attention fell through to Flash8 because the short-attention default table omitted that width. The profiler attributed 303.7 ms (22.9% of verifier GPU execution) to those six-row attention calls. This schedule remains under investigation; the six-row kernel improvement is independent of selecting it as the default. No new perplexity sweep was run.

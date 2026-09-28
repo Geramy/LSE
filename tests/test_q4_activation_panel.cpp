@@ -31,6 +31,10 @@ constexpr std::array kAdditionalProjections{
     Projection{10240, 5120}, Projection{6144, 5120}, Projection{12288, 5120},
     Projection{5120, 6144}, Projection{248320, 5120}};
 constexpr std::array<Projection, 1> kM7Head{Projection{248320, 5120}};
+constexpr std::array kM6Projections{
+    Projection{17408, 5120}, Projection{5120, 17408}, Projection{10240, 5120},
+    Projection{6144, 5120},  Projection{12288, 5120}, Projection{5120, 6144},
+    Projection{248320, 5120}};
 Array leaf(Shape shape, DType type) {
   auto node = std::make_shared<Node>();
   node->shape = shape;
@@ -139,7 +143,7 @@ LSE_TEST(q4_panel_graph_keeps_unmeasured_shapes_and_formats_on_legacy_route) {
   LSE_EXPECT_EQ(f32.node()->inputs.size(), 4u);
 }
 LSE_TEST(
-    q4_panel_additional_projection_routes_are_M4_only_and_share_input_panels) {
+    q4_panel_additional_projections_share_M4_panels_and_reject_unmeasured_widths) {
   auto x = leaf({1, 4, 5120}, DType::kF32);
   const auto ffn = contraction(x, 17408, 5120);
   for (const auto &pair : kAdditionalProjections) {
@@ -173,11 +177,32 @@ LSE_TEST(
     LSE_EXPECT(unmeasured.node()->prim &&
                unmeasured.node()->prim->name() == "quant_linear");
   }
-  for (const auto m : {1, 3, 6, 8}) {
+  for (const auto m : {1, 3, 5, 8}) {
     const auto unmeasured =
         contraction(leaf({1, m, 5120}, DType::kF32), 248320, 5120);
     LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
   }
+}
+LSE_TEST(q4_panel_M6_measured_projections_share_six_row_panels) {
+  auto x = leaf({1, 6, 5120}, DType::kF32);
+  const auto ffn = contraction(x, 17408, 5120);
+  for (const auto &pair : kM6Projections) {
+    const auto n = static_cast<std::int64_t>(pair[0]);
+    const auto k = static_cast<std::int64_t>(pair[1]);
+    const auto input = k == 5120 ? x : leaf({1, 6, k}, DType::kF32);
+    const auto output = contraction(input, n, k);
+    LSE_EXPECT_EQ(output.node()->inputs.size(), 5u);
+    LSE_EXPECT(output.node()->prim && output.node()->prim->name() == kConsumer);
+    LSE_EXPECT(output.node()->inputs[4]->shape == Shape{6, (k / 64) * 25});
+    if (k == 5120)
+      LSE_EXPECT(output.node()->inputs[4] == ffn.node()->inputs[4]);
+    for (const auto m : {3, 5, 8}) {
+      const auto unmeasured = contraction(leaf({1, m, k}, DType::kF32), n, k);
+      LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+    }
+  }
+  const auto unmeasured = contraction(x, 4096, 5120);
+  LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
 }
 LSE_TEST(q4_panel_typed_host_codec_and_retained_replay_are_exact) {
   auto *scheduler = default_scheduler();
@@ -303,7 +328,14 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
                                 {4, 12288, 5120},
                                 {4, 5120, 6144},
                                 {4, 248320, 5120},
-                                {7, 248320, 5120}}) {
+                                {7, 248320, 5120},
+                                {6, 17408, 5120},
+                                {6, 5120, 17408},
+                                {6, 10240, 5120},
+                                {6, 6144, 5120},
+                                {6, 12288, 5120},
+                                {6, 5120, 6144},
+                                {6, 248320, 5120}}) {
     auto out = contraction(leaf({1, dimensions[0], dimensions[2]}, DType::kF32),
                            dimensions[1], dimensions[2]);
     std::vector<Shape> input_shapes;
@@ -326,8 +358,8 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     if (consumer) {
       const auto *selected = consumer->specialize(invocation);
       LSE_EXPECT(selected->name() ==
-                 (dimensions[0] == 7 ? kRows8Consumer : kConsumer));
-      if (dimensions[0] == 7) {
+                 (dimensions[0] == 4 ? kConsumer : kRows8Consumer));
+      if (dimensions[0] != 4) {
         auto original = invocation;
         original.inputs = invocation.inputs.first(4);
         original.input_dtypes = invocation.input_dtypes.first(4);
@@ -547,5 +579,7 @@ int main(int argc, char **argv) {
     return gpu_panel(4, kAdditionalProjections);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m7")
     return gpu_panel(7, kM7Head);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m6")
+    return gpu_panel(6, kM6Projections);
   return lse::test::run_all();
 }
