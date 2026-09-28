@@ -22,6 +22,22 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
+## Chat sampling and prompt reuse
+
+The CLI and server load each model's supported settings from `generation_config.json`.
+If fields are missing, LSE uses embedded model settings and the fallback table under
+`src/models`. Explicit CLI flags and HTTP request parameters override these defaults.
+See [sampling defaults](docs/SAMPLING.md) for precedence and supported fields.
+
+Pi can return streamed reasoning without invalidating the previous prompt cache.
+The HTTP response reports reused tokens in `usage.prompt_tokens_details.cached_tokens`.
+In a two-turn Qwen3.8 Q4 + Q8 DFlash2 chat, the second prefill fell from 14.11 s
+for 5296 tokens to 0.93 s for 23 new tokens after the serialization fix.
+With the model's temperature 1, top-k 20 and top-p 0.95 settings, decode measured
+23.98 and 28.82 tokens/s on the two turns. These measurements describe those
+requests; output length and proposal acceptance affect the result.
+See the [Pi chat report](docs/benchmarks/pi-chat-2026-09-28.md).
+
 ## v0.4.8: lower VRAM use
 
 KV growth previously kept obsolete recurrent-state graphs and their buffers alive.

@@ -5,6 +5,7 @@
 // logits as running the whole sequence at once. Everything else in M7 rests on
 // that.
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -138,6 +139,84 @@ LSE_TEST(repetition_penalty_does_not_promote_negative_logits) {
   const std::vector<std::uint32_t> history{0};
   std::vector<float> logits{-1.0f, -1.2f};
   LSE_EXPECT_EQ(s.sample(logits, history), 1u);
+}
+
+LSE_TEST(unfiltered_sampling_excludes_zero_weight_at_rng_endpoints) {
+  SamplingParams p;
+  p.temperature = 1.0f;
+  for (const std::uint64_t seed : {14258097010372255221ull,
+                                  2295574122455614247ull}) {
+    // The first SplitMix64 uniforms are exactly 0 and 1 - 2^-24.
+    p.seed = seed;
+    Sampler sampler(p);
+    std::vector<float> logits{-1000.0f, 0.0f, -1000.0f};
+    LSE_EXPECT_EQ(sampler.sample(logits, {}), 1u);
+  }
+}
+
+LSE_TEST(filtered_sampling_preserves_the_seeded_stream) {
+  SamplingParams p;
+  p.temperature = 0.85f;
+  p.top_k = 20;
+  p.top_p = 0.95f;
+  p.seed = 12345;
+  Sampler sampler(p);
+  std::vector<float> logits(32);
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    logits[i] = 0.1f * static_cast<float>((i * 13) % 32) - 2.0f;
+  }
+  const std::uint32_t expected[] = {
+      27, 7, 22, 19, 27, 17, 9, 14, 16, 29, 7, 26, 11, 9, 27, 24,
+      14, 26, 27, 4, 27, 29, 4, 14, 17, 12, 27, 19, 22, 21, 17, 29};
+  for (const auto id : expected) {
+    LSE_EXPECT_EQ(sampler.sample(logits, {}), id);
+  }
+}
+
+LSE_TEST(unfiltered_sampling_reseed_repeats_the_stream) {
+  SamplingParams p;
+  p.temperature = 1.0f;
+  for (const std::uint64_t seed : {0ull, 12345ull}) {
+    p.seed = seed;
+    Sampler sampler(p);
+    std::vector<float> logits{-2.0f, 1.0f, 0.0f, -0.5f, 0.5f};
+    std::vector<std::uint32_t> first;
+    for (int i = 0; i < 32; ++i) first.push_back(sampler.sample(logits, {}));
+    sampler.reseed(seed);
+    std::vector<float> empty;
+    LSE_EXPECT_EQ(sampler.sample(empty, {}), 0u);
+    for (const auto id : first) {
+      LSE_EXPECT_EQ(sampler.sample(logits, {}), id);
+    }
+  }
+}
+
+LSE_TEST(unfiltered_sampling_matches_the_softmax_distribution) {
+  SamplingParams p;
+  p.temperature = 1.0f;
+  p.seed = 12345;
+  Sampler sampler(p);
+  std::vector<float> logits{-2.0f, 1.0f, 0.0f, -0.5f, 0.5f};
+  std::array<std::uint32_t, 5> counts{};
+  std::array<double, 5> probabilities{};
+  double total = 0.0;
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    probabilities[i] = std::exp(static_cast<double>(logits[i]) - 1.0);
+    total += probabilities[i];
+  }
+  constexpr std::uint32_t draws = 20000;
+  for (std::uint32_t i = 0; i < draws; ++i) {
+    const auto id = sampler.sample(logits, {});
+    LSE_EXPECT(id < counts.size());
+    if (id < counts.size()) ++counts[id];
+  }
+  for (std::size_t i = 0; i < counts.size(); ++i) {
+    const double expected = probabilities[i] / total;
+    const double observed = static_cast<double>(counts[i]) / draws;
+    const double bound =
+        6.0 * std::sqrt(expected * (1.0 - expected) / draws) + 2e-5;
+    LSE_EXPECT(std::abs(observed - expected) <= bound);
+  }
 }
 
 LSE_TEST(a_session_reports_and_releases_its_cache) {

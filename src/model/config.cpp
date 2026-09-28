@@ -185,6 +185,9 @@ Result<Config> Config::from_json_string(const std::string& text) {
     return LSE_ERROR(kInvalidArgument, "model config is not valid JSON: ", e.what());
   }
 
+  LSE_ASSIGN_OR(models::SamplingDefaults sampling,
+                models::sampling_defaults_from_json(text));
+
   // Read before the dispatch: the quantization block sits at the top level in
   // both spellings, and everything the two paths disagree about is shape
   // rather than storage.
@@ -194,11 +197,13 @@ Result<Config> Config::from_json_string(const std::string& text) {
   if (j.contains("text_config") && j["text_config"].is_object()) {
     LSE_ASSIGN_OR(Config hf, from_hf_json(j));
     hf.quantization = std::move(quantization);
+    hf.sampling_defaults = sampling;
     return hf;
   }
 
   Config c;
   c.quantization = std::move(quantization);
+  c.sampling_defaults = sampling;
   read(j, "vocab_size", c.vocab_size);
   read(j, "hidden_size", c.hidden_size);
   read(j, "num_layers", c.num_layers);
@@ -251,11 +256,17 @@ Result<Config> Config::from_json_file(const std::string& path) {
   if (!in) return LSE_ERROR(kIoError, "cannot open model config '", path, "'");
   std::ostringstream buf;
   buf << in.rdbuf();
-  return from_json_string(buf.str());
+  LSE_ASSIGN_OR(Config config, from_json_string(buf.str()));
+  LSE_ASSIGN_OR(config.sampling_defaults, models::load_sampling_defaults(path));
+  return config;
 }
 
 std::string Config::to_json() const {
   nlohmann::json j;
+  j["generation_config"] = {{"temperature", sampling_defaults.temperature},
+                            {"top_k", sampling_defaults.top_k},
+                            {"top_p", sampling_defaults.top_p},
+                            {"repetition_penalty", sampling_defaults.repetition_penalty}};
   j["vocab_size"] = vocab_size;
   j["hidden_size"] = hidden_size;
   j["num_layers"] = num_layers;

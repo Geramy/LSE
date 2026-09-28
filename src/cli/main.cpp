@@ -40,6 +40,8 @@ struct Options {
   std::string model;
   std::string prompt = "Hello";
   runtime::SamplingParams sampling;
+  bool temperature_set = false, top_k_set = false, top_p_set = false;
+  bool repetition_penalty_set = false;
   runtime::GenerationLimits limits;
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   // Empty means detect from the checkpoint.
@@ -84,10 +86,10 @@ void usage() {
       "                         a bare model name resolves when it is unique\n"
       "                         (default: $LSE_MODEL)\n"
       "  -n, --max-tokens N     tokens to generate (default 256)\n"
-      "  -t, --temperature F    0 or less is greedy (default 0.8)\n"
-      "      --top-k N          keep the N most likely tokens (default off)\n"
-      "      --top-p F          nucleus threshold (default 1.0, off)\n"
-      "      --repeat-penalty F penalize repeats, >1 discourages (default 1.0)\n"
+      "  -t, --temperature F    0 or less is greedy (default: model)\n"
+      "      --top-k N          keep the N most likely tokens (default: model)\n"
+      "      --top-p F          nucleus threshold (default: model)\n"
+      "      --repeat-penalty F penalize repeats, >1 discourages (default: model)\n"
       "  -s, --seed N           sampler seed (default 0)\n"
       "      --tokenizer REPO   HF repo for tokenizer.json, used only when the\n"
       "                         model directory has none (default Qwen/Qwen3.6-27B)\n"
@@ -195,15 +197,19 @@ bool parse(int argc, char** argv, Options* opt) {
     } else if (a == "-t" || a == "--temperature") {
       if (!take_value(argc, argv, i, "--temperature", &v)) return false;
       opt->sampling.temperature = std::strtof(v.c_str(), nullptr);
+      opt->temperature_set = true;
     } else if (a == "--top-k") {
       if (!take_value(argc, argv, i, "--top-k", &v)) return false;
       opt->sampling.top_k = std::atoi(v.c_str());
+      opt->top_k_set = true;
     } else if (a == "--top-p") {
       if (!take_value(argc, argv, i, "--top-p", &v)) return false;
       opt->sampling.top_p = std::strtof(v.c_str(), nullptr);
+      opt->top_p_set = true;
     } else if (a == "--repeat-penalty") {
       if (!take_value(argc, argv, i, "--repeat-penalty", &v)) return false;
       opt->sampling.repetition_penalty = std::strtof(v.c_str(), nullptr);
+      opt->repetition_penalty_set = true;
     } else if (a == "--mtp") {
       if (!take_value(argc, argv, i, "--mtp", &opt->mtp)) return false;
     } else if (a == "--mtp-depth") {
@@ -586,6 +592,12 @@ int main(int argc, char** argv) {
 
   auto cfg = model::Config::from_json_file(paths->config);
   if (!cfg.ok()) return fail(cfg.status(), "reading the config");
+  const auto& defaults = cfg->sampling_defaults;
+  if (!opt.temperature_set) opt.sampling.temperature = defaults.temperature;
+  if (!opt.top_k_set) opt.sampling.top_k = defaults.top_k;
+  if (!opt.top_p_set) opt.sampling.top_p = defaults.top_p;
+  if (!opt.repetition_penalty_set)
+    opt.sampling.repetition_penalty = defaults.repetition_penalty;
   if (opt.kv_len > 0) cfg->kv_length = opt.kv_len;
 
   auto weights = paths->weights.ends_with(".index.json")

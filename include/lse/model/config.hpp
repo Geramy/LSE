@@ -16,10 +16,12 @@
 #include "lse/core/dtype.hpp"
 #include "lse/core/status.hpp"
 #include "lse/quant/group_affine.hpp"
+#include "lse/models/sampling_defaults.hpp"
 
 namespace lse::model {
 
 struct Config {
+  models::SamplingDefaults sampling_defaults;
   std::int32_t vocab_size = 4096;
   std::int32_t hidden_size = 256;
   std::int32_t num_layers = 8;

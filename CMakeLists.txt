@@ -337,6 +337,7 @@ add_library(lse_model
   src/model/layer.cpp
   src/model/registry.cpp
   src/model/weights.cpp
+  src/models/sampling_defaults.cpp
   src/models/lemonseed.cpp
   src/models/qwen3_5.cpp
   src/models/qwen3_5_common.cpp

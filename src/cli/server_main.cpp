@@ -219,6 +219,10 @@ int main(int argc, char** argv) {
 
   auto cfg = model::Config::from_json_file(paths->config);
   if (!cfg.ok()) return fail(cfg.status(), "reading the config");
+  std::fprintf(stderr, "sampling defaults: temperature=%.3g top_k=%d top_p=%.3g\n",
+               static_cast<double>(cfg->sampling_defaults.temperature),
+               cfg->sampling_defaults.top_k,
+               static_cast<double>(cfg->sampling_defaults.top_p));
   if (kv_len > 0) cfg->kv_length = kv_len;
 
   auto weights = paths->weights.ends_with(".index.json")

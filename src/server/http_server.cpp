@@ -2,6 +2,7 @@
 #include "lse/server/shutdown.hpp"
 #include "jit_timings.hpp"
 #include "chat_protocol.hpp"
+#include "request_sampling.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -150,16 +151,13 @@ struct HttpServer::Impl {
     if (body.contains("stream_options") && body["stream_options"].is_object())
       r.include_usage = get_or<bool>(body["stream_options"], "include_usage", false);
 
-    // OpenAI's default temperature is 1.0, not this engine's 0.8: a client
-    // that sends nothing must get what the API promises, not what the CLI does.
-    r.sampling.temperature = get_or<float>(body, "temperature", 1.0f);
-    r.sampling.top_p = get_or<float>(body, "top_p", 1.0f);
-    r.sampling.top_k = get_or<std::int32_t>(body, "top_k", 0);
-    r.sampling.seed = get_or<std::uint64_t>(body, "seed", 0);
-    // frequency_penalty is additive in OpenAI and multiplicative here, so it
-    // is mapped rather than passed: 0 means off on both sides.
-    const float freq = get_or<float>(body, "frequency_penalty", 0.0f);
-    r.sampling.repetition_penalty = freq > 0.0f ? 1.0f + freq : 1.0f;
+    auto sampling = detail::request_sampling(body, model.config().sampling_defaults);
+    if (!sampling.ok()) {
+      send_error(res, 400, std::string(sampling.status().message()),
+                 "invalid_request_error", "sampling");
+      return sampling.status();
+    }
+    r.sampling = *sampling;
 
     // Thinking control. Accepts the OpenAI-style `reasoning_effort` ("none",
     // "low", "medium", "high", "xhigh") and a direct `thinking` (bool or
@@ -376,6 +374,7 @@ namespace {
 
 json usage_of(const Outcome& o) {
   return json{{"prompt_tokens", o.prompt_tokens},
+              {"prompt_tokens_details", {{"cached_tokens", o.prompt_tokens - o.prefill_tokens}}},
               {"completion_tokens", o.completion_tokens},
               {"total_tokens", o.prompt_tokens + o.completion_tokens}};
 }
@@ -385,6 +384,7 @@ json usage_of(const Outcome& o) {
 // the same information.
 json timings_of(const Outcome& o) {
   json t{{"prompt_n", o.prefill_tokens},
+         {"prompt_cached_n", o.prompt_tokens - o.prefill_tokens},
          {"prompt_ms", o.prefill_ns / 1e6},
          {"prompt_per_second", o.prompt_per_second},
          {"generated_n", o.completion_tokens},

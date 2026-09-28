@@ -67,6 +67,42 @@ std::uint32_t Sampler::sample(std::span<float> logits,
     return argmax(logits);
   }
 
+  const bool unfiltered =
+      (params_.top_k <= 0 ||
+       static_cast<std::size_t>(params_.top_k) >= logits.size()) &&
+      !(params_.top_p > 0.0f && params_.top_p < 1.0f);
+  if (unfiltered && std::isfinite(params_.temperature)) {
+    const std::uint32_t best = argmax(logits);
+    const float max_logit = logits[best];
+    if (std::isfinite(max_logit)) {
+      const float inv_t = 1.0f / params_.temperature;
+      probs_.resize(logits.size());
+      double total = 0.0;
+      bool finite = true;
+      for (std::size_t i = 0; i < logits.size(); ++i) {
+        const float p = std::exp((logits[i] - max_logit) * inv_t);
+        probs_[i] = p;
+        finite = finite && std::isfinite(p);
+        total += static_cast<double>(p);
+      }
+      if (finite && total > 0.0) {
+        // With no truncation, token order gives the same categorical weights.
+        // Keep one RNG draw; seeded continuations depend on the CDF order.
+        const double target = static_cast<double>(next_uniform()) * total;
+        double running = 0.0;
+        std::uint32_t last = best;
+        for (std::size_t i = 0; i < probs_.size(); ++i) {
+          const float p = probs_[i];
+          if (p == 0.0f) continue;
+          last = static_cast<std::uint32_t>(i);
+          running += static_cast<double>(p);
+          if (running >= target) return last;
+        }
+        return last;
+      }
+    }
+  }
+
   order_.resize(logits.size());
   for (std::size_t i = 0; i < order_.size(); ++i) {
     order_[i] = static_cast<std::uint32_t>(i);

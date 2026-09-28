@@ -103,6 +103,8 @@ if(NOT TARGET lse_backend_hrx)
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 endif()
 lse_add_test(test_shape)
+lse_add_test(test_sampling_defaults lse_model)
+target_include_directories(test_sampling_defaults PRIVATE ${CMAKE_SOURCE_DIR}/src/server)
 lse_add_test(test_server lse_server lse_tokenizer lse_model lse_backends)
 lse_add_test(test_chat_protocol lse_server lse_tokenizer lse_model lse_backends)
 target_include_directories(test_chat_protocol PRIVATE
