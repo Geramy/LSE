@@ -411,6 +411,48 @@ LSE_TEST(phase_emits_syncthreads_only_on_cross_lane_deps) {
   LSE_EXPECT(n < 6u);
 }
 
+LSE_TEST(a_phase_flash_stage_walks_every_logical_head) {
+  LSE_EXPECT(backend::hip_sources().find("thread.workgroup_id.x") == "blockIdx.x");
+  LSE_EXPECT(backend::hip_phase_sources().find("thread.workgroup_id.x") ==
+             "(i / 256u)");
+  for (const std::int64_t heads : {4, 2}) {
+    Array q = Array::full(Shape{1, heads, 4, 16}, DType::kF32, 0.1f);
+    Array scaled = mul(q, Array::full(Shape{1}, DType::kF32, 2.0f));
+    Array keys = Array::full(Shape{1, heads / 2, 16, 16}, DType::kF32, 0.2f);
+    Array values = Array::full(keys.shape(), DType::kF32, 0.3f);
+    Array meta = Array::full(Shape{5}, DType::kF32, 1.0f);
+    Array table = Array::full(Shape{1, 1}, DType::kF32, 0.0f);
+    Array output = sdpa_paged(scaled, keys, values, 0.25f, MaskKind::kCausal,
+                              0, meta, table, 16);
+    FusionGroup phase;
+    phase.is_phase = true;
+    phase.nodes = {scaled.node(), output.node()};
+    phase.outputs = {output.node()};
+    phase.inputs = {q.node(), scaled.node()->inputs[1], keys.node(),
+                    values.node(), meta.node(), table.node()};
+    auto emitted = backend::HipEmitter::emit_phase(phase, gfx1151());
+    LSE_EXPECT_OK(emitted.status());
+    if (!emitted.ok()) continue;
+    LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 1u);
+    LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
+    LSE_EXPECT(emitted->source.find("(i / 256u)") != std::string::npos);
+    LSE_EXPECT(emitted->source.find(" = blockIdx.x") == std::string::npos);
+    LSE_EXPECT(emitted->source.find("n = " + std::to_string(heads * 256) + "u") !=
+               std::string::npos);
+    FusionGroup standalone;
+    standalone.nodes = {output.node()};
+    standalone.outputs = standalone.nodes;
+    standalone.inputs = output.node()->inputs;
+    auto direct = backend::HipEmitter{}.emit(standalone, gfx1151());
+    LSE_EXPECT_OK(direct.status());
+    if (direct.ok()) {
+      LSE_EXPECT_EQ(direct->dims.workgroup_count[0], static_cast<unsigned>(heads));
+      LSE_EXPECT(direct->source.find("blockIdx.x") != std::string::npos);
+      LSE_EXPECT(direct->source.find("(i / 256u)") == std::string::npos);
+    }
+  }
+}
+
 LSE_TEST(phase_dependent_kernel_stays_one_workgroup) {
   Array h = Array::full(Shape{1, 32}, DType::kF32, 1.0f);
   Array rw = Array::full(Shape{32}, DType::kF32, 1.0f);

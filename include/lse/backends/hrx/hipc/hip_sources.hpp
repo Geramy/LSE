@@ -6,5 +6,6 @@
 namespace lse::backend {
 
 [[nodiscard]] graph::DialectSourceTable hip_sources() noexcept;
+[[nodiscard]] graph::DialectSourceTable hip_phase_sources() noexcept;
 
 }  // namespace lse::backend

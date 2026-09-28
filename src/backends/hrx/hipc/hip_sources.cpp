@@ -180,10 +180,21 @@ constexpr std::array<graph::PrimitiveSource, 71> kHipSources{{
     {"shared", "__shared__"},
 }};
 
+constexpr auto kHipPhaseSources = [] {
+  auto sources = kHipSources;
+  for (auto& source : sources)
+    if (source.primitive == "thread.workgroup_id.x") source.expr = "(i / 256u)";
+  return sources;
+}();
+
 }  // namespace
 
 graph::DialectSourceTable hip_sources() noexcept {
   return graph::DialectSourceTable(kHipSources);
+}
+
+graph::DialectSourceTable hip_phase_sources() noexcept {
+  return graph::DialectSourceTable(kHipPhaseSources);
 }
 
 }  // namespace lse::backend

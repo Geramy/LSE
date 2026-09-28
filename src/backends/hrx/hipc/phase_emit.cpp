@@ -867,6 +867,16 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
 
     if (spec != nullptr && spec->owns_indexing()) {
       KernelShapes sh = shapes_for(n);
+      const ThreadPlan plan = spec->plan(sh);
+      if (plan.workgroup_size[0] != 256u || plan.workgroup_size[1] != 1u ||
+          plan.workgroup_size[2] != 1u || plan.workgroup_count[1] != 1u ||
+          plan.workgroup_count[2] != 1u) {
+        return LSE_ERROR(kUnimplemented, "phase primitive '",
+                         std::string(spec->name()), "' needs incompatible workgroups");
+      }
+      // Each iteration is a complete logical workgroup, even on a serial grid.
+      const auto phase_spellings = hip_phase_sources();
+      sh.intrinsics = &phase_spellings;
       const std::string ob = bname(n.get());
       if (ob.empty()) {
         return LSE_ERROR(kInternal, std::string(spec->name()),

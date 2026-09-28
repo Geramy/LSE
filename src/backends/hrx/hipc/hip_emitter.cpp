@@ -516,6 +516,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
 std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
   std::uint64_t h = dispatch::specialization_cache_key(group.signature(), group, device, hip_types(), hip_sources());
+  if (group.is_phase) mix_name(h, "hip.phase-virtual-workgroups.v1");
   const KernelPrimitiveBase* self = nullptr;
   if (kernels::linked_bindings(group).ok) {
     KernelShapes dummy;
