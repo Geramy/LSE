@@ -93,6 +93,7 @@ Array Array::from_buffer(backend::DeviceBuffer buf, Shape shape, DType dtype) {
   n->dtype = dtype;
   n->member = stamped_member();
   n->buffer = buf;
+  n->device_dirty = buf.ptr == nullptr;
   n->materialized = true;
   return Array(n);
 }

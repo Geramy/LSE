@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -33,6 +34,47 @@ std::vector<float> read(graph::Array array) {
   LSE_EXPECT_OK(array.to_host(values.data(), values.size() * sizeof(float)));
   return values;
 }
+class OpaqueBufferBackend final : public backend::Backend<OpaqueBufferBackend> {
+ public:
+  static constexpr std::string_view kName = "fixture.opaque_buffer";
+  Status init_impl(int) { return OkStatus(); }
+  void shutdown_impl() noexcept {}
+  const backend::DeviceInfo& device_info_impl() const noexcept { return info_; }
+  Result<backend::DeviceBuffer> allocate_impl(std::size_t bytes, backend::MemoryClass, backend::Stream) {
+    auto storage = std::make_shared<std::vector<std::byte>>(bytes);
+    backend::DeviceBuffer buffer;
+    buffer.handle = reinterpret_cast<std::uint64_t>(storage->data());
+    buffer.size_bytes = bytes;
+    buffer.storage = std::move(storage);
+    return buffer;
+  }
+  void deallocate_impl(backend::DeviceBuffer& buffer) noexcept { buffer = {}; }
+  Status copy_h2d_impl(const void* source, backend::DeviceBuffer& destination,
+                       std::size_t bytes, std::size_t offset) {
+    std::memcpy(address(destination) + offset, source, bytes);
+    return OkStatus();
+  }
+  Status copy_d2h_impl(const backend::DeviceBuffer& source, void* destination,
+                       std::size_t bytes, std::size_t offset) {
+    std::memcpy(destination, address(source) + offset, bytes);
+    ++downloads;
+    return OkStatus();
+  }
+  Result<backend::KernelHandle> load_executable_impl(std::string_view, std::span<const std::byte>) {
+    return LSE_ERROR(kUnimplemented, "fixture has no device compiler");
+  }
+  Status launch_impl(const backend::KernelHandle&, const backend::LaunchDims&, const backend::DispatchArgs&) {
+    return LSE_ERROR(kUnimplemented, "fixture has no device execution");
+  }
+  Status synchronize_impl() { return OkStatus(); }
+  std::span<const graph::KernelToolchain> toolchains_impl() const noexcept { return {}; }
+  std::size_t downloads = 0;
+ private:
+  static std::byte* address(const backend::DeviceBuffer& buffer) {
+    return reinterpret_cast<std::byte*>(buffer.handle) + buffer.offset;
+  }
+  backend::DeviceInfo info_;
+};
 nlohmann::json config_json() {
   return {{"architectures", {"DFlash2DraftModel"}}, {"is_causal", false},
     {"hidden_size", 8}, {"vocab_size", 16}, {"num_hidden_layers", 1},
@@ -182,6 +224,34 @@ LSE_TEST(dflash2_attention_exposes_future_block_and_slides_only_context) {
   const float expected[]{10,12,12,14,14,16};
   for (std::size_t h = 0; h < 2; ++h)
     for (std::size_t i = 0; i < 6; ++i) LSE_EXPECT(std::fabs(output[h*6+i] - expected[i]) < 1e-6f);
+}
+LSE_TEST(dflash2_host_attention_reads_initialized_opaque_buffer_windows) {
+  backend::BackendAdapter<OpaqueBufferBackend> backend;
+  LSE_EXPECT_OK(backend.init(0));
+  graph::Scheduler scheduler(backend);
+  scheduler.set_mode(graph::Scheduler::Mode::kHostOnly);
+  auto upload = [&](Shape shape, const std::vector<float>& values) -> graph::Array {
+    auto allocation = backend.allocate((values.size() + 1) * sizeof(float), backend::MemoryClass::kDevice, backend::kDefaultStream);
+    LSE_EXPECT(allocation.ok());
+    if (!allocation.ok()) return {};
+    auto buffer = allocation.release();
+    LSE_EXPECT_OK(backend.copy({buffer, sizeof(float)}, values.data(), values.size() * sizeof(float)));
+    buffer.offset = sizeof(float);
+    buffer.size_bytes = values.size() * sizeof(float);
+    return graph::Array::from_buffer(std::move(buffer), std::move(shape), DType::kF32);
+  };
+  const std::vector<float> q(2*3*2, 0.0f), k(6*2, 0.0f);
+  const std::vector<float> v{0,0, 2,4, 6,8, 10,12, 14,16, 18,20}, meta{2,3};
+  auto output = graph::custom("dflash2.attention", {upload({1,2,3,2},q), upload({1,1,6,2},k),
+      upload({1,1,6,2},v), upload({2},meta)}, {2,1,2,3});
+  LSE_EXPECT(output.ok());
+  if (!output.ok()) return;
+  const graph::NodePtr roots[] = {output->node()};
+  LSE_EXPECT_OK(scheduler.eval(roots, true));
+  std::vector<float> actual(output->shape().elem_count());
+  LSE_EXPECT_OK(graph::interpreter::read_raw(*output->node(), actual.data(), actual.size() * sizeof(float)));
+  LSE_EXPECT(actual == attention_reference(q,k,v,meta,2,1,2,3,3));
+  LSE_EXPECT_EQ(backend.impl().downloads, 4u);
 }
 LSE_TEST(dflash2_dynamic_convolution_shares_groups_and_respects_left_boundary) {
   const std::vector<float> x{1,2,3,4, 5,6,7,8, 9,10,11,12};

@@ -187,8 +187,8 @@ target_link_libraries(test_trace PRIVATE lse_graph lse_backends Threads::Threads
 # tests still pass on the CPU backend, just without exercising a device.
 if(LSE_ROCM_RUNTIME_DIR)
   get_property(lse_tests DIRECTORY PROPERTY TESTS)
-  set_tests_properties(${lse_tests} PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
+  set_property(TEST ${lse_tests} APPEND PROPERTY ENVIRONMENT
+    "LD_LIBRARY_PATH=${LSE_ROCM_RUNTIME_DIR}")
 endif()
 
 # Exercise argument handling without opening a model, device or HTTP listener.
