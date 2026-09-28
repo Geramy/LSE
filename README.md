@@ -34,7 +34,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.6`.
+The examples below use `v0.4.7`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -43,7 +43,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.6
+   lse_tag=v0.4.7
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -76,7 +76,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.6
+   lse_tag=v0.4.7
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -275,6 +275,27 @@ A changed prefix requires new prefill. MTP requests currently start with fresh m
 
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
+
+### Current long-context result
+
+The v0.4.7 source reached these rates on an R9700 (`gfx1201`) with Qwen3.8-27B Q4 and a Q8 DFlash2 draft.
+
+| Mode | Prompt tokens | Prefill | Decode |
+|---|---:|---:|---:|
+| DFlash2, three verified proposals | 14,000 | **312.67** | **42.56** |
+
+The request used FP32 KV, temperature zero, and a 32 µs blocked-poll interval.
+It generated 64 tokens; the decode timer covers 63 tokens after the first token.
+The sample followed one initialization request and required no new compilation.
+The synthetic prompt was repetitive and gave 100% draft acceptance. General coding workloads can give different rates.
+
+In one baseline/candidate comparison, decode increased from 33.43 to 42.56 tokens per second (**27.32%**).
+Generated text matched exactly. Both runs used GPU kernels with zero host fallback.
+The baseline prefill compiled new kernels, so its prefill rate is not a comparable performance baseline.
+These are local source-build results, not measurements of the downloadable archive.
+See the [14K HTTP comparison](docs/benchmarks/short-query4-key-reuse-2026-09-28.md#http-comparison-at-14000-tokens).
+
+### Earlier short-context results
 
 These measurements used an R9700 (`gfx1201`), a Qwen3.8-27B Q4 target, and Q8 draft modules.
 The prompt contained 1,024 tokens. Each request generated 64 tokens at temperature zero.
