@@ -236,6 +236,7 @@ bool cooperative_rms_supported(const KernelShapes& s) {
       s.input_dtypes.size() != 2 || s.inputs[1].rank() != 1 ||
       s.output != s.inputs[0] || s.input_dtypes[0] != DType::kF32 ||
       s.output_dtype != DType::kF32 || !s.device ||
+      s.device->wavefront_size < 32 ||
       s.device->max_threads_per_workgroup < kThreads ||
       backend::workgroup_lds_bytes(s.device) < kThreads * sizeof(float) ||
       !s.staged.name.empty() || !s.staged_quant.codes.empty()) return false;
@@ -244,7 +245,7 @@ bool cooperative_rms_supported(const KernelShapes& s) {
   const auto width = s.inputs[0].dim(s.inputs[0].rank() - 1);
   return width >= 32 && s.inputs[1].elem_count() == static_cast<std::size_t>(width) &&
          s.output.elem_count() && s.output.elem_count() <= UINT32_MAX / sizeof(float) &&
-         has_ops(s, {"thread.local_id", "thread.workgroup_id.x", "barrier", "fma", "rsqrt"});
+         has_ops(s, {"thread.local_id", "thread.workgroup_id.x", "barrier", "fma", "rsqrt", "wave.shfl_xor"});
 }
 
 bool phase_cooperative_rms_supported(const KernelShapes& s) {

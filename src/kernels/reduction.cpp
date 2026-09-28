@@ -51,8 +51,8 @@ constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
 }  // namespace
 
 struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel> {
-  static constexpr std::string_view kName = "rms_norm.cooperative.v1";
-  static constexpr std::string_view kEntry = "lse_rms_norm_cooperative_v1";
+  static constexpr std::string_view kName = "rms_norm.cooperative.v2";
+  static constexpr std::string_view kEntry = "lse_rms_norm_cooperative_v2";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 2; }
   FusionClass fusion_class() const noexcept override { return FusionClass::kReduction; }
@@ -78,12 +78,18 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       if (!sums) return {};
       sums[lane] = partial.read();
       e.barrier();
-      for (std::uint32_t offset = kRmsBlock / 2; offset > 0; offset >>= 1) {
-        if (auto active = e.when(lane < offset)) {
-          sums[lane] = sums[lane].read() + sums[lane + offset].read();
-        }
-        e.barrier();
+      // Preserve the original 256-lane FP32 tree inside the first wave.
+      if (auto first_wave = e.when(lane < 32u)) {
+        const auto a0 = e.let(sums[lane].read() + sums[lane + 128u].read());
+        const auto a1 = e.let(sums[lane + 64u].read() + sums[lane + 192u].read());
+        const auto a2 = e.let(sums[lane + 32u].read() + sums[lane + 160u].read());
+        const auto a3 = e.let(sums[lane + 96u].read() + sums[lane + 224u].read());
+        auto total = e.let((a0 + a1) + (a2 + a3));
+        for (std::uint32_t offset = 16; offset > 0; offset >>= 1)
+          total = e.let(total + math::shfl_xor(total, e.u32(offset)));
+        if (auto lead = e.when(lane == 0u)) sums[0] = total;
       }
+      e.barrier();
       // All row reads precede stores; the hook preserves fused epilogues.
       const auto scale = e.let(math::rsqrt(
           sums[0].read() / static_cast<float>(d) + s.attrs[0]));

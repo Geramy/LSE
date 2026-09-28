@@ -35,6 +35,14 @@ struct Fixture {
    LSE_EXPECT_EQ(l->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(l->dims.workgroup_count[0],rows);
    LSE_EXPECT_EQ(h->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(h->dims.workgroup_count[0],rows);
    LSE_EXPECT_EQ(l->lds_bytes,1024u);
+   const auto occurrences=[](const std::string& source,std::string_view token) {
+    std::size_t count=0,pos=0;
+    while((pos=source.find(token,pos))!=std::string::npos){++count;pos+=token.size();}
+    return count;
+   };
+   LSE_EXPECT_EQ(occurrences(l->source,"kernel.barrier<workgroup>"),2u);
+   LSE_EXPECT_EQ(occurrences(h->source,"__syncthreads"),2u);
+
   }
  }
 };
