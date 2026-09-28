@@ -35,7 +35,9 @@ bool valid_panel(const KernelShapes &s) {
   if (!dispatch::q4_shared_panel_shape(original))
     return false;
   const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
-  return s.inputs[4] == Shape{4, k * 25 / 64};
+  const auto m = static_cast<std::int64_t>(s.inputs[0].elem_count() /
+                                           static_cast<std::uint64_t>(k));
+  return s.inputs[4] == Shape{m, (k / 64) * 25};
 }
 const KernelPrimitiveBase *legacy() {
   return dynamic_cast<const KernelPrimitiveBase *>(
@@ -109,7 +111,7 @@ std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule) {
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   const auto k =
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
-  constexpr std::uint32_t m = 4;
+  const auto m = static_cast<std::uint32_t>(s.output.elem_count() / n);
   const auto lanes = k / 8u, groups = k / 64u, nchunks = k / 8u;
   constexpr std::uint32_t chunks_per_group = 8;
   const auto wave = schedule.wave;
@@ -174,10 +176,14 @@ std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule) {
   return kb.str();
 }
 } // namespace
-struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel> {
-  static constexpr std::string_view kName = "quant_linear.q4_global_panel.v1";
+template <std::uint32_t Rows>
+struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
+  static constexpr std::string_view kName =
+      Rows == 8 ? "quant_linear.q4_global_panel.rows8.v1"
+                : "quant_linear.q4_global_panel.v1";
   static constexpr std::string_view kEntry =
-      "lse_quant_linear_q4_global_panel_v1";
+      Rows == 8 ? "lse_quant_linear_q4_global_panel_rows8_v1"
+                : "lse_quant_linear_q4_global_panel_v1";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
@@ -193,6 +199,25 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel> {
     out.push_back(in[1].dim(0));
     return out;
   }
+  const KernelPrimitiveBase *specialize(const KernelShapes &s) const override {
+    if constexpr (Rows == 0) {
+      if (valid_panel(s)) {
+        const auto original = original_shapes(s);
+        if (dispatch::quant_plan(original).shared_activation_panel &&
+            dispatch::q4_shared_panel_rows(original) == 8) {
+          static const Q4GlobalPanelKernel<8> rows8;
+          return &rows8;
+        }
+      }
+    }
+    return this;
+  }
+  static Dot4Schedule schedule_for(const KernelShapes &original) {
+    auto schedule = dot4_schedule(original);
+    if constexpr (Rows != 0)
+      schedule.rows = Rows;
+    return schedule;
+  }
   std::string emit_kernel(const KernelShapes &s) const override {
     if (!valid_panel(s) || !s.types.scalar || !s.store || !s.intrinsics)
       return {};
@@ -201,7 +226,7 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel> {
       const auto *kernel = legacy();
       return kernel ? kernel->emit_kernel(original) : std::string{};
     }
-    const auto schedule = dot4_schedule(original);
+    const auto schedule = schedule_for(original);
     return schedule.valid() ? emit_panel(s, schedule) : std::string{};
   }
   static ThreadPlan plan_impl(const KernelShapes &s) {
@@ -212,7 +237,7 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel> {
       const auto *kernel = legacy();
       return kernel ? kernel->plan(original) : ThreadPlan{};
     }
-    const auto schedule = dot4_schedule(original);
+    const auto schedule = schedule_for(original);
     if (!schedule.valid())
       return {};
     ThreadPlan plan;
@@ -220,9 +245,11 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel> {
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
     plan.workgroup_size[0] = kBlock;
     plan.workgroup_count[0] = (n + columns - 1) / columns;
-    plan.workgroup_count[1] = (4u + schedule.rows - 1) / schedule.rows;
+    const auto m = static_cast<std::uint32_t>(s.output.elem_count() / n);
+    plan.workgroup_count[1] = (m + schedule.rows - 1) / schedule.rows;
     return plan;
   }
 };
-LSE_REGISTER_PRIMITIVE(Q4GlobalPanelKernel);
+using Q4GlobalPanelDefault = Q4GlobalPanelKernel<0>;
+LSE_REGISTER_PRIMITIVE(Q4GlobalPanelDefault);
 } // namespace lse::kernels

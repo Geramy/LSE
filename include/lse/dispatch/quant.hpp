@@ -22,36 +22,48 @@ struct QuantPlan {
 };
 
 struct Q4PanelShape {
-  std::int64_t n, k;
+  std::int64_t m, n, k;
+  std::uint32_t rows = 0;
 };
 inline constexpr std::array kQ4PanelShapes{
-    Q4PanelShape{17408, 5120}, Q4PanelShape{5120, 17408},
-    Q4PanelShape{10240, 5120}, Q4PanelShape{6144, 5120},
-    Q4PanelShape{12288, 5120}, Q4PanelShape{5120, 6144},
-    Q4PanelShape{248320, 5120},
+    Q4PanelShape{4, 17408, 5120},  Q4PanelShape{4, 5120, 17408},
+    Q4PanelShape{4, 10240, 5120},  Q4PanelShape{4, 6144, 5120},
+    Q4PanelShape{4, 12288, 5120},  Q4PanelShape{4, 5120, 6144},
+    Q4PanelShape{4, 248320, 5120}, Q4PanelShape{7, 248320, 5120, 8},
 };
 
 // Shape eligibility is shared by graph construction and device dispatch.
-[[nodiscard]] inline bool q4_shared_panel_shape(const graph::KernelShapes& s) {
+[[nodiscard]] inline const Q4PanelShape* q4_shared_panel_rule(
+    const graph::KernelShapes& s) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
       s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
       s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
       s.output_dtype != DType::kF32 || s.iattrs[0] != 4 || s.iattrs[1] != 64 ||
-      !s.inputs[0].rank() || s.inputs[1].rank() != 2) return false;
+      !s.inputs[0].rank() || s.inputs[1].rank() != 2)
+    return nullptr;
   const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
   const auto n = s.inputs[1].dim(0);
-  bool measured = false;
+  const Q4PanelShape* measured = nullptr;
   for (const auto& shape : kQ4PanelShapes)
-    measured = measured || (n == shape.n && k == shape.k);
-  if (!measured ||
-      s.inputs[0].elem_count() != static_cast<std::uint64_t>(4 * k) ||
-      s.inputs[1] != Shape{n, k / 8} ||
-      s.inputs[2] != Shape{n, k / 64} || s.inputs[3] != s.inputs[2]) return false;
+    if (n == shape.n && k == shape.k &&
+        s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
+      measured = &shape;
+  if (!measured || s.inputs[1] != Shape{n, k / 8} ||
+      s.inputs[2] != Shape{n, k / 64} || s.inputs[3] != s.inputs[2])
+    return nullptr;
   Shape output;
   for (std::size_t i = 0; i + 1 < s.inputs[0].rank(); ++i)
     output.push_back(s.inputs[0].dim(i));
   output.push_back(n);
-  return s.output == output;
+  return s.output == output ? measured : nullptr;
+}
+[[nodiscard]] inline bool q4_shared_panel_shape(const graph::KernelShapes& s) {
+  return q4_shared_panel_rule(s) != nullptr;
+}
+[[nodiscard]] inline std::uint32_t q4_shared_panel_rows(
+    const graph::KernelShapes& s) {
+  const auto* rule = q4_shared_panel_rule(s);
+  return rule ? rule->rows : 0;
 }
 
 [[nodiscard]] QuantPlan quant_plan(const graph::KernelShapes&, bool indexed = false);

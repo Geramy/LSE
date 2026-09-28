@@ -7,10 +7,12 @@ Native gfx1201 on macOS, 64 CUs, wave32, 32,367 MiB reported device memory. Loca
 | Mode | Earlier release TPS | Current warm TPS | Mean TPS | Final prompt tokens/s |
 |---|---:|---:|---:|---:|
 | Plain Q4 | 24.22 / 24.18 | Not rerun | 24.20 baseline | 466.26 baseline |
-| MTP, three proposals | 23.12 / 23.18 | 36.39 / 36.35 | 36.37 | 464.71 |
-| DFlash2, four-row target verification | 15.15 / 15.16 | 36.84 / 36.84 | 36.84 | 469.25 |
+| MTP, three proposals | 23.12 / 23.18 | 36.50 / 36.56 | 36.53 | 467.20 |
+| DFlash2, four-row target verification | 15.15 / 15.16 | 38.07 / 38.38 | 38.23 | 471.47 |
 
 Both current measurements include shared Q4 activation panels. The panel change preserved the complete generated continuation and acceptance counters in both modes. Relative to the immediately preceding snapshots, MTP improved from 26.74 to 36.37 TPS (+36.0%) and DFlash from 28.04 to 36.84 TPS (+31.4%). The initial FFN-only panel checkpoint reached 33.14 and 33.94 TPS; extending the same kernel to five measured projection shapes added 9.7% and 8.5%, respectively. Earlier release and current continuations differ, so comparison to the earlier-release column is a fixed-input measurement rather than an identical-output claim. The current MTP and DFlash continuations match for these 64 generated tokens.
+
+The subsequent two-barrier RMS change and seven-row DFlash vocabulary panel reached the current table results. The complete continuations and acceptance counters remained unchanged. Final DFlash draft time fell from 413.12 to 357.23 ms; verification was 1,245.60 ms. MTP draft and verification were 339.32 and 1,383.66 ms. Relative to the preceding seven-shape panel checkpoint, mean DFlash throughput improved 3.77%; MTP increased 0.44%.
 
 The measured requests compile no new kernels. The prompt column reports the final warm request; cold startup and initial warmup are excluded. This run loaded the installed `/Library/MacAMDGPU/runtime/libhsa-runtime64.dylib` without a `DYLD_LIBRARY_PATH` override.
 
@@ -65,6 +67,16 @@ Additional exact component evidence includes preparation and consumer GPU time:
 
 ## Remaining cost
 
-LSE submission/step timing and GPU dispatch timestamps show FFN projections still consume about 55% of target GPU execution time. GPU timestamps measure dispatch duration, not occupancy. The requested 32-microsecond policy is a blocked completion-observation interval; it is not a fixed delay inserted after every kernel. Active spinning did not improve the earlier end-to-end comparison.
+LSE submission/step timing and GPU dispatch timestamps show FFN projections consume about 44–45% of target GPU execution time after the M4 panel changes. GPU timestamps measure dispatch duration, not occupancy. The requested 32-microsecond policy is a blocked completion-observation interval; it is not a fixed delay inserted after every kernel. Active spinning did not improve the earlier end-to-end comparison.
 
 The shared-panel path is active for the seven measured M4 shapes. Alternate matrix, weight-layout and workgroup experiments remain inactive; additional projection shapes are not enabled without measurement. The macOS release dependency pin includes the committed 32-microsecond HSA policy; existing release archives retain their previously bundled libraries.
+
+## Seven-row vocabulary panel and RMS reduction
+
+The DFlash vocabulary projection M7/N248320/K5120 now shares one activation panel and computes eight rows per workgroup, masking the unused row. Its original K partition and FP32 restoration/reduction order remain unchanged. Central dispatch selects only the measured shape, with a separate implementation identity. The original four-row paths retain their identities.
+
+ABBA20 native measurements, including preparation, reduced GPU execution from 5.1550 to 2.9710 ms (42.37%) and wall time from 5.1677 to 2.9895 ms. Both candidate samples beat both originals. The consumer uses 92 VGPRs, no LDS and no private scratch. The production raw and fused-residual cases preserved all 1,738,240 output bits, panel codes, input contents and allocation guards, with zero host fallback. Focused panel tests passed 7/7.
+
+RMS normalization preserves its 256-lane FP32 tree while using two workgroup barriers instead of nine. Six native shapes passed exact outputs and guards across 516 device dispatches; focused production tests passed 7/7. GPU median time changed from 6.52 to 6.26 microseconds for M4/K5120 and from 35.20 to 33.44 microseconds for M512/K5120. The small-shape wall measurements were noisy; these component results are distinct from the HTTP measurements above.
+
+These changes are newer than the v0.4.5 release archive. No additional perplexity sweep was run.

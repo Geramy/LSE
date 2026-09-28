@@ -286,7 +286,8 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   geometry.iattrs = n->iattrs;
   if (dispatch::q4_shared_panel_shape(geometry)) {
     const auto k = sx.dim(sx.rank() - 1);
-    const Shape panel_shape{4, k * 25 / 64};
+    const auto m = static_cast<std::int64_t>(sx.elem_count() / static_cast<std::uint64_t>(k));
+    const Shape panel_shape{m, (k / 64) * 25};
     auto panel = x.node()->quant_activation_panel.lock();
     if (!panel || panel->inputs.size() != 1 || panel->inputs[0] != x.node() ||
         panel->shape != panel_shape || panel->dtype != DType::kU32) {

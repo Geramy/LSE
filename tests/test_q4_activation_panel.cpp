@@ -8,6 +8,7 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
+#include "lse/kernels/lds_linear.hpp"
 
 #include <array>
 #include <bit>
@@ -22,12 +23,14 @@ using namespace lse::graph;
 namespace {
 constexpr auto kProducer = "quant_activation.q4_shared_panel.v1";
 constexpr auto kConsumer = "quant_linear.q4_global_panel.v1";
+constexpr auto kRows8Consumer = "quant_linear.q4_global_panel.rows8.v1";
 using Projection = std::array<std::size_t, 2>;
 constexpr std::array kFFNProjections{Projection{17408, 5120},
                                      Projection{5120, 17408}};
 constexpr std::array kAdditionalProjections{
     Projection{10240, 5120}, Projection{6144, 5120}, Projection{12288, 5120},
     Projection{5120, 6144}, Projection{248320, 5120}};
+constexpr std::array<Projection, 1> kM7Head{Projection{248320, 5120}};
 Array leaf(Shape shape, DType type) {
   auto node = std::make_shared<Node>();
   node->shape = shape;
@@ -155,6 +158,27 @@ LSE_TEST(
     LSE_EXPECT_EQ(wider.node()->inputs.size(), 4u);
   }
 }
+LSE_TEST(
+    q4_panel_M7_head_uses_seven_panel_rows_and_shape_local_specialization) {
+  auto x = leaf({1, 7, 5120}, DType::kF32);
+  const auto a = contraction(x, 248320, 5120);
+  const auto b = contraction(x, 248320, 5120);
+  LSE_EXPECT_EQ(a.node()->inputs.size(), 5u);
+  LSE_EXPECT(a.node()->prim && a.node()->prim->name() == kConsumer);
+  LSE_EXPECT(a.node()->inputs[4] == b.node()->inputs[4]);
+  LSE_EXPECT(a.node()->inputs[4]->shape == Shape{7, 2000});
+  for (const auto n : {6144, 10240, 12288, 17408}) {
+    const auto unmeasured = contraction(x, n, 5120);
+    LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+    LSE_EXPECT(unmeasured.node()->prim &&
+               unmeasured.node()->prim->name() == "quant_linear");
+  }
+  for (const auto m : {1, 3, 6, 8}) {
+    const auto unmeasured =
+        contraction(leaf({1, m, 5120}, DType::kF32), 248320, 5120);
+    LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+  }
+}
 LSE_TEST(q4_panel_typed_host_codec_and_retained_replay_are_exact) {
   auto *scheduler = default_scheduler();
   LSE_EXPECT(scheduler != nullptr);
@@ -226,6 +250,7 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
   device.lds_bytes_per_workgroup = 65536;
   backend::LoomEmitter loom;
   backend::HipEmitter hip;
+  const auto loom_intrinsics = loom.sources();
   const auto check_legacy = [&](const FusionGroup &group,
                                 IKernelEmitter &emitter,
                                 const EmittedKernel &emitted) {
@@ -271,15 +296,46 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     LSE_EXPECT_EQ(actual.lds_bytes, expected.lds_bytes);
     LSE_EXPECT_EQ(emitted.lds_bytes, expected.lds_bytes);
   };
-  for (const auto dimensions : {std::array<std::int64_t, 2>{17408, 5120},
-                                {5120, 17408},
-                                {10240, 5120},
-                                {6144, 5120},
-                                {12288, 5120},
-                                {5120, 6144},
-                                {248320, 5120}}) {
-    auto out = contraction(leaf({1, 4, dimensions[1]}, DType::kF32),
-                           dimensions[0], dimensions[1]);
+  for (const auto dimensions : {std::array<std::int64_t, 3>{4, 17408, 5120},
+                                {4, 5120, 17408},
+                                {4, 10240, 5120},
+                                {4, 6144, 5120},
+                                {4, 12288, 5120},
+                                {4, 5120, 6144},
+                                {4, 248320, 5120},
+                                {7, 248320, 5120}}) {
+    auto out = contraction(leaf({1, dimensions[0], dimensions[2]}, DType::kF32),
+                           dimensions[1], dimensions[2]);
+    std::vector<Shape> input_shapes;
+    std::vector<DType> input_types;
+    for (const auto &input : out.node()->inputs) {
+      input_shapes.push_back(input->shape);
+      input_types.push_back(input->dtype);
+    }
+    KernelShapes invocation;
+    invocation.inputs = input_shapes;
+    invocation.input_dtypes = input_types;
+    invocation.output = out.shape();
+    invocation.iattrs = {4, 64, 0, 0};
+    invocation.device = &device;
+    invocation.intrinsics = &loom_intrinsics;
+    invocation.types = backend::loom_types();
+    const auto *consumer =
+        dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);
+    LSE_EXPECT(consumer != nullptr);
+    if (consumer) {
+      const auto *selected = consumer->specialize(invocation);
+      LSE_EXPECT(selected->name() ==
+                 (dimensions[0] == 7 ? kRows8Consumer : kConsumer));
+      if (dimensions[0] == 7) {
+        auto original = invocation;
+        original.inputs = invocation.inputs.first(4);
+        original.input_dtypes = invocation.input_dtypes.first(4);
+        LSE_EXPECT_EQ(lse::kernels::dot4_schedule(original).k_splits, 1u);
+        LSE_EXPECT_EQ(dispatch::q4_shared_panel_rows(original), 8u);
+        LSE_EXPECT_EQ(selected->plan(invocation).workgroup_count[1], 1u);
+      }
+    }
     const NodePtr roots[]{out.node()};
     const auto groups = Partitioner::partition(roots);
     LSE_EXPECT_EQ(groups.size(), 2u);
@@ -294,6 +350,11 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
         }
         LSE_EXPECT_EQ(emitted->lds_bytes, 0u);
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
+        if (group.outputs[0]->prim->name() == kConsumer) {
+          LSE_EXPECT_EQ(emitted->dims.workgroup_count[1], 1u);
+          LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],
+                        static_cast<std::uint32_t>((dimensions[1] + 7) / 8));
+        }
       }
     for (const auto &group : groups) {
       if (group.outputs[0]->prim->name() != kConsumer)
@@ -331,7 +392,7 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
   }
 }
 
-int gpu_panel(std::span<const Projection> projections) {
+int gpu_panel(std::size_t m, std::span<const Projection> projections) {
   auto *scheduler = default_scheduler();
   if (!scheduler)
     return 1;
@@ -375,7 +436,7 @@ int gpu_panel(std::span<const Projection> projections) {
       allocations.push_back(std::move(g));
     };
     const auto n = dims[0], k = dims[1];
-    std::vector<float> data(4 * k);
+    std::vector<float> data(m * k);
     for (std::size_t i = 0; i < data.size(); ++i)
       data[i] = std::sin(static_cast<float>(i) * .173f) * .613f;
     std::vector<std::uint32_t> words(n * k / 8);
@@ -387,7 +448,8 @@ int gpu_panel(std::span<const Projection> projections) {
       biases[i] = bfloat16_t(-.131f + static_cast<float>(i % 17) * .0027f);
     }
     auto fast = quant_linear(
-        filled({1, 4, static_cast<std::int64_t>(k)}, DType::kF32, data),
+        filled({1, static_cast<std::int64_t>(m), static_cast<std::int64_t>(k)},
+               DType::kF32, data),
         filled({static_cast<std::int64_t>(n), static_cast<std::int64_t>(k / 8)},
                DType::kU32, words),
         filled(
@@ -425,11 +487,12 @@ int gpu_panel(std::span<const Projection> projections) {
                            actual.size() * sizeof(float)) == 0);
     LSE_EXPECT(read<std::uint32_t>(Array(fast.node()->inputs[4])) ==
                codec(data, k));
-    std::vector<float> residual(4 * n);
+    std::vector<float> residual(m * n);
     for (std::size_t i = 0; i < residual.size(); ++i)
       residual[i] = std::cos(static_cast<float>(i) * .091f) * .113f;
     auto r =
-        filled({1, 4, static_cast<std::int64_t>(n)}, DType::kF32, residual);
+        filled({1, static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)},
+               DType::kF32, residual);
     guard(r.node(), residual.data(), true);
     fast.node()->materialized = false;
     base->materialized = false;
@@ -470,17 +533,19 @@ int gpu_panel(std::span<const Projection> projections) {
       if (allocation.readonly)
         LSE_EXPECT(bytes == allocation.bytes);
     }
-    std::printf("Q4 panel M4 N%zu K%zu: device=%u host=%u fallback=%u complete "
-                "output/epilogue bits and panel exact; guards preserved\n",
-                n, k, trace.device_groups, trace.host_groups,
-                trace.host_fallbacks);
+    std::printf(
+        "Q4 panel M%zu N%zu K%zu: device=%u host=%u fallback=%u complete "
+        "output/epilogue bits and panel exact; guards preserved\n",
+        m, n, k, trace.device_groups, trace.host_groups, trace.host_fallbacks);
   }
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel")
-    return gpu_panel(kFFNProjections);
+    return gpu_panel(4, kFFNProjections);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-extensions")
-    return gpu_panel(kAdditionalProjections);
+    return gpu_panel(4, kAdditionalProjections);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m7")
+    return gpu_panel(7, kM7Head);
   return lse::test::run_all();
 }
