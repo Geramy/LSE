@@ -1,20 +1,30 @@
-Measured on **gfx1201 (AMD R9700, driver 197)**, Qwen3.8-27B-Q6, 1024-token
-prompt, 3 reps each. All tensors device-resident, compile-free, with
-`LSE_REQUIRE_DEVICE_KERNELS=1`.
+Recorded on **gfx1201 / AMD R9700**, Apple Silicon with Thunderbolt 5,
+Qwen3.8-27B-Q4, native HRX/Loom, MTP off. The warmed matched request used a
+1,024-token prompt and 64 generated tokens, two warmups and three measured
+requests per configuration, with flush 64 and 64 us completion polling.
 
-| Stage | This release | v0.4.1 | Delta |
-|---|---|---|---|
-| Prefill | **229 PP/s** (median; reps 229.25 / 227.20 / 225.84) | ~151 PP/s | **+51.7%** |
-| Decode | **16.3 TPS** (median; reps 16.30 / 16.22 / 16.18) | 16.3 TPS | no regression |
+| Stage | Qualified Q4 profile |
+|---|---:|
+| Prefill | **444.532 PP/s** |
+| Decode | **24.2635 TPS** |
 
-**What changed.** The GDN projection GEMMs (`in_proj_qkv`, and the full
-attention `qkv`/`v`/`o` projections) now select the staged-BF16 WMMA path at
-M=1024 instead of falling to the scalar path. All four large shapes went
-scalar→WMMA at ~3.0x each, taking the device total from 14053 ms to 9656 ms
-for the 1024-token prefill. Decode sits at the measured aggregate-GEMV
-bandwidth ceiling (~415 GB/s versus the ~549 GB/s that 25 TPS would need),
-so it is unchanged; the M=1024 decode selection fix is included as well.
+These are recorded measurements of the accepted qualified INT8 profile,
+including split-128 WG128 decode. They establish **400+ PP/s and 23+ TPS**
+on this system. The measurement predates the final automatic profile selection
+and wave32 normalization promotion; it is not a benchmark of the release archive.
 
-**Quality.** PPL-neutral: these are pure kernel-selection changes (records
-table only). Greedy text is identical to the f32 reference on the standard
-prompts, and the 0.005 logit rel-L2 gate holds where it applies.
+The checkpoint-qualified Q4 INT8 M1/M512 paths, Q4 M512 FFN LDS v2,
+FP32 Flash12 prefill, shared-exponential FP32 decode attention, and split-128
+WG128 decode are selected by default where qualified. Other kernels and operand
+types remain available with their existing diagnostic controls. Unknown
+checkpoints retain the exact FP32 path. Floating-point accumulation stays FP32;
+integer dot products accumulate in INT32 before FP32 affine restoration.
+
+**Quality uses perplexity.** New qualification windows contain 1,024–2,048
+actual target tokens. The 2,046-target automatic Q4 prefill result was 8.127312,
+matching explicit INT8 selection, versus 8.100851 for FP32 activations (+0.3266%).
+The 1,024-target automatic teacher-forced result was 7.20144530149 versus
+7.17831687877 with explicit INT8 (+0.3222%). These are separate fixtures and are
+not compared with each other. The accepted Q6 staged-BF16 M512 paths retain
+their documented historical 1,022-target qualification; FP8/BF8 alternatives
+remain inactive.

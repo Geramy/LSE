@@ -1,8 +1,6 @@
 #include "lse/backends/hrx/hrx_backend.hpp"
 #include "lse/backends/hrx/loaded_library.hpp"
-#if defined(__APPLE__)
 #include "sq_profiler.hpp"
-#endif
 #include "lse/backends/hrx/copy_route.hpp"
 
 #include <dlfcn.h>

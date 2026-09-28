@@ -105,7 +105,7 @@ def main():
     # Isolate the default JIT cache by immutable source/toolchain identity.
     build_inputs = {
         'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
-        'portability_patch': hashlib.sha256((root / '.github/patches/macos-portability.patch').read_bytes()).hexdigest(),
+        'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
@@ -167,7 +167,7 @@ def main():
         'gpu_execution_tested_in_ci': False,
         'jit_cache_identity': cache_identity,
         'jit_cache_build_inputs': build_inputs,
-        'portability_patch_sha256': hashlib.sha256((root / '.github/patches/macos-portability.patch').read_bytes()).hexdigest(),
+        'hrx_adapter_patch_sha256': build_inputs['hrx_adapter_patch'],
     }
     (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (package / 'QUICKSTART.txt').write_text(

@@ -154,7 +154,7 @@ def main():
     perf = measured_performance()
     if perf:
         L.append("## Measured performance (gfx1201 / R9700, "
-                 "Qwen3.8-27B-Q6)")
+                 "Qwen3.8-27B-Q4)")
         L.append("")
         L.append(perf)
         L.append("")
