@@ -382,7 +382,7 @@ Array topk(const Array& x, int k, int axis, Array* indices, float score_band) {
       Shape stage_shape{static_cast<std::int64_t>(x.shape().elem_count()) / width, chunks, k, 2};
       auto stage = make(OpKind::kCustom, stage_shape, DType::kF32, {candidates.node()});
       stage->attrs = {static_cast<float>(k), static_cast<float>(count), pairs ? 1.0f : 0.0f, 0.0f};
-      stage->prim = find_primitive("topk.chunk");
+      stage->prim = find_primitive("topk.chunk.v2");
       candidates = Array(stage);
       if (chunks == 1) break;
       count = chunks * k;

@@ -131,7 +131,7 @@ LSE_TEST(parallel_topk_loom_emits_ragged_three_stage_vocabulary) {
     LSE_EXPECT(emitted.ok());
     if (!emitted.ok()) { std::fprintf(stderr, "%s\n", emitted.status().to_string().c_str()); continue; }
     const auto name = group.outputs[0]->prim->name();
-    if (name == "topk.chunk") {
+    if (name == "topk.chunk.v2") {
       const unsigned expected_chunks[] = {485, 16, 1};
       LSE_EXPECT(chunks < 3);
       if (chunks < 3) LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], expected_chunks[chunks]);

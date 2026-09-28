@@ -242,8 +242,8 @@ auto pair_better(E& e, kir::Val<kir::f32> av, kir::Val<kir::f32> ai,
 }
 
 struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
-  static constexpr std::string_view kName = "topk.chunk";
-  static constexpr std::string_view kEntry = "lse_topk_chunk";
+  static constexpr std::string_view kName = "topk.chunk.v2";
+  static constexpr std::string_view kEntry = "lse_topk_chunk_v2";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 1; }
   bool owns_indexing() const noexcept override { return true; }
@@ -288,10 +288,10 @@ struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
     }
     const auto values = e.lds<kir::f32>(kChunkThreads * top);
     const auto indices = e.lds<kir::f32>(kChunkThreads * top);
-    const auto base = e.let(lid * top);
+    const auto base = e.let(lid);
     for (std::uint32_t p = 0; p < top; ++p) {
-      values[base + p] = p == 0 ? v0.read() : p == 1 ? v1.read() : math::neg_inf();
-      indices[base + p] = p == 0 ? i0.read() : p == 1 ? i1.read() : e.f32(kMissingIndex);
+      values[base + p * kChunkThreads] = p == 0 ? v0.read() : p == 1 ? v1.read() : math::neg_inf();
+      indices[base + p * kChunkThreads] = p == 0 ? i0.read() : p == 1 ? i1.read() : e.f32(kMissingIndex);
     }
     e.barrier();
     std::vector<kir::LValue<kir::f32>> merged_values, merged_indices;
@@ -302,15 +302,15 @@ struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
     for (std::uint32_t distance = kChunkThreads / 2; distance; distance >>= 1) {
       if (auto active = e.when(lid < distance)) {
         auto left = e.var(e.u32(0)), right = e.var(e.u32(0));
-        const auto other = e.let((lid + distance) * top);
+        const auto other = e.let(lid + distance);
         for (std::uint32_t p = 0; p < top; ++p) {
           auto lv = e.var(math::neg_inf()), rv = e.var(math::neg_inf());
           auto li = e.var(kMissingIndex), ri = e.var(kMissingIndex);
           if (auto valid = e.when(left.read() < top)) {
-            lv = values[base + left.read()].read(); li = indices[base + left.read()].read();
+            lv = values[base + left.read() * kChunkThreads].read(); li = indices[base + left.read() * kChunkThreads].read();
           }
           if (auto valid = e.when(right.read() < top)) {
-            rv = values[other + right.read()].read(); ri = indices[other + right.read()].read();
+            rv = values[other + right.read() * kChunkThreads].read(); ri = indices[other + right.read() * kChunkThreads].read();
           }
           const auto take_right = e.let(pair_better(e, rv.read(), ri.read(), lv.read(), li.read()));
           merged_values[p] = select(take_right, rv.read(), lv.read());
@@ -319,8 +319,8 @@ struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
           left = left.read() + select(take_right, e.u32(0), e.u32(1));
         }
         for (std::uint32_t p = 0; p < top; ++p) {
-          values[base + p] = merged_values[p].read();
-          indices[base + p] = merged_indices[p].read();
+          values[base + p * kChunkThreads] = merged_values[p].read();
+          indices[base + p * kChunkThreads] = merged_indices[p].read();
         }
       }
       e.barrier();
@@ -328,8 +328,8 @@ struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
     if (auto leader = e.when(lid == 0)) {
       const auto output = e.let((row * chunks + chunk) * top * 2u);
       for (std::uint32_t p = 0; p < top; ++p) {
-        e.store(output + p * 2u, values[e.u32(p)].read());
-        e.store(output + p * 2u + 1u, indices[e.u32(p)].read());
+        e.store(output + p * 2u, values[e.u32(p * kChunkThreads)].read());
+        e.store(output + p * 2u + 1u, indices[e.u32(p * kChunkThreads)].read());
       }
     }
     return body.lds().ok() ? body.str() : std::string{};
