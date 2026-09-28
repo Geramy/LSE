@@ -30,6 +30,16 @@ struct Fixture {
   if(!h.ok()||!l.ok())return;
   LSE_EXPECT((l->source.find("kernel.barrier<workgroup>")!=std::string::npos)==cooperative);
   LSE_EXPECT((h->source.find("__syncthreads")!=std::string::npos)==cooperative);
+  if(g.outputs.size()>1) {
+   LSE_EXPECT(h->source.find("__device__ float lse_rms_norm_")!=std::string::npos);
+   for(const auto& output:g.outputs) {
+    bool stored=false;
+    for(std::size_t i=0;i<h->binding_order.size();++i)
+     if(h->binding_order[i]==output)
+      stored=h->source.find("b"+std::to_string(i)+"[i] = ")!=std::string::npos;
+    LSE_EXPECT(stored);
+   }
+  }
   if(cooperative){
    const auto& shape=g.nodes[0]->shape;auto rows=shape.elem_count()/static_cast<size_t>(shape.dim(shape.rank()-1));
    LSE_EXPECT_EQ(l->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(l->dims.workgroup_count[0],rows);

@@ -65,6 +65,10 @@ Additional exact component evidence includes preparation and consumer GPU time:
 | 5,120 / 6,144 | 0.06248 | 0.04283 | 31.5% |
 | 248,320 / 5,120 | 2.67618 | 1.59546 | 40.4% |
 
+## Long-context follow-up
+
+The short-context figures above do not predict performance at 14K live KV. See [the long-context HTTP investigation](long-context-http-2026-09-28.md) for remainder-batch dispatch, attention, compilation, CPU-use and prefix-reuse measurements from the later checkpoint.
+
 ## Remaining cost
 
 LSE submission/step timing and GPU dispatch timestamps show FFN projections consume about 44–45% of target GPU execution time after the M4 panel changes. GPU timestamps measure dispatch duration, not occupancy. The requested 32-microsecond policy is a blocked completion-observation interval; it is not a fixed delay inserted after every kernel. Active spinning did not improve the earlier end-to-end comparison.

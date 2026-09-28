@@ -1433,11 +1433,9 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     }
 
     if (const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim)) {
-      std::vector<Shape> shapes;
-      std::vector<DType> dtypes;
-      const auto probe = shapes_for(n, shapes, dtypes);
-      const auto* chosen = kp->specialize(probe);
-      if ((chosen ? chosen : kp)->owns_indexing())
+      // The fallback preamble emits the base helper, even when its standalone
+      // specialization owns indexing. A base without a helper must decline.
+      if (kp->owns_indexing())
         return LSE_ERROR(kUnimplemented, "primitive '",
                          std::string(kp->name()),
                          "' owns its indexing but cannot emit in this group");

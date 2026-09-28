@@ -10,7 +10,7 @@ if(NOT CMAKE_CXX_COMPILER)
 endif()
 
 project(lse
-  VERSION 0.4.5
+  VERSION 0.4.6
   DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
   LANGUAGES CXX)
 
@@ -198,6 +198,7 @@ lse_apply_common_flags(lse_trace)
 
 add_library(lse_graph
   src/dispatch/attention.cpp
+  src/dispatch/q8_matrix.cpp
   src/graph/graph.cpp
   src/graph/ops.cpp
   src/graph/partitioner.cpp
@@ -233,7 +234,6 @@ add_library(lse_kernels
   src/kernels/matmul.cpp
   src/kernels/quant_embedding.cpp
   src/dispatch/quant.cpp
-  src/dispatch/q8_matrix.cpp
   src/kernels/quant_linear.cpp
   src/kernels/quant_activation_panel.cpp
   src/kernels/quant_linear_panel.cpp

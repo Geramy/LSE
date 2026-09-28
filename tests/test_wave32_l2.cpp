@@ -53,6 +53,16 @@ struct Fixture {
     if (!h.ok() || !l.ok()) return;
     LSE_EXPECT((h->source.find("__shfl_xor") != std::string::npos) == wave);
     LSE_EXPECT((l->source.find("kernel.subgroup.shuffle") != std::string::npos) == wave);
+    if (g.outputs.size() > 1) {
+      LSE_EXPECT(h->source.find("__device__ float lse_l2_normalize_") != std::string::npos);
+      for (const auto& output : g.outputs) {
+        bool stored = false;
+        for (std::size_t i = 0; i < h->binding_order.size(); ++i)
+          if (h->binding_order[i] == output)
+            stored = h->source.find("b" + std::to_string(i) + "[i] = ") != std::string::npos;
+        LSE_EXPECT(stored);
+      }
+    }
     if (wave) {
       for (const auto* e : {&*h, &*l}) {
         LSE_EXPECT_EQ(e->dims.workgroup_size[0], 128u);
