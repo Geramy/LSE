@@ -455,3 +455,8 @@ message(STATUS "  HSA runtime     : ${LSE_ROCM_RUNTIME_DIR}")
 message(STATUS "  GPU targets     : ${LSE_GPU_TARGETS}")
 message(STATUS "  tests           : ${LSE_BUILD_TESTS}")
 message(STATUS "")
+
+option(LSE_BUILD_SPLITK4_PROBE "Build the archived Q4 split-K4 experiment" OFF)
+if(LSE_BUILD_SPLITK4_PROBE)
+  add_subdirectory(experiments/q4-int8-splitk4)
+endif()

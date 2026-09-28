@@ -1,0 +1,32 @@
+{
+  "base_commit": "0817710340308f1e129fc3d9c19c864bee9429a0",
+  "status": "rejected_slower_than_active_panel",
+  "native_sha256": "c9c8ca088e0f60075bf3547581043e2fe88b88fc45fe1dc79b9c41e0cfc14007",
+  "measured_sources": {
+    "partial.cpp": "5f5a30180e8019011537317c5ac10f46195dc0e68094c980091f5ffd78119816",
+    "merge.cpp": "bf9bff93b2f27c159e005a1fd663d823478cc6298211272d09799e704136a614",
+    "global_panel.cpp": "4a7a84631e5a95c70012b6b4c70961cfaf1bce3b1f84d88c9be7851be4d2977d",
+    "producer.cpp": "dffae27b1b8cd1d417ee4e3915844556062c9d5a66927b55cd12ed1020e69b13",
+    "native.cpp": "b9a510a2ad6040a1fec6145699ef281f37cb88fd7916090e9fe6d4fe1c8703bd",
+    "q8_matrix.cpp": "eb48b85e5de4f697ee2c077317ed632b932c29c1a0139357f1d23135f545b9bb"
+  },
+  "archive_compatibility_changes": [
+    "Private dispatch namespace avoids replacing any project archive object.",
+    "Producer explicitly declines epilogues to satisfy generic typed terminal-output validation; arithmetic unchanged.",
+    "Producer symbol identity isolated from active registry; arithmetic unchanged."
+  ],
+  "cpu_compiler": "clang21.1.8, C++26, -O2, -fno-fast-math",
+  "device": "gfx1201 wave32",
+  "profile": "HRX dispatch CP timestamps at100MHz, not host clock correlated",
+  "device_dispatches": {
+    "edge": 80,
+    "actual_shapes": 576
+  },
+  "host_dispatches": 0,
+  "fallback_dispatches": 0,
+  "native_execution": "direct device backend launch, guarded byte-buffer fixtures",
+  "local_raw_capture": "mac_amdgpu/build/pp-optimization/q4-i8-splitk4-20260928",
+  "files": {},
+  "libloomc.dylib_sha256": "ebbb7cc3da1db6b7204b003b41afc6f01c5a355ff945553f34c89e2f41ee7a15",
+  "libhrx.dylib_sha256": "2d5c068575bfdd0bb301fda33244b9f840fc43f07abbb1adf0b2ab267f859bba"
+}

@@ -1,0 +1,144 @@
+{
+  "q4_up_m4": {
+    "baseline": {
+      "n": 40,
+      "mean_ms": 0.111922,
+      "median_ms": 0.10397999999999999,
+      "min_ms": 0.1004,
+      "p95_ms": 0.14186400000000002,
+      "max_ms": 0.22604
+    },
+    "candidate": {
+      "n": 40,
+      "mean_ms": 0.150186,
+      "median_ms": 0.14754,
+      "min_ms": 0.14392,
+      "p95_ms": 0.150682,
+      "max_ms": 0.24148
+    },
+    "baseline_arms": [
+      {
+        "n": 20,
+        "mean_ms": 0.112806,
+        "median_ms": 0.10628,
+        "min_ms": 0.1004,
+        "p95_ms": 0.14186400000000002,
+        "max_ms": 0.2244
+      },
+      {
+        "n": 20,
+        "mean_ms": 0.111038,
+        "median_ms": 0.10334,
+        "min_ms": 0.10048,
+        "p95_ms": 0.14016,
+        "max_ms": 0.22604
+      }
+    ],
+    "candidate_arms": [
+      {
+        "n": 20,
+        "mean_ms": 0.152992,
+        "median_ms": 0.14772000000000002,
+        "min_ms": 0.14672,
+        "p95_ms": 0.15886799999999998,
+        "max_ms": 0.24148
+      },
+      {
+        "n": 20,
+        "mean_ms": 0.14738,
+        "median_ms": 0.14712,
+        "min_ms": 0.14392,
+        "p95_ms": 0.150214,
+        "max_ms": 0.15048
+      }
+    ],
+    "wall_ms_per_call": {
+      "panel": [
+        0.130735,
+        0.127092
+      ],
+      "splitk4": [
+        0.169856,
+        0.164421
+      ]
+    },
+    "gpu_sum_change_percent": 34.18809528064186,
+    "wall_change_percent": 29.651665651774262,
+    "both_cp_arms_clear": false,
+    "warm_calls_per_arm": 32,
+    "measured_calls_per_arm": 40,
+    "clock_frequency_hz": 100000000,
+    "host_clock_correlated": false
+  },
+  "q4_down_m4": {
+    "baseline": {
+      "n": 40,
+      "mean_ms": 0.104908,
+      "median_ms": 0.09964,
+      "min_ms": 0.09556,
+      "p95_ms": 0.1105,
+      "max_ms": 0.20044
+    },
+    "candidate": {
+      "n": 40,
+      "mean_ms": 0.156416,
+      "median_ms": 0.15486,
+      "min_ms": 0.15172,
+      "p95_ms": 0.157886,
+      "max_ms": 0.21264
+    },
+    "baseline_arms": [
+      {
+        "n": 20,
+        "mean_ms": 0.104894,
+        "median_ms": 0.09964,
+        "min_ms": 0.09632,
+        "p95_ms": 0.1105,
+        "max_ms": 0.19676
+      },
+      {
+        "n": 20,
+        "mean_ms": 0.104922,
+        "median_ms": 0.09952,
+        "min_ms": 0.09556,
+        "p95_ms": 0.10924000000000002,
+        "max_ms": 0.20044
+      }
+    ],
+    "candidate_arms": [
+      {
+        "n": 20,
+        "mean_ms": 0.15847,
+        "median_ms": 0.15502,
+        "min_ms": 0.15432,
+        "p95_ms": 0.16073199999999999,
+        "max_ms": 0.21264
+      },
+      {
+        "n": 20,
+        "mean_ms": 0.154362,
+        "median_ms": 0.15410000000000001,
+        "min_ms": 0.15172,
+        "p95_ms": 0.15684800000000002,
+        "max_ms": 0.157
+      }
+    ],
+    "wall_ms_per_call": {
+      "panel": [
+        0.122242,
+        0.121925
+      ],
+      "splitk4": [
+        0.175773,
+        0.171392
+      ]
+    },
+    "gpu_sum_change_percent": 49.09825752087542,
+    "wall_change_percent": 42.183423640377256,
+    "both_cp_arms_clear": false,
+    "warm_calls_per_arm": 32,
+    "measured_calls_per_arm": 40,
+    "clock_frequency_hz": 100000000,
+    "host_clock_correlated": false
+  }
+}
