@@ -1,514 +1,379 @@
 # Lemon Seed Engine (LSE)
 
-A modular C++ inference engine for hybrid LLMs — Gated DeltaNet interleaved
-with gated GQA, dense or sparse-MoE feed-forward. Its defining property: **the
-kernels are generated at run time from the model's own shapes and the device
-it is running on, then selected by measured evidence — not picked from a fixed
-library.** There is no hand-tuned kernel per model per GPU. The engine probes
-the device, generates candidate kernels for the actual shapes, and keeps the
-one that is fastest *here, now, for this config* — so the same binary is
-near-optimal on a 256 GB/s APU and a 644.6 GB/s board, in 4-bit or 8-bit, on a
-single device or across a pool.
+LSE runs text models on AMD GPUs. It provides an HTTP server and a command-line program.
+It generates GPU kernels for the model and device, then stores compiled kernels in a local cache.
 
-That is what it was built for: **always-the-most-optimal kernels in any
-configuration** — any model shape, any precision, any single device, any
-multi-device pool, any platform that can run an AMD GPU (or the CPU reference).
-It is not a fixed kernel pack; the optimization is the product.
+- **HTTP server:** Chat Completions, text completions, reasoning output, and function tool calls.
+- **Model formats:** MLX group-affine Q4, Q6, and Q8 weights; BF16, FP16, and FP32 weights.
+- **Speculative decoding:** Native multi-token prediction (MTP) or an optional DFlash2 draft model.
+- **GPU execution:** HRX with HIP or Loom kernel source, subject to platform support.
+- **CPU backend:** Reference execution and a fallback when available GPU backends cannot start.
 
-## What it does
+[Install](#install-a-release) · [Start the server](#start-the-http-server) ·
+[MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
+[Performance](#measured-performance) · [Build](#build-from-source) ·
+[Troubleshooting](#troubleshooting)
 
-- **Run-time kernel generation.** Ops record into a lazy tensor DAG; on demand
-  the graph is partitioned into fusion groups and each group is emitted as
-  device source (HIP or Loom), compiled with the selected toolchain into a code
-  object for the exact target, cached on disk, and dispatched through the native
-  HRX ABI. A toolchain change invalidates stale objects by construction.
-- **Measured kernel selection.** A device-qualification probe measures DRAM
-  bandwidth, dispatch cost, and matrix-core throughput per operand family. The
-  optimizer ranks the accepted kernel variants (WMMA/MFMA, operand layout,
-  precision, tile) on shape, capabilities, accuracy, and *matched timing
-  evidence* — no manual selection. Adding an operand family is a table row.
-- **Precision held in the checkpoint's own format.** Weights are read in MLX
-  group-affine form at 4, 6 or 8 bits, or bf16/f16/f32; conversion happens
-  inside the kernel at the register boundary. Packed Q6 stays packed in VRAM;
-  matrix accumulation stays FP32.
-- **A real cost model for multi-device.** Throughput at a given queue depth,
-  with split proportions for uneven pools, per-ordered-pair link latency and
-  bandwidth fitted separately. Every number carries its provenance. The pool
-  machinery (open, probe, report every member) is in; the model-split across
-  members is the open half (see [Upcoming](#upcoming)).
-- **CPU reference backend** for numerics checking against every device kernel —
-  the engine falls back to it when no GPU backend initializes, and says so.
+## Supported platforms
 
-## Compatibility
-
-The engine is platform-agnostic; a "platform" here is just (host OS, GPU
-runtime, AOT target).
-
-| Platform | GPU runtime | Status | Notes |
-|---|---|---|---|
-| Linux x86_64 | ROCm 7.x + [hrx-system](https://github.com/ROCm/hrx-system) | **primary** | Full HIP + Loom dialects, all AOT targets |
-| macOS / Apple Silicon | [MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu) DriverKit driver + HSA runtime | qualified | Loom dialect, `gfx1201` qualified |
-| Any host | CPU reference backend | always available | No GPU; for numerics and as the fallback |
-
-AOT kernel targets: `gfx942` (CDNA3), `gfx1150`/`gfx1151` (RDNA3.5),
-`gfx1200`/`gfx1201` (RDNA4). A device with no ahead-of-time kernels still runs —
-it compiles once per kernel and caches it on disk.
-
-Build steps per platform: **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
-
-## Measured performance
-
-Medians, warm JIT cache, GPU otherwise idle, best of several runs. `—` = not
-measured on that platform. These are LSE results, not llama.cpp-parity claims;
-the point of the table is that one engine spans a 2.5× DRAM-bandwidth range.
-
-| Platform / GPU | Model | Prefill (tok/s) | Decode (tok/s) |
-|---|---|---|---|
-| gfx1151 (Strix Halo, 256 GB/s) | Qwen3.5-0.8B-4bit, 1601 tok | 1703 | — |
-| gfx1151 (Strix Halo, 256 GB/s) | Qwen3.8-27B-4bit, 401 tok | 28.7 | 11.9 (15.0 with MTP) |
-| gfx1151 (Strix Halo, 256 GB/s) | lemonseed-1.5b-base (bf16) | — | 102.3 |
-| gfx1201 (R9700, 644.6 GB/s) | Qwen3.8-27B-4bit, 401 tok | 112 | 20.9 (27.9 with MTP) |
-| gfx1201 (R9700, 644.6 GB/s) | Qwen3.8-27B-Q6, 1024 tok | **229** | **16.3** |
-
-Decode on the APU is bandwidth-bound at 82% of the measured DRAM rate; on the
-R9700 it is not, which is where the headroom is. 19 test suites green, zero
-warnings under the full warning set.
-
-## Models
-
-The architecture is what a checkpoint is loaded as, not its name, so a family
-shares one kernel. `--list-models` prints what a build registers.
-
-| Kernel | Checkpoints | Notes |
+| Platform | GPU requirements | Kernel source |
 |---|---|---|
-| `qwen3.5` | Qwen3.5, Qwen3.6, Qwen3.8 dense | Hybrid: three Gated DeltaNet layers to each full-attention one. Verified on Qwen3.5-0.8B and Qwen3.8-27B |
-| `qwen3.5-moe` | The A3B-style MoE variants of the same families | MLX's SwitchGLU layout, experts stacked as one plane per projection |
-| `lemonseed` | [lemonseed-1.5b-base](https://huggingface.co/lemonade-sdk/lemonseed-1.5b-base) | Adds Mixture-of-Depths |
+| Linux x86_64 | ROCm 7.x and [HRX](https://github.com/ROCm/hrx-system) | HIP or Loom |
+| macOS on Apple Silicon | An external AMD GPU and the activated [MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu) | Loom |
+| CPU | A build with the CPU backend | CPU reference execution |
 
-A multi-token-prediction module is used when the checkpoint has one (`--mtp`
-names it, `--no-mtp` declines it); the text tower loads on its own where a
-checkpoint also ships a vision tower, which this build does not run.
+The tested macOS GPU is the R9700 (`gfx1201`). The macOS package includes HSA, HRX, Loom, and their runtime libraries.
+It does not install the DriverKit extension.
 
-## Design in one paragraph
+The macOS binaries target macOS 15 or later. GPU use also requires a macOS version supported by MacAMDGPU.
+See the driver instructions for that requirement.
 
-Ops are lazy: they record into a DAG and execute only when a host-visible read
-demands a value. On demand the graph is partitioned into fusion groups, each
-group is emitted as HIP or Loom source, compiled with the selected toolchain
-into an AMDGPU code object, cached on disk, and dispatched through the native
-HRX ABI (`hrx_stream_dispatch`) — not through HIP. Every extension seam
-(backend, transport, quantization scheme, layer, sampler) is a CRTP base that
-owns the shared algorithms and calls into the derived type for the primitives.
+Linux release targets include `gfx942`, `gfx1150`, `gfx1151`, `gfx1200`, and `gfx1201`.
+Check each release for its build targets and runtime requirements.
 
 ## Install a release
 
-Releases are built by the **Build & Release** workflow and carry ahead-of-time
-kernels for the architectures selected for that build, which the release notes
-list. Pick the asset for your platform, verify it, unpack it:
+Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
+The examples below use `v0.4.6`.
+
+Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
+
+### Linux x86_64
+
+1. Download the archive and checksum.
+
+   ```bash
+   lse_tag=v0.4.6
+   lse_asset="lse-${lse_tag}-linux-x86_64"
+   curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
+   curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
+   ```
+
+2. Check the checksum. Continue only if the check reports `OK`.
+
+   ```bash
+   sha256sum -c "${lse_asset}.tar.gz.sha256"
+   ```
+
+3. Extract the archive.
+
+   ```bash
+   tar -xzf "${lse_asset}.tar.gz"
+   cd "$lse_asset"
+   LSE_BIN="$PWD"
+   ```
+
+4. Make the installed HRX and ROCm libraries available to the system loader.
+   Replace the HRX path below with your installation path.
+
+   ```bash
+   export LD_LIBRARY_PATH="/path/to/hrx-install/lib:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   ```
+
+### macOS on Apple Silicon
+
+1. Install and activate the [MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu).
+2. Download the archive and checksum.
+
+   ```bash
+   lse_tag=v0.4.6
+   lse_asset="lse-${lse_tag}-macos-arm64"
+   curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
+   curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
+   ```
+
+3. Check the checksum. Continue only if the check reports `OK`.
+
+   ```bash
+   shasum -a 256 -c "${lse_asset}.tar.gz.sha256"
+   ```
+
+4. Extract the archive.
+
+   ```bash
+   tar -xzf "${lse_asset}.tar.gz"
+   cd "$lse_asset"
+   LSE_BIN="$PWD/bin"
+   ```
+
+Use the programs in `bin/`. These launchers select the runtime libraries supplied with the package.
+You do not need to set `DYLD_LIBRARY_PATH` yourself.
+
+### Check the GPU
 
 ```bash
-# Linux x86_64 (the <tag> is e.g. v0.4.2)
-curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz
-curl -LO https://github.com/Geramy/LSE/releases/download/<tag>/lse-<tag>-linux-x86_64.tar.gz.sha256
-sha256sum -c lse-<tag>-linux-x86_64.tar.gz.sha256
-tar -xzf lse-<tag>-linux-x86_64.tar.gz && cd lse-<tag>-linux-x86_64
+"$LSE_BIN/lse" --devices
 ```
 
-The binary finds the ROCm runtime itself, searching `$ROCM_PATH`, `/opt/rocm`
-and the versioned installs beside it. Set `$ROCM_PATH` if the install is
-somewhere else; `LD_LIBRARY_PATH` still wins where it is set.
+Confirm that the output lists an HRX device before you load a model.
+The examples below select the first HRX device with `--pool hrx:0`.
 
-Run `./bin/lse --devices` first. If it reports no HRX device the engine falls
-back to the CPU backend (the same models, far slower) rather than failing, and
-names the backend that declined and why — a missing runtime symbol reads very
-differently from a machine with no GPU in it.
+## Start the HTTP server
 
-## Run
+Set the model location. Replace the example path with your Q4 checkpoint directory.
 
 ```bash
-# a repo id, a checkpoint directory, or a .safetensors file
-./lse -m mlx-community/Qwen3.8-27B-4bit -n 256 "The capital of France is"
-
-./lse --list-cache                 # models in the HF cache, and whether this build loads each
-./lse -m <model> --stats           # timings, launch counts and the device cost model
-./lse -m <model> -b 4 -p "..." -p "..."   # decode several sequences as one batch
+LSE_MODEL="/absolute/path/to/qwen38-27b-q4"
 ```
 
-Speculative decoding is on whenever the checkpoint ships a multi-token
-prediction module, or point at one:
+`--model` also accepts a Hugging Face repository ID or a supported `.safetensors` file.
+A repository ID can cause a model download.
+
+Start ordinary decoding first:
 
 ```bash
-./lse -m mlx-community/Qwen3.8-27B-4bit --mtp <path-or-repo-id> -n 256 "..."
+"$LSE_BIN/lse-server" \
+  --model "$LSE_MODEL" \
+  --no-mtp \
+  --pool hrx:0 --dialect loom \
+  --kv-len 32768 \
+  --served-name qwen38-q4 \
+  --host 127.0.0.1 --port 8080
 ```
 
-### Choose HIP or Loom
+Confirm that startup reports `device hrx` and `generates loom`.
+On Linux, you can select `--dialect hip` instead.
+A dialect request is a preference. If unavailable, LSE reports the change and selects an available toolchain.
 
-Both the CLI and server accept **`--dialect hip`** or **`--dialect loom`**. Both
-paths dispatch through HRX; `--dialect` is a preference among the device's
-available toolchains. If a device does not declare the requested dialect, LSE
-reports that fact and uses its own choice. Check the startup `generates hip` /
-`generates loom` line to confirm the selected path.
+In another terminal, check the server:
 
 ```bash
-./lse --pool hrx:0 --dialect loom -m /path/to/model --no-mtp -n 128 "Hello"
-./lse --pool hrx:0 --dialect hip  -m /path/to/model --no-mtp -n 128 "Hello"
-./lse-server --pool hrx:0 --dialect loom -m /path/to/model --no-mtp --port 8080
+curl -fsS http://127.0.0.1:8080/health
 ```
 
-`--pool hrx:0` selects the first HRX device; omit it for automatic device
-selection. Check `--devices` before loading a model.
-
-### `lse` options
-
-| Option | Default | |
-|---|---|---|
-| `-m, --model NAME` | `$LSE_MODEL` | Checkpoint directory, `.safetensors`, or an HF repo id. A bare name resolves when it is unique |
-| `-n, --max-tokens N` | 256 | Tokens to generate |
-| `-t, --temperature F` | 0.8 | 0 or less is greedy |
-| `--top-k N` | off | Keep the N most likely tokens |
-| `--top-p F` | 1.0 | Nucleus threshold |
-| `--repeat-penalty F` | 1.0 | Above 1 discourages repeats |
-| `-s, --seed N` | 0 | Sampler seed |
-| `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
-| `--mtp-depth N` | 3 | Draft proposals per verifier pass (1–7) |
-| `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
-| `--dflash2=on/off` | off | Use the DFlash2 block drafter instead of MTP |
-| `--dflash2-model PATH` | `incoai/Qwen3.8-27B-DFlash2` | Drafter checkpoint directory or HF repo id |
-| `--arch NAME` | detected | Force a model kernel instead of detecting one |
-| `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json`, used only when the model directory has none |
-| `--kv-len N` | `max(2*train_seq, 2048)` | Allocate the KV cache for N tokens and keep that shape |
-| `-b, --batch N` | 1 | Decode N copies of the prompt as one batch |
-| `-p, --prompt TEXT` | | One more sequence for the batch; repeatable, and differing lengths put the rows at different positions |
-| `--kv-blocks N` | no limit | Blocks one attention layer's pool may hold; below what the batch needs, sequences are preempted and resume |
-| `--pool LIST` | `$LSE_POOL` | Devices this run may use, backend-qualified and best first: `hrx:0,cpu:0` |
-| `--dialect NAME` | the device's choice | Source dialect to generate kernels in: `hip` or `loom` |
-| `--list-models` | | Print the registered model kernels and exit |
-| `--list-cache` | | List the models in the HF cache and whether this build can load each, and exit |
-| `--devices` | | Report every device this build can see, and what it will not answer |
-| `--stats` | | Print timings, launch counts and the cost model when done |
-| `--debug` | | Print the HIP dump path and file count |
-
-## Serve an OpenAI API
-
-`lse-server` answers the OpenAI wire format, so anything that already speaks it
-works by changing the base URL.
+Send a chat request:
 
 ```bash
-./lse-server -m mlx-community/Qwen3.8-27B-4bit --port 8080
-```
-
-For Qwen3.8-27B, a separate [Q8 MTP head](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-8bit)
-is about 451 MB and shares the target model's embeddings and output head:
-
-```bash
-./lse-server -m /path/to/qwen38-27b-q4 \
-  --mtp mlx-community/Qwen3.8-27B-MTP-8bit --mtp-depth 3 --port 8080
-```
-
-Depth 2 proposes two tokens and verifies them in a three-row target pass.
-A completion request can override the server depth with `"mtp_depth": 1` through
-`7`. `/health` reports `mtp_enabled` and the configured depth; response `timings`
-reports the depth used and the draft acceptance rate. A target checkpoint without
-an MTP head uses ordinary decoding unless `--mtp` supplies one.
-
-### DFlash2 block drafting
-
-DFlash2 is opt-in and replaces MTP for that server. It drafts seven proposals
-in an eight-position block. Each target pass checks the anchor and up to three
-proposals; rejected suffixes are discarded before the next draft:
-
-```bash
-./lse-server -m /path/to/qwen38-27b-q4 --pool hrx:0 --dialect loom \
-  --dflash2=on --dflash2-model /path/to/qwen38-27b-dflash2-q8 --port 8080
-```
-
-The Q8 drafter is about 2.045 GB. See [DFlash2](docs/DFLASH2.md) for its checkpoint,
-conversion command, and supported sampling behavior. `/health` reports
-`dflash2_enabled` and its depth; response `timings` identifies `spec_method`
-and reports compared and accepted proposals plus drafting and verification time.
-
-Thinking and function tools work through Chat Completions. See
-[pi and client configuration](docs/CHAT-COMPATIBILITY.md) for the provider setup,
-streaming fields, tool-result round trips, and supported API boundaries.
-
-### `lse-server` options
-
-| Option | Default | |
-|---|---|---|
-| `-m, --model NAME` | `$LSE_MODEL` | Checkpoint directory, `.safetensors`, or an HF repo id |
-| `--host ADDR` | `127.0.0.1` | Address to bind. `0.0.0.0` serves every interface, not just this machine |
-| `--port N` | 8080 | Port to bind |
-| `--api-key KEY` | none | Require `Authorization: Bearer KEY`. Without it every request is served unauthenticated |
-| `--served-name ID` | the model argument | Model id reported by `/v1/models` |
-| `--max-tokens N` | 4096 | Refuse requests asking for more |
-| `--mtp PATH` | beside the model | Multi-token-prediction module for speculative decoding |
-| `--mtp-depth N` | 3 | Draft proposals per verifier pass (1–7) |
-| `--no-mtp` | off | Decode one token per pass, ignoring any MTP module |
-| `--dflash2=on/off` | off | Use the DFlash2 block drafter instead of MTP |
-| `--dflash2-model PATH` | `incoai/Qwen3.8-27B-DFlash2` | Drafter checkpoint directory or HF repo id |
-| `--tokenizer REPO` | `Qwen/Qwen3.6-27B` | HF repo for `tokenizer.json` when the model directory has none |
-| `--kv-len N` | from the config | Allocate the KV cache for N tokens |
-| `--pool LIST` | `$LSE_POOL` | Device selection, for example `hrx:0` |
-| `--dialect NAME` | the device's choice | Kernel source dialect: `hip` or `loom` (not `hipc`) |
-
-Binding beyond localhost gives anyone who can reach the machine use of the
-GPU, so pair `--host 0.0.0.0` with `--api-key`:
-
-```bash
-./lse-server -m <model> --host 0.0.0.0 --api-key "$(openssl rand -hex 24)"
-```
-
-There is no rate limit and no per-client accounting, and generation is
-serialized, so `--max-tokens` is what stops one caller holding the device.
-
-| Endpoint | |
-|---|---|
-| `GET /health` | liveness |
-| `GET /v1/models`, `GET /v1/models/{id}` | the loaded model |
-| `POST /v1/chat/completions` | streaming and non-streaming |
-| `POST /v1/completions` | streaming and non-streaming |
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl -fsS http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":64}'
+  -d '{
+    "model": "qwen38-q4",
+    "messages": [{"role": "user", "content": "Say hello."}],
+    "enable_thinking": false,
+    "max_tokens": 64
+  }'
 ```
 
-Set `"stream": true` for server-sent events: an opening chunk carrying the
-assistant role, a chunk per delta, a final chunk with `finish_reason` and
-`usage`, then `data: [DONE]`.
+Press **Ctrl+C** in the server terminal to stop it.
+The default shutdown grace period is 30 seconds.
 
-Honoured: `messages` (string content or the array-of-parts form),
-`prompt`, `stream`, `max_tokens`, `max_completion_tokens`, `temperature`,
-`top_p`, `top_k`, `seed`, `frequency_penalty`, and `stop` as a string or an
-array. `n` must be 1. Prompts are framed as ChatML, which is what the models
-this engine targets are trained on, rather than evaluated from the
-checkpoint's own Jinja template.
+## Select a decoding mode
 
-Two places the wire format and this engine disagree, both resolved toward the
-wire so a client gets what the API promises:
+Stop the current server before you start another server on port 8080.
+Use a draft module that matches the target model.
 
-- `temperature` defaults to **1.0**, as the API specifies, not to the CLI's 0.8.
-- `frequency_penalty` is additive in the API and multiplicative here, so it is
-  mapped rather than passed through. 0 is off on both sides.
-
-Endpoints outside that set — `/v1/embeddings`, `/v1/responses`,
-`/v1/audio/*`, `/v1/images/*`, `/v1/moderations` — answer `501` naming
-themselves rather than `404`.
-
-One model on one device, so generation is serialized and concurrent requests
-queue. The engine decodes several sequences in one step; putting that behind
-the server is future work and does not change the wire format.
-
-## Requirements
-
-| | Version | Why |
+| Mode | Selection | Operation |
 |---|---|---|
-| **g++** | **16 or newer** | The host sources are C++26 and use P2996 static reflection. Kernel argument structs are reflected over to derive their ABI layout, so the tree does not compile without it. |
-| CMake | 3.24 or newer | |
-| Ninja | any | Generator used by the commands below |
-| cargo | any | Builds the `fastokens` FFI shim the tokenizer links |
-| ROCm | 7.x, with `amd_comgr` | HRX backend only. Supplies the compiler the JIT calls at runtime |
-| hrx-system | built and installed | HRX backend only |
-| fastokens | checked out beside the tree | Tokenizer only. A path dependency, see below |
+| Ordinary decoding | `--no-mtp` | The target model generates each next token. |
+| MTP | `--mtp PATH --mtp-depth 3` | The MTP module proposes three tokens. The target verifies them. |
+| DFlash2 | `--dflash2=on --dflash2-model PATH` | A separate draft model proposes tokens. The target verifies them. |
 
-Developed on Ubuntu 25.10 with g++ 16.2, CMake 3.31, Ninja 1.12, cargo 1.93 and
-ROCm 7.2.1. Older ROCm 7.x should work; ROCm 6 does not, because the backend
-needs `hsa_amd_vmem_address_reserve_align`.
+Speculative decoding speed depends on draft cost, verification cost, context length, and accepted proposals.
+A larger proposal count does not always increase speed.
 
-### Installing the toolchain
+### MTP with three proposals
 
-Ubuntu 25.10 carries g++-16 directly. On 24.04 it comes from the toolchain PPA:
+Use a matching Q8 MTP module. For Qwen3.8-27B, see
+[`mlx-community/Qwen3.8-27B-MTP-8bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-MTP-8bit).
 
 ```bash
-# Ubuntu 25.10 and newer
-sudo apt install g++-16 cmake ninja-build git curl pkg-config
-
-# Ubuntu 24.04
-sudo add-apt-repository ppa:ubuntu-toolchain-r/test
-sudo apt update && sudo apt install g++-16 cmake ninja-build git curl pkg-config
+"$LSE_BIN/lse-server" \
+  --model "$LSE_MODEL" \
+  --mtp /absolute/path/to/qwen38-27b-mtp-q8 \
+  --mtp-depth 3 \
+  --pool hrx:0 --dialect loom --kv-len 32768 \
+  --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```
 
-`cargo` from the distro is usually old enough to matter; rustup is the reliable
-route:
+MTP depth accepts values from 1 to 7. Its default is 3.
+A request can override this value with `"mtp_depth": 3`.
+Without `--no-mtp`, LSE can use an MTP module found beside the target model.
+
+### DFlash2 with a Q8 draft model
+
+Prepare the matching Q8 draft model with the [DFlash2 conversion instructions](docs/DFLASH2.md#reproduce-q8-conversion).
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-. "$HOME/.cargo/env"
+"$LSE_BIN/lse-server" \
+  --model "$LSE_MODEL" \
+  --dflash2=on \
+  --dflash2-model /absolute/path/to/qwen38-27b-dflash2-q8 \
+  --pool hrx:0 --dialect loom --kv-len 32768 \
+  --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```
 
-ROCm comes from AMD's repository, not the distro's:
+DFlash2 replaces MTP for this server process. It evaluates a draft block of eight positions.
+The default verifier checks the anchor token and up to three proposals.
+See [DFlash2](docs/DFLASH2.md) for model compatibility and sampling limits.
+
+## Connect a client
+
+Use these settings:
+
+| Setting | Value for the examples above |
+|---|---|
+| API | OpenAI-compatible Chat Completions |
+| Base URL | `http://127.0.0.1:8080/v1` |
+| Model ID | `qwen38-q4` |
+| API key | The key set with `--api-key`, if used |
+| Context limit | `32768`, to match `--kv-len` |
+
+Use the [pi setup guide](docs/CHAT-COMPATIBILITY.md#run-with-pi) for thinking controls and function tools.
+The [example pi configuration](docs/pi-models.example.json) contains the required provider fields.
+
+LSE returns reasoning in `reasoning_content` and function calls in `tool_calls`.
+The client executes tools and sends their results in the next request.
+Streaming responses use server-sent events. Set `"stream": true` to request them.
+
+| Endpoint | Support |
+|---|---|
+| `GET /health` | Server and speculation status |
+| `GET /v1/models`, `GET /v1/models/{id}` | Loaded model information |
+| `POST /v1/chat/completions` | Text chat, reasoning, tools, and streaming |
+| `POST /v1/completions` | Text completions and streaming |
+
+Current API limits:
+
+- The server runs one generation request at a time. Other requests wait.
+- `n` must be 1.
+- Image and video input are unavailable.
+- Strict JSON-schema generation is unavailable. Omit `strict` or set it to `false` for function tools.
+- The Responses, embeddings, audio, images, and moderation endpoints return HTTP 501.
+- `frequency_penalty` maps to a multiplicative repetition penalty. It does not use the exact OpenAI additive formula.
+
+For remote access, set `--host 0.0.0.0` and an API key.
+The server has no request rate limit or per-client accounting.
+See the [client compatibility guide](docs/CHAT-COMPATIBILITY.md) for complete behavior and test results.
+
+## Models and context
+
+| Registered architecture | Model families |
+|---|---|
+| `qwen3.5` | Dense Qwen3.5, Qwen3.6, and Qwen3.8 |
+| `qwen3.5-moe` | MoE models from these families |
+| `lemonseed` | LemonSeed models with Mixture-of-Depths |
+
+List the model architectures and local model cache:
 
 ```bash
-sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/amdrocm.gpg
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] \
-https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 noble main" \
-  | sudo tee /etc/apt/sources.list.d/rocm.list
-sudo apt update && sudo apt install rocm
-sudo usermod -aG render,video "$USER"   # log out and back in
+"$LSE_BIN/lse" --list-models
+"$LSE_BIN/lse" --list-cache
 ```
 
-Check it took with `rocminfo | grep gfx` -- the name it prints is the target
-this engine will compile kernels for.
+This build runs the text model. It does not run a checkpoint's vision tower.
+Q4, Q6, and Q8 refer to the stored weight format.
+Floating-point paths use FP32 accumulation. Integer dot products use INT32 accumulation before FP32 scale and bias operations.
 
-### The two checkouts that are not in this repo
+`--kv-len` sets the context limit. KV storage grows with use.
+A larger limit does not evaluate unused tokens. A longer active context increases attention work.
+Set the client context limit to the same value as the server limit.
 
-Both live under `reference/`, which is deliberately not tracked.
+The HTTP server can reuse an exact consumed prompt prefix for ordinary decoding and DFlash2.
+A changed prefix requires new prefill. MTP requests currently start with fresh model state.
 
-**fastokens** is a path dependency of `third_party/fastokens-ffi`, so the
-tokenizer does not build without it. **Configure fetches it for you** at the
-revision CI pins, into `reference/fastokens`; an existing checkout is left
-alone, whatever it is sitting on. Override with `-DLSE_FASTOKENS_REF` or
-`-DLSE_FASTOKENS_REPO`, or clone it yourself:
+## Measured performance
+
+**Prefill** processes input tokens. **Decode** generates output tokens.
+Both rates below use tokens per second.
+
+These measurements used an R9700 (`gfx1201`), a Qwen3.8-27B Q4 target, and Q8 draft modules.
+The prompt contained 1,024 tokens. Each request generated 64 tokens at temperature zero.
+The measurements exclude initial compilation and warmup.
+
+| Mode | Prefill | Decode |
+|---|---:|---:|
+| Ordinary Q4 | 466.26 | 24.20 |
+| MTP, three proposals | 467.20 | 36.53 |
+| DFlash2, three verified proposals | 471.47 | 38.23 |
+
+These measurements predate v0.4.6. They do not measure the release archive.
+See the [speculative decoding report](docs/benchmarks/speculative-decoding-2026-09-28.md) for the full method and results.
+
+Recent component results:
+
+- Flash12 attention GPU time decreased by 74.66% at 5,610 live keys and 59.72% at 14,000 keys.
+- Six attention kernels compiled in 71.54 seconds instead of 117.07 seconds with the macOS compiler change.
+- Both changes preserved the tested outputs. These component results do not establish the same improvement in total engine speed.
+
+See the [Flash12 report](docs/benchmarks/flash12-key-reuse-2026-09-28.md)
+and [long-context report](docs/benchmarks/long-context-http-2026-09-28.md).
+Model quality uses perplexity on 1,024–2,048 target tokens.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| The executable is missing | Linux programs are at the archive root. macOS launchers are in `bin/`. |
+| No HRX device appears | Check runtime libraries and driver status. On macOS, confirm that the DriverKit extension is active. |
+| The server reports CPU execution | Check `--devices`. Use `--pool hrx:0` after the GPU runtime can start. |
+| First requests are slow | Check kernel compilation counts. New model shapes and KV capacities can require new kernels. |
+| A later request has slow prefill | Check fresh prompt tokens and new compilation time. A request is not warm merely because it is second. |
+| macOS CPU use is near 100% | This can indicate one busy compiler thread. It does not, by itself, show CPU model execution. |
+| Long-context decode is slower | Compare the active token count, draft acceptance, and verification time with the benchmark workload. |
+| pi permits almost no output | Match the client context limit to `--kv-len`. See the pi guide for its output reservation. |
+| A client requests `/v1/responses` | Select its Chat Completions adapter. |
+
+HTTP response `timings` includes prefill, decode, compilation, and speculation statistics.
+The built-in dispatch profiler supports `LSE_PROFILE_DISPATCH=submit` and `LSE_PROFILE_DISPATCH=serial`.
+Serial mode waits after each dispatch and changes execution timing. Use ordinary execution for throughput measurements.
+
+Print the complete command options:
 
 ```bash
-git clone https://github.com/crusoecloud/fastokens.git reference/fastokens
-git -C reference/fastokens checkout 7973014e4f3a6028ac48f305704eacd64d0b4ef6
+"$LSE_BIN/lse-server" --help
+"$LSE_BIN/lse" --help
 ```
 
-**hrx-system** is the GPU backend, and there is a script for it:
+## Build from source
 
-```bash
-./scripts/bootstrap-hrx.sh          # ROCM_PATH, LSE_HRX_REPO, LSE_HRX_REF
-```
+Use [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for platform setup and CMake options.
+The main build requirements are:
 
-It checks out the revision this tree is tested against rather than whatever
-`main` is -- upstream moved 819 commits inside a fortnight -- and applies the
-patches in `patches/`, which are fixes we need and have sent upstream. Applying
-is idempotent, so a checkout that already carries them, or an upstream that has
-taken them, is left alone.
-
-It clones and builds, then prints the `-DLSE_HRX_ROOT` to configure with. This
-one is not folded into `configure` on purpose: it is an IREE-derived tree with
-its own build driver and it takes tens of minutes, which is not something a
-configure step should start on its own. To drive it by hand instead, follow its
-`BUILDING.md`:
-
-```bash
-git clone https://github.com/ROCm/hrx-system.git reference/hrx-system
-cd reference/hrx-system
-python dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH=/opt/rocm
-python dev.py cmake build
-```
-
-Without it the tree still builds and the tests still pass -- on the CPU
-backend, which is two orders of magnitude slower and is not what you want to
-measure anything on.
-
-**clang cannot build this tree.** P2996 reflection is enabled by `-freflection`,
-which the build applies only for GNU 16 and newer; on any other compiler the
-reflection headers stop with `no member named 'meta' in namespace 'std'`.
-CMake picks up `g++-16` from `PATH` on a fresh configure, but it does not
-override a compiler already cached in an existing build directory — pass
-`-DCMAKE_CXX_COMPILER=g++-16` if you are reconfiguring one, or check
-`build/CMakeCache.txt` if the reflection headers fail.
-
-Host code is C++26. Device code stays at C++20 so generated kernels do not
-depend on host-only language features.
-
-## Build
-
-Full build steps for both platforms are in **[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)**.
-The core library and CPU backend build with no GPU and no external packages; the
-HRX (GPU) backend needs the platform runtime. Quick build:
-
-```bash
-cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-      -DCMAKE_CXX_COMPILER=g++-16
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-`RelWithDebInfo` is what the numbers in this README were taken on; a `Debug`
-build is perhaps twenty times slower and will mislead you about everything.
-Enable the HRX backend with `-DLSE_HRX_ROOT=/path/to/hrx-install`; without a
-working HRX backend the engine falls back to the CPU backend (the same models,
-roughly two hundred times slower) and says so on the way past.
-
-### Options
-
-| Option | Default | Purpose |
+| Platform | Host compiler | Other tools |
 |---|---|---|
-| `LSE_ENABLE_HRX` | ON | Build the HRX backend |
-| `LSE_ENABLE_CPU` | ON | Build the CPU reference backend |
-| `LSE_BUILD_TESTS` | ON | Build the test suite |
-| `LSE_GPU_TARGETS` | `gfx1151;gfx1201;gfx942` | AOT kernel targets |
-| `LSE_ROCM_PATH` | `/opt/rocm` | ROCm root (Linux) |
-| `LSE_HRX_ROOT` | — | Path to a built `hrx-install` (enables GPU) |
-| `LSE_WERROR` | OFF | Warnings as errors |
-| `LSE_ASAN` | OFF | AddressSanitizer + UBSan |
+| Linux | GCC 16 or later, with C++26 reflection | CMake 3.24+, Ninja, Rust/Cargo, ROCm, HRX |
+| macOS | LLVM 21.1.8 and LLD 21.1.8 | Xcode command-line tools, CMake, Ninja, Rust/Cargo |
 
-## Current
+On Linux, `scripts/bootstrap-hrx.sh` builds the pinned HRX dependency.
+CMake obtains the pinned `fastokens` source when no checkout exists.
+On macOS, use the complete build script:
 
-**Compiler**
+```bash
+bash .github/scripts/build-macos.sh
+```
 
-- Tracing JIT: lazy tensor DAG, fusion-group partitioning, HIP emission,
-  `amd_comgr` compilation, disk cache, native-ABI dispatch with no HIP runtime.
-- Kernel IR with regions and typed SSA values, a verifier run after every pass,
-  and an iteration space whose dimensions carry their kind (parallel, reduction,
-  sequential).
-- Optimization passes: common subexpression elimination, dead code elimination,
-  and LDS folding — which collapses the identical shared-memory stagings of
-  fused siblings into one.
-- Sibling fusion, retained and replayed programs, and batched command buffers.
-- JIT cache keyed on group signature, target architecture, and the compiler's
-  own reported identity, so a toolchain change invalidates stale objects.
+That script builds the committed source and its pinned dependencies.
+Use `Release` or `RelWithDebInfo` for performance measurements.
 
-**Kernels**
+## Engine structure
 
-- Authored as ordinary C++ against a reflection-based surface — one body is
-  either executed on the host or recorded into device source, with argument
-  binding derived from struct layout.
-- Matrix-core descriptor table covering WMMA and MFMA across RDNA3/3.5, RDNA4
-  and CDNA3, keyed by target, accumulator, operand and shape. Adding an operand
-  family is a table row.
-- Weights are held and moved in the checkpoint's own format; conversion happens
-  inside the kernel at the register boundary. bf16 native, with Q8/Q6/Q4 block
-  codecs.
+LSE records tensor operations in a graph. The optimizer combines operations and selects supported kernel implementations.
+The compiler generates device code. HRX submits that code to the GPU.
+The disk cache checks device, compiler, and emitted-source identity before reuse.
 
-**Measurement and distribution**
+Architecture and shape policies are in these headers:
 
-- Device qualification probe: measured DRAM bandwidth, dispatch cost, and
-  matrix-core throughput per operand family, plus per-ordered-pair link latency
-  and bandwidth fitted separately. Every number carries its provenance.
-- Cost model answering throughput at a given queue depth, with split proportions
-  for uneven pools.
-- QuickReduce two-shot compressed all-reduce; execution-stream seam; loopback
-  transport exercising 2/4/8 ranks on one box.
-- CPU reference backend for numerics checking against every device kernel.
+- [Q4 and Q6 policies](include/lse/dispatch/quant_shapes.hpp)
+- [Q8 policies](include/lse/dispatch/q8_shapes.hpp)
+- [Attention policies](include/lse/dispatch/attention_shapes.hpp)
+- [Matrix instruction table](include/lse/math.hpp)
 
-**Model**
+The engine includes device probes, a cost model, tracing, and dispatch profiling.
+A device pool can discover multiple devices. Model execution currently uses one selected device.
+Multi-device model partitioning and continuous HTTP batching remain development work.
 
-- Gated DeltaNet, gated GQA with KV cache, sparse MoE (8 experts, top-2),
-  Mixture-of-Depths, chunked prefill, and device-side argmax.
+## More documentation
 
-## Upcoming
-
-- **Multi-device execution** — a pool opens, probes and reports every member
-  today, and a model still loads onto one of them. Splitting the work across
-  them, and choosing which split from the measured cost model rather than from
-  configuration, is the open half.
-- **Continuous batching** across sessions, which hides link latency behind queue
-  depth.
-- **Device-resident collectives** over a real peer path.
-- **Tracing seam** exporting Perfetto traces, with a rocprofiler adapter, so
-  engine spans and kernel traces share one timeline and one clock.
-- **Iteration-space windows** — fusion and sharding as one mechanism, where the
-  level of parallelism (data, expert, pipeline, tensor) is which dimension gets
-  split, derived from dimension kind, queue depth and measured link cost.
-- **Heterogeneous pools** — a device without fp8 matrix cores runs the fp16
-  route for the same operation and stays a full pool member, taking a smaller
-  share proportional to its measured throughput.
-- **Communication layer** — one asynchronous client/server API over TCP and
-  RDMA, with the transport hidden from callers.
-- **Batched serving** — the server's requests decoded together in one step
-  rather than queued, and `/v1/embeddings` once the engine exposes pooling.
-- **Multi-machine** — a control plane that ships IR rather than code objects, so
-  each peer compiles for its own architecture.
-- **Runtime-adaptive optimization** — variant tournaments judged on measured
-  time, with what was learned persisted so the next process starts tuned.
+| Topic | Document |
+|---|---|
+| Build and runtime setup | [Build instructions](BUILD_INSTRUCTIONS.md) |
+| Thinking, tools, pi, and API limits | [Client compatibility](docs/CHAT-COMPATIBILITY.md) |
+| DFlash2 model and Q8 conversion | [DFlash2](docs/DFLASH2.md) |
+| Q4 compute selection | [INT8 policy](docs/INT8_POLICY.md) |
+| Quantized weights and compute formats | [Quantized operands](docs/QUANT_OPERANDS.md) |
+| FP8 and BF8 conversion | [FP8 conversion](docs/FP8_CONVERSION.md) |
+| Measured optimization results | [Benchmark reports](docs/benchmarks/) |
 
 ## License
 
-MIT — see **[LICENSE.md](LICENSE.md)**.
+LSE uses the [MIT license](LICENSE.md).
