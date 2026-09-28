@@ -46,6 +46,8 @@ struct CaptureCompiler final : IKernelCompiler {
 struct CaptureDevice:backend::CpuBackend {
   unsigned launches=0;
   bool audit_ranges=false, overlapped=false;
+  std::vector<NodePtr> prebound_views;
+  bool saw_prebound_views=false;
   mutable CaptureEmitter emitter;
   mutable CaptureCompiler compiler;
   mutable KernelToolchain chain{Dialect::kLoom,&emitter,&compiler};
@@ -58,6 +60,12 @@ struct CaptureDevice:backend::CpuBackend {
   Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
                 const backend::DispatchArgs& args, const backend::DispatchTarget&) {
     ++launches;
+    if (!prebound_views.empty()) {
+      saw_prebound_views = std::all_of(
+          prebound_views.begin(), prebound_views.end(), [](const NodePtr& view) {
+            return view->buffer.valid() && !view->materialized;
+          });
+    }
     if (audit_ranges) {
       if (emitter.writes.size() != args.bindings.size())
         return LSE_ERROR(kInternal, "capture binding metadata mismatch");
@@ -239,6 +247,57 @@ LSE_TEST(device_view_validation_precedes_partition_and_launch) {
   LSE_EXPECT(evaluate(short_view).code() == StatusCode::kOutOfRange);
   LSE_EXPECT(!short_view.node()->materialized);
   LSE_EXPECT_EQ(backend.impl().launches, 0u);
+}
+
+
+LSE_TEST(prebound_reshape_roots_refresh_after_dispatch_and_replay) {
+  backend::BackendAdapter<CaptureDevice> backend;
+  check(backend.init(0));
+  Scheduler scheduler(backend);
+  scheduler.set_dialect(Dialect::kLoom);
+  auto allocation = backend.allocate(32 * sizeof(float),
+      backend::MemoryClass::kDevice, backend::kDefaultStream);
+  LSE_EXPECT(allocation.ok());
+  if (!allocation.ok()) return;
+  auto input = Array::from_buffer(allocation.release(), Shape{32}, DType::kF32);
+  auto producer = silu(input);
+  auto inner = reshape(producer, Shape{4, 8});
+  auto outer = reshape(inner, Shape{1, 4, 2, 4});
+  backend.impl().prebound_views = {inner.node(), outer.node()};
+  const NodePtr roots[] = {outer.node()};
+  Program retained;
+  auto expect_current_views = [&] {
+    const auto& owner = producer.node()->buffer;
+    LSE_EXPECT(producer.node()->materialized);
+    for (const auto& view : backend.impl().prebound_views) {
+      LSE_EXPECT(view->materialized && view->device_dirty && !view->host_dirty);
+      LSE_EXPECT_EQ(view->buffer.handle, owner.handle);
+      LSE_EXPECT_EQ(view->buffer.offset, owner.offset);
+      LSE_EXPECT_EQ(view->buffer.size_bytes, 32 * sizeof(float));
+      LSE_EXPECT(view->buffer.storage == owner.storage);
+    }
+    LSE_EXPECT(backend.impl().saw_prebound_views);
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 1u);
+  };
+  check(scheduler.eval(roots, false, &retained));
+  expect_current_views();
+  const auto old_handle = outer.node()->buffer.handle;
+  retained.reset_compute();
+  LSE_EXPECT(!inner.node()->materialized && !outer.node()->materialized);
+  auto replacement = backend.allocate(40 * sizeof(float),
+      backend::MemoryClass::kDevice, backend::kDefaultStream);
+  LSE_EXPECT(replacement.ok());
+  if (!replacement.ok()) return;
+  producer.node()->buffer = replacement.release();
+  producer.node()->buffer.offset = 3 * sizeof(float);
+  producer.node()->buffer.size_bytes = 32 * sizeof(float);
+  LSE_EXPECT(producer.node()->buffer.handle != old_handle);
+  backend.impl().saw_prebound_views = false;
+  check(scheduler.eval(roots, false, &retained));
+  LSE_EXPECT(scheduler.last_trace().replayed);
+  LSE_EXPECT_EQ(producer.node()->buffer.offset, 3 * sizeof(float));
+  expect_current_views();
 }
 
 LSE_TEST_MAIN()

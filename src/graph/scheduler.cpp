@@ -848,8 +848,8 @@ Status try_alias_group(const FusionGroup& group) {
     }
     const std::size_t bytes =
         dtype_storage_bytes(n->dtype, n->element_count());
-    if (bytes == 0) {
-      return LSE_ERROR(kUnimplemented, "view alias cannot size the window");
+    if (bytes == 0 || bytes > src.buffer.size_bytes) {
+      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
     }
     alias_onto(*n, src, view_of(src.buffer, 0, bytes), 0);
   }
@@ -862,7 +862,7 @@ void alias_ready_reshapes(const FusionGroup& group) {
     progressed = false;
     for (const NodePtr& n : group.nodes) {
       if (!n || n->kind != OpKind::kReshape || n->inputs.size() != 1) continue;
-      if (n->buffer.valid()) continue;
+      if (n->buffer.valid() && n->materialized) continue;
       const Node& src = *n->inputs[0];
       if (!src.materialized || !src.buffer.valid()) continue;
       if (src.dtype != n->dtype || src.element_count() != n->element_count()) {
@@ -870,7 +870,7 @@ void alias_ready_reshapes(const FusionGroup& group) {
       }
       const std::size_t bytes =
           dtype_storage_bytes(n->dtype, n->element_count());
-      if (bytes == 0) continue;
+      if (bytes == 0 || bytes > src.buffer.size_bytes) continue;
       alias_onto(*n, src, view_of(src.buffer, 0, bytes), 0);
       progressed = true;
     }
