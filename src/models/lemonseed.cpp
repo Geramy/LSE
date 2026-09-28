@@ -207,6 +207,7 @@ class GatedDeltaNet final : public IMixer {
     spec_.key_heads = spec_.value_heads = c.gdn_qk_heads;
     spec_.key_head_dim = spec_.value_head_dim = c.gdn_head_dim;
     spec_.norm_eps = c.rms_eps;
+    LSE_RETURN_IF_ERROR(ops::prepare_gated_delta_rate(w_, spec_));
     return OkStatus();
   }
 

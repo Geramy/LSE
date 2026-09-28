@@ -56,6 +56,7 @@ struct ShortTileRule {
   std::uint32_t min_rows, max_rows, capacity, query_tile;
 };
 inline constexpr std::array kShortTileRules{
+    ShortTileRule{4, 8, 8192, 4},
     ShortTileRule{4, 8, 16384, 4},
 };
 

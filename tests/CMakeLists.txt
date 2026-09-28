@@ -120,6 +120,8 @@ add_test(NAME test_server_shutdown COMMAND test_server_shutdown)
 set_tests_properties(test_server_shutdown PROPERTIES TIMEOUT 15)
 
 lse_add_test(test_model lse_model lse_backends)
+lse_add_test(test_gdn_rate lse_ops lse_kernels lse_backends)
+set_tests_properties(test_gdn_rate PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 lse_add_test(test_prefix_commit lse_model lse_backends)
 set_tests_properties(test_prefix_commit PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 lse_add_test(test_feature_taps lse_model lse_backends)

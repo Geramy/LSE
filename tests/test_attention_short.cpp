@@ -206,19 +206,22 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
         LSE_EXPECT(sliding == (causal && signed_distance < 7));
       }
 }
-LSE_TEST(short_split_long_tile_has_measured_scope_and_matching_lds_contract) {
-  for (int queries : {2, 3, 4, 5, 6, 7, 8})
-    for (int capacity : {8192, 8208, 16384}) {
+LSE_TEST(short_split_query_tile_has_measured_scope_and_matching_lds_contract) {
+  for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
+    for (int capacity : {1024, 2048, 4096, 8192, 8208, 16384, 32768}) {
       const auto tile = dispatch::attention_shapes::short_query_tile(
           static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
-      LSE_EXPECT_EQ(tile, capacity == 16384 && queries >= 4 ? 4u : 1u);
+      const bool measured = queries >= 4 && queries <= 8 &&
+                            (capacity == 8192 || capacity == 16384);
+      LSE_EXPECT_EQ(tile, measured ? 4u : 1u);
     }
-  for (unsigned lds : {512u, 2047u, 2048u}) {
-    Fixture fx(4, 16384);
-    fx.gpu.lds_bytes_per_workgroup = lds;
-    auto out = fx.split();
-    LSE_EXPECT(out.node()->prim->name() ==
-        (lds >= 2048u ? "attention.short_merge128.wg128c2.v1" : "attention"));
-  }
+  for (int capacity : {8192, 16384})
+    for (unsigned lds : {512u, 2047u, 2048u}) {
+      Fixture fx(4, capacity);
+      fx.gpu.lds_bytes_per_workgroup = lds;
+      auto out = fx.split();
+      LSE_EXPECT(out.node()->prim->name() ==
+          (lds >= 2048u ? "attention.short_merge128.wg128c2.v1" : "attention"));
+    }
 }
 LSE_TEST_MAIN()

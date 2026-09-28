@@ -78,7 +78,17 @@ struct GatedDeltaNetWeights {
   Array conv_w, conv_b;                                              // kFusedQKV
   Array a_log, dt_bias, norm;
   Array gate_proj, out_proj;
+  // Immutable FP32 parameter prepared from A_log with the selected decay rule.
+  // Empty keeps the public raw-A_log path.
+  Array prepared_rate;
+  DecayRate prepared_rate_decay = DecayRate::kSoftplusExpALog;
 };
+
+// Uses the same graph cast/exp/softplus operations as the raw path, then keeps
+// their materialized buffer as a leaf. A_log must remain immutable while the
+// prepared rate is used; prepare again after rebinding it.
+Status prepare_gated_delta_rate(GatedDeltaNetWeights& weights,
+                                const GatedDeltaNetSpec& spec);
 
 // Carried across decode steps; all empty on the first call.
 //

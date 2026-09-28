@@ -399,6 +399,7 @@ class Qwen35GatedDeltaNet final : public IMixer {
       sp.layout = ops::ProjLayout::kFusedQKV;
       sp.norm_eps = c.rms_eps;
       sp.zero_centered_norm = false;
+      LSE_RETURN_IF_ERROR(ops::prepare_gated_delta_rate(w, sp));
     }
     return OkStatus();
   }

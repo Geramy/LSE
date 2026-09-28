@@ -1,5 +1,7 @@
 #include "lse/ops/linear_attention.hpp"
 
+#include <utility>
+
 #include "lse/graph/ops.hpp"
 
 namespace lse::ops {
@@ -9,6 +11,18 @@ namespace {
 // beta off the 0/1 rails: a saturated beta drives the delta-rule gain up until
 // the recurrent state overflows to inf, then NaN.
 constexpr float kBetaFloor = 1e-4f;
+
+Array raw_rate(const Array& a_log, DecayRate decay) {
+  Array rate = graph::exp(graph::cast(a_log, DType::kF32));
+  return decay == DecayRate::kSoftplusExpALog ? graph::softplus(rate) : rate;
+}
+
+Status validate_rate_shape(const Array& rate, const GatedDeltaNetSpec& spec) {
+  const auto heads = spec.decay_per_value_head ? spec.value_heads : spec.key_heads;
+  if (!rate.valid() || heads <= 0 || rate.shape() != Shape{heads})
+    return LSE_ERROR(kInvalidArgument, "GDN rate must have one element per decay head");
+  return OkStatus();
+}
 
 // Runs the depthwise causal conv over x with `tail` standing in for the zero
 // pad, leaving `tail` holding the last kernel-1 inputs for the next call —
@@ -32,6 +46,28 @@ Array conv_stream(const Array& x, const Array& weight, const Array& bias,
 
 }  // namespace
 
+Status prepare_gated_delta_rate(GatedDeltaNetWeights& weights,
+                                const GatedDeltaNetSpec& spec) {
+  LSE_RETURN_IF_ERROR(validate_rate_shape(weights.a_log, spec));
+  if (spec.decay != DecayRate::kExpALog &&
+      spec.decay != DecayRate::kSoftplusExpALog)
+    return LSE_ERROR(kInvalidArgument, "unknown GDN decay rule");
+  Array rate = raw_rate(weights.a_log, spec.decay);
+  LSE_RETURN_IF_ERROR(rate.materialize());
+  const graph::Node& source = *rate.node();
+  if (!source.materialized || !source.buffer.valid() ||
+      source.buffer.size_bytes < dtype_storage_bytes(source.dtype, source.element_count()))
+    return LSE_ERROR(kInternal, "GDN rate preparation did not produce a buffer");
+  Array leaf = Array::from_buffer(source.buffer, source.shape, source.dtype);
+  leaf.node()->member = source.member;
+  leaf.node()->host_mirror = source.host_mirror;
+  leaf.node()->host_dirty = source.host_dirty;
+  leaf.node()->device_dirty = source.device_dirty;
+  weights.prepared_rate = std::move(leaf);
+  weights.prepared_rate_decay = spec.decay;
+  return OkStatus();
+}
+
 Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
                               const GatedDeltaNetSpec& spec,
                               GatedDeltaNetState* state) {
@@ -44,6 +80,16 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // dim, and graph::gated_delta_step allocates it square.
   if (spec.key_head_dim != spec.value_head_dim || spec.key_head_dim <= 0) {
     return LSE_ERROR(kInvalidArgument, "key and value head dims must match");
+  }
+
+  if (w.prepared_rate.valid()) {
+    LSE_RETURN_IF_ERROR(validate_rate_shape(w.prepared_rate, spec));
+    const graph::Node& rate = *w.prepared_rate.node();
+    if (w.prepared_rate_decay != spec.decay || rate.dtype != DType::kF32 ||
+        rate.kind != graph::OpKind::kBuffer || !rate.materialized ||
+        !rate.buffer.valid() || rate.buffer.size_bytes <
+            dtype_storage_bytes(DType::kF32, rate.element_count()))
+      return LSE_ERROR(kInvalidArgument, "GDN prepared rate does not match its decay rule");
   }
 
   const Shape& sx = x.shape();
@@ -93,12 +139,9 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // alpha = exp(-rate * softplus(a + dt_bias)) — the decay applied to the
   // recurrent state each step. The rate is where the two models part company.
   Array a = graph::linear(x, w.in_proj_a);
-  // Widened once, at the weight boundary: the decay multiplies the recurrent
-  // state on every step, so its error compounds without bound, and the
-  // delta-rule solve this feeds NaNs outright in bf16. `a + dt_bias` is a
-  // binary op and already promotes to f32; the exp chain would not.
-  Array rate = graph::exp(graph::cast(w.a_log, DType::kF32));
-  if (spec.decay == DecayRate::kSoftplusExpALog) rate = graph::softplus(rate);
+  // Decay stays FP32: its rounding error compounds in the recurrent state.
+  const Array rate = w.prepared_rate.valid() ? w.prepared_rate
+                                            : raw_rate(w.a_log, spec.decay);
   Array alpha =
       graph::exp(graph::neg(rate * graph::softplus(a + w.dt_bias)));
   Array beta = graph::clamp(graph::sigmoid(graph::linear(x, w.in_proj_b)),
