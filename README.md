@@ -61,6 +61,26 @@ tokens/s**; decode remains about **40.7 TPS**. Responses and sampling statistics
 match the control exactly. See
 [attention window results](docs/benchmarks/attention-causal-windows-2026-09-29.md).
 
+Cooperative activation staging for M1024 gate/up now reaches **568.03 prompt
+tokens/s**, versus **526.26** for its matched control. Decode remains **40.73 TPS**.
+Both responses and acceptance statistics match exactly. The change preserves
+the accepted M8 and M1024 down emitted kernels and launch plans. See
+[cooperative prefill results](docs/benchmarks/prefill-m1024-up-2026-09-29.md).
+
+A separate comparison uses one binary and the same 1024-token requests,
+temperature 0.6, BF16 KV and batch/ubatch 1024. Each mode starts with an empty
+private disk cache. The resident request reuses compiled code but no prompt KV.
+
+| Mode | Resident prompt tokens/s | Resident decode tokens/s | Acceptance |
+| --- | ---: | ---: | ---: |
+| Baseline | 572.30 | 24.79 | — |
+| MTP=3 | 560.78 | 48.93 | 80.70% |
+| DFlash2, seven proposals | 568.03 | 40.73 | 76.15% |
+
+These source changes follow published v0.4.13. The performance targets remain
+unmet. This coding request does not establish rates for long-context Pi chat.
+See [mode comparison and timing limits](docs/benchmarks/forward-modes-2026-09-29.md).
+
 ## v0.4.12: typed attention and automatic buffer views
 
 This version adds typed WMMA attention, cooperative single-token attention, and

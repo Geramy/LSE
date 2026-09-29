@@ -167,7 +167,11 @@ const math::MatrixCoreRow* q4_matrix_panel_row(const KernelShapes& s) {
        {"bits.f32", "value.f32", "wave.shfl_xor", "rint", "max", "abs"})
     if (s.intrinsics->find(symbol).empty()) return nullptr;
   if (!quant_shape_device(*rule, s.device->arch, s.device->wavefront_size) ||
-      s.device->max_threads_per_workgroup < rule->threads)
+      s.device->max_threads_per_workgroup < rule->threads ||
+      backend::workgroup_lds_bytes(s.device) <
+          rule->shared_words * sizeof(std::uint32_t))
+    return nullptr;
+  if (rule->shared_words && s.intrinsics->find("barrier").empty())
     return nullptr;
   const auto* row = matrix_row(s, math::MatrixElem::kI32, math::MatrixElem::kSU8);
   return row && row->chained == 1 ? row : nullptr;

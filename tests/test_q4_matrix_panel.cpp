@@ -138,8 +138,11 @@ struct Fixture {
   backend::DeviceInfo device;
   DialectSourceTable sources = backend::loom_sources();
   KernelShapes shapes;
-  explicit Fixture(std::int64_t rows = 8) {
-    inputs[0] = Shape{1, rows, 17408};
+  explicit Fixture(std::int64_t rows = 8, std::int64_t n = 5120,
+                   std::int64_t k = 17408) {
+    inputs[0] = Shape{1, rows, k};
+    inputs[1] = Shape{n, k / 8};
+    inputs[2] = inputs[3] = Shape{n, k / 64};
     inputs[4] = dispatch::q4_matrix_panel_storage_shape(inputs[0]);
     device.arch = "gfx1201";
     backend::apply_arch_defaults(device, amd);
@@ -147,7 +150,7 @@ struct Fixture {
     device.extension = &amd;
     shapes.inputs = inputs;
     shapes.input_dtypes = dtypes;
-    shapes.output = Shape{1, rows, 5120};
+    shapes.output = Shape{1, rows, n};
     shapes.iattrs = {4, 64, 0, 0};
     shapes.device = &device;
     shapes.intrinsics = &sources;
@@ -230,8 +233,16 @@ LSE_TEST(q4_matrix_panel_prefill_shape_and_temporary_slot_reuse) {
   workgroup.plan_slots(roots, launches);
   LSE_EXPECT_EQ(workgroup.slot_count(), 2u);
   LSE_EXPECT_EQ(workgroup.reused_slots(), 2u);
-  auto up = contraction(leaf({1, 1024, 5120}, DType::kF32), 17408, 5120);
-  LSE_EXPECT(up.node()->prim->name() != kConsumer);
+  auto x = leaf({1, 1024, 5120}, DType::kF32);
+  auto gate = contraction(x, 17408, 5120), up = contraction(x, 17408, 5120);
+  LSE_EXPECT(up.node()->prim->name() == kConsumer);
+  LSE_EXPECT(gate.node()->inputs[4] == up.node()->inputs[4]);
+  LSE_EXPECT(up.node()->inputs[4]->shape == Shape{16, 80, 1152});
+  LSE_EXPECT_EQ(up.node()->inputs[4]->element_count() * 4, 5898240u);
+  for (const auto m : {8, 512, 1023, 1025}) {
+    auto other = contraction(leaf({1, m, 5120}, DType::kF32), 17408, 5120);
+    LSE_EXPECT(other.node()->prim->name() != kConsumer);
+  }
 }
 LSE_TEST(q4_matrix_panel_dispatch_validates_geometry_capabilities_and_staging) {
   for (const auto rows : {8, 1024}) {
@@ -271,6 +282,53 @@ LSE_TEST(q4_matrix_panel_dispatch_validates_geometry_capabilities_and_staging) {
     unknown.shapes.intrinsics = nullptr;
     LSE_EXPECT(dispatch::q4_matrix_panel_row(unknown.original()) == nullptr);
   }
+}
+LSE_TEST(q4_matrix_panel_cooperative_up_requires_exact_shape_and_lds_capacity) {
+  Fixture f(1024, 17408, 5120);
+  LSE_EXPECT(dispatch::q4_matrix_panel_shape(f.original()));
+  LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) != nullptr);
+  LSE_EXPECT_EQ(dispatch::q4_matrix_panel_rule(f.original())->shared_words,
+                1152u);
+  for (const auto bytes : {0u, 4096u, 4607u}) {
+    f.device.lds_bytes_per_workgroup = bytes;
+    LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) == nullptr);
+  }
+  f.device.lds_bytes_per_workgroup = 4608;
+  LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) != nullptr);
+  for (const auto rows : {512, 1023, 1025}) {
+    Fixture other(rows, 17408, 5120);
+    LSE_EXPECT(!dispatch::q4_matrix_panel_shape(other.original()));
+  }
+  Fixture down(1024);
+  down.device.lds_bytes_per_workgroup = 0;
+  LSE_EXPECT(dispatch::q4_matrix_panel_row(down.original()) != nullptr);
+  LSE_EXPECT_EQ(dispatch::q4_matrix_panel_rule(down.original())->shared_words,
+                0u);
+}
+LSE_TEST(q4_matrix_panel_requires_barriers_only_for_shared_staging) {
+  Fixture up(1024, 17408, 5120);
+  const auto *matrix = dispatch::q4_matrix_panel_row(up.original());
+  LSE_EXPECT(matrix != nullptr);
+  if (!matrix)
+    return;
+  const std::array symbols{"bits.f32", "value.f32", "wave.shfl_xor",
+                           "rint", "max", "abs"};
+  std::vector<ir::PrimitiveSource> entries;
+  for (const auto symbol : symbols)
+    entries.push_back({symbol, up.sources.find(symbol)});
+  entries.push_back({matrix->key, up.sources.find(matrix->key)});
+  const auto barrier = up.sources.find("barrier");
+  LSE_EXPECT(!barrier.empty());
+  up.sources = DialectSourceTable(entries, ir::Dialect::kLoom);
+  LSE_EXPECT(dispatch::q4_matrix_panel_row(up.original()) == nullptr);
+  for (const auto rows : {8, 1024}) {
+    Fixture down(rows);
+    down.sources = DialectSourceTable(entries, ir::Dialect::kLoom);
+    LSE_EXPECT(dispatch::q4_matrix_panel_row(down.original()) != nullptr);
+  }
+  entries.push_back({"barrier", barrier});
+  up.sources = DialectSourceTable(entries, ir::Dialect::kLoom);
+  LSE_EXPECT(dispatch::q4_matrix_panel_row(up.original()) != nullptr);
 }
 LSE_TEST(q4_matrix_panel_typed_codec_pads_sixteen_rows_and_refreshes_replay) {
   auto *scheduler = default_scheduler();
@@ -316,34 +374,40 @@ LSE_TEST(
   if (!scheduler)
     return;
   scheduler->set_mode(Scheduler::Mode::kHostOnly);
-  auto data = activations(kWidth, 1024);
-  auto x = filled({1, 1024, 17408}, DType::kF32, data);
-  auto result = custom(kProducer, {x});
-  LSE_EXPECT(result.ok());
-  if (!result.ok())
-    return;
-  auto output = result.release();
-  LSE_EXPECT(output.shape() == Shape{16, 272, 1152});
-  const NodePtr roots[]{output.node()};
-  Program program;
-  LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
-  LSE_EXPECT(read<std::uint32_t>(output) == codec(data, kWidth, 1024));
-  std::fill(data.begin(), data.end(), 0.0f);
-  LSE_EXPECT_OK(scheduler->backend().copy(x.node()->buffer, data.data(),
-                                          data.size() * 4));
-  x.node()->host_dirty = false;
-  x.node()->device_dirty = true;
-  program.reset_compute();
-  LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
-  LSE_EXPECT(read<std::uint32_t>(output) ==
-             std::vector<std::uint32_t>(output.shape().elem_count()));
+  for (const auto width : {5120u, 17408u}) {
+    auto data = activations(width, 1024);
+    auto x = filled({1, 1024, width}, DType::kF32, data);
+    auto result = custom(kProducer, {x});
+    LSE_EXPECT(result.ok());
+    if (!result.ok())
+      return;
+    auto output = result.release();
+    LSE_EXPECT(output.shape() == Shape{16, width / 64, 1152});
+    const NodePtr roots[]{output.node()};
+    Program program;
+    LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
+    LSE_EXPECT(read<std::uint32_t>(output) == codec(data, width, 1024));
+    std::fill(data.begin(), data.end(), 0.0f);
+    LSE_EXPECT_OK(scheduler->backend().copy(x.node()->buffer, data.data(),
+                                            data.size() * 4));
+    x.node()->host_dirty = false;
+    x.node()->device_dirty = true;
+    program.reset_compute();
+    LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
+    LSE_EXPECT(read<std::uint32_t>(output) ==
+               std::vector<std::uint32_t>(output.shape().elem_count()));
+  }
 }
 LSE_TEST(
     q4_matrix_panel_emission_cache_and_declined_device_keep_original_body) {
-  for (const auto rows : {8, 1024}) {
-    auto output = contraction(leaf({1, rows, 17408}, DType::kF32), 5120, 17408);
+  for (const auto shape : {std::array<std::int64_t, 3>{8, 5120, 17408},
+                           std::array<std::int64_t, 3>{1024, 5120, 17408},
+                           std::array<std::int64_t, 3>{1024, 17408, 5120}}) {
+    const auto rows = shape[0], columns = shape[1], width = shape[2];
+    auto output =
+        contraction(leaf({1, rows, width}, DType::kF32), columns, width);
     const auto g = group(output);
-    Fixture f(rows);
+    Fixture f(rows, columns, width);
     const auto *kernel =
         dynamic_cast<const KernelPrimitiveBase *>(output.node()->prim);
     const auto *base = dynamic_cast<const KernelPrimitiveBase *>(
@@ -363,9 +427,12 @@ LSE_TEST(
       LSE_EXPECT(admitted.ok());
       if (!admitted.ok())
         continue;
-      LSE_EXPECT_EQ(admitted->lds_bytes, 0u);
+      LSE_EXPECT_EQ(admitted->lds_bytes, columns == 17408 ? 4608u : 0u);
       LSE_EXPECT_EQ(admitted->dims.workgroup_size[0], 256u);
-      LSE_EXPECT_EQ(admitted->dims.workgroup_count[0], rows == 8 ? 40u : 640u);
+      LSE_EXPECT_EQ(admitted->dims.workgroup_count[0], rows == 8 ? 40u
+                                                       : columns == 17408
+                                                           ? 2176u
+                                                           : 640u);
       const auto admitted_key = emitter->cache_key(g, f.device);
       f.amd.matrix_core = backend::MatrixCore::kNone;
       const auto declined_key = emitter->cache_key(g, f.device);
@@ -439,11 +506,12 @@ float weight_bias(std::size_t col, std::size_t group) {
       .to_float();
 }
 std::vector<float> reference(const std::vector<float> &x,
-                             std::size_t rows = kRows) {
+                             std::size_t rows = kRows,
+                             std::size_t width = kWidth) {
   std::vector<float> result(rows * kPeriod);
   for (std::size_t row = 0; row < rows; ++row)
-    for (std::size_t group = 0; group < kWidth / 64; ++group) {
-      const auto encoded = encode_group(x.data() + row * kWidth + group * 64);
+    for (std::size_t group = 0; group < width / 64; ++group) {
+      const auto encoded = encode_group(x.data() + row * width + group * 64);
       for (std::size_t col = 0; col < kPeriod; ++col) {
         std::int32_t dot = 0;
         for (std::size_t t = 0; t < 64; ++t)
@@ -456,34 +524,42 @@ std::vector<float> reference(const std::vector<float> &x,
     }
   return result;
 }
-int gpu_down(std::size_t rows = kRows) {
+int gpu_down(std::size_t rows = kRows, std::size_t columns = kColumns,
+             std::size_t width = kWidth) {
   auto *scheduler = default_scheduler();
   if (!scheduler)
     return 1;
   scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
   scheduler->set_dialect(Dialect::kLoom);
-  auto data = activations(kWidth, rows);
-  std::vector<std::uint32_t> weights(kColumns * kWidth / 8);
-  std::vector<bfloat16_t> scales(kColumns * kWidth / 64), biases(scales.size());
-  for (std::size_t col = 0; col < kColumns; ++col) {
-    for (std::size_t at = 0; at < kWidth; at += 8) {
+  auto data = activations(width, rows);
+  std::vector<std::uint32_t> weights(columns * width / 8);
+  std::vector<bfloat16_t> scales(columns * width / 64), biases(scales.size());
+  for (std::size_t col = 0; col < columns; ++col) {
+    for (std::size_t at = 0; at < width; at += 8) {
       std::uint32_t word = 0;
       for (std::size_t nibble = 0; nibble < 8; ++nibble)
         word |= static_cast<std::uint32_t>(
                     weight_code(col, at / 64, at % 64 + nibble))
                 << (nibble * 4);
-      weights[col * (kWidth / 8) + at / 8] = word;
+      weights[col * (width / 8) + at / 8] = word;
     }
-    for (std::size_t group = 0; group < kWidth / 64; ++group) {
-      scales[col * (kWidth / 64) + group] =
-          bfloat16_t(weight_scale(col, group));
-      biases[col * (kWidth / 64) + group] = bfloat16_t(weight_bias(col, group));
+    for (std::size_t group = 0; group < width / 64; ++group) {
+      scales[col * (width / 64) + group] = bfloat16_t(weight_scale(col, group));
+      biases[col * (width / 64) + group] = bfloat16_t(weight_bias(col, group));
     }
   }
-  auto x = leaf({1, static_cast<std::int64_t>(rows), 17408}, DType::kF32);
-  auto w = leaf({5120, 2176}, DType::kU32);
-  auto s = leaf({5120, 272}, DType::kBF16);
-  auto b = leaf({5120, 272}, DType::kBF16);
+  auto x = leaf(
+      {1, static_cast<std::int64_t>(rows), static_cast<std::int64_t>(width)},
+      DType::kF32);
+  auto w = leaf({static_cast<std::int64_t>(columns),
+                 static_cast<std::int64_t>(width / 8)},
+                DType::kU32);
+  auto s = leaf({static_cast<std::int64_t>(columns),
+                 static_cast<std::int64_t>(width / 64)},
+                DType::kBF16);
+  auto b = leaf({static_cast<std::int64_t>(columns),
+                 static_cast<std::int64_t>(width / 64)},
+                DType::kBF16);
   auto output = quant_linear(x, w, s, b, 4, 64);
   LSE_EXPECT(output.node()->prim->name() == kConsumer);
   const auto groups = Partitioner::partition(std::array{output.node()});
@@ -500,7 +576,7 @@ int gpu_down(std::size_t rows = kRows) {
                          bool readonly) {
     const auto bytes = dtype_storage_bytes(node->dtype, node->element_count());
     const auto extra = !readonly && node->dtype == DType::kF32
-                           ? std::min(rows, std::size_t{64}) * kColumns * 4
+                           ? std::min(rows, std::size_t{64}) * columns * 4
                            : 0;
     Allocation a{{},
                  std::vector<std::byte>(bytes + extra + 128, std::byte{0xa5}),
@@ -535,13 +611,13 @@ int gpu_down(std::size_t rows = kRows) {
   guard(b.node(), biases.data(), true);
   guard(output.node()->inputs[4], nullptr, false);
   guard(output.node(), nullptr, false);
-  const auto expected = reference(data, rows);
+  const auto expected = reference(data, rows, width);
   const auto check = [&](const std::vector<float> &actual,
                          const std::vector<float> *residual) {
     double maximum = 0;
     for (std::size_t row = 0; row < rows; ++row)
-      for (std::size_t col = 0; col < kColumns; ++col) {
-        const auto at = row * kColumns + col;
+      for (std::size_t col = 0; col < columns; ++col) {
+        const auto at = row * columns + col;
         const auto want = expected[row * kPeriod + col % kPeriod] +
                           (residual ? (*residual)[at] : 0.0f);
         LSE_EXPECT(std::isfinite(actual[at]));
@@ -590,11 +666,13 @@ int gpu_down(std::size_t rows = kRows) {
     LSE_EXPECT(std::memcmp(raw.data(), baseline.data(), raw.size() * 4) == 0);
   }
   LSE_EXPECT(read<std::uint32_t>(Array(output.node()->inputs[4])) ==
-             codec(data, kWidth, rows));
-  std::vector<float> residual(rows * kColumns);
+             codec(data, width, rows));
+  std::vector<float> residual(rows * columns);
   for (std::size_t i = 0; i < residual.size(); ++i)
     residual[i] = std::cos(static_cast<float>(i) * .091f) * .113f;
-  auto r = leaf({1, static_cast<std::int64_t>(rows), 5120}, DType::kF32);
+  auto r = leaf(
+      {1, static_cast<std::int64_t>(rows), static_cast<std::int64_t>(columns)},
+      DType::kF32);
   guard(r.node(), residual.data(), true);
   program.reset_compute();
   auto epilogue = add(output, r);
@@ -662,5 +740,7 @@ int main(int argc, char **argv) {
     return gpu_down();
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-down")
     return gpu_down(1024);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-up")
+    return gpu_down(1024, 17408, 5120);
   return lse::test::run_all();
 }

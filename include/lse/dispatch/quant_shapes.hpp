@@ -105,10 +105,12 @@ struct Q4MatrixPanelShape {
   std::uint32_t wave, bits, group, threads;
   std::int64_t m, n, k;
   std::uint32_t rows = 16;
+  std::uint32_t shared_words = 0;
 };
 inline constexpr std::array kQ4MatrixPanelShapes{
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 8, 5120, 17408},
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 5120, 17408, 64},
+    Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 17408, 5120, 64, 1152},
 };
 struct Q4MatrixPanelLayout {
   std::int64_t m, k;
@@ -117,6 +119,7 @@ struct Q4MatrixPanelLayout {
 inline constexpr std::array kQ4MatrixPanelLayouts{
     Q4MatrixPanelLayout{8, 0, 16},
     Q4MatrixPanelLayout{1024, 17408, 64},
+    Q4MatrixPanelLayout{1024, 5120, 64},
 };
 inline constexpr std::uint32_t kQ4MatrixPanelRows = 16;
 inline constexpr std::uint32_t kQ4MatrixPanelGroupWords = 288;

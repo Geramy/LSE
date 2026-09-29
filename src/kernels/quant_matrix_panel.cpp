@@ -10,6 +10,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 namespace lse::kernels {
@@ -340,6 +341,7 @@ std::string emit_matrix(const KernelShapes &s) {
   }
   return kb.str();
 }
+template <bool Cooperative>
 std::string emit_prefill_matrix(const KernelShapes &s) {
   using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
                             math::MatrixElem::kSU8, 16, 16, 16>;
@@ -356,12 +358,16 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
   constexpr std::uint32_t waves = kBlock / 32u;
   const auto tiles_n = (n + 15u) / 16u;
   const auto nblocks = (tiles_n + waves - 1u) / waves;
-  kir::KernelBody kb(s.types, *s.intrinsics, 0);
+  kir::KernelBody kb(s.types, *s.intrinsics,
+                     Cooperative ? backend::workgroup_lds_bytes(s.device) : 0);
   kb.set_store(s.store);
   MatrixArgs a;
   if (!env::bind(kb, a, s))
     return {};
   env::Emit e{&kb};
+  std::optional<kir::Tile<kir::u32>> cached_panel;
+  if constexpr (Cooperative)
+    cached_panel = e.lds<kir::u32>(1152u);
   const auto lid = e.let(math::local_id());
   const auto lane = e.let(lid % 32u);
   const auto lo = e.let(lane % 16u);
@@ -377,6 +383,19 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
   for (int z = 0; z < 4 * slots; ++z)
     out.push_back(e.var(0.0f));
   for (auto g : e.range(0u, groups, 1u)) {
+    std::optional<kir::Val<kir::u32>> group_base;
+    if constexpr (Cooperative) {
+      group_base = e.let((mblock * groups + g) * 1152u);
+      const auto copy_chunk = [&](std::uint32_t chunk) {
+        const auto at = e.let(lid * 4u + chunk * 1024u);
+        const auto packed = e.load(a.panel, e.let(*group_base + at), 16u);
+        kb.store_pack<kir::u32>(cached_panel->id(), at, packed, 16u);
+      };
+      copy_chunk(0u);
+      if (auto tail = e.when(lid < 32u))
+        copy_chunk(1u);
+      e.barrier();
+    }
     const auto sa = e.let(safe_col * groups + g);
     const auto scale = e.let(math::widen(a.scales[sa]));
     const auto bias = e.let(math::widen(a.biases[sa]));
@@ -397,15 +416,18 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
         bf[t][f] = expanded;
       }
     }
-    const auto group_base = e.let((mblock * groups + g) * 1152u);
+    if constexpr (!Cooperative)
+      group_base = e.let((mblock * groups + g) * 1152u);
     for (std::uint32_t i = 0; i < 4u; ++i) {
-      const auto block_base = e.let(group_base + i * 288u);
+      const auto block_base =
+          Cooperative ? e.let(e.u32(i * 288u)) : e.let(*group_base + i * 288u);
       const auto acc = e.local<kir::i32, slots>();
       for (int z = 0; z < slots; ++z)
         acc[z] = kir::cast<kir::i32>(e.u32(0));
       for (std::uint32_t t = 0; t < 4u; ++t) {
-        const auto av = e.load(
-            a.panel, e.let(block_base + t * 64u + hi * 32u + lo * 2u), 8u);
+        const auto index = e.let(block_base + t * 64u + hi * 32u + lo * 2u);
+        const auto av = Cooperative ? cached_panel->load(index, 8u)
+                                    : e.load(a.panel, index, 8u);
         const auto af = e.local<kir::u32, frag>();
         for (int f = 0; f < frag; ++f)
           af[f] = av[f];
@@ -414,7 +436,11 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
       std::vector<kir::Pack<kir::u32>> metadata;
       for (std::uint32_t z = 0; z < 8u; z += 2u)
         metadata.push_back(
-            e.load(a.panel, e.let(block_base + 256u + hi * 16u + z * 2u), 16u));
+            Cooperative
+                ? cached_panel->load(
+                      e.let(block_base + 256u + hi * 16u + z * 2u), 16u)
+                : e.load(a.panel, e.let(block_base + 256u + hi * 16u + z * 2u),
+                         16u));
       for (int z = 0; z < slots; ++z) {
         const auto step = e.let(math::from_bits<lse::f32>(
             metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
@@ -427,6 +453,8 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
                   bias * sum;
       }
     }
+    if constexpr (Cooperative)
+      e.barrier();
   }
   for (std::uint32_t i = 0; i < 4u; ++i)
     for (int z = 0; z < slots; ++z) {
@@ -437,7 +465,7 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
         e.store(output_row * n + col,
                 out[i * slots + static_cast<std::uint32_t>(z)].read());
     }
-  return kb.str();
+  return kb.lds().ok() ? kb.str() : std::string{};
 }
 struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
   static constexpr std::string_view kName = "quant_linear.q4_matrix_panel.v1";
@@ -464,7 +492,10 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     const auto original = original_shapes(s);
     if (dispatch::q4_matrix_panel_row(original)) {
       const auto *rule = dispatch::q4_matrix_panel_rule(original);
-      return rule->rows == kRows ? emit_matrix(s) : emit_prefill_matrix(s);
+      if (rule->rows == kRows)
+        return emit_matrix(s);
+      return rule->shared_words ? emit_prefill_matrix<true>(s)
+                                : emit_prefill_matrix<false>(s);
     }
     const auto *kernel = legacy(original);
     return kernel ? kernel->emit_kernel(original) : std::string{};
@@ -482,6 +513,7 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     tp.workgroup_size[0] = kBlock;
     const auto *rule = dispatch::q4_matrix_panel_rule(original);
     const auto m = static_cast<std::uint32_t>(rule->m);
+    tp.lds_bytes = rule->shared_words * sizeof(std::uint32_t);
     tp.workgroup_count[0] =
         ((m + rule->rows - 1u) / rule->rows) * ((n + 127u) / 128u);
     return tp;
