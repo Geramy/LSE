@@ -54,6 +54,38 @@ void baseline(const dispatch::QuantPlan& p) {
 }
 }
 
+LSE_TEST(quant_M8_rate_panel_is_shape_and_device_qualified) {
+  for (bool loom : {false, true}) {
+    Fixture f(8, 48, 5120, 4, loom);
+    f.inputs[0] = Shape{1, 8, 5120};
+    f.shapes.output = Shape{1, 8, 48};
+    LSE_EXPECT(f.plan().shared_activation_panel && f.plan().int8_activations);
+    LSE_EXPECT_EQ(dispatch::q4_shared_panel_rows(f.shapes), 8u);
+    LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(f.shapes), 1u);
+    LSE_EXPECT(!f.plan(true).shared_activation_panel);
+    f.shapes.staged.name = "owned_row";
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    f.shapes.staged.name = {};
+    f.device.arch = "gfx1100";
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    f.device.arch = "gfx1201";
+    f.device.wavefront_size = 64;
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    f.device.wavefront_size = 32;
+    f.device.max_threads_per_workgroup = 128;
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    f.device.max_threads_per_workgroup = 1024;
+    f.amd.has_dot4_iu8 = false;
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    f.amd.has_dot4_iu8 = true;
+    f.dtypes[2] = f.dtypes[3] = DType::kF32;
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    for (const auto m : {1, 4, 6, 7, 9})
+      LSE_EXPECT(!Fixture(m, 48, 5120, 4, loom).plan().shared_activation_panel);
+    LSE_EXPECT(!Fixture(8, 49, 5120, 4, loom).plan().shared_activation_panel);
+    LSE_EXPECT(!Fixture(8, 48, 6144, 4, loom).plan().shared_activation_panel);
+  }
+}
 LSE_TEST(quant_ffn_m512_uses_architecture_defaults) {
   for (bool loom : {false, true}) {
     for (int bits : {4, 6}) {

@@ -96,7 +96,7 @@ inline constexpr std::array kQ4PanelShapes{
     Q4PanelShape{8, 17408, 5120, 8, 4}, Q4PanelShape{8, 5120, 17408, 8, 2},
     Q4PanelShape{8, 10240, 5120, 8, 4}, Q4PanelShape{8, 6144, 5120, 8, 2},
     Q4PanelShape{8, 12288, 5120, 8}, Q4PanelShape{8, 5120, 6144, 8, 2},
-    Q4PanelShape{8, 248320, 5120, 8},
+    Q4PanelShape{8, 248320, 5120, 8}, Q4PanelShape{8, 48, 5120, 8},
 };
 
 

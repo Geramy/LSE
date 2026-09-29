@@ -10,6 +10,7 @@
 #include "lse/graph/program.hpp"
 #include "lse/kernels/lds_linear.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -229,6 +230,48 @@ LSE_TEST(q4_panel_M8_measured_projections_share_eight_row_panels) {
   }
   const auto unmeasured = contraction(x, 4096, 5120);
   LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+}
+LSE_TEST(q4_panel_M8_rate_projections_share_existing_GDN_source_panel) {
+  auto x = leaf({1, 8, 5120}, DType::kF32);
+  const auto qkv = contraction(x, 10240, 5120);
+  const auto a = contraction(x, 48, 5120);
+  const auto b = contraction(x, 48, 5120);
+  const auto gate = contraction(x, 6144, 5120);
+  const auto shared = qkv.node()->inputs.at(4);
+  for (const auto& y : {qkv, a, b, gate}) {
+    LSE_EXPECT_EQ(y.node()->inputs.size(), 5u);
+    LSE_EXPECT(y.node()->prim && y.node()->prim->name() == kConsumer);
+    LSE_EXPECT(y.node()->inputs[4] == shared);
+  }
+  LSE_EXPECT(shared->shape == Shape{8, 2000});
+  LSE_EXPECT(shared->inputs.size() == 1u && shared->inputs[0] == x.node());
+  LSE_EXPECT_EQ(shared->consumer_count, 4u);
+  const auto alpha = exp(neg(mul(leaf({48}, DType::kF32),
+                               softplus(add(a, leaf({48}, DType::kBF16))))));
+  const auto beta = clamp(sigmoid(b), 1e-4f, 1.0f - 1e-4f);
+  LSE_EXPECT(alpha.shape() == Shape{1, 8, 48});
+  LSE_EXPECT(beta.shape() == alpha.shape());
+  std::vector<NodePtr> visited;
+  std::size_t producers = 0;
+  const auto visit = [&](auto&& self, const NodePtr& node) -> void {
+    if (std::find(visited.begin(), visited.end(), node) != visited.end()) return;
+    visited.push_back(node);
+    if (node->prim && node->prim->name() == kProducer) ++producers;
+    for (const auto& input : node->inputs) self(self, input);
+  };
+  for (const auto& root : {qkv, alpha, beta, gate}) visit(visit, root.node());
+  LSE_EXPECT_EQ(producers, 1u);
+  auto clone = std::make_shared<Node>(*x.node());
+  const auto cloned = contraction(Array(clone), 48, 5120);
+  LSE_EXPECT(cloned.node()->inputs[4] != shared);
+  LSE_EXPECT(cloned.node()->inputs[4]->inputs[0] == clone);
+  for (const auto m : {1, 4, 6, 7, 9}) {
+    const auto unmeasured = contraction(leaf({1, m, 5120}, DType::kF32), 48, 5120);
+    LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
+  }
+  LSE_EXPECT_EQ(contraction(x, 49, 5120).node()->inputs.size(), 4u);
+  LSE_EXPECT_EQ(contraction(leaf({1, 8, 6144}, DType::kF32), 48, 6144)
+                    .node()->inputs.size(), 4u);
 }
 LSE_TEST(q4_panel_typed_host_codec_and_retained_replay_are_exact) {
   auto *scheduler = default_scheduler();
