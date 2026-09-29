@@ -458,7 +458,11 @@ Result<std::unique_ptr<DFlash2Module>> DFlash2Module::open(const std::string& pa
 std::span<const std::int32_t> DFlash2Module::target_layers() const noexcept { return impl_->config.target_layers; }
 std::uint32_t DFlash2Module::block_size() const noexcept { return impl_->config.block_size; }
 std::int32_t DFlash2Module::context_position() const noexcept { return impl_->position; }
-void DFlash2Module::reset() { impl_->position = 0; impl_->live = 0; }
+void DFlash2Module::reset() {
+  impl_->position = 0;
+  impl_->live = 0;
+  impl_->contexts.clear();
+}
 Status DFlash2Module::rewind(std::int32_t position) {
   if (position < 0 || position > impl_->position) return LSE_ERROR(kInvalidArgument, "invalid DFlash2 rewind position");
   const auto drop = impl_->position - position;

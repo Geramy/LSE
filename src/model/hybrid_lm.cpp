@@ -1186,6 +1186,42 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   return y;
 }
 
+Status HybridLM::retire_prefill(std::vector<MixerState>& states) {
+  const bool wide = std::any_of(caches_.begin(), caches_.end(),
+      [&](const ForwardCache& cache) {
+        return cache.states == &states && cache.t_key > 8 &&
+               !cache.retains_prefix_state;
+      });
+  if (!wide) return OkStatus();
+  for (const MixerState& state : states) {
+    for (const Array* value : {&state.gdn_state, &state.gdn_conv_q,
+                              &state.gdn_conv_k, &state.gdn_conv_v,
+                              &state.gdn_conv_qkv, &state.key_cache, &state.value_cache}) {
+      if (value->valid() && (!value->node()->materialized || !value->node()->buffer.valid()))
+        return LSE_ERROR(kInternal, "prefill retirement requires materialized state");
+    }
+  }
+  if (graph::Scheduler* scheduler = graph::default_scheduler()) {
+    LSE_RETURN_IF_ERROR(scheduler->release_program());
+  }
+  for (MixerState& state : states) {
+    detach_state(state.gdn_state);
+    detach_state(state.gdn_conv_q);
+    detach_state(state.gdn_conv_k);
+    detach_state(state.gdn_conv_v);
+    detach_state(state.gdn_conv_qkv);
+    if (!state.paged.valid()) {
+      detach_state(state.key_cache);
+      detach_state(state.value_cache);
+    }
+  }
+  for (ForwardCache& cache : caches_) cache = ForwardCache{};
+  next_cache_ = 0;
+  last_pass_id_ = 0;
+  last_pass_host_groups_ = 0;
+  return OkStatus();
+}
+
 Result<Array> HybridLM::lm_head(const Array& hidden_states) const {
   const Array& w =
       lm_head_weight_.valid() ? lm_head_weight_ : embed_weight_;

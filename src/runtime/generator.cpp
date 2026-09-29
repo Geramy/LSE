@@ -295,6 +295,7 @@ Result<std::vector<float>> Generator::step(
   std::vector<float> out(logits.shape().elem_count());
   LSE_RETURN_IF_ERROR(
       logits.to_host(out.data(), out.size() * sizeof(float)));
+  LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
   return out;
 }
 

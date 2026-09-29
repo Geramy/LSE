@@ -340,6 +340,7 @@ class Scheduler {
   Status drain();
   // Frees the pointer tables of finished passes; drains the devices first.
   Status release_phase_tables();
+  Status release_program();
   Status eval(std::span<const NodePtr> roots, bool pull_host = true);
   // When `plan` is set, replay and retain write that Program instead of the
   // scheduler's leftover one. Same-root reuse is how decode avoids rebuild.

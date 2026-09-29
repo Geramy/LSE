@@ -527,4 +527,45 @@ LSE_TEST(view_replay_preserves_previously_materialized_producer_boundaries) {
   for (float value : view_read(view)) LSE_EXPECT_EQ(value, -7.25f);
 }
 
+
+namespace {
+class FailingAllocationCpu : public backend::CpuBackend {
+ public:
+  Result<backend::DeviceBuffer> allocate(std::size_t bytes,
+      backend::MemoryClass cls, backend::Stream stream) {
+    if (++attempts == 2) return LSE_ERROR(kOutOfMemory, "injected allocation failure");
+    return backend::CpuBackend::allocate(bytes, cls, stream);
+  }
+  Result<std::size_t> sample_free_memory() const { return std::size_t{4096}; }
+  int attempts = 0;
+};
+}
+
+LSE_TEST(slot_allocation_failure_keeps_original_status_and_size_context) {
+  backend::BackendAdapter<FailingAllocationCpu> backend;
+  LSE_EXPECT_OK(backend.init(0));
+  AllocationTestKernel ordinary;
+  auto input = Array::full({4}, DType::kF32, 0).node();
+  auto first = make_test_node(&ordinary, {4}, {input});
+  auto second = make_test_node(&ordinary, {8}, {first});
+  Workgroup workgroup;
+  LSE_EXPECT(workgroup.try_add(first));
+  LSE_EXPECT(workgroup.try_add(second));
+  const NodePtr roots[]{first, second};
+  const std::vector<NodePtr> order{first, second};
+  workgroup.plan_slots(roots, separate_launches(order));
+  const auto failed = workgroup.bind_slots(backend);
+  LSE_EXPECT(!failed.ok());
+  LSE_EXPECT(failed.code() == StatusCode::kOutOfMemory);
+  LSE_EXPECT(failed.message().find("32 bytes") != std::string::npos);
+  LSE_EXPECT(failed.message().find("available 4096") != std::string::npos);
+  LSE_EXPECT(failed.message().find("injected allocation failure") != std::string::npos);
+  LSE_EXPECT_EQ(backend.impl().attempts, 2);
+  LSE_EXPECT(!first->buffer.valid() && !second->buffer.valid());
+  LSE_EXPECT_OK(workgroup.bind_slots(backend));
+  LSE_EXPECT_EQ(backend.impl().attempts, 3);
+  LSE_EXPECT(first->buffer.valid() && second->buffer.valid());
+  LSE_EXPECT(first->buffer.storage != second->buffer.storage);
+}
+
 LSE_TEST_MAIN()

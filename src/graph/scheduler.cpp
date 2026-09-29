@@ -925,6 +925,12 @@ Status Scheduler::release_phase_tables() {
   return OkStatus();
 }
 
+Status Scheduler::release_program() {
+  LSE_RETURN_IF_ERROR(drain());
+  impl_->program.destroy();
+  return release_phase_tables();
+}
+
 Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host) {
   return eval(roots, pull_host, nullptr);
 }
@@ -1377,10 +1383,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       }
       const backend::Stream wg_stream =
           devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
-      if (wg.bind_slots(devices_.device(wg_member), wg_stream).ok()) {
-        trace_.slots_reused += wg.reused_slots();
-        trace_.slots_allocated += wg.slot_count();
-      }
+      LSE_RETURN_IF_ERROR(wg.bind_slots(devices_.device(wg_member), wg_stream));
+      trace_.slots_reused += wg.reused_slots();
+      trace_.slots_allocated += wg.slot_count();
     }
   }
 

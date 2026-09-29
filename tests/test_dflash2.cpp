@@ -813,7 +813,7 @@ LSE_TEST(dflash2_generator_unrelated_prefix_coldstarts_retained_request) {
     LSE_EXPECT(output.ok()); if (!output.ok()) return;
   }
   expect_retained_dflash(fixture, session, 5);
-  const std::vector<std::uint32_t> unrelated{7, 6, 5, 4, 3, 2, 1};
+  const std::vector<std::uint32_t> unrelated{7, 6, 5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3};
   runtime::Generator next(*fixture.target, greedy_sampling());
   next.use_dflash2(*fixture.draft);
   const auto output = next.generate(session, unrelated, limits);
@@ -822,7 +822,7 @@ LSE_TEST(dflash2_generator_unrelated_prefix_coldstarts_retained_request) {
   auto expected_history = unrelated;
   expected_history.insert(expected_history.end(), output->begin(), output->end());
   LSE_EXPECT(session.history() == expected_history);
-  expect_retained_dflash(fixture, session, 10);
+  expect_retained_dflash(fixture, session, 20);
 
   Fixture cold;
   const auto cold_opened = cold.open(FixtureWeights::kConstantTokens);
@@ -835,6 +835,38 @@ LSE_TEST(dflash2_generator_unrelated_prefix_coldstarts_retained_request) {
   LSE_EXPECT(*output == *expected_output);
   LSE_EXPECT(fresh.history() == session.history());
   expect_retained_dflash(cold, fresh, session.position());
+}
+LSE_TEST(prefill_retirement_releases_graph_owners_and_preserves_session_state) {
+  Fixture fixture;
+  const auto opened = fixture.open(FixtureWeights::kDefault, 8);
+  LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+  auto states = fixture.target->make_states();
+  std::weak_ptr<graph::Node> held;
+  {
+    auto input = filled({1, 16}, std::vector<float>(16, 1.0f));
+    auto hidden = fixture.target->hidden(input, &states, nullptr);
+    LSE_EXPECT(hidden.ok()); if (!hidden.ok()) return;
+    held = hidden->node();
+    auto logits = fixture.target->lm_head(*hidden);
+    LSE_EXPECT(logits.ok()); if (!logits.ok()) return;
+    const auto values = read(*logits);
+    LSE_EXPECT_EQ(values.size(), 16u * 16u);
+  }
+  LSE_EXPECT(!held.expired());
+  std::vector<backend::DeviceBuffer> storage;
+  for (const auto& state : states) storage.push_back(state.gdn_state.node()->buffer);
+  LSE_EXPECT_OK(fixture.target->retire_prefill(states));
+  LSE_EXPECT(held.expired());
+  for (std::size_t i = 0; i < states.size(); ++i) {
+    LSE_EXPECT_EQ(states[i].position, 16);
+    LSE_EXPECT(states[i].gdn_state.node()->buffer.storage == storage[i].storage);
+    LSE_EXPECT(states[i].gdn_state.node()->materialized);
+  }
+  auto next = fixture.target->hidden(filled({1, 8}, std::vector<float>(8, 2.0f)),
+                                   &states, nullptr);
+  LSE_EXPECT(next.ok()); if (!next.ok()) return;
+  LSE_EXPECT_EQ(states[0].position, 24);
+  LSE_EXPECT_EQ(read(*next).size(), 8u * 8u);
 }
 #endif
 

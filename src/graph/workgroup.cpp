@@ -652,7 +652,13 @@ Status Workgroup::bind_slots(backend::IBackend& backend,
     // stream is what places the bytes, and the default stream put every
     // member's phase activations in the primary's VRAM.
     auto buf = backend.allocate(s.bytes, backend::MemoryClass::kDevice, stream);
-    if (!buf.ok()) return buf.status();
+    if (!buf.ok()) {
+      const auto available = backend.sample_free_memory();
+      return Status(buf.status().code(), detail::concat(
+          "workgroup slot allocation (", std::to_string(s.bytes), " bytes; available ",
+          available.ok() ? std::to_string(*available) : "unknown", "): ",
+          buf.status().message()));
+    }
     s.buffer = buf.release();
   }
   for (const auto& [node, id] : slot_of_) {

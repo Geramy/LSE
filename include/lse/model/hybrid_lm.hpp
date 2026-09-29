@@ -170,6 +170,7 @@ class HybridLM {
 
   // Commit valid input rows from the latest retained verifier, without its FFNs.
   Status commit_prefix(std::vector<MixerState>& states, std::size_t rows);
+  Status retire_prefill(std::vector<MixerState>& states);
 
   // [.., D] -> [.., vocab]. Applied to only the positions a caller needs: at
   // long context the full [B,T,vocab] tensor does not fit.
