@@ -60,7 +60,7 @@ lengths and acceptance counters. Reserved VRAM increases only 12.14 MB across
 those eight turns (28.2432 to 28.2554 GB). Aggregate decode rate over the matched
 472 timed tokens is 42.89 tok/s for control and 42.94 tok/s for the final build.
 
-The saved KanaMobile failure has not been replayed. Replaying that private
+The reported allocation failure has not been replayed. Replaying that private
 session requires user approval. The synthetic test establishes excess workspace
 reservation and its reduction; it does not prove that every cause of the
 reported 31.11 GB allocation failure has been removed.

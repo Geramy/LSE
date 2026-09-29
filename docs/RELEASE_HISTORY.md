@@ -3,6 +3,21 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.17: completed prefill workspace retirement
+
+This release fixes overlapping target activation workspaces when ragged prefill
+changes chunk width, and retires completed verifier graphs before a new request.
+DFlash2 retains one wide context program during prefill and releases completed
+wide programs afterward. Narrow decode replay, live state, KV and compiled
+kernels remain available.
+
+The matched 6143-token request reduces reserved VRAM from 29.77 to 28.26 GB.
+Output and acceptance results match exactly. Prefill and decode rates differ
+by less than 0.5% in that comparison. Eight cached follow-ups also preserve
+output, acceptance and prefix reuse, with only 12.14 MB reserved-memory growth.
+The reported allocation failure has not yet been replayed. See
+[the memory report](benchmarks/prefill-workspace-memory-2026-09-29.md).
+
 ## Development: full-width DFlash2
 
 The current development build verifies all seven proposals from the block-8
