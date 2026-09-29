@@ -298,3 +298,116 @@ The actual Pi workload has not established 451 prompt tokens/s or 46–48 decode
 tokens/s. Cold compilation, steady GPU execution and speculative acceptance
 are separate measured costs. Short warmed synthetic tests must not be presented
 as the performance of this conversation workload.
+
+## Compare decoding modes on the Pi requests
+
+The following runs use released source `85d1293`, server SHA-256
+`f37492b16ae84fe74aef24e8c40e321f8bca2f5854d4978972bdd035b45b1b50`,
+and the same mapped HSA library identified above. Each process starts with an
+empty disk kernel cache. Both turns use FP32 KV and the model defaults:
+temperature 1, top-k 20, and top-p 0.95. The first prompt has 5,207 tokens.
+
+| Mode | First prompt, tokens/s | First decode, tokens/s | Follow-up decode, tokens/s | Follow-up prefill, s |
+| --- | ---: | ---: | ---: | ---: |
+| Plain Q4 | 319.56 | 12.91 | 12.70 | 0.761 |
+| Q4 with Q8 MTP, depth 3 | 294.51 | 30.83 | 29.36 | 14.247 |
+| Q4 with Q8 DFlash2, depth 3 | 310.72 | 28.59 | 34.03 | 0.747 |
+
+MTP and DFlash produce identical first responses and receive identical second
+requests. Their second responses differ. Generated counts for the two turns
+are 107/291 for plain decoding, 103/264 for MTP, and 103/160 for DFlash.
+Decode rates exclude the first generated token and all prefill time.
+
+MTP reprocesses all 5,333 prompt tokens on the second turn. The HTTP server
+restarts the MTP session unconditionally. DFlash reuses 5,310 tokens and processes
+23 new tokens. Removing the restart requires retaining verified target state,
+synchronizing the MTP cache, and preserving the target hidden row used to start
+the next suffix.
+
+The older approximately 24 tokens/s plain result used a warmed 1,024-token,
+greedy workload. It is not a matched comparison with these sampled Pi requests.
+These Pi measurements do not establish 46–48 tokens/s.
+
+### Single-token attention cost
+
+A separate first-turn plain-decode diagnostic uses the same source, binary,
+HSA library and request, with submit profiling, passive GPU timestamps and CPU
+samples. It records 191,891 compute dispatches, 255 distinct compiled entries,
+and 19.028 s of summed GPU execution. There are no host kernel groups or CPU
+fallbacks. Diagnostic wall timing is excluded from the throughput table above.
+
+Single-token split attention is limited to a capacity of 4,096 keys in this
+release. The Pi request has a physical capacity of 8,192 keys and therefore
+selects the monolithic shared-exponential attention implementation. Its entry
+is `lse_loom_7398005682657427028`, with 24 workgroups of 256 threads.
+
+The entry consumes 4,086.030 ms over 1,712 dispatches. Across the 16 attention
+layers, this is **38.187 ms per target step**. The 107 target steps include one
+at the end of prefill and 106 in timed decode. The uninstrumented first-turn
+plain decode spends approximately 77.5 ms per timed token overall.
+
+Of 2,596 decode stack samples, 92.6% are inside HSA completion waits and none
+are inside compilation. These waits include pending GPU execution. They do not
+measure avoidable CPU sleep. The attention timestamps identify a specific GPU
+cost that accounts for nearly half the plain per-token duration.
+
+## Remove monolithic single-token attention and retain MTP sessions
+
+The single-token shared and shared-exponential implementations, their dispatch
+entries, and the unused legacy split implementation are deleted. Single-token
+attention now uses the existing 128-key partial kernel and a merge with
+lane-strided partition initialization. Shape admission checks actual buffer
+indices and device LDS limits instead of the old 4K context cutoff. At a
+262,144-key capacity, merge storage is 8 KiB LDS; it is not private scratch.
+The short-query verifier implementations retain their selection and arithmetic.
+
+MTP now commits only verified target inputs when generation stops. It aligns
+its own attention cache with verified target hidden/token pairs and retains an
+owned copy of the last target hidden row for the next request. Prefix reuse
+also checks the module revision. A mismatched prompt or module still starts a
+fresh session.
+
+The candidate server SHA-256 is
+`1e18ecddb4c26ab3b938542a1f1e9bd515941d258b10e7426dbc9da0333868a9`.
+It uses the same mapped HSA library, FP32 KV, sampling defaults and cache policy
+as the released-source comparison above.
+
+| Mode | First prompt, tokens/s | First decode, tokens/s | Follow-up decode, tokens/s | Follow-up prefill, s |
+| --- | ---: | ---: | ---: | ---: |
+| Plain Q4 | 318.42 | 19.71 | 19.72 | 0.729 |
+| Q4 with Q8 MTP, depth 3 | 293.95 | 32.68 | 31.90 | 0.709 |
+| Q4 with Q8 DFlash2, depth 3 | 291.75 | 27.97 | 35.26 | 0.738 |
+
+MTP and DFlash produce identical responses on both candidate turns (103 and
+199 generated tokens). MTP reuses 5,310 tokens and processes only 23 new tokens
+on the second request, reducing its prefill from 14.247 s to 0.709 s.
+End-of-request MTP cache alignment is included in draft and decode timing.
+
+The first MTP response, 38 verifier steps and 65/86 accepted/tested proposals
+match the prior run. Its draft time falls from 1,078.777 to 930.787 ms; verifier
+time remains approximately 2,175 ms. The first DFlash response is also unchanged,
+but its measured rate falls from 28.59 to 27.97 tokens/s in this individual pair.
+No DFlash first-turn speedup is claimed.
+
+Plain decoding produces 66/176 tokens instead of 107/291. Its initial request
+is identical, but its sampled responses and therefore its second request differ.
+The new split reduction can change floating-point rounding. The rate increase
+from 12.91/12.70 to 19.71/19.72 tokens/s is a workload observation, not an
+exact-output comparison. The MTP/DFlash follow-up outputs also differ from the
+released-source runs. No result establishes 46–48 tokens/s or context-independent
+prefill throughput.
+
+### Verification
+
+- All eight focused host suites pass after running the local HTTP shutdown test
+  with permission to bind a port. Runtime tests pass 74 cases and skip six
+  device-only cases under the CPU backend. All 13 new MTP state cases pass.
+- The isolated native split fixture passes 18 cases across capacities 16, 512,
+  8,192, 16,384, 32,768 and 262,144, including causal and sliding masks, poisoned
+  padding, read-only inputs, and replay after poisoning the retained output.
+  The largest tables contain 513 live keys; they validate partition bounds,
+  not full 262K-context throughput. The Pi HTTP runs exercise over 5K live keys.
+- Native attention agrees with an independent FP64 component reference within
+  2e-6 absolute error. This is a kernel correctness check, not an L2 logits or
+  model-quality test. All three HTTP runs record zero host groups and fallbacks.
+- No additional perplexity run was performed.

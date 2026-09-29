@@ -1,71 +1,41 @@
-### Pi chat: shorter compilation stalls
+### Removed monolithic decode attention
 
-Measured on macOS with an AMD R9700 (`gfx1201`), native HRX/Loom, the mapped HSA
-runtime, Qwen Q4 weights, Q8 DFlash2, depth 3, and FP32 KV storage. Sampling uses
-temperature 1, top-k 20 and top-p 0.95. Each process starts with an empty disk
-kernel cache. Both turns run in the same process.
+The old single-token attention implementation and its dispatch entries are
+removed. Split attention now covers long tables subject to actual index and LDS
+limits. Native boundary checks include a 262,144-key capacity with 8 KiB merge
+LDS; this is not a full 262K-context throughput result.
 
-| Measurement | Earlier baseline | Compiler fixes |
-| --- | ---: | ---: |
-| First prefill, 5,207 tokens | 91.53 s | **16.88 s** |
-| First prefill rate | 56.89 tokens/s | **308.54 tokens/s** |
-| Follow-up prefill, 23 new tokens | 16.14 s | **0.76 s** |
-| Total kernel compilation | 92.91 s | **3.35 s** |
-| Unique compilations | 427 | **372** |
-| First decode | 26.64 tokens/s | **27.11 tokens/s** |
-| Follow-up decode | 31.34 tokens/s | **31.28 tokens/s** |
+### MTP prompt reuse
 
-Both responses and acceptance counts match exactly. These are individual paired
-workload measurements; prompt timing excludes model loading. The changes reduce
-compilation stalls. They do not establish a steady decode speedup or 46–48
-tokens/s on Pi chat. See the [CPU/GPU profile and verification report](https://github.com/Geramy/LSE/blob/master/docs/benchmarks/pi-execution-profile-2026-09-28.md).
+MTP preserves verified target state, aligns its draft cache, and keeps an owned
+last target hidden row between requests. On the two-turn Pi workload, follow-up
+prefill falls from **14.247 s to 0.709 s**: 5,310 tokens reused, 23 new tokens.
 
-The compiler shares code only when complete generated bodies match. Attention
-page traversal remains a device loop. Invocation bindings, device ownership,
-launch metadata and optimizer measurements remain distinct.
+Measured on macOS/R9700 gfx1201 with Qwen Q4, Q8 draft weights, FP32 KV,
+temperature 1, top-k 20 and top-p 0.95. Each process starts with an empty kernel
+cache. The first prompt has 5,207 tokens.
 
-A subsequent DFlash buffer-view fix removes repeated traversal of materialized
-feature graphs, 65 copy dispatches and three compiled kernels. The same two
-responses remain exact. That pair measures 309.10 prompt tokens/s and
-27.20 / 32.13 decode tokens/s. This small decode change is not a statistical
-speedup claim.
+| Mode | First prompt tokens/s | First decode tokens/s | Follow-up decode tokens/s |
+| --- | ---: | ---: | ---: |
+| Plain Q4 | 318.42 | 19.71 | 19.72 |
+| MTP=3 | 293.95 | 32.68 | 31.90 |
+| DFlash2, depth 3 | 291.75 | 27.97 | 35.26 |
 
-### Optional KV storage
+MTP and DFlash produce identical responses in both candidate turns. MTP first
+response and acceptance counts match the previous build. Plain responses and
+speculative follow-up responses changed from the previous build, so those rate
+comparisons are not exact-output comparisons. DFlash first-turn rate was 28.59
+before this change; this pair does not establish an improvement there.
+The higher 46–48 tokens/s target remains unmet on these Pi requests.
 
-`--kv-cache-dtype` accepts `fp32`, `fp16`, `bf16`, `fp8` and `bf8`. FP32 remains
-the default. Target and MTP paged caches use the selected format; the DFlash2
-private ring remains FP32. FP16 halves paged KV storage and selects matrix
-attention on supported gfx1201 shapes. Floating-point accumulation stays FP32.
+All 13 new MTP state tests and 18 native attention boundary cases pass. The
+three HTTP runs use zero CPU fallback groups. No new perplexity run was needed.
+See the [profile, measurements and limits](https://github.com/Geramy/LSE/blob/master/docs/benchmarks/pi-execution-profile-2026-09-28.md).
 
-One paired check with 1,024 scored target tokens measured perplexity **4.9049**
-for FP32 and **4.9014** for FP16 plus matrix attention. BF16 and the 8-bit formats
-have component validation; this model comparison covers FP16. See [KV formats](https://github.com/Geramy/LSE/blob/master/docs/KV_CACHE.md).
+### Packages
 
-### macOS runtime
-
-The macOS archive bundles the mapped-transfer HSA update. Its launcher selects
-the bundled runtime; no `DYLD_LIBRARY_PATH` setting is required. The activated
-MacAMDGPU DriverKit extension is still required and is installed separately.
-The Linux archive uses the installed ROCm/HRX runtime.
-
-### Scratch allocation detection
-
-The optimizer retains fixed private-memory allocation and distinguishes it from
-LDS and confirmed register spills. The native resource reader now handles all
-32-bit unsigned encodings. Cached metadata is refreshed without recompiling
-existing kernels. Submit/serial profiling reports affected active kernels.
-Fusion comparisons can refuse measured scratch regressions when a legal
-alternative is known. Current Loom kernels receive detection and resource
-reporting; automatic selection of new Loom alternatives is not claimed.
-
-### Faster M4 Q4 loads
-
-The shape table now pairs adjacent activation loads for three measured M4
-projections. Complete preparation-plus-consumer GPU time falls 19–31%, with
-exact outputs and zero private scratch. The slower down-projection experiment
-was rejected. The final matched Pi pair measures **310.72 prompt tokens/s** and
-**28.59 / 34.03 decode tokens/s**, versus 309.10 and 27.20 / 32.13 immediately
-before this change. Responses and proposal counts match exactly, and compilation
-count stays at 369. This is a single paired HTTP observation, not a guarantee
-for other prompts or context lengths. All 369 active kernels report zero fixed
-private scratch; allocator spill counts are unreported and remain unknown.
+Linux x86_64 uses the installed ROCm/HRX runtime. The macOS arm64 archive bundles
+HSA, HRX and Loom; its launcher selects those libraries without a
+`DYLD_LIBRARY_PATH` override. The activated MacAMDGPU driver is installed
+separately. FP32 remains the default KV format; optional FP16/BF16/FP8/BF8 storage
+and the existing kernel cache remain available.

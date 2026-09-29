@@ -22,6 +22,21 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
+## v0.4.11: split decode attention and MTP prompt reuse
+
+The monolithic single-token attention kernel is removed. Split attention now
+covers long contexts without the old 4K capacity cutoff. On the recorded Pi
+requests, plain decode measured **19.71 / 19.72 tokens/s**, compared with
+12.91 / 12.70 before the change. The sampled responses changed.
+
+MTP now retains verified state between requests. Follow-up prefill fell from
+**14.25 s to 0.71 s**, with 5,310 cached tokens and 23 new tokens. Current decode
+measures **32.68 / 31.90 tokens/s with MTP=3** and **27.97 / 35.26 tokens/s with
+DFlash2**. The two modes produced identical responses in these candidate runs.
+First prompt rates were **293.95 and 291.75 tokens/s**, respectively.
+These are individual Pi workload measurements, not a 46–48 tokens/s guarantee.
+See the [methods and limits](docs/benchmarks/pi-execution-profile-2026-09-28.md#remove-monolithic-single-token-attention-and-retain-mtp-sessions).
+
 ## v0.4.10: shorter compilation stalls and optional KV formats
 
 Identical Loom kernel bodies now share compiled code. Attention page traversal
@@ -96,7 +111,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.10`.
+The examples below use `v0.4.11`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -105,7 +120,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.10
+   lse_tag=v0.4.11
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -138,7 +153,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.10
+   lse_tag=v0.4.11
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
