@@ -1928,6 +1928,145 @@ LSE_TEST(q4_mtp_rows_match_a_scalar_reference_on_device) {
   }
 }
 
+LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
+  auto* scheduler = graph::default_scheduler();
+  LSE_EXPECT(scheduler != nullptr);
+  if (!scheduler) return;
+  if (!scheduler->backend().emitter()) LSE_SKIP("requires native attention dispatch");
+  struct RestoreMode {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode mode;
+    ~RestoreMode() { scheduler.set_mode(mode); }
+  } restore{*scheduler, scheduler->mode()};
+  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  auto& backend = scheduler->backend();
+  const auto& device = backend.device_info();
+  constexpr int batch = 3, heads = 2, dim = 256, block = 16;
+  const float poison = std::numeric_limits<float>::quiet_NaN();
+  auto read = [&](graph::Array array) { return read_all(array); };
+  auto rewrite = [&](const graph::Array& array, const std::vector<float>& values) {
+    auto& node = *array.node();
+    for (std::size_t i = 0; i < values.size(); ++i)
+      graph::interpreter::store_element(node, i, values[i]);
+    LSE_EXPECT_OK(graph::interpreter::sync_to_device(node, backend));
+  };
+  for (int capacity : {16, 512, 8192, 16384, 32768, 262144}) {
+    const int live = std::min(capacity, 513);
+    const int lengths[]{live, std::max(1, live / 2), 0};
+    const int blocks = (live + block - 1) / block;
+    const int pool_blocks = 2 * blocks + 1, stride = capacity / block;
+    std::vector<float> query(batch * heads * dim), keys(pool_blocks * block * dim, poison);
+    std::vector<float> values(keys.size(), poison), table(batch * stride, 999999.0f);
+    for (std::size_t i = 0; i < query.size(); ++i) query[i] = noise(i + 137) * .25f;
+    std::fill(query.begin() + 2 * heads * dim, query.end(), poison);
+    for (int row = 0; row < 2; ++row) {
+      for (int bi = 0; bi < blocks; ++bi)
+        table[row * stride + bi] = static_cast<float>(1 + row * blocks + blocks - bi - 1);
+      for (int key = 0; key < lengths[row]; ++key) {
+        const int physical = static_cast<int>(table[row * stride + key / block]);
+        for (int d = 0; d < dim; ++d) {
+          const auto address = static_cast<std::size_t>((physical * block + key % block) * dim + d);
+          keys[address] = noise(address + 3101) * .25f;
+          values[address] = noise(address + 7103) * .25f;
+        }
+      }
+    }
+    auto q = filled(Shape{batch, heads, 1, dim}, query);
+    auto k = filled(Shape{pool_blocks, 1, block, dim}, keys);
+    auto v = filled(k.shape(), values);
+    auto t = filled(Shape{batch, stride}, table);
+    std::vector<float> metadata{static_cast<float>(live - 1), static_cast<float>(capacity + 17), 2,
+                               static_cast<float>(live - 1), static_cast<float>(lengths[0]),
+                               static_cast<float>(lengths[1] - 1), static_cast<float>(lengths[1]), 0, 0};
+    auto meta = filled(Shape{kv::step_meta_elems(batch)}, metadata);
+    for (const auto [mask, window] : {
+         std::pair{graph::MaskKind::kCausal, 0},
+         std::pair{graph::MaskKind::kSlidingWindow, 7},
+         std::pair{graph::MaskKind::kSlidingWindow, 0}}) {
+      auto out = graph::sdpa_paged(q, k, v, .0625f, mask, window, meta, t, block, &device);
+      LSE_EXPECT(out.node()->prim->name() == "attention.decode_merge128.wg128c2.v3");
+      if (out.node()->prim->name() != "attention.decode_merge128.wg128c2.v3") return;
+      auto partial = graph::Array(out.node()->inputs[0]);
+      graph::Program program;
+      const graph::NodePtr roots[]{out.node()};
+      const auto status = scheduler->eval(roots, false, &program);
+      LSE_EXPECT_OK(status);
+      if (!status.ok()) return;
+      const auto trace = scheduler->last_trace();
+      LSE_EXPECT_EQ(trace.device_groups, 2u);
+      LSE_EXPECT_EQ(trace.host_groups, 0u);
+      LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+      LSE_EXPECT_EQ(program.groups().size(), 2u);
+      const auto actual = read(out);
+      LSE_EXPECT_EQ(actual.size(), query.size());
+      if (actual.size() != query.size()) return;
+      double max_abs = 0;
+      for (int row = 0; row < batch; ++row) {
+        for (int h = 0; h < heads; ++h) {
+          const int offset = row < 2 ? lengths[row] - 1 : 0;
+          std::vector<double> score(static_cast<std::size_t>(lengths[row]),
+                                    -std::numeric_limits<double>::infinity());
+          double maximum = -std::numeric_limits<double>::infinity();
+          for (int key = 0; key < lengths[row]; ++key) {
+            if (mask == graph::MaskKind::kSlidingWindow && offset - key >= window) continue;
+            double dot = 0;
+            const int physical = static_cast<int>(table[row * stride + key / block]);
+            const auto base = static_cast<std::size_t>((physical * block + key % block) * dim);
+            for (int d = 0; d < dim; ++d)
+              dot += static_cast<double>(query[(row * heads + h) * dim + d]) * keys[base + d];
+            score[key] = dot * .0625;
+            maximum = std::max(maximum, score[key]);
+          }
+          std::vector<double> numerator(dim, 0);
+          double denominator = 0;
+          for (int key = 0; key < lengths[row]; ++key) {
+            if (!std::isfinite(score[key])) continue;
+            const auto weight = std::exp(score[key] - maximum);
+            denominator += weight;
+            const int physical = static_cast<int>(table[row * stride + key / block]);
+            const auto base = static_cast<std::size_t>((physical * block + key % block) * dim);
+            for (int d = 0; d < dim; ++d) numerator[d] += weight * values[base + d];
+          }
+          for (int d = 0; d < dim; ++d) {
+            const auto expected = denominator > 0 ? numerator[d] / denominator : 0;
+            const auto got = actual[(row * heads + h) * dim + d];
+            LSE_EXPECT(std::isfinite(got));
+            max_abs = std::max(max_abs, std::abs(static_cast<double>(got) - expected));
+          }
+        }
+      }
+      LSE_EXPECT(max_abs < 2e-6);
+      const auto q_after = read(q), k_after = read(k), v_after = read(v), t_after = read(t);
+      LSE_EXPECT(q_after.size() == query.size() && std::memcmp(q_after.data(), query.data(), query.size() * sizeof(float)) == 0);
+      LSE_EXPECT(k_after.size() == keys.size() && std::memcmp(k_after.data(), keys.data(), keys.size() * sizeof(float)) == 0);
+      LSE_EXPECT(v_after.size() == values.size() && std::memcmp(v_after.data(), values.data(), values.size() * sizeof(float)) == 0);
+      LSE_EXPECT(t_after.size() == table.size() && std::memcmp(t_after.data(), table.data(), table.size() * sizeof(float)) == 0);
+
+      // Poison retained output slots, then replay with no live rows. Every
+      // partition must overwrite its complete record before the merge reads it.
+      rewrite(partial, std::vector<float>(partial.shape().elem_count(), poison));
+      rewrite(out, std::vector<float>(out.shape().elem_count(), poison));
+      rewrite(meta, std::vector<float>(metadata.size(), 0));
+      program.reset_compute();
+      const auto replay = scheduler->eval(roots, false, &program);
+      LSE_EXPECT_OK(replay);
+      if (!replay.ok()) return;
+      const auto empty = read(out), records = read(partial);
+      for (float value : empty) LSE_EXPECT_EQ(value, 0.0f);
+      LSE_EXPECT_EQ(records.size(), partial.shape().elem_count());
+      for (std::size_t at = 0; at < records.size(); at += 258) {
+        LSE_EXPECT(std::isinf(records[at]) && records[at] < 0);
+        for (std::size_t field = 1; field < 258; ++field) LSE_EXPECT_EQ(records[at + field], 0.0f);
+      }
+      LSE_EXPECT_EQ(scheduler->last_trace().host_groups, 0u);
+      LSE_EXPECT_EQ(scheduler->last_trace().host_fallbacks, 0u);
+      rewrite(meta, metadata);
+      std::printf("       split T1 capacity=%d live=%d mask=%d window=%d max_abs=%.3e device=2 host=0 fallback=0 empty-replay=pass\n",
+                  capacity, live, static_cast<int>(mask), window, max_abs);
+    }
+  }
+}
+
 LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {
   graph::Scheduler* sched = graph::default_scheduler();
   LSE_EXPECT(sched != nullptr);
@@ -3319,18 +3458,24 @@ struct MtpFixture {
 MtpFixture build_mtp_fixture(bool passthrough = false,
                              std::int32_t gdn_head_dim = 16,
                              bool recurrent_only = false,
-                             std::int32_t kv_length = 64) {
+                             std::int32_t kv_length = 64,
+                             bool attention_only = false,
+                             bool transitions = false) {
   MtpFixture fx;
   fx.config = mtp_test_config(gdn_head_dim);
   fx.config.kv_length = kv_length;
   if (recurrent_only) fx.config.full_attention_interval = fx.config.num_layers + 1;
+  if (attention_only) fx.config.full_attention_interval = 1;
+  if (transitions) fx.config.tie_word_embeddings = false;
   const std::int64_t h = fx.config.hidden_size;
   std::error_code ec;
   const std::filesystem::path base =
       std::filesystem::temp_directory_path() /
       (passthrough ? "lse-mtp-fixture-pt"
                    : "lse-mtp-fixture-" + std::to_string(gdn_head_dim) +
-                         (recurrent_only ? "-recurrent" : ""));
+                         (recurrent_only ? "-recurrent" : "") +
+                         (attention_only ? "-attention" : "") +
+                         (transitions ? "-transitions" : ""));
   std::filesystem::create_directories(base / "mtp", ec);
   fx.module_dir = (base / "mtp").string();
 
@@ -3341,6 +3486,15 @@ MtpFixture build_mtp_fixture(bool passthrough = false,
   // the model rather than of the rounding.
   const auto parent = [&](const std::string& name, std::size_t i) {
     const std::size_t width = static_cast<std::size_t>(h);
+    if (transitions) {
+      const auto row = i / width, col = i % width;
+      if (name == "language_model.model.embed_tokens.weight")
+        return row < width && col == row ? 1.0f : 0.0f;
+      if (name == "language_model.lm_head.weight")
+        return row < width && col == (row + width - 1) % width ? 1.0f : 0.0f;
+      if (name.find("norm") != std::string::npos) return 1.0f;
+      return 0.0f;
+    }
     float v = filler(i);
     if (name == "language_model.model.embed_tokens.weight" &&
         i % width == (i / width) % width) {
@@ -3349,12 +3503,13 @@ MtpFixture build_mtp_fixture(bool passthrough = false,
     return v;
   };
   const auto module = [&](const std::string& name, std::size_t i) {
-    if (!passthrough) return filler(i);
+    if (!passthrough && !transitions) return filler(i);
     if (name == "fc.weight") {
       const std::size_t width = 2 * static_cast<std::size_t>(h);
       const std::size_t row = i / width;
       const std::size_t col = i % width;
-      return col == static_cast<std::size_t>(h) + row ? 1.0f : 0.0f;
+      const auto half = transitions && !passthrough ? 0 : static_cast<std::size_t>(h);
+      return col == half + row ? 1.0f : 0.0f;
     }
     if (name.find(".weight") != std::string::npos &&
         name.find("norm") != std::string::npos) {
@@ -3363,8 +3518,10 @@ MtpFixture build_mtp_fixture(bool passthrough = false,
     return 0.0f;
   };
 
-  write_shaped(base / "model.safetensors", qwen_dense_tensors(fx.config),
-               parent);
+  auto target_tensors = qwen_dense_tensors(fx.config);
+  if (transitions)
+    target_tensors.push_back({"language_model.lm_head.weight", {fx.config.vocab_size, h}});
+  write_shaped(base / "model.safetensors", target_tensors, parent);
   write_shaped(base / "mtp" / "model.safetensors", mtp_tensors(fx.config),
                module);
   {
@@ -3375,7 +3532,9 @@ MtpFixture build_mtp_fixture(bool passthrough = false,
   auto st = model::SafeTensors::open((base / "model.safetensors").string());
   if (!st.ok()) return fx;
   fx.weights = st.release();
-  auto built = model::build_model(fx.config, fx.weights);
+  // The attention-only fixture deliberately lacks the hybrid GDN marker.
+  auto built = model::build_model(fx.config, fx.weights,
+                                 attention_only ? "qwen3.5" : "");
   if (!built.ok()) return fx;
   fx.lm = built.release();
   model::WeightBinder binder(fx.weights);
@@ -3771,6 +3930,235 @@ LSE_TEST(generation_timing_excludes_prefill_token_and_early_stop) {
     LSE_EXPECT_EQ(cancelled.stats().decode_ns, 0u);
     LSE_EXPECT_EQ(cancelled.stats().decode_tokens_per_second(), 0.0);
   }
+}
+
+namespace {
+void expect_mtp_resident(const MtpFixture& fixture, Session& session,
+                         std::int32_t covered) {
+  LSE_EXPECT_EQ(session.position(), covered);
+  LSE_EXPECT_EQ(fixture.mtp->position(), covered);
+  LSE_EXPECT(session.mtp_context_matches(*fixture.mtp));
+  LSE_EXPECT(session.mtp_tail().valid());
+  LSE_EXPECT(session.history().size() == static_cast<std::size_t>(covered) ||
+             session.history().size() == static_cast<std::size_t>(covered + 1));
+  for (const auto& state : session.states())
+    LSE_EXPECT_EQ(state.position, covered);
+}
+
+void mtp_terminal_next_request(bool rejected, std::int32_t max_tokens,
+                              std::size_t cancel_after, std::uint32_t stop) {
+  auto fixture = build_mtp_fixture(rejected, 16, false, 256, true, true);
+  LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
+  Session session("mtp-resident", fixture.lm->state_slots());
+  GenerationLimits limits;
+  limits.max_tokens = max_tokens;
+  if (stop != std::numeric_limits<std::uint32_t>::max()) limits.stop_tokens = {stop};
+  std::vector<std::uint32_t> delivered;
+  {
+    Generator first(*fixture.lm, greedy_params());
+    first.use_mtp(*fixture.mtp);
+    auto result = first.generate(session, {2, 3}, limits, [&](std::uint32_t token) {
+      delivered.push_back(token);
+      return cancel_after == 0 || delivered.size() < cancel_after;
+    });
+    LSE_EXPECT(result.ok()); if (!result.ok()) { LSE_EXPECT_OK(result.status()); return; }
+    LSE_EXPECT(*result == delivered);
+    if (rejected && delivered.size() >= 3)
+      LSE_EXPECT(first.stats().spec_tested > first.stats().spec_accepted);
+    if (!rejected && delivered.size() >= 5) LSE_EXPECT(first.stats().spec_accepted > 0);
+  }
+  std::vector<std::uint32_t> expected;
+  for (std::uint32_t token = 4; expected.size() < static_cast<std::size_t>(max_tokens); ++token) {
+    if (token == stop) break;
+    expected.push_back(token);
+    if (cancel_after != 0 && expected.size() == cancel_after) break;
+  }
+  LSE_EXPECT(delivered == expected);
+  const auto covered = 2 + static_cast<std::int32_t>(delivered.size()) -
+      (stop == 4 + delivered.size() ? 0 : delivered.empty() ? 0 : 1);
+  expect_mtp_resident(fixture, session, covered);
+
+  auto prompt = session.history();
+  prompt.insert(prompt.end(), {9, 10});
+  GenerationLimits next_limits;
+  next_limits.max_tokens = 4;
+  std::vector<std::uint32_t> warm;
+  {
+    Generator next(*fixture.lm, greedy_params());
+    next.use_mtp(*fixture.mtp);
+    auto result = next.generate(session, prompt, next_limits);
+    LSE_EXPECT(result.ok()); if (!result.ok()) { LSE_EXPECT_OK(result.status()); return; }
+    warm = *result;
+    LSE_EXPECT_EQ(next.stats().prompt_tokens, static_cast<std::int32_t>(prompt.size()) - covered);
+  }
+  expect_mtp_resident(fixture, session, static_cast<std::int32_t>(prompt.size()) + 3);
+  auto cold = build_mtp_fixture(rejected, 16, false, 256, true, true);
+  LSE_EXPECT(cold.ok); if (!cold.ok) return;
+  Session fresh("mtp-cold", cold.lm->state_slots());
+  Generator next(*cold.lm, greedy_params());
+  next.use_mtp(*cold.mtp);
+  auto result = next.generate(fresh, prompt, next_limits);
+  LSE_EXPECT(result.ok()); if (!result.ok()) { LSE_EXPECT_OK(result.status()); return; }
+  LSE_EXPECT(*result == warm);
+  LSE_EXPECT(fresh.history() == session.history());
+}
+}
+
+LSE_TEST(mtp_next_request_reuses_full_acceptance_prefix) {
+  mtp_terminal_next_request(false, 7, 0, std::numeric_limits<std::uint32_t>::max());
+}
+LSE_TEST(mtp_next_request_reuses_rejected_prefix) {
+  mtp_terminal_next_request(true, 7, 0, std::numeric_limits<std::uint32_t>::max());
+}
+LSE_TEST(mtp_next_request_reuses_one_terminal_row_after_cancel) {
+  mtp_terminal_next_request(false, 7, 2, std::numeric_limits<std::uint32_t>::max());
+}
+LSE_TEST(mtp_next_request_reuses_two_terminal_rows_after_cancel) {
+  mtp_terminal_next_request(false, 7, 3, std::numeric_limits<std::uint32_t>::max());
+}
+LSE_TEST(mtp_next_request_reuses_first_token_cancellation) {
+  mtp_terminal_next_request(false, 7, 1, std::numeric_limits<std::uint32_t>::max());
+}
+LSE_TEST(mtp_next_request_reuses_prefill_stop) {
+  mtp_terminal_next_request(false, 7, 0, 4);
+}
+LSE_TEST(mtp_next_request_reuses_stop_inside_verifier) {
+  mtp_terminal_next_request(false, 7, 0, 6);
+}
+LSE_TEST(mtp_next_request_reuses_stop_after_rejection) {
+  mtp_terminal_next_request(true, 7, 0, 6);
+}
+LSE_TEST(mtp_next_request_reuses_max_one_token) {
+  mtp_terminal_next_request(false, 1, 0, std::numeric_limits<std::uint32_t>::max());
+}
+
+LSE_TEST(mtp_unrelated_prompt_coldstarts_both_caches) {
+  auto fixture = build_mtp_fixture(false, 16, false, 256, true, true);
+  LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
+  Session session("unrelated-mtp", fixture.lm->state_slots());
+  GenerationLimits limits;
+  limits.max_tokens = 1;
+  {
+    Generator first(*fixture.lm, greedy_params());
+    first.use_mtp(*fixture.mtp);
+    auto result = first.generate(session, {2, 3}, limits);
+    LSE_EXPECT(result.ok()); if (!result.ok()) return;
+  }
+  Generator next(*fixture.lm, greedy_params());
+  next.use_mtp(*fixture.mtp);
+  auto result = next.generate(session, {7, 8}, limits);
+  LSE_EXPECT(result.ok()); if (!result.ok()) return;
+  LSE_EXPECT(*result == std::vector<std::uint32_t>{9});
+  LSE_EXPECT_EQ(next.stats().prompt_tokens, 2);
+  expect_mtp_resident(fixture, session, 2);
+}
+
+LSE_TEST(mtp_target_tail_is_owned_and_module_changes_invalidate_reuse) {
+  auto fixture = build_mtp_fixture();
+  LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
+  Session session("owned-tail", fixture.lm->state_slots());
+  auto source = graph::Array::full(Shape{1, 1, fixture.config.hidden_size}, DType::kF32, 3.0f);
+  LSE_EXPECT_OK(source.materialize());
+  const std::uint32_t token = 2;
+  auto proposal = fixture.mtp->draft(source, std::span(&token, 1), 0);
+  LSE_EXPECT(proposal.ok()); if (!proposal.ok()) return;
+  session.advance(1);
+  LSE_EXPECT_OK(session.retain_mtp_tail(source, 1, *fixture.mtp));
+  LSE_EXPECT(session.mtp_context_matches(*fixture.mtp));
+  for (std::size_t i = 0; i < source.shape().elem_count(); ++i)
+    graph::interpreter::store_element(*source.node(), i, 9.0f);
+  const auto held = array_to_host(session.mtp_tail());
+  for (float value : held) LSE_EXPECT_EQ(value, 3.0f);
+  const auto revision = fixture.mtp->revision();
+  LSE_EXPECT(!fixture.mtp->truncate(2).ok());
+  LSE_EXPECT(!fixture.mtp->truncate(-1).ok());
+  LSE_EXPECT_EQ(fixture.mtp->revision(), revision);
+  LSE_EXPECT(session.mtp_context_matches(*fixture.mtp));
+  LSE_EXPECT_OK(fixture.mtp->truncate(1));
+  LSE_EXPECT(!session.mtp_context_matches(*fixture.mtp));
+  LSE_EXPECT_OK(session.restart());
+  LSE_EXPECT(!session.mtp_tail().valid());
+}
+
+LSE_TEST(mtp_continued_prefill_carries_the_previous_target_hidden) {
+  auto fixture = build_mtp_fixture(false, 16, false, 256, true);
+  LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
+  Session session("shifted-tail", fixture.lm->state_slots());
+  GenerationLimits limits;
+  limits.max_tokens = 0;
+  {
+    Generator first(*fixture.lm, greedy_params());
+    first.use_mtp(*fixture.mtp);
+    LSE_EXPECT(first.generate(session, {2, 11, 33}, limits).ok());
+  }
+  expect_mtp_resident(fixture, session, 3);
+  // The independently seeded module consumes the same shifted boundary.
+  const std::uint32_t token = 19;
+  auto expected = fixture.mtp->draft(session.mtp_tail(), std::span(&token, 1), 3);
+  LSE_EXPECT(expected.ok()); if (!expected.ok()) return;
+  // A different pass at the same cursor must not reuse this session's tail.
+  LSE_EXPECT_OK(fixture.mtp->truncate(3));
+  Generator changed(*fixture.lm, greedy_params());
+  changed.use_mtp(*fixture.mtp);
+  auto reset = changed.generate(session, {2, 11, 33, 19}, limits);
+  LSE_EXPECT(reset.ok()); if (!reset.ok()) return;
+  LSE_EXPECT_EQ(changed.stats().prompt_tokens, 4);
+  Generator next(*fixture.lm, greedy_params());
+  next.use_mtp(*fixture.mtp);
+  auto output = next.generate(session, {2, 11, 33, 19, 23}, limits);
+  LSE_EXPECT(output.ok()); if (!output.ok()) return;
+  LSE_EXPECT_EQ(next.stats().prompt_tokens, 1);
+  LSE_EXPECT_EQ(fixture.mtp->position(), 5);
+  expect_mtp_resident(fixture, session, 5);
+  const std::uint32_t next_token = 27;
+  auto warm = fixture.mtp->draft_chain(session.mtp_tail(), std::span(&next_token, 1), 5, 3);
+  LSE_EXPECT(warm.ok()); if (!warm.ok()) return;
+  auto cold = build_mtp_fixture(false, 16, false, 256, true);
+  LSE_EXPECT(cold.ok); if (!cold.ok) return;
+  Session fresh("cold-shifted-tail", cold.lm->state_slots());
+  Generator full(*cold.lm, greedy_params());
+  full.use_mtp(*cold.mtp);
+  auto prefill = full.generate(fresh, {2, 11, 33, 19, 23}, limits);
+  LSE_EXPECT(prefill.ok()); if (!prefill.ok()) return;
+  auto expected_chain = cold.mtp->draft_chain(fresh.mtp_tail(), std::span(&next_token, 1), 5, 3);
+  LSE_EXPECT(expected_chain.ok()); if (!expected_chain.ok()) return;
+  LSE_EXPECT(*warm == *expected_chain);
+}
+
+LSE_TEST(mtp_continued_prefill_preserves_tail_across_kv_pool_growth) {
+  if (std::getenv("LSE_KV_PREALLOC")) LSE_SKIP("requires growing KV storage");
+  auto fixture = build_mtp_fixture(false, 16, false, 256, true);
+  LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
+  Session session("mtp-tail-growth", fixture.lm->state_slots());
+  GenerationLimits limits;
+  limits.max_tokens = 0;
+  std::vector<std::uint32_t> prompt(128, 2);
+  Generator first(*fixture.lm, greedy_params());
+  first.use_mtp(*fixture.mtp);
+  auto primed = first.generate(session, prompt, limits);
+  LSE_EXPECT(primed.ok()); if (!primed.ok()) return;
+  const auto old_pool = session.states().front().paged.keys.node();
+  prompt.push_back(11);
+  Generator next(*fixture.lm, greedy_params());
+  next.use_mtp(*fixture.mtp);
+  auto continued = next.generate(session, prompt, limits);
+  LSE_EXPECT(continued.ok()); if (!continued.ok()) return;
+  LSE_EXPECT_EQ(next.stats().prompt_tokens, 1);
+  LSE_EXPECT(session.states().front().paged.keys.node() != old_pool);
+  expect_mtp_resident(fixture, session, 129);
+  const std::uint32_t token = 33;
+  auto warm = fixture.mtp->draft_chain(session.mtp_tail(), std::span(&token, 1), 129, 3);
+  LSE_EXPECT(warm.ok()); if (!warm.ok()) return;
+  auto cold = build_mtp_fixture(false, 16, false, 256, true);
+  LSE_EXPECT(cold.ok); if (!cold.ok) return;
+  Session fresh("mtp-tail-growth-cold", cold.lm->state_slots());
+  Generator full(*cold.lm, greedy_params());
+  full.use_mtp(*cold.mtp);
+  auto prefill = full.generate(fresh, prompt, limits);
+  LSE_EXPECT(prefill.ok()); if (!prefill.ok()) return;
+  auto expected = cold.mtp->draft_chain(fresh.mtp_tail(), std::span(&token, 1), 129, 3);
+  LSE_EXPECT(expected.ok()); if (!expected.ok()) return;
+  LSE_EXPECT(*warm == *expected);
 }
 
 LSE_TEST(resident_restart_cursors_distinguish_single_token_prefill_from_decode) {

@@ -46,11 +46,10 @@ inline constexpr std::array kFlashWmmaRules{
 struct DecodeRule {
   std::string_view arch;
   std::uint32_t wave, threads, query_rows, head_dim;
-  std::uint32_t max_block, max_keys, merge_parts;
-  std::int64_t split_min_offset, split_max_keys;
+  std::uint32_t max_block;
 };
 inline constexpr std::array kDecodeRules{
-    DecodeRule{"gfx1201", 32, 256, 1, 256, 256, 8192, 64, 511, 4096},
+    DecodeRule{"gfx1201", 32, 128, 1, 256, 256},
 };
 
 struct SplitShortRule {

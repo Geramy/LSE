@@ -75,11 +75,15 @@ class MtpModule {
       const graph::Array& hidden, std::span<const std::uint32_t> tokens,
       std::int32_t first, std::uint32_t depth);
 
+  // Attention-only state can discard a speculative suffix by live cursor.
+  Status truncate(std::int32_t position);
+
   // Drops the module's KV. The decoder's session and this must be cleared
   // together or the module drafts against another conversation's prefix.
   void reset();
 
   [[nodiscard]] std::int32_t position() const noexcept { return position_; }
+  [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
   [[nodiscard]] const std::string& path() const noexcept { return path_; }
   [[nodiscard]] const Config& config() const noexcept { return config_; }
 
@@ -109,6 +113,7 @@ class MtpModule {
 
   MixerState state_;
   std::int32_t position_ = 0;
+  std::uint64_t revision_ = 0;
 
   struct Pass {
     graph::Program program;

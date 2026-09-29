@@ -839,8 +839,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                          cache_.prev_pass == prev_pass_run) ||
                         (cache_.pass_id != 0 &&
                          cache_.pass_id == prev_pass_run);
-  const bool split_scope_ok = !cache_.split_decode_attention ||
-                              replaces_previous || kv_len >= 512;
+  const bool split_scope_ok = !cache_.split_decode_attention || replaces_previous ||
+                              cache_.seq == 1 || kv_len >= 512;
   const bool can_reuse =
       chain_ok && split_scope_ok && feature_layers_match(cache_) &&
       cache_.retains_prefix_state == retain_prefix_state &&
@@ -1126,8 +1126,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.split_decode_attention = false;
   for (const auto& group : cache_.program.groups())
     for (const auto& node : group.nodes)
-      if (node->prim && (node->prim->name() == "attention.decode_partial128.v1" ||
-                         node->prim->name() == "attention.decode_partial128.wg128c2.v2" ||
+      if (node->prim && (node->prim->name() == "attention.decode_partial128.wg128c2.v2" ||
                          node->prim->name() == "attention.short_partial128.wg128c2.v2"))
         cache_.split_decode_attention = true;
   cache_.tokens = tokens;

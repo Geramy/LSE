@@ -253,7 +253,10 @@ Result<std::vector<float>> Generator::step(
   const auto base = static_cast<std::int32_t>(session.position());
   Array carry;
   if (mtp_ != nullptr) {
-    carry = Array::zeros(Shape{1, 1, model_.config().hidden_size}, DType::kF32);
+    carry = base == 0
+                ? Array::zeros(Shape{1, 1, model_.config().hidden_size}, DType::kF32)
+                : session.mtp_tail();
+    if (!carry.valid()) return LSE_ERROR(kInternal, "missing resident MTP target tail");
   }
   Array hidden;
   std::size_t at = 0;
@@ -277,7 +280,11 @@ Result<std::vector<float>> Generator::step(
     }
     at += take;
   }
-  if (mtp_ != nullptr) prefill_tail_ = std::move(carry);
+  if (mtp_ != nullptr) {
+    LSE_RETURN_IF_ERROR(session.retain_mtp_tail(
+        carry, base + static_cast<std::int32_t>(tokens.size()), *mtp_));
+    prefill_tail_ = session.mtp_tail();
+  }
   LSE_ASSIGN_OR(Array last, last_hidden(hidden));
   LSE_ASSIGN_OR(Array logits, model_.lm_head(last));
 
@@ -448,6 +455,8 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   bool running = give(pending);
   std::uint64_t decode_start = 0;
 
+  std::size_t retained_rows = 0;
+  std::int32_t retained_first = 0;
   std::vector<std::uint32_t> row_in;   // the m tokens the next pass consumes
   if (running) {
     const std::uint32_t width = next_width();
@@ -489,18 +498,16 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         }
       }
     }
+    retained_rows = emitted_to;
+    retained_first = at;
     if (!running) {
-      if (dflash2_ != nullptr) {
-        if (emitted_to < m) {
-          const auto started = now_ns();
-          LSE_RETURN_IF_ERROR(model_.commit_prefix(session.states(), emitted_to));
-          stats_.spec_verify_ns += now_ns() - started;
-        }
-        LSE_RETURN_IF_ERROR(append_draft_context(emitted_to, at));
-        session.advance(static_cast<std::int32_t>(emitted_to));
-      } else {
-        session.advance(static_cast<std::int32_t>(m));
+      if (emitted_to < m) {
+        const auto started = now_ns();
+        LSE_RETURN_IF_ERROR(model_.commit_prefix(session.states(), emitted_to));
+        stats_.spec_verify_ns += now_ns() - started;
       }
+      LSE_RETURN_IF_ERROR(append_draft_context(emitted_to, at));
+      session.advance(static_cast<std::int32_t>(emitted_to));
       break;
     }
 
@@ -548,11 +555,29 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     row_in.insert(row_in.end(), chain.begin(), chain.end());
   }
 
+  if (mtp_ != nullptr && retained_rows > 0) {
+    const auto started = now_ns();
+    // Row zero already used the preceding verified target hidden. Replace the
+    // remaining draft KV rows with their verified target-hidden/token pairs.
+    if (retained_rows > 1) {
+      LSE_ASSIGN_OR(Array prefix,
+                    materialized_feature_prefix(spec_.hidden, retained_rows - 1));
+      LSE_RETURN_IF_ERROR(mtp_->draft(
+          prefix, std::span<const std::uint32_t>(row_in.data() + 1, retained_rows - 1),
+          retained_first + 1).status());
+    }
+    LSE_RETURN_IF_ERROR(mtp_->truncate(session.position()));
+    const auto last = static_cast<std::int64_t>(retained_rows - 1);
+    Array tail = graph::slice(spec_.hidden, 1, last, last + 1);
+    LSE_RETURN_IF_ERROR(session.retain_mtp_tail(tail, session.position(), *mtp_));
+    stats_.spec_draft_ns += now_ns() - started;
+  }
+
   const auto draft_position = mtp_ != nullptr ? mtp_->position()
                                               : dflash2_->context_position();
   const auto covered = static_cast<std::size_t>(session.position());
   const bool history_matches = covered + 1 == session.history().size() ||
-      (dflash2_ != nullptr && covered == session.history().size());
+                               covered == session.history().size();
   if (!history_matches || draft_position != session.position()) {
     if (!session.restart().ok()) session.clear();
     if (mtp_ != nullptr) mtp_->reset();
@@ -594,6 +619,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   // conversation; anything else is a cold start.
   const auto covered = static_cast<std::size_t>(session.position());
   const bool continues =
+      (mtp_ == nullptr || session.mtp_context_matches(*mtp_)) &&
       covered > 0 && covered < prompt.size() &&
       covered <= session.history().size() &&
       std::equal(session.history().begin(),

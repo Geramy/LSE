@@ -298,12 +298,9 @@ struct HttpServer::Run {
     if (impl.dflash2 != nullptr) gen.use_dflash2(*impl.dflash2);
 
     // Generator checks the exact token prefix before reusing resident state.
-    bool resident = true;
     if (!impl.session_live) {
       impl.session = runtime::Session{"resident", impl.model.state_slots()};
       impl.session_live = true;
-    } else if (impl.mtp != nullptr) {
-      resident = impl.session.restart().ok();
     }
 
     tokenizer::DecodeStream stream(impl.tok);
@@ -335,9 +332,7 @@ struct HttpServer::Run {
       return true;
     };
 
-    auto ids = resident
-                   ? gen.generate(impl.session, r.prompt, r.limits, on_token)
-                   : gen.generate(r.prompt, r.limits, on_token);
+    auto ids = gen.generate(impl.session, r.prompt, r.limits, on_token);
     if (!ids.ok()) {
       impl.session.clear();
       impl.session_live = false;

@@ -609,7 +609,7 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                                      "attention.short_merge128.wg128c2.v1", true);
     if (dispatch::split_decode_supported(request))
       return split_paged_attention(n, "attention.decode_partial128.wg128c2.v2",
-                                     "attention.decode_merge128.wg128c2.v2", false);
+                                     "attention.decode_merge128.wg128c2.v3", false);
   }
   return Array(n);
 }

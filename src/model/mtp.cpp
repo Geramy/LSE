@@ -256,6 +256,17 @@ Status MtpModule::build(WeightBinder& binder) {
   return block_->load(binder, "layers.0", ctx);
 }
 
+Status MtpModule::truncate(std::int32_t position) {
+  if (position < 0 || position > position_) {
+    return LSE_ERROR(kOutOfRange, "MTP truncation is outside the cached prefix");
+  }
+  state_.position = position;
+  state_.paged.row_tokens.assign(1, position);
+  position_ = position;
+  ++revision_;
+  return OkStatus();
+}
+
 void MtpModule::reset() {
   if (state_.paged.valid()) {
     const Status s = ops::release_row(state_.paged, 0);
@@ -265,6 +276,7 @@ void MtpModule::reset() {
   pass_ = Pass{};
   passes_.clear();
   position_ = 0;
+  ++revision_;
 }
 
 Result<Array> MtpModule::record(std::int64_t rows) {
@@ -337,6 +349,7 @@ Result<std::uint32_t> MtpModule::draft_pass(
                      std::to_string(config_.kv_capacity()));
   }
 
+  ++revision_;
   Array held;
   if (device_hidden != nullptr) {
     LSE_ASSIGN_OR(held, hold_hidden(*device_hidden));

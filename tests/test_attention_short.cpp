@@ -99,7 +99,7 @@ LSE_TEST(short_split_declines_unsupported_contracts_without_changing_baseline) {
     if (variant == 15) fx.k = fx.v = leaf({65, 2, 16, 256});
     auto out = variant == 11 ? fx.split(MaskKind::kSlidingWindow, -1) : fx.split();
     LSE_EXPECT(out.node()->prim->name() ==
-               (variant == 4 ? "attention.decode_merge128.wg128c2.v2" : "attention"));
+               (variant == 4 ? "attention.decode_merge128.wg128c2.v3" : "attention"));
   }
 }
 

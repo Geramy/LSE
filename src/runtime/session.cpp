@@ -1,6 +1,8 @@
 #include "lse/runtime/session.hpp"
 
 #include "lse/graph/graph.hpp"
+#include "lse/graph/interpreter.hpp"
+#include "lse/model/mtp.hpp"
 #include "lse/ops/attention.hpp"
 
 #include <algorithm>
@@ -19,6 +21,10 @@ std::size_t array_bytes(const graph::Array& a) noexcept {
 void Session::clear() {
   for (model::MixerState& s : states_) s = model::MixerState{};
   history_.clear();
+  mtp_tail_ = {};
+  mtp_owner_ = nullptr;
+  mtp_revision_ = 0;
+  mtp_position_ = 0;
   position_ = 0;
 }
 
@@ -69,12 +75,57 @@ Status Session::restart() {
     s.position = 0;
   }
   history_.clear();
+  mtp_tail_ = {};
+  mtp_owner_ = nullptr;
+  mtp_revision_ = 0;
+  mtp_position_ = 0;
   position_ = 0;
   return OkStatus();
 }
 
+Status Session::retain_mtp_tail(const graph::Array& hidden,
+                                std::int32_t position,
+                                const model::MtpModule& module) {
+  if (!hidden.valid() || hidden.dtype() != DType::kF32 ||
+      hidden.shape().rank() != 3 || hidden.shape().dim(0) != 1 ||
+      hidden.shape().dim(1) != 1 || hidden.shape().dim(2) != module.config().hidden_size ||
+      position <= 0 || module.position() != position) {
+    return LSE_ERROR(kInvalidArgument, "invalid resident MTP target tail");
+  }
+  graph::Array held = hidden;
+  LSE_RETURN_IF_ERROR(held.materialize());
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for MTP target tail");
+  graph::Node& src = *hidden.node();
+  const auto member = sched->devices().member_of(src.buffer.residency);
+  if (!src.buffer.valid() || member >= sched->devices().size())
+    return LSE_ERROR(kInvalidArgument, "MTP target tail has no resident storage");
+  auto& owner = sched->devices().device(member);
+  LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(src, owner));
+  const auto bytes = dtype_storage_bytes(hidden.dtype(), hidden.shape().elem_count());
+  if (!mtp_tail_.valid() || mtp_tail_.shape() != hidden.shape() ||
+      mtp_tail_.node()->buffer.residency != src.buffer.residency) {
+    LSE_ASSIGN_OR(auto buffer, owner.allocate(bytes, backend::MemoryClass::kDevice));
+    mtp_tail_ = graph::Array::from_buffer(std::move(buffer), hidden.shape(), hidden.dtype());
+  }
+  LSE_RETURN_IF_ERROR(owner.copy({mtp_tail_.node()->buffer}, {src.buffer}, bytes));
+  mtp_tail_.node()->host_dirty = false;
+  mtp_tail_.node()->device_dirty = mtp_tail_.node()->buffer.ptr == nullptr;
+  mtp_tail_.node()->materialized = true;
+  mtp_owner_ = &module;
+  mtp_revision_ = module.revision();
+  mtp_position_ = position;
+  return OkStatus();
+}
+
+bool Session::mtp_context_matches(const model::MtpModule& module) const noexcept {
+  return mtp_tail_.valid() && mtp_owner_ == &module &&
+         mtp_revision_ == module.revision() && mtp_position_ == position_ &&
+         module.position() == position_;
+}
+
 std::size_t Session::cache_bytes() const noexcept {
-  std::size_t total = 0;
+  std::size_t total = array_bytes(mtp_tail_);
   for (const model::MixerState& s : states_) {
     total += array_bytes(s.gdn_state);
     // The conv tails are live device tensors too. Leaving them out under-reported

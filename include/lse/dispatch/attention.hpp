@@ -6,7 +6,7 @@
 
 namespace lse::dispatch {
 
-enum class AttentionPlan : std::uint8_t { kScalar, kSharedExp, kFlash8, kFlash12, kFlashWmmaF16 };
+enum class AttentionPlan : std::uint8_t { kScalar = 0, kFlash8 = 2, kFlash12, kFlashWmmaF16 };
 
 struct FlashDims {
   std::uint32_t bsz = 0, qh = 0, tq = 0, dh = 0, kvh = 0, ts = 0, dv = 0;
@@ -23,7 +23,6 @@ struct FlashDims {
 [[nodiscard]] bool flash_wmma_f16_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_scope(const Shape& query, std::int64_t offset,
                                        std::int64_t capacity);
-[[nodiscard]] bool shared_decode_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_merge_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_short_scope(const Shape& query, std::int64_t offset,

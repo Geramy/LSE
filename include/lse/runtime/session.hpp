@@ -28,6 +28,8 @@
 #include "lse/kv/block.hpp"
 #include "lse/model/hybrid_lm.hpp"
 
+namespace lse::model { class MtpModule; }
+
 namespace lse::runtime {
 
 class Session {
@@ -45,6 +47,13 @@ class Session {
   // Tokens the cache already covers. The next forward pass starts here.
   [[nodiscard]] std::int32_t position() const noexcept { return position_; }
   void advance(std::int32_t tokens) noexcept { position_ += tokens; }
+
+  // The target row immediately before the MTP cursor must survive a new
+  // Generator and target-program replay.
+  Status retain_mtp_tail(const graph::Array& hidden, std::int32_t position,
+                         const model::MtpModule& module);
+  [[nodiscard]] bool mtp_context_matches(const model::MtpModule& module) const noexcept;
+  [[nodiscard]] const graph::Array& mtp_tail() const noexcept { return mtp_tail_; }
 
   // Drops the cache but keeps the id, so the next turn is a fresh prefill.
   void clear();
@@ -71,6 +80,10 @@ class Session {
   std::vector<model::MixerState> states_;
   std::vector<std::uint32_t> history_;
   std::int32_t position_ = 0;
+  graph::Array mtp_tail_;
+  const model::MtpModule* mtp_owner_ = nullptr;
+  std::uint64_t mtp_revision_ = 0;
+  std::int32_t mtp_position_ = 0;
 };
 
 // Sessions by id, evicted least-recently-used once the total cache exceeds the

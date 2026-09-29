@@ -172,44 +172,44 @@ bool flash_wmma_f16_supported(const KernelShapes& s) {
 }
 
 bool split_decode_scope(const Shape& query, std::int64_t offset, std::int64_t capacity) {
-  if (query.rank() != 4 || capacity <= 0) return false;
+  if (query.rank() != 4 || offset < 0 || capacity <= 0) return false;
   for (const auto& rule : shapes::kDecodeRules)
-    if (query.dim(2) == rule.query_rows && offset >= rule.split_min_offset &&
-        capacity <= rule.split_max_keys) return true;
+    if (query.dim(2) == rule.query_rows) return true;
   return false;
 }
 
-namespace {
-const shapes::DecodeRule* shared_decode_rule(const KernelShapes& s) {
-  if (!paged_inputs(s) || !s.device || !attention_ops(s) || s.inputs[1] != s.inputs[2])
-    return nullptr;
-  const auto& q = s.inputs[0];
-  const auto stride = s.inputs[4].dim(1), block = s.inputs[1].dim(2);
-  for (const auto& rule : shapes::kDecodeRules)
-    if (s.device->arch == rule.arch && s.device->max_threads_per_workgroup >= rule.threads &&
-        q.dim(2) == rule.query_rows && q.dim(3) == rule.head_dim &&
-        block <= rule.max_block && stride <= rule.max_keys / block &&
-        static_cast<std::uint64_t>(stride * block) * sizeof(float) <=
-            backend::workgroup_lds_bytes(s.device)) return &rule;
-  return nullptr;
-}
-}  // namespace
-
-bool shared_decode_supported(const KernelShapes& s) { return shared_decode_rule(s) != nullptr; }
-
 bool split_decode_supported(const KernelShapes& s) {
-  const auto* rule = shared_decode_rule(s);
-  return rule && s.device->wavefront_size == rule->wave;
+  if (!paged_inputs(s) || !s.device || !attention_ops(s) ||
+      s.inputs[1] != s.inputs[2] || !std::isfinite(s.attrs[0]) ||
+      s.attrs[0] <= 0.0f) return false;
+  const auto& q = s.inputs[0];
+  const auto block = s.inputs[1].dim(2);
+  const auto capacity = s.inputs[4].dim(1) * block;
+  for (const auto& rule : shapes::kDecodeRules) {
+    if (s.device->arch != rule.arch || s.device->wavefront_size != rule.wave ||
+        s.device->max_threads_per_workgroup < rule.threads ||
+        q.dim(2) != rule.query_rows || q.dim(3) != rule.head_dim ||
+        block > rule.max_block ||
+        backend::workgroup_lds_bytes(s.device) < shapes::kShortKeyWindow * sizeof(float))
+      continue;
+    const auto parts = (capacity + shapes::kShortKeyWindow - 1) / shapes::kShortKeyWindow;
+    const auto merge_bytes = (static_cast<std::uint64_t>(parts) * sizeof(float) + 15u) / 16u * 16u;
+    const Shape partial{q.dim(0), q.dim(1), parts, shapes::kSplitRecord};
+    return merge_bytes <= backend::workgroup_lds_bytes(s.device) &&
+        positive_shape(partial) && (s.output == q || s.output == partial);
+  }
+  return false;
 }
 
 bool split_decode_merge_supported(const KernelShapes& s) {
   if (s.inputs.size() != 1 || s.inputs[0].rank() != 4 ||
       !positive_shape(s.inputs[0]) || s.inputs[0].dim(3) != shapes::kSplitRecord ||
       !f32_inputs(s, 1) || !s.device || !attention_ops(s)) return false;
-  const auto bytes = static_cast<std::uint32_t>(s.inputs[0].dim(2)) * sizeof(float);
+  const auto bytes = static_cast<std::uint64_t>(s.inputs[0].dim(2)) * sizeof(float);
   for (const auto& rule : shapes::kDecodeRules)
-    if (s.device->arch == rule.arch && s.device->max_threads_per_workgroup >= rule.threads &&
-        s.inputs[0].dim(2) <= rule.merge_parts &&
+    if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+        s.device->max_threads_per_workgroup >= rule.threads &&
+        s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1), 1, rule.head_dim} &&
         ((bytes + 15u) / 16u) * 16u <= backend::workgroup_lds_bytes(s.device)) return true;
   return false;
 }
@@ -268,7 +268,6 @@ bool split_short_merge_supported(const KernelShapes& s) {
 }
 
 AttentionPlan attention_plan(const KernelShapes& s) {
-  if (shared_decode_supported(s)) return AttentionPlan::kSharedExp;
   if (flash_wmma_f16_supported(s)) return AttentionPlan::kFlashWmmaF16;
   const auto d = flash_dimensions(s);
   if (!d.valid || !s.device || s.device->max_threads_per_workgroup < shapes::kFlashThreads ||
