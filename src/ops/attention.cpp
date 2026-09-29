@@ -61,7 +61,8 @@ std::int32_t paged_pool_blocks(std::int32_t tokens, std::int32_t rows,
 
 namespace {
 
-Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
+Result<Array> alloc_pool(const Shape& shape, DType dtype,
+                         std::size_t initialized_prefix_bytes) {
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
     return LSE_ERROR(kInternal, "no backend to allocate the KV pool");
@@ -70,6 +71,9 @@ Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
       dtype_storage_bytes(dtype, static_cast<std::size_t>(shape.elem_count()));
   if (bytes == 0) {
     return LSE_ERROR(kInvalidArgument, "empty KV allocation");
+  }
+  if (initialized_prefix_bytes > bytes) {
+    return LSE_ERROR(kInvalidArgument, "KV prefix exceeds the new pool");
   }
   // The pool belongs to the layer that reads it. Left on whoever is primary,
   // every attention group on every other device fetches the whole pool across
@@ -84,14 +88,27 @@ Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
           ? set.stream_for(member).value_or(backend::kDefaultStream)
           : backend::kDefaultStream;
   auto buf = be.allocate(bytes, backend::MemoryClass::kDevice, at);
-  if (!buf.ok()) return buf.status();
+  if (!buf.ok()) {
+    return Status(buf.status().code(), detail::concat(
+        "KV pool allocation (", shape.to_string(), ", ", std::to_string(bytes),
+        " bytes): ", buf.status().message()));
+  }
   backend::DeviceBuffer owned = buf.release();
-  // Zeroed, not just allocated. A partially filled block is read by the attention
-  // kernel's last iteration and multiplied by a zero weight; with garbage bytes
-  // a NaN would survive `fma(0, NaN, acc)` and poison the whole row.
-  const std::vector<std::byte> zeros(bytes, std::byte{0});
-  LSE_RETURN_IF_ERROR(be.copy_h2d(zeros.data(), owned, bytes, 0));
+  // A partially filled block can be read under a zero attention weight. Zero
+  // the new tail so NaN bytes cannot survive fma(0, NaN, acc). On growth the
+  // old prefix is copied below; zeroing that prefix first wastes a full pool
+  // transfer and a pool-sized host allocation at every context rung.
+  const std::size_t tail_bytes = bytes - initialized_prefix_bytes;
+  if (tail_bytes != 0) {
+    const std::vector<std::byte> zeros(tail_bytes, std::byte{0});
+    LSE_RETURN_IF_ERROR(be.copy_h2d(
+        zeros.data(), owned, tail_bytes, initialized_prefix_bytes));
+  }
   return Array::from_buffer(std::move(owned), shape, dtype);
+}
+
+Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
+  return alloc_pool(shape, dtype, 0);
 }
 
 // Moves a pool to a bigger rung. Block ids keep their meaning — the allocator
@@ -99,22 +116,22 @@ Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
 // The move is one engine call and stays on the device; it happens once per
 // rung, i.e. at 128, 256, 512 ... tokens.
 Result<Array> regrow_pool(const Array& old, const Shape& want, DType dtype) {
-  LSE_ASSIGN_OR(Array grown, alloc_zeroed(want, dtype));
-  if (!old.valid()) return grown;
+  if (!old.valid()) return alloc_zeroed(want, dtype);
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
     return LSE_ERROR(kInternal, "no backend to grow the KV pool");
   }
   const std::size_t bytes =
       dtype_storage_bytes(dtype, static_cast<std::size_t>(old.shape().elem_count()));
-  if (bytes == 0) return grown;
+  if (bytes == 0) return alloc_zeroed(want, dtype);
   graph::Node& src = *old.node();
-  if (!src.buffer.valid()) return grown;
+  if (!src.buffer.valid()) return alloc_zeroed(want, dtype);
   if (src.buffer.size_bytes < bytes) {
     return LSE_ERROR(kInternal, "KV pool ", old.shape().to_string(),
                      " wants ", std::to_string(bytes), " bytes but its buffer holds ",
                      std::to_string(src.buffer.size_bytes));
   }
+  LSE_ASSIGN_OR(Array grown, alloc_pool(want, dtype, bytes));
   LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(src, sched->backend()));
   // One statement: move the used prefix into the bigger pool. Both ends are
   // device memory, so this is the copy engine and the bytes never touch the
