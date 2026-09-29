@@ -55,7 +55,44 @@ void emit_run_dot(env::Emit &e, const Args &a,
   for (std::size_t r = 0; r < acc.size(); ++r)
     facc.push_back(e.var(e.f32(0.0f)));
   const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
-  if (load_chunks == 2 && count % 2 == 0) {
+  if (load_chunks == 4 && count == 4 && acc.size() == 8) {
+    // Four weight chunks are decoded once; each row keeps the original chunk order.
+    std::vector<std::array<kir::Val<kir::u32>, 2>> planes;
+    for (std::uint32_t j = 0; j < count; ++j) {
+      const auto word = e.let(words[static_cast<int>(j)]);
+      std::array<kir::Val<kir::u32>, 2> value;
+      for (std::size_t plane = 0; plane < 2; ++plane)
+        value[plane] = quant::dot4_code_plane(e, word, static_cast<int>(plane));
+      planes.push_back(value);
+    }
+    for (std::size_t row_pair = 0; row_pair < acc.size(); row_pair += 2) {
+      std::vector<kir::Pack<kir::u32>> codes_first, codes_second, steps;
+      for (std::size_t at = 0; at < 2; ++at) {
+        const auto r = row_pair + at;
+        const auto input_row =
+            e.let(select(row + static_cast<std::uint32_t>(r) < m,
+                         row + static_cast<std::uint32_t>(r), e.u32(0)));
+        const auto panel_base = e.let(input_row * ((k / 64u) * 25u));
+        codes_first.push_back(e.load(a.panel, e.let(panel_base + chunk0 * 2u), 16u));
+        codes_second.push_back(e.load(a.panel, e.let(panel_base + chunk0 * 2u + 4u), 16u));
+        steps.push_back(e.load(a.panel, e.let(panel_base + k / 4u + chunk0), 16u));
+      }
+      for (std::uint32_t j = 0; j < count; ++j) {
+        for (std::size_t at = 0; at < 2; ++at) {
+          const auto r = row_pair + at;
+          auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
+          for (std::size_t plane = 0; plane < 2; ++plane) {
+            const auto x = e.let((j < 2 ? codes_first[at] : codes_second[at])
+                [static_cast<int>((j % 2) * 2u + plane)]);
+            iacc = math::dot4_iu8(kir::cast<kir::i32>(x),
+                                  kir::cast<kir::i32>(planes[j][plane]), iacc.read());
+          }
+          const auto step = e.let(math::from_bits<lse::f32>(steps[at][static_cast<int>(j)]));
+          facc[r] = math::fma(step, kir::cast<kir::f32>(iacc.read()), facc[r].read());
+        }
+      }
+    }
+  } else if (load_chunks == 2 && count % 2 == 0) {
     for (std::uint32_t first = 0; first < count; first += 2) {
       std::vector<kir::Pack<kir::u32>> code_pairs;
       std::vector<kir::Pack<kir::u32>> step_pairs;

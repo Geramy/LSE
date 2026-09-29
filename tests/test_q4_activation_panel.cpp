@@ -395,7 +395,9 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
           (dimensions[1] == 5120 &&
            (dimensions[2] == 17408 || dimensions[2] == 6144))));
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
-                  adjacent ? 2u : 1u);
+                  dimensions[0] == 8 && dimensions[2] == 5120 &&
+                          (dimensions[1] == 17408 || dimensions[1] == 10240)
+                      ? 4u : adjacent ? 2u : 1u);
     const auto *consumer =
         dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);
     LSE_EXPECT(consumer != nullptr);
@@ -629,5 +631,9 @@ int main(int argc, char **argv) {
     return gpu_panel(7, kM7Head);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m6")
     return gpu_panel(6, kWidePanelProjections);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m8-rowpairs") {
+    const std::array measured{Projection{17408, 5120}, Projection{10240, 5120}};
+    return gpu_panel(8, measured);
+  }
   return lse::test::run_all();
 }

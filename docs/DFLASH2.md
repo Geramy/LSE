@@ -15,10 +15,11 @@ model verifies proposals and determines every emitted token.
   --host 127.0.0.1 --port 8080
 ```
 
-This first implementation uses deterministic draft selection. Target sampling
-still governs output, but stochastic draft sampling and rejection-residual
-selection are not implemented. Acceptance at nonzero temperature may therefore
-differ from the authors' reported rates. DFlash2 remains opt-in.
+Conditional draft selection uses the request's sampling settings. The target
+verifies all seven proposals with probability-ratio rejection and residual
+sampling. Greedy requests retain deterministic draft selection. DFlash2 remains
+opt-in. Current matched results and limits are in the
+[final mode comparison](benchmarks/forward-modes-final-2026-09-29.md).
 
 ```sh
 curl http://127.0.0.1:8080/v1/completions \
@@ -26,7 +27,7 @@ curl http://127.0.0.1:8080/v1/completions \
   -d '{"model":"qwen38-q4","prompt":"Explain how GPU caches improve inference.","temperature":0,"max_tokens":16}'
 ```
 
-## Bounded HTTP measurement
+## Initial implementation measurement (historical)
 
 The complete Q4-target/Q8-drafter HTTP path succeeded with device kernels
 required. Two identical greedy requests used 1024 prompt tokens, 16 output
@@ -71,9 +72,8 @@ Target feature taps are post-block outputs at zero-based layers
 
 Every draft evaluates the complete trained block of eight positions: one anchor
 and seven mask tokens. Returning a shorter prefix preserves that computation.
-The default target verifier consumes the anchor plus up to three proposals,
-reducing work on rejected suffixes. Health and timing fields report this verifier
-depth of three; the trained draft block remains eight positions.
+The target verifier consumes the anchor plus all seven proposals. Health and
+timing fields report depth seven; the trained draft block remains eight positions.
 Attention is noncausal within the draft block, including future mask positions;
 context keys obey the 2048-position sliding window. Learned dynamic convolutions
 have two taps and groups of 16 channels. The selector conditions each choice on

@@ -22,127 +22,36 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
-## Development: full-width DFlash2
+## Current source update: v0.4.14
 
-The current development build verifies all seven proposals from the block-8
-checkpoint. Conditional drafting uses the request temperature and preserves
-target sampling through probability-ratio rejection and residual sampling.
-Both prefill batch limits default to 1024. Use `--batch-size 2048 --ubatch-size 2048`
-to select larger passes. The HTTP server accepts `--temperature 0.6`; an explicit
-request temperature overrides it.
+The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
+Conditional drafting uses the request temperature. Probability-ratio rejection
+and residual sampling preserve the target sampling distribution.
 
-On exact 1024- and 2048-token coding requests at temperature 0.6, the second
-requests measured **501.38 / 508.09 prompt tokens/s** and **35.04 / 34.53 decode
-tokens/s**, respectively. Both generated 384 tokens, reused no prompt KV and had
-zero host fallbacks. The process retained compiled code, but further compilation
-remained inside these timings. Different temperatures produce different answers.
-These are workload measurements, not general rates or achieved 103 TPS/600 PP/s
-goals. Published v0.4.13 includes the full-width changes and the M8 optimization below.
-See [full-width DFlash2 results](docs/benchmarks/dflash-fullwidth-2026-09-29.md).
+Prefill uses shared Q4 activation panels for the measured M1024 projection
+shapes. M8 gate/up and QKV projections now consume two activation rows at a time.
+The accepted M8 down WMMA, typed attention, buffer views and memory retirement
+remain active. Floating-point accumulation remains FP32.
 
-The next M8 Q4 down-projection optimization measured **40.21 TPS** on the
-second 1024-token request, versus **35.42 TPS** for its matched control.
-Prefill remained about **500 prompt tokens/s**. Both use seven proposals,
-temperature 0.6 and BF16 KV. A 1024-target perplexity comparison was
-4.8660 versus 4.8675. Completed prefill workspace is released before decode
-to fix the reproduced second-request allocation failure at batch 4096.
-See [M8 WMMA and memory results](docs/benchmarks/wmma-m8-down-2026-09-29.md).
+The final same-binary resident measurements are **624.10 PP/s / 24.73 TPS** for
+baseline, **608.19 PP/s / 48.62 TPS** for MTP=3, and **616.78 PP/s / 42.41 TPS** for
+seven-proposal DFlash2. These are 1024-token coding requests at temperature 0.6.
+They do not establish these rates for every context or Pi conversation. See
+[measured performance](#current-bf16-source-measurements) for cold results and method.
 
-The next M1024 down-projection schedule measured **522.58 prompt tokens/s**,
-versus **507.24** for the matched control. Decode was effectively unchanged:
-**40.78 versus 40.55 TPS**. Both responses and acceptance statistics match exactly.
-This prefill change is newer than v0.4.13. See
-[M1024 prefill results](docs/benchmarks/prefill-m1024-down-2026-09-29.md).
+| Optimization | Evidence |
+| --- | --- |
+| Full-width DFlash2 and conditional sampling | [DFlash2 results](docs/benchmarks/dflash-fullwidth-2026-09-29.md) |
+| M8 down WMMA and prefill memory retirement | [M8 and memory results](docs/benchmarks/wmma-m8-down-2026-09-29.md) |
+| M1024 down activation panel | [Down prefill results](docs/benchmarks/prefill-m1024-down-2026-09-29.md) |
+| Skip fully masked attention windows | [Attention results](docs/benchmarks/attention-causal-windows-2026-09-29.md) |
+| Cooperative M1024 gate/up | [Gate/up results](docs/benchmarks/prefill-m1024-up-2026-09-29.md) |
+| Cooperative QKV, GDN gate and attention projections | [Projection results](docs/benchmarks/prefill-projections-2026-09-29.md) |
+| M8 activation register lifetime | [Decode scheduling results](docs/benchmarks/m8-dot4-rowpairs-2026-09-29.md) |
 
-WMMA attention now skips entire windows that are outside the row or fully
-causally masked. The component time falls 30.74% at 1024 live keys and 7.45%
-at 5207 live keys. The matched resident HTTP request reaches **526.26 prompt
-tokens/s**; decode remains about **40.7 TPS**. Responses and sampling statistics
-match the control exactly. See
-[attention window results](docs/benchmarks/attention-causal-windows-2026-09-29.md).
-
-Cooperative activation staging for M1024 gate/up now reaches **568.03 prompt
-tokens/s**, versus **526.26** for its matched control. Decode remains **40.73 TPS**.
-Both responses and acceptance statistics match exactly. The change preserves
-the accepted M8 and M1024 down emitted kernels and launch plans. See
-[cooperative prefill results](docs/benchmarks/prefill-m1024-up-2026-09-29.md).
-
-A separate comparison uses one binary and the same 1024-token requests,
-temperature 0.6, BF16 KV and batch/ubatch 1024. Each mode starts with an empty
-private disk cache. The resident request reuses compiled code but no prompt KV.
-
-| Mode | Resident prompt tokens/s | Resident decode tokens/s | Acceptance |
-| --- | ---: | ---: | ---: |
-| Baseline | 572.30 | 24.79 | — |
-| MTP=3 | 560.78 | 48.93 | 80.70% |
-| DFlash2, seven proposals | 568.03 | 40.73 | 76.15% |
-
-These source changes follow published v0.4.13. The performance targets remain
-unmet. This coding request does not establish rates for long-context Pi chat.
-See [mode comparison and timing limits](docs/benchmarks/forward-modes-2026-09-29.md).
-
-The same cooperative schedule now covers the exact M1024 QKV, GDN gate and
-attention projection shapes. The matched resident request reaches **619.08
-prompt tokens/s**, versus **568.03** before these entries. Decode remains
-**40.68 TPS**. Responses and acceptance statistics match exactly. This exceeds
-600 PP/s on this controlled 1024-token workload, not at every context length.
-See [projection results and validation](docs/benchmarks/prefill-projections-2026-09-29.md).
-
-## v0.4.12: typed attention and automatic buffer views
-
-This version adds typed WMMA attention, cooperative single-token attention, and
-automatic contiguous buffer views. Eligible slices no longer launch copy kernels.
-K/V storage defaults to BF16 for models that declare BF16, and FP16 otherwise.
-
-Single-token split attention now shares K/V loads across six query heads.
-The matched component check reduced BF16 attention time by 49% at 5.2K live
-keys and 53% at 14K. Empty partitions publish neutral records and return early.
-The submission tuner skips its end wait when the policy did not change.
-
-The measurements below use the same Q4 target, BF16 KV, binary/runtime, and
-requests. Each mode starts with an empty private kernel cache. First prefill
-includes compilation. Sampling uses model defaults 1/20/0.95. The first prompt
-has 5,207 tokens; the follow-up has 5,262 cached tokens and 23 new tokens.
-
-| Mode | First prefill, tokens/s | First decode, tokens/s | Follow-up decode, tokens/s |
-| --- | ---: | ---: | ---: |
-| Baseline | 344.21 | 22.58 | 23.82 |
-| MTP=3 | 313.32 | 24.74 | 40.25 |
-| DFlash2 | 328.65 | 26.40 | 37.53 |
-
-Baseline follow-up increased from 22.82 to 23.82 tokens/s in the matched check.
-The speculative modes remain near their previous rates. Responses match their
-preceding controls, with zero host groups or fallbacks. These are individual
-workload measurements, not a general throughput guarantee. See the
-[shared-KV decode report](docs/benchmarks/shared-kv-decode-2026-09-28.md) for
-component results, first/follow-up timing limits, and CPU sampling costs.
-
-## v0.4.11: split decode attention and MTP prompt reuse
-
-The monolithic single-token attention kernel is removed. Split attention now
-covers long contexts without the old 4K capacity cutoff. On the recorded Pi
-requests, plain decode measured **19.71 / 19.72 tokens/s**, compared with
-12.91 / 12.70 before the change. The sampled responses changed.
-
-MTP now retains verified state between requests. Follow-up prefill fell from
-**14.25 s to 0.71 s**, with 5,310 cached tokens and 23 new tokens. Recorded decode
-measured **32.68 / 31.90 tokens/s with MTP=3** and **27.97 / 35.26 tokens/s with
-DFlash2**. The two modes produced identical responses in these candidate runs.
-First prompt rates were **293.95 and 291.75 tokens/s**, respectively.
-These are individual Pi workload measurements, not a 46–48 tokens/s guarantee.
-See the [methods and limits](docs/benchmarks/pi-execution-profile-2026-09-28.md#remove-monolithic-single-token-attention-and-retain-mtp-sessions).
-
-## v0.4.10: shorter compilation stalls and optional KV formats
-
-Identical Loom kernel bodies now share compiled code. Attention page traversal
-stays in generated control flow instead of expanding each page into source.
-In the same two-turn Pi conversation with an empty starting cache, total JIT
-compilation fell from **92.91 s to 3.35 s**. First prefill fell from **91.53 s to
-16.88 s**; follow-up prefill fell from **16.14 s to 0.76 s**. Both responses and
-proposal acceptance counts matched. The final paired-load build measured **28.59 / 34.03 decode tokens/s** and
-**310.72 prompt tokens/s** on those turns. Scratch allocation is now preserved
-in optimizer facts and reported by dispatch profiling.
-See the [execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
+The launch examples use temperature 0.6 and batch/ubatch 1024. Explicit request
+parameters override launch defaults. Earlier versions and measurements remain
+in [release history](docs/RELEASE_HISTORY.md).
 
 ## KV storage
 
@@ -166,36 +75,6 @@ component coverage across all five formats. A later BF16 v2 check scored 1,024
 pinned targets at PPL **4.8499**, with zero host fallback. This prefill result
 does not establish sampled-conversation quality or a statistical improvement.
 See [KV cache formats](docs/KV_CACHE.md) for selection and evidence.
-
-## v0.4.9: chat sampling and prompt reuse
-
-The CLI and server load each model's supported settings from `generation_config.json`.
-If fields are missing, LSE uses embedded model settings and the fallback table under
-`src/models`. Explicit CLI flags and HTTP request parameters override these defaults.
-See [sampling defaults](docs/SAMPLING.md) for precedence and supported fields.
-
-Pi can return streamed reasoning without invalidating the previous prompt cache.
-The HTTP response reports reused tokens in `usage.prompt_tokens_details.cached_tokens`.
-In a two-turn Qwen3.8 Q4 + Q8 DFlash2 chat, the second prefill fell from 14.11 s
-for 5296 tokens to 0.93 s for 23 new tokens after the serialization fix.
-With the model's temperature 1, top-k 20 and top-p 0.95 settings, decode measured
-23.98 and 28.82 tokens/s on the two turns. These measurements describe those
-requests; output length and proposal acceptance affect the result.
-See the [Pi chat report](docs/benchmarks/pi-chat-2026-09-28.md).
-
-## v0.4.8: lower VRAM use
-
-KV growth previously kept obsolete recurrent-state graphs and their buffers alive.
-The fix releases those graphs while keeping the current state and compiled kernels.
-On one 14K Q4 + Q8 DFlash2 request, live allocations fell from **30.72 to 22.33 GiB**.
-Sampled peak driver reservations fell from **30.93 to 24.86 GiB**.
-
-The performance check measured 323.41 prompt tokens/s and 42.41 decode tokens/s
-on the second identical request, with temperature 0 and 100% proposal acceptance.
-**These are warmed synthetic results, not expected Pi or coding-session rates.**
-The first request measured 15.51 decode tokens/s even without new kernel compilation;
-request setup and reuse remain under investigation.
-See the [memory report](docs/benchmarks/kv-growth-memory-2026-09-28.md).
 
 ## Supported platforms
 
@@ -221,7 +100,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.12`.
+The examples below use `v0.4.14`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -230,7 +109,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.12
+   lse_tag=v0.4.14
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -263,7 +142,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.12
+   lse_tag=v0.4.14
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -313,6 +192,7 @@ Start ordinary decoding first:
   --model "$LSE_MODEL" \
   --no-mtp \
   --pool hrx:0 --dialect loom \
+  --temperature 0.6 --batch-size 1024 --ubatch-size 1024 \
   --kv-len 32768 \
   --served-name qwen38-q4 \
   --host 127.0.0.1 --port 8080
@@ -369,6 +249,7 @@ Use a matching Q8 MTP module. For Qwen3.8-27B, see
   --mtp /absolute/path/to/qwen38-27b-mtp-q8 \
   --mtp-depth 3 \
   --pool hrx:0 --dialect loom --kv-len 32768 \
+  --temperature 0.6 --batch-size 1024 --ubatch-size 1024 \
   --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```
 
@@ -386,11 +267,12 @@ Prepare the matching Q8 draft model with the [DFlash2 conversion instructions](d
   --dflash2=on \
   --dflash2-model /absolute/path/to/qwen38-27b-dflash2-q8 \
   --pool hrx:0 --dialect loom --kv-len 32768 \
+  --temperature 0.6 --batch-size 1024 --ubatch-size 1024 \
   --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```
 
 DFlash2 replaces MTP for this server process. It evaluates a draft block of eight positions.
-The default verifier checks the anchor token and up to three proposals.
+The verifier checks the anchor token and all seven proposals.
 See [DFlash2](docs/DFLASH2.md) for model compatibility and sampling limits.
 
 ## Connect a client
@@ -463,11 +345,28 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
-### Current BF16 source candidate
+### Current BF16 source measurements
 
-The current baseline, MTP=3 and DFlash2 comparison is shown [above](#current-source-candidate-bf16-mode-comparison).
-It uses one binary and identical requests; its method and quality limits are in the
-[shared-KV report](docs/benchmarks/shared-kv-decode-2026-09-28.md).
+One binary, identical 1024-token coding requests and 384 generated tokens per
+request. The decode rate times 383 tokens after the first token. Each mode starts
+with an empty private disk cache. The resident request retains compiled code
+but reuses zero prompt KV. Compilation is included. All requests have zero host
+fallbacks. The GPU is R9700/gfx1201; target is Qwen3.8-27B Q4 with Q8 draft modules.
+
+Sampling: temperature 0.6, top-k 20, top-p 0.95 and seed 1234. BF16 KV,
+FP32 floating accumulation, batch/ubatch 1024 and configured KV capacity 262100.
+
+| Mode | Cold prefill tokens/s | Cold decode tokens/s | Resident prefill tokens/s | Resident decode tokens/s |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 442.18 | 24.14 | 624.10 | 24.73 |
+| MTP=3 | 403.95 | 37.96 | 608.19 | 48.62 |
+| DFlash2, seven proposals | 417.14 | 31.39 | 616.78 | 42.41 |
+
+This is one pair per mode, not a statistical estimate or long-context Pi replay.
+The 600 PP/s threshold is met on these resident requests. The 29 baseline,
+49 MTP and 103 DFlash2 TPS targets remain unmet. See the
+[final mode comparison](docs/benchmarks/forward-modes-final-2026-09-29.md) for binary
+identity, request hashes, acceptance and timing limits.
 
 ### Earlier FP32 Pi chat measurements
 
@@ -619,6 +518,7 @@ Multi-device model partitioning and continuous HTTP batching remain development 
 | Quantized weights and compute formats | [Quantized operands](docs/QUANT_OPERANDS.md) |
 | FP8 and BF8 conversion | [FP8 conversion](docs/FP8_CONVERSION.md) |
 | Measured optimization results | [Benchmark reports](docs/benchmarks/) |
+| Earlier versions and measurements | [Release history](docs/RELEASE_HISTORY.md) |
 
 ## License
 
