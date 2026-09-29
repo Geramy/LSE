@@ -127,18 +127,18 @@ def main():
 
     L.append("## Requirements")
     L.append("")
-    L.append("The released binary links the ROCm and HRX runtimes and loads them "
-             "at start-up:")
+    L.append("The archive bundles the selected HRX runtime and patched Loom "
+             "compiler. Use the root or `bin/` launchers to select the bundled "
+             "libraries. Compatible Linux C/C++ libraries, ROCm 7.x, HSA and "
+             "the GPU driver remain external requirements.")
     L.append("")
-    L.append("```bash")
-    L.append("export LD_LIBRARY_PATH=/opt/rocm/lib:/path/to/hrx-install/lib:"
-             "$LD_LIBRARY_PATH")
-    L.append("```")
+    L.append("Make the installed ROCm libraries available to the dynamic loader. "
+             "If they are not in its search path, set `LD_LIBRARY_PATH` to "
+             "their installation directory, for example `/opt/rocm/lib`. "
+             "An external HRX installation is not required for this archive.")
     L.append("")
-    L.append("Without that path the HRX backend does not initialize and the "
-             "engine falls back to the CPU backend, which runs the same models "
-             "far slower. Building from source additionally needs g++ 16 for "
-             "C++26 reflection; see the README.")
+    L.append("Building from source needs a compiler with C++26 reflection "
+             "support; see the README for the supported toolchain.")
     L.append("")
 
     if grouped:
