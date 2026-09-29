@@ -11,6 +11,7 @@
 #include "lse/graph/ops.hpp"
 #include "lse/core/hash.hpp"
 #include "lse/runtime/decode_sample.hpp"
+#include "lse/runtime/feature_prefix.hpp"
 
 namespace lse::runtime {
 
@@ -379,10 +380,7 @@ Status Generator::append_draft_context(std::size_t rows, std::int32_t first) {
     return LSE_ERROR(kInternal, "invalid verified draft feature prefix");
   }
   const auto started = now_ns();
-  Array prefix = rows == static_cast<std::size_t>(spec_features_.shape().dim(1))
-                     ? spec_features_
-                     : graph::slice(spec_features_, 1, 0,
-                                    static_cast<std::int64_t>(rows));
+  LSE_ASSIGN_OR(Array prefix, materialized_feature_prefix(spec_features_, rows));
   LSE_RETURN_IF_ERROR(dflash2_->append_context(prefix, first));
   stats_.spec_draft_ns += now_ns() - started;
   return OkStatus();

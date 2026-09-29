@@ -346,14 +346,18 @@ conversation prefix and added 23 tokens.
 | KV and attention | First prefill tokens/s, including compilation | First decode tokens/s | Follow-up decode tokens/s |
 | --- | ---: | ---: | ---: |
 | Earlier FP32 baseline | 56.89 | 26.64 | 31.34 |
-| Current FP32 with bounded attention source and compiled-code reuse | **308.54** | **27.11** | **31.28** |
+| FP32 with bounded attention source and compiled-code reuse | 308.54 | 27.11 | 31.28 |
+| Current FP32, also using materialized DFlash feature views | **309.10** | **27.20** | **32.13** |
 | Earlier optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
 
 Current FP32 compilation took 3.35 seconds across 372 unique kernels, compared
 with 92.91 seconds across 427 kernels in the baseline. Follow-up prefill took
 0.760 seconds. Both FP32 runs generated identical responses and acceptance
 counts. This establishes a reduction in cold compilation stalls; steady decode
-is effectively unchanged. Prompt rates exclude model loading. See the
+is effectively unchanged. The subsequent buffer-view change removes 65 copy
+dispatches and three compiled kernels while preserving both responses; its
+small decode improvement is from one pair, not a statistical result.
+Prompt rates exclude model loading. See the
 [execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
 
 The earlier FP16 run predates the compiler fixes. It generated different text,

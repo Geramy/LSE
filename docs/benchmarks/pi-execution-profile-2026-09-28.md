@@ -150,6 +150,38 @@ descriptors that are absent from this local Loom build. No target policy or test
 expectation was changed to conceal those failures. The actual gfx1201 HTTP run
 above verifies native execution on the installed GPU.
 
+## Remove repeated DFlash feature-graph traversal
+
+The steady decode sample contains 33 of 2,590 inference-thread samples in
+`Program::retain` while appending verified features to DFlash context. The
+entire append-context branch contains 75 samples. It constructs a slice of an
+already-materialized contiguous feature buffer, then traverses the target graph
+to materialize that slice again. The 65 corresponding slice dispatches consume
+only 0.329 ms total GPU time; the avoidable cost is mainly host planning.
+
+A bounded buffer view now retains the allocation and its offset, residency and
+owner while detaching the old computation graph. The helper validates the full
+source extent and storage state. It does not change recurrence, context cursors,
+readback ordering or required GPU completion waits.
+
+All 25 DFlash host cases pass, including offsets, ownership lifetime, opaque
+buffer mirrors, invalid bounds, rejection and continuation. A native two-turn
+comparison reproduces both responses and all proposal counts exactly. It removes
+19 device groups in the first turn and 46 in the second, with no host fallback.
+Unique compilations fall from 372 to 369.
+
+| Measurement | Before buffer view | After buffer view |
+| --- | ---: | ---: |
+| First prefill, s | 16.876 | 16.846 |
+| Follow-up prefill, s | 0.760 | 0.756 |
+| First decode, tokens/s | 27.11 | 27.20 |
+| Follow-up decode, tokens/s | 31.28 | 32.13 |
+
+This single pair shows a small improvement; it is not a statistical speedup
+claim. The required completion waits remain. Of the 2,178 steady samples inside
+HSA waits, 1,572 occur while completing target verification and 446 occur on
+draft-result readback paths. These waits depend on pending GPU results.
+
 ## Remaining limit
 
 The actual Pi workload has not established 451 prompt tokens/s or 46–48 decode

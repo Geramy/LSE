@@ -4,6 +4,7 @@
 #include "lse/model/weights.hpp"
 #if defined(LSE_DFLASH2_RUNTIME_TESTS)
 #include "lse/runtime/generator.hpp"
+#include "lse/runtime/feature_prefix.hpp"
 #endif
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -228,6 +229,91 @@ struct Fixture {
   }
 };
 }
+
+#if defined(LSE_DFLASH2_RUNTIME_TESTS)
+LSE_TEST(materialized_feature_prefix_keeps_offset_owner_and_exact_rows_without_a_graph) {
+  bool released = false;
+  auto* data = new float[40];
+  for (std::size_t i = 0; i < 40; ++i) data[i] = static_cast<float>(i) - 13.5f;
+  backend::DeviceBuffer buffer;
+  buffer.ptr = data; buffer.offset = 4 * sizeof(float); buffer.size_bytes = 32 * sizeof(float);
+  buffer.residency = backend::DeviceIndex{7}; buffer.member = 3;
+  buffer.storage = std::shared_ptr<void>(data, [&](void* ptr) {
+    delete[] static_cast<float*>(ptr); released = true;
+  });
+  graph::Array source = graph::Array::from_buffer(buffer, {1, 4, 8}, DType::kF32);
+  source.node()->member = 3;
+  source.node()->inputs.push_back(graph::Array::zeros({1}, DType::kF32).node());
+  for (std::size_t rows : {1u, 2u, 3u, 4u}) {
+    auto made = runtime::materialized_feature_prefix(source, rows);
+    LSE_EXPECT(made.ok()); if (!made.ok()) continue;
+    auto& view = *made;
+    LSE_EXPECT(view.shape() == (Shape{1, static_cast<std::int64_t>(rows), 8}));
+    LSE_EXPECT_EQ(view.node()->buffer.offset, 4 * sizeof(float));
+    LSE_EXPECT_EQ(view.node()->buffer.size_bytes, rows * 8 * sizeof(float));
+    LSE_EXPECT(view.node()->buffer.storage == buffer.storage);
+    LSE_EXPECT(view.node()->buffer.residency == buffer.residency);
+    LSE_EXPECT_EQ(view.node()->member, 3u);
+    LSE_EXPECT(view.node()->inputs.empty());
+    LSE_EXPECT(view.node()->kind == graph::OpKind::kBuffer);
+    std::vector<float> actual(rows * 8);
+    LSE_EXPECT_OK(graph::interpreter::read_raw(*view.node(), actual.data(), actual.size() * sizeof(float)));
+    LSE_EXPECT(std::memcmp(actual.data(), data + 4, actual.size() * sizeof(float)) == 0);
+  }
+  auto retained = runtime::materialized_feature_prefix(source, 2);
+  LSE_EXPECT(retained.ok());
+  source = {}; buffer = {};
+  LSE_EXPECT(!released);
+  if (retained.ok()) *retained = {};
+  LSE_EXPECT(released);
+}
+LSE_TEST(materialized_feature_prefix_opaque_storage_ignores_stale_mirrors) {
+  OpaqueBufferBackend backend;
+  LSE_EXPECT_OK(backend.init_impl(0));
+  auto allocation = backend.allocate_impl(20 * sizeof(float), backend::MemoryClass::kDevice, backend::kDefaultStream);
+  LSE_EXPECT(allocation.ok()); if (!allocation.ok()) return;
+  auto buffer = allocation.release(); buffer.offset = 2 * sizeof(float); buffer.size_bytes = 16 * sizeof(float);
+  std::vector<float> values(16);
+  for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<float>(i) * .125f;
+  LSE_EXPECT_OK(backend.copy_h2d_impl(values.data(), buffer, values.size() * sizeof(float), 0));
+  auto source = graph::Array::from_buffer(buffer, {1, 4, 4}, DType::kF32);
+  source.node()->host_mirror.assign(values.size() * sizeof(float), std::byte{0xff});
+  source.node()->device_dirty = true;
+  auto made = runtime::materialized_feature_prefix(source, 3);
+  LSE_EXPECT(made.ok()); if (!made.ok()) return;
+  LSE_EXPECT(made->node()->host_mirror.empty());
+  LSE_EXPECT(made->node()->device_dirty && !made->node()->host_dirty);
+  backend::BackendAdapter<OpaqueBufferBackend> adapter;
+  // Read through the same opaque-fixture copy contract, without a scheduler.
+  LSE_EXPECT_OK(graph::interpreter::sync_from_device(*made->node(), adapter));
+  std::vector<float> actual(12);
+  LSE_EXPECT_OK(graph::interpreter::read_raw(*made->node(), actual.data(), actual.size() * sizeof(float)));
+  LSE_EXPECT(std::memcmp(actual.data(), values.data(), actual.size() * sizeof(float)) == 0);
+}
+LSE_TEST(materialized_feature_prefix_rejects_missing_dirty_or_short_storage) {
+  auto storage = std::make_shared<std::vector<std::byte>>(64);
+  backend::DeviceBuffer buffer; buffer.handle = reinterpret_cast<std::uint64_t>(storage->data());
+  buffer.size_bytes = storage->size(); buffer.storage = storage;
+  auto source = graph::Array::from_buffer(buffer, {1, 4, 4}, DType::kF32);
+  LSE_EXPECT(!runtime::materialized_feature_prefix({}, 1).ok());
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 0).ok());
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 5).ok());
+  source.node()->materialized = false;
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+  source.node()->materialized = true; source.node()->host_dirty = true;
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+  source.node()->host_dirty = false; source.node()->buffer.size_bytes = 4;
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+  source.node()->buffer = buffer; source.node()->buffer.storage.reset();
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+  source.node()->buffer = buffer; source.node()->buffer.offset = std::numeric_limits<std::size_t>::max();
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+  source.node()->buffer = buffer; source.node()->shape = {2, 2, 4};
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+  source.node()->shape = {1, std::numeric_limits<std::int64_t>::max(), 8};
+  LSE_EXPECT(!runtime::materialized_feature_prefix(source, 1).ok());
+}
+#endif
 
 LSE_TEST(dflash2_config_checks_target_and_attention_contracts) {
   auto result = model::DFlash2Config::from_json_string(config_json().dump());
