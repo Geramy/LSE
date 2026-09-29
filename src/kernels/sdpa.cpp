@@ -48,28 +48,29 @@ template<class E> struct SplitMergeArgs {
   env::Out<kir::f32, E> out;
 };
 
-template <bool ShortQuery>
-struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuery>> {
-  static constexpr std::string_view kName = ShortQuery
-      ? "attention.short_partial128.wg128c2.v4" : "attention.decode_partial128.wg128c2.v3";
-  static constexpr std::string_view kEntry = ShortQuery
-      ? "lse_sdpa_short_partial128_wg128c2_v4" : "lse_sdpa_decode_partial128_wg128c2_v3";
+struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
+  static constexpr std::string_view kName = "attention.split_partial128.wg128c2.v1";
+  static constexpr std::string_view kEntry = "lse_sdpa_split_partial128_wg128c2_v1";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
-    return (ShortQuery ? dispatch::split_short_supported(s) : dispatch::split_decode_supported(s)) ? this : nullptr;
+    if (s.inputs.empty() || s.inputs[0].rank() != 4) return nullptr;
+    return (s.inputs[0].dim(2) == 1 ? dispatch::split_decode_supported(s)
+                                   : dispatch::split_short_supported(s)) ? this : nullptr;
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (s.input_dtypes.size() < 3) return {};
+    if (s.input_dtypes.size() < 3 || s.inputs.empty() || s.inputs[0].rank() != 4)
+      return {};
     return with_kv_storage(s.input_dtypes[1], s.attrs[1], [&]<kv::CacheDType Storage>() {
-      return emit_storage<Storage>(s);
+      return s.inputs[0].dim(2) == 1 ? emit_storage<Storage, false>(s)
+                                     : emit_storage<Storage, true>(s);
     });
   }
 
-  template <kv::CacheDType Storage>
+  template <kv::CacheDType Storage, bool ShortQuery>
   std::string emit_storage(const KernelShapes& s) const {
     if (!(ShortQuery ? dispatch::split_short_supported(s) : dispatch::split_decode_supported(s)) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
@@ -348,21 +349,20 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
     if (in.size() != 5 || in[0].rank() != 4 || in[1].rank() != 4 || in[4].rank() != 2)
-      return LSE_ERROR(kInvalidArgument, "split decode attention takes five paged inputs");
+      return LSE_ERROR(kInvalidArgument, "split attention takes five paged inputs");
     const auto capacity = in[1].dim(2) * in[4].dim(1);
-    if constexpr (ShortQuery)
+    if (in[0].dim(2) > 1)
       return Shape{in[0].dim(0), in[0].dim(1), in[0].dim(2),
                    (capacity + kSplitKeys - 1) / kSplitKeys, kSplitRecord};
-    else
-      return Shape{in[0].dim(0), in[0].dim(1),
-                   (capacity + kSplitKeys - 1) / kSplitKeys, kSplitRecord};
+    return Shape{in[0].dim(0), in[0].dim(1),
+                 (capacity + kSplitKeys - 1) / kSplitKeys, kSplitRecord};
   }
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     tp.workgroup_size[0] = 128;
     auto query_tile = 1u;
-    if constexpr (ShortQuery) {
+    if (s.inputs[0].dim(2) > 1) {
       query_tile = dispatch::attention_shapes::short_query_tile(
           static_cast<std::uint32_t>(s.inputs[0].dim(2)),
           static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
@@ -380,19 +380,19 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
 };
 
 
-template <bool ShortQuery>
-struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2<ShortQuery>> {
-  static constexpr std::string_view kName = ShortQuery
-      ? "attention.short_merge128.wg128c2.v1" : "attention.decode_merge128.wg128c2.v3";
-  static constexpr std::string_view kEntry = ShortQuery
-      ? "lse_sdpa_short_merge128_wg128c2_v1" : "lse_sdpa_decode_merge128_wg128c2_v3";
+struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
+  static constexpr std::string_view kName = "attention.split_merge128.wg128c2.v1";
+  static constexpr std::string_view kEntry = "lse_sdpa_split_merge128_wg128c2_v1";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 1; }
   bool owns_indexing() const noexcept override { return true; }
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (!(ShortQuery ? dispatch::split_short_merge_supported(s) : dispatch::split_decode_merge_supported(s)) || !s.types.scalar || !s.intrinsics || !s.store)
+    if (s.inputs.empty() ||
+        !(s.inputs[0].rank() == 5 ? dispatch::split_short_merge_supported(s)
+                                 : dispatch::split_decode_merge_supported(s)) ||
+        !s.types.scalar || !s.intrinsics || !s.store)
       return {};
-    const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(ShortQuery ? 3 : 2));
+    const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 2));
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     SplitMergeArgs<env::Emit> a;
@@ -413,11 +413,7 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2<ShortQuery>> 
         weight = math::exp(a.partial[pb] - maximum.read());
       weights[part] = weight.read();
     };
-    if constexpr (ShortQuery) {
-      if (auto owns = e.when(lane < parts)) write_weight(lane);
-    } else {
-      for (auto part : e.range(lane, e.u32(parts), 128u)) write_weight(part);
-    }
+    for (auto part : e.range(lane, e.u32(parts), 128u)) write_weight(part);
     e.barrier();
     auto denom = e.var(0.0f), acc0 = e.var(0.0f), acc1 = e.var(0.0f);
     for (auto p : e.range(parts)) {
@@ -434,29 +430,23 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2<ShortQuery>> 
     return k.lds().ok() ? k.str() : std::string{};
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
-    if (in.size() != 1 || in[0].rank() != (ShortQuery ? 5 : 4) ||
-        in[0].dim(ShortQuery ? 4 : 3) != kSplitRecord)
-      return LSE_ERROR(kInvalidArgument, "split decode merge takes one partial record array");
-    return Shape{in[0].dim(0), in[0].dim(1), ShortQuery ? in[0].dim(2) : 1, 256};
+    if (in.size() != 1 || (in[0].rank() != 4 && in[0].rank() != 5) ||
+        in[0].dim(in[0].rank() - 1) != kSplitRecord)
+      return LSE_ERROR(kInvalidArgument, "split attention merge takes one partial record array");
+    return Shape{in[0].dim(0), in[0].dim(1), in[0].rank() == 5 ? in[0].dim(2) : 1, 256};
   }
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     tp.workgroup_size[0] = 128;
     tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / 256u);
-    tp.lds_bytes = static_cast<std::uint32_t>(s.inputs[0].dim(ShortQuery ? 3 : 2)) * sizeof(float);
+    tp.lds_bytes = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 2)) * sizeof(float);
     return tp;
   }
 };
 
-using SplitDecodePartialWg128C2 = SplitPartialWg128C2<false>;
-using SplitShortPartialWg128C2 = SplitPartialWg128C2<true>;
-using SplitDecodeMergeWg128C2 = SplitMergeWg128C2<false>;
-using SplitShortMergeWg128C2 = SplitMergeWg128C2<true>;
-LSE_REGISTER_PRIMITIVE(SplitDecodePartialWg128C2);
-LSE_REGISTER_PRIMITIVE(SplitShortPartialWg128C2);
-LSE_REGISTER_PRIMITIVE(SplitShortMergeWg128C2);
-LSE_REGISTER_PRIMITIVE(SplitDecodeMergeWg128C2);
+LSE_REGISTER_PRIMITIVE(SplitPartialWg128C2);
+LSE_REGISTER_PRIMITIVE(SplitMergeWg128C2);
 
 // Scalar attention supports contiguous (3/4 inputs) and paged (5 inputs) KV.
 struct SdpaKernel final : KernelPrimitive<SdpaKernel> {

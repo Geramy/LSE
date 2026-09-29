@@ -243,7 +243,6 @@ bool split_short_merge_supported(const KernelShapes& s) {
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
-        s.inputs[0].dim(3) <= rule.threads &&
         s.inputs[0].dim(3) <= rule.max_keys() / shapes::kShortKeyWindow &&
         ((static_cast<std::uint32_t>(s.inputs[0].dim(3)) * sizeof(float) + 15u) / 16u) * 16u <=
             backend::workgroup_lds_bytes(s.device)) return true;

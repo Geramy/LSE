@@ -73,8 +73,8 @@ LSE_TEST(split_decode_attention_orders_two_barriers_and_versions_both_kernels) {
   device.max_threads_per_workgroup = 1024;
   device.lds_bytes_per_workgroup = 65536;
   backend::LoomEmitter emitter;
-  constexpr auto partial_name = "attention.decode_partial128.wg128c2.v3";
-  constexpr auto merge_name = "attention.decode_merge128.wg128c2.v3";
+  constexpr auto partial_name = "attention.split_partial128.wg128c2.v1";
+  constexpr auto merge_name = "attention.split_merge128.wg128c2.v1";
   for (int capacity : {128, 320, 2048}) {
     for (auto mask : {MaskKind::kNone, MaskKind::kCausal, MaskKind::kSlidingWindow}) {
       auto q = leaf({2, 24, 1, 256});

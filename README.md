@@ -26,13 +26,21 @@ LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
 
-## Current release: v0.4.18
+## Current release: v0.4.19
 
-This version reduces unused GPU weight-allocation space for the Q4 target and
-Q8 DFlash2 draft by about 1.71 GB in a matched R9700 test. Warm decode stayed
-at 49.9 tokens/s, and output and acceptance matched. See the
-[weight slab measurements](docs/benchmarks/weight-slab-memory-2026-09-29.md).
-The v0.4.17 workspace-retirement fix remains active; see
+This version releases consumed prefill graphs before paged KV growth and uses
+smaller growth steps above 32K tokens. The local R9700 with a Q4 target, Q8
+DFlash2 draft and BF16 KV completed a 65,354-token prompt and a subsequent
+32-token decode request. Peak reserved GPU memory in the extension was 29.72 GB.
+One split-attention kernel family now covers single-token decode and short
+verification queries. In a matched cold 65,126-token HTTP request, DFlash2
+decode increased from 8.51 to 14.57 tokens/s; prefill stayed near 147 tokens/s.
+The output text matched. See the
+[attention comparison](docs/benchmarks/long-context-attention-2026-09-29.md).
+The configured KV limit is not a measured usable capacity; see the
+[long-context test](docs/benchmarks/kv-growth-2026-09-29.md).
+The v0.4.18 weight-allocation reduction and v0.4.17 workspace-retirement fix
+remain active; see [weight slab measurements](docs/benchmarks/weight-slab-memory-2026-09-29.md) and
 [prefill memory ownership](#prefill-memory-ownership).
 
 The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
@@ -107,11 +115,17 @@ when prefill changes chunk width. Consecutive chunks of the same width retain
 replay. Model weights, compiled kernels and live KV storage remain resident.
 DFlash2 also releases completed large context-projection programs.
 
+The generator releases each consumed chunk's hidden graph before recording the
+next chunk. When the KV pool moves, the scheduler releases its previous
+program and the model drops redundant paged KV references. This removes old
+pool ownership during long-context growth. See the
+[65K-token test](docs/benchmarks/kv-growth-2026-09-29.md).
+
 A matched 6143-token ragged request reduced reserved GPU memory from 29.77 GB
 to 28.26 GB, with identical output and acceptance counts. Prefill and decode
 rates remained within 0.5% in that comparison. See the
 [memory report](docs/benchmarks/prefill-workspace-memory-2026-09-29.md) for the
-method and the unresolved reproduction of the reported allocation failure.
+earlier workspace method and limits.
 
 ## Supported platforms
 
@@ -137,7 +151,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.18`.
+The examples below use `v0.4.19`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -146,7 +160,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.18
+   lse_tag=v0.4.19
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -179,7 +193,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.18
+   lse_tag=v0.4.19
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"

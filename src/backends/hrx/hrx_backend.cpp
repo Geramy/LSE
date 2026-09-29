@@ -1412,10 +1412,14 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
     // be handed back to the pool here, flushed or not.
     auto stream = stream_at(0);
     if (!stream.ok()) return stream.status();
-    LSE_RETURN_IF_ERROR(from_hrx(
-        hrx_buffer_allocate(static_cast<hrx_stream_t>(*stream), bytes,
-                            HRX_MEMORY_TYPE_DEVICE_LOCAL, usage, &buffer),
-        "hrx_buffer_allocate"));
+    hrx_status_t allocated = hrx_buffer_allocate(
+        static_cast<hrx_stream_t>(*stream), bytes,
+        HRX_MEMORY_TYPE_DEVICE_LOCAL, usage, &buffer);
+    if (!hrx_status_is_ok(allocated)) {
+      const std::string context = "hrx_buffer_allocate (" +
+                                  std::to_string(bytes) + " bytes)";
+      return from_hrx(allocated, context.c_str());
+    }
     unflushed_launches_[0] = 0;
   } else {
     // Staging has to stay mapped; the stream-ordered path is device-local.

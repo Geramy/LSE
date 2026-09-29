@@ -3,6 +3,22 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.19: long-context KV growth and split attention
+
+Consumed prefill chunk graphs and the scheduler's previous program are released
+before a paged KV pool moves. Pools above 32K tokens grow in 4K-token steps to
+limit allocation pressure. The local R9700 completed a 65,354-token prompt
+with BF16 KV and Q8 DFlash2, followed by a 32-token decode request. The test
+peaked at 29.72 GB of reserved device memory. A shorter deterministic response
+matched v0.4.18 exactly. See the
+[long-context report](benchmarks/kv-growth-2026-09-29.md).
+
+One split partial and one merge kernel family now serve both single-token
+decode and short verification queries. A matched cold 65,126-token Q4+DFlash2
+request improved from 8.51 to 14.57 decode tokens/s; prefill measured 147.7
+versus 147.0 prompt tokens/s. Both runs produced the same 64-token response.
+See the [attention comparison](benchmarks/long-context-attention-2026-09-29.md).
+
 ## v0.4.18: smaller weight slabs
 
 The weight allocator now uses 512 MiB slabs on macOS HRX, avoiding large

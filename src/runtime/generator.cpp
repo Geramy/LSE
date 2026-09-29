@@ -266,9 +266,11 @@ Result<std::vector<float>> Generator::step(
   }
   std::size_t previous_width = 0;
   for (std::size_t take : passes) {
-    if (previous_width != 0 && take != previous_width) {
+    if (previous_width != 0) {
       hidden = {};
-      LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
+      if (take != previous_width) {
+        LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
+      }
     }
     previous_width = take;
     const auto first = tokens.begin() + static_cast<std::ptrdiff_t>(at);

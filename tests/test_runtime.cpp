@@ -715,6 +715,10 @@ LSE_TEST(the_pool_ladder_bounds_the_shapes_a_context_can_compile) {
   LSE_EXPECT_EQ(kv::pool_rung(9, 256), 16);
   LSE_EXPECT_EQ(kv::pool_rung(200, 256), 256);
   LSE_EXPECT_EQ(kv::pool_rung(999, 256), 256);
+  LSE_EXPECT_EQ(kv::pool_rung(2048, 16384), 2048);
+  LSE_EXPECT_EQ(kv::pool_rung(2049, 16384), 2304);
+  LSE_EXPECT_EQ(kv::pool_rung(2305, 16384), 2560);
+  LSE_EXPECT_EQ(kv::pool_rung(2305, 2400), 2400);
   // 4096 tokens at 16 per block is 256 blocks, so the whole ladder a session can
   // ever walk is six rungs.
   int rungs = 0;
@@ -1993,8 +1997,8 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
          std::pair{graph::MaskKind::kSlidingWindow, 7},
          std::pair{graph::MaskKind::kSlidingWindow, 0}}) {
       auto out = graph::sdpa_paged(q, k, v, .0625f, mask, window, meta, t, block, &device);
-      LSE_EXPECT(out.node()->prim->name() == "attention.decode_merge128.wg128c2.v3");
-      if (out.node()->prim->name() != "attention.decode_merge128.wg128c2.v3") return;
+      LSE_EXPECT(out.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
+      if (out.node()->prim->name() != "attention.split_merge128.wg128c2.v1") return;
       auto partial = graph::Array(out.node()->inputs[0]);
       graph::Program program;
       const graph::NodePtr roots[]{out.node()};

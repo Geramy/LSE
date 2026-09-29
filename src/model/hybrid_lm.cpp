@@ -787,7 +787,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   if (pool_moved && !replaces_previous) {
     if (graph::Scheduler* sched = graph::default_scheduler()) {
-      LSE_RETURN_IF_ERROR(sched->drain());
+      LSE_RETURN_IF_ERROR(sched->release_program());
     }
     // All retained programs name the old KV allocation. Keep the current
     // recurrent state, then release the graphs that can no longer replay.
@@ -797,6 +797,10 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       detach_state(st.gdn_conv_k);
       detach_state(st.gdn_conv_v);
       detach_state(st.gdn_conv_qkv);
+      if (st.paged.valid()) {
+        st.key_cache = {};
+        st.value_cache = {};
+      }
     }
     for (ForwardCache& c : caches_) c = ForwardCache{};
     cache_.t_key = t_now;
@@ -1135,8 +1139,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.split_decode_attention = false;
   for (const auto& group : cache_.program.groups())
     for (const auto& node : group.nodes)
-      if (node->prim && (node->prim->name() == "attention.decode_partial128.wg128c2.v3" ||
-                         node->prim->name() == "attention.short_partial128.wg128c2.v4"))
+      if (node->prim && node->prim->name() == "attention.split_partial128.wg128c2.v1")
         cache_.split_decode_attention = true;
   cache_.tokens = tokens;
   cache_.hidden = y;

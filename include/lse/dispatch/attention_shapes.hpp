@@ -51,15 +51,14 @@ inline constexpr std::array kDecodeHeadRules{
 
 struct SplitShortRule {
   std::string_view arch;
-  std::uint32_t wave, min_rows, max_rows, threads, head_dim;
+  std::uint32_t wave, min_rows, max_rows, threads, head_dim, max_partitions;
 
-  // Each merge lane initializes one partition weight.
   [[nodiscard]] constexpr std::uint32_t max_keys() const {
-    return kShortKeyWindow * threads;
+    return kShortKeyWindow * max_partitions;
   }
 };
 inline constexpr std::array kSplitShortRules{
-    SplitShortRule{"gfx1201", 32, 2, 8, 128, 256},
+    SplitShortRule{"gfx1201", 32, 2, 8, 128, 256, 512},
 };
 
 struct ShortTileRule {
@@ -70,6 +69,15 @@ inline constexpr std::array kShortTileRules{
     ShortTileRule{4, 4, 8192, 4, true},
     ShortTileRule{5, 8, 8192, 4, true},
     ShortTileRule{4, 8, 16384, 4, true},
+    ShortTileRule{4, 8, 32768, 4, true},
+    ShortTileRule{4, 8, 36864, 4, true},
+    ShortTileRule{4, 8, 40960, 4, true},
+    ShortTileRule{4, 8, 45056, 4, true},
+    ShortTileRule{4, 8, 49152, 4, true},
+    ShortTileRule{4, 8, 53248, 4, true},
+    ShortTileRule{4, 8, 57344, 4, true},
+    ShortTileRule{4, 8, 61440, 4, true},
+    ShortTileRule{4, 8, 65536, 4, true},
 };
 
 [[nodiscard]] constexpr std::uint32_t short_query_tile(std::uint32_t rows,

@@ -565,12 +565,12 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 }
 
 namespace {
-Array split_paged_attention(const NodePtr& baseline, std::string_view partial_name,
-                            std::string_view merge_name, bool short_query) {
-  const auto* partial_prim = find_primitive(partial_name);
-  const auto* merge_prim = find_primitive(merge_name);
+Array split_paged_attention(const NodePtr& baseline) {
+  const auto* partial_prim = find_primitive("attention.split_partial128.wg128c2.v1");
+  const auto* merge_prim = find_primitive("attention.split_merge128.wg128c2.v1");
   if (!partial_prim || !merge_prim) return Array(baseline);
   const auto& q = baseline->inputs[0]->shape;
+  const bool short_query = q.dim(2) > 1;
   const auto capacity = baseline->inputs[1]->shape.dim(2) * baseline->inputs[4]->shape.dim(1);
   const auto parts = (capacity + 127) / 128;
   const Shape shape = short_query ? Shape{q.dim(0), q.dim(1), q.dim(2), parts, 258}
@@ -617,12 +617,9 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     request.attrs = n->attrs;
     request.iattrs = n->iattrs;
     request.device = device;
-    if (dispatch::split_short_default_supported(request))
-      return split_paged_attention(n, "attention.short_partial128.wg128c2.v4",
-                                     "attention.short_merge128.wg128c2.v1", true);
-    if (dispatch::split_decode_supported(request))
-      return split_paged_attention(n, "attention.decode_partial128.wg128c2.v3",
-                                     "attention.decode_merge128.wg128c2.v3", false);
+    if (dispatch::split_short_default_supported(request) ||
+        dispatch::split_decode_supported(request))
+      return split_paged_attention(n);
   }
   return Array(n);
 }

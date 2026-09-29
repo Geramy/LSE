@@ -5,6 +5,17 @@ namespace lse::kv {
 std::int32_t pool_rung(std::int32_t blocks, std::int32_t ceiling) noexcept {
   if (ceiling <= 0) return 0;
   if (blocks >= ceiling) return ceiling;
+  // Beyond 32K tokens, a full doubling can exceed the free VRAM while both
+  // the old and replacement pools are live. Add at most 256 blocks (4K tokens)
+  // per rung instead.
+  constexpr std::int32_t kLargePoolStart = 2048;
+  constexpr std::int32_t kLargePoolStep = 256;
+  if (blocks > kLargePoolStart) {
+    const std::int32_t remainder = blocks % kLargePoolStep;
+    const std::int32_t added =
+        remainder == 0 ? 0 : kLargePoolStep - remainder;
+    return added >= ceiling - blocks ? ceiling : blocks + added;
+  }
   std::int32_t rung = kMinPoolBlocks;
   while (rung < blocks && rung < ceiling) rung *= 2;
   return rung < ceiling ? rung : ceiling;

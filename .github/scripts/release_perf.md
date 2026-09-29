@@ -1,3 +1,27 @@
+### Long-context split attention
+
+The separate single-token and short-query split kernels are consolidated into
+one partial and one merge family. Four verifier query rows share KV loads at
+capacities through 65K keys. In matched cold 65,126-token HTTP requests on the
+local R9700, Q4+DFlash2 decode rose from 8.51 to 14.57 tokens/s. Prefill was
+147.7 versus 147.0 tokens/s, and the 64-token output matched. The prompts
+repeat a short sequence; this is not a general chat throughput claim.
+[Method and limits](https://github.com/Geramy/LSE/blob/v0.4.19/docs/benchmarks/long-context-attention-2026-09-29.md).
+
+### Long-context KV growth
+
+The macOS R9700 with a Q4 target, Q8 DFlash2 draft and BF16 KV completed
+successive 30,726, 33,126, 37,126 and 41,126-token prompts in one HTTP
+process. It then completed a 65,354-token prompt with 41,394 cached tokens.
+Peak reserved device memory during that extension was 29.72 GB, leaving at
+least 4.22 GB free in sampled counters. A 32-token continuation at 65K
+completed without device allocation growth. The shorter seeded 8,192-token
+request generated exactly the same 128-token response as v0.4.18.
+
+The long prompts repeat a short synthetic sequence. Its decode rates are not
+representative of general conversations. The configured 262,100-token KV limit
+is not a measured usable capacity. [Method and limits](https://github.com/Geramy/LSE/blob/v0.4.19/docs/benchmarks/kv-growth-2026-09-29.md).
+
 ### Weight slab VRAM reduction
 
 The macOS HRX weight allocator now packs the Q4 target and Q8 DFlash2 draft

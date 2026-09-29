@@ -67,10 +67,10 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
     const auto request = fx.request();
     LSE_EXPECT(dispatch::split_decode_supported(request));
     const auto output = fx.graph();
-    LSE_EXPECT(output.node()->prim->name() == "attention.decode_merge128.wg128c2.v3");
+    LSE_EXPECT(output.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
     const auto partial = output.node()->inputs[0];
     const unsigned parts = (static_cast<unsigned>(capacity) + 127u) / 128u;
-    LSE_EXPECT(partial->prim->name() == "attention.decode_partial128.wg128c2.v3");
+    LSE_EXPECT(partial->prim->name() == "attention.split_partial128.wg128c2.v1");
     LSE_EXPECT(partial->shape == Shape({2, 24, parts, 258}));
     const NodePtr roots[]{output.node()};
     const auto groups = Partitioner::partition(roots, &fx.gpu);
@@ -133,7 +133,7 @@ LSE_TEST(decode_attention_scope_covers_every_nonnegative_offset) {
 LSE_TEST(decode_attention_merge_initializes_partitions_beyond_one_wavegroup) {
   Fixture fx;
   const auto* merge = dynamic_cast<const KernelPrimitiveBase*>(
-      find_primitive("attention.decode_merge128.wg128c2.v3"));
+      find_primitive("attention.split_merge128.wg128c2.v1"));
   LSE_EXPECT(merge != nullptr);
   if (!merge) return;
   for (int parts : {1, 64, 128, 129, 256, 2048, 16384, 16385}) {
@@ -189,7 +189,7 @@ LSE_TEST(decode_attention_keeps_every_kv_storage_format_on_the_split_route) {
     request.attrs[1] = static_cast<float>(storage);
     LSE_EXPECT(dispatch::split_decode_supported(request));
     LSE_EXPECT(fx.graph(MaskKind::kCausal, 0, true, storage).node()->prim->name() ==
-               "attention.decode_merge128.wg128c2.v3");
+               "attention.split_merge128.wg128c2.v1");
   }
 }
 
