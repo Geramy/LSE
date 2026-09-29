@@ -1,5 +1,6 @@
 #pragma once
 #include "lse/graph/graph.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/dispatch/quant.hpp"
 #include "lse/dispatch/q8_matrix.hpp"
@@ -11,6 +12,10 @@ namespace lse::dispatch {
     std::uint64_t key, const graph::FusionGroup& group,
     const backend::DeviceInfo& device, graph::kir::TypeTable types,
     const graph::DialectSourceTable& intrinsics) {
+  if (graph::group_bindings_may_alias(group)) {
+    key ^= implementation_id("bindings.aliases.v1");
+    key *= 1099511628211ull;
+  }
   key ^= implementation_id("dispatch.tables.v1");
   key *= 1099511628211ull;
   key ^= kTableRevision;

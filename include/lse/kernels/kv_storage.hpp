@@ -47,21 +47,20 @@ ir::Val<ir::u32> kv_block_index(const ir::Val<ir::f32>& block) {
     return ir::cast<ir::u32>(block);
 }
 
-// Callers retain logical FP32 element indices; only this load maps physical
-// pitch.
+// The vector and column stay separate when the caller already knows them.
 template <kv::CacheDType Format>
 ir::Val<ir::f32>
-kv_load(ir::env::Emit &e,
-        const ir::env::In<KvElement<Format>, ir::env::Emit> &input,
-        const ir::Val<ir::u32> &index, std::uint32_t width) {
+kv_load_vector(ir::env::Emit &e,
+               const ir::env::In<KvElement<Format>, ir::env::Emit> &input,
+               const ir::Val<ir::u32> &vector,
+               const ir::Val<ir::u32> &column, std::uint32_t width) {
   if constexpr (!kv::packed_cache(Format)) {
-    return math::widen(input[index]);
+    return math::widen(input[e.let(vector * width + column)]);
   } else {
     constexpr auto element = Format == kv::CacheDType::kFP8
                                  ? math::MatrixElem::kFp8
                                  : math::MatrixElem::kBf8;
-    const auto base = e.let((index / width) * (width / 4u + 1u));
-    const auto column = e.let(index % width);
+    const auto base = e.let(vector * (width / 4u + 1u));
     const auto bits = e.let(input[base + column / 4u]);
     const auto byte = e.let(column % 4u);
     const auto value = math::unpack_fp8<element>(bits, ir::cast<ir::i32>(byte));
@@ -71,13 +70,30 @@ kv_load(ir::env::Emit &e,
   }
 }
 
+// Callers retain logical FP32 element indices; only this load maps physical pitch.
+template <kv::CacheDType Format>
+ir::Val<ir::f32>
+kv_load(ir::env::Emit &e,
+        const ir::env::In<KvElement<Format>, ir::env::Emit> &input,
+        const ir::Val<ir::u32> &index, std::uint32_t width) {
+  if constexpr (!kv::packed_cache(Format)) {
+    return math::widen(input[index]);
+  } else {
+    return kv_load_vector<Format>(e, input, e.let(index / width),
+                                  e.let(index % width), width);
+  }
+}
+
 template <kv::CacheDType Format>
 auto kv_load_pair(ir::env::Emit &e,
                   const ir::env::In<KvElement<Format>, ir::env::Emit> &input,
                   const ir::Val<ir::u32> &index, std::uint32_t width) {
   if constexpr (Format == kv::CacheDType::kF32)
     return e.load(input, index, 8u);
-  else
+  else if constexpr (Format == kv::CacheDType::kF16 || Format == kv::CacheDType::kBF16) {
+    const auto pair = e.load(input, index, 4u);
+    return std::array<ir::Val<ir::f32>, 2>{math::widen(pair[0]), math::widen(pair[1])};
+  } else
     return std::array<ir::Val<ir::f32>, 2>{
         kv_load<Format>(e, input, index, width),
         kv_load<Format>(e, input, index + 1u, width)};

@@ -96,10 +96,6 @@ bool paged_inputs(const KernelShapes& s) {
   return true;
 }
 
-std::uint64_t flash_lds_bytes(const FlashDims& d, std::uint32_t rows) {
-  return static_cast<std::uint64_t>(rows) *
-         (d.dh + 2ull * shapes::kFlashKeyWindow + 4) * sizeof(float);
-}
 }  // namespace
 
 bool paged_attention_inputs_valid(const KernelShapes& s) { return paged_inputs(s); }
@@ -127,44 +123,29 @@ FlashDims flash_dimensions(const KernelShapes& s) {
   return d;
 }
 
-bool flash_supported(const KernelShapes& s, std::uint32_t query_rows) {
-  const auto d = flash_dimensions(s);
-  if (!d.valid || !s.device ||
-      s.device->max_threads_per_workgroup < shapes::kFlashThreads || !attention_ops(s)) return false;
-  for (const auto& rule : shapes::kFlashRules)
-    if (query_rows == rule.tile_rows)
-      return flash_lds_bytes(d, query_rows) <= backend::workgroup_lds_bytes(s.device);
-  return false;
-}
-
-bool flash_wmma_f16_supported(const KernelShapes& s) {
+bool flash_wmma_supported(const KernelShapes& s) {
   const auto d = flash_dimensions(s);
   if (!d.valid || !s.device || !s.intrinsics || !s.types.scalar ||
       !attention_ops(s) || !has_ops(s, {"wave.shfl_xor"}) ||
-      s.input_dtypes[1] != DType::kF16 || s.input_dtypes[2] != DType::kF16 ||
-      kv::cache_dtype(s.input_dtypes[1], s.attrs[1]) != kv::CacheDType::kF16 ||
       s.output != Shape{d.bsz, d.qh, d.tq, d.dv} ||
       !std::isfinite(d.scale) || d.scale <= 0.0f ||
       !s.staged.name.empty() || !s.staged_quant.codes.empty()) return false;
-  const auto capacity = static_cast<std::uint64_t>(d.stride) * d.ts;
   bool geometry = false;
   for (const auto& rule : shapes::kFlashWmmaRules)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
-        s.device->max_threads_per_workgroup >= rule.threads &&
-        d.bsz <= rule.max_batch && d.qh == rule.query_heads && d.kvh == rule.key_heads &&
-        d.tq >= rule.min_rows && d.tq <= rule.max_rows &&
-        d.dh == rule.head_dim && d.dv == rule.head_dim && d.ts == rule.block &&
-        capacity >= rule.min_keys && capacity <= rule.max_keys && power_of_two(static_cast<std::int64_t>(capacity)) &&
-        d.mask == rule.mask && d.window == static_cast<std::uint32_t>(rule.window) &&
-        backend::workgroup_lds_bytes(s.device) >= rule.lds_bytes &&
-        backend::max_load_bytes(*s.device) >= 16) geometry = true;
+        s.device->max_threads_per_workgroup >= rule.threads && d.tq >= rule.min_rows &&
+        d.dh <= rule.max_head_dim && d.dv <= rule.max_head_dim &&
+        backend::workgroup_lds_bytes(s.device) >= shapes::flash_wmma_lds_bytes(d.dh))
+      geometry = true;
   if (!geometry) return false;
   const auto target = kernels::matrix_target(*s.device);
   if (!target) return false;
+  const auto operand = kv::cache_dtype(s.input_dtypes[1], s.attrs[1]) == kv::CacheDType::kF16
+      ? math::MatrixElem::kF16 : math::MatrixElem::kBF16;
   const auto caps = kernels::device_matrix_caps(*s.device);
   for (const auto& row : math::matrix_core_table())
     if (row.target == *target && row.wave == s.device->wavefront_size &&
-        row.acc == math::MatrixElem::kF32 && row.operand == math::MatrixElem::kF16 &&
+        row.acc == math::MatrixElem::kF32 && row.operand == operand &&
         row.m == 16 && row.n == 16 && row.k_step == 16 && row.chained == 1 &&
         row.a_len == 8 && row.b_len == 8 && row.c_len == 8 && row.emittable() &&
         math::has_cap(caps, row.cap) && !s.intrinsics->find(row.key).empty()) return true;
@@ -268,16 +249,7 @@ bool split_short_merge_supported(const KernelShapes& s) {
 }
 
 AttentionPlan attention_plan(const KernelShapes& s) {
-  if (flash_wmma_f16_supported(s)) return AttentionPlan::kFlashWmmaF16;
-  const auto d = flash_dimensions(s);
-  if (!d.valid || !s.device || s.device->max_threads_per_workgroup < shapes::kFlashThreads ||
-      !attention_ops(s)) return AttentionPlan::kScalar;
-  const auto budget = backend::workgroup_lds_bytes(s.device);
-  for (const auto& rule : shapes::kFlashRules)
-    if ((rule.arch.empty() || s.device->arch == rule.arch) &&
-        d.tq >= rule.min_rows && flash_lds_bytes(d, rule.tile_rows) <= budget)
-      return rule.plan;
-  return AttentionPlan::kScalar;
+  return flash_wmma_supported(s) ? AttentionPlan::kFlashWmma : AttentionPlan::kScalar;
 }
 
 bool reduction_row_supported(const KernelShapes& s) {

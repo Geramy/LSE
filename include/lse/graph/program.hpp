@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "lse/graph/codegen.hpp"
@@ -89,6 +90,7 @@ class Program {
  private:
   std::vector<NodePtr> roots_;
   std::vector<NodePtr> nodes_;
+  std::vector<std::pair<const Node*, bool>> view_ownership_;
   std::vector<Workgroup> phases_;
   std::vector<FusionGroup> groups_;
   struct EmissionCache {
@@ -96,6 +98,7 @@ class Program {
     const backend::IBackend* backend = nullptr;
     const IKernelEmitter* emitter = nullptr;
     std::uint64_t key = 0;
+    bool aliases = false;
     std::string arch;
     std::optional<EmittedKernel> kernel;
   };

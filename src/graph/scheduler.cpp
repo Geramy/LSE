@@ -1,5 +1,6 @@
 #include "lse/graph/gdn_pair.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/graph/view.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -810,69 +811,29 @@ FallbackChain& Scheduler::fallback_chain() const noexcept {
 
 namespace {
 
-backend::DeviceBuffer view_of(const backend::DeviceBuffer& src,
-                              std::size_t byte_offset, std::size_t byte_size) {
-  backend::DeviceBuffer v = src;
-  v.offset = src.offset + byte_offset;
-  v.size_bytes = byte_size;
-  return v;
-}
-
-void alias_onto(Node& dst, const Node& src, backend::DeviceBuffer buf,
-                std::size_t host_byte_off) {
-  dst.buffer = buf;
-  dst.device_dirty = src.device_dirty && !src.host_dirty;
-  dst.host_dirty = src.host_dirty;
-  dst.host_mirror.clear();
-  if (src.host_dirty && host_byte_off + buf.size_bytes <= src.host_mirror.size()) {
-    const auto begin = src.host_mirror.begin() +
-                       static_cast<std::ptrdiff_t>(host_byte_off);
-    dst.host_mirror.assign(begin, begin + static_cast<std::ptrdiff_t>(buf.size_bytes));
-  }
-  dst.materialized = true;
-}
-
-// Reshape is a view of the same bytes. A slice is a real device copy (its own
-// kernel) so MixerState never aliases a live producer buffer.
 Status try_alias_group(const FusionGroup& group) {
-  for (const NodePtr& n : group.nodes) {
-    if (n->kind != OpKind::kReshape || n->inputs.size() != 1) {
-      return LSE_ERROR(kUnimplemented, "not a reshape view");
+  for (const NodePtr& node : group.nodes) {
+    if (!node) return LSE_ERROR(kInvalidArgument, "null buffer view");
+    if (node->kind == OpKind::kConstant || node->kind == OpKind::kBuffer) {
+      if (!node->materialized || !node->buffer.valid())
+        return LSE_ERROR(kUnimplemented, "view group has an incomplete leaf");
+      continue;
     }
-    const Node& src = *n->inputs[0];
-    if (!src.materialized || !src.buffer.valid()) {
-      return LSE_ERROR(kUnimplemented, "view alias needs a materialized input");
-    }
-    if (src.dtype != n->dtype || src.element_count() != n->element_count()) {
-      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
-    }
-    const std::size_t bytes =
-        dtype_storage_bytes(n->dtype, n->element_count());
-    if (bytes == 0 || bytes > src.buffer.size_bytes) {
-      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
-    }
-    alias_onto(*n, src, view_of(src.buffer, 0, bytes), 0);
+    if (!is_buffer_view(*node))
+      return LSE_ERROR(kUnimplemented, "not a buffer view");
+    LSE_RETURN_IF_ERROR(bind_buffer_view(*node));
   }
   return OkStatus();
 }
 
-void alias_ready_reshapes(const FusionGroup& group) {
+void alias_ready_views(const FusionGroup& group) {
   bool progressed = true;
   while (progressed) {
     progressed = false;
-    for (const NodePtr& n : group.nodes) {
-      if (!n || n->kind != OpKind::kReshape || n->inputs.size() != 1) continue;
-      if (n->buffer.valid() && n->materialized) continue;
-      const Node& src = *n->inputs[0];
-      if (!src.materialized || !src.buffer.valid()) continue;
-      if (src.dtype != n->dtype || src.element_count() != n->element_count()) {
-        continue;
-      }
-      const std::size_t bytes =
-          dtype_storage_bytes(n->dtype, n->element_count());
-      if (bytes == 0 || bytes > src.buffer.size_bytes) continue;
-      alias_onto(*n, src, view_of(src.buffer, 0, bytes), 0);
-      progressed = true;
+    for (const NodePtr& node : group.nodes) {
+      if (!node || !is_buffer_view(*node) || node->materialized) continue;
+      if (!node->inputs[0]->materialized || !node->inputs[0]->buffer.valid()) continue;
+      if (bind_buffer_view(*node).ok()) progressed = true;
     }
   }
 }
@@ -1080,23 +1041,16 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // require no dispatch at all, so neither a kernel nor the host interpreter
   // is guaranteed to validate it later.
   for (const NodePtr& node : order) {
-    if (node->kind != OpKind::kReshape) continue;
-    if (node->inputs.size() != 1 || !node->inputs[0]) {
-      return LSE_ERROR(kInvalidArgument, "reshape requires one input");
-    }
-    const Node& source = *node->inputs[0];
-    if (source.dtype != node->dtype ||
-        source.element_count() != node->element_count()) {
-      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
-    }
-    const std::size_t bytes =
-        dtype_storage_bytes(node->dtype, node->element_count());
-    if (source.materialized && source.buffer.valid() &&
-        (bytes == 0 || bytes > source.buffer.size_bytes)) {
-      return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
+    if (node->kind != OpKind::kReshape && node->kind != OpKind::kSlice) continue;
+    LSE_ASSIGN_OR(auto window, buffer_view_window(*node));
+    if (window && node->inputs[0]->materialized && node->inputs[0]->buffer.valid()) {
+      const auto& source = node->inputs[0]->buffer;
+      constexpr auto limit = std::numeric_limits<std::size_t>::max();
+      if (window->offset > source.size_bytes || window->bytes > source.size_bytes - window->offset ||
+          source.offset > limit - window->offset || source.offset + window->offset > limit - window->bytes)
+        return LSE_ERROR(kOutOfRange, "view exceeds its source buffer window");
     }
   }
-
 
   std::vector<FusionGroup> phase_groups;
   bool replayed = false;
@@ -1148,7 +1102,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       const std::size_t phase_begin = phase_groups.size();
       FusionGroup g = Partitioner::phase_group(wg, roots);
       if (g.nodes.empty()) continue;
-      alias_ready_reshapes(g);
+      alias_ready_views(g);
       FusionGroup staged;
       staged.is_phase = true;
       staged.launches = 1;
@@ -1174,8 +1128,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       auto reads_staged = [&](const NodePtr& n) {
         for (const NodePtr& in : n->inputs) {
           const Node* p = in.get();
-          while (p != nullptr && p->kind == OpKind::kReshape &&
-                 p->inputs.size() == 1) {
+          while (p != nullptr && is_buffer_view(*p)) {
             p = p->inputs[0].get();
           }
           for (const NodePtr& m : staged.nodes) {
@@ -1268,6 +1221,17 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         return true;
       };
       for (const NodePtr& n : g.nodes) {
+        if (n->kind == OpKind::kSlice && is_buffer_view(*n)) {
+          flush_staged();
+          FusionGroup view;
+          view.nodes = {n};
+          view.inputs = n->inputs;
+          view.outputs = {n};
+          view.anchor = n->kind;
+          view.anchor_class = n->fclass;
+          phase_groups.push_back(std::move(view));
+          continue;
+        }
         // N>=128 matches Workgroup::is_wide_linear. Those GEMVs get a
         // fat grid; stream visibility is the barrier. A software grid
         // sync deadlocks without a cooperative launch.
@@ -1452,6 +1416,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
                           .index;
         }
       }
+      // Replay inputs and carry owners may have been rebound since the last
+      // pass. Placement must see the current physical windows, not stale views.
+      LSE_RETURN_IF_ERROR(refresh_buffer_aliases(order));
       impl_->plan = plan_streams(staged_groups, backend().stream_capabilities(),
                                  backend().device_info(), group_members, pinned);
       impl_->events.assign(staged_groups.size(), backend::StreamEvent{});
@@ -1549,7 +1516,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       for (const FusionGroup& g : staged_groups) {
         const std::uint32_t gi = static_cast<std::uint32_t>(done);
         if (views_only(g)) {
-          alias_ready_reshapes(g);
+          LSE_RETURN_IF_ERROR(try_alias_group(g));
           ++trace_.views_aliased;
           trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
           if (!replayed) ran.push_back(g);
@@ -1663,7 +1630,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           launched_phase = false;
           break;
         }
-        alias_ready_reshapes(g);
+        alias_ready_views(g);
         if (on.index < stream_count) impl_->outstanding[on.index] = 1;
         if (split.empty()) {
           ++trace_.device_groups;
@@ -1745,13 +1712,15 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     desc += "]";
     trace_.group_descriptions.push_back(std::move(desc));
 
+    if (views_only(g)) {
+      LSE_RETURN_IF_ERROR(try_alias_group(g));
+      ++trace_.views_aliased;
+      trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
+      ran.push_back(g);
+      continue;
+    }
+
     if (mode_ == Mode::kDeviceFirst) {
-      if (try_alias_group(g).ok()) {
-        ++trace_.views_aliased;
-        trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
-        ran.push_back(g);
-        continue;
-      }
       std::size_t gm = member_for(g);
       // This arm carries no dependency information -- it issues in order and
       // relies on one stream to order it. Across members that needs a barrier

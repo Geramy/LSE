@@ -240,7 +240,6 @@ add_library(lse_kernels
   src/kernels/reduction.cpp
   src/kernels/rope.cpp
   src/kernels/scatter.cpp
-  src/kernels/flash_sdpa.cpp
   src/kernels/flash_wmma_sdpa.cpp
   src/kernels/sdpa.cpp
   src/kernels/slice.cpp

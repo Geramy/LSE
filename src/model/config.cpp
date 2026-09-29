@@ -36,6 +36,41 @@ Status need(const nlohmann::json& j, const char* key, T& out) {
   return OkStatus();
 }
 
+Status read_storage_config(const nlohmann::json& root, Config& c) {
+  const auto nested = root.find("text_config");
+  const nlohmann::json* text = nested != root.end() && nested->is_object()
+      ? &*nested : nullptr;
+  bool declared_dtype = false;
+  for (const auto* scope : {text, &root}) {
+    if (scope == nullptr || declared_dtype) continue;
+    for (const auto* key : {"dtype", "torch_dtype"}) {
+      const auto field = scope->find(key);
+      if (field == scope->end() || field->is_null()) continue;
+      if (!field->is_string())
+        return LSE_ERROR(kInvalidArgument, "model config field '", key,
+                         "' must be a string");
+      c.dtype = field->get<std::string>();
+      if (c.dtype.starts_with("torch.")) c.dtype.erase(0, 6);
+      declared_dtype = true;
+      break;
+    }
+  }
+  c.kv_cache_dtype = declared_dtype && dtype_from_string(c.dtype) == DType::kBF16
+      ? kv::CacheDType::kBF16 : kv::CacheDType::kF16;
+  // Engine overrides at the root take precedence over decoder metadata.
+  for (const auto* scope : {&root, text}) {
+    if (scope == nullptr) continue;
+    const auto field = scope->find("kv_cache_dtype");
+    if (field == scope->end()) continue;
+    if (!field->is_string())
+      return LSE_ERROR(kInvalidArgument, "kv_cache_dtype must be a string");
+    LSE_ASSIGN_OR(c.kv_cache_dtype,
+                  kv::cache_dtype_from_string(field->get<std::string>()));
+    break;
+  }
+  return OkStatus();
+}
+
 // Qwen3.5 (dense and MoE), read off Qwen/Qwen3.5-0.8B, Qwen/Qwen3.5-4B and
 // Qwen/Qwen3.5-35B-A3B and cross-checked against
 // transformers/models/qwen3_5/configuration_qwen3_5.py. Both are gated
@@ -145,7 +180,7 @@ Result<Config> from_hf_json(const nlohmann::json& root) {
   read(t, "tie_word_embeddings", c.tie_word_embeddings);
   read(t, "mtp_num_hidden_layers", c.mtp_layers);
   read(t, "mtp_use_dedicated_embeddings", c.mtp_dedicated_embeddings);
-  read(t, "dtype", c.dtype);
+  LSE_RETURN_IF_ERROR(read_storage_config(root, c));
   read(t, "max_position_embeddings", c.train_seq_len);
 
   // layer_types is the checkpoint's own statement of which layers attend. The
@@ -243,14 +278,8 @@ Result<Config> Config::from_json_string(const std::string& text) {
 
   read(j, "train_seq_len", c.train_seq_len);
   read(j, "kv_length", c.kv_length);
-  if (j.contains("kv_cache_dtype")) {
-    if (!j["kv_cache_dtype"].is_string())
-      return LSE_ERROR(kInvalidArgument, "kv_cache_dtype must be a string");
-    LSE_ASSIGN_OR(c.kv_cache_dtype,
-                  kv::cache_dtype_from_string(j["kv_cache_dtype"].get<std::string>()));
-  }
+  LSE_RETURN_IF_ERROR(read_storage_config(j, c));
   read(j, "rms_eps", c.rms_eps);
-  read(j, "dtype", c.dtype);
   read(j, "grad_checkpoint_segment", c.grad_checkpoint_segment);
 
   LSE_RETURN_IF_ERROR(c.validate());

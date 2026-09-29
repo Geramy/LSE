@@ -8,6 +8,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/block.hpp"
+#include "lse/kv/cache_dtype.hpp"
 
 LSE_TEST(flash_attention_handles_long_ragged_queries_and_bound_cache_windows) {
   using namespace lse;
@@ -20,10 +21,11 @@ LSE_TEST(flash_attention_handles_long_ragged_queries_and_bound_cache_windows) {
     return Array(node);
   };
   backend::DeviceInfo device;
+  backend::AmdDeviceInfo amd;
   device.arch = "gfx1201";
-  device.wavefront_size = 32;
-  device.max_threads_per_workgroup = 1024;
-  device.lds_bytes_per_workgroup = 65536;
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
   for (int seq : {2, 3, 7, 8, 17, 33, 128}) {
     for (int capacity : {128, 320}) {
       for (auto mask : {MaskKind::kCausal, MaskKind::kSlidingWindow})
@@ -44,11 +46,12 @@ LSE_TEST(flash_attention_handles_long_ragged_queries_and_bound_cache_windows) {
             if (emitted.ok()) {
               LSE_EXPECT(emitted->lds_bytes > 0);
               LSE_EXPECT(emitted->dims.workgroup_size[0] == 256);
-              const unsigned tile = seq >= 12 ? 12u : 8u;
+              const unsigned tile = 16u;
               LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],
                             4u * ((static_cast<unsigned>(seq) + tile - 1u) / tile));
               LSE_EXPECT(emitted->binding_order.size() == (alias ? 5u : 6u));
               LSE_EXPECT(emitted->source.find("extent_zero") != std::string::npos);
+              LSE_EXPECT(emitted->source.find("vector.mma") != std::string::npos);
               LSE_EXPECT(emitted->source.find("kernel.barrier") != std::string::npos);
             }
           }
@@ -70,7 +73,7 @@ LSE_TEST(split_decode_attention_orders_two_barriers_and_versions_both_kernels) {
   device.max_threads_per_workgroup = 1024;
   device.lds_bytes_per_workgroup = 65536;
   backend::LoomEmitter emitter;
-  constexpr auto partial_name = "attention.decode_partial128.wg128c2.v2";
+  constexpr auto partial_name = "attention.decode_partial128.wg128c2.v3";
   constexpr auto merge_name = "attention.decode_merge128.wg128c2.v3";
   for (int capacity : {128, 320, 2048}) {
     for (auto mask : {MaskKind::kNone, MaskKind::kCausal, MaskKind::kSlidingWindow}) {
@@ -171,7 +174,7 @@ LSE_TEST(split_decode_attention_preserves_portable_graph_for_unsupported_request
 }
 
 
-LSE_TEST(flash_wmma_fp16_policy_requires_typed_kv_and_matrix_resources) {
+LSE_TEST(flash_wmma_policy_covers_kv_formats_ragged_tiles_and_matrix_resources) {
   using namespace lse;
   using namespace lse::graph;
   backend::DeviceInfo device;
@@ -189,34 +192,36 @@ LSE_TEST(flash_wmma_fp16_policy_requires_typed_kv_and_matrix_resources) {
   s.inputs = inputs; s.input_dtypes = dtypes; s.output = inputs[0];
   s.device = &device; s.types = types; s.intrinsics = &intrinsics;
   s.attrs = {0.0625f,1.0f,0,0}; s.iattrs = {1,0,0,16};
-  for (int capacity : {512,1024,2048,4096,8192,16384}) {
+  for (int capacity : {512,1024,2048,4096,8192,16384,32768,262144}) {
     inputs[4] = Shape{1,capacity/16};
-    for (int rows : {16,17,64,128,256,512}) {
+    for (int rows : {2,8,16,17,64,128,256,512}) {
       inputs[0] = Shape{1,24,rows,256}; s.output = inputs[0];
-      const bool selected = rows >= 64 || (rows == 16 && capacity == 8192);
-      LSE_EXPECT(dispatch::flash_wmma_f16_supported(s) == selected);
-      LSE_EXPECT(dispatch::attention_plan(s) == (selected ? dispatch::AttentionPlan::kFlashWmmaF16 : dispatch::AttentionPlan::kFlash12));
+      LSE_EXPECT(dispatch::flash_wmma_supported(s));
+      LSE_EXPECT(dispatch::attention_plan(s) == dispatch::AttentionPlan::kFlashWmma);
     }
   }
-  inputs[0] = Shape{3,24,512,256}; inputs[4] = Shape{3,64}; s.output=inputs[0];
-  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
-  inputs[0] = Shape{1,24,512,256}; inputs[4] = Shape{1,64}; s.output=inputs[0];
-  dtypes[1] = dtypes[2] = DType::kF32; s.attrs[1] = 0;
-  LSE_EXPECT(dispatch::attention_plan(s) == dispatch::AttentionPlan::kFlash12);
-  dtypes[1] = dtypes[2] = DType::kBF16; s.attrs[1] = 2;
-  LSE_EXPECT(dispatch::attention_plan(s) == dispatch::AttentionPlan::kFlash12);
-  dtypes[1] = dtypes[2] = DType::kF16; s.attrs[1] = 1;
+  inputs[0] = Shape{3,24,17,256}; inputs[3] = Shape{kv::step_meta_elems(3)};
+  inputs[4] = Shape{3,65}; s.output=inputs[0];
+  for (const auto storage : {kv::CacheDType::kF32, kv::CacheDType::kF16,
+                             kv::CacheDType::kBF16, kv::CacheDType::kFP8,
+                             kv::CacheDType::kBF8}) {
+    inputs[1] = inputs[2] = Shape{64,4,16,kv::storage_width(storage,256)};
+    dtypes[1] = dtypes[2] = kv::storage_dtype(storage);
+    s.attrs[1] = static_cast<float>(storage);
+    for (int mask : {0,1,2}) {
+      s.iattrs[0] = mask; s.iattrs[1] = mask == 2 ? 7 : 0;
+      LSE_EXPECT(dispatch::flash_wmma_supported(s));
+    }
+  }
   device.lds_bytes_per_workgroup = 24767;
-  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  LSE_EXPECT(!dispatch::flash_wmma_supported(s));
   device.lds_bytes_per_workgroup = 24768;
-  LSE_EXPECT(dispatch::flash_wmma_f16_supported(s));
+  LSE_EXPECT(dispatch::flash_wmma_supported(s));
   device.extension = nullptr;
-  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  LSE_EXPECT(!dispatch::flash_wmma_supported(s));
   device.extension = &amd;
-  inputs[4] = Shape{1,2048};
-  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
-  inputs[4] = Shape{1,64}; inputs[0] = Shape{1,24,8,256}; s.output=inputs[0];
-  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  inputs[0] = Shape{3,24,1,256}; s.output=inputs[0];
+  LSE_EXPECT(!dispatch::flash_wmma_supported(s));
 }
 
 LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
@@ -264,6 +269,45 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()&&restored.ok()) LSE_EXPECT(restored->source==emitted->source);
 }
 
+LSE_TEST(flash_wmma_emits_typed_operands_for_packed_and_unequal_widths) {
+  using namespace lse;
+  using namespace lse::graph;
+  auto leaf=[](Shape shape,DType dtype=DType::kF32) {
+    auto node=std::make_shared<Node>(); node->shape=shape; node->dtype=dtype; node->materialized=true;
+    return Array(node);
+  };
+  backend::DeviceInfo device; backend::AmdDeviceInfo amd;
+  device.arch="gfx1201"; backend::apply_arch_defaults(device,amd);
+  device.extension_id=backend::AmdDeviceInfo::kExtensionId; device.extension=&amd;
+  std::vector<std::uint64_t> keys;
+  backend::LoomEmitter loom;
+  for (auto storage : {kv::CacheDType::kF32, kv::CacheDType::kF16, kv::CacheDType::kBF16,
+                       kv::CacheDType::kFP8, kv::CacheDType::kBF8}) {
+    auto output=sdpa_paged(leaf({3,4,17,20}),
+        leaf({131,2,8,kv::storage_width(storage,20)},kv::storage_dtype(storage)),
+        leaf({131,2,8,kv::storage_width(storage,28)},kv::storage_dtype(storage)),
+        0.125f,MaskKind::kSlidingWindow,9,leaf({kv::step_meta_elems(3)}),
+        leaf({3,43}),8,&device,storage);
+    const NodePtr roots[]{output.node()};
+    const auto groups=Partitioner::partition(roots,&device);
+    LSE_EXPECT_EQ(groups.size(),1u);
+    if(groups.size()!=1) continue;
+    const auto key=loom.cache_key(groups[0],device);
+    for(auto previous: keys) LSE_EXPECT(key!=previous);
+    keys.push_back(key);
+    const auto emitted=loom.emit(groups[0],device);
+    LSE_EXPECT(emitted.ok());
+    if(!emitted.ok()) continue;
+    LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],24u);
+    LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,17600u);
+    LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
+    LSE_EXPECT(emitted->source.find(storage==kv::CacheDType::kF16
+        ? "vector<8xf16>" : "vector<8xbf16>")!=std::string::npos);
+    LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
+  }
+}
+
 LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   using namespace lse;
   using namespace lse::graph;
@@ -282,23 +326,25 @@ LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   LSE_EXPECT_EQ(groups.size(), 1u);
   if (groups.size() != 1) return;
   backend::DeviceInfo device;
+  backend::AmdDeviceInfo amd;
   device.arch = "gfx1201";
-  device.wavefront_size = 32;
-  device.max_threads_per_workgroup = 1024;
-  device.lds_bytes_per_workgroup = 65536;
-  LSE_EXPECT(find_primitive("attention.flash.qtile12.v2") != nullptr);
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
+  LSE_EXPECT(find_primitive("attention.flash.qtile12.v2") == nullptr);
+  LSE_EXPECT(find_primitive("attention.flash.v2") == nullptr);
+  LSE_EXPECT(find_primitive("attention.flash.wmma16.v2") != nullptr);
   const auto emitted = backend::LoomEmitter{}.emit(groups[0], device);
   LSE_EXPECT(emitted.ok());
   if (!emitted.ok()) return;
-  LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 48u);
+  LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u);
   LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
-  LSE_EXPECT_EQ(emitted->lds_bytes, 37056u);
-  // The page-loop form is 246 KB; the expanded form was 1.44 MB.
+  LSE_EXPECT_EQ(emitted->lds_bytes, 24768u);
   LSE_EXPECT(emitted->source.size() < 384u * 1024u);
   std::size_t loops = 0;
   for (auto at = emitted->source.find(" = scf.for "); at != std::string::npos;
        at = emitted->source.find(" = scf.for ", at + 1)) ++loops;
-  LSE_EXPECT(loops >= 3u);  // Window, QK component, and value-page loops.
+  LSE_EXPECT(loops >= 3u);
 }
 
 LSE_TEST_MAIN()

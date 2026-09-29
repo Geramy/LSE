@@ -35,4 +35,28 @@ Fixture binary SHA256: `78c335e2ccfa0b26c8bcfd55e8d24051f53e25e9d4b44482c62f9ad1
 
 ## Limits
 
-These are output-component results, not model throughput or perplexity measurements. An integrated matched HTTP gate remains required. The unchanged eight-row body still contains the largest Q8 FFN and ring-attention work. Uncomputed output positions four to seven are no longer validated; consumed bucket positions preserve finite-score validation. Requests of one or two proposals reuse the same three-position output bucket.
+The table above measures output components, without a perplexity run.
+
+## Integrated HTTP comparison
+
+The same two-turn Pi conversation, FP32 KV and model sampling defaults produced
+byte-identical responses and identical accepted/tested proposal counts:
+
+| Metric | Full output | Prefix output |
+| --- | ---: | ---: |
+| First prompt, 5,207 tokens | 291.75 tokens/s | 308.26 tokens/s |
+| First decode, 102 timed tokens | 27.97 tokens/s | 28.96 tokens/s |
+| Follow-up decode, 198 timed tokens | 35.26 tokens/s | 36.66 tokens/s |
+| Follow-up prefill, 23 new tokens | 0.738 s | 0.729 s |
+
+Decode improved approximately 3.5% and 4.0% in this single pair. Both runs had
+zero host groups and zero fallback groups. Process and disk caches started empty;
+the second conversation turn reused each running process. The candidate used
+a fresh isolated cache directory. These measurements do not reach 46–48 tokens/s.
+Artifacts: `dflash-split-cold` and `dflash-prefix-cold` under
+`mac_amdgpu/build/release/pi-performance`. Candidate server SHA256:
+`01dcf624adc20b0c49adbc38317e0071f24df2957695ebe9686eabd8f995627f`.
+
+## Remaining work
+
+ The unchanged eight-row body still contains the largest Q8 FFN and ring-attention work. Uncomputed output positions four to seven are no longer validated; consumed bucket positions preserve finite-score validation. Requests of one or two proposals reuse the same three-position output bucket.

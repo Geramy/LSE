@@ -1,5 +1,6 @@
 #include <algorithm>
 #include "lse/graph/workgroup.hpp"
+#include "lse/graph/view.hpp"
 
 #include "lse/core/dtype.hpp"
 #include "lse/graph/graph.hpp"
@@ -525,26 +526,8 @@ namespace {
 // Slot lifetime belongs to the allocation, including temporary inplace
 // outputs. Following only reshapes lets a later reader of an inplace alias
 // observe a slot recycled after the alias-producing launch.
-const Node* alias_source(const Node* n) noexcept {
-  if (n == nullptr) return nullptr;
-  if (n->kind == OpKind::kReshape && n->inputs.size() == 1)
-    return n->inputs[0].get();
-  const int index = n->prim != nullptr ? n->prim->inplace_input() : -1;
-  if (index < 0 || static_cast<std::size_t>(index) >= n->inputs.size())
-    return nullptr;
-  return n->inputs[static_cast<std::size_t>(index)].get();
-}
-
-const Node* allocation_owner(const Node* n) noexcept {
-  const Node* slow = n;
-  const Node* fast = n;
-  while (const Node* next = alias_source(n)) {
-    n = next;
-    slow = alias_source(slow);
-    fast = alias_source(alias_source(fast));
-    if (slow != nullptr && slow == fast) return nullptr;
-  }
-  return n;
+const Node* allocation_owner(const Node* node) noexcept {
+  return buffer_allocation_owner(node);
 }
 }  // namespace
 
@@ -640,7 +623,7 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
 
   for (std::uint32_t ci = 0; ci < groups.size(); ++ci) {
     for (const NodePtr& n : groups[ci].nodes) {
-      if (n->kind == OpKind::kReshape || n->fclass == FusionClass::kLeaf) {
+      if (is_buffer_view(*n) || n->fclass == FusionClass::kLeaf) {
         continue;
       }
       if (n->prim != nullptr && n->prim->inplace_input() >= 0) continue;
@@ -663,7 +646,6 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
 
 Status Workgroup::bind_slots(backend::IBackend& backend,
                              backend::Stream stream) {
-  if (slot_of_.empty()) return OkStatus();
   for (Slot& s : slots_) {
     if (s.buffer.valid()) continue;
     // Through the caller's stream: on a device spanning several GPUs the
@@ -688,20 +670,9 @@ Status Workgroup::bind_slots(backend::IBackend& backend,
     if (!src || !src->buffer.valid()) continue;
     n->buffer = src->buffer;
   }
-  for (const NodePtr& n : members_) {
-    if (!n || n->kind != OpKind::kReshape || n->inputs.size() != 1) continue;
-    if (n->buffer.valid()) continue;
-    const Node* src = skip_reshape(n->inputs[0].get());
-    if (src == nullptr || !src->buffer.valid()) continue;
-    if (src->dtype != n->dtype || src->element_count() != n->element_count()) {
-      continue;
-    }
-    n->buffer = src->buffer;
-    n->buffer.size_bytes =
-        dtype_storage_bytes(n->dtype, n->element_count());
-    n->materialized = src->materialized;
-    n->device_dirty = src->device_dirty;
-    n->host_dirty = src->host_dirty;
+  for (const NodePtr& node : members_) {
+    if (!node || !is_buffer_view(*node) || !node->inputs[0]->buffer.valid()) continue;
+    LSE_RETURN_IF_ERROR(bind_buffer_view(*node, false));
   }
   return OkStatus();
 }

@@ -1,4 +1,5 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/epilogue_input.hpp"
 #include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
@@ -812,7 +813,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       const NodePtr& b = out.binding_order[i];
       const bool is_out = output_set.count(b.get()) != 0;
       body << "    " << (is_out ? "" : "const ") << device_scalar(b->dtype)
-           << "* __restrict__ b" << i << ",\n";
+           << (graph::bindings_may_alias(out.binding_order) ? "* b" : "* __restrict__ b") << i << ",\n";
     }
     body << "    LseConstants k) {\n"
          << "  const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;\n";
@@ -1349,7 +1350,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       const bool writable = is_out || scratch || aliased_in;
       body << "    " << (writable ? "" : "const ")
            << device_scalar(b->dtype)
-           << (aliased_in || (is_out && inplace_src != nullptr) ? "* "
+           << (graph::bindings_may_alias(out.binding_order) || aliased_in || (is_out && inplace_src != nullptr) ? "* "
                                                                 : "* __restrict__ ")
            << (is_out ? "out" : "in" + std::to_string(i)) << ",\n";
     }
@@ -1404,7 +1405,8 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
     const NodePtr& n = out.binding_order[i];
     const bool is_out = output_set.count(n.get()) != 0;
-    src << "    " << (is_out ? "" : "const ") << device_scalar(n->dtype) << "* __restrict__ b"
+    src << "    " << (is_out ? "" : "const ") << device_scalar(n->dtype)
+        << (graph::bindings_may_alias(out.binding_order) ? "* b" : "* __restrict__ b")
         << i << ",\n";
   }
   src << "    LseConstants k) {\n"

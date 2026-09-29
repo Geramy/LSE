@@ -149,6 +149,8 @@ class Node {
 
   backend::DeviceBuffer buffer;
   bool materialized = false;
+  // Persistent state requests an independent output, rather than a view.
+  bool requires_owned_storage = false;
 
   // Non-null only on the packed plane of a group-affine weight.
   std::shared_ptr<const QuantPlanes> quant;
@@ -243,6 +245,8 @@ class Array {
   // barrier (one block's output feeding the next) so a host-visible read does
   // not bounce the tensor through the mirror.
   Status materialize();
+  // Evaluates and detaches an independent snapshot of the current byte window.
+  Status materialize_owned();
   Result<float> item();
   Status to_host(void* dst, std::size_t bytes);
 

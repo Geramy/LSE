@@ -215,8 +215,7 @@ Array slice(const Array& x, int axis, std::int64_t begin, std::int64_t end) {
   n->iattrs[0] = static_cast<std::int32_t>(a);
   n->iattrs[1] = static_cast<std::int32_t>(begin);
   n->iattrs[2] = static_cast<std::int32_t>(end);
-  // A device copy, not a host bounce: the window stays where the producer put
-  // it. The host only sees a tensor when something actually reads it.
+  // The scheduler aliases contiguous windows; strided windows keep indexed copies.
   n->prim = find_primitive("slice");
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
@@ -605,10 +604,10 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     request.iattrs = n->iattrs;
     request.device = device;
     if (dispatch::split_short_default_supported(request))
-      return split_paged_attention(n, "attention.short_partial128.wg128c2.v2",
+      return split_paged_attention(n, "attention.short_partial128.wg128c2.v3",
                                      "attention.short_merge128.wg128c2.v1", true);
     if (dispatch::split_decode_supported(request))
-      return split_paged_attention(n, "attention.decode_partial128.wg128c2.v2",
+      return split_paged_attention(n, "attention.decode_partial128.wg128c2.v3",
                                      "attention.decode_merge128.wg128c2.v3", false);
   }
   return Array(n);

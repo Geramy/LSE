@@ -1,6 +1,16 @@
 # KV storage and FP16 matrix attention — 2026-09-28
 
-## Model quality
+## Later BF16 quality point
+
+The generalized BF16 KV/WMMA v2 family subsequently scored the same 1,024 pinned
+targets at **PPL 4.849896867834** (CE 1.578957440359). All 32 M512 attention routes
+selected v2 at capacities 512 and 1,024; all 254,279,680 logits were finite,
+with 3,142 device groups and zero host/fallback groups. This is one later-build
+prefill measurement against the historical references below. It does not
+establish sampled-conversation quality or a statistical improvement. See the
+[BF16 comparison](bf16-mode-comparison-2026-09-28.md) for provenance and scope.
+
+## Earlier FP16 matched pair
 
 One ordered pair compared the accepted FP32 KV/Flash12 path with **FP16 KV plus FP16-operand WMMA attention**, preserving FP32 accumulation/output. Both used the same frozen executable, checkpoint, public corpus and settings. This is a combined numerical change; the result does not isolate KV rounding from matrix-operand rounding.
 
@@ -9,7 +19,7 @@ One ordered pair compared the accepted FP32 KV/Flash12 path with **FP16 KV plus 
 | FP32 KV / Flash12 | 1,024 | 1.590237269669 | 4.904912577255 | 3,142 | 0 / 0 |
 | FP16 KV / matrix attention | 1,024 | 1.589521984382 | 4.901405419912 | 3,142 | 0 / 0 |
 
-PPL changed by -0.071503% on this corpus. BF16, FP8 and BF8 storage have component validation, **no model PPL result** in this comparison. FP32 remains the default.
+PPL changed by -0.071503% on this corpus. BF16, FP8 and BF8 were outside this earlier two-arm quality comparison. FP32 was the default at that time; current model dtype policy is described in [KV cache formats](../KV_CACHE.md).
 
 ### Method and route proof
 

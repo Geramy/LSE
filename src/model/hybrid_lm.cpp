@@ -6,6 +6,7 @@
 #include <span>
 
 #include "lse/graph/interpreter.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/ops/norm.hpp"
 
@@ -1095,12 +1096,11 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   }
   if (graph::Scheduler* sched = graph::default_scheduler()) {
     // Before eval, because plan_slots leaves any node that already owns a
-    // buffer out of its free list. The skips mirror the planner's own: a
-    // reshape, a leaf and an in-place primitive all take their bytes from
-    // somewhere else by design.
+    // buffer out of its free list. Leaves and in-place outputs already own
+    // their state; views reserve their producer or an independent slice.
     backend::IDeviceSet& set = sched->devices();
     for (const graph::NodePtr& n : carried) {
-      if (n->buffer.valid() || n->kind == graph::OpKind::kReshape) continue;
+      if (n->buffer.valid() && !graph::is_buffer_view(*n)) continue;
       if (n->fclass == graph::FusionClass::kLeaf) continue;
       if (n->prim != nullptr && n->prim->inplace_input() >= 0) continue;
       // On the member the state was stamped with when it was made, through
@@ -1117,7 +1117,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       const backend::Stream at =
           set.stream_for(member).value_or(backend::kDefaultStream);
       LSE_RETURN_IF_ERROR(
-          graph::interpreter::ensure_output_buffer(*n, on, at));
+          graph::interpreter::ensure_owned_output_buffer(*n, on, at));
     }
     LSE_RETURN_IF_ERROR(sched->eval(roots, false, &cache_.program));
   }
@@ -1126,8 +1126,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.split_decode_attention = false;
   for (const auto& group : cache_.program.groups())
     for (const auto& node : group.nodes)
-      if (node->prim && (node->prim->name() == "attention.decode_partial128.wg128c2.v2" ||
-                         node->prim->name() == "attention.short_partial128.wg128c2.v2"))
+      if (node->prim && (node->prim->name() == "attention.decode_partial128.wg128c2.v3" ||
+                         node->prim->name() == "attention.short_partial128.wg128c2.v3"))
         cache_.split_decode_attention = true;
   cache_.tokens = tokens;
   cache_.hidden = y;

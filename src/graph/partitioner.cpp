@@ -1,4 +1,5 @@
 #include "lse/graph/graph.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/gdn_pair.hpp"
 
 #include "lse/graph/kernel_primitive.hpp"
@@ -30,6 +31,7 @@ bool is_kernel_prim(const Node& n) noexcept {
 // Attention, MoE, embedding, top-k, 2-D matmul, collectives. linear / rms /
 // conv / gdn / slice are shareable and go through Workgroup instead.
 bool hard_barrier(const Node& n) noexcept {
+  if (n.kind == OpKind::kSlice && is_buffer_view(n)) return true;
   return (n.fclass == FusionClass::kBarrier ||
           n.fclass == FusionClass::kCollective) &&
          !workgroup_shareable(n);
@@ -206,6 +208,8 @@ void group_sibling_linears(std::vector<NodePtr>& order) {
 }  // namespace
 
 bool Partitioner::can_fuse(const Node& producer, const Node& consumer) noexcept {
+  if ((producer.kind == OpKind::kSlice && is_buffer_view(producer)) ||
+      (consumer.kind == OpKind::kSlice && is_buffer_view(consumer))) return false;
   if (producer.materialized) return false;
 
   // Two devices' work never lands in one kernel. A group runs in one place, so
@@ -468,7 +472,8 @@ std::vector<FusionGroup> Partitioner::partition(
     std::size_t target = groups.size();
 
     const bool n_barrier = n->fclass == FusionClass::kBarrier ||
-                           n->fclass == FusionClass::kCollective;
+                           n->fclass == FusionClass::kCollective ||
+                           (n->kind == OpKind::kSlice && is_buffer_view(*n));
     if (!n_barrier) {
       for (const NodePtr& in : n->inputs) {
         auto it = group_of.find(in.get());

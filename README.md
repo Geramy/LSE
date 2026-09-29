@@ -22,6 +22,26 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
+## Current source candidate: BF16 mode comparison
+
+These unreleased measurements use source `9cb4cd8` plus working changes, the same
+server binary/runtime, a Q4 target and BF16 KV. Each mode starts with an empty
+private kernel cache; first prefill includes compilation. Sampling uses model
+defaults 1/20/0.95. The first prompt has 5,207 tokens; the identical follow-up has
+5,262 cached tokens and 23 new tokens.
+
+| Mode | First prefill, tokens/s | First decode, tokens/s | Follow-up decode, tokens/s |
+| --- | ---: | ---: | ---: |
+| Baseline | 348.69 | 22.55 | 22.93 |
+| MTP=3 | 318.86 | 26.19 | 40.19 |
+| DFlash2 | 333.95 | 26.15 | 38.12 |
+
+All first responses match. MTP=3 and DFlash2 responses match on both turns;
+baseline's follow-up differs. There are zero host groups/fallbacks. These are
+single observations, with different first/follow-up JIT conditions; they do not
+establish a general throughput guarantee. See the
+[mode comparison and limits](docs/benchmarks/bf16-mode-comparison-2026-09-28.md).
+
 ## v0.4.11: split decode attention and MTP prompt reuse
 
 The monolithic single-token attention kernel is removed. Split attention now
@@ -30,8 +50,8 @@ requests, plain decode measured **19.71 / 19.72 tokens/s**, compared with
 12.91 / 12.70 before the change. The sampled responses changed.
 
 MTP now retains verified state between requests. Follow-up prefill fell from
-**14.25 s to 0.71 s**, with 5,310 cached tokens and 23 new tokens. Current decode
-measures **32.68 / 31.90 tokens/s with MTP=3** and **27.97 / 35.26 tokens/s with
+**14.25 s to 0.71 s**, with 5,310 cached tokens and 23 new tokens. Recorded decode
+measured **32.68 / 31.90 tokens/s with MTP=3** and **27.97 / 35.26 tokens/s with
 DFlash2**. The two modes produced identical responses in these candidate runs.
 First prompt rates were **293.95 and 291.75 tokens/s**, respectively.
 These are individual Pi workload measurements, not a 46–48 tokens/s guarantee.
@@ -49,17 +69,28 @@ proposal acceptance counts matched. The final paired-load build measured **28.59
 in optimizer facts and reported by dispatch profiling.
 See the [execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
 
-## Optional KV formats
+## KV storage
 
-Use `--kv-cache-dtype fp16` to select FP16 KV storage. Other values are `fp32`,
-`bf16`, `fp8` and `bf8`. FP32 remains the default. The setting applies to target
-and MTP paged caches; DFlash2 retains its private FP32 ring.
+K/V storage defaults to BF16 when the model declares BF16, including the local
+Qwen3.8 checkpoints, and FP16 otherwise. LSE reads `dtype` or `torch_dtype` from
+`text_config` before checking the top level. An explicit model `kv_cache_dtype`
+setting overrides this default; `--kv-cache-dtype` overrides both. Supported
+values are `fp32`, `fp16`, `bf16`, `fp8` and `bf8`. The setting applies to target
+and MTP paged caches; DFlash2 retains its private FP32 ring. Attention accumulation
+remains FP32.
 
-FP16 halves paged KV storage. On admitted gfx1201 shapes, it also selects matrix
-attention with FP32 accumulation. One matched 1,024-token check measured
-perplexity **4.9049 with FP32** and **4.9014 with FP16 plus matrix attention**.
-BF16 and the 8-bit formats have component validation; this model comparison
-covers FP16. See [KV cache formats](docs/KV_CACHE.md).
+FP16 and BF16 each halve paged KV storage relative to FP32. Eligible gfx1201
+paged batches use WMMA directly from all five formats: FP16 storage uses FP16
+Q/K/P/V matrix operands; FP32, BF16, FP8 and BF8 storage use BF16 operands after
+decoding or conversion. Matrix accumulators, softmax state and output remain
+FP32. Single-token and selected short-query split attention keep FP32 calculation.
+
+An earlier matched 1,024-token check measured perplexity **4.9049 with FP32 KV**
+and **4.9014 with FP16 KV plus WMMA v1**. The generalized family has native
+component coverage across all five formats. A later BF16 v2 check scored 1,024
+pinned targets at PPL **4.8499**, with zero host fallback. This prefill result
+does not establish sampled-conversation quality or a statistical improvement.
+See [KV cache formats](docs/KV_CACHE.md) for selection and evidence.
 
 ## v0.4.9: chat sampling and prompt reuse
 
@@ -346,14 +377,20 @@ A larger limit does not evaluate unused tokens. A longer active context increase
 Set the client context limit to the same value as the server limit.
 
 The HTTP server can reuse an exact consumed prompt prefix for ordinary decoding and DFlash2.
-A changed prefix requires new prefill. MTP requests currently start with fresh model state.
+A changed prefix requires new prefill. MTP also retains verified state for an exact continuation.
 
 ## Measured performance
 
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
-### Current Pi chat measurements
+### Current BF16 source candidate
+
+The current baseline, MTP=3 and DFlash2 comparison is shown [above](#current-source-candidate-bf16-mode-comparison).
+It uses one binary and identical requests; its method and quality limits are in the
+[BF16 report](docs/benchmarks/bf16-mode-comparison-2026-09-28.md).
+
+### Earlier FP32 Pi chat measurements
 
 The same two-turn Pi workload used Qwen3.8-27B Q4, Q8 DFlash2 with three proposals,
 temperature 1, top-k 20 and top-p 0.95. Each process started with an empty disk
@@ -365,7 +402,7 @@ conversation prefix and added 23 tokens.
 | Earlier FP32 baseline | 56.89 | 26.64 | 31.34 |
 | FP32 with bounded attention source and compiled-code reuse | 308.54 | 27.11 | 31.28 |
 | FP32 with materialized DFlash feature views | 309.10 | 27.20 | 32.13 |
-| Current FP32, also using paired M4 activation loads | **310.72** | **28.59** | **34.03** |
+| Final FP32 run with paired M4 activation loads | **310.72** | **28.59** | **34.03** |
 | Earlier optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
 
 After the compiler changes, FP32 compilation took 3.35 seconds across 372 unique
@@ -381,7 +418,8 @@ Prompt rates exclude model loading. See the
 
 The earlier FP16 run predates the compiler fixes. It generated different text,
 with 59% follow-up acceptance versus 68% for FP32, and does not establish a
-decode speedup. FP32 remains the default. See the
+decode speedup. These measurements used an explicit FP32 control; the current
+model policy defaults to BF16 for BF16 checkpoints and FP16 otherwise. See the
 [KV and attention report](docs/benchmarks/kv-storage-attention-2026-09-28.md).
 
 ### Earlier 14K synthetic result

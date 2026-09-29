@@ -1,4 +1,5 @@
 #include "lse/graph/program.hpp"
+#include "lse/graph/view.hpp"
 
 #include <cstdlib>
 #include <unordered_map>
@@ -28,6 +29,7 @@ std::uint64_t program_signature(std::span<const NodePtr> order) noexcept {
   for (std::uint32_t i = 0; i < order.size(); ++i) idx[order[i].get()] = i;
   for (const NodePtr& n : order) {
     mix_u64(h, static_cast<std::uint64_t>(n->kind));
+    mix_u64(h, n->requires_owned_storage);
     mix_u64(h, n->shape.rank());
     for (std::size_t d = 0; d < n->shape.rank(); ++d) {
       mix_u64(h, static_cast<std::uint64_t>(n->shape.dim(d)));
@@ -57,6 +59,10 @@ void Program::retain(std::span<const NodePtr> roots,
   nodes_.clear();
   std::unordered_set<const Node*> seen;
   for (const NodePtr& r : roots_) collect_reachable(r, nodes_, seen);
+  view_ownership_.clear();
+  for (const auto& node : nodes_)
+    if (node->kind == OpKind::kSlice || node->kind == OpKind::kReshape)
+      view_ownership_.emplace_back(node.get(), node->requires_owned_storage);
   phases_ = std::move(phases);
   groups_ = std::move(groups);
   emissions_.clear();
@@ -129,6 +135,7 @@ void Program::destroy() noexcept {
   for (Workgroup& wg : phases_) wg.clear();
   roots_.clear();
   nodes_.clear();
+  view_ownership_.clear();
   phases_.clear();
   groups_.clear();
   emissions_.clear();
@@ -146,7 +153,8 @@ const EmittedKernel* Program::cached_emission(
   const EmissionCache& cached = emissions_[index];
   if (cached.group != &group || cached.backend != backend ||
       cached.emitter != emitter || cached.arch != arch ||
-      !cached.kernel.has_value()) return nullptr;
+      !cached.kernel.has_value() ||
+      cached.aliases != group_bindings_may_alias(group)) return nullptr;
   *key = cached.key;
   return &*cached.kernel;
 }
@@ -161,6 +169,7 @@ const EmittedKernel* Program::cache_emission(
   cached.backend = backend;
   cached.emitter = emitter;
   cached.key = key;
+  cached.aliases = group_bindings_may_alias(group);
   cached.arch = arch;
   cached.kernel.emplace(std::move(kernel));
   return &*cached.kernel;
@@ -171,39 +180,61 @@ bool Program::holds(std::span<const NodePtr> roots) const noexcept {
   for (std::size_t i = 0; i < roots_.size(); ++i) {
     if (roots_[i].get() != roots[i].get()) return false;
   }
+  for (const auto& [node, owned] : view_ownership_)
+    if (node->requires_owned_storage != owned) return false;
   return true;
 }
 
 void Program::reset_compute() noexcept {
   for (Workgroup& wg : phases_) wg.reset_compute();
-  for (const NodePtr& n : nodes_) {
-    if (!n) continue;
-    if (n->fclass == FusionClass::kLeaf || n->kind == OpKind::kBuffer) continue;
-    n->materialized = false;
+  // Reachable materialized inputs belong to their producer, not this replay.
+  // Only invalidate nodes covered by the retained execution schedule.
+  for (const FusionGroup& group : groups_) {
+    for (const NodePtr& n : group.nodes) {
+      if (!n) continue;
+      if (n->fclass == FusionClass::kLeaf || n->kind == OpKind::kBuffer) continue;
+      n->materialized = false;
+    }
   }
 }
 
+namespace {
+void refresh_carry_view(const NodePtr& node) noexcept {
+  if (!node || !is_buffer_view(*node)) return;
+  refresh_carry_view(node->inputs[0]);
+  (void)bind_buffer_view(*node, false);
+}
+Node* carry_owner(const NodePtr& node) noexcept {
+  return const_cast<Node*>(buffer_allocation_owner(node.get()));
+}
+}  // namespace
+
 void Program::fold_carries() noexcept {
   for (Carry& c : carries_) {
-    if (!c.in || !c.out || !c.out->buffer.valid()) continue;
-    backend::DeviceBuffer produced = c.out->buffer;
-    backend::DeviceBuffer consumed = c.in->buffer;
-    c.in->buffer = produced;
-    c.in->materialized = true;
-    c.in->device_dirty = true;
-    c.in->host_dirty = false;
-    c.out->buffer = consumed;
-    c.out->materialized = false;
+    Node* in = carry_owner(c.in);
+    Node* out = carry_owner(c.out);
+    if (!in || !out || in == out || !out->buffer.valid()) continue;
+    std::swap(in->buffer, out->buffer);
+    in->materialized = true;
+    in->device_dirty = true;
+    in->host_dirty = false;
+    out->materialized = false;
+    refresh_carry_view(c.in);
+    refresh_carry_view(c.out);
   }
 }
 
 void Program::hold_carries() noexcept {
   for (Carry& c : carries_) {
-    if (!c.in || !c.out) continue;
-    c.in->materialized = true;
-    c.in->device_dirty = true;
-    c.in->host_dirty = false;
-    c.out->materialized = false;
+    Node* in = carry_owner(c.in);
+    Node* out = carry_owner(c.out);
+    if (!in || !out || in == out) continue;
+    in->materialized = true;
+    in->device_dirty = true;
+    in->host_dirty = false;
+    out->materialized = false;
+    refresh_carry_view(c.in);
+    refresh_carry_view(c.out);
   }
 }
 

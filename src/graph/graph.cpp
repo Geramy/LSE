@@ -129,6 +129,21 @@ Status Array::eval() { return run_eval(node_, true); }
 
 Status Array::materialize() { return run_eval(node_, false); }
 
+Status Array::materialize_owned() {
+  if (!node_) return LSE_ERROR(kInvalidArgument, "owned materialize on an empty Array");
+  LSE_RETURN_IF_ERROR(materialize());
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "no backend for owned storage");
+  auto& devices = scheduler->devices();
+  const auto member = node_->member != Node::kAnyMember && node_->member < devices.size()
+      ? static_cast<std::size_t>(node_->member) : devices.primary();
+  auto& backend = devices.device(member);
+  const auto stream = devices.stream_for(member).value_or(backend::kDefaultStream);
+  LSE_ASSIGN_OR(auto buffer, interpreter::snapshot_buffer(*node_, backend, stream));
+  *this = Array::from_buffer(std::move(buffer), node_->shape, node_->dtype);
+  return OkStatus();
+}
+
 Result<float> Array::item() {
   LSE_RETURN_IF_ERROR(eval());
   return interpreter::read_scalar(*node_);

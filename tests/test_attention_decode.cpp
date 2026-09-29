@@ -1,5 +1,7 @@
 #include "harness.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
+#include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
@@ -68,7 +70,7 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
     LSE_EXPECT(output.node()->prim->name() == "attention.decode_merge128.wg128c2.v3");
     const auto partial = output.node()->inputs[0];
     const unsigned parts = (static_cast<unsigned>(capacity) + 127u) / 128u;
-    LSE_EXPECT(partial->prim->name() == "attention.decode_partial128.wg128c2.v2");
+    LSE_EXPECT(partial->prim->name() == "attention.decode_partial128.wg128c2.v3");
     LSE_EXPECT(partial->shape == Shape({2, 24, parts, 258}));
     const NodePtr roots[]{output.node()};
     const auto groups = Partitioner::partition(roots, &fx.gpu);
@@ -186,28 +188,36 @@ LSE_TEST(decode_attention_keeps_every_kv_storage_format_on_the_split_route) {
   }
 }
 
-LSE_TEST(attention_dispatch_flash_tiles_follow_device_and_scratch_limits) {
+LSE_TEST(attention_dispatch_matrix_tiles_follow_device_and_lds_limits) {
   Fixture fx;
+  backend::AmdDeviceInfo amd;
+  backend::apply_arch_defaults(fx.gpu, amd);
+  fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  fx.gpu.extension = &amd;
   fx.shapes[0] = Shape{2, 24, 512, 256};
   auto request = fx.request();
+  const auto intrinsics = backend::loom_sources();
+  request.types = backend::loom_types();
+  request.intrinsics = &intrinsics;
   using dispatch::AttentionPlan;
   for (const auto [bytes, expected] : {
-       std::pair{37056u, AttentionPlan::kFlash12},
-       std::pair{37055u, AttentionPlan::kFlash8},
-       std::pair{24704u, AttentionPlan::kFlash8},
-       std::pair{24703u, AttentionPlan::kScalar}}) {
+       std::pair{65536u, AttentionPlan::kFlashWmma},
+       std::pair{24768u, AttentionPlan::kFlashWmma},
+       std::pair{24767u, AttentionPlan::kScalar}}) {
     fx.gpu.lds_bytes_per_workgroup = bytes;
     LSE_EXPECT(dispatch::attention_plan(request) == expected);
-    LSE_EXPECT(dispatch::flash_supported(request, 12) == (bytes >= 37056u));
   }
   fx.gpu.lds_bytes_per_workgroup = 65536;
   fx.gpu.arch = "gfx1100";
-  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
+  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kScalar);
   fx.gpu.arch = "gfx1201";
-  fx.shapes[0] = Shape{2, 24, 11, 256};
-  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
-  fx.shapes[0] = Shape{2, 24, 7, 256};
-  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlash8);
+  for (int rows : {2, 7, 11, 17, 512}) {
+    fx.shapes[0] = Shape{2, 24, rows, 256};
+    request.output = fx.shapes[0];
+    LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kFlashWmma);
+  }
+  fx.gpu.extension = nullptr;
+  LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kScalar);
 }
 
 LSE_TEST(attention_dispatch_rejects_malformed_paged_input_contracts) {
@@ -228,7 +238,7 @@ LSE_TEST(attention_dispatch_rejects_malformed_paged_input_contracts) {
     if (variant == 9) request.output_dtype = DType::kBF16;
     LSE_EXPECT(dispatch::attention_plan(request) == AttentionPlan::kScalar);
     LSE_EXPECT(!dispatch::flash_dimensions(request).valid);
-    LSE_EXPECT(!dispatch::flash_supported(request, 8));
+    LSE_EXPECT(!dispatch::flash_wmma_supported(request));
     LSE_EXPECT(!dispatch::split_decode_supported(request));
   }
 }
@@ -248,4 +258,35 @@ LSE_TEST(decode_attention_sliding_mask_equivalence_at_integer_boundaries) {
         LSE_EXPECT(original == shared);
       }
 }
+LSE_TEST(decode_attention_narrow_storage_uses_wave_qk_and_preserves_partial_abi) {
+  backend::LoomEmitter emitter;
+  for (const auto storage : {kv::CacheDType::kF16, kv::CacheDType::kBF16}) {
+    for (int capacity : {8192, 16384}) {
+      Fixture fx(capacity, 1);
+      fx.dtypes[1] = fx.dtypes[2] = kv::storage_dtype(storage);
+      const auto output = fx.graph(MaskKind::kCausal, 0, true, storage);
+      const unsigned parts = static_cast<unsigned>(capacity) / 128u;
+      LSE_EXPECT(output.node()->inputs[0]->shape == Shape({1, 24, parts, 258}));
+      const NodePtr roots[]{output.node()};
+      const auto groups = Partitioner::partition(roots, &fx.gpu);
+      LSE_EXPECT_EQ(groups.size(), 2u);
+      if (groups.size() != 2) return;
+      const auto partial = emitter.emit(groups[0], fx.gpu);
+      const auto merge = emitter.emit(groups[1], fx.gpu);
+      LSE_EXPECT(partial.ok());
+      LSE_EXPECT(merge.ok());
+      if (!partial.ok() || !merge.ok()) return;
+      LSE_EXPECT_EQ(partial->dims.workgroup_size[0], 128u);
+      LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 24u * parts);
+      LSE_EXPECT_EQ(partial->lds_bytes, 512u);
+      LSE_EXPECT_EQ(partial->binding_order.size(), 6u);
+      LSE_EXPECT(partial->source.find("kernel.subgroup.shuffle<xor>") != std::string::npos);
+      LSE_EXPECT(partial->source.find("scalar.fmaf") != std::string::npos);
+      LSE_EXPECT(partial->source.find(storage == kv::CacheDType::kF16 ? "xf16" : "xbf16") != std::string::npos);
+      LSE_EXPECT_EQ(merge->dims.workgroup_count[0], 24u);
+      LSE_EXPECT_EQ(merge->lds_bytes, parts * sizeof(float));
+    }
+  }
+}
+
 LSE_TEST_MAIN()

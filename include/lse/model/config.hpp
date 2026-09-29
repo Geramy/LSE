@@ -100,7 +100,9 @@ struct Config {
   // train_seq_len. Attention allocates [B, kv_heads, capacity, head_dim] once
   // and advances a write position; the tensor never grows.
   std::int32_t kv_length = 0;
-  kv::CacheDType kv_cache_dtype = kv::CacheDType::kF32;
+  // Parsed BF16 model metadata selects BF16; other models use FP16.
+  // An explicit model setting or CLI override takes precedence.
+  kv::CacheDType kv_cache_dtype = kv::CacheDType::kF16;
 
   // Engine allocation, not a checkpoint fact. Attention reserves
   // [B, kv_heads, capacity, head_dim] once and never grows it, so a model that

@@ -933,6 +933,63 @@ LSE_TEST(hf_config_is_read_with_hf_field_names) {
   LSE_EXPECT_EQ(c->num_experts, 0);
 }
 
+LSE_TEST(hf_kv_storage_reads_decoder_metadata_and_engine_overrides) {
+  auto nested = Config::from_json_string(hf_config(R"(, "dtype":"bfloat16")"));
+  LSE_EXPECT(nested.ok());
+  if (nested.ok()) LSE_EXPECT(nested->kv_cache_dtype == kv::CacheDType::kBF16);
+  auto legacy = Config::from_json_string(hf_config(R"(, "torch_dtype":"bfloat16")"));
+  LSE_EXPECT(legacy.ok());
+  if (legacy.ok()) LSE_EXPECT(legacy->kv_cache_dtype == kv::CacheDType::kBF16);
+  auto missing = Config::from_json_string(hf_config());
+  LSE_EXPECT(missing.ok());
+  if (missing.ok()) LSE_EXPECT(missing->kv_cache_dtype == kv::CacheDType::kF16);
+
+  const auto at_root = [](const std::string& fields, const std::string& decoder) {
+    return "{" + fields + "," + decoder.substr(1);
+  };
+  auto root = Config::from_json_string(at_root(
+      R"("torch_dtype":"bfloat16")", hf_config()));
+  LSE_EXPECT(root.ok());
+  if (root.ok()) LSE_EXPECT(root->kv_cache_dtype == kv::CacheDType::kBF16);
+  auto text_wins = Config::from_json_string(at_root(
+      R"("dtype":"bfloat16")", hf_config(R"(, "torch_dtype":"float16")")));
+  LSE_EXPECT(text_wins.ok());
+  if (text_wins.ok()) LSE_EXPECT(text_wins->kv_cache_dtype == kv::CacheDType::kF16);
+  auto decoder_override = Config::from_json_string(
+      hf_config(R"(, "dtype":"bfloat16", "kv_cache_dtype":"fp32")"));
+  LSE_EXPECT(decoder_override.ok());
+  if (decoder_override.ok())
+    LSE_EXPECT(decoder_override->kv_cache_dtype == kv::CacheDType::kF32);
+  auto root_wins = Config::from_json_string(at_root(
+      R"("kv_cache_dtype":"fp16")",
+      hf_config(R"(, "dtype":"bfloat16", "kv_cache_dtype":"fp32")")));
+  LSE_EXPECT(root_wins.ok());
+  if (root_wins.ok()) LSE_EXPECT(root_wins->kv_cache_dtype == kv::CacheDType::kF16);
+  auto null_fallback = Config::from_json_string(at_root(
+      R"("torch_dtype":"bfloat16")", hf_config(R"(, "dtype":null)")));
+  LSE_EXPECT(null_fallback.ok());
+  if (null_fallback.ok())
+    LSE_EXPECT(null_fallback->kv_cache_dtype == kv::CacheDType::kBF16);
+  for (const auto format : {kv::CacheDType::kF32, kv::CacheDType::kF16,
+                            kv::CacheDType::kBF16, kv::CacheDType::kFP8,
+                            kv::CacheDType::kBF8}) {
+    const auto fields = std::string(R"(, "dtype":"bfloat16", "kv_cache_dtype":")") +
+        std::string(kv::to_string(format)) + R"(")";
+    const auto explicit_format = Config::from_json_string(hf_config(fields));
+    LSE_EXPECT(explicit_format.ok());
+    if (explicit_format.ok())
+      LSE_EXPECT(explicit_format->kv_cache_dtype == format);
+  }
+  for (const auto fields : {R"(, "torch_dtype":42)",
+                           R"(, "kv_cache_dtype":null)",
+                           R"(, "kv_cache_dtype":"invalid")"}) {
+    auto invalid = Config::from_json_string(hf_config(fields));
+    LSE_EXPECT(!invalid.ok());
+    if (!invalid.ok())
+      LSE_EXPECT(invalid.status().code() == StatusCode::kInvalidArgument);
+  }
+}
+
 LSE_TEST(the_quantization_block_travels_with_the_config) {
   // An MLX checkpoint carries its group geometry beside the shape fields, and
   // the loader needs both from the same read. The block is top level in both

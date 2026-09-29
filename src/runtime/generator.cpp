@@ -228,7 +228,7 @@ Status Generator::mtp_prefill_chunk(const Array& hidden,
                                   {*carry, graph::slice(hidden, 1, 0, rows - 1)}, 1);
   LSE_RETURN_IF_ERROR(mtp_->draft(shifted, tokens, first).status());
   Array last = graph::slice(hidden, 1, rows - 1, rows);
-  LSE_RETURN_IF_ERROR(last.materialize());
+  LSE_RETURN_IF_ERROR(last.materialize_owned());
   // Detach the retained value from a target graph that the next chunk replays.
   *carry = Array::from_buffer(last.node()->buffer, last.shape(), last.dtype());
   return OkStatus();

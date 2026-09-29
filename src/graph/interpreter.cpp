@@ -1,5 +1,6 @@
 #include "lse/kv/cache_codec.hpp"
 #include "lse/graph/interpreter.hpp"
+#include "lse/graph/view.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -496,6 +497,23 @@ Status eval_slice(Node& n) {
   const auto begin = static_cast<std::size_t>(n.iattrs[1]);
   const AxisSplit in_sp = split_axis(src.shape, axis);
   const AxisSplit out_sp = split_axis(n.shape, axis);
+  const auto element_bytes = dtype_info(n.dtype).size_bytes;
+  if (element_bytes != 0) {
+    const auto row_bytes = out_sp.axis_len * out_sp.inner * element_bytes;
+    auto* destination = static_cast<std::byte*>(host_bytes(n));
+    const auto* source = static_cast<const std::byte*>(host_bytes(src));
+    const auto source_bytes = dtype_storage_bytes(src.dtype, src.element_count());
+    if (!source || source_bytes > src.buffer.size_bytes ||
+        (src.buffer.ptr == nullptr && source_bytes > src.host_mirror.size()))
+      return LSE_ERROR(kInvalidArgument, "slice input has no complete host window");
+    for (std::size_t row = 0; row < out_sp.outer; ++row)
+      std::memcpy(destination + row * row_bytes,
+                  source + (row * in_sp.axis_len + begin) * in_sp.inner * element_bytes,
+                  row_bytes);
+    n.host_dirty = true;
+    n.device_dirty = false;
+    return OkStatus();
+  }
 
   for (std::size_t o = 0; o < out_sp.outer; ++o) {
     for (std::size_t a = 0; a < out_sp.axis_len; ++a) {
@@ -1310,31 +1328,60 @@ Status ensure_output_buffer(Node& node, backend::IBackend& backend,
   return ensure_buffer(node, backend, stream);
 }
 
+Result<backend::DeviceBuffer> snapshot_buffer(const Node& node,
+    backend::IBackend& backend, backend::Stream stream) {
+  const auto bytes = dtype_storage_bytes(node.dtype, node.element_count());
+  if (!node.materialized || !node.buffer.valid() || bytes == 0 ||
+      bytes > node.buffer.size_bytes)
+    return LSE_ERROR(kInvalidArgument, "snapshot requires a complete materialized window");
+  const void* host = host_bytes(node);
+  if (node.host_dirty && (!host ||
+      (node.buffer.ptr == nullptr && node.host_mirror.size() < bytes)))
+    return LSE_ERROR(kInvalidArgument, "snapshot has no authoritative host window");
+  LSE_ASSIGN_OR(auto buffer, backend.allocate(bytes, backend::MemoryClass::kDevice, stream));
+  if (node.host_dirty || node.buffer.ptr != nullptr)
+    LSE_RETURN_IF_ERROR(backend.copy_h2d(host, buffer, bytes, 0));
+  else
+    LSE_RETURN_IF_ERROR(backend.copy_peer_ordered(node.buffer, buffer, bytes, 0, 0, stream, stream));
+  return buffer;
+}
+
+Status ensure_owned_output_buffer(Node& node, backend::IBackend& backend,
+                                 backend::Stream stream) {
+  if (node.kind == OpKind::kReshape && is_buffer_view(node)) {
+    node.buffer = {};
+    node.host_mirror.clear();
+    node.materialized = false;
+    return ensure_owned_output_buffer(*node.inputs[0], backend, stream);
+  }
+  if (node.kind == OpKind::kSlice && is_buffer_view(node)) {
+    if (node.materialized && node.buffer.valid()) {
+      LSE_ASSIGN_OR(auto buffer, snapshot_buffer(node, backend, stream));
+      node.buffer = std::move(buffer);
+      node.requires_owned_storage = true;
+      node.host_dirty = false;
+      node.device_dirty = node.buffer.ptr == nullptr;
+      node.host_mirror.clear();
+      return OkStatus();
+    }
+    node.requires_owned_storage = true;
+    node.buffer = {};
+    node.host_mirror.clear();
+    node.host_dirty = false;
+    node.device_dirty = false;
+    node.materialized = false;
+  }
+  return ensure_buffer(node, backend, stream);
+}
+
 Status evaluate(const NodePtr& node, backend::IBackend& backend) {
   Node& n = *node;
   if (n.materialized) return OkStatus();
 
-  // A host-addressable reshape names the same bytes as its source. Copy the
-  // allocation owner and window before ensure_buffer() can allocate a second
-  // buffer. This also rebinds a retained view if its input storage was swapped.
-  if (n.kind == OpKind::kReshape && n.inputs.size() == 1 && n.inputs[0]) {
-    const Node& src = *n.inputs[0];
-    if (src.dtype != n.dtype || src.element_count() != n.element_count()) {
-      return LSE_ERROR(kInvalidArgument, "reshape changes dtype or element count");
-    }
-    if (src.materialized && src.buffer.ptr != nullptr) {
-      const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
-      if (bytes == 0 || bytes > src.buffer.size_bytes) {
-        return LSE_ERROR(kOutOfRange, "reshape exceeds its source buffer window");
-      }
-      n.buffer = src.buffer;
-      n.buffer.size_bytes = bytes;
-      n.host_mirror.clear();
-      n.host_dirty = src.host_dirty;
-      n.device_dirty = src.device_dirty && !src.host_dirty;
-      n.materialized = true;
-      return OkStatus();
-    }
+  if (n.kind == OpKind::kReshape || n.kind == OpKind::kSlice) {
+    LSE_ASSIGN_OR(auto window, buffer_view_window(n));
+    if (window && n.inputs[0]->materialized && n.inputs[0]->buffer.valid())
+      return bind_buffer_view(n);
   }
 
   if (n.prim != nullptr) {

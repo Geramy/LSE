@@ -53,8 +53,8 @@ struct StreamPlan {
   std::uint32_t chain = 1;
 };
 
-// A group that dispatches nothing: a reshape is a window onto bytes that
-// already exist, so the scheduler skips it and the planner never places it.
+// A group that dispatches nothing: reshape and contiguous slice views name
+// existing bytes, so the scheduler skips them and the planner never places them.
 // One definition, because two would drift apart and the plan's indices are
 // the scheduler's indices.
 [[nodiscard]] bool views_only(const FusionGroup& group) noexcept;

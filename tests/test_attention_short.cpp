@@ -69,7 +69,7 @@ LSE_TEST(short_split_selects_bounded_capacity_range_and_two_ordered_native_stage
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       }
       const auto split_key = emitter.cache_key(groups[0], fx.gpu);
-      groups[0].outputs[0]->prim = find_primitive("attention.decode_partial128.wg128c2.v2");
+      groups[0].outputs[0]->prim = find_primitive("attention.decode_partial128.wg128c2.v3");
       LSE_EXPECT(split_key != emitter.cache_key(groups[0], fx.gpu));
     }
   }
@@ -179,7 +179,7 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
   for (auto mask : {MaskKind::kNone, MaskKind::kCausal, MaskKind::kSlidingWindow}) {
     Fixture fx(3, 1024);
     auto inputs = std::vector<Array>{fx.q, fx.k, fx.v, fx.meta, fx.table};
-    auto partial = custom("attention.short_partial128.wg128c2.v2", inputs, {0.0625f, 0, 0, 0});
+    auto partial = custom("attention.short_partial128.wg128c2.v3", inputs, {0.0625f, 0, 0, 0});
     LSE_EXPECT(partial.ok());
     if (!partial.ok()) return;
     partial->node()->iattrs = {static_cast<int>(mask), 7, 0, 16};

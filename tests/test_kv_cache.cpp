@@ -14,6 +14,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 using namespace lse;
 using namespace lse::graph;
@@ -55,9 +56,9 @@ Array pool(backend::IBackend &cpu, kv::CacheDType format) {
 }
 } // namespace
 
-LSE_TEST(kv_formats_parse_and_keep_fp32_default) {
+LSE_TEST(kv_formats_parse_and_keep_explicit_overrides) {
   model::Config cfg;
-  LSE_EXPECT(cfg.kv_cache_dtype == kv::CacheDType::kF32);
+  LSE_EXPECT(cfg.kv_cache_dtype == kv::CacheDType::kF16);
   for (auto f : formats) {
     cfg.kv_cache_dtype = f;
     auto roundtrip = model::Config::from_json_string(cfg.to_json());
@@ -73,6 +74,46 @@ LSE_TEST(kv_formats_parse_and_keep_fp32_default) {
   LSE_EXPECT(!kv::cache_dtype_from_string("int8").ok());
   LSE_EXPECT_EQ(kv::storage_width(kv::CacheDType::kFP8, 257), 0);
   LSE_EXPECT_EQ(dtype_storage_bytes(DType::kU32, 65), 260u);
+}
+
+LSE_TEST(kv_storage_defaults_follow_declared_model_dtype) {
+  const std::array cases{
+      std::pair{R"({})", kv::CacheDType::kF16},
+      std::pair{R"({"dtype":"bfloat16"})", kv::CacheDType::kBF16},
+      std::pair{R"({"dtype":"bf16"})", kv::CacheDType::kBF16},
+      std::pair{R"({"torch_dtype":"bfloat16"})", kv::CacheDType::kBF16},
+      std::pair{R"({"torch_dtype":"torch.bfloat16"})", kv::CacheDType::kBF16},
+      std::pair{R"({"dtype":"float16"})", kv::CacheDType::kF16},
+      std::pair{R"({"dtype":"float32"})", kv::CacheDType::kF16},
+      std::pair{R"({"dtype":"float16","torch_dtype":"bfloat16"})", kv::CacheDType::kF16},
+      std::pair{R"({"dtype":null,"torch_dtype":"bfloat16"})", kv::CacheDType::kBF16},
+      std::pair{R"({"torch_dtype":null})", kv::CacheDType::kF16}};
+  for (const auto& [json, expected] : cases) {
+    const auto config = model::Config::from_json_string(json);
+    LSE_EXPECT(config.ok());
+    if (config.ok()) LSE_EXPECT(config->kv_cache_dtype == expected);
+  }
+  for (const auto format : formats) {
+    const auto json = std::string(R"({"dtype":"bfloat16","kv_cache_dtype":")") +
+        std::string(kv::to_string(format)) + R"("})";
+    const auto config = model::Config::from_json_string(json);
+    LSE_EXPECT(config.ok());
+    if (config.ok()) LSE_EXPECT(config->kv_cache_dtype == format);
+  }
+  // Low-level attention references still require an explicit FP32 default.
+  const ops::GatedAttentionSpec reference;
+  LSE_EXPECT(reference.kv_cache_dtype == kv::CacheDType::kF32);
+}
+
+LSE_TEST(kv_storage_metadata_rejects_invalid_explicit_types) {
+  for (const auto json : {R"({"dtype":42})", R"({"torch_dtype":false})",
+                         R"({"kv_cache_dtype":null})", R"({"kv_cache_dtype":7})",
+                         R"({"kv_cache_dtype":"int8"})"}) {
+    const auto config = model::Config::from_json_string(json);
+    LSE_EXPECT(!config.ok());
+    if (!config.ok())
+      LSE_EXPECT(config.status().code() == StatusCode::kInvalidArgument);
+  }
 }
 
 LSE_TEST(scaled_fp8_zero_extremes_and_independent_head_scales) {

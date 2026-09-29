@@ -1,4 +1,5 @@
 #include "lse/graph/stream_plan.hpp"
+#include "lse/graph/view.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -8,17 +9,19 @@
 
 namespace lse::graph {
 
-// Invisible to the planner as well as to the scheduler: the buffer a reshape
-// names is the producer's, so a consumer reading it depends on the producer
-// directly and the view in between adds nothing to order against.
+// Views share the producer's allocation and add no dispatch dependency.
 bool views_only(const FusionGroup& group) noexcept {
+  bool has_view = false;
   for (const NodePtr& n : group.nodes) {
-    if (n->kind != OpKind::kReshape && n->kind != OpKind::kConstant &&
-        n->kind != OpKind::kBuffer) {
+    if (!n) return false;
+    if (is_buffer_view(*n)) {
+      has_view = true;
+    } else if ((n->kind != OpKind::kConstant && n->kind != OpKind::kBuffer) ||
+               !n->materialized || !n->buffer.valid()) {
       return false;
     }
   }
-  return !group.nodes.empty();
+  return has_view;
 }
 
 namespace {

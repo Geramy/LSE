@@ -17,6 +17,15 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend);
 Status ensure_output_buffer(Node& node, backend::IBackend& backend,
                             backend::Stream stream = backend::kDefaultStream);
 
+// Copies the current materialized byte window without a device-to-host bounce.
+Result<backend::DeviceBuffer> snapshot_buffer(const Node& node,
+    backend::IBackend& backend, backend::Stream stream = backend::kDefaultStream);
+
+// Reserves owning output storage before persistent-state evaluation. Reshapes
+// keep the allocation owned by their producer; this is not a detached snapshot.
+Status ensure_owned_output_buffer(Node& node, backend::IBackend& backend,
+                                 backend::Stream stream = backend::kDefaultStream);
+
 Result<float> read_scalar(const Node& node);
 Status read_raw(const Node& node, void* dst, std::size_t bytes);
 

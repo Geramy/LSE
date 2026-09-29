@@ -38,6 +38,12 @@ for value in ('true', 'false', '1', '', 'ON'):
     cases.append(([f'--dflash2={value}'], 2, '--dflash2 must be on or off'))
 cases.append((['--dflash2'], 2, '--dflash2 needs a value'))
 cases.append((['--dflash2-model'], 2, '--dflash2-model needs a value'))
+cases.append((['--help'], 0, 'default: bf16 for BF16 models, fp16 otherwise'))
+for value in ('fp32', 'fp16', 'bf16', 'fp8', 'bf8'):
+    cases.append((['--kv-cache-dtype', value, '--help'], 0, '--kv-cache-dtype TYPE'))
+for value in ('int8', '', 'invalid'):
+    cases.append((['--kv-cache-dtype', value], 2, 'KV cache dtype must be'))
+cases.append((['--kv-cache-dtype'], 2, '--kv-cache-dtype needs a value'))
 for args, code, message in cases:
     result = subprocess.run([str(server), *args], env=env, capture_output=True, text=True, timeout=10)
     output = result.stdout + result.stderr
@@ -59,6 +65,12 @@ if len(sys.argv) == 3:
         cli_cases.append(([f'--dflash2={value}'], 2, '--dflash2 must be on or off'))
     cli_cases.append((['--dflash2'], 2, '--dflash2 needs a value'))
     cli_cases.append((['--dflash2-model'], 2, '--dflash2-model needs a value'))
+    cli_cases.append((['--help'], 0, 'default: bf16 for BF16 models, fp16 otherwise'))
+    for value in ('fp32', 'fp16', 'bf16', 'fp8', 'bf8'):
+        cli_cases.append((['--kv-cache-dtype', value, '--help'], 0, '--kv-cache-dtype TYPE'))
+    for value in ('int8', '', 'invalid'):
+        cli_cases.append((['--kv-cache-dtype', value], 2, 'KV cache dtype must be'))
+    cli_cases.append((['--kv-cache-dtype'], 2, '--kv-cache-dtype needs a value'))
     for args, code, message in cli_cases:
         result = subprocess.run([str(cli), *args], env=env, capture_output=True,
                                 text=True, timeout=10)

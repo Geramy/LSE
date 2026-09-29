@@ -1,4 +1,5 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/epilogue_input.hpp"
 #include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
@@ -566,7 +567,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   // on the pair.
   const int inplace =
       (si && anchor && anchor->prim) ? anchor->prim->inplace_input() : -1;
-  const bool aliased = inplace >= 0 || bool(gdn_pair);
+  const bool aliased = inplace >= 0 || bool(gdn_pair) || graph::bindings_may_alias(out.binding_order);
   if (!aliased && out.binding_order.size() > 1) {
     std::string lhs;
     std::string rhs;

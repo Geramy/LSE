@@ -19,14 +19,20 @@ format of a running server.
 | `fp8` | OCP E4M3FN | One FP32 scale per token and KV head, separately for K and V |
 | `bf8` | OCP E5M2 | One FP32 scale per token and KV head, separately for K and V |
 
-The CLI option overrides `kv_cache_dtype` in the model configuration. When neither
-is present, LSE uses FP32. The startup log reports the selected format.
+The CLI option overrides `kv_cache_dtype` in the model configuration. A top-level
+`kv_cache_dtype` overrides the same setting in `text_config`. If neither is set,
+LSE uses BF16 when the model declares BF16, and FP16 otherwise. Model dtype
+metadata is read in this order: `text_config.dtype`, `text_config.torch_dtype`,
+`dtype`, then `torch_dtype`; null values are skipped. `--kv-cache-dtype fp32`
+selects an explicit FP32 control. The startup log reports the selected format.
 
 The 8-bit formats use round-to-nearest-even and finite saturation. Each packed
 vector contains its codes and scale. Attention reads that storage directly; LSE
-does not retain an expanded FP32 copy. Floating-point accumulation, softmax state,
-and attention output remain FP32. The admitted FP16 matrix attention path also
-uses FP16 query and probability operands with FP32 matrix accumulators.
+does not retain an expanded FP32 copy. WMMA uses FP16 Q/K/P/V matrix operands for
+FP16 storage and BF16 operands for the other four formats, after decoding or
+conversion. Matrix accumulators, online softmax state and attention output remain
+FP32. The single-token and short-query split kernels retain FP32 floating-point
+calculation while reading typed KV storage.
 
 ## Memory
 
@@ -44,13 +50,34 @@ live token count can be smaller than allocated capacity.
 
 ## GPU selection
 
-The central attention shape table selects the measured matrix path for FP16 KV
-on gfx1201. It covers the admitted 64–512-query batches through a 16,384-token
-table capacity, plus the 16-query batch at capacity 8,192. Other configurations
-use their established attention kernels. BF16 and the 8-bit KV formats do not
-select the FP16 matrix path.
+The central shape table selects `attention.flash.wmma16.v2` for eligible paged
+batches on gfx1201/wave32 across all five storage formats. Query width starts at
+2; logical K and V head widths can differ and reach 512. The rule requires the
+matching F16/BF16 matrix capability, 256-thread workgroups, sufficient LDS, valid
+metadata/table geometry and a power-of-two page block that divides the 256-key
+window. It has no 64-query minimum or fixed 16,384-token table ceiling. Traversal
+uses clamped live metadata; inactive pages and padded rows are guarded.
 
-Storage codecs and all supported attention routes passed native component checks.
-See the accompanying benchmark report for model perplexity and HTTP measurements;
-component correctness alone does not establish equal quality or throughput for
-all formats.
+Single-token and selected short-query shapes keep their split-attention routes.
+Other configurations use their established attention implementation.
+
+Native qualification covers all five formats, ragged/padded rows, causal,
+sliding and unmasked attention, nondivisible head tails, blocks 2/8/16, empty
+replay, finite scaled values around 1e30, and the maximum Dh=Dv512 boundary.
+FP16/BF16 additionally cover M512 at live lengths 5,610 and 14,000. All 39 cases
+passed with 137 device dispatches and zero host/fallback groups. See the
+[WMMA component report](benchmarks/flash-wmma-general-2026-09-28.md) for resources,
+precision contracts and passive device durations.
+
+## Model quality
+
+An earlier matched 1,024-token pair measured perplexity 4.9049 for FP32 KV with
+scalar Flash12 and 4.9014 for FP16 KV with the narrower FP16-operand WMMA v1 path.
+A later BF16 KV/generalized WMMA v2 check scored the same 1,024 pinned targets at
+PPL 4.849896867834, with 3,142 device groups, zero host/fallback and all logits
+finite. All 32 paged layers across two M512 passes selected v2 at capacities 512
+and 1,024. This is one later-build prefill measurement against historical references;
+it does not establish sampled-conversation quality or a statistical improvement.
+FP8/BF8 retain component checks without a model-quality result. See the
+[current BF16 report](benchmarks/bf16-mode-comparison-2026-09-28.md) and
+[original quality method](benchmarks/kv-storage-attention-2026-09-28.md).

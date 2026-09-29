@@ -9,38 +9,20 @@
 namespace lse::dispatch::attention_shapes {
 
 inline constexpr std::uint32_t kFlashThreads = 256, kFlashKeyWindow = 256;
-inline constexpr std::uint32_t kFlashDefaultQueryTile = 8, kFlashPrefillQueryTile = 12;
+inline constexpr std::uint32_t kFlashQueryTile = 16;
 inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;
-
-struct FlashRule {
-  std::string_view arch;
-  std::uint32_t min_rows, tile_rows;
-  AttentionPlan plan;
-  bool reuse_keys;
-};
-inline constexpr std::array kFlashRules{
-    FlashRule{"gfx1201", kFlashPrefillQueryTile, kFlashPrefillQueryTile, AttentionPlan::kFlash12, true},
-    FlashRule{{}, 2, kFlashDefaultQueryTile, AttentionPlan::kFlash8, false},
-};
 
 struct FlashWmmaRule {
   std::string_view arch;
-  std::uint32_t wave, threads, tile_rows, min_rows, max_rows;
-  std::uint32_t max_batch, query_heads, key_heads, head_dim, block;
-  std::uint32_t min_keys, max_keys, lds_bytes;
-  std::int32_t mask, window;
+  std::uint32_t wave, threads, min_rows, max_head_dim;
 };
 inline constexpr std::array kFlashWmmaRules{
-    FlashWmmaRule{"gfx1201", 32, 256, 16, 64, 512, 1, 24, 4, 256, 16,
-                  512, 16384, 24768, 1, 0},
-    FlashWmmaRule{"gfx1201", 32, 256, 16, 16, 16, 1, 24, 4, 256, 16,
-                  8192, 8192, 24768, 1, 0},
+    FlashWmmaRule{"gfx1201", 32, 256, 2, 512},
 };
 
-[[nodiscard]] constexpr bool flash_reuses_keys(std::uint32_t tile_rows) noexcept {
-  for (const auto& rule : kFlashRules)
-    if (rule.tile_rows == tile_rows) return rule.reuse_keys;
-  return false;
+[[nodiscard]] constexpr std::uint64_t flash_wmma_lds_bytes(std::uint32_t head_dim) {
+  const auto padded = (static_cast<std::uint64_t>(head_dim) + 15u) / 16u * 16u;
+  return kFlashQueryTile * (padded * 2u + kFlashKeyWindow * 4u + 3u * 4u);
 }
 
 struct DecodeRule {

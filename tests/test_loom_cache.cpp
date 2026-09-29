@@ -3,6 +3,7 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/graph/program.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -102,6 +103,33 @@ LSE_TEST(loom_cache_identity_distinguishes_edges_aliases_constants_and_devices) 
   const auto one = emitter.cache_key(constant, info);
   constant.inputs[0]->attrs[0] = 2.0f;
   LSE_EXPECT(one != emitter.cache_key(constant, info));
+}
+
+LSE_TEST(loom_cache_separates_contiguous_views_from_owned_slice_bindings) {
+  backend::LoomEmitter emitter;
+  const auto info = device();
+  auto source = leaf({1, 4, 8});
+  auto left = slice(source, 1, 0, 2);
+  auto right = slice(source, 1, 2, 4);
+  auto sum = left + right;
+  FusionGroup group;
+  group.nodes = {sum.node()};
+  group.inputs = {left.node(), right.node()};
+  group.outputs = {sum.node()};
+  group.anchor = sum.node()->kind;
+  group.anchor_class = sum.node()->fclass;
+  const auto view_key = emitter.cache_key(group, info);
+  auto view = emitter.emit(group, info);
+  LSE_EXPECT(view.ok());
+  if (!view.ok()) return;
+  LSE_EXPECT(view->source.find("buffer.assume.noalias") == std::string::npos);
+  left.node()->requires_owned_storage = true;
+  right.node()->requires_owned_storage = true;
+  LSE_EXPECT(view_key != emitter.cache_key(group, info));
+  auto owned = emitter.emit(group, info);
+  LSE_EXPECT(owned.ok());
+  if (!owned.ok()) return;
+  LSE_EXPECT(owned->source.find("buffer.assume.noalias") != std::string::npos);
 }
 
 LSE_TEST(loom_cache_reuses_q6_kernel_source_and_launch_metadata) {
@@ -484,6 +512,43 @@ LSE_TEST(cached_resource_reader_refreshes_facts_without_recompiling_code) {
     LSE_EXPECT_EQ(compiler.resource_reads, 1);
     LSE_EXPECT_EQ(cache.stats().disk_hits, 1u);
   }
+}
+
+
+LSE_TEST(retained_emission_refuses_changed_buffer_alias_class) {
+  backend::LoomEmitter emitter;
+  const auto info = device();
+  auto group = subtraction();
+  for (std::size_t i = 0; i < group.inputs.size(); ++i) {
+    group.inputs[i]->buffer.handle = 11 + i;
+    group.inputs[i]->buffer.size_bytes = 128 * sizeof(float);
+  }
+  group.outputs[0]->buffer.handle = 13;
+  group.outputs[0]->buffer.size_bytes = 128 * sizeof(float);
+  Program program;
+  program.retain(group.outputs, {}, {group}, group.nodes);
+  auto& retained = program.groups()[0];
+  const auto key = emitter.cache_key(retained, info);
+  auto kernel = emitter.emit(retained, info);
+  LSE_EXPECT(kernel.ok());
+  if (!kernel.ok()) return;
+  LSE_EXPECT(program.cache_emission(0, retained, nullptr, &emitter, key,
+                                   info.arch, kernel.release()) != nullptr);
+  std::uint64_t cached_key = 0;
+  LSE_EXPECT(program.cached_emission(0, retained, nullptr, &emitter,
+                                    info.arch, &cached_key) != nullptr);
+  retained.inputs[1]->buffer = retained.inputs[0]->buffer;
+  program.reset_compute();
+  LSE_EXPECT(program.cached_emission(0, retained, nullptr, &emitter,
+                                    info.arch, &cached_key) == nullptr);
+  LSE_EXPECT(key != emitter.cache_key(retained, info));
+  auto aliased = emitter.emit(retained, info);
+  LSE_EXPECT(aliased.ok());
+  if (aliased.ok())
+    LSE_EXPECT(aliased->source.find("buffer.assume.noalias") == std::string::npos);
+  // Disjoint windows in one slab still permit the original noalias source.
+  retained.inputs[1]->buffer.offset = retained.inputs[0]->buffer.size_bytes;
+  LSE_EXPECT_EQ(key, emitter.cache_key(retained, info));
 }
 
 LSE_TEST_MAIN()
