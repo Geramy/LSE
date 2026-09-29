@@ -22,14 +22,14 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
-## Current source: shorter compilation stalls
+## v0.4.10: shorter compilation stalls and optional KV formats
 
 Identical Loom kernel bodies now share compiled code. Attention page traversal
 stays in generated control flow instead of expanding each page into source.
 In the same two-turn Pi conversation with an empty starting cache, total JIT
 compilation fell from **92.91 s to 3.35 s**. First prefill fell from **91.53 s to
 16.88 s**; follow-up prefill fell from **16.14 s to 0.76 s**. Both responses and
-proposal acceptance counts matched. Decode remained about **27 / 31 tokens/s**.
+proposal acceptance counts matched. The subsequent feature-view fix measured about **27 / 32 tokens/s**.
 See the [execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
 
 ## Optional KV formats
@@ -94,7 +94,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.9`.
+The examples below use `v0.4.10`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -103,7 +103,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.9
+   lse_tag=v0.4.10
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -136,7 +136,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.9
+   lse_tag=v0.4.10
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -350,7 +350,8 @@ conversation prefix and added 23 tokens.
 | Current FP32, also using materialized DFlash feature views | **309.10** | **27.20** | **32.13** |
 | Earlier optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
 
-Current FP32 compilation took 3.35 seconds across 372 unique kernels, compared
+After the compiler changes, FP32 compilation took 3.35 seconds across 372 unique
+kernels, compared
 with 92.91 seconds across 427 kernels in the baseline. Follow-up prefill took
 0.760 seconds. Both FP32 runs generated identical responses and acceptance
 counts. This establishes a reduction in cold compilation stalls; steady decode
