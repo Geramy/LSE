@@ -836,6 +836,62 @@ LSE_TEST(dflash2_generator_unrelated_prefix_coldstarts_retained_request) {
   LSE_EXPECT(fresh.history() == session.history());
   expect_retained_dflash(cold, fresh, session.position());
 }
+LSE_TEST(completed_decode_retirement_releases_graph_and_preserves_live_state) {
+  Fixture fixture;
+  LSE_EXPECT_OK(fixture.open(FixtureWeights::kDefault, 8));
+  if (!fixture.target) return;
+  auto states = fixture.target->make_states();
+  std::weak_ptr<graph::Node> held;
+  {
+    auto hidden = fixture.target->hidden(filled({1, 8}, std::vector<float>(8, 1.0f)), &states, nullptr);
+    LSE_EXPECT(hidden.ok()); if (!hidden.ok()) return;
+    held = hidden->node();
+    auto logits = fixture.target->lm_head(*hidden);
+    LSE_EXPECT(logits.ok()); if (!logits.ok()) return;
+    (void)read(*logits);
+  }
+  const auto before = read(states.front().gdn_state);
+  const auto storage = states.front().gdn_state.node()->buffer.storage;
+  LSE_EXPECT(!held.expired());
+  LSE_EXPECT_OK(fixture.target->retire_completed_passes(states));
+  LSE_EXPECT(held.expired());
+  LSE_EXPECT_EQ(states.front().position, 8);
+  LSE_EXPECT(states.front().gdn_state.node()->buffer.storage == storage);
+  LSE_EXPECT(read(states.front().gdn_state) == before);
+  LSE_EXPECT_OK(fixture.target->retire_completed_passes(states));
+  auto next = fixture.target->hidden(filled({1, 16}, std::vector<float>(16, 2.0f)), &states, nullptr);
+  LSE_EXPECT(next.ok()); if (!next.ok()) return;
+  LSE_EXPECT_EQ(states.front().position, 24);
+  LSE_EXPECT_EQ(read(*next).size(), 16u * 8u);
+}
+LSE_TEST(dflash2_prefill_retirement_preserves_ring_rewind_and_repeated_drafts) {
+  Fixture reference, retired;
+  reference.config.kv_length = retired.config.kv_length = 128;
+  LSE_EXPECT_OK(reference.open(FixtureWeights::kDefault, 8));
+  LSE_EXPECT_OK(retired.open(FixtureWeights::kDefault, 8));
+  if (!reference.draft || !retired.draft) return;
+  std::int32_t position = 0;
+  for (const auto rows : {16, 5, 9, 3, 10, 4}) {
+    std::vector<float> values(static_cast<std::size_t>(rows) * 8);
+    for (std::size_t i = 0; i < values.size(); ++i) values[i] = .01f * static_cast<float>((i + static_cast<std::size_t>(position)) % 17);
+    auto features = filled({1, rows, 8}, values);
+    LSE_EXPECT_OK(reference.draft->append_context(features, position));
+    LSE_EXPECT_OK(retired.draft->append_context(features, position));
+    position += rows;
+    LSE_EXPECT_OK(retired.draft->retire_prefill());
+    LSE_EXPECT_EQ(retired.draft->context_position(), position);
+    for (const auto proposals : {7u, 3u, 7u}) {
+      auto expected = reference.draft->draft(1, position, proposals);
+      auto actual = retired.draft->draft(1, position, proposals);
+      LSE_EXPECT(expected.ok() && actual.ok());
+      if (expected.ok() && actual.ok()) LSE_EXPECT(*actual == *expected);
+    }
+    LSE_EXPECT_OK(retired.draft->retire_prefill());
+    LSE_EXPECT_OK(reference.draft->rewind(position - 1));
+    LSE_EXPECT_OK(retired.draft->rewind(position - 1));
+    --position;
+  }
+}
 LSE_TEST(prefill_retirement_releases_graph_owners_and_preserves_session_state) {
   Fixture fixture;
   const auto opened = fixture.open(FixtureWeights::kDefault, 8);

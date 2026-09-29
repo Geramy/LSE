@@ -264,7 +264,13 @@ Result<std::vector<float>> Generator::step(
     const auto chunks = prefill_plan(batch, prefill_batch_.ubatch_size);
     passes.insert(passes.end(), chunks.begin(), chunks.end());
   }
+  std::size_t previous_width = 0;
   for (std::size_t take : passes) {
+    if (previous_width != 0 && take != previous_width) {
+      hidden = {};
+      LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
+    }
+    previous_width = take;
     const auto first = tokens.begin() + static_cast<std::ptrdiff_t>(at);
     LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(
                                  first, first + static_cast<std::ptrdiff_t>(take))));
@@ -296,6 +302,7 @@ Result<std::vector<float>> Generator::step(
   LSE_RETURN_IF_ERROR(
       logits.to_host(out.data(), out.size() * sizeof(float)));
   LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
+  if (dflash2_ != nullptr) LSE_RETURN_IF_ERROR(dflash2_->retire_prefill());
   return out;
 }
 
@@ -694,6 +701,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   stats_.prompt_tokens = static_cast<std::int32_t>(fresh.size());
 
   const std::uint64_t prefill_start = now_ns();
+  LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
   LSE_ASSIGN_OR(std::vector<float> logits, step(session, fresh));
   session.advance(static_cast<std::int32_t>(fresh.size()));
   stats_.prefill_ns = now_ns() - prefill_start;

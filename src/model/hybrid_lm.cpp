@@ -1202,12 +1202,19 @@ Status HybridLM::retire_prefill(std::vector<MixerState>& states) {
                !cache.retains_prefix_state;
       });
   if (!wide) return OkStatus();
+  return retire_completed_passes(states);
+}
+
+Status HybridLM::retire_completed_passes(std::vector<MixerState>& states) {
+  if (std::none_of(caches_.begin(), caches_.end(),
+      [&](const ForwardCache& cache) { return cache.states == &states && cache.pass_id != 0; }))
+    return OkStatus();
   for (const MixerState& state : states) {
     for (const Array* value : {&state.gdn_state, &state.gdn_conv_q,
                               &state.gdn_conv_k, &state.gdn_conv_v,
                               &state.gdn_conv_qkv, &state.key_cache, &state.value_cache}) {
       if (value->valid() && (!value->node()->materialized || !value->node()->buffer.valid()))
-        return LSE_ERROR(kInternal, "prefill retirement requires materialized state");
+        return LSE_ERROR(kInternal, "forward retirement requires materialized state");
     }
   }
   if (graph::Scheduler* scheduler = graph::default_scheduler()) {

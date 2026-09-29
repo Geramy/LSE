@@ -65,6 +65,7 @@ class DFlash2Module {
   Status append_context(const graph::Array& features, std::int32_t first);
   Status rewind(std::int32_t position);
   void reset();
+  Status retire_prefill();
 
   Result<std::vector<std::uint32_t>> draft(std::uint32_t anchor,
                                           std::int32_t first,

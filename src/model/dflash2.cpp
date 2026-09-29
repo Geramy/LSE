@@ -463,6 +463,17 @@ void DFlash2Module::reset() {
   impl_->live = 0;
   impl_->contexts.clear();
 }
+Status DFlash2Module::retire_prefill() {
+  const auto wide = [this](const auto& entry) {
+    return entry.first > static_cast<std::int64_t>(impl_->config.block_size);
+  };
+  if (std::none_of(impl_->contexts.begin(), impl_->contexts.end(), wide)) return OkStatus();
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+  LSE_RETURN_IF_ERROR(scheduler->drain());
+  std::erase_if(impl_->contexts, wide);
+  return OkStatus();
+}
 Status DFlash2Module::rewind(std::int32_t position) {
   if (position < 0 || position > impl_->position) return LSE_ERROR(kInvalidArgument, "invalid DFlash2 rewind position");
   const auto drop = impl_->position - position;
@@ -486,6 +497,17 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
   if (rows > impl_->capacity) {
     input = graph::slice(features, 1, rows - impl_->capacity, rows);
     first += static_cast<std::int32_t>(rows - impl_->capacity); rows = impl_->capacity;
+  }
+  // Keep one wide prefill program; narrow verifier widths replay during decode.
+  const auto obsolete = [&](const auto& entry) {
+    return entry.first > static_cast<std::int64_t>(impl_->config.block_size) &&
+           entry.first != rows;
+  };
+  if (std::any_of(impl_->contexts.begin(), impl_->contexts.end(), obsolete)) {
+    auto* scheduler = graph::default_scheduler();
+    if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+    LSE_RETURN_IF_ERROR(scheduler->drain());
+    std::erase_if(impl_->contexts, obsolete);
   }
   auto it = impl_->contexts.find(rows);
   if (it == impl_->contexts.end()) {

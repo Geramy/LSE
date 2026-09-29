@@ -93,6 +93,20 @@ pinned targets at PPL **4.8499**, with zero host fallback. This prefill result
 does not establish sampled-conversation quality or a statistical improvement.
 See [KV cache formats](docs/KV_CACHE.md) for selection and evidence.
 
+## Prefill memory ownership
+
+Current source releases completed forward workspaces before a new request and
+when prefill changes chunk width. Consecutive chunks of the same width retain
+replay. Model weights, compiled kernels and live KV storage remain resident.
+DFlash2 also releases completed large context-projection programs.
+
+A matched 6143-token ragged request reduced reserved GPU memory from 29.77 GB
+to 28.26 GB, with identical output and acceptance counts. Prefill and decode
+rates remained within 0.5% in that comparison. This change follows v0.4.16;
+its published archives do not include it. See the
+[memory report](docs/benchmarks/prefill-workspace-memory-2026-09-29.md) for the
+method and the unresolved reproduction of the reported KanaMobile failure.
+
 ## Supported platforms
 
 | Platform | GPU requirements | Kernel source |
