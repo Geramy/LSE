@@ -162,6 +162,8 @@ def main():
                  package / 'docs/benchmarks/m8-gate-up-pair-2026-09-29.md')
     shutil.copy2(root / 'docs/benchmarks/prefill-workspace-memory-2026-09-29.md',
                  package / 'docs/benchmarks/prefill-workspace-memory-2026-09-29.md')
+    shutil.copy2(root / 'docs/benchmarks/weight-slab-memory-2026-09-29.md',
+                 package / 'docs/benchmarks/weight-slab-memory-2026-09-29.md')
     manifest = {
         'lse_revision': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
         'mac_amdgpu_revision': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
