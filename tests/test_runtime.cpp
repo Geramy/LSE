@@ -20,6 +20,7 @@
 
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
+#include "lse/dispatch/attention_shapes.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/allocator.hpp"
@@ -1941,6 +1942,12 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
   scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
   auto& backend = scheduler->backend();
   const auto& device = backend.device_info();
+  const auto& rules = dispatch::attention_shapes::kDecodeRules;
+  if (!std::any_of(rules.begin(), rules.end(), [&](const auto& rule) {
+        return device.arch == rule.arch && device.wavefront_size == rule.wave &&
+               device.max_threads_per_workgroup >= rule.threads;
+      }))
+    LSE_SKIP("requires a device in the split decode attention shape table");
   constexpr int batch = 3, heads = 2, dim = 256, block = 16;
   const float poison = std::numeric_limits<float>::quiet_NaN();
   auto read = [&](graph::Array array) { return read_all(array); };
