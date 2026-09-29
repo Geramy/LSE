@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -30,6 +31,12 @@ std::vector<std::byte> read_file(const fs::path& path) {
   in.read(reinterpret_cast<char*>(out.data()), size);
   if (in.gcount() != size) return {};
   return out;
+}
+
+bool source_matches(const fs::path& path, std::string_view source) {
+  const auto bytes = read_file(path);
+  return bytes.size() == source.size() &&
+         std::memcmp(bytes.data(), source.data(), source.size()) == 0;
 }
 
 std::uint64_t fnv(std::string_view s) noexcept {
@@ -271,14 +278,47 @@ bool read_meta(const fs::path& path, DiskMeta* out) {
   return true;
 }
 
+void record_structural_measurements(std::string_view alias,
+                                    std::string_view canonical,
+                                    std::span<const backend::KernelResources> resources,
+                                    std::span<const backend::KernelCensus> census) {
+  if (alias.empty() || alias == canonical) return;
+  auto& measured = opt::KernelMeasurements::instance();
+  for (auto r : resources) {
+    if (r.entry != canonical) continue;
+    r.entry = alias;
+    measured.record(alias, r);
+  }
+  for (auto c : census) {
+    if (c.entry != canonical) continue;
+    c.entry = alias;
+    measured.record(alias, c);
+  }
+}
+
 // Hand every measurement already on disk to the optimizer, once, before the
 // first kernel is emitted. Without this a decision made at emit time can only
 // see kernels this process has already compiled, so the first emit of a run
 // always falls back to the estimate — and the answer would then depend on how
 // long the process had been running, which is exactly what must not happen.
 void preload_measurements(const std::string& dir) {
+  struct Alias {
+    std::string entry;
+    std::string artifact;
+    std::uint64_t hash = 0;
+  };
+  std::vector<Alias> aliases;
+  std::unordered_map<std::string, DiskMeta> metadata;
   std::error_code ec;
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; ++it) {
+    if (it->path().extension() == ".alias") {
+      std::ifstream in(it->path());
+      std::string entry;
+      std::uint64_t artifact = 0, hash = 0;
+      if (std::getline(in, entry) && !entry.empty() && (in >> artifact >> hash))
+        aliases.push_back({std::move(entry), std::to_string(artifact), hash});
+      continue;
+    }
     if (it->path().extension() != ".meta") continue;
     DiskMeta meta;
     if (!read_meta(it->path(), &meta)) continue;
@@ -288,6 +328,14 @@ void preload_measurements(const std::string& dir) {
     for (const backend::KernelCensus& c : meta.census) {
       opt::KernelMeasurements::instance().record(c.entry, c);
     }
+    metadata.emplace(it->path().stem().string(), std::move(meta));
+  }
+  for (const auto& alias : aliases) {
+    const auto it = metadata.find(alias.artifact);
+    if (it == metadata.end() || it->second.source_hash != alias.hash) continue;
+    const auto& canonical = it->second;
+    record_structural_measurements(alias.entry, canonical.entry,
+                                   canonical.resources, canonical.census);
   }
 }
 
@@ -443,6 +491,7 @@ struct JitCache::Impl {
     backend::KernelHandle handle;
     std::uint64_t source_hash = 0;
     std::string arch;
+    std::string source;
     // What the toolchain said about the object behind this handle. Carried
     // whether the object was compiled here or read back from disk: a warm
     // start that lost the numbers would make them a property of process age.
@@ -456,7 +505,14 @@ struct JitCache::Impl {
   // them. Splitting by dialect as well is what makes try_get — the one lookup
   // that answers without seeing source — unable to return the other language's
   // object even if two dialects ever collided on a key.
-  std::vector<std::unordered_map<std::uint64_t, Slot>> memory;
+  struct Alias {
+    std::shared_ptr<const Slot> slot;
+    std::string structural_entry;
+  };
+  std::vector<std::unordered_map<std::uint64_t, Alias>> memory;
+  // Hash buckets compare complete source; each member owns its loaded handle.
+  std::vector<std::unordered_multimap<std::uint64_t,
+                                    std::shared_ptr<const Slot>>> artifacts;
 };
 
 JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
@@ -464,6 +520,7 @@ JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
       cache_dir_(std::move(cache_dir)),
       impl_(std::make_unique<Impl>()) {
   impl_->memory.resize(devices_.size() * kDialectCount);
+  impl_->artifacts.resize(impl_->memory.size());
   compiler_id_.resize(devices_.size() * kDialectCount, 0);
   for (std::size_t i = 0; i < devices_.size(); ++i) {
     // Every dialect the member declares, not just its front one: an object
@@ -491,6 +548,7 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
   // object is named by the hash of the source it was built from.
   compiler_id_.assign(kDialectCount, fnv(compiler.identity()));
   impl_->memory.resize(kDialectCount);
+  impl_->artifacts.resize(impl_->memory.size());
   purge_kernel_artifacts();
   preload_measurements(cache_dir_);
 }
@@ -544,11 +602,11 @@ const backend::KernelHandle* JitCache::try_get(std::size_t member,
   auto& slots = impl_->memory[slot];
   const auto it = slots.find(slot_key(member, dialect, signature));
   if (it == slots.end()) return nullptr;
-  if (it->second.arch != devices_.device(member).device_info().arch) {
+  if (it->second.slot->arch != devices_.device(member).device_info().arch) {
     return nullptr;
   }
   ++stats_.memory_hits;
-  return &it->second.handle;
+  return &it->second.slot->handle;
 }
 
 Result<backend::KernelHandle> JitCache::get_or_compile(
@@ -574,25 +632,65 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   const std::uint64_t key = slot_key(member, emitted.dialect, signature);
   const std::uint64_t src_hash =
       emitted.source.empty() ? 0 : fnv(emitted.source);
+  if (emitted.content_addressed && emitted.source.empty())
+    return LSE_ERROR(kInvalidArgument, "content-addressed kernel has no source");
+  const std::uint64_t artifact_key = emitted.content_addressed
+      ? slot_key(member, emitted.dialect,
+          mix(mix(fnv("jit.exact-source.v1"),
+                  static_cast<std::uint64_t>(emitted.dialect)), src_hash))
+      : key;
 
   dump_hip_source(emitted, key);
 
+  auto publish_alias = [&](const std::shared_ptr<const Impl::Slot>& slot) {
+    slots.insert_or_assign(key, Impl::Alias{slot, emitted.structural_entry_name});
+    record_structural_measurements(emitted.structural_entry_name,
+                                   emitted.entry_name, slot->resources, slot->census);
+    // Traffic is an invocation fact, kept under its structural identity.
+    const auto& traffic_entry = emitted.structural_entry_name.empty()
+        ? emitted.entry_name : emitted.structural_entry_name;
+    opt::KernelMeasurements::instance().record(traffic_entry, emitted.traffic);
+    if (emitted.content_addressed && !emitted.structural_entry_name.empty()) {
+      write_text(fs::path(cache_dir_) / (std::to_string(key) + ".alias"),
+          emitted.structural_entry_name + "\n" + std::to_string(artifact_key) +
+          "\n" + std::to_string(slot->source_hash) + "\n");
+    }
+  };
+
   if (const auto it = slots.find(key); it != slots.end()) {
-    const Impl::Slot& slot = it->second;
+    const Impl::Slot& slot = *it->second.slot;
     if (slot.arch == arch &&
-        (src_hash == 0 || src_hash == slot.source_hash)) {
+        (src_hash == 0 || src_hash == slot.source_hash) &&
+        (!emitted.content_addressed ||
+         slot.source == emitted.source)) {
       ++stats_.memory_hits;
       return slot.handle;
     }
   }
 
-  const fs::path stem = fs::path(cache_dir_) / std::to_string(key);
+  if (emitted.content_addressed) {
+    const auto [first, last] = impl_->artifacts[table].equal_range(artifact_key);
+    for (auto it = first; it != last; ++it) {
+      const auto& slot = it->second;
+      if (slot->arch == arch && slot->source == emitted.source) {
+        publish_alias(slot);
+        ++stats_.memory_hits;
+        return slot->handle;
+      }
+    }
+  }
+
+  const fs::path stem = fs::path(cache_dir_) / std::to_string(artifact_key);
   const fs::path meta_path = stem.string() + ".meta";
 
   DiskMeta meta;
   const bool meta_ok = read_meta(meta_path, &meta);
-  const bool source_matches =
-      src_hash == 0 || (meta_ok && src_hash == meta.source_hash);
+  const fs::path source_path = stem.string() + ".source";
+  const bool source_ok =
+      (src_hash == 0 || (meta_ok && src_hash == meta.source_hash)) &&
+      (!emitted.content_addressed ||
+       (meta_ok && meta.entry == emitted.entry_name &&
+        source_matches(source_path, emitted.source)));
   const bool device_matches = meta_ok && meta.arch == arch;
 
   // The object is named by the source hash it was built from, so a load can
@@ -607,7 +705,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   std::vector<std::byte> code;
   std::vector<backend::KernelResources> resources;
   std::vector<backend::KernelCensus> census;
-  if (device_matches && source_matches) {
+  if (device_matches && source_ok) {
     code = read_file(co_path);
     if (!code.empty()) {
       ++stats_.disk_hits;
@@ -651,7 +749,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     for (fs::directory_iterator it(cache_dir_, ec), end; !ec && it != end;
          ++it) {
       const std::string name = it->path().filename().string();
-      const std::string prefix = std::to_string(key) + ".";
+      const std::string prefix = std::to_string(artifact_key) + ".";
       if (name.rfind(prefix, 0) == 0 && name.size() > 3 &&
           name.compare(name.size() - 3, 3, ".co") == 0 &&
           it->path() != co_path) {
@@ -660,6 +758,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
       }
     }
     write_code(co_path, code);
+    if (emitted.content_addressed) write_text(source_path, emitted.source);
     write_meta(meta_path,
                DiskMeta{arch, src_hash, emitted.entry_name, resources, census});
   }
@@ -681,13 +780,12 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   for (const backend::KernelCensus& c : census) {
     opt::KernelMeasurements::instance().record(c.entry, c);
   }
-  // The intent beside the count, under the same identity, so the two are
-  // comparable without anyone holding on to the EmittedKernel that produced
-  // them.
-  opt::KernelMeasurements::instance().record(emitted.entry_name,
-                                             emitted.traffic);
-  slots[key] = Impl::Slot{kernel, stored_hash, arch, std::move(resources),
-                          std::move(census)};
+  auto slot = std::make_shared<const Impl::Slot>(Impl::Slot{
+      kernel, stored_hash, arch, emitted.content_addressed ? emitted.source : std::string{},
+      std::move(resources), std::move(census)});
+  publish_alias(slot);
+  if (emitted.content_addressed)
+    impl_->artifacts[table].emplace(artifact_key, slot);
   return kernel;
 }
 
@@ -699,9 +797,10 @@ const backend::KernelCensus* JitCache::census(
   const auto& slots = impl_->memory[slot];
   const auto it = slots.find(slot_key(member, dialect, signature));
   if (it == slots.end()) return nullptr;
-  const std::vector<backend::KernelCensus>& all = it->second.census;
+  const std::vector<backend::KernelCensus>& all = it->second.slot->census;
   if (all.empty()) return nullptr;
-  if (entry.empty()) return all.size() == 1 ? &all.front() : nullptr;
+  if (entry.empty() || entry == it->second.structural_entry)
+    return all.size() == 1 ? &all.front() : nullptr;
   for (const backend::KernelCensus& c : all) {
     if (c.entry == entry) return &c;
   }
@@ -716,9 +815,10 @@ const backend::KernelResources* JitCache::resources(
   const auto& slots = impl_->memory[slot];
   const auto it = slots.find(slot_key(member, dialect, signature));
   if (it == slots.end()) return nullptr;
-  const std::vector<backend::KernelResources>& all = it->second.resources;
+  const std::vector<backend::KernelResources>& all = it->second.slot->resources;
   if (all.empty()) return nullptr;
-  if (entry.empty()) return all.size() == 1 ? &all.front() : nullptr;
+  if (entry.empty() || entry == it->second.structural_entry)
+    return all.size() == 1 ? &all.front() : nullptr;
   for (const backend::KernelResources& r : all) {
     if (r.entry == entry) return &r;
   }

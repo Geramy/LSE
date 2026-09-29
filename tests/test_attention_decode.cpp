@@ -106,7 +106,7 @@ LSE_TEST(decode_attention_falls_back_to_flash_for_supported_contracts) {
     if (base) {
       const auto* selected = base->specialize(shapes);
       if (variant == 4)
-        LSE_EXPECT(selected != nullptr && selected->name() == "attention.flash");
+        LSE_EXPECT(selected != nullptr && selected->name() == "attention.flash.v2");
       else
         LSE_EXPECT(selected == base);
     }

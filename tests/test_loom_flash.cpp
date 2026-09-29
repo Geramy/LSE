@@ -333,4 +333,41 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()&&restored.ok()) LSE_EXPECT(restored->source==emitted->source);
 }
 
+LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
+  using namespace lse;
+  using namespace lse::graph;
+  auto leaf = [](Shape shape) {
+    auto node = std::make_shared<Node>();
+    node->shape = shape;
+    node->dtype = DType::kF32;
+    node->materialized = true;
+    return Array(node);
+  };
+  auto output = sdpa_paged(leaf({1, 24, 16, 256}), leaf({512, 4, 16, 256}),
+      leaf({512, 4, 16, 256}), 0.0625f, MaskKind::kCausal, 0,
+      leaf({kv::step_meta_elems(1)}), leaf({1, 512}), 16);
+  const NodePtr roots[]{output.node()};
+  const auto groups = Partitioner::partition(roots);
+  LSE_EXPECT_EQ(groups.size(), 1u);
+  if (groups.size() != 1) return;
+  backend::DeviceInfo device;
+  device.arch = "gfx1201";
+  device.wavefront_size = 32;
+  device.max_threads_per_workgroup = 1024;
+  device.lds_bytes_per_workgroup = 65536;
+  LSE_EXPECT(find_primitive("attention.flash.qtile12.v2") != nullptr);
+  const auto emitted = backend::LoomEmitter{}.emit(groups[0], device);
+  LSE_EXPECT(emitted.ok());
+  if (!emitted.ok()) return;
+  LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 48u);
+  LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
+  LSE_EXPECT_EQ(emitted->lds_bytes, 37056u);
+  // The page-loop form is 246 KB; the expanded form was 1.44 MB.
+  LSE_EXPECT(emitted->source.size() < 384u * 1024u);
+  std::size_t loops = 0;
+  for (auto at = emitted->source.find(" = scf.for "); at != std::string::npos;
+       at = emitted->source.find(" = scf.for ", at + 1)) ++loops;
+  LSE_EXPECT(loops >= 3u);  // Window, QK component, and value-page loops.
+}
+
 LSE_TEST_MAIN()

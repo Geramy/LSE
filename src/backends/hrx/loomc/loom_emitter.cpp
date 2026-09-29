@@ -493,6 +493,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     ++cache_misses_;
   }
   auto remember = [&] {
+    (void)finalize_source_identity(out, "lse_loom_");
     EmittedKernel saved = out;
     saved.binding_order.clear();
     const std::lock_guard lock(cache_mutex_);

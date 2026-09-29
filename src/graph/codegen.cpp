@@ -4,9 +4,51 @@
 #include "lse/opt/occupancy.hpp"
 
 #include <algorithm>
-
+#include <cctype>
 
 namespace lse::graph {
+
+bool finalize_source_identity(EmittedKernel& emitted,
+                              std::string_view entry_prefix) {
+  emitted.content_addressed = false;
+  if (emitted.source.empty() || emitted.entry_name.empty()) return false;
+  const auto identifier = [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+  };
+  const auto replace = [&](std::string_view replacement) {
+    std::string result;
+    result.reserve(emitted.source.size());
+    std::size_t at = 0;
+    while (at < emitted.source.size()) {
+      const auto found = emitted.source.find(emitted.entry_name, at);
+      if (found == std::string::npos) break;
+      const auto after = found + emitted.entry_name.size();
+      result.append(emitted.source, at, found - at);
+      if ((found == 0 || !identifier(emitted.source[found - 1])) &&
+          (after == emitted.source.size() || !identifier(emitted.source[after])))
+        result.append(replacement);
+      else
+        result.append(emitted.entry_name);
+      at = after;
+    }
+    result.append(emitted.source, at, std::string::npos);
+    return result;
+  };
+  const auto normalized = replace("lse_canonical_self_export");
+  if (normalized == emitted.source) return false;
+  std::uint64_t hash = 1469598103934665603ull;
+  for (char c : normalized) {
+    hash ^= static_cast<unsigned char>(c);
+    hash *= 1099511628211ull;
+  }
+  if (emitted.structural_entry_name.empty())
+    emitted.structural_entry_name = emitted.entry_name;
+  const std::string entry = std::string(entry_prefix) + std::to_string(hash);
+  emitted.source = replace(entry);
+  emitted.entry_name = entry;
+  emitted.content_addressed = true;
+  return true;
+}
 
 std::uint64_t IKernelEmitter::cache_key(const FusionGroup& group,
                                         const backend::DeviceInfo&) const {

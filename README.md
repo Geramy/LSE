@@ -22,7 +22,17 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
-## Current source: optional KV formats
+## Current source: shorter compilation stalls
+
+Identical Loom kernel bodies now share compiled code. Attention page traversal
+stays in generated control flow instead of expanding each page into source.
+In the same two-turn Pi conversation with an empty starting cache, total JIT
+compilation fell from **92.91 s to 3.35 s**. First prefill fell from **91.53 s to
+16.88 s**; follow-up prefill fell from **16.14 s to 0.76 s**. Both responses and
+proposal acceptance counts matched. Decode remained about **27 / 31 tokens/s**.
+See the [execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
+
+## Optional KV formats
 
 Use `--kv-cache-dtype fp16` to select FP16 KV storage. Other values are `fp32`,
 `bf16`, `fp8` and `bf8`. FP32 remains the default. The setting applies to target
@@ -335,15 +345,21 @@ conversation prefix and added 23 tokens.
 
 | KV and attention | First prefill tokens/s, including compilation | First decode tokens/s | Follow-up decode tokens/s |
 | --- | ---: | ---: | ---: |
-| FP32 baseline | 56.89 | 26.64 | 31.34 |
-| Optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
+| Earlier FP32 baseline | 56.89 | 26.64 | 31.34 |
+| Current FP32 with bounded attention source and compiled-code reuse | **308.54** | **27.11** | **31.28** |
+| Earlier optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
 
-Total compilation fell from 92.91 to 15.91 seconds. Follow-up prefill fell from
-16.14 to 0.742 seconds. Both generated different text; follow-up proposal
-acceptance was 68% for FP32 and 59% for FP16. These runs establish a cold-start
-improvement, with lower observed decode rates on the FP16 responses. They do
-not establish a decode speedup. FP32 remains the default.
-See the [KV and attention report](docs/benchmarks/kv-storage-attention-2026-09-28.md).
+Current FP32 compilation took 3.35 seconds across 372 unique kernels, compared
+with 92.91 seconds across 427 kernels in the baseline. Follow-up prefill took
+0.760 seconds. Both FP32 runs generated identical responses and acceptance
+counts. This establishes a reduction in cold compilation stalls; steady decode
+is effectively unchanged. Prompt rates exclude model loading. See the
+[execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
+
+The earlier FP16 run predates the compiler fixes. It generated different text,
+with 59% follow-up acceptance versus 68% for FP32, and does not establish a
+decode speedup. FP32 remains the default. See the
+[KV and attention report](docs/benchmarks/kv-storage-attention-2026-09-28.md).
 
 ### Earlier 14K synthetic result
 

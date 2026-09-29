@@ -40,9 +40,9 @@ struct FlashArgs {
 template <std::uint32_t QTile>
 struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
   static constexpr std::string_view kName =
-      QTile == 12 ? "attention.flash.qtile12" : "attention.flash";
+      QTile == 12 ? "attention.flash.qtile12.v2" : "attention.flash.v2";
   static constexpr std::string_view kEntry =
-      QTile == 12 ? "lse_sdpa_flash_qtile12" : "lse_sdpa_flash";
+      QTile == 12 ? "lse_sdpa_flash_qtile12_v2" : "lse_sdpa_flash_v2";
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return 3; }
@@ -284,9 +284,8 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
         }
       }
 
-      // One table read per block, and the value it names is spent on every
-      // query row of the tile before it is dropped.
-      for (std::uint32_t bi = 0; bi < blocks_per_win; ++bi) {
+      // Keep page traversal in IR; the fixed key body preserves FMA order.
+      for (auto bi : e.range(blocks_per_win)) {
         const auto j0 = e.let(wbase + bi * d.ts);
         if (auto held = e.when(j0 < row_len)) {
           const auto blk =
@@ -313,7 +312,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
             }
           } else {
             for (std::uint32_t jj = 0; jj < d.ts; ++jj) {
-              const std::uint32_t slot = bi * d.ts + jj;
+              const auto slot = e.let(bi * d.ts + jj);
               if (auto live_value = e.when(j0 + jj < row_len)) {
                 for (std::uint32_t p = 0; p < dpt; ++p) {
                   const auto dd = e.let(lid + p * kThreads);
@@ -321,7 +320,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
                     const auto vv = e.let(kv_load<Storage>(e, a.v, e.let(vb0 + jj * d.dv + dd), d.dv));
                     for (std::uint32_t r = 0; r < QTile; ++r) {
                       o[r * dpt + p] =
-                          math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
+                          math::fma(sc[e.let(r * kKWin + slot)].read(), vv,
                                     o[r * dpt + p].read());
                     }
                   }

@@ -58,6 +58,9 @@ struct EmittedKernel {
   // that predates this field.
   Dialect dialect = Dialect::kHip;
   std::string entry_name;
+  // Finalized exports may share one compiled artifact across graph identities.
+  bool content_addressed = false;
+  std::string structural_entry_name;
   ConstantsLayout constants;
   std::vector<NodePtr> binding_order;
   backend::LaunchDims dims;
@@ -76,6 +79,11 @@ struct EmittedKernel {
   // binding; a dialect that sets it must first say how it synchronizes.
   bool persist_grid = false;
 };
+
+// Rename a generated self export from the complete source body. Invocation
+// bindings and launch metadata remain unchanged; JIT verifies exact source.
+[[nodiscard]] bool finalize_source_identity(
+    EmittedKernel& emitted, std::string_view entry_prefix = "lse_body_");
 
 // Folding a run of nodes into one launch body. Which nodes an emitter can
 // carry as a stage, and how wide each would be if it owned the launch, are
