@@ -10,7 +10,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 51> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 52> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -101,6 +101,7 @@ constexpr std::array<graph::PrimitiveSource, 51> kLoomSources{{
     // scalar.minui/maxui to VGPR-only instructions without converting uniform
     // SGPR operands/results. Compare/select preserves unsigned semantics and
     // lets the target choose scalar or vector register classes consistently.
+    {"and.u32", "$r = scalar.andi $0, $1 : i32"},
     {"min.u32", "$t0 = scalar.cmpi ult, $0, $1 : i32\n"
                 "$r = scf.select $t0, $0, $1 : i32"},
     {"max.u32", "$t0 = scalar.cmpi ugt, $0, $1 : i32\n"
@@ -305,7 +306,8 @@ struct ResultType {
 };
 
 // Everything not listed produces f32, which is what every arithmetic row does.
-constexpr std::array<ResultType, 12> kNonFloatResults{{
+constexpr std::array<ResultType, 13> kNonFloatResults{{
+    {"and.u32", "i32"},
     {"bits.f32", "i32"},
     {"bits.f16", "i32"},
     {"pack4.fp8.ocp", "i32"},

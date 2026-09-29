@@ -23,6 +23,10 @@ LSE_TEST(signed_mixed_dot_and_ties_even_rounding_emit_shader_bytes) {
 LSE_TEST(workgroup_uniform_unsigned_minmax_emit_shader_bytes) {
  compile_fixture(2);
 }
+LSE_TEST(q4_plane_masks_and_uniform_unsigned_masks_compile_native_shaders) {
+ compile_fixture(3);
+ compile_fixture(4);
+}
 LSE_TEST(ordered_equal_and_unordered_not_equal_compile_native_shaders) {
  lse::backend::LoomcCompiler compiler;LSE_EXPECT(compiler.available());
  if(!compiler.available())return;

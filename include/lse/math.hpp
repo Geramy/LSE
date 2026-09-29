@@ -40,6 +40,7 @@ inline float select(bool c, float a, float b) { return c ? a : b; }
 // std::round, so this must NOT become rint/nearbyint (round-half-to-even).
 inline float round(float x) { return std::round(x); }
 inline float rint(float x) { return std::rint(x); }
+inline std::uint32_t bit_and(std::uint32_t a, std::uint32_t b) { return a & b; }
 
 
 // Expression type of this library. The recorder lives in lse::ir; authors
@@ -94,6 +95,10 @@ struct MinU {
 };
 struct MaxU {
   static constexpr std::string_view key = "max.u32";
+  using result = ir::u32;
+};
+struct AndU {
+  static constexpr std::string_view key = "and.u32";
   using result = ir::u32;
 };
 struct NegInf {
@@ -188,6 +193,9 @@ inline Val<ir::u32> min(const Val<ir::u32>& a, const Val<ir::u32>& b) {
 }
 inline Val<ir::u32> max(const Val<ir::u32>& a, const Val<ir::u32>& b) {
   return emit<op::MaxU>(a, b);
+}
+inline Val<ir::u32> bit_and(const Val<ir::u32>& a, const Val<ir::u32>& b) {
+  return emit<op::AndU>(a, b);
 }
 inline Val<lse::f32> neg_inf() { return emit<op::NegInf>(); }
 inline Val<lse::f32> abs(const Val<lse::f32>& x) { return emit<op::Abs>(x); }

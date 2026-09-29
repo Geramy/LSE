@@ -7,6 +7,7 @@
 #include "lse/graph/ops.hpp"
 #include "lse/ir/env.hpp"
 #include "lse/math.hpp"
+#include "lse/quant/group_affine_codec.hpp"
 namespace dot_fixture {
 using namespace lse;
 inline Result<backend::LoomBody> body(unsigned kind) {
@@ -25,6 +26,14 @@ inline Result<backend::LoomBody> body(unsigned kind) {
     e.ret(ir::cast<ir::f32>(dot));
   } else if(kind==1) {
     e.ret(math::rint(values[e.thread_id()].read()));
+  } else if(kind==3) {
+    const auto word=e.let(ir::cast<ir::u32>(codes[e.thread_id()].read()));
+    const auto even=quant::dot4_code_plane(e,word,0);
+    const auto odd=quant::dot4_code_plane(e,word,1);
+    e.ret(ir::cast<ir::f32>(even)+ir::cast<ir::f32>(odd));
+  } else if(kind==4) {
+    const auto index=e.let(math::workgroup_id_x());
+    e.ret(ir::cast<ir::f32>(math::bit_and(index,e.u32(15))));
   } else {
     const auto index=e.let(math::workgroup_id_x());
     const auto lo=e.let(math::min(index,e.u32(2)));

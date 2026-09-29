@@ -7,11 +7,8 @@
 // the GEMV multiplies it into the accumulator and it never reaches memory.
 // Nothing in this file writes a widened weight anywhere.
 //
-// The bit arithmetic is `/` `%` `*` `+` rather than shifts and masks: kir has
-// no bitwise operators, and on unsigned values these are the same operation.
-// Every divisor and modulus is a compile-time constant because a chunk is the
-// smallest run of lanes holding a whole number of codes, so within it each
-// code's lane and bit offset are fixed.
+// Constant divisions and moduli decode general widths; DOT4 planes use an
+// exact unsigned mask to keep nibble extraction compact.
 #pragma once
 
 #include <array>
@@ -100,8 +97,8 @@ void dequant_chunk(E& e, const env::In<std::uint32_t, E>& packed,
 
 // Rows the integer path spells that the fma codec does not. A target missing
 // any of them has no integer path and takes the codec above.
-inline constexpr std::array<std::string_view, 4> kGroupAffineDotSymbols{
-    "dot4.i32.iu8", "rint", "max", "abs"};
+inline constexpr std::array<std::string_view, 5> kGroupAffineDotSymbols{
+    "dot4.i32.iu8", "rint", "max", "abs", "and.u32"};
 
 // A 4-bit chunk is one lane holding this many codes, which is also how many
 // activations one pair of dot4 operands consumes.
@@ -121,19 +118,12 @@ inline constexpr int kDot4ChunkCodes = 8;
   return 2 * b + p;
 }
 
-// Plane `p` of a packed 4-bit word: four unsigned codes, one per byte, ready
-// to be a dot4 operand. Written as division and modulus like the codec above;
-// the backend folds it back into one shift and one mask.
+// Plane p (0 or 1) holds its four unsigned nibbles in separate bytes.
 template <class E>
 [[nodiscard]] detail::U<E> dot4_code_plane(E& e, const detail::U<E>& word,
                                            int p) {
-  detail::U<E> plane =
-      (word / (1u << (4 * dot4_operand_slot(p, 0)))) % 16u;
-  for (int b = 1; b < 4; ++b) {
-    plane = plane + ((word / (1u << (4 * dot4_operand_slot(p, b)))) % 16u) *
-                        (1u << (8 * b));
-  }
-  return e.let(plane);
+  const auto shifted = word / (1u << (4 * p));
+  return e.let(math::bit_and(shifted, e.u32(0x0f0f0f0fu)));
 }
 
 // The activation operand that plane `p` multiplies. `byte_of(j)` hands back

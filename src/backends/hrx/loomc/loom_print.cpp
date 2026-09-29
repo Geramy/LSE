@@ -806,7 +806,7 @@ class Printer {
         return unsupported("operand of '" + o.key + "' was never defined");
       }
       auto arg = name(v);
-      if ((o.key == "min.u32" || o.key == "max.u32") &&
+      if (o.type.elem == Scalar::kU32 && loom_result_type(o.key) == "i32" &&
           operand(v)->cls == Cls::kIndex) {
         arg = fresh("word");
         line(depth, arg + " = index.cast " + name(v) + " : index to i32");
