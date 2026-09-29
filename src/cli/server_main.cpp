@@ -3,6 +3,8 @@
 #include <charconv>
 #include <cmath>
 #include <optional>
+#include <locale>
+#include <sstream>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -153,8 +155,10 @@ int main(int argc, char** argv) {
     else if (a == "--temperature") {
       const auto text = value("--temperature");
       float temperature = 0;
-      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), temperature);
-      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+      std::istringstream parsed(text);
+      parsed.imbue(std::locale::classic());
+      parsed >> std::noskipws >> temperature;
+      if (text.empty() || text.front() == '+' || parsed.fail() || !parsed.eof() ||
           !std::isfinite(temperature) || temperature < 0 || temperature > 2) {
         std::fputs("lse-server: temperature must be a finite number from 0 to 2\n", stderr);
         return 2;
