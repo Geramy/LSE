@@ -10,7 +10,7 @@ if(NOT CMAKE_CXX_COMPILER)
 endif()
 
 project(lse
-  VERSION 0.4.14
+  VERSION 0.4.15
   DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
   LANGUAGES CXX)
 
@@ -283,7 +283,8 @@ endif()
 lse_apply_common_flags(lse_graph)
 # Review copies of generated HIP land in ${CMAKE_BINARY_DIR}/hip/.
 target_compile_definitions(lse_graph PRIVATE
-  "LSE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\"")
+  "LSE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\""
+  "LSE_ENGINE_VERSION=\"${PROJECT_VERSION}\"")
 
 lse_provide_fastokens("${CMAKE_CURRENT_SOURCE_DIR}/reference/fastokens")
 lse_add_rust_staticlib(fastokens_ffi

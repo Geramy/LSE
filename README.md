@@ -20,9 +20,13 @@ The CLI and HTTP server create `~/.lse/cache/` automatically and reuse compiled
 kernels across launches. Use `--cache-dir /path/to/cache` to select another
 location. The startup log prints the selected directory. The flag takes precedence
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
-required. Cache entries check compiler identity, device properties and kernel source.
+required. Cache entries include the engine release version and check compiler
+identity, device properties and kernel source. Startup removes complete older
+LSE-owned artifact families from the selected directory. It preserves current
+and newer releases, unrelated files, incomplete records and symlinks. An update
+can compile kernels again; later launches reuse the current release cache.
 
-## Current source update: v0.4.14
+## Current source update: v0.4.15
 
 The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
 Conditional drafting uses the request temperature. Probability-ratio rejection
@@ -33,7 +37,12 @@ shapes. M8 gate/up and QKV projections now consume two activation rows at a time
 The accepted M8 down WMMA, typed attention, buffer views and memory retirement
 remain active. Floating-point accumulation remains FP32.
 
-The final same-binary resident measurements are **624.10 PP/s / 24.73 TPS** for
+M8 GDN alpha and beta projections now reuse the activation panel shared by QKV
+and the GDN gate. Their preparation-inclusive paired GPU time falls from
+0.0500 to 0.0249 ms, with complete fused outputs matching exactly. This is a
+component result; token throughput has not been remeasured for this addition.
+
+The last same-binary comparison, collected with v0.4.14, measured **624.10 PP/s / 24.73 TPS** for
 baseline, **608.19 PP/s / 48.62 TPS** for MTP=3, and **616.78 PP/s / 42.41 TPS** for
 seven-proposal DFlash2. These are 1024-token coding requests at temperature 0.6.
 They do not establish these rates for every context or Pi conversation. See
@@ -48,6 +57,7 @@ They do not establish these rates for every context or Pi conversation. See
 | Cooperative M1024 gate/up | [Gate/up results](docs/benchmarks/prefill-m1024-up-2026-09-29.md) |
 | Cooperative QKV, GDN gate and attention projections | [Projection results](docs/benchmarks/prefill-projections-2026-09-29.md) |
 | M8 activation register lifetime | [Decode scheduling results](docs/benchmarks/m8-dot4-rowpairs-2026-09-29.md) |
+| M8 GDN alpha/beta panel reuse | [Rate projection results](docs/benchmarks/m8-gdn-rate-panel-2026-09-29.md) |
 
 The launch examples use temperature 0.6 and batch/ubatch 1024. Explicit request
 parameters override launch defaults. Earlier versions and measurements remain
@@ -100,7 +110,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.14`.
+The examples below use `v0.4.15`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -109,7 +119,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.14
+   lse_tag=v0.4.15
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -142,7 +152,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.14
+   lse_tag=v0.4.15
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -345,9 +355,9 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
-### Current BF16 source measurements
+### Last same-binary BF16 measurements
 
-One binary, identical 1024-token coding requests and 384 generated tokens per
+Measured source `c11f103` (v0.4.14). One binary, identical 1024-token coding requests and 384 generated tokens per
 request. The decode rate times 383 tokens after the first token. Each mode starts
 with an empty private disk cache. The resident request retains compiled code
 but reuses zero prompt KV. Compilation is included. All requests have zero host

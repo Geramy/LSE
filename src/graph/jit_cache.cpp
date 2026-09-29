@@ -4,8 +4,14 @@
 #include "resource_profile.hpp"
 
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
+#include <charconv>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -64,6 +70,7 @@ struct DiskMeta {
   std::vector<backend::KernelResources> resources;
   std::vector<backend::KernelCensus> census;
   std::uint32_t resource_version = 0;
+  std::string engine_version;
 };
 
 // A fact renders as its number or as "-", never as a 0 standing in for
@@ -257,19 +264,98 @@ bool read_resource_line(const std::string& line,
   return true;
 }
 
+constexpr std::string_view kMetaOwner = "lse-kernel-cache-v1";
+constexpr std::string_view kAliasOwner = "lse-kernel-alias-v1";
+
+bool unsigned_number(std::string_view text, std::uint64_t* out, int base = 10) {
+  if (text.empty()) return false;
+  const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(),
+                                        *out, base);
+  return ec == std::errc{} && end == text.data() + text.size();
+}
+
+using ReleaseVersion = std::array<std::uint32_t, 3>;
+bool release_version(std::string_view text, ReleaseVersion* out) {
+  for (std::size_t i = 0; i < out->size(); ++i) {
+    const auto dot = text.find('.');
+    if ((i + 1 == out->size()) != (dot == std::string_view::npos)) return false;
+    const auto part = text.substr(0, dot);
+    std::uint64_t value = 0;
+    if (!unsigned_number(part, &value) || value > UINT32_MAX) return false;
+    (*out)[i] = static_cast<std::uint32_t>(value);
+    if (dot != std::string_view::npos) text.remove_prefix(dot + 1);
+  }
+  return true;
+}
+
+std::string artifact_stem(std::string_view version, std::uint64_t key) {
+  return "lse-" + std::string(version) + "-" + std::to_string(key);
+}
+
+bool versioned_stem(std::string_view stem, std::string_view version) {
+  const auto prefix = "lse-" + std::string(version) + "-";
+  std::uint64_t key = 0;
+  return stem.starts_with(prefix) &&
+      unsigned_number(stem.substr(prefix.size()), &key);
+}
+
+bool regular_file(const fs::path& path) {
+  std::error_code ec;
+  return fs::is_regular_file(fs::symlink_status(path, ec)) && !ec;
+}
+
+bool complete_file(const fs::path& path) {
+  std::error_code ec;
+  return regular_file(path) && fs::file_size(path, ec) > 0 && !ec;
+}
+
+// Serializes cleanup and publication across cooperating processes, not JIT
+// compilation. Each release has distinct filenames, including temporary files.
+class CacheDiskLock {
+ public:
+  explicit CacheDiskLock(const fs::path& dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return;
+    const auto path = dir / ".lse-cache.lock";
+    fd_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd_ < 0) return;
+    struct stat info{};
+    if (::fstat(fd_, &info) != 0 || !S_ISREG(info.st_mode)) {
+      ::close(fd_);
+      fd_ = -1;
+      return;
+    }
+    int result;
+    do { result = ::flock(fd_, LOCK_EX); } while (result != 0 && errno == EINTR);
+    if (result != 0) { ::close(fd_); fd_ = -1; }
+  }
+  ~CacheDiskLock() {
+    if (fd_ >= 0) { ::flock(fd_, LOCK_UN); ::close(fd_); }
+  }
+  CacheDiskLock(const CacheDiskLock&) = delete;
+  CacheDiskLock& operator=(const CacheDiskLock&) = delete;
+  explicit operator bool() const noexcept { return fd_ >= 0; }
+ private:
+  int fd_ = -1;
+};
+
 bool read_meta(const fs::path& path, DiskMeta* out) {
+  if (!regular_file(path)) return false;
   std::ifstream in(path);
   if (!in) return false;
+  *out = {};
   std::string hash;
   if (!std::getline(in, out->arch)) return false;
-  if (!std::getline(in, hash)) return false;
-  if (!std::getline(in, out->entry)) return false;
-  if (out->arch.empty() || hash.empty()) return false;
-  try {
-    out->source_hash = std::stoull(hash, nullptr, 16);
-  } catch (...) {
-    return false;
+  if (out->arch == kMetaOwner) {
+    ReleaseVersion version{};
+    if (!std::getline(in, out->engine_version) ||
+        !release_version(out->engine_version, &version) ||
+        !std::getline(in, out->arch)) return false;
   }
+  if (!std::getline(in, hash) || !std::getline(in, out->entry)) return false;
+  if (out->arch.empty() || out->entry.empty() ||
+      !unsigned_number(hash, &out->source_hash, 16)) return false;
   for (std::string line; std::getline(in, line);) {
     if (line.starts_with("resource_version ")) {
       std::istringstream version(line.substr(17));
@@ -286,6 +372,126 @@ bool read_meta(const fs::path& path, DiskMeta* out) {
     read_access_line(line, &out->census);
   }
   return true;
+}
+
+struct DiskAlias {
+  std::string entry;
+  std::string artifact;
+  std::uint64_t hash = 0;
+  std::string engine_version;
+};
+
+bool read_alias(const fs::path& path, DiskAlias* out) {
+  if (!regular_file(path)) return false;
+  std::ifstream in(path);
+  if (!in || !std::getline(in, out->entry)) return false;
+  if (out->entry == kAliasOwner) {
+    ReleaseVersion version{};
+    if (!std::getline(in, out->engine_version) ||
+        !release_version(out->engine_version, &version) ||
+        !std::getline(in, out->entry)) return false;
+  }
+  std::string hash, extra;
+  if (out->entry.empty() || !std::getline(in, out->artifact) ||
+      !std::getline(in, hash) || !unsigned_number(hash, &out->hash) ||
+      (std::getline(in, extra) && !extra.empty())) return false;
+  std::uint64_t key = 0;
+  return out->engine_version.empty()
+      ? unsigned_number(out->artifact, &key)
+      : versioned_stem(out->artifact, out->engine_version);
+}
+
+bool legacy_entry(std::string_view entry) {
+  for (const auto prefix : {"lse_loom_", "lse_fused_", "lse_phase_", "lse_body_"}) {
+    std::uint64_t key = 0;
+    if (entry.starts_with(prefix) &&
+        unsigned_number(entry.substr(std::strlen(prefix)), &key)) return true;
+  }
+  return false;
+}
+
+void remove_older_cache_entries(const fs::path& dir) {
+  ReleaseVersion current{};
+  if (!release_version(kernel_cache_version(), &current)) return;
+  CacheDiskLock lock(dir);
+  if (!lock) return;
+  struct Family { fs::path meta; DiskMeta info; std::vector<fs::path> files; };
+  std::unordered_map<std::string, Family> older;
+  std::error_code ec;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; ++it) {
+    const auto& path = it->path();
+    if (path.extension() != ".meta" || !regular_file(path)) continue;
+    DiskMeta meta;
+    if (!read_meta(path, &meta)) continue;
+    const auto stem = path.stem().string();
+    if (meta.engine_version.empty()) {
+      std::uint64_t key = 0;
+      // Unmarked files are legacy only with the old numeric key, generated LSE
+      // entry name, AMD architecture, and matching complete code object.
+      if (!unsigned_number(stem, &key) || !legacy_entry(meta.entry) ||
+          !meta.arch.starts_with("gfx") || meta.arch.size() <= 3 ||
+          !std::all_of(meta.arch.begin() + 3, meta.arch.end(), [](char c) {
+            return std::isxdigit(static_cast<unsigned char>(c));
+          })) continue;
+      const fs::path code = dir / (stem + "." +
+          std::to_string(meta.source_hash) + ".co");
+      if (!complete_file(code)) continue;
+    } else {
+      ReleaseVersion version{};
+      if (!versioned_stem(stem, meta.engine_version) ||
+          !release_version(meta.engine_version, &version) || !(version < current))
+        continue;
+      const fs::path code = dir / (stem + "." +
+          std::to_string(meta.source_hash) + ".co");
+      if (!complete_file(code)) continue;
+    }
+    older.emplace(stem, Family{path, std::move(meta), {path}});
+  }
+  if (older.empty()) return;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; ++it) {
+    const auto& path = it->path();
+    if (!regular_file(path)) continue;
+    if (path.extension() == ".alias") {
+      DiskAlias alias;
+      if (!read_alias(path, &alias)) continue;
+      const auto family = older.find(alias.artifact);
+      if (family == older.end() || alias.hash != family->second.info.source_hash ||
+          alias.engine_version != family->second.info.engine_version) continue;
+      std::uint64_t key = 0;
+      const auto stem = path.stem().string();
+      if (alias.engine_version.empty()
+              ? (unsigned_number(stem, &key) && legacy_entry(alias.entry))
+              : versioned_stem(stem, alias.engine_version))
+        family->second.files.push_back(path);
+      continue;
+    }
+    if (path.extension() == ".source") {
+      if (auto family = older.find(path.stem().string()); family != older.end())
+        family->second.files.push_back(path);
+      continue;
+    }
+    if (path.extension() != ".co" || !complete_file(path)) continue;
+    const auto name = path.stem().string();
+    const auto dot = name.rfind('.');
+    if (dot == std::string::npos) continue;
+    std::uint64_t hash = 0;
+    if (!unsigned_number(std::string_view(name).substr(dot + 1), &hash)) continue;
+    if (auto family = older.find(name.substr(0, dot)); family != older.end())
+      family->second.files.push_back(path);
+  }
+  for (const auto& item : older) {
+    const auto& family = item.second;
+    // Recheck the ownership record before deleting any family member. Partial
+    // metadata and temporary files never authorize a cleanup.
+    DiskMeta now;
+    if (!read_meta(family.meta, &now) ||
+        now.engine_version != family.info.engine_version ||
+        now.arch != family.info.arch || now.entry != family.info.entry ||
+        now.source_hash != family.info.source_hash) continue;
+    for (const auto& path : family.files) {
+      if (regular_file(path)) { std::error_code rm; fs::remove(path, rm); }
+    }
+  }
 }
 
 void record_structural_measurements(std::string_view alias,
@@ -313,29 +519,26 @@ void record_structural_measurements(std::string_view alias,
 // long the process had been running, which is exactly what must not happen.
 void preload_measurements(const std::string& dir,
     const std::unordered_map<std::string, std::uint32_t>& resource_versions) {
-  struct Alias {
-    std::string entry;
-    std::string artifact;
-    std::uint64_t hash = 0;
-  };
-  std::vector<Alias> aliases;
+  std::vector<DiskAlias> aliases;
   std::unordered_map<std::string, DiskMeta> metadata;
   std::error_code ec;
   for (fs::directory_iterator it(dir, ec), end; !ec && it != end; ++it) {
     if (it->path().extension() == ".alias") {
-      std::ifstream in(it->path());
-      std::string entry;
-      std::uint64_t artifact = 0, hash = 0;
-      if (std::getline(in, entry) && !entry.empty() && (in >> artifact >> hash))
-        aliases.push_back({std::move(entry), std::to_string(artifact), hash});
+      DiskAlias alias;
+      if (read_alias(it->path(), &alias) &&
+          alias.engine_version == kernel_cache_version() &&
+          versioned_stem(it->path().stem().string(), alias.engine_version))
+        aliases.push_back(std::move(alias));
       continue;
     }
     if (it->path().extension() != ".meta") continue;
     DiskMeta meta;
-    if (!read_meta(it->path(), &meta)) continue;
+    if (!read_meta(it->path(), &meta) ||
+        meta.engine_version != kernel_cache_version() ||
+        !versioned_stem(it->path().stem().string(), meta.engine_version)) continue;
     const auto version = resource_versions.find(meta.arch);
     if (version == resource_versions.end()) continue;
-    // Legacy objects remain reusable; stale resource facts are not evidence.
+    // Stale resource-reader facts are not evidence, even within this release.
     if (meta.resource_version != version->second) meta.resources.clear();
     for (const backend::KernelResources& r : meta.resources) {
       opt::KernelMeasurements::instance().record(r.entry, r);
@@ -354,12 +557,30 @@ void preload_measurements(const std::string& dir,
   }
 }
 
+void write_atomic(const fs::path& path, std::span<const std::byte> bytes) {
+  auto temporary = path.string() + ".tmpXXXXXX";
+  const int fd = ::mkstemp(temporary.data());
+  if (fd < 0) return;
+  std::size_t written = 0;
+  while (written < bytes.size()) {
+    const auto result = ::write(fd, bytes.data() + written, bytes.size() - written);
+    if (result < 0 && errno == EINTR) continue;
+    if (result <= 0) break;
+    written += static_cast<std::size_t>(result);
+  }
+  const bool complete = ::close(fd) == 0 && written == bytes.size();
+  std::error_code ec;
+  if (complete) fs::rename(temporary, path, ec);
+  if (!complete || ec) fs::remove(temporary, ec);
+}
+
+void write_text(const fs::path& path, std::string_view text) {
+  write_atomic(path, std::as_bytes(std::span(text.data(), text.size())));
+}
+
 void write_meta(const fs::path& path, const DiskMeta& meta) {
-  const fs::path tmp =
-      path.string() + ".tmp" + std::to_string(::getpid());
-  std::ofstream out(tmp);
-  if (!out) return;
-  out << meta.arch << '\n';
+  std::ostringstream out;
+  out << kMetaOwner << '\n' << meta.engine_version << '\n' << meta.arch << '\n';
   char buf[17];
   std::snprintf(buf, sizeof(buf), "%016llx",
                 static_cast<unsigned long long>(meta.source_hash));
@@ -367,35 +588,11 @@ void write_meta(const fs::path& path, const DiskMeta& meta) {
   out << "resource_version " << meta.resource_version << '\n';
   write_resources(out, meta.resources);
   write_census(out, meta.census);
-  out.close();
-  std::error_code ec;
-  fs::rename(tmp, path, ec);
-  if (ec) fs::remove(tmp, ec);
+  write_text(path, out.str());
 }
 
 void write_code(const fs::path& path, const std::vector<std::byte>& code) {
-  const fs::path tmp =
-      path.string() + ".tmp" + std::to_string(::getpid());
-  std::ofstream out(tmp, std::ios::binary);
-  if (!out) return;
-  out.write(reinterpret_cast<const char*>(code.data()),
-            static_cast<std::streamsize>(code.size()));
-  out.close();
-  std::error_code ec;
-  fs::rename(tmp, path, ec);
-  if (ec) fs::remove(tmp, ec);
-}
-
-void write_text(const fs::path& path, std::string_view text) {
-  const fs::path tmp =
-      path.string() + ".tmp" + std::to_string(::getpid());
-  std::ofstream out(tmp);
-  if (!out) return;
-  out.write(text.data(), static_cast<std::streamsize>(text.size()));
-  out.close();
-  std::error_code ec;
-  fs::rename(tmp, path, ec);
-  if (ec) fs::remove(tmp, ec);
+  write_atomic(path, code);
 }
 
 }  // namespace
@@ -452,30 +649,25 @@ std::string hip_dump_directory() {
 #endif
 }
 
-void purge_kernel_artifacts() {
+std::string_view kernel_cache_version() noexcept { return LSE_ENGINE_VERSION; }
+
+void purge_kernel_artifacts(std::string_view cache_dir) {
+  remove_older_cache_entries(cache_dir.empty() ? default_cache_dir()
+                                              : std::string(cache_dir));
   static std::once_flag once;
   std::call_once(once, [] {
-    const auto wipe = [](const fs::path& dir) {
-      if (dir.empty()) return;
-      const fs::path n = dir.lexically_normal();
-      if (n.empty() || n == n.root_path()) return;
-      const std::string s = n.generic_string();
-      if (s.find("lse") == std::string::npos &&
-          s.find("hip") == std::string::npos &&
-          s.find("kernel") == std::string::npos) {
-        return;
+    const fs::path dir = hip_dump_directory();
+    if (dir.empty()) return;
+    // A dump directory can coincide with the code cache. Delete only generated
+    // LSE source files, never the directory or arbitrary contents.
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; ++it) {
+      const auto& path = it->path();
+      if ((path.extension() == ".hip" || path.extension() == ".loom") &&
+          legacy_entry(path.stem().string()) && regular_file(path)) {
+        std::error_code rm;
+        fs::remove(path, rm);
       }
-      std::error_code ec;
-      fs::remove_all(n, ec);
-    };
-    // The dump dir is debug output; clearing it keeps build/hip in step with
-    // this process's emission. The .co cache is NOT wiped: entries carry an
-    // arch + source-hash check on read, so stale ones self-invalidate, and
-    // wiping here forced every process to recompile every kernel.
-    wipe(hip_dump_directory());
-    if (const char* env = std::getenv("LSE_JIT_PURGE");
-        env != nullptr && env[0] == '1') {
-      wipe(default_cache_dir());
     }
   });
 }
@@ -550,7 +742,7 @@ JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
       version = std::max(version, tc.compiler->resource_metadata_version());
     }
   }
-  purge_kernel_artifacts();
+  purge_kernel_artifacts(cache_dir_);
   preload_measurements(cache_dir_, resource_versions);
 }
 
@@ -568,7 +760,7 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
   compiler_id_.assign(kDialectCount, fnv(compiler.identity()));
   impl_->memory.resize(kDialectCount);
   impl_->artifacts.resize(impl_->memory.size());
-  purge_kernel_artifacts();
+  purge_kernel_artifacts(cache_dir_);
   preload_measurements(cache_dir_,
       {{backend.device_info().arch, compiler.resource_metadata_version()}});
 }
@@ -611,7 +803,7 @@ std::uint64_t JitCache::slot_key(std::size_t member, Dialect dialect,
   h = mix(h, static_cast<std::uint64_t>(info.max_threads_per_workgroup));
   h = mix(h, static_cast<std::uint64_t>(info.wavefront_size));
   h = mix(h, static_cast<std::uint64_t>(info.cus_per_lds_pool));
-  return h;
+  return mix(h, fnv(kernel_cache_version()));
 }
 
 const backend::KernelHandle* JitCache::try_get(std::size_t member,
@@ -671,9 +863,13 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
         ? emitted.entry_name : emitted.structural_entry_name;
     opt::KernelMeasurements::instance().record(traffic_entry, emitted.traffic);
     if (emitted.content_addressed && !emitted.structural_entry_name.empty()) {
-      write_text(fs::path(cache_dir_) / (std::to_string(key) + ".alias"),
-          emitted.structural_entry_name + "\n" + std::to_string(artifact_key) +
-          "\n" + std::to_string(slot->source_hash) + "\n");
+      CacheDiskLock lock(cache_dir_);
+      if (lock) write_text(fs::path(cache_dir_) /
+          (artifact_stem(kernel_cache_version(), key) + ".alias"),
+          std::string(kAliasOwner) + "\n" + std::string(kernel_cache_version()) +
+          "\n" + emitted.structural_entry_name + "\n" +
+          artifact_stem(kernel_cache_version(), artifact_key) + "\n" +
+          std::to_string(slot->source_hash) + "\n");
     }
   };
 
@@ -700,11 +896,13 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     }
   }
 
-  const fs::path stem = fs::path(cache_dir_) / std::to_string(artifact_key);
+  const fs::path stem = fs::path(cache_dir_) /
+      artifact_stem(kernel_cache_version(), artifact_key);
   const fs::path meta_path = stem.string() + ".meta";
 
   DiskMeta meta;
-  const bool meta_ok = read_meta(meta_path, &meta);
+  const bool meta_ok = read_meta(meta_path, &meta) &&
+      meta.engine_version == kernel_cache_version();
   const fs::path source_path = stem.string() + ".source";
   const bool source_ok =
       (src_hash == 0 || (meta_ok && src_hash == meta.source_hash)) &&
@@ -747,7 +945,10 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
           metadata_changed = true;
         }
       }
-      if (metadata_changed) write_meta(meta_path, meta);
+      if (metadata_changed) {
+        CacheDiskLock lock(cache_dir_);
+        if (lock) write_meta(meta_path, meta);
+      }
     }
   }
 
@@ -769,26 +970,31 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
             .count());
     ++stats_.compiles;
 
+    CacheDiskLock lock(cache_dir_);
     std::error_code ec;
-    fs::create_directories(cache_dir_, ec);
     // Best-effort reclaim of objects this key no longer references (older
     // source revisions); the hash-suffixed name makes them dead, not wrong.
-    for (fs::directory_iterator it(cache_dir_, ec), end; !ec && it != end;
+    for (fs::directory_iterator it(cache_dir_, ec), end; lock && !ec && it != end;
          ++it) {
       const std::string name = it->path().filename().string();
-      const std::string prefix = std::to_string(artifact_key) + ".";
-      if (name.rfind(prefix, 0) == 0 && name.size() > 3 &&
-          name.compare(name.size() - 3, 3, ".co") == 0 &&
-          it->path() != co_path) {
+      const std::string prefix = stem.filename().string() + ".";
+      std::uint64_t old_hash = 0;
+      if (name.starts_with(prefix) && name.ends_with(".co") &&
+          unsigned_number(std::string_view(name).substr(
+              prefix.size(), name.size() - prefix.size() - 3), &old_hash) &&
+          complete_file(it->path()) && it->path() != co_path) {
         std::error_code rm;
         fs::remove(it->path(), rm);
       }
     }
-    write_code(co_path, code);
-    if (emitted.content_addressed) write_text(source_path, emitted.source);
-    write_meta(meta_path,
-               DiskMeta{arch, src_hash, emitted.entry_name, resources, census,
-                        compiler->resource_metadata_version()});
+    if (lock) {
+      write_code(co_path, code);
+      if (emitted.content_addressed) write_text(source_path, emitted.source);
+      write_meta(meta_path,
+                 DiskMeta{arch, src_hash, emitted.entry_name, resources, census,
+                          compiler->resource_metadata_version(),
+                          std::string(kernel_cache_version())});
+    }
   }
 
   auto handle = be.load_executable(

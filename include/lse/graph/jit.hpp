@@ -3,8 +3,8 @@
 // Device-agnostic. Compilation itself is delegated to the IKernelCompiler the
 // backend supplies, so nothing here knows about a particular toolchain.
 //
-// A kernel is compiled only when the device (arch) changed, the cache has
-// no entry for this (arch, signature), or the generated source changed.
+// Cache ownership is scoped to the engine release. Source, compiler, and
+// device checks still distinguish kernels within that release.
 #pragma once
 
 #include <cstddef>
@@ -20,6 +20,9 @@
 
 namespace lse::graph {
 
+// The release compiled into the cache implementation.
+std::string_view kernel_cache_version() noexcept;
+
 // $LSE_CACHE_DIR when set, otherwise ~/.lse/cache.
 std::string default_cache_dir();
 
@@ -33,9 +36,10 @@ std::string hip_dump_directory();
 // entry name per process; later launches of the same kernel skip.
 void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key = 0);
 
-// Drops on-disk code objects and HIP dumps from the previous process.
-// Called once the first time this process constructs a JitCache.
-void purge_kernel_artifacts();
+// Removes identifiable older LSE cache families in the selected directory.
+// Same/newer releases, incomplete entries, symlinks and unrelated files remain.
+// Generated-source dumps are cleared separately, once per process.
+void purge_kernel_artifacts(std::string_view cache_dir = {});
 
 class JitCache {
  public:

@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <barrier>
+#include <thread>
 #include <unistd.h>
 
 #include "lse/graph/jit.hpp"
@@ -331,6 +333,67 @@ LSE_TEST(loom_compiled_body_ignores_bound_producer_metadata_but_keeps_edges) {
   if (aliased.ok()) LSE_EXPECT(a->source != aliased->source);
 }
 
+namespace {
+std::string cache_text(const std::filesystem::path& path) {
+  std::ifstream in(path);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+void cache_write(const std::filesystem::path& path, std::string_view text) {
+  std::ofstream out(path);
+  out << text;
+}
+struct CacheFamily {
+  std::string stem;
+  std::filesystem::path meta, code, source, alias;
+};
+CacheFamily seed_cache_family(const std::filesystem::path& dir,
+                              std::string_view version, unsigned key,
+                              std::string_view entry = "lse_loom_123") {
+  CacheFamily out;
+  out.stem = version.empty() ? std::to_string(key)
+      : "lse-" + std::string(version) + "-" + std::to_string(key);
+  out.meta = dir / (out.stem + ".meta");
+  out.code = dir / (out.stem + ".11.co");
+  out.source = dir / (out.stem + ".source");
+  const auto alias_stem = version.empty() ? std::to_string(key + 1000)
+      : "lse-" + std::string(version) + "-" + std::to_string(key + 1000);
+  out.alias = dir / (alias_stem + ".alias");
+  const auto ownership = version.empty() ? std::string{}
+      : "lse-kernel-cache-v1\n" + std::string(version) + "\n";
+  cache_write(out.meta, ownership + "gfx1201\n000000000000000b\n" +
+      std::string(entry) + "\nresource_version 0\n");
+  cache_write(out.code, "complete old code object");
+  cache_write(out.source, "complete old emitted source");
+  const auto alias_owner = version.empty() ? std::string{}
+      : "lse-kernel-alias-v1\n" + std::string(version) + "\n";
+  cache_write(out.alias, alias_owner + "lse_loom_456\n" + out.stem + "\n11\n");
+  return out;
+}
+void expect_cache_family(const CacheFamily& family, bool present) {
+  for (const auto& path : {family.meta, family.code, family.source, family.alias})
+    LSE_EXPECT(std::filesystem::exists(path) == present);
+}
+}  // namespace
+
+LSE_TEST(cache_dump_overlap_preserves_all_cache_ownership_versions_and_user_files) {
+  ArtifactDirectory dir;
+  const auto older = seed_cache_family(dir.path, "0.0.0", 61);
+  const auto same = seed_cache_family(dir.path, kernel_cache_version(), 62);
+  const auto newer = seed_cache_family(dir.path, "999.0.0", 63);
+  const auto user = dir.path / "user-data.loom";
+  const auto generated = dir.path / "lse_loom_123.loom";
+  cache_write(user, "user source");
+  cache_write(generated, "generated source");
+  ::setenv("LSE_HIP_DUMP", dir.path.c_str(), 1);
+  // This is the first purge in this test process, including debug cleanup.
+  purge_kernel_artifacts(dir.path.string());
+  expect_cache_family(older, false);
+  expect_cache_family(same, true);
+  expect_cache_family(newer, true);
+  LSE_EXPECT(cache_text(user) == "user source");
+  LSE_EXPECT(!std::filesystem::exists(generated));
+}
+
 LSE_TEST(compiled_source_aliases_load_once_and_preserve_resource_names) {
   ArtifactDirectory dir;
   ArtifactCompiler compiler;
@@ -512,6 +575,229 @@ LSE_TEST(cached_resource_reader_refreshes_facts_without_recompiling_code) {
     LSE_EXPECT_EQ(compiler.resource_reads, 1);
     LSE_EXPECT_EQ(cache.stats().disk_hits, 1u);
   }
+}
+
+
+LSE_TEST(cache_release_ownership_removes_only_complete_older_families) {
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  const auto legacy = seed_cache_family(dir.path, "", 71);
+  const auto older = seed_cache_family(dir.path, "0.0.0", 72);
+  const auto same = seed_cache_family(dir.path, kernel_cache_version(), 73);
+  const auto newer = seed_cache_family(dir.path, "999.0.0", 74);
+  const auto unrelated = dir.path / "notes.txt";
+  const auto orphan = dir.path / "789.11.co";
+  const auto foreign = seed_cache_family(dir.path, "", 75, "user_kernel");
+  const auto temp = dir.path / (older.stem + ".meta.tmp123");
+  const auto empty_code = dir.path / (older.stem + ".12.co");
+  const auto notes_code = dir.path / (older.stem + ".notes.co");
+  cache_write(unrelated, "retain user file");
+  cache_write(orphan, "unattributed code object");
+  cache_write(temp, "incomplete publication");
+  cache_write(empty_code, "");
+  cache_write(notes_code, "unrelated family-adjacent file");
+  JitCache cache(backend, compiler, dir.path.string());
+  expect_cache_family(legacy, false);
+  expect_cache_family(older, false);
+  expect_cache_family(same, true);
+  expect_cache_family(newer, true);
+  expect_cache_family(foreign, true);
+  LSE_EXPECT(cache_text(unrelated) == "retain user file");
+  LSE_EXPECT(std::filesystem::exists(orphan));
+  LSE_EXPECT(std::filesystem::exists(temp));
+  LSE_EXPECT(std::filesystem::exists(empty_code));
+  LSE_EXPECT(cache_text(notes_code) == "unrelated family-adjacent file");
+  LSE_EXPECT_EQ(compiler.compiles, 0);
+}
+
+LSE_TEST(cache_release_ownership_preserves_partial_malformed_and_symlink_entries) {
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  const auto partial = seed_cache_family(dir.path, "0.0.0", 81);
+  cache_write(partial.meta, "lse-kernel-cache-v1\n0.0.0\ngfx1201\n");
+  const auto missing = seed_cache_family(dir.path, "0.0.0", 82);
+  std::filesystem::remove(missing.code);
+  const auto malformed = seed_cache_family(dir.path, "", 83);
+  cache_write(malformed.meta, "gfx1201\nb trailing\nlse_loom_123\n");
+  const auto mismatched = seed_cache_family(dir.path, "999.0.0", 84);
+  cache_write(mismatched.meta,
+      "lse-kernel-cache-v1\n0.0.0\ngfx1201\nb\nlse_loom_123\n");
+  const auto unknown = seed_cache_family(dir.path, "0.0.0", 85);
+  cache_write(unknown.meta,
+      "lse-kernel-cache-v2\n0.0.0\ngfx1201\nb\nlse_loom_123\n");
+  const auto symlink = seed_cache_family(dir.path, "0.0.0", 86);
+  const auto outside = dir.path / "user-owned-metadata";
+  std::filesystem::rename(symlink.meta, outside);
+  std::filesystem::create_symlink(outside, symlink.meta);
+  const auto directory = seed_cache_family(dir.path, "0.0.0", 87);
+  std::filesystem::remove(directory.meta);
+  std::filesystem::create_directory(directory.meta);
+  JitCache cache(backend, compiler, dir.path.string());
+  for (const auto& family : {partial, malformed, mismatched, unknown, symlink, directory})
+    expect_cache_family(family, true);
+  LSE_EXPECT(std::filesystem::exists(missing.meta));
+  LSE_EXPECT(std::filesystem::exists(missing.source));
+  LSE_EXPECT(std::filesystem::exists(missing.alias));
+  LSE_EXPECT(std::filesystem::exists(outside));
+  LSE_EXPECT(std::filesystem::is_symlink(symlink.meta));
+}
+
+LSE_TEST(cache_release_alias_cleanup_requires_matching_owned_artifact) {
+  ArtifactDirectory dir;
+  const auto older = seed_cache_family(dir.path, "0.0.0", 91);
+  const auto wrong_hash = dir.path / "lse-0.0.0-2001.alias";
+  const auto wrong_owner = dir.path / "lse-999.0.0-2002.alias";
+  const auto traversal = dir.path / "lse-0.0.0-2003.alias";
+  cache_write(wrong_hash, "lse-kernel-alias-v1\n0.0.0\nlse_loom_456\n" +
+      older.stem + "\n12\n");
+  cache_write(wrong_owner, "lse-kernel-alias-v1\n999.0.0\nlse_loom_456\n" +
+      older.stem + "\n11\n");
+  cache_write(traversal, "lse-kernel-alias-v1\n0.0.0\nlse_loom_456\n../" +
+      older.stem + "\n11\n");
+  purge_kernel_artifacts(dir.path.string());
+  expect_cache_family(older, false);
+  for (const auto& path : {wrong_hash, wrong_owner, traversal})
+    LSE_EXPECT(std::filesystem::exists(path));
+}
+
+LSE_TEST(cache_release_cleanup_uses_selected_directory_at_each_startup) {
+  ArtifactDirectory dir;
+  const auto selected = dir.path / "explicit";
+  const auto other = dir.path / "environment";
+  std::filesystem::create_directories(selected);
+  std::filesystem::create_directories(other);
+  const auto old_selected = seed_cache_family(selected, "0.0.0", 101);
+  const auto old_other = seed_cache_family(other, "0.0.0", 102);
+  const auto* before = std::getenv("LSE_CACHE_DIR");
+  const std::optional<std::string> saved = before ? std::optional<std::string>(before)
+                                                 : std::nullopt;
+  ::setenv("LSE_CACHE_DIR", other.c_str(), 1);
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  { JitCache cache(backend, compiler, selected.string()); }
+  expect_cache_family(old_selected, false);
+  expect_cache_family(old_other, true);
+  // A second selected cache is not hidden behind a process-global once_flag.
+  { JitCache cache(backend, compiler); }
+  expect_cache_family(old_other, false);
+  if (saved) ::setenv("LSE_CACHE_DIR", saved->c_str(), 1);
+  else ::unsetenv("LSE_CACHE_DIR");
+}
+
+LSE_TEST(cache_release_publication_keeps_same_release_warm_and_newer_facts_separate) {
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  auto source = artifact_source("release_probe");
+  LSE_EXPECT(finalize_source_identity(source));
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.get_or_compile(0, 111, source).status());
+  }
+  std::filesystem::path meta;
+  for (const auto& item : std::filesystem::directory_iterator(dir.path)) {
+    if (item.path().extension() != ".meta") continue;
+    meta = item.path();
+    LSE_EXPECT(item.path().filename().string().starts_with(
+        "lse-" + std::string(kernel_cache_version()) + "-"));
+  }
+  LSE_EXPECT(!meta.empty());
+  LSE_EXPECT(cache_text(meta).starts_with(
+      "lse-kernel-cache-v1\n" + std::string(kernel_cache_version()) + "\n"));
+  const auto future = seed_cache_family(dir.path, "999.0.0", 112, "future_resources");
+  cache_write(future.meta, cache_text(future.meta) +
+      "res future_resources 99 - - - - - - - - - - - - - - - - - - - - - -\n");
+  auto& measured = opt::KernelMeasurements::instance();
+  measured.clear();
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT(!measured.known("future_resources"));
+    LSE_EXPECT(measured.known(source.structural_entry_name));
+    LSE_EXPECT_OK(cache.get_or_compile(0, 111, source).status());
+    LSE_EXPECT_EQ(cache.stats().disk_hits, 1u);
+  }
+  LSE_EXPECT_EQ(compiler.compiles, 1);
+  expect_cache_family(future, true);
+}
+
+LSE_TEST(cache_release_concurrent_publications_remain_complete_and_reusable) {
+  ArtifactDirectory dir;
+  std::barrier start(2);
+  bool ok[2]{};
+  auto worker = [&](unsigned index) {
+    ArtifactCompiler compiler;
+    ArtifactBackend backend;
+    auto source = artifact_source("concurrent_release");
+    const bool finalized = finalize_source_identity(source);
+    JitCache cache(backend, compiler, dir.path.string());
+    start.arrive_and_wait();
+    ok[index] = finalized && cache.get_or_compile(0, 121 + index, source).ok();
+  };
+  std::thread one(worker, 0), two(worker, 1);
+  one.join();
+  two.join();
+  LSE_EXPECT(ok[0] && ok[1]);
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  auto source = artifact_source("concurrent_release");
+  LSE_EXPECT(finalize_source_identity(source));
+  JitCache cache(backend, compiler, dir.path.string());
+  LSE_EXPECT_OK(cache.get_or_compile(0, 123, source).status());
+  LSE_EXPECT_EQ(compiler.compiles, 0);
+  LSE_EXPECT_EQ(cache.stats().disk_hits, 1u);
+  for (const auto& item : std::filesystem::directory_iterator(dir.path))
+    LSE_EXPECT(item.path().filename().string().find(".tmp") == std::string::npos);
+}
+
+LSE_TEST(cache_publication_reclaim_preserves_unrelated_partial_and_symlink_siblings) {
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  auto source = artifact_source("changing_source");
+  JitCache cache(backend, compiler, dir.path.string());
+  LSE_EXPECT_OK(cache.get_or_compile(0, 125, source).status());
+  std::filesystem::path stem, original;
+  for (const auto& item : std::filesystem::directory_iterator(dir.path)) {
+    if (item.path().extension() == ".meta") {
+      stem = item.path();
+      stem.replace_extension();
+    }
+    if (item.path().extension() == ".co") original = item.path();
+  }
+  LSE_EXPECT(!stem.empty() && !original.empty());
+  if (stem.empty() || original.empty()) return;
+  const auto notes = stem.string() + ".notes.co";
+  const auto empty = stem.string() + ".12.co";
+  const auto linked = stem.string() + ".13.co";
+  const auto target = dir.path / "user-code";
+  cache_write(notes, "user notes");
+  cache_write(empty, "");
+  cache_write(target, "user binary");
+  std::filesystem::create_symlink(target, linked);
+  source = artifact_source("changing_source", "256");
+  LSE_EXPECT_OK(cache.get_or_compile(0, 125, source).status());
+  LSE_EXPECT_EQ(compiler.compiles, 2);
+  LSE_EXPECT(!std::filesystem::exists(original));
+  LSE_EXPECT(cache_text(notes) == "user notes");
+  LSE_EXPECT(std::filesystem::exists(empty));
+  LSE_EXPECT(std::filesystem::is_symlink(linked));
+  LSE_EXPECT(cache_text(target) == "user binary");
+}
+
+LSE_TEST(cache_release_codec_storage_variants_keep_distinct_compiled_sources) {
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  JitCache cache(backend, compiler, dir.path.string());
+  std::uint64_t signature = 130;
+  for (const auto dtype : {"f32", "f16", "bf16", "fp8", "bf8"}) {
+    auto source = artifact_source("same_shape", "128", dtype);
+    LSE_EXPECT(finalize_source_identity(source));
+    LSE_EXPECT_OK(cache.get_or_compile(0, ++signature, source).status());
+  }
+  LSE_EXPECT_EQ(compiler.compiles, 5);
 }
 
 
