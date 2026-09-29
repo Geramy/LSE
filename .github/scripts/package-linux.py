@@ -103,7 +103,8 @@ def main():
         (package / name).mkdir(exist_ok=True)
     sources = {soname(library): library, soname(hrx): hrx}
     for links in closure.values():
-        for name, path in links.items():
+        for name, path_text in links.items():
+            path = Path(path_text)
             if path.is_relative_to(hrx.parent) and name not in sources:
                 sources[name] = path
     bundled = []
@@ -184,7 +185,7 @@ def main():
             run(str(relocated / 'bin' / name), '--help', env=relocated_env)
         for links in relocated_closure.values():
             for name in sources:
-                if links.get(name) != (relocated / 'lib' / sources[name].name).resolve():
+                if links.get(name) != str((relocated / 'lib' / sources[name].name).resolve()):
                     raise RuntimeError(f'Relocated binary loads an external bundled dependency: {name}')
     print('Relocated Linux launchers and bundled compiler/HRX closure passed --help and ldd checks.')
 
