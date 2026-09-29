@@ -8,6 +8,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
+#include "lse/graph/view.hpp"
 #include <cstdio>
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
@@ -93,8 +94,8 @@ LSE_TEST(actual_scheduler_epilogues_preserve_roots_fanout_and_replay) {
   backend::BackendAdapter<CaptureDevice> backend;check(backend.init(0));
   Scheduler scheduler(backend);scheduler.set_dialect(Dialect::kLoom);
   auto leaf=[&](Shape sh,DType dt=DType::kF32){auto b=backend.allocate(sh.elem_count()*4,backend::MemoryClass::kDevice,backend::kDefaultStream);if(!b.ok())throw std::runtime_error(b.status().to_string());return Array::from_buffer(std::move(*b),sh,dt);};
-  Array producer;
-  if(kind==0)producer=slice(leaf({rows,256}),-1,3,131);
+  Array producer, input;
+  if(kind==0){input=leaf({rows,256});producer=slice(input,-1,3,131);}
   if(kind==1)producer=l2_normalize(leaf({rows,128}),1e-6f);
   if(kind==2)producer=quant_linear(leaf({rows,64}),leaf({17,12},DType::kU32),leaf({17,1},DType::kBF16),leaf({17,1},DType::kBF16),6,64);
   auto out=silu(producer);
@@ -103,14 +104,30 @@ LSE_TEST(actual_scheduler_epilogues_preserve_roots_fanout_and_replay) {
   if(escapes==2){other=neg(producer);roots.push_back(other.node());}
   if(reverse)std::reverse(roots.begin(),roots.end());
   Program program;check(scheduler.eval(roots,false,&program));
-  const unsigned expected=escapes==0?1u:escapes==1?2u:3u;
+  const bool contiguous=kind==0&&rows==1;
+  const unsigned expected=contiguous?(escapes==2?2u:1u)
+      :(escapes==0?1u:escapes==1?2u:3u);
+  auto check_view=[&] {
+    if(!contiguous)return;
+    LSE_EXPECT(is_buffer_view(*producer.node()));
+    LSE_EXPECT(producer.node()->materialized);
+    LSE_EXPECT_EQ(producer.node()->buffer.handle,input.node()->buffer.handle);
+    LSE_EXPECT_EQ(producer.node()->buffer.offset,
+                  input.node()->buffer.offset+3*sizeof(float));
+    LSE_EXPECT_EQ(producer.node()->buffer.size_bytes,128*sizeof(float));
+    LSE_EXPECT(producer.node()->buffer.storage==input.node()->buffer.storage);
+  };
+  check_view();
   LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,expected);
+  LSE_EXPECT_EQ(backend.impl().launches,expected);
   LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
   LSE_EXPECT_EQ(backend.impl().emitter.failures,0u);
   if(escapes)LSE_EXPECT(producer.node()->buffer.valid());
   program.reset_compute();check(scheduler.eval(roots,false,&program));
   LSE_EXPECT(scheduler.last_trace().replayed);
+  check_view();
   LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,expected);
+  LSE_EXPECT_EQ(backend.impl().launches,2*expected);
   LSE_EXPECT_EQ(scheduler.last_trace().host_groups,0u);
  }
 }
@@ -133,7 +150,8 @@ LSE_TEST(final_launch_slots_keep_reduction_input_live_through_fused_epilogue) {
     // Unlike a preallocated leaf, this activation is produced inside the
     // phase and therefore eligible for slot recycling. Nested reshapes must
     // extend its underlying allocation's lifetime, not merely a view node's.
-    auto activation = silu(slice(parent, -1, 0, heads * 128));
+    auto cut = slice(parent, -1, 0, heads * 128);
+    auto activation = silu(cut);
     auto flat = reshape(activation, Shape{rows, heads * 128});
     auto view = reshape(flat, Shape{1, rows, heads, 128});
     auto norm = reduction ? l2_normalize(view, 1e-6f) : sigmoid(view);
@@ -146,7 +164,16 @@ LSE_TEST(final_launch_slots_keep_reduction_input_live_through_fused_epilogue) {
     LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
     LSE_EXPECT(!backend.impl().overlapped);
     LSE_EXPECT(activation.node()->buffer.ptr != scaled.node()->buffer.ptr);
-    LSE_EXPECT(scheduler.last_trace().slots_reused > 0);
+    if (rows == 1) {
+      // The contiguous slice has no temporary slot to recycle.
+      LSE_EXPECT(is_buffer_view(*cut.node()));
+      LSE_EXPECT(cut.node()->buffer.storage == parent.node()->buffer.storage);
+      LSE_EXPECT_EQ(cut.node()->buffer.offset, parent.node()->buffer.offset);
+      LSE_EXPECT_EQ(scheduler.last_trace().slots_reused, 0u);
+    } else {
+      LSE_EXPECT(!is_buffer_view(*cut.node()));
+      LSE_EXPECT(scheduler.last_trace().slots_reused > 0);
+    }
     program.reset_compute();
     check(scheduler.eval(roots, false, &program));
     LSE_EXPECT(scheduler.last_trace().replayed);

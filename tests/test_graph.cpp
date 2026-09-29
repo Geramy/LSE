@@ -994,11 +994,19 @@ LSE_TEST(a_held_program_reevals_the_same_nodes) {
 
   Program p;
   const NodePtr roots[] = {y.node()};
-  p.retain(roots, {}, {}, {});
+  std::vector<Workgroup> phases;
+  phases.push_back(std::move(wg));
+  p.retain(roots, std::move(phases), {}, roots);
   LSE_EXPECT(p.holds(roots));
   p.reset_compute();
   LSE_EXPECT(!y.node()->materialized);
+  LSE_EXPECT(x.node()->materialized && w.node()->materialized);
   LSE_EXPECT_OK(y.eval());
+
+  Program lifetime_only;
+  lifetime_only.retain(roots, {}, {}, {});
+  lifetime_only.reset_compute();
+  LSE_EXPECT(y.node()->materialized);
 }
 
 LSE_TEST(workgroup_refuses_an_unrelated_or_oversized_member) {

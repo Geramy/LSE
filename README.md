@@ -22,10 +22,14 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
-## Current source candidate: BF16 mode comparison
+## v0.4.12: typed attention and automatic buffer views
 
-These unreleased measurements use source `9cb4cd8` plus working changes, the same
-server binary/runtime, a Q4 target and BF16 KV. Each mode starts with an empty
+This version adds typed WMMA attention, cooperative single-token attention, and
+automatic contiguous buffer views. Eligible slices no longer launch copy kernels.
+K/V storage defaults to BF16 for models that declare BF16, and FP16 otherwise.
+
+The measurements below use implementation commit `b0b93ad`, the same server
+binary/runtime, a Q4 target and BF16 KV. Each mode starts with an empty
 private kernel cache; first prefill includes compilation. Sampling uses model
 defaults 1/20/0.95. The first prompt has 5,207 tokens; the identical follow-up has
 5,262 cached tokens and 23 new tokens.
@@ -137,12 +141,16 @@ The macOS binaries target macOS 15 or later. GPU use also requires a macOS versi
 See the driver instructions for that requirement.
 
 Linux release targets include `gfx942`, `gfx1150`, `gfx1151`, `gfx1200`, and `gfx1201`.
+The Linux archive bundles its selected HRX runtime and patched Loom compiler;
+root and `bin/` launchers load those libraries and forward the existing CLI arguments.
+A compatible Linux C/C++ runtime, ROCm 7.x, HSA and GPU driver remain required.
+`BUILD.json` records the compiler source pins, patch hashes and bundled library hashes.
 Check each release for its build targets and runtime requirements.
 
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.11`.
+The examples below use `v0.4.12`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -151,7 +159,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.11
+   lse_tag=v0.4.12
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -171,11 +179,11 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
    LSE_BIN="$PWD"
    ```
 
-4. Make the installed HRX and ROCm libraries available to the system loader.
-   Replace the HRX path below with your installation path.
+4. If ROCm is outside the system loader paths, add the runtime directory from
+   your matching ROCm installation. The launchers select the bundled HRX and Loom.
 
    ```bash
-   export LD_LIBRARY_PATH="/path/to/hrx-install/lib:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
    ```
 
 ### macOS on Apple Silicon
@@ -184,7 +192,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.11
+   lse_tag=v0.4.12
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"

@@ -133,6 +133,9 @@ jobs:
             echo "rocm=$(basename "$(readlink -f "$ROCM_PATH")")" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Build the pinned patched Loom compiler
+        run: bash .github/scripts/build-linux-loom.sh
+
       - name: Configure
         id: configure
         run: |
@@ -142,18 +145,27 @@ jobs:
             hrx_args=("-DLSE_HRX_ROOT=$HRX_ROOT")
             echo "hrx=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "hrx=no" >> "$GITHUB_OUTPUT"
-            echo "::warning::No HRX install at '${HRX_ROOT:-<unset>}'. Building the core and CPU backend only; this artifact will not run on a GPU. Set the repository variable LSE_HRX_ROOT to a built hrx-install."
+            echo "::error::No HRX install at '${HRX_ROOT:-<unset>}'. Set LSE_HRX_ROOT to the runtime being qualified and bundled."
+            exit 1
           fi
           cmake -S . -B build -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER=g++-16 \
             -DLSE_GPU_TARGETS="${{ steps.targets.outputs.gpu_targets }}" \
             -DLSE_ROCM_PATH="$ROCM_PATH" \
-            "${hrx_args[@]}"
+            "${hrx_args[@]}" \
+            -DLSE_LOOMC_INCLUDE_DIR="$LSE_LOOMC_INCLUDE_DIR" \
+            -DLSE_LOOMC_LIBRARY="$LSE_LOOMC_LIBRARY" \
+            -DCMAKE_BUILD_RPATH="$(dirname "$LSE_LOOMC_LIBRARY")" \
+            -DLSE_LOOMC_VERSION_FILE="$LSE_LOOMC_VERSION_FILE"
 
       - name: Build
         run: cmake --build build
+
+      - name: Verify the selected compiler and linked runtime
+        run: |
+          python3 .github/scripts/package-linux.py \
+            --build "$PWD/build" --loom-manifest "$LSE_LOOMC_MANIFEST"
 
       - name: Test
         id: test
@@ -163,7 +175,7 @@ jobs:
           # ROCM_PATH/lib can belong to a different LLVM release than bitcode.
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
           echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
-          export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           ctest --test-dir build --output-on-failure | tee ctest.log
           echo "summary=$(grep -oE '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' ctest.log | tail -1)" >> "$GITHUB_OUTPUT"
 
@@ -172,7 +184,7 @@ jobs:
         run: |
           set -euo pipefail
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
-          export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           # Skipped rather than failed when the model is not cached on this
           # runner: a missing checkpoint is a runner fact, not a defect, and
           # asserting on generated text needs the weights that produced it.
@@ -202,11 +214,9 @@ jobs:
           cp README.md LICENSE.md "dist/$name/"
           mkdir -p "dist/$name/docs"
           cp docs/CHAT-COMPATIBILITY.md docs/pi-models.example.json docs/DFLASH2.md "dist/$name/docs/"
-          cmake -DLSE_PACKAGE_DIR="$PWD/dist/$name" -P .github/scripts/package-linux.cmake
-          RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
-          export LD_LIBRARY_PATH="${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
-          "dist/$name/lse" --help >/dev/null
-          "dist/$name/lse-server" --help >/dev/null
+          python3 .github/scripts/package-linux.py \
+            --build "$PWD/build" --loom-manifest "$LSE_LOOMC_MANIFEST" \
+            --package-dir "$PWD/dist/$name"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 

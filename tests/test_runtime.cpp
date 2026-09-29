@@ -20,6 +20,7 @@
 
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
+#include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/dispatch/attention_shapes.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
@@ -2115,8 +2116,8 @@ LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {
     auto ka = filled(Shape{kPool, 1, kv::kBlockSize, kDim}, keys);
     auto va = filled(Shape{kPool, 1, kv::kBlockSize, kDim}, values);
     // The padded table row is deliberately invalid and must never be read.
-    auto table = filled(Shape{kRows, kStride},
-                         {2, 0, 3, 0, 1, 0, 0, 0, 99999, 99999, 99999, 99999});
+    const std::vector<float> pages{2, 0, 3, 0, 1, 0, 0, 0, 99999, 99999, 99999, 99999};
+    auto table = filled(Shape{kRows, kStride}, pages);
     auto meta = step_meta({{32, lengths[0]}, {3, lengths[1]}, {0, 0}});
     for (auto mask : {graph::MaskKind::kCausal, graph::MaskKind::kSlidingWindow}) {
       sched->set_mode(graph::Scheduler::Mode::kDeviceFirst);
@@ -2134,13 +2135,76 @@ LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {
       sched->set_mode(graph::Scheduler::Mode::kHostOnly);
       auto host = graph::sdpa_paged(qa, ka, va, scale, mask, 5, meta, table,
                                     kv::kBlockSize);
-      const auto expected = read_all(host);
+      auto expected = read_all(host);
+      std::vector<Shape> shapes;
+      std::vector<DType> dtypes;
+      for (const auto& input : native.node()->inputs) {
+        shapes.push_back(input->shape);
+        dtypes.push_back(input->dtype);
+      }
+      graph::KernelShapes invocation;
+      invocation.inputs = shapes;
+      invocation.input_dtypes = dtypes;
+      invocation.output = native.shape();
+      invocation.output_dtype = native.dtype();
+      invocation.attrs = native.node()->attrs;
+      invocation.iattrs = native.node()->iattrs;
+      invocation.device = &sched->backend().device_info();
+      const auto sources = sched->backend().emitter()->sources();
+      invocation.intrinsics = &sources;
+      invocation.types = backend::loom_types();
+      const bool matrix = dispatch::attention_plan(invocation) ==
+                          dispatch::AttentionPlan::kFlashWmma;
+      if (matrix) {
+        // F32 storage uses BF16 Q/K/P/V operands; softmax and accumulation stay F32.
+        const auto narrow = [](float value) { return bfloat16_t(value).to_float(); };
+        std::fill(expected.begin(), expected.end(), 0.0f);
+        const auto physical_base = [&](int row, int key) {
+          const auto slot = static_cast<std::size_t>(row * kStride + key / kv::kBlockSize);
+          const int page = static_cast<int>(pages[slot]);
+          return static_cast<std::size_t>(page * kv::kBlockSize + key % kv::kBlockSize) * kDim;
+        };
+        for (int row = 0; row < 2; ++row) {
+          for (int head = 0; head < kHeads; ++head) {
+            for (int query = 0; query < tq; ++query) {
+              const int position = (row == 0 ? 32 : 3) + query;
+              std::vector<float> scores(static_cast<std::size_t>(lengths[row]),
+                                        -std::numeric_limits<float>::infinity());
+              const auto qbase = static_cast<std::size_t>((row * kHeads + head) * tq + query) * kDim;
+              float maximum = -std::numeric_limits<float>::infinity();
+              for (int key = 0; key < lengths[row]; ++key) {
+                if (key > position || (mask == graph::MaskKind::kSlidingWindow &&
+                                       position - key >= 5)) continue;
+                const auto base = physical_base(row, key);
+                float dot = 0.0f;
+                for (std::size_t d = 0; d < static_cast<std::size_t>(kDim); ++d)
+                  dot = std::fma(narrow(q[qbase + d]), narrow(keys[base + d]), dot);
+                scores[static_cast<std::size_t>(key)] = dot * scale;
+                maximum = std::max(maximum, scores[static_cast<std::size_t>(key)]);
+              }
+              float denominator = 0.0f;
+              for (float& score : scores) {
+                score = std::exp(score - maximum);
+                denominator += score;
+              }
+              for (int key = 0; key < lengths[row]; ++key) {
+                if (scores[static_cast<std::size_t>(key)] == 0.0f) continue;
+                const auto base = physical_base(row, key);
+                for (std::size_t d = 0; d < static_cast<std::size_t>(kDim); ++d)
+                  expected[qbase + d] = std::fma(narrow(scores[static_cast<std::size_t>(key)]), narrow(values[base + d]),
+                                                 expected[qbase + d]);
+              }
+              for (std::size_t d = 0; d < static_cast<std::size_t>(kDim); ++d) expected[qbase + d] /= denominator;
+            }
+          }
+        }
+      }
       LSE_EXPECT_EQ(got.size(), q.size());
       LSE_EXPECT_EQ(expected.size(), got.size());
       if (got.size() != q.size() || expected.size() != got.size()) return;
       for (std::size_t i = 0; i < got.size(); ++i) {
         LSE_EXPECT(std::isfinite(got[i]) && std::isfinite(expected[i]));
-        LSE_EXPECT_NEAR(got[i], expected[i], 2e-4);
+        LSE_EXPECT_NEAR(got[i], expected[i], matrix ? 2e-5 : 2e-4);
         if (i >= static_cast<std::size_t>(2 * kHeads * tq * kDim))
           LSE_EXPECT_EQ(got[i], 0.0f);
       }
@@ -2493,16 +2557,9 @@ LSE_TEST(a_context_that_outgrows_its_pool_keeps_the_keys_it_wrote) {
 
 LSE_TEST_MAIN()
 
-// The SwiGLU chain, at lemonseed's expert width, through the real scheduler.
-// gate and up join one wide-linear group, silu and mul are one lane-fused grid
-// launch, down is its own: three launches, not four. The pair used to split
-// because stage_threads(2176) marks each stage fat and a fat stage that read the
-// chunk forced a flush — 120 launches per token on lemonseed, 32% of them, for a
-// barrier the chain never needed. Counted here rather than in the emitter
-// because the splitter and the emitter have to agree: if only one of them
-// changes, the pair still merges and then lands on ONE workgroup, which measured
-// slower than the two launches it replaced.
-LSE_TEST(the_swiglu_chain_costs_three_launches_not_four) {
+// Staged lowering joins the sibling projections; non-staged lowering launches
+// them separately. Materialized intermediates provide an FP32 order reference.
+LSE_TEST(swiglu_chain_preserves_values_and_backend_launch_contract) {
   graph::Scheduler* sched = graph::default_scheduler();
   LSE_EXPECT(sched != nullptr);
   if (sched == nullptr) return;
@@ -2510,17 +2567,34 @@ LSE_TEST(the_swiglu_chain_costs_three_launches_not_four) {
 
   constexpr std::int64_t kHidden = 1024;
   constexpr std::int64_t kInter = 2176;
-  graph::Array h = graph::Array::zeros(Shape{1, 1, kHidden}, DType::kF32);
-  graph::Array wg = graph::Array::zeros(Shape{kInter, kHidden}, DType::kF32);
-  graph::Array wu = graph::Array::zeros(Shape{kInter, kHidden}, DType::kF32);
-  graph::Array wd = graph::Array::zeros(Shape{kHidden, kInter}, DType::kF32);
-  // Resident before the step, the way loaded weights are: an unmaterialized
-  // weight is still a node in the topological order, and a sibling whose weight
-  // has not been reached yet is not admitted to the run — so without this the
-  // two projections never share a launch and the shape under test is gone.
-  for (graph::Array* w : {&h, &wg, &wu, &wd}) {
-    LSE_EXPECT(w->eval().ok());
+  std::vector<float> values(static_cast<std::size_t>(kHidden));
+  std::vector<float> gate_weights(static_cast<std::size_t>(kInter * kHidden));
+  std::vector<float> up_weights(gate_weights.size());
+  std::vector<float> down_weights(gate_weights.size());
+  for (std::size_t i = 0; i < values.size(); ++i)
+    values[i] = 0.07f * static_cast<float>(static_cast<int>(i % 11) - 5);
+  for (std::size_t c = 0; c < static_cast<std::size_t>(kInter); ++c) {
+    const std::size_t row = c * static_cast<std::size_t>(kHidden);
+    gate_weights[row + c % values.size()] = 0.125f;
+    up_weights[row + (c + 3) % values.size()] = -0.25f;
   }
+  for (std::size_t c = 0; c < values.size(); ++c)
+    down_weights[c * static_cast<std::size_t>(kInter) + c] = 0.5f;
+  graph::Array h = filled({1, 1, kHidden}, values);
+  graph::Array wg = filled({kInter, kHidden}, gate_weights);
+  graph::Array wu = filled({kInter, kHidden}, up_weights);
+  graph::Array wd = filled({kHidden, kInter}, down_weights);
+  auto reference_gate = graph::linear(h, wg);
+  auto reference_up = graph::linear(h, wu);
+  LSE_EXPECT_OK(reference_gate.eval());
+  LSE_EXPECT_OK(reference_up.eval());
+  auto reference_activation = graph::silu(reference_gate);
+  LSE_EXPECT_OK(reference_activation.eval());
+  auto reference_hidden = reference_activation * reference_up;
+  LSE_EXPECT_OK(reference_hidden.eval());
+  auto reference_out = graph::linear(reference_hidden, wd);
+  const std::vector<float> reference = read_all(reference_out);
+  LSE_EXPECT_EQ(reference.size(), static_cast<std::size_t>(kHidden));
   // Built in the model's order: both projections, then the pair over them.
   // The phase splitter walks the nodes as they were recorded, so building the
   // gate's silu before the up projection is a different graph to the one
@@ -2536,7 +2610,23 @@ LSE_TEST(the_swiglu_chain_costs_three_launches_not_four) {
   if (!ev.ok()) return;
   const auto& t = sched->last_trace();
   LSE_EXPECT_EQ(t.host_groups, 0u);
-  LSE_EXPECT_EQ(t.kernels_launched, 3u);
+  const unsigned expected_launches =
+      sched->backend().emitter()->staging() != nullptr ? 3u : 4u;
+  LSE_EXPECT_EQ(t.kernels_launched, expected_launches);
+  const std::vector<float> got = read_all(out);
+  LSE_EXPECT_EQ(got.size(), reference.size());
+  if (got.size() == reference.size() && !got.empty()) {
+    LSE_EXPECT(std::memcmp(got.data(), reference.data(),
+                           got.size() * sizeof(float)) == 0);
+    for (std::size_t c = 0; c < got.size(); ++c) {
+      const float g = 0.125f * values[c % values.size()];
+      const float u = -0.25f * values[(c + 3) % values.size()];
+      const float expected = 0.5f * (g / (1.0f + std::exp(-g))) * u;
+      LSE_EXPECT(std::isfinite(got[c]));
+      LSE_EXPECT_NEAR(got[c], expected, 2e-6f);
+    }
+  }
+
 }
 
 namespace {
@@ -3798,15 +3888,9 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
   if (graph::default_scheduler()->backend().emitter() == nullptr) {
     LSE_SKIP("speculative rollback requires device replay");
   }
-  // The exhaustive form of this is a diff of a full continuation on a trained
-  // checkpoint. What a synthetic fixture can say is narrower, because its
-  // untrained logits decide some greedy steps by the last bit of an f32 sum
-  // and the one-row and two-row kernels round differently there. So each
-  // prompt is first asked whether the plain path itself is stable — the same
-  // prompt prefilled in one piece and in two — and only a prompt the decoder
-  // answers the same way twice is one whose tokens the speculative path is
-  // required to reproduce.
-  MtpFixture fx = build_mtp_fixture();
+  // A one-hot target has separated logits. The hidden-dependent module drafts
+  // the previous prediction, so rejection is independent of reduction rounding.
+  MtpFixture fx = build_mtp_fixture(true, 16, false, 64, false, true);
   LSE_EXPECT(fx.ok);
   if (!fx.ok) return;
 
@@ -3819,8 +3903,8 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
   prefill_only.max_tokens = 0;
 
   const std::vector<std::vector<std::uint32_t>> prompts{
-      {2, 11, 33},    {1, 5, 9, 17},  {7, 7, 7},        {40, 3},
-      {60, 1, 2, 3, 4}, {12, 44, 5, 6}, {33, 2, 19}, {8, 8, 9, 10, 11}};
+      {2, 11, 13},    {1, 5, 9, 17},  {7, 7, 7},        {20, 3},
+      {30, 1, 2, 3, 4}, {12, 24, 5, 6}, {13, 2, 19}, {8, 8, 9, 10, 11}};
 
   std::size_t compared = 0;
   std::uint32_t rejections = 0;
@@ -3830,6 +3914,13 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
     auto want = plain.generate(ps, prompt, limits);
     LSE_EXPECT(want.ok());
     if (!want.ok()) return;
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t token = (prompt.back() + 1) % 32;
+         expected.size() < static_cast<std::size_t>(limits.max_tokens);
+         token = (token + 1) % 32) {
+      expected.push_back(token);
+    }
+    LSE_EXPECT(*want == expected);
 
     Generator split(*fx.lm, greedy_params());
     Session ss("split", fx.lm->num_layers());
@@ -3838,7 +3929,7 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
     auto again = split.generate(ss, prompt, limits);
     LSE_EXPECT(again.ok());
     if (!again.ok()) return;
-    if (*again != *want) continue;  // the fixture, not the speculation
+    LSE_EXPECT(*again == *want);
 
     Generator spec(*fx.lm, greedy_params());
     spec.use_mtp(*fx.mtp);
@@ -3856,7 +3947,7 @@ LSE_TEST(speculating_gives_the_tokens_a_plain_decode_gives) {
                   ids_to_string(*got).c_str());
     }
   }
-  LSE_EXPECT(compared >= prompts.size() - 1);
+  LSE_EXPECT_EQ(compared, prompts.size());
   // A run in which nothing was ever rejected would not have exercised the redo.
   LSE_EXPECT(rejections > 0);
 }
@@ -4088,7 +4179,7 @@ LSE_TEST(mtp_target_tail_is_owned_and_module_changes_invalidate_reuse) {
 }
 
 LSE_TEST(mtp_continued_prefill_carries_the_previous_target_hidden) {
-  auto fixture = build_mtp_fixture(false, 16, false, 256, true);
+  auto fixture = build_mtp_fixture(true, 16, false, 256, true, true);
   LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
   Session session("shifted-tail", fixture.lm->state_slots());
   GenerationLimits limits;
@@ -4096,23 +4187,24 @@ LSE_TEST(mtp_continued_prefill_carries_the_previous_target_hidden) {
   {
     Generator first(*fixture.lm, greedy_params());
     first.use_mtp(*fixture.mtp);
-    LSE_EXPECT(first.generate(session, {2, 11, 33}, limits).ok());
+    LSE_EXPECT(first.generate(session, {2, 11, 13}, limits).ok());
   }
   expect_mtp_resident(fixture, session, 3);
   // The independently seeded module consumes the same shifted boundary.
   const std::uint32_t token = 19;
   auto expected = fixture.mtp->draft(session.mtp_tail(), std::span(&token, 1), 3);
   LSE_EXPECT(expected.ok()); if (!expected.ok()) return;
+  LSE_EXPECT_EQ(*expected, 14u);
   // A different pass at the same cursor must not reuse this session's tail.
   LSE_EXPECT_OK(fixture.mtp->truncate(3));
   Generator changed(*fixture.lm, greedy_params());
   changed.use_mtp(*fixture.mtp);
-  auto reset = changed.generate(session, {2, 11, 33, 19}, limits);
+  auto reset = changed.generate(session, {2, 11, 13, 19}, limits);
   LSE_EXPECT(reset.ok()); if (!reset.ok()) return;
   LSE_EXPECT_EQ(changed.stats().prompt_tokens, 4);
   Generator next(*fixture.lm, greedy_params());
   next.use_mtp(*fixture.mtp);
-  auto output = next.generate(session, {2, 11, 33, 19, 23}, limits);
+  auto output = next.generate(session, {2, 11, 13, 19, 23}, limits);
   LSE_EXPECT(output.ok()); if (!output.ok()) return;
   LSE_EXPECT_EQ(next.stats().prompt_tokens, 1);
   LSE_EXPECT_EQ(fixture.mtp->position(), 5);
@@ -4120,21 +4212,22 @@ LSE_TEST(mtp_continued_prefill_carries_the_previous_target_hidden) {
   const std::uint32_t next_token = 27;
   auto warm = fixture.mtp->draft_chain(session.mtp_tail(), std::span(&next_token, 1), 5, 3);
   LSE_EXPECT(warm.ok()); if (!warm.ok()) return;
-  auto cold = build_mtp_fixture(false, 16, false, 256, true);
+  auto cold = build_mtp_fixture(true, 16, false, 256, true, true);
   LSE_EXPECT(cold.ok); if (!cold.ok) return;
   Session fresh("cold-shifted-tail", cold.lm->state_slots());
   Generator full(*cold.lm, greedy_params());
   full.use_mtp(*cold.mtp);
-  auto prefill = full.generate(fresh, {2, 11, 33, 19, 23}, limits);
+  auto prefill = full.generate(fresh, {2, 11, 13, 19, 23}, limits);
   LSE_EXPECT(prefill.ok()); if (!prefill.ok()) return;
   auto expected_chain = cold.mtp->draft_chain(fresh.mtp_tail(), std::span(&next_token, 1), 5, 3);
   LSE_EXPECT(expected_chain.ok()); if (!expected_chain.ok()) return;
+  LSE_EXPECT(*warm == std::vector<std::uint32_t>({24, 24, 24}));
   LSE_EXPECT(*warm == *expected_chain);
 }
 
 LSE_TEST(mtp_continued_prefill_preserves_tail_across_kv_pool_growth) {
   if (std::getenv("LSE_KV_PREALLOC")) LSE_SKIP("requires growing KV storage");
-  auto fixture = build_mtp_fixture(false, 16, false, 256, true);
+  auto fixture = build_mtp_fixture(true, 16, false, 256, true, true);
   LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
   Session session("mtp-tail-growth", fixture.lm->state_slots());
   GenerationLimits limits;
@@ -4144,6 +4237,8 @@ LSE_TEST(mtp_continued_prefill_preserves_tail_across_kv_pool_growth) {
   first.use_mtp(*fixture.mtp);
   auto primed = first.generate(session, prompt, limits);
   LSE_EXPECT(primed.ok()); if (!primed.ok()) return;
+  expect_mtp_resident(fixture, session, 128);
+  LSE_EXPECT(session.mtp_tail().node()->inputs.empty());
   const auto old_pool = session.states().front().paged.keys.node();
   prompt.push_back(11);
   Generator next(*fixture.lm, greedy_params());
@@ -4153,10 +4248,11 @@ LSE_TEST(mtp_continued_prefill_preserves_tail_across_kv_pool_growth) {
   LSE_EXPECT_EQ(next.stats().prompt_tokens, 1);
   LSE_EXPECT(session.states().front().paged.keys.node() != old_pool);
   expect_mtp_resident(fixture, session, 129);
-  const std::uint32_t token = 33;
+  LSE_EXPECT(session.mtp_tail().node()->inputs.empty());
+  const std::uint32_t token = 17;
   auto warm = fixture.mtp->draft_chain(session.mtp_tail(), std::span(&token, 1), 129, 3);
   LSE_EXPECT(warm.ok()); if (!warm.ok()) return;
-  auto cold = build_mtp_fixture(false, 16, false, 256, true);
+  auto cold = build_mtp_fixture(true, 16, false, 256, true, true);
   LSE_EXPECT(cold.ok); if (!cold.ok) return;
   Session fresh("mtp-tail-growth-cold", cold.lm->state_slots());
   Generator full(*cold.lm, greedy_params());
@@ -4165,6 +4261,7 @@ LSE_TEST(mtp_continued_prefill_preserves_tail_across_kv_pool_growth) {
   LSE_EXPECT(prefill.ok()); if (!prefill.ok()) return;
   auto expected = cold.mtp->draft_chain(fresh.mtp_tail(), std::span(&token, 1), 129, 3);
   LSE_EXPECT(expected.ok()); if (!expected.ok()) return;
+  LSE_EXPECT(*warm == std::vector<std::uint32_t>({12, 12, 12}));
   LSE_EXPECT(*warm == *expected);
 }
 

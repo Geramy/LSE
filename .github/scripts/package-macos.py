@@ -105,6 +105,8 @@ def main():
     build_inputs = {
         'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
         'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
+        'loom_symbolic_memo_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch').read_bytes()).hexdigest(),
+        'loom_vopd_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch').read_bytes()).hexdigest(),
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
@@ -169,6 +171,8 @@ def main():
         'jit_cache_identity': cache_identity,
         'jit_cache_build_inputs': build_inputs,
         'hrx_adapter_patch_sha256': build_inputs['hrx_adapter_patch'],
+        'loom_symbolic_memo_patch_sha256': build_inputs['loom_symbolic_memo_patch'],
+        'loom_vopd_patch_sha256': build_inputs['loom_vopd_patch'],
     }
     (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (package / 'QUICKSTART.txt').write_text(

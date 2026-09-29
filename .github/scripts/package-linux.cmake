@@ -1,6 +1,0 @@
-if(NOT DEFINED LSE_PACKAGE_DIR)
-  message(FATAL_ERROR "LSE_PACKAGE_DIR is required")
-endif()
-foreach(binary IN ITEMS lse lse-server)
-  file(RPATH_REMOVE FILE "${LSE_PACKAGE_DIR}/${binary}")
-endforeach()

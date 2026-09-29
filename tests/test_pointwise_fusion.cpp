@@ -102,6 +102,11 @@ LSE_TEST(views_and_shape_changes_cannot_join) {
   auto a = sigmoid(x), v = reshape(a, Shape{128});
   auto g = solo(a);
   LSE_EXPECT(!join(g, v));
+  auto contiguous = slice(leaf(Shape{1, 256}), -1, 3, 131);
+  auto activation = silu(contiguous);
+  auto metadata = solo(contiguous);
+  LSE_EXPECT(!Partitioner::can_fuse(*contiguous.node(), *activation.node()));
+  LSE_EXPECT(!join(metadata, activation));
   auto small = sigmoid(leaf(Shape{1}));
   auto broad = small * x;
   auto sg = solo(small);
@@ -151,7 +156,8 @@ LSE_TEST(kernel_roots_fanout_shape_and_narrowing_stay_materialized) {
   LSE_EXPECT(!join(hg,hn));
 }
 LSE_TEST(epilogue_retains_anchor_shape_input_aliases_and_indexing) {
-  for(int rows:{1,64}) {
+  // Multiple rows make the inner-axis slice strided, so it remains a kernel.
+  for(int rows:{2,64}) {
     auto x=leaf(Shape{rows,256});auto cut=slice(x,-1,3,131);auto activated=silu(cut);auto out=activated*activated;
     auto g=solo(cut);LSE_EXPECT(join(g,activated));LSE_EXPECT(join(g,out));
     LSE_EXPECT(g.nodes.size()==3);LSE_EXPECT(g.inputs.size()==1);LSE_EXPECT(g.inputs.front()==x.node());
@@ -164,7 +170,7 @@ LSE_TEST(kernel_epilogue_body_matches_existing_generic_partitioner) {
   backend::AmdDeviceInfo amd;backend::apply_arch_defaults(device,amd);device.extension_id=backend::AmdDeviceInfo::kExtensionId;device.extension=&amd;
   for(int kind:{0,1,2})for(int rows:{1,64}) {
     Array producer;
-    if(kind==0)producer=slice(leaf(Shape{rows,256}),-1,3,131);
+    if(kind==0)producer=slice(leaf(Shape{rows==1?2:rows,256}),-1,3,131);
     if(kind==1)producer=l2_normalize(leaf(Shape{rows,128}),1e-6f);
     if(kind==2)producer=quant_linear(leaf(Shape{rows,64}),leaf(Shape{17,12},DType::kU32),leaf(Shape{17,1},DType::kBF16),leaf(Shape{17,1},DType::kBF16),6,64);
     auto out=silu(producer);const NodePtr roots[]{out.node()};

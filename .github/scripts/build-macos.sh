@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=9a205df2babf78297521fa45cfc875c3b3357598
+mac_rev=3095ae4b78cc930b733f896970e790e748ac7447
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
@@ -81,6 +81,8 @@ git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/macos
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch"
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch"
+git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch"
+git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch"
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \

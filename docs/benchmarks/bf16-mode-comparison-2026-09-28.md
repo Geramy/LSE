@@ -1,8 +1,9 @@
 # BF16 mode comparison — 2026-09-28
 
-This is an **unreleased source candidate**, based on `9cb4cd8` plus the recorded
-working changes. It includes generalized typed WMMA attention, automatic buffer
-views and the replay-cover correction. It does not describe a published archive.
+These measurements cover the implementation committed in `b0b93ad` and included
+in v0.4.12. It adds generalized typed WMMA attention, automatic buffer views,
+and the replay-boundary correction. The recorded executable below was built
+locally before release packaging; it is not the release archive binary.
 
 ## Two-turn Pi observations
 
@@ -36,7 +37,7 @@ The decode timer excludes the first generated token:
 All six requests report zero host groups and zero host fallbacks. Speculative
 acceptance is 32/47 then 59/78 for MTP, and 39/43 then 58/80 for DFlash2. These are
 single observations. Output length and acceptance differ; no repeated-run mean
-or general throughput throughput claim follows from this comparison.
+or general throughput claim follows from this comparison.
 
 ## Compilation conditions
 

@@ -9,9 +9,7 @@
 
 namespace lse::kernels {
 
-// The generator walks a fusion group and, when the nodes are a linked
-// contraction pipeline (SwiGLU, exclusive RMS then linear), emits one
-// staged kernel instead of one launch per op.
+// Emit an exact GDN output/state pair through one linked kernel.
 const graph::KernelPrimitiveBase* linked_kernel_for(
     const graph::FusionGroup& group, const graph::KernelShapes& shapes);
 

@@ -411,12 +411,18 @@ LSE_TEST(phase_emits_syncthreads_only_on_cross_lane_deps) {
   LSE_EXPECT(n < 6u);
 }
 
-LSE_TEST(a_phase_flash_stage_walks_every_logical_head) {
+LSE_TEST(a_phase_wmma_flash_stage_walks_every_head_and_query_tile) {
   LSE_EXPECT(backend::hip_sources().find("thread.workgroup_id.x") == "blockIdx.x");
   LSE_EXPECT(backend::hip_phase_sources().find("thread.workgroup_id.x") ==
              "(i / 256u)");
+  backend::DeviceInfo device;
+  device.arch = "gfx1201";
+  backend::AmdDeviceInfo amd;
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
   for (const std::int64_t heads : {4, 2}) {
-    Array q = Array::full(Shape{1, heads, 4, 16}, DType::kF32, 0.1f);
+    Array q = Array::full(Shape{1, heads, 17, 16}, DType::kF32, 0.1f);
     Array scaled = mul(q, Array::full(Shape{1}, DType::kF32, 2.0f));
     Array keys = Array::full(Shape{1, heads / 2, 16, 16}, DType::kF32, 0.2f);
     Array values = Array::full(keys.shape(), DType::kF32, 0.3f);
@@ -430,23 +436,23 @@ LSE_TEST(a_phase_flash_stage_walks_every_logical_head) {
     phase.outputs = {output.node()};
     phase.inputs = {q.node(), scaled.node()->inputs[1], keys.node(),
                     values.node(), meta.node(), table.node()};
-    auto emitted = backend::HipEmitter::emit_phase(phase, gfx1151());
+    auto emitted = backend::HipEmitter::emit_phase(phase, device);
     LSE_EXPECT_OK(emitted.status());
     if (!emitted.ok()) continue;
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 1u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
     LSE_EXPECT(emitted->source.find("(i / 256u)") != std::string::npos);
     LSE_EXPECT(emitted->source.find(" = blockIdx.x") == std::string::npos);
-    LSE_EXPECT(emitted->source.find("n = " + std::to_string(heads * 256) + "u") !=
+    LSE_EXPECT(emitted->source.find("n = " + std::to_string(heads * 2 * 256) + "u") !=
                std::string::npos);
     FusionGroup standalone;
     standalone.nodes = {output.node()};
     standalone.outputs = standalone.nodes;
     standalone.inputs = output.node()->inputs;
-    auto direct = backend::HipEmitter{}.emit(standalone, gfx1151());
+    auto direct = backend::HipEmitter{}.emit(standalone, device);
     LSE_EXPECT_OK(direct.status());
     if (direct.ok()) {
-      LSE_EXPECT_EQ(direct->dims.workgroup_count[0], static_cast<unsigned>(heads));
+      LSE_EXPECT_EQ(direct->dims.workgroup_count[0], static_cast<unsigned>(heads * 2));
       LSE_EXPECT(direct->source.find("blockIdx.x") != std::string::npos);
       LSE_EXPECT(direct->source.find("(i / 256u)") == std::string::npos);
     }
