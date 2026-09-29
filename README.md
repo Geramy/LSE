@@ -54,6 +54,13 @@ versus **507.24** for the matched control. Decode was effectively unchanged:
 This prefill change is newer than v0.4.13. See
 [M1024 prefill results](docs/benchmarks/prefill-m1024-down-2026-09-29.md).
 
+WMMA attention now skips entire windows that are outside the row or fully
+causally masked. The component time falls 30.74% at 1024 live keys and 7.45%
+at 5207 live keys. The matched resident HTTP request reaches **526.26 prompt
+tokens/s**; decode remains about **40.7 TPS**. Responses and sampling statistics
+match the control exactly. See
+[attention window results](docs/benchmarks/attention-causal-windows-2026-09-29.md).
+
 ## v0.4.12: typed attention and automatic buffer views
 
 This version adds typed WMMA attention, cooperative single-token attention, and

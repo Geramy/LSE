@@ -154,7 +154,7 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
                                      kir::cast<std::int64_t>(last_query));
     e.barrier();
 
-    // All workgroup lanes use the longest live row for the window loop.
+    // The window bound is shared by the workgroup.
     const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
     const auto kv_len = e.runtime_extent(
         "kv_len", select(loaded_max < capacity, loaded_max, capacity));
@@ -162,147 +162,152 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
     for (auto w : e.range(nwin)) {
       const auto wbase = e.let(w * kKWin);
 
-      auto write_score = [&](const kir::Val<kir::u32>& row,
-                             const kir::Val<kir::u32>& key,
-                             const kir::Val<kir::f32>& value) {
-        const auto position = e.let(kir::cast<std::int64_t>(offset) +
-                                    kir::cast<std::int64_t>(q0) + kir::cast<std::int64_t>(row));
-        const auto signed_key = e.let(kir::cast<std::int64_t>(key));
-        const auto slot = e.let(row * kKWin + key - wbase);
-        sc[slot] = math::neg_inf();
-        if (auto live_score = e.when(key < row_len && q0 + row < d.tq)) {
-          if (mask == 0) sc[slot] = value;
-          else if (mask == 1) {
-            if (auto causal = e.when(signed_key <= position)) sc[slot] = value;
-          } else {
-            const auto distance = e.let(position - signed_key);
-            if (auto sliding = e.when(signed_key <= position && distance < kir::cast<std::int64_t>(e.u32(d.window))))
-              sc[slot] = value;
-          }
-        }
-      };
-      for (std::uint32_t column_tile = 0; column_tile < 2; ++column_tile) {
-        const auto key = e.let(wbase + (wave + column_tile * 8u) * 16u + lane_lo);
-        auto acc = e.local<kir::f32, 8>();
-        for (auto f : e.unroll(8u)) acc[f] = e.f32(0.0f);
-        for (auto depth : e.range(0u, padded_depth, 16u)) {
-          auto af = e.local<Narrow, 8>();
-          auto bf = e.local<Narrow, 8>();
-          const auto kk = e.let(depth + lane_hi * 8u);
-          for (auto f : e.unroll(8u)) {
-            af[f] = qs[e.let(lane_lo * padded_depth + kk + f)].read();
-            bf[f] = math::narrow<Narrow>(e.f32(0.0f));
-          }
-          if (auto key_live = e.when(key < row_len)) {
-            const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + key / d.ts)]));
-            const auto vector = e.let((page * d.kvh + kh) * d.ts + key % d.ts);
-            const auto base = e.let(vector * d.dh + kk);
-            if constexpr (Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16) {
-              if (d.dh % 16u == 0) {
-                const auto packed = e.load(a.k, base, 16u);
-                for (auto f : e.unroll(8u)) bf[f] = packed[f];
-              } else {
-                for (auto f : e.unroll(8u))
-                  if (auto tail = e.when(kk + f < d.dh)) bf[f] = a.k[e.let(base + f)];
-              }
+      const auto signed_start = e.let(kir::cast<std::int64_t>(wbase));
+      const auto useful = mask == 0 ? wbase < row_len
+                                   : wbase < row_len && signed_start <= last_position;
+      if (auto live_window = e.when(useful)) {
+        auto write_score = [&](const kir::Val<kir::u32>& row,
+                               const kir::Val<kir::u32>& key,
+                               const kir::Val<kir::f32>& value) {
+          const auto position = e.let(kir::cast<std::int64_t>(offset) +
+                                      kir::cast<std::int64_t>(q0) + kir::cast<std::int64_t>(row));
+          const auto signed_key = e.let(kir::cast<std::int64_t>(key));
+          const auto slot = e.let(row * kKWin + key - wbase);
+          sc[slot] = math::neg_inf();
+          if (auto live_score = e.when(key < row_len && q0 + row < d.tq)) {
+            if (mask == 0) sc[slot] = value;
+            else if (mask == 1) {
+              if (auto causal = e.when(signed_key <= position)) sc[slot] = value;
             } else {
-              for (auto f : e.unroll(8u)) {
-                auto load_key = [&] {
-                  bf[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.k, vector, e.let(kk + f), d.dh));
-                };
-                if (d.dh % 16u == 0) load_key();
-                else if (auto tail = e.when(kk + f < d.dh)) load_key();
-              }
+              const auto distance = e.let(position - signed_key);
+              if (auto sliding = e.when(signed_key <= position && distance < kir::cast<std::int64_t>(e.u32(d.window))))
+                sc[slot] = value;
             }
           }
-          acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
-        }
-        for (auto f : e.unroll(8u))
-          write_score(e.let(f + lane_hi * 8u), key, e.let(acc[f].read() * d.scale));
-      }
-      e.barrier();
-
-      // A wave owns two rows; each lane owns eight contiguous-bank keys.
-      for (std::uint32_t wave_row = 0; wave_row < 2; ++wave_row) {
-        const auto row = e.let(wave * 2u + wave_row);
-        auto maximum = e.var(math::neg_inf());
-        for (auto f : e.unroll(8u)) {
-          const auto slot = e.let(lane + f * 32u);
-          maximum = math::max(maximum.read(), sc[e.let(row * kKWin + slot)].read());
-        }
-        for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
-          maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
-        const auto old_max = e.let(mrow[row].read());
-        const auto new_max = e.let(math::max(old_max, maximum.read()));
-        const auto empty = e.let(new_max == math::neg_inf());
-        const auto safe_max = e.let(select(empty, e.f32(0.0f), new_max));
-        const auto alpha = e.let(select(empty, e.f32(1.0f), math::exp(old_max - safe_max)));
-        auto total = e.var(0.0f);
-        for (auto f : e.unroll(8u)) {
-          const auto slot = e.let(lane + f * 32u);
-          const auto index = e.let(row * kKWin + slot);
-          const auto probability = e.let(math::exp(sc[index].read() - safe_max));
-          sc[index] = probability;
-          total = total.read() + probability;
-        }
-        for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
-          total = total.read() + math::shfl_xor(total.read(), e.u32(shift));
-        if (auto leader = e.when(lane == 0u)) {
-          mrow[row] = new_max;
-          arow[row] = alpha;
-          drow[row] = math::fma(drow[row].read(), alpha, total.read());
-        }
-      }
-      e.barrier();
-
-      // A wave owns one D16 tile per 128-channel slice; C remains FP32.
-      for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
-        const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
-        for (auto f : e.unroll(8u)) {
-          const auto row = e.let(f + lane_hi * 8u);
-          o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
-        }
-        for (auto tile : e.range(0u, kKWin, 16u)) {
-          const auto page_start = e.let(wbase + tile);
-          auto page = e.var(e.u32(0u));
-          if (d.ts >= 16u)
-            if (auto page_live = e.when(page_start < row_len))
-              page = kir::cast<kir::u32>(a.table[e.let(tb + page_start / d.ts)]);
-          auto af = e.local<Narrow, 8>();
-          auto bf = e.local<Narrow, 8>();
-          const auto key_half = e.let(lane_hi * 8u);
-          for (auto f : e.unroll(8u)) {
-            const auto key_slot = e.let(tile + key_half + f);
-            const auto key = e.let(wbase + key_slot);
-            af[f] = math::narrow<Narrow>(sc[e.let(lane_lo * kKWin + key_slot)].read());
-            bf[f] = math::narrow<Narrow>(e.f32(0.0f));
-            auto load_value = [&] {
-              const auto block = d.ts >= 16u ? page.read()
-                  : e.let(kir::cast<kir::u32>(a.table[e.let(tb + key / d.ts)]));
-              const auto vector = e.let((block * d.kvh + kh) * d.ts + key % d.ts);
-              const auto base = e.let(vector * d.dv + dimension);
-              if constexpr (Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16)
-                bf[f] = a.v[base];
-              else bf[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.v, vector, dimension, d.dv));
-            };
-            if (auto live_key = e.when(key < row_len && dimension < d.dv)) {
-              if (mask == 0) load_value();
-              else {
-                const auto signed_key = e.let(kir::cast<std::int64_t>(key));
-                if (mask == 1) {
-                  if (auto used = e.when(signed_key <= last_position)) load_value();
+        };
+        for (std::uint32_t column_tile = 0; column_tile < 2; ++column_tile) {
+          const auto key = e.let(wbase + (wave + column_tile * 8u) * 16u + lane_lo);
+          auto acc = e.local<kir::f32, 8>();
+          for (auto f : e.unroll(8u)) acc[f] = e.f32(0.0f);
+          for (auto depth : e.range(0u, padded_depth, 16u)) {
+            auto af = e.local<Narrow, 8>();
+            auto bf = e.local<Narrow, 8>();
+            const auto kk = e.let(depth + lane_hi * 8u);
+            for (auto f : e.unroll(8u)) {
+              af[f] = qs[e.let(lane_lo * padded_depth + kk + f)].read();
+              bf[f] = math::narrow<Narrow>(e.f32(0.0f));
+            }
+            if (auto key_live = e.when(key < row_len)) {
+              const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + key / d.ts)]));
+              const auto vector = e.let((page * d.kvh + kh) * d.ts + key % d.ts);
+              const auto base = e.let(vector * d.dh + kk);
+              if constexpr (Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16) {
+                if (d.dh % 16u == 0) {
+                  const auto packed = e.load(a.k, base, 16u);
+                  for (auto f : e.unroll(8u)) bf[f] = packed[f];
                 } else {
-                  if (auto used = e.when(signed_key <= last_position &&
-                        first_position - signed_key < kir::cast<std::int64_t>(e.u32(d.window))))
-                    load_value();
+                  for (auto f : e.unroll(8u))
+                    if (auto tail = e.when(kk + f < d.dh)) bf[f] = a.k[e.let(base + f)];
+                }
+              } else {
+                for (auto f : e.unroll(8u)) {
+                  auto load_key = [&] {
+                    bf[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.k, vector, e.let(kk + f), d.dh));
+                  };
+                  if (d.dh % 16u == 0) load_key();
+                  else if (auto tail = e.when(kk + f < d.dh)) load_key();
                 }
               }
             }
+            acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
           }
-          o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
+          for (auto f : e.unroll(8u))
+            write_score(e.let(f + lane_hi * 8u), key, e.let(acc[f].read() * d.scale));
         }
+        e.barrier();
+
+        // A wave owns two rows; each lane owns eight contiguous-bank keys.
+        for (std::uint32_t wave_row = 0; wave_row < 2; ++wave_row) {
+          const auto row = e.let(wave * 2u + wave_row);
+          auto maximum = e.var(math::neg_inf());
+          for (auto f : e.unroll(8u)) {
+            const auto slot = e.let(lane + f * 32u);
+            maximum = math::max(maximum.read(), sc[e.let(row * kKWin + slot)].read());
+          }
+          for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
+            maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
+          const auto old_max = e.let(mrow[row].read());
+          const auto new_max = e.let(math::max(old_max, maximum.read()));
+          const auto empty = e.let(new_max == math::neg_inf());
+          const auto safe_max = e.let(select(empty, e.f32(0.0f), new_max));
+          const auto alpha = e.let(select(empty, e.f32(1.0f), math::exp(old_max - safe_max)));
+          auto total = e.var(0.0f);
+          for (auto f : e.unroll(8u)) {
+            const auto slot = e.let(lane + f * 32u);
+            const auto index = e.let(row * kKWin + slot);
+            const auto probability = e.let(math::exp(sc[index].read() - safe_max));
+            sc[index] = probability;
+            total = total.read() + probability;
+          }
+          for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
+            total = total.read() + math::shfl_xor(total.read(), e.u32(shift));
+          if (auto leader = e.when(lane == 0u)) {
+            mrow[row] = new_max;
+            arow[row] = alpha;
+            drow[row] = math::fma(drow[row].read(), alpha, total.read());
+          }
+        }
+        e.barrier();
+
+        // A wave owns one D16 tile per 128-channel slice; C remains FP32.
+        for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+          const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
+          for (auto f : e.unroll(8u)) {
+            const auto row = e.let(f + lane_hi * 8u);
+            o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
+          }
+          for (auto tile : e.range(0u, kKWin, 16u)) {
+            const auto page_start = e.let(wbase + tile);
+            auto page = e.var(e.u32(0u));
+            if (d.ts >= 16u)
+              if (auto page_live = e.when(page_start < row_len))
+                page = kir::cast<kir::u32>(a.table[e.let(tb + page_start / d.ts)]);
+            auto af = e.local<Narrow, 8>();
+            auto bf = e.local<Narrow, 8>();
+            const auto key_half = e.let(lane_hi * 8u);
+            for (auto f : e.unroll(8u)) {
+              const auto key_slot = e.let(tile + key_half + f);
+              const auto key = e.let(wbase + key_slot);
+              af[f] = math::narrow<Narrow>(sc[e.let(lane_lo * kKWin + key_slot)].read());
+              bf[f] = math::narrow<Narrow>(e.f32(0.0f));
+              auto load_value = [&] {
+                const auto block = d.ts >= 16u ? page.read()
+                    : e.let(kir::cast<kir::u32>(a.table[e.let(tb + key / d.ts)]));
+                const auto vector = e.let((block * d.kvh + kh) * d.ts + key % d.ts);
+                const auto base = e.let(vector * d.dv + dimension);
+                if constexpr (Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16)
+                  bf[f] = a.v[base];
+                else bf[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.v, vector, dimension, d.dv));
+              };
+              if (auto live_key = e.when(key < row_len && dimension < d.dv)) {
+                if (mask == 0) load_value();
+                else {
+                  const auto signed_key = e.let(kir::cast<std::int64_t>(key));
+                  if (mask == 1) {
+                    if (auto used = e.when(signed_key <= last_position)) load_value();
+                  } else {
+                    if (auto used = e.when(signed_key <= last_position &&
+                          first_position - signed_key < kir::cast<std::int64_t>(e.u32(d.window))))
+                      load_value();
+                  }
+                }
+              }
+            }
+            o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
+          }
+        }
+        e.barrier();
       }
-      e.barrier();
     }
 
     for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
