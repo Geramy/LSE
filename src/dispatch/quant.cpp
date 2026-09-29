@@ -159,20 +159,18 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
 }
 
 const math::MatrixCoreRow* q4_matrix_panel_row(const KernelShapes& s) {
-  if (!q4_matrix_panel_shape(s) || !s.device || !s.intrinsics ||
+  const auto* rule = q4_matrix_panel_rule(s);
+  if (!rule || !s.device || !s.intrinsics ||
       !s.staged.name.empty() || !s.staged_quant.codes.empty())
     return nullptr;
   for (const auto symbol :
        {"bits.f32", "value.f32", "wave.shfl_xor", "rint", "max", "abs"})
     if (s.intrinsics->find(symbol).empty()) return nullptr;
-  for (const auto& rule : kQ4MatrixPanelShapes) {
-    if (!quant_shape_device(rule, s.device->arch, s.device->wavefront_size) ||
-        s.device->max_threads_per_workgroup < rule.threads)
-      continue;
-    const auto* row = matrix_row(s, math::MatrixElem::kI32, math::MatrixElem::kSU8);
-    return row && row->chained == 1 ? row : nullptr;
-  }
-  return nullptr;
+  if (!quant_shape_device(*rule, s.device->arch, s.device->wavefront_size) ||
+      s.device->max_threads_per_workgroup < rule->threads)
+    return nullptr;
+  const auto* row = matrix_row(s, math::MatrixElem::kI32, math::MatrixElem::kSU8);
+  return row && row->chained == 1 ? row : nullptr;
 }
 
 const math::MatrixCoreRow* linear_matrix_row(const KernelShapes& s) {

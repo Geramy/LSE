@@ -37,7 +37,7 @@ tokens/s**, respectively. Both generated 384 tokens, reused no prompt KV and had
 zero host fallbacks. The process retained compiled code, but further compilation
 remained inside these timings. Different temperatures produce different answers.
 These are workload measurements, not general rates or achieved 103 TPS/600 PP/s
-goals. Published v0.4.12 remains the preceding three-proposal build.
+goals. Published v0.4.13 includes the full-width changes and the M8 optimization below.
 See [full-width DFlash2 results](docs/benchmarks/dflash-fullwidth-2026-09-29.md).
 
 The next M8 Q4 down-projection optimization measured **40.21 TPS** on the
@@ -47,6 +47,12 @@ temperature 0.6 and BF16 KV. A 1024-target perplexity comparison was
 4.8660 versus 4.8675. Completed prefill workspace is released before decode
 to fix the reproduced second-request allocation failure at batch 4096.
 See [M8 WMMA and memory results](docs/benchmarks/wmma-m8-down-2026-09-29.md).
+
+The next M1024 down-projection schedule measured **522.58 prompt tokens/s**,
+versus **507.24** for the matched control. Decode was effectively unchanged:
+**40.78 versus 40.55 TPS**. Both responses and acceptance statistics match exactly.
+This prefill change is newer than v0.4.13. See
+[M1024 prefill results](docs/benchmarks/prefill-m1024-down-2026-09-29.md).
 
 ## v0.4.12: typed attention and automatic buffer views
 

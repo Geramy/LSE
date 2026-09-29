@@ -25,21 +25,10 @@ Result<Shape> matrix_panel_shape(std::span<const Shape> in) {
   if (in.size() != 1 || !in[0].rank())
     return LSE_ERROR(kInvalidArgument,
                      "matrix panel needs complete group64 rows");
-  const auto k = in[0].dim(in[0].rank() - 1);
-  if (k <= 0 || k % 64 != 0 ||
-      static_cast<std::uint64_t>(k) > UINT32_MAX / kInputRows ||
-      in[0].elem_count() != kInputRows * static_cast<std::uint64_t>(k) ||
-      in[0].elem_count() > UINT32_MAX ||
-      static_cast<std::uint64_t>(k / 64) * kGroupWords > UINT32_MAX)
+  const auto shape = dispatch::q4_matrix_panel_storage_shape(in[0]);
+  if (!shape.rank())
     return LSE_ERROR(kInvalidArgument, "invalid matrix panel extent");
-  std::uint64_t count = 1;
-  for (std::size_t axis = 0; axis < in[0].rank(); ++axis) {
-    const auto extent = in[0].dim(axis);
-    if (extent <= 0 || static_cast<std::uint64_t>(extent) > UINT32_MAX / count)
-      return LSE_ERROR(kInvalidArgument, "invalid matrix panel row shape");
-    count *= static_cast<std::uint64_t>(extent);
-  }
-  return Shape{k / 64, kGroupWords};
+  return shape;
 }
 struct PanelArgs {
   env::In<kir::f32, env::Emit> x;
@@ -88,13 +77,18 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
       return LSE_ERROR(kInvalidArgument, "invalid matrix panel byte extent");
     const auto k =
         static_cast<std::size_t>(in[0].shape.dim(in[0].shape.rank() - 1));
+    const auto *layout = dispatch::q4_matrix_panel_layout(in[0].shape);
+    const auto rows = static_cast<std::size_t>(layout->m);
+    const auto tile_rows = static_cast<std::size_t>(layout->rows);
+    const auto padded_rows = (rows + tile_rows - 1) / tile_rows * tile_rows;
+    const auto tile_words = tile_rows / kRows * kGroupWords;
     const auto store = [&](std::size_t at, std::uint32_t bits) {
       std::memcpy(out.bytes.data() + at * 4, &bits, 4);
     };
     for (std::size_t group = 0; group < k / 64; ++group) {
-      for (std::size_t row = 0; row < kRows; ++row) {
+      for (std::size_t row = 0; row < padded_rows; ++row) {
         std::array<float, 64> values{};
-        if (row < kInputRows)
+        if (row < rows)
           std::memcpy(values.data(),
                       in[0].bytes.data() + (row * k + group * 64) * 4,
                       values.size() * 4);
@@ -113,6 +107,9 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
           maximum = std::max(maximum, maxima[slice]);
           sum += sums[slice];
         }
+        const auto row16 = row % kRows;
+        const auto dst = ((row / tile_rows) * (k / 64) + group) * tile_words +
+                         ((row % tile_rows) / kRows) * kGroupWords;
         const float inverse = 127.0f / std::max(maximum, 1e-30f);
         for (std::size_t word = 0; word < 16; ++word) {
           std::uint32_t packed = 0;
@@ -123,14 +120,13 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
                 std::isfinite(rounded) ? static_cast<std::int32_t>(rounded) : 0;
             packed |= (static_cast<std::uint32_t>(code) & 255u) << (8 * byte);
           }
-          const auto at = group * kGroupWords + (word / 4) * 64 +
-                          ((word % 4) / 2) * 32 + row * 2 + word % 2;
+          const auto at = dst + (word / 4) * 64 + ((word % 4) / 2) * 32 +
+                          row16 * 2 + word % 2;
           store(at, packed);
         }
-        store(group * kGroupWords + 256 + row * 2,
+        store(dst + 256 + row16 * 2,
               std::bit_cast<std::uint32_t>(maximum * (1.0f / 127.0f)));
-        store(group * kGroupWords + 257 + row * 2,
-              std::bit_cast<std::uint32_t>(sum));
+        store(dst + 257 + row16 * 2, std::bit_cast<std::uint32_t>(sum));
       }
     }
     return OkStatus();
@@ -141,6 +137,11 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
     const auto k =
         static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
     const auto groups = k / 64u;
+    const auto *layout = dispatch::q4_matrix_panel_layout(s.inputs[0]);
+    const auto input_rows = static_cast<std::uint32_t>(layout->m);
+    const auto padded_rows =
+        (input_rows + layout->rows - 1u) / layout->rows * layout->rows;
+    const auto tile_words = layout->rows / kRows * kGroupWords;
     kir::KernelBody kb(s.types, *s.intrinsics, 0);
     kb.set_store(s.store);
     PanelArgs a;
@@ -151,11 +152,11 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
     const auto slice = e.let(lid % 4u);
     const auto row = e.let(math::workgroup_id_y());
     const auto group = e.let(math::workgroup_id_x() * 64u + lid / 4u);
-    if (auto valid = e.when(row < kRows && group < groups)) {
+    if (auto valid = e.when(row < padded_rows && group < groups)) {
       std::vector<kir::LValue<kir::f32>> values;
       for (int t = 0; t < 16; ++t)
         values.push_back(e.var(0.0f));
-      if (auto actual = e.when(row < kInputRows)) {
+      if (auto actual = e.when(row < input_rows)) {
         const auto base = e.let(row * k + group * 64u + slice * 16u);
         for (std::uint32_t j = 0; j < 16u; j += 4u) {
           const auto pack = e.load(a.x, e.let(base + j), 16u);
@@ -178,7 +179,12 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
       const auto total = e.let(((local_sum + sum1) + sum2) + sum3);
       const auto step = e.let(maximum * (1.0f / 127.0f));
       const auto inverse = e.let(127.0f / math::max(maximum, e.f32(1e-30f)));
-      const auto dst = e.let(group * kGroupWords);
+      const auto row16 = layout->rows == kRows ? row : e.let(row % kRows);
+      const auto dst =
+          layout->rows == kRows
+              ? e.let(group * kGroupWords)
+              : e.let(((row / layout->rows) * groups + group) * tile_words +
+                      ((row % layout->rows) / kRows) * kGroupWords);
       for (std::uint32_t word_index = 0; word_index < 4; ++word_index) {
         auto word = e.let(e.u32(0));
         for (std::uint32_t byte_index = 0; byte_index < 4; ++byte_index) {
@@ -188,12 +194,12 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
               e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
           word = e.let(word + byte * (1u << (8u * byte_index)));
         }
-        a.out[dst + slice * 64u + (word_index / 2u) * 32u + row * 2u +
+        a.out[dst + slice * 64u + (word_index / 2u) * 32u + row16 * 2u +
               word_index % 2u] = word;
       }
       if (auto leader = e.when(slice == 0u)) {
-        a.out[dst + 256u + row * 2u] = math::bits_of<lse::f32>(step);
-        a.out[dst + 257u + row * 2u] = math::bits_of<lse::f32>(total);
+        a.out[dst + 256u + row16 * 2u] = math::bits_of<lse::f32>(step);
+        a.out[dst + 257u + row16 * 2u] = math::bits_of<lse::f32>(total);
       }
     }
     return kb.str();
@@ -202,10 +208,14 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
     ThreadPlan tp;
     if (!supported(s))
       return tp;
-    const auto groups = static_cast<std::uint32_t>(s.output.dim(0));
+    const auto *layout = dispatch::q4_matrix_panel_layout(s.inputs[0]);
+    const auto groups = static_cast<std::uint32_t>(
+        s.inputs[0].dim(s.inputs[0].rank() - 1) / 64);
     tp.workgroup_size[0] = kBlock;
     tp.workgroup_count[0] = (groups + 63u) / 64u;
-    tp.workgroup_count[1] = kRows;
+    tp.workgroup_count[1] =
+        (static_cast<std::uint32_t>(layout->m) + layout->rows - 1u) /
+        layout->rows * layout->rows;
     return tp;
   }
 };
@@ -223,8 +233,7 @@ bool valid_matrix_panel(const KernelShapes &s) {
   const auto original = original_shapes(s);
   if (!dispatch::q4_matrix_panel_shape(original))
     return false;
-  const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
-  return s.inputs[4] == Shape{k / 64, kGroupWords};
+  return s.inputs[4] == dispatch::q4_matrix_panel_storage_shape(s.inputs[0]);
 }
 const KernelPrimitiveBase *legacy(const KernelShapes &s) {
   const auto *base =
@@ -331,6 +340,105 @@ std::string emit_matrix(const KernelShapes &s) {
   }
   return kb.str();
 }
+std::string emit_prefill_matrix(const KernelShapes &s) {
+  using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
+                            math::MatrixElem::kSU8, 16, 16, 16>;
+  constexpr auto row = Mma::kRow;
+  constexpr auto geo = geometry_of(row);
+  constexpr int frag = row.a_len / row.chained;
+  constexpr int slots = row.c_len;
+  const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+  const auto m = static_cast<std::uint32_t>(
+      s.output.elem_count() / static_cast<std::uint64_t>(s.inputs[1].dim(0)));
+  const auto groups =
+      static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1) / 64);
+  const auto lanes = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+  constexpr std::uint32_t waves = kBlock / 32u;
+  const auto tiles_n = (n + 15u) / 16u;
+  const auto nblocks = (tiles_n + waves - 1u) / waves;
+  kir::KernelBody kb(s.types, *s.intrinsics, 0);
+  kb.set_store(s.store);
+  MatrixArgs a;
+  if (!env::bind(kb, a, s))
+    return {};
+  env::Emit e{&kb};
+  const auto lid = e.let(math::local_id());
+  const auto lane = e.let(lid % 32u);
+  const auto lo = e.let(lane % 16u);
+  const auto hi = e.let(lane / 16u);
+  const auto wg = e.let(math::workgroup_id_x());
+  const auto mblock = e.let(wg / nblocks);
+  const auto m0 = e.let(mblock * 64u);
+  const auto ntile = e.let((wg % nblocks) * waves + lid / 32u);
+  const auto col = e.let(ntile * 16u + lo);
+  const auto live = e.let(ntile < tiles_n && col < n);
+  const auto safe_col = e.let(select(col < n, col, e.u32(0)));
+  std::vector<kir::LValue<kir::f32>> out;
+  for (int z = 0; z < 4 * slots; ++z)
+    out.push_back(e.var(0.0f));
+  for (auto g : e.range(0u, groups, 1u)) {
+    const auto sa = e.let(safe_col * groups + g);
+    const auto scale = e.let(math::widen(a.scales[sa]));
+    const auto bias = e.let(math::widen(a.biases[sa]));
+    std::vector<kir::Local<kir::u32, frag>> bf;
+    for (std::uint32_t t = 0; t < 4u; ++t) {
+      const auto weight =
+          e.let(a.packed[e.let(safe_col * lanes + g * 8u + t * 2u + hi)]);
+      bf.push_back(e.local<kir::u32, frag>());
+      for (int f = 0; f < frag; ++f) {
+        auto expanded = e.let(e.u32(0));
+        for (std::uint32_t b = 0; b < 4u; ++b) {
+          const auto code =
+              e.let((weight /
+                     (1u << (4u * (static_cast<std::uint32_t>(f) * 4u + b)))) %
+                    16u);
+          expanded = e.let(expanded + code * (1u << (8u * b)));
+        }
+        bf[t][f] = expanded;
+      }
+    }
+    const auto group_base = e.let((mblock * groups + g) * 1152u);
+    for (std::uint32_t i = 0; i < 4u; ++i) {
+      const auto block_base = e.let(group_base + i * 288u);
+      const auto acc = e.local<kir::i32, slots>();
+      for (int z = 0; z < slots; ++z)
+        acc[z] = kir::cast<kir::i32>(e.u32(0));
+      for (std::uint32_t t = 0; t < 4u; ++t) {
+        const auto av = e.load(
+            a.panel, e.let(block_base + t * 64u + hi * 32u + lo * 2u), 8u);
+        const auto af = e.local<kir::u32, frag>();
+        for (int f = 0; f < frag; ++f)
+          af[f] = av[f];
+        acc = math::mma<Mma>(af.value(), bf[t].value(), acc.value());
+      }
+      std::vector<kir::Pack<kir::u32>> metadata;
+      for (std::uint32_t z = 0; z < 8u; z += 2u)
+        metadata.push_back(
+            e.load(a.panel, e.let(block_base + 256u + hi * 16u + z * 2u), 16u));
+      for (int z = 0; z < slots; ++z) {
+        const auto step = e.let(math::from_bits<lse::f32>(
+            metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
+        const auto sum = e.let(math::from_bits<lse::f32>(
+            metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2 + 1]));
+        const auto term = e.let(scale * step);
+        const auto at = i * slots + static_cast<std::uint32_t>(z);
+        out[at] = math::fma(term, kir::cast<kir::f32>(acc[z].read()),
+                            out[at].read()) +
+                  bias * sum;
+      }
+    }
+  }
+  for (std::uint32_t i = 0; i < 4u; ++i)
+    for (int z = 0; z < slots; ++z) {
+      const auto output_row =
+          e.let(m0 + i * 16u + hi * geo.half_rows +
+                static_cast<std::uint32_t>(z) * geo.slot_step);
+      if (auto valid = e.when(live && output_row < m))
+        e.store(output_row * n + col,
+                out[i * slots + static_cast<std::uint32_t>(z)].read());
+    }
+  return kb.str();
+}
 struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
   static constexpr std::string_view kName = "quant_linear.q4_matrix_panel.v1";
   static constexpr std::string_view kEntry =
@@ -354,8 +462,10 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     if (!valid_matrix_panel(s) || !s.types.scalar || !s.store || !s.intrinsics)
       return {};
     const auto original = original_shapes(s);
-    if (dispatch::q4_matrix_panel_row(original))
-      return emit_matrix(s);
+    if (dispatch::q4_matrix_panel_row(original)) {
+      const auto *rule = dispatch::q4_matrix_panel_rule(original);
+      return rule->rows == kRows ? emit_matrix(s) : emit_prefill_matrix(s);
+    }
     const auto *kernel = legacy(original);
     return kernel ? kernel->emit_kernel(original) : std::string{};
   }
@@ -370,7 +480,10 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     }
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
     tp.workgroup_size[0] = kBlock;
-    tp.workgroup_count[0] = (n + 127u) / 128u;
+    const auto *rule = dispatch::q4_matrix_panel_rule(original);
+    const auto m = static_cast<std::uint32_t>(rule->m);
+    tp.workgroup_count[0] =
+        ((m + rule->rows - 1u) / rule->rows) * ((n + 127u) / 128u);
     return tp;
   }
 };

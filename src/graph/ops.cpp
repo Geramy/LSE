@@ -295,8 +295,7 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
     }
     n->prim = find_primitive("quant_linear.q8.wmma16.packed.v1");
   } else if (dispatch::q4_matrix_panel_shape(geometry)) {
-    const auto k = sx.dim(sx.rank() - 1);
-    const Shape panel_shape{k / 64, dispatch::kQ4MatrixPanelGroupWords};
+    const Shape panel_shape = dispatch::q4_matrix_panel_storage_shape(sx);
     auto panel = x.node()->quant_activation_panel.lock();
     if (!panel || panel->inputs.size() != 1 || panel->inputs[0] != x.node() ||
         panel->shape != panel_shape || panel->dtype != DType::kU32 ||

@@ -53,17 +53,18 @@ struct QuantPlan {
   return rule ? rule->rows : 0;
 }
 
-[[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s) {
+[[nodiscard]] inline const Q4MatrixPanelShape* q4_matrix_panel_rule(
+    const graph::KernelShapes& s) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
       s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
       s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
       s.output_dtype != DType::kF32 || !s.inputs[0].rank())
-    return false;
+    return nullptr;
   std::uint64_t count = 1;
   for (std::size_t axis = 0; axis < s.inputs[0].rank(); ++axis) {
     const auto extent = s.inputs[0].dim(axis);
     if (extent <= 0 || static_cast<std::uint64_t>(extent) > UINT32_MAX / count)
-      return false;
+      return nullptr;
     count *= static_cast<std::uint64_t>(extent);
   }
   for (const auto& rule : kQ4MatrixPanelShapes) {
@@ -79,9 +80,47 @@ struct QuantPlan {
     for (std::size_t axis = 0; axis + 1 < s.inputs[0].rank(); ++axis)
       expected.push_back(s.inputs[0].dim(axis));
     expected.push_back(rule.n);
-    return s.output == expected;
+    return s.output == expected ? &rule : nullptr;
   }
-  return false;
+  return nullptr;
+}
+[[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s) {
+  return q4_matrix_panel_rule(s) != nullptr;
+}
+
+[[nodiscard]] inline const Q4MatrixPanelLayout* q4_matrix_panel_layout(
+    const Shape& input) {
+  if (!input.rank()) return nullptr;
+  std::uint64_t count = 1;
+  for (std::size_t axis = 0; axis < input.rank(); ++axis) {
+    const auto extent = input.dim(axis);
+    if (extent <= 0 || static_cast<std::uint64_t>(extent) > UINT32_MAX / count)
+      return nullptr;
+    count *= static_cast<std::uint64_t>(extent);
+  }
+  const auto k = input.dim(input.rank() - 1);
+  if (k % 64 != 0) return nullptr;
+  const auto m = count / static_cast<std::uint64_t>(k);
+  for (const auto& rule : kQ4MatrixPanelLayouts) {
+    if (m != static_cast<std::uint64_t>(rule.m) || (rule.k && k != rule.k))
+      continue;
+    const auto blocks = (m + rule.rows - 1) / rule.rows;
+    const auto words = blocks * static_cast<std::uint64_t>(k / 64) *
+                       (rule.rows / kQ4MatrixPanelRows) * kQ4MatrixPanelGroupWords;
+    if (words > UINT32_MAX) return nullptr;
+    return &rule;
+  }
+  return nullptr;
+}
+
+[[nodiscard]] inline Shape q4_matrix_panel_storage_shape(const Shape& input) {
+  const auto* rule = q4_matrix_panel_layout(input);
+  if (!rule) return {};
+  const auto groups = input.dim(input.rank() - 1) / 64;
+  if (rule->rows == kQ4MatrixPanelRows)
+    return Shape{groups, kQ4MatrixPanelGroupWords};
+  return Shape{(rule->m + rule->rows - 1) / rule->rows, groups,
+               (rule->rows / kQ4MatrixPanelRows) * kQ4MatrixPanelGroupWords};
 }
 [[nodiscard]] const math::MatrixCoreRow* q4_matrix_panel_row(
     const graph::KernelShapes&);
