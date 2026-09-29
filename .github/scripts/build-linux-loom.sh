@@ -43,6 +43,8 @@ for patch in "${patches[@]}"; do
   git -C "$work/source" apply "$path"
 done
 # Build the compiler only. HRX/HSA/ROCm continue to use the runner's selected runtime.
+# The upstream loom-compile configuration requires the VM execution target when
+# its VM emitter is enabled; only loomc_shared is built below.
 cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DLIBHRX_BUILD=OFF \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
@@ -51,7 +53,7 @@ cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DIREE_HAL_DRIVER_HIP_RCCL=OFF -DIREE_HAL_DRIVER_VULKAN=OFF \
   -DLOOM_BUILD=ON -DLOOM_TARGET_DEFAULTS=OFF -DLOOM_EXECUTE_DEFAULTS=OFF \
   -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults \
-  -DLOOM_TARGET_IREE_VM=ON -DLOOM_TARGET_LLVMIR=ON \
+  -DLOOM_TARGET_IREE_VM=ON -DLOOM_EXECUTE_IREE_VM=ON -DLOOM_TARGET_LLVMIR=ON \
   -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON
 cmake --build "$work/build" --target loomc_shared --parallel "${LSE_BUILD_JOBS:-3}"
 python3 - "$work" "$deps" "$hrx_rev" "$mac_rev" <<'PY'
