@@ -244,6 +244,27 @@ LSE_TEST(q4_matrix_panel_prefill_shape_and_temporary_slot_reuse) {
     LSE_EXPECT(other.node()->prim->name() != kConsumer);
   }
 }
+LSE_TEST(q4_matrix_panel_measured_prefill_projections_share_one_producer) {
+  auto x = leaf({1, 1024, 5120}, DType::kF32);
+  auto gate = contraction(x, 17408, 5120);
+  for (const auto columns : {10240, 6144, 12288}) {
+    auto output = contraction(x, columns, 5120);
+    LSE_EXPECT(output.node()->prim->name() == kConsumer);
+    LSE_EXPECT(output.node()->inputs[4] == gate.node()->inputs[4]);
+    Fixture f(1024, columns, 5120);
+    const auto *rule = dispatch::q4_matrix_panel_rule(f.original());
+    LSE_EXPECT(rule != nullptr);
+    LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) != nullptr);
+    if (rule)
+      LSE_EXPECT_EQ(rule->shared_words, 1152u);
+    for (const auto rows : {8, 512, 1023, 1025}) {
+      Fixture other(rows, columns, 5120);
+      LSE_EXPECT(!dispatch::q4_matrix_panel_shape(other.original()));
+    }
+  }
+  auto other = contraction(x, 1024, 5120);
+  LSE_EXPECT(other.node()->prim->name() != kConsumer);
+}
 LSE_TEST(q4_matrix_panel_dispatch_validates_geometry_capabilities_and_staging) {
   for (const auto rows : {8, 1024}) {
     Fixture f(rows);
@@ -742,5 +763,11 @@ int main(int argc, char **argv) {
     return gpu_down(1024);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-up")
     return gpu_down(1024, 17408, 5120);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-qkv")
+    return gpu_down(1024, 10240, 5120);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-gdn-z")
+    return gpu_down(1024, 6144, 5120);
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-attn-q")
+    return gpu_down(1024, 12288, 5120);
   return lse::test::run_all();
 }

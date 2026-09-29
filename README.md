@@ -81,6 +81,13 @@ These source changes follow published v0.4.13. The performance targets remain
 unmet. This coding request does not establish rates for long-context Pi chat.
 See [mode comparison and timing limits](docs/benchmarks/forward-modes-2026-09-29.md).
 
+The same cooperative schedule now covers the exact M1024 QKV, GDN gate and
+attention projection shapes. The matched resident request reaches **619.08
+prompt tokens/s**, versus **568.03** before these entries. Decode remains
+**40.68 TPS**. Responses and acceptance statistics match exactly. This exceeds
+600 PP/s on this controlled 1024-token workload, not at every context length.
+See [projection results and validation](docs/benchmarks/prefill-projections-2026-09-29.md).
+
 ## v0.4.12: typed attention and automatic buffer views
 
 This version adds typed WMMA attention, cooperative single-token attention, and
