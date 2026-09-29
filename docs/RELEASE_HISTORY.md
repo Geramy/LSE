@@ -3,6 +3,16 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.18: smaller weight slabs
+
+The weight allocator now uses 512 MiB slabs on macOS HRX, avoiding large
+unused tails in the Q4 target and Q8 DFlash2 draft allocations. Matched driver
+counters fell by about 1.71 GB after load and after a request. Repeated warm
+requests measured 545.5 versus 548.3 prompt tokens/s and 49.9 decode
+tokens/s for both builds. Output and acceptance matched. This does not resolve
+the remaining long-context workspace and allocation high-water. See
+[the slab report](benchmarks/weight-slab-memory-2026-09-29.md).
+
 ## v0.4.17: completed prefill workspace retirement
 
 This release fixes overlapping target activation workspaces when ragged prefill
@@ -177,4 +187,3 @@ on the second identical request, with temperature 0 and 100% proposal acceptance
 The first request measured 15.51 decode tokens/s even without new kernel compilation;
 request setup and reuse remain under investigation.
 See the [memory report](benchmarks/kv-growth-memory-2026-09-28.md).
-

@@ -1,4 +1,17 @@
-### Prefill workspace memory fixes
+### Weight slab VRAM reduction
+
+The macOS HRX weight allocator now packs the Q4 target and Q8 DFlash2 draft
+into 512 MiB slabs. In matched local R9700 runs, reserved GPU memory after
+loading fell from 20.583 to 18.870 GB and after a request from 24.694 to
+22.978 GB. Warm repeated requests measured 545.5 versus 548.3 prompt
+tokens/s and 49.9 decode tokens/s in both builds. Generated output hashes and
+80% DFlash2 acceptance matched. These numbers use decimal GB and driver
+reserved-memory counters; timing does not show a throughput regression, but
+does not establish identical performance for every workload.
+
+[Method and limits](https://github.com/Geramy/LSE/blob/v0.4.18/docs/benchmarks/weight-slab-memory-2026-09-29.md).
+
+### Earlier prefill workspace memory fixes
 
 Completed target graphs are released before the next request's prefill and
 when the prefill chunk width changes. Consecutive full-size chunks keep replay.

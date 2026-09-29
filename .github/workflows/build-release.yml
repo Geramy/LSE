@@ -217,6 +217,7 @@ jobs:
           mkdir -p "dist/$name/docs/benchmarks"
           cp docs/benchmarks/m8-gate-up-pair-2026-09-29.md "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/prefill-workspace-memory-2026-09-29.md "dist/$name/docs/benchmarks/"
+          cp docs/benchmarks/weight-slab-memory-2026-09-29.md "dist/$name/docs/benchmarks/"
           python3 .github/scripts/package-linux.py \
             --build "$PWD/build" --loom-manifest "$LSE_LOOMC_MANIFEST" \
             --package-dir "$PWD/dist/$name"

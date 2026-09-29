@@ -26,11 +26,13 @@ LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
 
-## Current release: v0.4.17
+## Current release: v0.4.18
 
-This version fixes excess GPU workspace retention during ragged prefill and
-DFlash2 follow-up requests. The matched 6143-token request uses 1.51 GB less
-reserved VRAM, with identical output and acceptance counts. See
+This version reduces unused GPU weight-allocation space for the Q4 target and
+Q8 DFlash2 draft by about 1.71 GB in a matched R9700 test. Warm decode stayed
+at 49.9 tokens/s, and output and acceptance matched. See the
+[weight slab measurements](docs/benchmarks/weight-slab-memory-2026-09-29.md).
+The v0.4.17 workspace-retirement fix remains active; see
 [prefill memory ownership](#prefill-memory-ownership).
 
 The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
@@ -135,7 +137,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.17`.
+The examples below use `v0.4.18`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -144,7 +146,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.17
+   lse_tag=v0.4.18
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -177,7 +179,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.17
+   lse_tag=v0.4.18
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"

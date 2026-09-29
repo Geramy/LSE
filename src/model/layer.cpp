@@ -68,20 +68,9 @@ struct WeightSlab {
   std::size_t used = 0;
 };
 
-std::size_t weight_slab_bytes(const backend::IBackend& be) {
-  constexpr std::size_t kAlign = 4096;
-  std::size_t kSlab = std::size_t{512} << 20;
-#if defined(__APPLE__)
-  // Device-only VRAM slabs have no individual host-DMA descriptor limit.
-  // Bound each slab to 1/16 of reported VRAM and at most 2 GiB so a large
-  // checkpoint does not exhaust the transport's BO slots merely on weights.
-  // CPU and small/unknown-capacity devices retain the original 512 MiB slab.
-  if (be.name() == "hrx") {
-    const std::size_t budget = be.device_info().total_memory / 16;
-    kSlab = std::clamp(budget & ~(kAlign - 1), kSlab, std::size_t{2} << 30);
-  }
-#endif
-  return kSlab;
+std::size_t weight_slab_bytes(const backend::IBackend&) {
+  // Bound unused tail space without returning to per-tensor allocations.
+  return std::size_t{512} << 20;
 }
 
 Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
