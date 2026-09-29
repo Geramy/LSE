@@ -28,6 +28,10 @@ class ComgrCompiler final : public graph::IKernelCompiler {
   [[nodiscard]] std::vector<KernelCensus> census(
       std::span<const std::byte> object) const override;
 
+  [[nodiscard]] std::uint32_t resource_metadata_version() const noexcept override;
+  [[nodiscard]] std::vector<KernelResources> resources(
+      std::span<const std::byte> object) const override;
+
   [[nodiscard]] bool available() const override;
 
   // comgr's own version plus the exact option lists both actions run with.

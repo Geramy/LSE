@@ -344,6 +344,15 @@ std::vector<KernelCensus> LoomcCompiler::census(
   return read_code_object_census(object);
 }
 
+std::uint32_t LoomcCompiler::resource_metadata_version() const noexcept {
+  return kCodeObjectResourceVersion;
+}
+
+std::vector<KernelResources> LoomcCompiler::resources(
+    std::span<const std::byte> object) const {
+  return read_code_object_resources(object);
+}
+
 bool LoomcCompiler::available() const {
 #if LSE_HAVE_LOOMC
   return true;

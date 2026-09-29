@@ -37,6 +37,10 @@ class LoomcCompiler final : public graph::IKernelCompiler {
   [[nodiscard]] std::vector<KernelCensus> census(
       std::span<const std::byte> object) const override;
 
+  [[nodiscard]] std::uint32_t resource_metadata_version() const noexcept override;
+  [[nodiscard]] std::vector<KernelResources> resources(
+      std::span<const std::byte> object) const override;
+
   [[nodiscard]] bool available() const override;
 
   // The actual loaded loomc image plus the exact option set every

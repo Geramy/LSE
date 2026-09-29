@@ -46,6 +46,11 @@ bool prefer(const ArrangementCost& candidate, const ArrangementCost& incumbent) 
 
   if (!candidate.stated || !candidate.residency.seated()) return false;
   if (!incumbent.stated || !incumbent.residency.seated()) return true;
+  const AllocationPreference allocation = private_allocation_preference(
+      candidate.residency, incumbent.residency);
+  if (allocation != AllocationPreference::kUnchanged) {
+    return allocation == AllocationPreference::kCandidate;
+  }
 
   if (candidate.charged_bytes < incumbent.charged_bytes) return true;
   if (candidate.charged_bytes > incumbent.charged_bytes) return false;
@@ -55,6 +60,11 @@ bool prefer(const ArrangementCost& candidate, const ArrangementCost& incumbent) 
   const std::uint32_t cand = candidate.residency.workgroups_per_pool;
   const std::uint32_t inc = incumbent.residency.workgroups_per_pool;
   if (cand != inc) return cand > inc;
+  const AllocationPreference allocation_tie = private_allocation_preference(
+      candidate.residency, incumbent.residency, true);
+  if (allocation_tie != AllocationPreference::kUnchanged) {
+    return allocation_tie == AllocationPreference::kCandidate;
+  }
   // Still equal. The smaller request wins: the room it leaves on the pool is
   // what a later fusion has to spend, and two shapes that move the same bytes
   // and seat the same workgroups differ in nothing else. This is where the two

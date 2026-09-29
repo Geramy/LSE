@@ -147,6 +147,8 @@ LSE_TEST(loom_cache_reuses_q6_kernel_source_and_launch_metadata) {
 namespace {
 struct ArtifactCompiler final : IKernelCompiler {
   mutable int compiles = 0;
+  mutable int resource_reads = 0;
+  std::uint32_t metadata_version = 0;
   std::string id = "exact-source-test.v1";
   static std::string entry(std::string_view text) {
     const auto at = text.find("export(\"");
@@ -173,6 +175,18 @@ struct ArtifactCompiler final : IKernelCompiler {
     c.entry = entry({reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     c.instructions = backend::DeviceFact<std::uint32_t>::queried(19);
     return {c};
+  }
+  std::uint32_t resource_metadata_version() const noexcept override {
+    return metadata_version;
+  }
+  std::vector<backend::KernelResources> resources(
+      std::span<const std::byte> bytes) const override {
+    ++resource_reads;
+    backend::KernelResources r;
+    r.entry = entry({reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    r.vector_registers = backend::DeviceFact<std::uint32_t>::queried(17);
+    r.private_segment_bytes = backend::DeviceFact<std::uint32_t>::queried(192);
+    return {r};
   }
   bool available() const override { return true; }
   std::string identity() const override { return id; }
@@ -429,6 +443,46 @@ LSE_TEST(compiled_source_preserves_toolchain_geometry_and_device_ownership) {
     JitCache cache(second, compiler, dir.path.string());
     LSE_EXPECT_OK(cache.get_or_compile(0, 55, source).status());
     LSE_EXPECT_EQ(compiler.compiles, 4);
+  }
+}
+
+LSE_TEST(cached_resource_reader_refreshes_facts_without_recompiling_code) {
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  ArtifactBackend backend;
+  auto source = artifact_source();
+  LSE_EXPECT(finalize_source_identity(source));
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.get_or_compile(0, 61, source).status());
+    LSE_EXPECT_EQ(compiler.compiles, 1);
+  }
+  compiler.metadata_version = 1;
+  auto& measured = opt::KernelMeasurements::instance();
+  measured.clear();
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT(!measured.known(source.entry_name));
+    LSE_EXPECT(!measured.known(source.structural_entry_name));
+    LSE_EXPECT_OK(cache.get_or_compile(0, 61, source).status());
+    LSE_EXPECT_EQ(compiler.compiles, 1);
+    LSE_EXPECT_EQ(compiler.resource_reads, 1);
+    LSE_EXPECT_EQ(cache.stats().disk_hits, 1u);
+    const auto r = measured.lookup(source.structural_entry_name);
+    LSE_EXPECT(r.private_segment_bytes.known());
+    LSE_EXPECT_EQ(r.private_segment_bytes.value, 192u);
+    LSE_EXPECT(r.spilled() == backend::SpillState::kUnknown);
+  }
+  measured.clear();
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    const auto r = measured.lookup(source.structural_entry_name);
+    LSE_EXPECT(r.private_segment_bytes.known());
+    LSE_EXPECT_EQ(r.private_segment_bytes.value, 192u);
+    LSE_EXPECT_OK(cache.get_or_compile(0, 61, source).status());
+    LSE_EXPECT_EQ(compiler.compiles, 1);
+    LSE_EXPECT_EQ(compiler.resource_reads, 1);
+    LSE_EXPECT_EQ(cache.stats().disk_hits, 1u);
   }
 }
 

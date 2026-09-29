@@ -91,8 +91,9 @@ struct ArrangementCost {
 // workgroups are not equal if one leaves the pool room and the other fills it,
 // because that room is what the next fusion decision has to spend.
 //
-// Spilling decides before any of that, for the same reason it does in
-// opt::prefer: no byte count buys back a kernel whose values live in memory.
+// Reported spills and known zero-private versus positive-private allocation
+// decide before modeled cost, as in opt::prefer. Two positive allocations only
+// break a modeled tie; allocation bytes are not executed memory traffic.
 [[nodiscard]] bool prefer(const ArrangementCost& candidate,
                           const ArrangementCost& incumbent);
 

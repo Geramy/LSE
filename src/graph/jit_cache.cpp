@@ -1,8 +1,11 @@
 #include "lse/graph/jit.hpp"
 #include "lse/opt/measurements.hpp"
+#include "dispatch_profile.hpp"
+#include "resource_profile.hpp"
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -60,6 +63,7 @@ struct DiskMeta {
   std::string entry;
   std::vector<backend::KernelResources> resources;
   std::vector<backend::KernelCensus> census;
+  std::uint32_t resource_version = 0;
 };
 
 // A fact renders as its number or as "-", never as a 0 standing in for
@@ -267,6 +271,12 @@ bool read_meta(const fs::path& path, DiskMeta* out) {
     return false;
   }
   for (std::string line; std::getline(in, line);) {
+    if (line.starts_with("resource_version ")) {
+      std::istringstream version(line.substr(17));
+      std::uint32_t value = 0;
+      if (version >> value) out->resource_version = value;
+      continue;
+    }
     backend::KernelResources r;
     if (read_resource_line(line, &r)) {
       out->resources.push_back(std::move(r));
@@ -301,7 +311,8 @@ void record_structural_measurements(std::string_view alias,
 // see kernels this process has already compiled, so the first emit of a run
 // always falls back to the estimate — and the answer would then depend on how
 // long the process had been running, which is exactly what must not happen.
-void preload_measurements(const std::string& dir) {
+void preload_measurements(const std::string& dir,
+    const std::unordered_map<std::string, std::uint32_t>& resource_versions) {
   struct Alias {
     std::string entry;
     std::string artifact;
@@ -322,6 +333,10 @@ void preload_measurements(const std::string& dir) {
     if (it->path().extension() != ".meta") continue;
     DiskMeta meta;
     if (!read_meta(it->path(), &meta)) continue;
+    const auto version = resource_versions.find(meta.arch);
+    if (version == resource_versions.end()) continue;
+    // Legacy objects remain reusable; stale resource facts are not evidence.
+    if (meta.resource_version != version->second) meta.resources.clear();
     for (const backend::KernelResources& r : meta.resources) {
       opt::KernelMeasurements::instance().record(r.entry, r);
     }
@@ -349,6 +364,7 @@ void write_meta(const fs::path& path, const DiskMeta& meta) {
   std::snprintf(buf, sizeof(buf), "%016llx",
                 static_cast<unsigned long long>(meta.source_hash));
   out << buf << '\n' << meta.entry << '\n';
+  out << "resource_version " << meta.resource_version << '\n';
   write_resources(out, meta.resources);
   write_census(out, meta.census);
   out.close();
@@ -522,6 +538,7 @@ JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
   impl_->memory.resize(devices_.size() * kDialectCount);
   impl_->artifacts.resize(impl_->memory.size());
   compiler_id_.resize(devices_.size() * kDialectCount, 0);
+  std::unordered_map<std::string, std::uint32_t> resource_versions;
   for (std::size_t i = 0; i < devices_.size(); ++i) {
     // Every dialect the member declares, not just its front one: an object
     // built by the Loom compiler must not sit in a slot keyed by comgr's
@@ -529,10 +546,12 @@ JitCache::JitCache(backend::IDeviceSet& devices, std::string cache_dir)
     for (const KernelToolchain& tc : devices_.device(i).toolchains()) {
       if (tc.compiler == nullptr) continue;
       compiler_id_[toolchain_slot(i, tc.dialect)] = fnv(tc.compiler->identity());
+      auto& version = resource_versions[devices_.device(i).device_info().arch];
+      version = std::max(version, tc.compiler->resource_metadata_version());
     }
   }
   purge_kernel_artifacts();
-  preload_measurements(cache_dir_);
+  preload_measurements(cache_dir_, resource_versions);
 }
 
 JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
@@ -550,7 +569,8 @@ JitCache::JitCache(backend::IBackend& backend, const IKernelCompiler& compiler,
   impl_->memory.resize(kDialectCount);
   impl_->artifacts.resize(impl_->memory.size());
   purge_kernel_artifacts();
-  preload_measurements(cache_dir_);
+  preload_measurements(cache_dir_,
+      {{backend.device_info().arch, compiler.resource_metadata_version()}});
 }
 
 JitCache::~JitCache() = default;
@@ -709,6 +729,12 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     code = read_file(co_path);
     if (!code.empty()) {
       ++stats_.disk_hits;
+      bool metadata_changed = false;
+      if (meta.resource_version != compiler->resource_metadata_version()) {
+        meta.resources = compiler->resources(code);
+        meta.resource_version = compiler->resource_metadata_version();
+        metadata_changed = true;
+      }
       resources = meta.resources;
       census = meta.census;
       // An object cached before anything counted instructions still has them:
@@ -718,9 +744,10 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
         census = compiler->census(code);
         if (!census.empty()) {
           meta.census = census;
-          write_meta(meta_path, meta);
+          metadata_changed = true;
         }
       }
+      if (metadata_changed) write_meta(meta_path, meta);
     }
   }
 
@@ -760,7 +787,8 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     write_code(co_path, code);
     if (emitted.content_addressed) write_text(source_path, emitted.source);
     write_meta(meta_path,
-               DiskMeta{arch, src_hash, emitted.entry_name, resources, census});
+               DiskMeta{arch, src_hash, emitted.entry_name, resources, census,
+                        compiler->resource_metadata_version()});
   }
 
   auto handle = be.load_executable(
@@ -770,6 +798,18 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
   backend::KernelHandle kernel = handle.release();
   const std::uint64_t stored_hash =
       src_hash != 0 ? src_hash : (meta_ok ? meta.source_hash : 0);
+  static const auto resource_profile_mode =
+      detail::dispatch_profile_mode(std::getenv("LSE_PROFILE_DISPATCH"));
+  if (resource_profile_mode == detail::DispatchProfileMode::kSubmit ||
+      resource_profile_mode == detail::DispatchProfileMode::kSerial) {
+    for (const auto& r : resources) {
+      if (r.entry != (emitted.entry_name.empty() ? meta.entry : emitted.entry_name))
+        continue;
+      const auto diagnostic =
+          detail::private_memory_diagnostic(r, arch, artifact_key, stored_hash);
+      if (!diagnostic.empty()) std::fputs(diagnostic.c_str(), stderr);
+    }
+  }
   // Publish what the toolchain said, so a decision made BEFORE the next
   // compile of the same kernel can consult a measurement instead of a
   // prediction. Keyed on the entry name, which a decision site can spell

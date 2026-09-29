@@ -52,9 +52,16 @@ struct FusionVerdict {
   bool admit = false;
   Occupancy fused;
   Occupancy unfused;
-  // Whether both sides were scored from previous compiles rather than from the
-  // emitter's prediction.
+  // Whether residency on both sides came from compiler resource facts. Known
+  // private-allocation and spill facts are compared independently of LDS.
   bool measured = false;
+  // A settled admission can only move toward refusal when both alternatives
+  // provide the private-memory or spill facts justifying it. Existing compiled
+  // Programs are unaffected; subsequent planning uses the refusal.
+  bool demoted = false;
+  bool recommendation_deferred = false;
+
+  [[nodiscard]] std::string describe() const;
 };
 
 [[nodiscard]] FusionVerdict admit_fusion(const DeviceCapacity& cap,

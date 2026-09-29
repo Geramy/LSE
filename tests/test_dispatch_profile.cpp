@@ -1,5 +1,6 @@
 #include "harness.hpp"
 #include "../src/graph/dispatch_profile.hpp"
+#include "../src/graph/resource_profile.hpp"
 
 using lse::graph::detail::DispatchProfile;
 using lse::graph::detail::DispatchProfileMode;
@@ -46,3 +47,40 @@ LSE_TEST(dispatch_profile_has_a_bounded_overflow_bucket) {
   LSE_EXPECT_EQ(rows[0].second.submit_ns, 11u);
 }
 LSE_TEST_MAIN()
+
+LSE_TEST(private_memory_profile_does_not_infer_register_spills) {
+  lse::backend::KernelResources r;
+  r.entry = "canonical_fixture";
+  r.private_segment_bytes =
+      lse::backend::DeviceFact<std::uint32_t>::queried(192);
+  r.workgroup_segment_bytes =
+      lse::backend::DeviceFact<std::uint32_t>::queried(8192);
+  const auto text = lse::graph::detail::private_memory_diagnostic(r, "gfx1201", 31, 47);
+  LSE_EXPECT(text.find("entry=canonical_fixture arch=gfx1201 artifact=31 source_hash=47")
+             != std::string::npos);
+  LSE_EXPECT(text.find("private_B_per_workitem=192 private_source=queried")
+             != std::string::npos);
+  LSE_EXPECT(text.find("LDS_B_per_workgroup=8192 spill=unknown") != std::string::npos);
+  LSE_EXPECT(text.find("vgpr_spills=unknown sgpr_spills=unknown") != std::string::npos);
+}
+
+LSE_TEST(private_memory_profile_reports_proven_spills_with_unknown_allocation) {
+  lse::backend::KernelResources r;
+  r.entry = "spilled_fixture";
+  r.vector_spills = lse::backend::DeviceFact<std::uint32_t>::queried(4);
+  r.scalar_spills = lse::backend::DeviceFact<std::uint32_t>::queried(0);
+  const auto text = lse::graph::detail::private_memory_diagnostic(r, "gfx1201", 31, 47);
+  LSE_EXPECT(text.find("private_B_per_workitem=unknown private_source=unknown")
+             != std::string::npos);
+  LSE_EXPECT(text.find("spill=spilled vgpr_spills=4 sgpr_spills=0") != std::string::npos);
+}
+
+LSE_TEST(private_memory_profile_keeps_zero_and_unknown_quiet) {
+  lse::backend::KernelResources r;
+  r.entry = "quiet_fixture";
+  LSE_EXPECT(lse::graph::detail::private_memory_diagnostic(r, "gfx1201", 31, 47).empty());
+  r.private_segment_bytes = lse::backend::DeviceFact<std::uint32_t>::queried(0);
+  r.vector_spills = lse::backend::DeviceFact<std::uint32_t>::queried(0);
+  r.scalar_spills = lse::backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(lse::graph::detail::private_memory_diagnostic(r, "gfx1201", 31, 47).empty());
+}

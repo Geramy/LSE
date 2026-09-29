@@ -96,6 +96,7 @@ KernelDemand KernelDemand::measured(std::uint32_t threads,
   // workgroup segment arrives unknown rather than as a request for none.
   d.lds_bytes = r.workgroup_segment_bytes;
   d.vector_registers = r.vector_registers;
+  d.private_bytes_per_workitem = r.private_segment_bytes;
   d.spill = r.spilled();
   return d;
 }
@@ -104,6 +105,7 @@ Occupancy occupancy(const DeviceCapacity& cap, const KernelDemand& demand) {
   Occupancy occ;
   occ.spill = demand.spill;
   occ.scratch_request = demand.lds_bytes;
+  occ.private_bytes_per_workitem = demand.private_bytes_per_workitem;
   if (!cap.usable() || demand.threads == 0) return occ;
 
   const std::uint32_t wave = cap.wavefront_size.value;
@@ -214,9 +216,31 @@ std::string Occupancy::describe() const {
   arm(waves_by_registers);
   os << ", lds ";
   arm(waves_by_scratch);
-  os << "), spill " << to_string(spill) << (exact ? ", exact" : ", inexact")
-     << '\n';
+  os << "), LDS ";
+  if (scratch_request.known()) os << scratch_request.value;
+  else os << '-';
+  os << " B/workgroup, private ";
+  if (private_bytes_per_workitem.known()) os << private_bytes_per_workitem.value;
+  else os << '-';
+  os << " B/work-item [" << to_string(private_bytes_per_workitem.source)
+     << "], spill " << to_string(spill)
+     << (exact ? ", exact" : ", inexact") << '\n';
   return os.str();
+}
+
+AllocationPreference private_allocation_preference(
+    const Occupancy& candidate, const Occupancy& incumbent,
+    bool modeled_tie) noexcept {
+  const auto& a = candidate.private_bytes_per_workitem;
+  const auto& b = incumbent.private_bytes_per_workitem;
+  if (!a.known() || !b.known() || a.value == b.value) {
+    return AllocationPreference::kUnchanged;
+  }
+  if (!modeled_tie && a.value != 0 && b.value != 0) {
+    return AllocationPreference::kUnchanged;
+  }
+  return a.value < b.value ? AllocationPreference::kCandidate
+                           : AllocationPreference::kIncumbent;
 }
 
 bool prefer(const Occupancy& candidate, const Occupancy& incumbent) {
@@ -232,8 +256,18 @@ bool prefer(const Occupancy& candidate, const Occupancy& incumbent) {
   }
   if (!candidate.seated()) return false;
   if (!incumbent.seated()) return true;
+  const AllocationPreference allocation =
+      private_allocation_preference(candidate, incumbent);
+  if (allocation != AllocationPreference::kUnchanged) {
+    return allocation == AllocationPreference::kCandidate;
+  }
   if (candidate.workgroups_per_pool > incumbent.workgroups_per_pool) return true;
   if (candidate.workgroups_per_pool < incumbent.workgroups_per_pool) return false;
+  const AllocationPreference tie =
+      private_allocation_preference(candidate, incumbent, true);
+  if (tie != AllocationPreference::kUnchanged) {
+    return tie == AllocationPreference::kCandidate;
+  }
   // A tie. Trustworthy when both figures were counted from answered facts, and
   // otherwise only when the candidate asks for no more scratch than the
   // incumbent — an unmeasured granule cannot separate two equal requests, but

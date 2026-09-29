@@ -277,6 +277,15 @@ std::vector<KernelCensus> ComgrCompiler::census(
   return read_code_object_census(object);
 }
 
+std::uint32_t ComgrCompiler::resource_metadata_version() const noexcept {
+  return kCodeObjectResourceVersion;
+}
+
+std::vector<KernelResources> ComgrCompiler::resources(
+    std::span<const std::byte> object) const {
+  return read_code_object_resources(object);
+}
+
 bool ComgrCompiler::available() const {
 #if LSE_HAVE_COMGR
   return true;

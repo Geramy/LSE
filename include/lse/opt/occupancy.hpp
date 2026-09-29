@@ -86,6 +86,9 @@ struct KernelDemand {
   // them the same.
   backend::DeviceFact<std::uint32_t> lds_bytes;
   backend::DeviceFact<std::uint32_t> vector_registers;
+  // Compiler-reported fixed private allocation per work-item. This is not LDS
+  // and is not a count of executed spill traffic or proof of register spills.
+  backend::DeviceFact<std::uint32_t> private_bytes_per_workitem;
   backend::SpillState spill = backend::SpillState::kUnknown;
 
   // Scratch this caller counted itself. Named for what it is so a bare integer
@@ -136,6 +139,7 @@ struct Occupancy {
   // granule is, and two asking for different bytes do not. Unknown when the
   // demand itself was unanswered, which is not the same as asking for none.
   backend::DeviceFact<std::uint32_t> scratch_request;
+  backend::DeviceFact<std::uint32_t> private_bytes_per_workitem;
 
   // A SPILLING KERNEL IS A DIFFERENT REGIME, NOT A LOWER NUMBER. Occupancy
   // says how many waves fit; it says nothing about a wave that goes to memory
@@ -168,10 +172,24 @@ struct Occupancy {
 [[nodiscard]] Occupancy occupancy(const DeviceCapacity& cap,
                                   const KernelDemand& demand);
 
+enum class AllocationPreference : std::uint8_t {
+  kUnchanged,
+  kCandidate,
+  kIncumbent,
+};
+
+// Known zero versus known private allocation decides before a modeled cost.
+// Two positive allocations decide only a modeled tie. Unknown is never zero.
+[[nodiscard]] AllocationPreference private_allocation_preference(
+    const Occupancy& candidate, const Occupancy& incumbent,
+    bool modeled_tie = false) noexcept;
+
 // Would `candidate` be at least as good an arrangement as `incumbent`?
 //
 // Spilling decides first and outright: no occupancy figure buys back a kernel
-// whose values live in memory. Then residency, in workgroups per pool. Ties go
+// whose values live in memory. A known zero-private alternative also wins
+// over one with known private allocation; unknown facts do not decide. Then
+// residency, in workgroups per pool, and less private allocation on ties. Ties go
 // to the candidate, which is what makes a scratch-neutral fusion admissible —
 // merging two stages that already share their staged row costs nothing, and a
 // rule that demanded strict improvement would refuse it.

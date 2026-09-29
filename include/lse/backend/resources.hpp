@@ -108,12 +108,13 @@ struct KernelResources {
   DeviceFact<std::array<std::uint32_t, 3>> required_workgroup_size;
 
   [[nodiscard]] SpillState spilled() const noexcept {
-    if (!vector_spills.known() && !scalar_spills.known()) {
-      return SpillState::kUnknown;
+    if ((vector_spills.known() && vector_spills.value != 0) ||
+        (scalar_spills.known() && scalar_spills.value != 0)) {
+      return SpillState::kSpilled;
     }
-    const std::uint32_t v = vector_spills.known() ? vector_spills.value : 0;
-    const std::uint32_t s = scalar_spills.known() ? scalar_spills.value : 0;
-    return (v != 0 || s != 0) ? SpillState::kSpilled : SpillState::kNone;
+    return vector_spills.known() && scalar_spills.known()
+               ? SpillState::kNone
+               : SpillState::kUnknown;
   }
 
   // Whether anything at all was reported. A default-constructed instance means

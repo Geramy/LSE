@@ -1,13 +1,10 @@
-// The MEASUREMENT and FACTS halves of this backend, for AMD code objects.
-//
-// Not under hipc/ or loomc/: an AMDGPU code object is an AMDGPU code object
-// whichever generator wrote it, and both of this backend's compilers hand
-// their bytes to the same reader here. The note both emit is the ELF
-// `amdhsa.kernels` map, read through amd_comgr rather than by walking the ELF
-// ourselves, so an ELF or metadata-version change is the toolchain's problem.
+// AMDGPU resource metadata and native instruction census.
+// HIP and Loom objects share the reader. Metadata is decoded through COMGR
+// when available, or directly from the ELF MessagePack note otherwise.
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
@@ -19,6 +16,8 @@
 #include "lse/core/status.hpp"
 
 namespace lse::backend {
+
+inline constexpr std::uint32_t kCodeObjectResourceVersion = 1;
 
 // What the object says about every kernel it defines. An object whose note is
 // missing or unreadable yields an empty vector and an ok status: "this

@@ -168,19 +168,19 @@ LSE_TEST(the_decode_gemv_census_reads_measured_resources) {
 
   std::printf("       == decode Q6 GEMV occupancy census (gfx1201, M=1) ==\n");
   std::printf(
-      "       %-12s %5s %5s %7s %5s %4s %6s %9s %11s %15s %6s\n", "shape",
+      "       %-12s %5s %5s %7s %5s %7s %6s %9s %11s %15s %6s\n", "shape",
       "vgpr", "sgpr", "lds", "priv", "spill", "wg_th", "waves/simd", "wgs/pool",
       "binding", "GB/s");
   for (const CensusRow& row : rows) {
     const auto& r = row.census.resources;
-    auto u = [](const backend::DeviceFact<std::uint32_t>& f) -> std::uint32_t {
-      return f.known() ? f.value : 0;
+    auto value = [](const backend::DeviceFact<std::uint32_t>& f) {
+      return f.known() ? std::to_string(f.value) : std::string{"-"};
     };
     std::printf(
-        "       %-12s %5u %5u %7u %5u %4d %6u %9u %9u %-11s %6.1f\n", row.spec.name,
-        u(r.vector_registers), u(r.scalar_registers),
-        u(r.workgroup_segment_bytes), u(r.private_segment_bytes),
-        r.spilled() == backend::SpillState::kSpilled ? 1 : 0, row.workgroup_threads,
+        "       %-12s %5s %5s %7s %5s %7s %6u %9u %9u %-11s %6.1f\n", row.spec.name,
+        value(r.vector_registers).c_str(), value(r.scalar_registers).c_str(),
+        value(r.workgroup_segment_bytes).c_str(), value(r.private_segment_bytes).c_str(),
+        to_string(r.spilled()).data(), row.workgroup_threads,
         row.census.occupancy.waves_per_simd,
         row.census.occupancy.workgroups_per_pool,
         to_string(row.census.occupancy.binding).data(), row.spec.gbps);

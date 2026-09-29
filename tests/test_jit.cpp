@@ -1153,6 +1153,16 @@ LSE_TEST(an_unanswered_fact_is_not_a_zero) {
   clean.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
   clean.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
   LSE_EXPECT(clean.spilled() == backend::SpillState::kNone);
+  backend::KernelResources partial;
+  partial.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(partial.spilled() == backend::SpillState::kUnknown);
+  partial.vector_spills = backend::DeviceFact<std::uint32_t>::queried(4);
+  LSE_EXPECT(partial.spilled() == backend::SpillState::kSpilled);
+  partial.vector_spills = {};
+  partial.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(partial.spilled() == backend::SpillState::kUnknown);
+  partial.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(4);
+  LSE_EXPECT(partial.spilled() == backend::SpillState::kSpilled);
   backend::KernelResources spilling = clean;
   spilling.vector_spills = backend::DeviceFact<std::uint32_t>::queried(4);
   LSE_EXPECT(spilling.spilled() == backend::SpillState::kSpilled);
@@ -2331,7 +2341,9 @@ LSE_TEST(measured_resources_survive_a_warm_start_holes_included) {
     // The hole is the point: a compiler that never answered must not come back
     // from disk having answered zero.
     LSE_EXPECT(!r->vector_spills.known());
-    LSE_EXPECT(r->spilled() == backend::SpillState::kNone);
+    LSE_EXPECT(r->scalar_spills.known());
+    LSE_EXPECT_EQ(r->scalar_spills.value, 0u);
+    LSE_EXPECT(r->spilled() == backend::SpillState::kUnknown);
     LSE_EXPECT(r->required_workgroup_size.known());
     LSE_EXPECT_EQ(r->required_workgroup_size.value[0], 256u);
     // Facts nobody ever reported stay unreported through the round trip.
@@ -4108,10 +4120,194 @@ LSE_TEST(a_fusion_that_costs_residency_is_refused_by_the_model) {
   LSE_EXPECT(opt::prefer(at(16384), at(32000)));
 }
 
-// A verdict must not move under a running model. The engine re-emits every
-// group every step, so an answer that changed when a measurement landed would
-// change the kernel mid-run — and the first answer for an arrangement is
-// therefore the one that stands for the process.
+namespace {
+
+backend::KernelResources private_resources(std::uint32_t private_bytes,
+                                           std::uint32_t lds_bytes = 0) {
+  backend::KernelResources r;
+  r.workgroup_segment_bytes =
+      backend::DeviceFact<std::uint32_t>::queried(lds_bytes);
+  r.private_segment_bytes =
+      backend::DeviceFact<std::uint32_t>::queried(private_bytes);
+  return r;
+}
+
+}  // namespace
+
+LSE_TEST(private_allocation_is_preserved_without_inventing_register_spills) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  auto r = private_resources(192, 8192);
+  const auto demand = opt::KernelDemand::measured(256, r);
+  LSE_EXPECT(demand.private_bytes_per_workitem.known());
+  LSE_EXPECT_EQ(demand.private_bytes_per_workitem.value, 192u);
+  LSE_EXPECT(demand.private_bytes_per_workitem.source ==
+             backend::FactSource::kQueried);
+  const auto measured = opt::occupancy(cap, demand);
+  const auto counted = opt::occupancy(cap, opt::KernelDemand::counted(256, 8192));
+  LSE_EXPECT_EQ(measured.workgroups_per_pool, counted.workgroups_per_pool);
+  LSE_EXPECT(measured.spill == backend::SpillState::kUnknown);
+  LSE_EXPECT(!counted.private_bytes_per_workitem.known());
+  LSE_EXPECT(measured.describe().find("LDS 8192 B/workgroup") != std::string::npos);
+  LSE_EXPECT(measured.describe().find("private 192 B/work-item") != std::string::npos);
+  r.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  r.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(r.spilled() == backend::SpillState::kNone);
+  LSE_EXPECT(opt::occupancy(cap, opt::KernelDemand::measured(256, r)).spill ==
+             backend::SpillState::kNone);
+  r.private_segment_bytes = {};
+  LSE_EXPECT(!opt::occupancy(cap, opt::KernelDemand::measured(256, r))
+                  .private_bytes_per_workitem.known());
+}
+
+LSE_TEST(known_zero_private_allocation_wins_over_modeled_residency_and_traffic) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  auto zero = tile(2, 5120, 17408, 128, 48000);
+  zero.demand = opt::KernelDemand::measured(256, private_resources(0, 48000));
+  auto positive = zero;
+  positive.demand = opt::KernelDemand::measured(256, private_resources(64));
+  positive.traffic.workgroups = 1;
+  const auto a = opt::arrangement_cost(cap, zero);
+  const auto b = opt::arrangement_cost(cap, positive);
+  LSE_EXPECT(b.residency.workgroups_per_pool > a.residency.workgroups_per_pool);
+  LSE_EXPECT(b.charged_bytes < a.charged_bytes);
+  LSE_EXPECT(opt::prefer(a.residency, b.residency));
+  LSE_EXPECT(!opt::prefer(b.residency, a.residency));
+  LSE_EXPECT(opt::prefer(a, b));
+  LSE_EXPECT(!opt::prefer(b, a));
+  const opt::Arrangement choices[] = {positive, zero};
+  LSE_EXPECT_EQ(opt::best_arrangement(cap, choices), std::size_t{1});
+  // Positive private allocation is legal when it is the available path.
+  LSE_EXPECT_EQ(opt::best_arrangement(cap, std::span(&positive, 1)),
+                std::size_t{0});
+  const auto illegal = opt::occupancy(
+      cap, opt::KernelDemand::measured(256, private_resources(0, 65552)));
+  LSE_EXPECT(!opt::prefer(illegal, b.residency));
+}
+
+LSE_TEST(positive_private_requests_only_break_modeled_ties_and_unknown_stays_unknown) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  auto lean = tile(2, 5120, 17408, 128, 8192);
+  lean.demand = opt::KernelDemand::measured(256, private_resources(64, 8192));
+  auto larger = lean;
+  larger.demand = opt::KernelDemand::measured(256, private_resources(192, 8192));
+  const auto a = opt::arrangement_cost(cap, lean);
+  auto b = opt::arrangement_cost(cap, larger);
+  LSE_EXPECT(opt::prefer(a.residency, b.residency));
+  LSE_EXPECT(!opt::prefer(b.residency, a.residency));
+  LSE_EXPECT(opt::prefer(a, b));
+  LSE_EXPECT(!opt::prefer(b, a));
+  larger.traffic.workgroups = 1;
+  b = opt::arrangement_cost(cap, larger);
+  LSE_EXPECT(b.charged_bytes < a.charged_bytes);
+  LSE_EXPECT(opt::prefer(b, a));
+  auto roomy = b.residency;
+  auto tight = a.residency;
+  roomy.workgroups_per_pool = tight.workgroups_per_pool + 1;
+  LSE_EXPECT(opt::prefer(roomy, tight));
+  LSE_EXPECT(!opt::prefer(tight, roomy));
+  auto unknown = a.residency;
+  unknown.private_bytes_per_workitem = {};
+  LSE_EXPECT(opt::private_allocation_preference(unknown, a.residency, true) ==
+             opt::AllocationPreference::kUnchanged);
+  LSE_EXPECT(opt::prefer(unknown, a.residency));
+  LSE_EXPECT(opt::prefer(a.residency, unknown));
+  LSE_EXPECT(unknown.describe().find("private - B/work-item") != std::string::npos);
+  auto spilling = a.residency;
+  spilling.spill = backend::SpillState::kSpilled;
+  spilling.private_bytes_per_workitem =
+      backend::DeviceFact<std::uint32_t>::queried(0);
+  LSE_EXPECT(!opt::prefer(spilling, unknown));
+}
+
+LSE_TEST(measured_private_feedback_can_demote_once_without_repromoting) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  auto& measurements = opt::KernelMeasurements::instance();
+  const std::vector<std::string> solos = {"private_feedback_solo_a",
+                                         "private_feedback_solo_b"};
+  opt::FusionCandidate c;
+  c.threads = 256;
+  c.fused_scratch_bytes = c.worst_solo_scratch_bytes = 8192;
+  c.fused_entry = "private_feedback_fused";
+  c.solo_entries = solos;
+  LSE_EXPECT(opt::admit_fusion(cap, c).admit);
+  measurements.record(c.fused_entry, private_resources(192, 8192));
+  // One unknown counterpart does not establish a scratch-free alternative.
+  measurements.record(solos[0], private_resources(0, 8192));
+  auto incomplete = opt::admit_fusion(cap, c);
+  LSE_EXPECT(incomplete.admit);
+  LSE_EXPECT(!incomplete.demoted);
+  LSE_EXPECT(!incomplete.unfused.private_bytes_per_workitem.known());
+  measurements.record(solos[1], private_resources(0, 8192));
+  const auto demoted = opt::admit_fusion(cap, c);
+  LSE_EXPECT(demoted.measured);
+  LSE_EXPECT(demoted.demoted);
+  LSE_EXPECT(!demoted.admit);
+  LSE_EXPECT(demoted.describe().find("private allocation demoted") !=
+             std::string::npos);
+  const auto settled = opt::admit_fusion(cap, c);
+  LSE_EXPECT(!settled.admit);
+  LSE_EXPECT(!settled.demoted);
+  measurements.record(c.fused_entry, private_resources(0, 8192));
+  const auto improved = opt::admit_fusion(cap, c);
+  LSE_EXPECT(!improved.admit);
+  LSE_EXPECT(!improved.demoted);
+  LSE_EXPECT(improved.recommendation_deferred);
+}
+
+LSE_TEST(private_feedback_uses_all_solo_requests_without_corrupting_residency) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  auto& measurements = opt::KernelMeasurements::instance();
+  const std::vector<std::string> solos = {"private_worst_solo_a",
+                                         "private_worst_solo_b"};
+  measurements.record(solos[0], private_resources(0, 48000));
+  measurements.record(solos[1], private_resources(128));
+  opt::FusionCandidate c;
+  c.threads = 256;
+  c.fused_entry = "private_worst_fused";
+  c.solo_entries = solos;
+  measurements.record(c.fused_entry, private_resources(64));
+  const auto v = opt::admit_fusion(cap, c);
+  LSE_EXPECT(v.measured);
+  LSE_EXPECT(v.admit);
+  LSE_EXPECT_EQ(v.unfused.workgroups_per_pool, 2u);
+  LSE_EXPECT_EQ(v.unfused.private_bytes_per_workitem.value, 128u);
+}
+
+LSE_TEST(reported_spill_feedback_requires_known_nonspilling_counterparts) {
+  const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
+  auto& measurements = opt::KernelMeasurements::instance();
+  const std::vector<std::string> solos = {"spill_feedback_solo"};
+  opt::FusionCandidate c;
+  c.threads = 256;
+  c.fused_scratch_bytes = c.worst_solo_scratch_bytes = 8192;
+  c.fused_entry = "spill_feedback_fused";
+  c.solo_entries = solos;
+  LSE_EXPECT(opt::admit_fusion(cap, c).admit);
+  backend::KernelResources spilled;
+  spilled.vector_spills = backend::DeviceFact<std::uint32_t>::queried(4);
+  measurements.record(c.fused_entry, spilled);
+  auto unknown = opt::admit_fusion(cap, c);
+  LSE_EXPECT(unknown.admit);
+  LSE_EXPECT(!unknown.demoted);
+  LSE_EXPECT(unknown.recommendation_deferred);
+  backend::KernelResources clean;
+  clean.vector_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  measurements.record(solos[0], clean);
+  const auto partial = opt::admit_fusion(cap, c);
+  LSE_EXPECT(partial.admit);
+  LSE_EXPECT(!partial.demoted);
+  clean.scalar_spills = backend::DeviceFact<std::uint32_t>::queried(0);
+  measurements.record(solos[0], clean);
+  const auto known = opt::admit_fusion(cap, c);
+  LSE_EXPECT(!known.admit);
+  LSE_EXPECT(known.demoted);
+  LSE_EXPECT(!known.measured);
+  LSE_EXPECT(known.fused.spill == backend::SpillState::kSpilled);
+  LSE_EXPECT(known.unfused.spill == backend::SpillState::kNone);
+}
+
+// Ordinary residency feedback stays settled. A reported spill without known
+// nonspilling counterparts cannot demote an already selected arrangement.
 LSE_TEST(a_fusion_verdict_does_not_move_once_it_is_taken) {
   const opt::DeviceCapacity cap = opt::DeviceCapacity::of(gfx1151());
 
@@ -4124,7 +4320,7 @@ LSE_TEST(a_fusion_verdict_does_not_move_once_it_is_taken) {
 
   // Now make the same arrangement look terrible, in both the ways a later
   // answer could differ: a much larger request, and a measurement saying the
-  // kernel spills. Neither may move the answer for this process.
+  // kernel spills. Without counterparts neither may move the settled answer.
   opt::KernelMeasurements& measured = opt::KernelMeasurements::instance();
   backend::KernelResources spilling;
   spilling.vector_registers = backend::DeviceFact<std::uint32_t>::queried(180);
@@ -5681,3 +5877,133 @@ LSE_TEST(kernel_cache_defaults_and_startup_override) {
   std::error_code ec;
   std::filesystem::remove_all(root, ec);
 }
+
+#if !LSE_HAVE_COMGR
+namespace {
+std::vector<std::byte> resource_note_object(const std::vector<std::uint8_t>& note) {
+  constexpr std::size_t sections = 64, strings = 256, notes = 288;
+  constexpr char names[] = "\0.shstrtab\0.note\0";
+  const std::size_t note_size = 20 + ((note.size() + 3) & ~std::size_t{3});
+  std::vector<std::byte> out(notes + note_size);
+  auto put = [&](std::size_t at, std::uint64_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i)
+      out[at + i] = static_cast<std::byte>(value >> (8 * i));
+  };
+  out[0] = std::byte{0x7f}; out[1] = std::byte{'E'};
+  out[2] = std::byte{'L'}; out[3] = std::byte{'F'};
+  out[4] = std::byte{2}; out[5] = std::byte{1};
+  put(40, sections, 8); put(58, 64, 2); put(60, 3, 2); put(62, 1, 2);
+  put(sections + 64, 1, 4);
+  put(sections + 64 + 24, strings, 8);
+  put(sections + 64 + 32, sizeof(names), 8);
+  put(sections + 128, 11, 4);
+  put(sections + 128 + 24, notes, 8);
+  put(sections + 128 + 32, note_size, 8);
+  std::memcpy(out.data() + strings, names, sizeof(names));
+  put(notes, 7, 4); put(notes + 4, note.size(), 4); put(notes + 8, 32, 4);
+  std::memcpy(out.data() + notes + 12, "AMDGPU", 7);
+  for (std::size_t i = 0; i < note.size(); ++i)
+    out[notes + 20 + i] = static_cast<std::byte>(note[i]);
+  return out;
+}
+
+void resource_note_text(std::vector<std::uint8_t>& out, std::string_view value) {
+  out.push_back(static_cast<std::uint8_t>(0xa0u | value.size()));
+  for (char c : value) out.push_back(static_cast<std::uint8_t>(c));
+}
+
+std::vector<std::uint8_t> resource_note_header(unsigned fields) {
+  std::vector<std::uint8_t> note{0x81};
+  resource_note_text(note, "amdhsa.kernels");
+  note.push_back(0x91);
+  note.push_back(static_cast<std::uint8_t>(0x80u | (fields + 1)));
+  resource_note_text(note, ".name"); resource_note_text(note, "resource_fixture");
+  return note;
+}
+
+lse::backend::KernelResources resource_note_read(std::vector<std::uint8_t> note) {
+  const auto object = resource_note_object(note);
+  const auto all = lse::backend::read_code_object_resources(object);
+  LSE_EXPECT_EQ(all.size(), 1u);
+  return all.empty() ? lse::backend::KernelResources{} : all.front();
+}
+}  // namespace
+
+LSE_TEST(resource_private_bytes_decode_all_unsigned_encodings) {
+  struct Case { std::vector<std::uint8_t> encoded; std::uint32_t value; };
+  const Case cases[] = {{{0x00}, 0}, {{0x7f}, 127}, {{0xcc, 0xbf}, 191},
+      {{0xcd, 0x12, 0x34}, 4660}, {{0xce, 0x00, 0x01, 0x00, 0x00}, 65536},
+      {{0xce, 0xff, 0xff, 0xff, 0xff}, UINT32_MAX}};
+  for (const auto& c : cases) {
+    auto note = resource_note_header(1);
+    resource_note_text(note, ".private_segment_fixed_size");
+    note.insert(note.end(), c.encoded.begin(), c.encoded.end());
+    const auto r = resource_note_read(note);
+    LSE_EXPECT(r.private_segment_bytes.known());
+    LSE_EXPECT(r.private_segment_bytes.source == lse::backend::FactSource::kQueried);
+    LSE_EXPECT_EQ(r.private_segment_bytes.value, c.value);
+    LSE_EXPECT(!r.vector_spills.known() && !r.scalar_spills.known());
+    LSE_EXPECT(r.spilled() == lse::backend::SpillState::kUnknown);
+  }
+  const auto absent = resource_note_read(resource_note_header(0));
+  LSE_EXPECT(!absent.private_segment_bytes.known());
+}
+
+LSE_TEST(resource_private_bytes_reject_truncated_unsigned_payloads) {
+  for (const auto& encoded : {std::vector<std::uint8_t>{0xcc},
+           std::vector<std::uint8_t>{0xcd, 0xff},
+           std::vector<std::uint8_t>{0xce, 0x00, 0x01, 0x00}}) {
+    auto note = resource_note_header(1);
+    resource_note_text(note, ".private_segment_fixed_size");
+    note.insert(note.end(), encoded.begin(), encoded.end());
+    const auto r = resource_note_read(note);
+    LSE_EXPECT(!r.private_segment_bytes.known());
+    LSE_EXPECT(r.spilled() == lse::backend::SpillState::kUnknown);
+  }
+}
+
+LSE_TEST(resource_integer_payload_bytes_do_not_hide_following_keys) {
+  auto note = resource_note_header(2);
+  resource_note_text(note, ".vgpr_count"); note.insert(note.end(), {0xcc, 0xbf});
+  resource_note_text(note, ".private_segment_fixed_size"); note.push_back(0);
+  const auto r = resource_note_read(note);
+  LSE_EXPECT_EQ(r.vector_registers.value, 191u);
+  LSE_EXPECT(r.private_segment_bytes.known());
+  LSE_EXPECT_EQ(r.private_segment_bytes.value, 0u);
+}
+
+LSE_TEST(resource_workgroup_dimensions_consume_integer_widths) {
+  auto note = resource_note_header(1);
+  resource_note_text(note, ".reqd_workgroup_size");
+  note.insert(note.end(), {0x93, 0xcc, 0x80, 0xcd, 0, 1, 0xce, 0, 0, 0, 1});
+  auto r = resource_note_read(note);
+  LSE_EXPECT(r.required_workgroup_size.known());
+  LSE_EXPECT_EQ(r.required_workgroup_size.value[0], 128u);
+  LSE_EXPECT_EQ(r.required_workgroup_size.value[1], 1u);
+  LSE_EXPECT_EQ(r.required_workgroup_size.value[2], 1u);
+  note.pop_back();
+  r = resource_note_read(note);
+  LSE_EXPECT(!r.required_workgroup_size.known());
+}
+LSE_TEST(resource_reader_rejects_missing_and_truncated_entry_values) {
+  for (const auto& suffix : {std::vector<std::uint8_t>{},
+                            std::vector<std::uint8_t>{0xa3, 'a', 'b'}}) {
+    std::vector<std::uint8_t> note{0x81};
+    resource_note_text(note, ".name");
+    note.insert(note.end(), suffix.begin(), suffix.end());
+    const auto object = resource_note_object(note);
+    LSE_EXPECT(backend::read_code_object_resources(object).empty());
+  }
+}
+
+LSE_TEST(resource_reader_rejects_missing_and_truncated_target_values) {
+  for (const auto& suffix : {std::vector<std::uint8_t>{},
+                            std::vector<std::uint8_t>{0xa3, 'a', 'b'}}) {
+    std::vector<std::uint8_t> note{0x81};
+    resource_note_text(note, "amdhsa.target");
+    note.insert(note.end(), suffix.begin(), suffix.end());
+    const auto object = resource_note_object(note);
+    LSE_EXPECT(backend::read_code_object_target(object).empty());
+  }
+}
+#endif  // !LSE_HAVE_COMGR

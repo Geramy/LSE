@@ -264,6 +264,13 @@ class IKernelCompiler {
   [[nodiscard]] virtual std::vector<backend::KernelCensus> census(
       std::span<const std::byte> object) const;
 
+  // Re-read metadata from cached bytes after a resource-reader correction.
+  [[nodiscard]] virtual std::uint32_t resource_metadata_version() const noexcept {
+    return 0;
+  }
+  [[nodiscard]] virtual std::vector<backend::KernelResources> resources(
+      std::span<const std::byte>) const { return {}; }
+
   [[nodiscard]] virtual bool available() const = 0;
 
   // Everything that changes the bytes this compiler produces from identical

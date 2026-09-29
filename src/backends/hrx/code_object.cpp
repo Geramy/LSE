@@ -253,22 +253,9 @@ ArchFacts query_isa_facts(std::string_view arch) {
 // adapter is one: the device compiler is loomc, and comgr is a Linux/ROCm
 // dependency) still gets the measured resources, because the `amdhsa.kernels`
 // note is a standard ELF note that both the comgr and loomc code objects carry.
-// The `amdhsa.kernels` note description is NOT plain YAML: it is LLVM's
-// AMDGPU metadata binary format. Both the comgr and loomc code objects carry
-// it, and both readers must decode it the same way. The grammar (verified
-// byte-for-byte against the objects this toolchain emits):
-//   - a string is one tag byte `0xa0 | len` (0 <= len <= 31) followed by `len`
-//     bytes; a key is such a string;
-//   - a small integer (0 <= v <= 127) is one byte, `v`;
-//   - a larger integer is the tag byte `0xcd` followed by two bytes,
-//     high then low, so the value is `(b0 << 8) | b1`;
-//   - container tags (`0x83`, `0x91`, `0x8c`, `0x93`, ...) introduce nested
-//     maps/arrays; the field we want is located by scanning for its key string
-//     and reading the value token that immediately follows it.
-//
-// This is the same field set comgr reads (same keys, same "name not symbol"
-// rule, same unknown-is-not-zero discipline); only the transport differs — a
-// binary note instead of a comgr metadata handle.
+// The note contains MessagePack. The portable reader scans token boundaries
+// and decodes the unsigned resource fields emitted by loomc. Missing or
+// malformed fields remain unknown, including absent allocator spill counts.
 
 namespace {
 
@@ -300,86 +287,101 @@ std::string key_bytes(const std::string& key) {
   return b;
 }
 
-// A key match at `pos` is standalone when the byte before its tag is not the
-// tag byte of a longer string that runs on past `pos`. A key tag is in
-// [0xa0, 0xbf); if the preceding byte is in that range too, the previous
-// string would end at (pos-1)+len+1, and if that is not exactly pos the key is
-// a substring of a longer key, not a key of its own.
-bool key_is_standalone(std::string_view note, std::size_t pos) {
-  if (pos == 0) return true;
-  const unsigned char prev = static_cast<unsigned char>(note[pos - 1]);
-  if (prev < 0xa0 || prev > 0xbf) return true;
-  const std::size_t prev_len = prev - 0xa0;
-  return (pos - 1) + prev_len + 1 == pos;
-}
-
-// Finds the LAST occurrence of `key` in the note (position just past its
-// bytes), or npos. Used for `.name`, which appears once per argument inside
-// the `.args` list before the kernel's own entry; the kernel's is the last.
-std::size_t find_last_key(std::string_view note, const std::string& key) {
-  const std::string needle = key_bytes(key);
-  if (needle.empty()) return std::string_view::npos;
-  std::size_t pos = note.rfind(needle);
-  while (pos != std::string_view::npos) {
-    if (key_is_standalone(note, pos)) return pos + needle.size();
-    pos = note.rfind(needle, pos == 0 ? 0 : pos - 1);
-  }
-  return std::string_view::npos;
-}
-
-// Finds `key` in the note and returns the position just past its bytes, or
-// npos when absent. The key must be a standalone string token: the byte before
-// its tag must not itself be part of a longer string, which guards against a
-// key that is a substring of an unrelated longer key.
-std::size_t find_key(std::string_view note, const std::string& key) {
-  const std::string needle = key_bytes(key);
-  if (needle.empty()) return std::string_view::npos;
-  std::size_t pos = note.find(needle);
-  while (pos != std::string_view::npos) {
-    if (key_is_standalone(note, pos)) return pos + needle.size();
-    pos = note.find(needle, pos + 1);
-  }
-  return std::string_view::npos;
-}
-
-// Reads the integer value token at `pos`. Returns false when the token is not
-// an integer (it is a string or a container, which the caller does not want for
-// the numeric fields). A small int is one byte; a large int is `0xcd` + two
-// bytes (high, low).
-bool read_int(std::string_view note, std::size_t pos, std::uint32_t* out) {
+// Advance past one token header/payload, visiting container children in order.
+// Integer payload bytes can look like string tags; only token starts are keys.
+bool next_token(std::string_view note, std::size_t pos, std::size_t* next) {
   if (pos >= note.size()) return false;
-  const unsigned char b = static_cast<unsigned char>(note[pos]);
-  if (b == 0xcd) {
-    if (pos + 3 > note.size()) return false;
-    const unsigned char hi = static_cast<unsigned char>(note[pos + 1]);
-    const unsigned char lo = static_cast<unsigned char>(note[pos + 2]);
-    *out = (static_cast<std::uint32_t>(hi) << 8) | lo;
-    return true;
+  const auto tag = static_cast<unsigned char>(note[pos]);
+  std::size_t header = 1, payload = 0, length_bytes = 0;
+  bool sized_payload = false;
+  if (tag >= 0xa0 && tag <= 0xbf) {
+    payload = tag & 0x1fu;
+  } else if (tag < 0xa0 || tag >= 0xe0 || tag == 0xc0 ||
+             tag == 0xc2 || tag == 0xc3) {
+    // Fixints, fixed container headers, nil and booleans.
+  } else if ((tag >= 0xcc && tag <= 0xcf) ||
+             (tag >= 0xd0 && tag <= 0xd3)) {
+    payload = std::size_t{1} << (tag & 3u);
+  } else if (tag == 0xca || tag == 0xcb) {
+    payload = tag == 0xca ? 4 : 8;
+  } else if (tag >= 0xd4 && tag <= 0xd8) {
+    payload = 1 + (std::size_t{1} << (tag - 0xd4));
+  } else if ((tag >= 0xc4 && tag <= 0xc6) ||
+             (tag >= 0xc7 && tag <= 0xc9) ||
+             (tag >= 0xd9 && tag <= 0xdb)) {
+    const auto first = tag <= 0xc6 ? 0xc4 : tag <= 0xc9 ? 0xc7 : 0xd9;
+    length_bytes = std::size_t{1} << (tag - first);
+    sized_payload = true;
+    if (tag >= 0xc7 && tag <= 0xc9) ++header;  // extension type
+  } else if (tag >= 0xdc && tag <= 0xdf) {
+    length_bytes = (tag & 1u) == 0 ? 2 : 4;
+  } else {
+    return false;
   }
-  if (b >= 0xa0) return false;  // a string tag, not an integer
-  // A small integer: one byte. Container tags and other high bytes are not
-  // small-int values, so refuse anything >= 0x80 (those are tag/struct bytes).
-  if (b >= 0x80) return false;
-  *out = b;
+  if (length_bytes > note.size() - pos - 1) return false;
+  if (sized_payload) {
+    for (std::size_t i = 1; i <= length_bytes; ++i)
+      payload = (payload << 8) | static_cast<unsigned char>(note[pos + i]);
+  }
+  header += length_bytes;
+  if (header > note.size() - pos || payload > note.size() - pos - header)
+    return false;
+  *next = pos + header + payload;
   return true;
 }
 
-// Reads the three-element `.reqd_workgroup_size` list at `pos` (the position
-// just past the key string, as returned by find_key). The value is a container
-// tag byte followed by its three integer elements in order; each element is a
-// small int or a `0xcd`-extended int.
-void read_reqd(std::string_view note, std::size_t pos, std::array<std::uint32_t, 3>* out) {
-  std::size_t q = pos;
-  // Skip the list container tag byte (>= 0x80) if present.
-  if (q < note.size() && static_cast<unsigned char>(note[q]) >= 0x80) ++q;
+std::size_t find_key(std::string_view note, const std::string& key,
+                     bool last = false) {
+  const std::string needle = key_bytes(key);
+  if (needle.empty()) return std::string_view::npos;
+  std::size_t found = std::string_view::npos;
+  for (std::size_t pos = 0; pos < note.size();) {
+    if (note.substr(pos, needle.size()) == needle) {
+      found = pos + needle.size();
+      if (!last) return found;
+    }
+    if (!next_token(note, pos, &pos)) break;
+  }
+  return found;
+}
+
+// Argument names precede the kernel name in the current single-entry objects.
+std::size_t find_last_key(std::string_view note, const std::string& key) {
+  return find_key(note, key, true);
+}
+
+// Positive fixint and MessagePack uint8/16/32, as emitted by loomc.
+bool read_int(std::string_view note, std::size_t pos, std::uint32_t* out,
+              std::size_t* next = nullptr) {
+  if (pos >= note.size()) return false;
+  const auto tag = static_cast<unsigned char>(note[pos]);
+  std::size_t payload = 0;
+  if (tag == 0xcc) payload = 1;
+  else if (tag == 0xcd) payload = 2;
+  else if (tag == 0xce) payload = 4;
+  else if (tag >= 0x80) return false;
+  if (payload > note.size() - pos - 1) return false;
+  std::uint32_t value = payload == 0 ? tag : 0;
+  for (std::size_t i = 1; i <= payload; ++i) {
+    value = (value << 8) | static_cast<unsigned char>(note[pos + i]);
+  }
+  *out = value;
+  if (next != nullptr) *next = pos + payload + 1;
+  return true;
+}
+
+// Reads the three unsigned elements of `.reqd_workgroup_size`.
+bool read_reqd(std::string_view note, std::size_t pos, std::array<std::uint32_t, 3>* out) {
+  if (pos >= note.size() || static_cast<unsigned char>(note[pos]) != 0x93)
+    return false;
+  std::size_t q = pos + 1;
   std::size_t got = 0;
   while (got < 3 && q < note.size()) {
     std::uint32_t v = 0;
-    if (!read_int(note, q, &v)) break;
-    // A small int is one byte, a `0xcd` int is three bytes.
-    q += (static_cast<unsigned char>(note[q]) == 0xcd) ? 3 : 1;
+    if (!read_int(note, q, &v, &q)) break;
     (*out)[got++] = v;
   }
+  return got == 3;
 }
 
 // Walks the `.note` section of a 64-bit ELF and returns the description bytes
@@ -459,12 +461,12 @@ std::vector<KernelResources> read_code_object_resources(
   // token in the entry. (The loader symbol `.symbol`, where present, is the
   // same string plus a ".kd" descriptor suffix.)
   const std::size_t entry_pos = find_last_key(doc, ".name");
-  if (entry_pos == std::string_view::npos) return out;
+  if (entry_pos == std::string_view::npos || entry_pos >= doc.size()) return out;
   // The `.name` value is a string token: `0xa0|len` tag then the bytes.
   const unsigned char tag = static_cast<unsigned char>(doc[entry_pos]);
   if (tag < 0xa0 || tag > 0xbf) return out;
   const std::size_t len = tag - 0xa0;
-  if (entry_pos + 1 + len > doc.size()) return out;
+  if (len > doc.size() - entry_pos - 1) return out;
   const std::string_view entry(doc.data() + entry_pos + 1, len);
 
   KernelResources r;
@@ -492,8 +494,8 @@ std::vector<KernelResources> read_code_object_resources(
   const std::size_t reqd_pos = find_key(doc, ".reqd_workgroup_size");
   if (reqd_pos != std::string_view::npos) {
     std::array<std::uint32_t, 3> reqd{};
-    read_reqd(doc, reqd_pos, &reqd);
-    if (reqd[0] != 0)
+    if (read_reqd(doc, reqd_pos, &reqd) && reqd[0] != 0 &&
+        reqd[1] != 0 && reqd[2] != 0)
       r.required_workgroup_size =
           DeviceFact<std::array<std::uint32_t, 3>>::queried(reqd);
   }
@@ -509,11 +511,11 @@ std::string read_code_object_target(std::span<const std::byte> object) {
   std::string_view doc(reinterpret_cast<const char*>(note.data()), note.size());
   // `amdhsa.target` is a top-level key (a `0xa0|len` string token).
   const std::size_t p = find_key(doc, "amdhsa.target");
-  if (p == std::string_view::npos) return {};
+  if (p == std::string_view::npos || p >= doc.size()) return {};
   const unsigned char tag = static_cast<unsigned char>(doc[p]);
   if (tag < 0xa0 || tag > 0xbf) return {};
   const std::size_t len = tag - 0xa0;
-  if (p + 1 + len > doc.size()) return {};
+  if (len > doc.size() - p - 1) return {};
   return std::string(doc.data() + p + 1, len);
 }
 
