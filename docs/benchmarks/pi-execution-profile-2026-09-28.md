@@ -182,6 +182,116 @@ claim. The required completion waits remain. Of the 2,178 steady samples inside
 HSA waits, 1,572 occur while completing target verification and 446 occur on
 draft-result readback paths. These waits depend on pending GPU results.
 
+## Pair adjacent M4 activation-panel loads
+
+The M4 profile identifies two additional hot projections, N10240/K5120 and
+N6144/K5120, totaling 6.423 ms per target verification body. The existing Q4
+consumer now reads two neighboring activation chunks together: 16 bytes of
+packed codes and 8 bytes of FP32 step bits per row. Weight loads, integer DOT4
+order, FP32 accumulation and affine restoration, K partitioning, wave reduction
+and fused epilogues retain their arithmetic order.
+
+The central shape table selects paired loads only for the following three
+M4/K5120 shapes under existing gfx1201/wave32 Q4/group64 panel admission.
+Each component comparison uses one warmed A/B/B/A sequence of 20 projections
+per arm. Both arms include the same activation-preparation kernel. These CP
+means sum preparation and consumer execution, excluding compilation and host
+validation.
+
+| M4 projection | Current CP mean, ms | Paired-load CP mean, ms | Reduction |
+| --- | ---: | ---: | ---: |
+| N17408/K5120, SiLU | 0.122309 | 0.098667 | 19.33% |
+| N10240/K5120 | 0.085419 | 0.059385 | 30.48% |
+| N6144/K5120 | 0.054874 | 0.038126 | 30.52% |
+
+Both candidate arms beat both baseline arms for each selected shape. Baseline
+drift is visible; these component results do not establish an HTTP throughput
+gain. The N5120/K17408 down experiment increases CP execution from 0.111918 to
+0.114716 ms (+2.50%), so down retains its current implementation. Other shapes,
+row counts, formats and devices also retain their current selections.
+
+All 768 native dispatches pass complete bit comparisons against the current
+consumer, an independent activation codec and contraction reference, finite
+outputs, unchanged inputs and allocation guards, with zero host/fallback
+launches. Tests include non-dyadic distinct-row activations, zero chunks,
+BF16 affine scales/biases, N17 tails, SiLU, SiLU*external input and two residual
+adds. Each owner starts fresh after clearing the disk cache; cold compilation
+is outside the warmed timing.
+
+The selected consumers reduce VGPR use from 66 to 53, with unchanged launch
+geometry and zero declared LDS or scratch bytes. The producer is unchanged.
+These resource counts do not measure occupancy. Implementation cache keys
+include the selected load width; no new registered alternative or buffer
+layout is introduced. No additional model-quality test or HTTP gain is claimed
+for this exact arithmetic-order change.
+
+## Detect private scratch allocation in optimizer facts
+
+The native code-object reader previously missed MessagePack uint8 and uint32
+values. It could also mistake an integer payload byte for a string boundary.
+The corrected reader preserves fixed private bytes per work-item, LDS bytes
+per workgroup, register counts and required launch dimensions. Missing or
+truncated metadata remains unknown. Positive private allocation is not proof
+of register spills or a count of executed memory traffic.
+
+A resource-reader revision is stored separately from compiler identity. An old
+cached object stays reusable. Its stale resource facts are withheld from the
+optimizer until the object loads, then the metadata is refreshed from the
+existing bytes and saved without compilation. Later starts can preload the
+corrected facts.
+
+Occupancy and arrangement comparisons now retain private allocation. Among
+legal alternatives, a known zero-private option wins over one with known
+private allocation before modeled occupancy or traffic is compared. Two
+positive allocations only break a modeled tie. Unknown values do not supply
+zero. A settled fusion admission can be demoted once after measurements prove
+a private-memory or register-spill regression against usable alternatives;
+already-compiled Programs are unchanged.
+
+The current Loom emitter does not use that fusion-admission path. Its active
+JIT does record resource facts, and existing `LSE_PROFILE_DISPATCH=submit` or
+`serial` profiling now reports positive private allocation and confirmed spills
+when the canonical object loads. The record includes the entry, architecture,
+artifact and source hash, typed allocation units, and unknown spill counts.
+This detects the problem in active Loom code; it does not invent an alternative
+kernel or establish a throughput gain from scratch avoidance.
+
+## Final native HTTP check
+
+The canonical Release build includes the paired M4 loads and corrected resource
+metadata. The same two-turn run starts with an empty kernel cache and uses the
+same mapped HSA library, sampling defaults, FP32 KV and Q8 DFlash2 depth 3.
+Both complete responses, token counts, proposal counts and acceptance counts
+match the feature-view baseline exactly. Device group counts are unchanged;
+there are zero host groups and zero CPU fallbacks.
+
+| Measurement | Feature-view baseline | Paired M4 loads |
+| --- | ---: | ---: |
+| First prefill, s | 16.846 | 16.758 |
+| First prefill, tokens/s | 309.10 | 310.72 |
+| Follow-up prefill, s | 0.756 | 0.747 |
+| First decode, tokens/s | 27.20 | 28.59 |
+| Follow-up decode, tokens/s | 32.13 | 34.03 |
+| Unique compilations | 369 | 369 |
+| Total JIT compilation, s | 3.379 | 3.269 |
+
+Decode rate increases 5.12% and 5.90% in this single comparison. Component GPU
+measurements above support the kernel selection; this is not a repeated-run
+statistical claim. The server SHA-256 is
+`f37492b16ae84fe74aef24e8c40e321f8bca2f5854d4978972bdd035b45b1b50`.
+
+All 369 active code objects report fixed private allocation of zero with the
+corrected reader. All omit allocator spill counts, which remain unknown.
+Six objects report 164–186 VGPRs. The result finds register pressure to inspect;
+it does not find fixed private scratch as the cause of the remaining slowdown.
+
+The coherent build passes eight of nine focused host suites. `test_jit` passes
+120 of 123 cases, including all six new resource-reader cases and all six new
+optimizer cases. Its three failures are the same unavailable RDNA3.5/CDNA3
+compiler-target fixtures described above. The cache migration test verifies
+one metadata refresh, no compilation, and reuse of refreshed facts on a later
+startup. No additional perplexity run was used.
+
 ## Remaining limit
 
 The actual Pi workload has not established 451 prompt tokens/s or 46–48 decode

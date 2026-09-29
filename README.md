@@ -29,7 +29,9 @@ stays in generated control flow instead of expanding each page into source.
 In the same two-turn Pi conversation with an empty starting cache, total JIT
 compilation fell from **92.91 s to 3.35 s**. First prefill fell from **91.53 s to
 16.88 s**; follow-up prefill fell from **16.14 s to 0.76 s**. Both responses and
-proposal acceptance counts matched. The subsequent feature-view fix measured about **27 / 32 tokens/s**.
+proposal acceptance counts matched. The final paired-load build measured **28.59 / 34.03 decode tokens/s** and
+**310.72 prompt tokens/s** on those turns. Scratch allocation is now preserved
+in optimizer facts and reported by dispatch profiling.
 See the [execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
 
 ## Optional KV formats
@@ -347,7 +349,8 @@ conversation prefix and added 23 tokens.
 | --- | ---: | ---: | ---: |
 | Earlier FP32 baseline | 56.89 | 26.64 | 31.34 |
 | FP32 with bounded attention source and compiled-code reuse | 308.54 | 27.11 | 31.28 |
-| Current FP32, also using materialized DFlash feature views | **309.10** | **27.20** | **32.13** |
+| FP32 with materialized DFlash feature views | 309.10 | 27.20 | 32.13 |
+| Current FP32, also using paired M4 activation loads | **310.72** | **28.59** | **34.03** |
 | Earlier optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
 
 After the compiler changes, FP32 compilation took 3.35 seconds across 372 unique

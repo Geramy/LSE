@@ -26,7 +26,7 @@ launch metadata and optimizer measurements remain distinct.
 
 A subsequent DFlash buffer-view fix removes repeated traversal of materialized
 feature graphs, 65 copy dispatches and three compiled kernels. The same two
-responses remain exact. The final pair measures 309.10 prompt tokens/s and
+responses remain exact. That pair measures 309.10 prompt tokens/s and
 27.20 / 32.13 decode tokens/s. This small decode change is not a statistical
 speedup claim.
 
@@ -47,3 +47,25 @@ The macOS archive bundles the mapped-transfer HSA update. Its launcher selects
 the bundled runtime; no `DYLD_LIBRARY_PATH` setting is required. The activated
 MacAMDGPU DriverKit extension is still required and is installed separately.
 The Linux archive uses the installed ROCm/HRX runtime.
+
+### Scratch allocation detection
+
+The optimizer retains fixed private-memory allocation and distinguishes it from
+LDS and confirmed register spills. The native resource reader now handles all
+32-bit unsigned encodings. Cached metadata is refreshed without recompiling
+existing kernels. Submit/serial profiling reports affected active kernels.
+Fusion comparisons can refuse measured scratch regressions when a legal
+alternative is known. Current Loom kernels receive detection and resource
+reporting; automatic selection of new Loom alternatives is not claimed.
+
+### Faster M4 Q4 loads
+
+The shape table now pairs adjacent activation loads for three measured M4
+projections. Complete preparation-plus-consumer GPU time falls 19–31%, with
+exact outputs and zero private scratch. The slower down-projection experiment
+was rejected. The final matched Pi pair measures **310.72 prompt tokens/s** and
+**28.59 / 34.03 decode tokens/s**, versus 309.10 and 27.20 / 32.13 immediately
+before this change. Responses and proposal counts match exactly, and compilation
+count stays at 369. This is a single paired HTTP observation, not a guarantee
+for other prompts or context lengths. All 369 active kernels report zero fixed
+private scratch; allocator spill counts are unreported and remain unknown.
