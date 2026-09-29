@@ -1,4 +1,5 @@
 #include "lse/graph/gdn_pair.hpp"
+#include "lse/graph/quant_swiglu.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/view.hpp"
 
@@ -1042,6 +1043,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   SpanTimer setup_span(trace_.spans.schedule);
   LSE_RETURN_IF_ERROR(release_phase_tables());
 
+  if (device_first && !rec.holds(roots))
+    optimize_quant_swiglu(roots, devices_.device(devices_.primary()).device_info(),
+                         *emitter, devices_.primary());
   const std::vector<NodePtr> order = Partitioner::unmaterialized(roots);
   // Views must be valid before partitioning: a device-only view group may
   // require no dispatch at all, so neither a kernel nor the host interpreter

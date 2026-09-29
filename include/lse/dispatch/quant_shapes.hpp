@@ -100,6 +100,15 @@ inline constexpr std::array kQ4PanelShapes{
 };
 
 
+struct Q4SwiGluShape {
+  std::string_view arch;
+  std::uint32_t wave, bits, group, threads, chunks_per_lane, k_splits;
+  std::int64_t m, n, k;
+};
+inline constexpr std::array kQ4SwiGluShapes{
+    Q4SwiGluShape{"gfx1201", 32, 4, 64, 256, 4, 2, 8, 17408, 5120},
+};
+
 struct Q4MatrixPanelShape {
   std::string_view arch;
   std::uint32_t wave, bits, group, threads;

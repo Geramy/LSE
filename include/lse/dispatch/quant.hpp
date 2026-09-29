@@ -132,6 +132,47 @@ struct QuantPlan {
   return rule && quant_plan(s).shared_activation_panel ? rule->load_chunks : 1;
 }
 
+[[nodiscard]] inline const Q4SwiGluShape *
+q4_swiglu_shape(const graph::KernelShapes &s) {
+  if (s.inputs.size() != 8 || s.input_dtypes.size() != 8 ||
+      s.output_dtype != DType::kF32 || s.input_dtypes[0] != DType::kF32 ||
+      s.input_dtypes[1] != DType::kU32 || s.input_dtypes[4] != DType::kU32 ||
+      s.input_dtypes[7] != DType::kU32)
+    return nullptr;
+  for (const auto slot : {2u, 3u, 5u, 6u})
+    if (s.input_dtypes[slot] != DType::kBF16)
+      return nullptr;
+  for (const auto &rule : kQ4SwiGluShapes) {
+    if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
+        s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
+        s.inputs[0] != Shape{1, rule.m, rule.k} ||
+        s.output != Shape{1, rule.m, rule.n} ||
+        s.inputs[1] != Shape{rule.n, rule.k / 8} ||
+        s.inputs[4] != s.inputs[1] ||
+        s.inputs[7] != Shape{rule.m, (rule.k / rule.group) * 25})
+      continue;
+    bool affines = true;
+    for (const auto slot : {2u, 3u, 5u, 6u})
+      affines &= s.inputs[slot] == Shape{rule.n, rule.k / rule.group};
+    if (affines)
+      return &rule;
+  }
+  return nullptr;
+}
+[[nodiscard]] inline const Q4SwiGluShape *
+q4_swiglu_rule(const graph::KernelShapes &s) {
+  const auto *rule = q4_swiglu_shape(s);
+  if (!rule || !s.device || !s.intrinsics ||
+      !quant_shape_device(*rule, s.device->arch, s.device->wavefront_size) ||
+      s.device->max_threads_per_workgroup < rule->threads ||
+      s.intrinsics->find("silu").empty())
+    return nullptr;
+  auto original = s;
+  original.inputs = s.inputs.first(4);
+  original.input_dtypes = s.input_dtypes.first(4);
+  return quant_plan(original).shared_activation_panel ? rule : nullptr;
+}
+
 [[nodiscard]] const math::MatrixCoreRow* linear_matrix_row(const graph::KernelShapes&);
 
 inline constexpr std::uint32_t kTableRevision = 1;

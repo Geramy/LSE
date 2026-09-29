@@ -44,11 +44,15 @@ component result. The later matched DFlash2 HTTP check measured 616.38 PP/s
 and 43.05 TPS on its resident request, with exact responses and unchanged acceptance.
 See the [v0.4.15 check](docs/benchmarks/m8-gdn-http-2026-09-29.md).
 
-The last same-binary comparison, collected with v0.4.14, measured **624.10 PP/s / 24.73 TPS** for
-baseline, **608.19 PP/s / 48.62 TPS** for MTP=3, and **616.78 PP/s / 42.41 TPS** for
-seven-proposal DFlash2. These are 1024-token coding requests at temperature 0.6.
-They do not establish these rates for every context or Pi conversation. See
-[measured performance](#measured-performance) for cold results and method.
+The current source combines the measured M8 Q4 gate/up sequence in one kernel.
+Its matched DFlash2 resident decode rate increases from 43.44 to 45.64 TPS, with
+identical output. The latest same-executable resident comparison measures
+**634.34 PP/s / 24.86 TPS** for baseline, **607.88 PP/s / 48.42 TPS** for MTP=3,
+and **629.80 PP/s / 45.64 TPS** for seven-proposal DFlash2. These are 1024-token
+coding requests at temperature 0.6. See the
+[combined gate/up report](docs/benchmarks/m8-gate-up-pair-2026-09-29.md) for cold
+results, resource costs and method. These rates do not apply to every context
+or Pi conversation.
 
 | Optimization | Evidence |
 | --- | --- |
@@ -59,6 +63,7 @@ They do not establish these rates for every context or Pi conversation. See
 | Cooperative M1024 gate/up | [Gate/up results](docs/benchmarks/prefill-m1024-up-2026-09-29.md) |
 | Cooperative QKV, GDN gate and attention projections | [Projection results](docs/benchmarks/prefill-projections-2026-09-29.md) |
 | M8 activation register lifetime | [Decode scheduling results](docs/benchmarks/m8-dot4-rowpairs-2026-09-29.md) |
+| Combined M8 gate/up | [Gate/up pairing results](docs/benchmarks/m8-gate-up-pair-2026-09-29.md) |
 | M8 GDN alpha/beta panel reuse | [Rate projection results](docs/benchmarks/m8-gdn-rate-panel-2026-09-29.md) |
 
 The launch examples use temperature 0.6 and batch/ubatch 1024. Explicit request
@@ -356,6 +361,23 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
+
+### Current source: combined M8 gate/up
+
+Same executable, 1024-token coding prompts, 384 generated tokens, temperature 0.6,
+top-k 20, top-p 0.95, BF16 KV and batch/ubatch 1024. Each mode starts with an empty
+kernel cache. The resident request reuses compiled code and no prompt KV.
+
+| Mode | Cold PP/s | Cold TPS | Resident PP/s | Resident TPS |
+|---|---:|---:|---:|---:|
+| Baseline | 446.28 | 24.23 | 634.34 | 24.86 |
+| MTP=3 | 403.89 | 37.44 | 607.88 | 48.42 |
+| DFlash2 | 418.73 | 33.42 | 629.80 | 45.64 |
+
+DFlash2 improves 5.07% against a matched 43.44 TPS control; output and acceptance
+are identical. Higher register use is included in these measurements. See the
+[gate/up report](docs/benchmarks/m8-gate-up-pair-2026-09-29.md). The published
+v0.4.15 binaries retain the results below.
 
 ### v0.4.15 DFlash2 check
 

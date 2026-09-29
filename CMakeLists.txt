@@ -199,6 +199,7 @@ lse_apply_common_flags(lse_trace)
 add_library(lse_graph
   src/dispatch/attention.cpp
   src/dispatch/q8_matrix.cpp
+  src/graph/quant_swiglu.cpp
   src/graph/graph.cpp
   src/graph/ops.cpp
   src/graph/partitioner.cpp
@@ -238,6 +239,7 @@ add_library(lse_kernels
   src/kernels/quant_activation_panel.cpp
   src/kernels/quant_matrix_panel.cpp
   src/kernels/quant_linear_panel.cpp
+  src/kernels/quant_swiglu.cpp
   src/kernels/reduction.cpp
   src/kernels/rope.cpp
   src/kernels/scatter.cpp
