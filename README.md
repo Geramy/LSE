@@ -26,7 +26,7 @@ LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
 
-## Current source update: v0.4.15
+## Current release: v0.4.16
 
 The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
 Conditional drafting uses the request temperature. Probability-ratio rejection
@@ -117,7 +117,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.15`.
+The examples below use `v0.4.16`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -126,7 +126,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.15
+   lse_tag=v0.4.16
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -159,7 +159,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.15
+   lse_tag=v0.4.16
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -362,7 +362,7 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
-### Current source: combined M8 gate/up
+### v0.4.16: combined M8 gate/up
 
 Same executable, 1024-token coding prompts, 384 generated tokens, temperature 0.6,
 top-k 20, top-p 0.95, BF16 KV and batch/ubatch 1024. Each mode starts with an empty

@@ -1,39 +1,61 @@
-### Measured source and workload
+### Combined M8 Q4 gate/up execution
 
-These measurements use source `c11f103c86627e66c36d1b109fb02281c40ad686` and server SHA256 `4c635d610f6bfb7545b81ededa5a356f1b2a1b5389bdd28d736a5d24837a88dd`. They describe that measured build. A later build needs its own comparison before it can claim the same rates.
+The optimizer selects one shared-panel SwiGLU consumer for the measured gfx1201
+M8/N17408/K5120 shape. It removes one launch and the gate temporary. Independent
+FP32 projection accumulation order and the existing SiLU intrinsic are preserved.
+The architecture and shape rule is in the central dispatch table.
 
-macOS/R9700 gfx1201, Qwen Q4 target, Q8 auxiliary/draft weights, BF16 KV, temperature 0.6, top-k 20, top-p 0.95, seed 1234, batch/ubatch 1,024 and configured KV capacity 262,100. Each 1,024-token coding request generates 384 tokens, with 383 timed for decode. MTP uses depth 3. DFlash2 uses all seven proposals in block 8.
+Full-size native component checks match all 139,264 output bits. Paired component
+GPU time falls 27.69%, and wall time falls 20.50%. The combined kernel uses 120 VGPRs
+versus 88 for each separate kernel, with zero private scratch and zero LDS. The
+measured gains include the higher register pressure; occupied waves were not measured.
 
-Each mode starts with an empty private kernel cache. The resident request retains compiled code and reuses zero prompt KV. Compilation is included. No host groups or fallbacks were recorded. One pair per mode is not a statistical estimate or a long-context Pi replay.
+### Measured workload and results
+
+Measurements use source `257cc97f3bbc4fa1ae1877f068103415ea944857` and local server
+SHA256 `30aa8dd5651d7fd541a48f3a7fa0c35c782a13e6a1dcfcbe8cb8296c734e6582`.
+The release adds a version bump, documentation and packaging changes. These rates
+were measured locally on macOS/R9700 gfx1201. They are not Linux throughput results.
+
+Qwen3.8-27B Q4 target, Q8 auxiliary/draft weights, BF16 KV, FP32 floating
+accumulation, temperature 0.6, top-k 20, top-p 0.95, seed 1234, batch/ubatch 1024 and
+KV capacity 262100. Two 1024-token coding requests generate 384 tokens each, with
+383 timed decode tokens. MTP uses depth 3; DFlash2 uses all seven proposals in block 8.
+Each mode starts a new process with an empty private kernel cache. The resident
+request reuses compiled code and zero prompt KV tokens. Compilation is included.
+No profiler or competing GPU workload runs during throughput timing.
 
 | Mode | Cold PP/s | Cold TPS | Resident PP/s | Resident TPS |
 |---|---:|---:|---:|---:|
-| Baseline | 442.18 | 24.14 | 624.10 | 24.73 |
-| MTP=3 | 403.95 | 37.96 | 608.19 | 48.62 |
-| DFlash2, seven proposals | 417.14 | 31.39 | 616.78 | 42.41 |
+| Baseline | 446.28 | 24.23 | 634.34 | 24.86 |
+| MTP=3 | 403.89 | 37.44 | 607.88 | 48.42 |
+| DFlash2, seven proposals | 418.73 | 33.42 | 629.80 | 45.64 |
 
-All three controlled resident requests exceed 600 PP/s. The 29 TPS baseline, 49 TPS MTP and 103 TPS DFlash2 goals remain unmet. Rates vary with prompt, sampling and live context.
+Matched resident DFlash2 improves 43.44 → 45.64 TPS (+5.07%). Both requests preserve
+exact generated choices, acceptance counts and speculative pass counts. Verifier
+time falls 70.7413 → 66.5850 ms per pass; draft time remains about 14.8 ms. All modes
+record zero host groups and zero host fallbacks. MTP=3 remains faster on this prompt.
+One cold/resident pair per mode does not establish long-context Pi throughput.
+The 29/49/103 TPS targets remain unmet.
 
-The matched projection table change improved resident DFlash2 prefill from 568.03 to 619.08 PP/s (+8.99%). The subsequent M8 row-pair schedule improved resident decode from 40.68 to 42.41 TPS (+4.27%). Each scoped comparison preserved exact responses and speculative statistics. Different generation modes can produce different answers.
-
-[Final methods and results](https://github.com/Geramy/LSE/blob/c11f103c86627e66c36d1b109fb02281c40ad686/docs/benchmarks/forward-modes-final-2026-09-29.md), [M8 schedule](https://github.com/Geramy/LSE/blob/c11f103c86627e66c36d1b109fb02281c40ad686/docs/benchmarks/m8-dot4-rowpairs-2026-09-29.md), [prefill projections](https://github.com/Geramy/LSE/blob/c11f103c86627e66c36d1b109fb02281c40ad686/docs/benchmarks/prefill-projections-2026-09-29.md).
+[Full method and resource results](https://github.com/Geramy/LSE/blob/v0.4.16/docs/benchmarks/m8-gate-up-pair-2026-09-29.md).
 
 ### Retained optimizations and compatibility
 
-Full-width conditional DFlash2 sampling, completed prefill workspace retirement, the qualified M8 down WMMA path and the faster paired DOT4 projection schedules remain active. Floating-point accumulation remains FP32. Compact Q4 weights remain unchanged. The cooperative M1024 panels and uniform masked-attention window skip passed complete output checks; measured component kernels have zero private scratch. No additional perplexity run was added for these bit-identical schedule changes.
+All accepted M8 down WMMA, M1024 prefill panels, GDN panel reuse, typed attention,
+conditional DFlash2 sampling, memory retirement, buffer views, model generation
+configuration and thinking/tool-call HTTP behavior remain active. No additional
+perplexity run is needed for the bit-identical gate/up change.
 
-The macOS archive bundles HSA, HRX, Loom and its runtime dependency closure. Use `bin/lse` or `bin/lse-server`; install and activate MacAMDGPU separately. Linux uses the bundled HRX/Loom runtimes and compatible installed ROCm/HSA. Each archive includes a source/runtime manifest and checksum.
+Kernel cache ownership advances to 0.4.16. Startup removes only complete,
+identifiable older LSE artifact families from the selected cache directory.
+The default is `~/.lse/cache/`; `--cache-dir` overrides it. Foreign, partial,
+symlink and newer-version entries are preserved.
 
-K/V defaults to model-declared BF16 for BF16 checkpoints and FP16 otherwise, with explicit overrides. Batch/ubatch 1,024 and seven-proposal DFlash2 remain defaults. `--temperature` sets the server default; request settings take precedence. Launch examples use 0.6.
-
-### Later v0.4.15 DFlash2 snapshot
-
-Source `cb285b136fbb7d45b23ce4d0ffc7f0dfb0a4d665`, local server SHA256
-`b78f36a45355f5cade9bf5b960f5080e5e6607fc3e86e5eccd14a79c8795329f`.
-One matching DFlash2 cold/resident pair measures 413.74 PP/s / 32.01 TPS cold
-and 616.38 PP/s / 43.05 TPS resident. Complete responses and acceptance statistics
-match v0.4.14; zero host groups/fallbacks and zero prompt KV reuse. The real GPU
-cache uses the release namespace. Resident decode differs by about +1.5% in one
-pair, not a statistical estimate or long-context Pi guarantee. Baseline/MTP were
-not rerun; their table above remains explicitly the older v0.4.14 snapshot.
-See `docs/benchmarks/m8-gdn-http-2026-09-29.md`.
+Use `bin/lse` or `bin/lse-server` in the archives. The macOS arm64 package bundles
+HSA/HRX/Loom and the dependency closure; MacAMDGPU must be installed and activated
+separately. The Linux x86_64 package bundles HRX/Loom and uses compatible installed
+ROCm/HSA. Each archive contains source/runtime manifests and a SHA256 checksum.
+The macOS build runner checks host behavior, native gfx1201 compilation and
+relocated launchers. It has no external AMD GPU; actual GPU execution was checked
+locally in the qualified component and HTTP runs above.
