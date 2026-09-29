@@ -213,8 +213,13 @@ LSE_TEST(q4_panel_M8_measured_projections_share_eight_row_panels) {
     const auto input = k == 5120 ? x : leaf({1, 8, k}, DType::kF32);
     const auto output = contraction(input, n, k);
     LSE_EXPECT_EQ(output.node()->inputs.size(), 5u);
-    LSE_EXPECT(output.node()->prim && output.node()->prim->name() == kConsumer);
-    LSE_EXPECT(output.node()->inputs[4]->shape == Shape{8, (k / 64) * 25});
+    const bool matrix = n == 5120 && k == 17408;
+    LSE_EXPECT(output.node()->prim &&
+               output.node()->prim->name() ==
+                   (matrix ? "quant_linear.q4_matrix_panel.v1" : kConsumer));
+    LSE_EXPECT(output.node()->inputs[4]->shape ==
+               (matrix ? Shape{k / 64, dispatch::kQ4MatrixPanelGroupWords}
+                       : Shape{8, (k / 64) * 25}));
     if (k == 5120)
       LSE_EXPECT(output.node()->inputs[4] == ffn.node()->inputs[4]);
     const auto unmeasured = contraction(leaf({1, 9, k}, DType::kF32), n, k);
@@ -397,7 +402,10 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     if (consumer) {
       const auto *selected = consumer->specialize(invocation);
       LSE_EXPECT(selected->name() ==
-                 (dimensions[0] == 4 ? kConsumer : kRows8Consumer));
+                 (dimensions[0] == 8 && dimensions[1] == 5120 &&
+                          dimensions[2] == 17408
+                      ? "quant_linear.q4_matrix_panel.v1"
+                      : dimensions[0] == 4 ? kConsumer : kRows8Consumer));
       if (dimensions[0] != 4) {
         auto original = invocation;
         original.inputs = invocation.inputs.first(4);

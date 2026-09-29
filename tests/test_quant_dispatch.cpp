@@ -268,13 +268,13 @@ LSE_TEST(quant_dispatch_checks_index_capacity_and_scale_formats) {
 
 LSE_TEST(q4_prefill_range_uses_existing_matrix_tile_continuously) {
   for (bool loom : {false, true}) {
-    for (int m : {16, 17, 32, 64, 128, 256, 257, 511, 512, 513}) {
+    for (int m : {16, 17, 32, 64, 128, 256, 257, 511, 512, 513, 1024, 4096, 4097}) {
       for (auto [n, k] : {std::pair{17408, 5120}, std::pair{5120, 17408}}) {
         Fixture f(m, n, k, 4, loom);
         const auto p = f.plan();
         LSE_EXPECT(p.int8_activations && p.matrix != nullptr);
-        LSE_EXPECT(p.implementation == (m <= 512 ? dispatch::QuantMatrix::kInt8Lds
-                                               : dispatch::QuantMatrix::kInt8));
+        LSE_EXPECT(p.implementation == (m <= 4096 ? dispatch::QuantMatrix::kInt8Lds
+                                                : dispatch::QuantMatrix::kInt8));
         LSE_EXPECT(p.matrix && p.matrix->acc == math::MatrixElem::kI32);
       }
     }
@@ -338,9 +338,15 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
         LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(declined.shapes), 1u);
       }
     }
+    for (auto [n, k] : {std::pair{17408, 5120}, {5120, 17408},
+                        {10240, 5120}, {6144, 5120}, {5120, 6144}}) {
+      Fixture measured(8, n, k, 4, loom);
+      LSE_EXPECT(measured.plan().shared_activation_panel);
+      LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(measured.shapes), 2u);
+    }
     for (auto [m, n, k] : {std::array{4, 5120, 17408}, {4, 12288, 5120},
                            {4, 5120, 6144}, {4, 248320, 5120},
-                           {6, 17408, 5120}, {8, 17408, 5120},
+                           {6, 17408, 5120}, {8, 12288, 5120},
                            {3, 17408, 5120}, {4, 17, 5120}}) {
       Fixture unchanged(m, n, k, 4, loom);
       LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(unchanged.shapes), 1u);

@@ -236,6 +236,7 @@ add_library(lse_kernels
   src/dispatch/quant.cpp
   src/kernels/quant_linear.cpp
   src/kernels/quant_activation_panel.cpp
+  src/kernels/quant_matrix_panel.cpp
   src/kernels/quant_linear_panel.cpp
   src/kernels/reduction.cpp
   src/kernels/rope.cpp

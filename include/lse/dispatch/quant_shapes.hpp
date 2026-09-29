@@ -100,6 +100,17 @@ inline constexpr std::array kQ4PanelShapes{
 };
 
 
+struct Q4MatrixPanelShape {
+  std::string_view arch;
+  std::uint32_t wave, bits, group, threads;
+  std::int64_t m, n, k;
+};
+inline constexpr std::array kQ4MatrixPanelShapes{
+    Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 8, 5120, 17408},
+};
+inline constexpr std::uint32_t kQ4MatrixPanelRows = 16;
+inline constexpr std::uint32_t kQ4MatrixPanelGroupWords = 288;
+
 template <class Rule>
 [[nodiscard]] constexpr bool quant_shape_device(const Rule& rule,
     std::string_view arch, std::uint32_t wave) noexcept {

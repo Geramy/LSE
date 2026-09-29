@@ -294,6 +294,21 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
       ++leaf->consumer_count;
     }
     n->prim = find_primitive("quant_linear.q8.wmma16.packed.v1");
+  } else if (dispatch::q4_matrix_panel_shape(geometry)) {
+    const auto k = sx.dim(sx.rank() - 1);
+    const Shape panel_shape{k / 64, dispatch::kQ4MatrixPanelGroupWords};
+    auto panel = x.node()->quant_activation_panel.lock();
+    if (!panel || panel->inputs.size() != 1 || panel->inputs[0] != x.node() ||
+        panel->shape != panel_shape || panel->dtype != DType::kU32 ||
+        !panel->prim || panel->prim->name() != "quant_activation.q4_matrix_panel.v1") {
+      panel = make(OpKind::kCustom, panel_shape, DType::kU32, {x.node()});
+      panel->prim = find_primitive("quant_activation.q4_matrix_panel.v1");
+      if (panel->prim) panel->fclass = panel->prim->fusion_class();
+      x.node()->quant_activation_panel = panel;
+    }
+    n->inputs.push_back(panel);
+    ++panel->consumer_count;
+    n->prim = find_primitive("quant_linear.q4_matrix_panel.v1");
   } else if (dispatch::q4_shared_panel_shape(geometry)) {
     const auto k = sx.dim(sx.rank() - 1);
     const auto m = static_cast<std::int64_t>(sx.elem_count() / static_cast<std::uint64_t>(k));

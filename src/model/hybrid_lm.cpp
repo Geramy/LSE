@@ -289,9 +289,18 @@ Status poke_tokens(Array& slot, const Array& incoming) {
     return LSE_ERROR(kInvalidArgument, "token count changed");
   }
   graph::Node& dst = *slot.node();
-  const graph::Node& src = *incoming.node();
+  graph::Node& src = *incoming.node();
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for token poke");
+  if (src.buffer.ptr == nullptr && src.device_dirty) {
+    const auto member = sched->devices().member_of(src.buffer.residency);
+    if (src.buffer.residency.bound() && member >= sched->devices().size()) {
+      return LSE_ERROR(kInvalidArgument, "tokens belong to another device set");
+    }
+    auto& owner = member < sched->devices().size()
+                      ? sched->devices().device(member) : sched->backend();
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(src, owner));
+  }
   if (!dst.buffer.valid()) {
     LSE_RETURN_IF_ERROR(
         graph::interpreter::ensure_output_buffer(dst, sched->backend()));

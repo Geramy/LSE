@@ -40,6 +40,14 @@ These are workload measurements, not general rates or achieved 103 TPS/600 PP/s
 goals. Published v0.4.12 remains the preceding three-proposal build.
 See [full-width DFlash2 results](docs/benchmarks/dflash-fullwidth-2026-09-29.md).
 
+The next M8 Q4 down-projection optimization measured **40.21 TPS** on the
+second 1024-token request, versus **35.42 TPS** for its matched control.
+Prefill remained about **500 prompt tokens/s**. Both use seven proposals,
+temperature 0.6 and BF16 KV. A 1024-target perplexity comparison was
+4.8660 versus 4.8675. Completed prefill workspace is released before decode
+to fix the reproduced second-request allocation failure at batch 4096.
+See [M8 WMMA and memory results](docs/benchmarks/wmma-m8-down-2026-09-29.md).
+
 ## v0.4.12: typed attention and automatic buffer views
 
 This version adds typed WMMA attention, cooperative single-token attention, and

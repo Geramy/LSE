@@ -53,6 +53,39 @@ struct QuantPlan {
   return rule ? rule->rows : 0;
 }
 
+[[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s) {
+  if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
+      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
+      s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
+      s.output_dtype != DType::kF32 || !s.inputs[0].rank())
+    return false;
+  std::uint64_t count = 1;
+  for (std::size_t axis = 0; axis < s.inputs[0].rank(); ++axis) {
+    const auto extent = s.inputs[0].dim(axis);
+    if (extent <= 0 || static_cast<std::uint64_t>(extent) > UINT32_MAX / count)
+      return false;
+    count *= static_cast<std::uint64_t>(extent);
+  }
+  for (const auto& rule : kQ4MatrixPanelShapes) {
+    if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
+        s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
+        s.inputs[0].dim(s.inputs[0].rank() - 1) != rule.k ||
+        s.inputs[0].elem_count() != static_cast<std::uint64_t>(rule.m * rule.k) ||
+        s.inputs[1] != Shape{rule.n, rule.k / 8} ||
+        s.inputs[2] != Shape{rule.n, rule.k / rule.group} ||
+        s.inputs[3] != s.inputs[2])
+      continue;
+    Shape expected;
+    for (std::size_t axis = 0; axis + 1 < s.inputs[0].rank(); ++axis)
+      expected.push_back(s.inputs[0].dim(axis));
+    expected.push_back(rule.n);
+    return s.output == expected;
+  }
+  return false;
+}
+[[nodiscard]] const math::MatrixCoreRow* q4_matrix_panel_row(
+    const graph::KernelShapes&);
+
 [[nodiscard]] QuantPlan quant_plan(const graph::KernelShapes&, bool indexed = false);
 [[nodiscard]] inline std::uint32_t q4_shared_panel_load_chunks(
     const graph::KernelShapes& s) {
