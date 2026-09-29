@@ -171,7 +171,9 @@ bool split_decode_supported(const KernelShapes& s) {
         s.device->max_threads_per_workgroup < rule.threads ||
         q.dim(2) != rule.query_rows || q.dim(3) != rule.head_dim ||
         block > rule.max_block ||
-        backend::workgroup_lds_bytes(s.device) < shapes::kShortKeyWindow * sizeof(float))
+        backend::workgroup_lds_bytes(s.device) < shapes::kShortKeyWindow * sizeof(float) *
+            shapes::decode_head_tile(static_cast<std::uint32_t>(q.dim(1)),
+                                     static_cast<std::uint32_t>(s.inputs[1].dim(1))))
       continue;
     const auto parts = (capacity + shapes::kShortKeyWindow - 1) / shapes::kShortKeyWindow;
     const auto merge_bytes = (static_cast<std::uint64_t>(parts) * sizeof(float) + 15u) / 16u * 16u;

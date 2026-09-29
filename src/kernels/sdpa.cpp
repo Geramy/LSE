@@ -85,16 +85,17 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
     SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
-    const auto query_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : 1u;
+    const auto head_tile = ShortQuery ? 1u : dispatch::attention_shapes::decode_head_tile(heads, kvheads);
+    const auto query_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : head_tile;
     if (query_tile > 1u) {
       const auto scores = e.lds<kir::f32>(query_tile * kSplitKeys);
       const auto lane = e.let(math::local_id());
       const auto wg = e.let(math::workgroup_id_x());
-      const auto query_tiles = (queries + query_tile - 1u) / query_tile;
+      const auto query_tiles = ShortQuery ? (queries + query_tile - 1u) / query_tile : 1u;
       const auto part = e.let(wg % parts);
       const auto q0 = e.let(((wg / parts) % query_tiles) * query_tile);
-      const auto h = e.let((wg / (parts * query_tiles)) % heads);
-      const auto b = e.let(wg / (parts * query_tiles * heads));
+      const auto h = e.let(((wg / (parts * query_tiles)) % (heads / head_tile)) * head_tile);
+      const auto b = e.let(wg / (parts * query_tiles * (heads / head_tile)));
       const auto kh = e.let(h / (heads / kvheads));
       const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
       const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
@@ -104,12 +105,21 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
       const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
       const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
       const auto begin = e.let(part * kSplitKeys), tb = e.let(b * stride);
-      if (dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity)) {
+      auto row_live = [&](std::uint32_t r) {
+        if constexpr (ShortQuery) return q0 + r < queries;
+        else return h + r < heads;
+      };
+      auto record_offset = [&](std::uint32_t r) {
+        if constexpr (ShortQuery)
+          return e.let((((b * heads + h) * queries + q0 + r) * parts + part) * kSplitRecord);
+        else return e.let(((b * heads + h + r) * parts + part) * kSplitRecord);
+      };
+      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity)) {
         const auto no_keys = e.let(begin >= kv_len);
         if (auto empty = e.when(no_keys)) {
           for (std::uint32_t r = 0; r < query_tile; ++r) {
-            if (auto row = e.when(q0 + r < queries)) {
-              const auto output = e.let((((b * heads + h) * queries + q0 + r) * parts + part) * kSplitRecord);
+            if (auto row = e.when(row_live(r))) {
+              const auto output = record_offset(r);
               e.store(output + 2u + lane * 2u, e.f32(0.0f));
               e.store(output + 3u + lane * 2u, e.f32(0.0f));
               if (auto first = e.when(lane == 0u)) {
@@ -124,8 +134,11 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
       }
       auto allowed = [&](auto j, std::uint32_t r) {
         if (s.iattrs[0] == 0) return e.u32(1) == e.u32(1);
-        const auto position = e.let(kir::cast<std::int64_t>(offset) +
-                                     kir::cast<std::int64_t>(q0 + r));
+        const auto position = [&] {
+          if constexpr (ShortQuery)
+            return e.let(kir::cast<std::int64_t>(offset) + kir::cast<std::int64_t>(q0 + r));
+          else return e.let(kir::cast<std::int64_t>(offset));
+        }();
         const auto key = e.let(kir::cast<std::int64_t>(j));
         if (s.iattrs[0] == 1) return key <= position;
         return key <= position && position - key < kir::cast<std::int64_t>(e.u32(static_cast<std::uint32_t>(s.iattrs[1])));
@@ -133,7 +146,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
       auto valid_rows = [&](auto j) {
         std::vector<kir::Val<kir::boolean>> valid;
         for (std::uint32_t r = 0; r < query_tile; ++r)
-          valid.push_back(e.let(q0 + r < queries && b < rows && j < kv_len && j < row_len && allowed(j, r)));
+          valid.push_back(e.let(row_live(r) && b < rows && j < kv_len && j < row_len && allowed(j, r)));
         return valid;
       };
       auto any_valid = [&](const auto& valid) {
@@ -144,10 +157,13 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
       const auto wl = e.let(lane % 32u), wi = e.let(lane / 32u);
       std::vector<kir::LValue<kir::f32>> query_values;
       for (std::uint32_t r = 0; r < query_tile; ++r) {
-        const auto qb = e.let(((b * heads + h) * queries + q0 + r) * 256u);
+        const auto qb = [&] {
+          if constexpr (ShortQuery) return e.let(((b * heads + h) * queries + q0 + r) * 256u);
+          else return e.let((b * heads + h + r) * 256u);
+        }();
         for (std::uint32_t d = 0; d < 8u; ++d) {
           query_values.push_back(e.var(0.0f));
-          if (auto live = e.when(q0 + r < queries && b < rows))
+          if (auto live = e.when(row_live(r) && b < rows))
             query_values.back() = a.q[qb + wl + d * 32u];
         }
       }
@@ -214,8 +230,8 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
         }
       }
       for (std::uint32_t r = 0; r < query_tile; ++r) {
-        if (auto row = e.when(q0 + r < queries)) {
-          const auto output = e.let((((b * heads + h) * queries + q0 + r) * parts + part) * kSplitRecord);
+        if (auto row = e.when(row_live(r))) {
+          const auto output = record_offset(r);
           e.store(output + 2u + lane * 2u, acc0[r].read());
           e.store(output + 3u + lane * 2u, acc1[r].read());
           if (auto first = e.when(lane == 0u)) {
@@ -245,6 +261,17 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
       const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
       const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
       const auto begin = e.let(part * kSplitKeys);
+      const auto no_keys = e.let(begin >= kv_len);
+      if (auto empty = e.when(no_keys)) {
+        e.store(output + 2u + lane * 2u, e.f32(0.0f));
+        e.store(output + 3u + lane * 2u, e.f32(0.0f));
+        if (auto first = e.when(lane == 0u)) {
+          e.store(output, math::neg_inf());
+          e.store(output + 1u, e.f32(0.0f));
+        }
+      }
+      // Every lane publishes its empty record and takes the same exit before barriers.
+      (void)e.ret_if(no_keys);
       const auto tb = e.let(b * stride);
       const auto qb = [&] {
         if constexpr (ShortQuery) return e.let(((b * heads + h) * queries + query) * 256u);
@@ -342,7 +369,10 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
       tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1) *
           ((s.output.dim(2) + query_tile - 1) / query_tile) * s.output.dim(3));
     } else {
-      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / kSplitRecord);
+      query_tile = dispatch::attention_shapes::decode_head_tile(
+          static_cast<std::uint32_t>(s.inputs[0].dim(1)),
+          static_cast<std::uint32_t>(s.inputs[1].dim(1)));
+      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / (kSplitRecord * query_tile));
     }
     tp.lds_bytes = query_tile * kSplitKeys * sizeof(float);
     return tp;

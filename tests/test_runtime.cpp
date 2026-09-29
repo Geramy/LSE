@@ -1949,7 +1949,7 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
                device.max_threads_per_workgroup >= rule.threads;
       }))
     LSE_SKIP("requires a device in the split decode attention shape table");
-  constexpr int batch = 3, heads = 2, dim = 256, block = 16;
+  constexpr int batch = 3, dim = 256, block = 16;
   const float poison = std::numeric_limits<float>::quiet_NaN();
   auto read = [&](graph::Array array) { return read_all(array); };
   auto rewrite = [&](const graph::Array& array, const std::vector<float>& values) {
@@ -1958,6 +1958,7 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
       graph::interpreter::store_element(node, i, values[i]);
     LSE_EXPECT_OK(graph::interpreter::sync_to_device(node, backend));
   };
+  for (int heads : {2, 6})
   for (int capacity : {16, 512, 8192, 16384, 32768, 262144}) {
     const int live = std::min(capacity, 513);
     const int lengths[]{live, std::max(1, live / 2), 0};

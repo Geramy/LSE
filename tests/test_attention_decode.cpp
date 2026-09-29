@@ -81,8 +81,8 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
       LSE_EXPECT(emitted.ok());
       if (!emitted.ok()) return;
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
-      LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], i == 0 ? 48u * parts : 48u);
-      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 512u : (parts * 4u + 15u) / 16u * 16u);
+      LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], i == 0 ? 8u * parts : 48u);
+      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u : (parts * 4u + 15u) / 16u * 16u);
     }
   }
   LSE_EXPECT(find_primitive("attention.decode_shared") == nullptr);
@@ -90,6 +90,11 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
 }
 
 LSE_TEST(decode_attention_admission_uses_actual_resources_and_partial_extent) {
+  Fixture grouped(8192, 1);
+  grouped.gpu.lds_bytes_per_workgroup = 3072;
+  LSE_EXPECT(dispatch::split_decode_supported(grouped.request()));
+  grouped.gpu.lds_bytes_per_workgroup = 3071;
+  LSE_EXPECT(!dispatch::split_decode_supported(grouped.request()));
   Fixture fx(262144, 1);
   auto request = fx.request();
   fx.gpu.max_threads_per_workgroup = 128;
@@ -164,7 +169,7 @@ LSE_TEST(decode_attention_masks_keep_binding_and_launch_abi) {
         LSE_EXPECT(emitted.ok());
         if (!emitted.ok()) return;
         LSE_EXPECT_EQ(emitted->binding_order.size(), stage == 0 ? 6u : 2u);
-        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], stage == 0 ? 48u * 64u : 48u);
+        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], stage == 0 ? 8u * 64u : 48u);
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
         LSE_EXPECT(emitted->source.find("kernel.barrier<workgroup>") != std::string::npos);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
@@ -277,8 +282,8 @@ LSE_TEST(decode_attention_narrow_storage_uses_wave_qk_and_preserves_partial_abi)
       LSE_EXPECT(merge.ok());
       if (!partial.ok() || !merge.ok()) return;
       LSE_EXPECT_EQ(partial->dims.workgroup_size[0], 128u);
-      LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 24u * parts);
-      LSE_EXPECT_EQ(partial->lds_bytes, 512u);
+      LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 4u * parts);
+      LSE_EXPECT_EQ(partial->lds_bytes, 3072u);
       LSE_EXPECT_EQ(partial->binding_order.size(), 6u);
       LSE_EXPECT(partial->source.find("kernel.subgroup.shuffle<xor>") != std::string::npos);
       LSE_EXPECT(partial->source.find("scalar.fmaf") != std::string::npos);

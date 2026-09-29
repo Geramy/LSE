@@ -2,11 +2,34 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 namespace lse::runtime {
 
 namespace {
+
+class SamplingProfile {
+ public:
+  explicit SamplingProfile(std::size_t logits) : logits_(logits) {
+    static const bool enabled = std::getenv("LSE_TIME_STEPS") != nullptr;
+    enabled_ = enabled;
+    if (enabled_) start_ = std::chrono::steady_clock::now();
+  }
+  ~SamplingProfile() {
+    if (!enabled_) return;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start_).count();
+    std::fprintf(stderr, "[sampling-spans] logits=%zu elapsed_ns=%lld\n",
+                 logits_, static_cast<long long>(ns));
+  }
+ private:
+  bool enabled_ = false;
+  std::size_t logits_;
+  std::chrono::steady_clock::time_point start_;
+};
 
 // splitmix64. Self-contained and reproducible across platforms, which
 // std::mt19937 with a distribution is not.
@@ -46,6 +69,7 @@ float Sampler::next_uniform() noexcept {
 
 std::uint32_t Sampler::sample(std::span<float> logits,
                               std::span<const std::uint32_t> history) {
+  const SamplingProfile profile(logits.size());
   if (logits.empty()) return 0;
 
   if (params_.repetition_penalty != 1.0f && !history.empty()) {

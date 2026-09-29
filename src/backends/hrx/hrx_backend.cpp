@@ -2009,12 +2009,24 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
   LSE_SYNC_TRACE("copy_d2h %zu bytes", bytes);
+  static const bool profile_readback = std::getenv("LSE_TIME_STEPS") != nullptr;
+  using Clock = std::chrono::steady_clock;
+  const auto start = profile_readback ? Clock::now() : Clock::time_point{};
   LSE_RETURN_IF_ERROR(synchronize_impl());
+  const auto completed = profile_readback ? Clock::now() : Clock::time_point{};
+  auto report_readback = [&](const char* route) {
+    if (!profile_readback) return;
+    const auto end = Clock::now();
+    std::fprintf(stderr, "[readback-spans] bytes=%zu route=%s wait_ms=%.6f transfer_ms=%.6f\n",
+                 bytes, route, std::chrono::duration<double, std::milli>(completed - start).count(),
+                 std::chrono::duration<double, std::milli>(end - completed).count());
+  };
   // Same choice as copy_h2d, same reason: the runtime's own blocking transfer
   // on a spanning device, the raw single-device machinery otherwise.
   if (const Status dma = dma_host_transfer(dst, src, bytes, src_offset,
                                            /*to_device=*/false);
       dma.ok()) {
+    report_readback("dma");
     return dma;
   }
 
@@ -2037,6 +2049,7 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
     std::memcpy(out + done, staging_host_, n);
     done += n;
   }
+  report_readback("staging");
   return OkStatus();
 #endif
 }
@@ -2140,9 +2153,10 @@ Status HrxBackend::end_decode_sample_impl(std::uint64_t elapsed, bool eligible) 
   const auto prior_warm = state->warm;
   const auto prior_samples = state->samples;
   const auto sampled_interval = flush_interval_;
-  // The result readback already orders the inference dependency chain; drain
-  // every stream before changing a backend-global submission policy as well.
-  const Status retired = synchronize_impl();
+  // Readback completes inference. Retire all streams only when restoring a
+  // different backend-global policy; an unchanged interval needs no extra wait.
+  const bool policy_changed = flush_interval_ != baseline_flush_interval_;
+  const Status retired = policy_changed ? synchronize_impl() : OkStatus();
   submission_sample_ = nullptr;
   flush_interval_ = baseline_flush_interval_;
   if (!retired.ok()) {

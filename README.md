@@ -28,23 +28,28 @@ This version adds typed WMMA attention, cooperative single-token attention, and
 automatic contiguous buffer views. Eligible slices no longer launch copy kernels.
 K/V storage defaults to BF16 for models that declare BF16, and FP16 otherwise.
 
-The measurements below use implementation commit `b0b93ad`, the same server
-binary/runtime, a Q4 target and BF16 KV. Each mode starts with an empty
-private kernel cache; first prefill includes compilation. Sampling uses model
-defaults 1/20/0.95. The first prompt has 5,207 tokens; the identical follow-up has
-5,262 cached tokens and 23 new tokens.
+Single-token split attention now shares K/V loads across six query heads.
+The matched component check reduced BF16 attention time by 49% at 5.2K live
+keys and 53% at 14K. Empty partitions publish neutral records and return early.
+The submission tuner skips its end wait when the policy did not change.
+
+The measurements below use the same Q4 target, BF16 KV, binary/runtime, and
+requests. Each mode starts with an empty private kernel cache. First prefill
+includes compilation. Sampling uses model defaults 1/20/0.95. The first prompt
+has 5,207 tokens; the follow-up has 5,262 cached tokens and 23 new tokens.
 
 | Mode | First prefill, tokens/s | First decode, tokens/s | Follow-up decode, tokens/s |
 | --- | ---: | ---: | ---: |
-| Baseline | 348.69 | 22.55 | 22.93 |
-| MTP=3 | 318.86 | 26.19 | 40.19 |
-| DFlash2 | 333.95 | 26.15 | 38.12 |
+| Baseline | 344.21 | 22.58 | 23.82 |
+| MTP=3 | 313.32 | 24.74 | 40.25 |
+| DFlash2 | 328.65 | 26.40 | 37.53 |
 
-All first responses match. MTP=3 and DFlash2 responses match on both turns;
-baseline's follow-up differs. There are zero host groups/fallbacks. These are
-single observations, with different first/follow-up JIT conditions; they do not
-establish a general throughput guarantee. See the
-[mode comparison and limits](docs/benchmarks/bf16-mode-comparison-2026-09-28.md).
+Baseline follow-up increased from 22.82 to 23.82 tokens/s in the matched check.
+The speculative modes remain near their previous rates. Responses match their
+preceding controls, with zero host groups or fallbacks. These are individual
+workload measurements, not a general throughput guarantee. See the
+[shared-KV decode report](docs/benchmarks/shared-kv-decode-2026-09-28.md) for
+component results, first/follow-up timing limits, and CPU sampling costs.
 
 ## v0.4.11: split decode attention and MTP prompt reuse
 
@@ -396,7 +401,7 @@ Both rates below use tokens per second.
 
 The current baseline, MTP=3 and DFlash2 comparison is shown [above](#current-source-candidate-bf16-mode-comparison).
 It uses one binary and identical requests; its method and quality limits are in the
-[BF16 report](docs/benchmarks/bf16-mode-comparison-2026-09-28.md).
+[shared-KV report](docs/benchmarks/shared-kv-decode-2026-09-28.md).
 
 ### Earlier FP32 Pi chat measurements
 

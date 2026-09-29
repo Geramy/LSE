@@ -34,6 +34,21 @@ inline constexpr std::array kDecodeRules{
     DecodeRule{"gfx1201", 32, 128, 1, 256, 256},
 };
 
+struct DecodeHeadRule {
+  std::uint32_t queries_per_kv, head_tile;
+};
+inline constexpr std::array kDecodeHeadRules{
+    DecodeHeadRule{6, 6},
+};
+
+[[nodiscard]] constexpr std::uint32_t decode_head_tile(std::uint32_t heads,
+                                                      std::uint32_t kvheads) noexcept {
+  if (kvheads == 0 || heads % kvheads != 0) return 1;
+  for (const auto& rule : kDecodeHeadRules)
+    if (heads / kvheads == rule.queries_per_kv) return rule.head_tile;
+  return 1;
+}
+
 struct SplitShortRule {
   std::string_view arch;
   std::uint32_t wave, min_rows, max_rows, threads, head_dim;
