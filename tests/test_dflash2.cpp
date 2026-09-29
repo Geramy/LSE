@@ -1,5 +1,6 @@
 #include "harness.hpp"
 #include "lse/model/dflash2.hpp"
+#include "lse/dispatch/dflash2.hpp"
 #include "lse/model/layer.hpp"
 #include "lse/model/weights.hpp"
 #if defined(LSE_DFLASH2_RUNTIME_TESTS)
@@ -188,7 +189,8 @@ struct Fixture {
   std::unique_ptr<model::HybridLM> target;
   std::unique_ptr<model::DFlash2Module> draft;
   ~Fixture() { std::error_code ec; std::filesystem::remove_all(directory, ec); }
-  Status open(FixtureWeights mode = FixtureWeights::kDefault) {
+  Status open(FixtureWeights mode = FixtureWeights::kDefault,
+              std::uint32_t block_size = 3) {
     // ZeroMixer has no recurrence for the generator to retain.
     if (mode != FixtureWeights::kDefault) config.full_attention_interval = 1;
     static unsigned serial = 0;
@@ -223,7 +225,9 @@ struct Fixture {
       {"layers.0.attention_conv.kernel_projection.weight", {16,8}}, {"layers.0.mlp_conv.base_kernel", {2,2,8}},
       {"layers.0.mlp_conv.kernel_projection.weight", {16,8}}};
     write_weights(directory / "draft" / "model.safetensors", names, mode);
-    std::ofstream(directory / "draft" / "config.json") << config_json().dump();
+    auto draft_config = config_json();
+    draft_config["dflash_config"]["block_size"] = block_size;
+    std::ofstream(directory / "draft" / "config.json") << draft_config.dump();
     LSE_ASSIGN_OR(draft, model::DFlash2Module::open((directory / "draft").string(), config, *target));
     return OkStatus();
   }
@@ -397,6 +401,86 @@ LSE_TEST(dflash2_dynamic_convolution_shares_groups_and_respects_left_boundary) {
         if (tap <= t) expected += (base[tap*4+d] + dynamic[(t*2+tap)*2+d/2]) * x[(t-tap)*4+d];
       LSE_EXPECT(std::fabs(output[t*4+d] - expected) < 1e-5f);
     }
+}
+LSE_TEST(dflash2_output_bucket_keeps_one_prefix_shape_and_full_block_fallback) {
+  for (std::uint32_t proposals = 1; proposals <= 3; ++proposals) {
+    const auto plan = dispatch::dflash2_output_plan(8, proposals);
+    LSE_EXPECT_EQ(plan.head_rows, 4u);
+    LSE_EXPECT_EQ(plan.selector_positions, 3u);
+  }
+  for (std::uint32_t proposals = 4; proposals <= 7; ++proposals) {
+    const auto plan = dispatch::dflash2_output_plan(8, proposals);
+    LSE_EXPECT_EQ(plan.head_rows, 7u);
+    LSE_EXPECT_EQ(plan.selector_positions, 7u);
+  }
+  for (std::uint32_t block = 2; block < 8; ++block)
+    for (std::uint32_t proposals = 1; proposals < block; ++proposals) {
+      const auto plan = dispatch::dflash2_output_plan(block, proposals);
+      LSE_EXPECT_EQ(plan.head_rows, block - 1);
+      LSE_EXPECT_EQ(plan.selector_positions, block - 1);
+    }
+  LSE_EXPECT_EQ(dispatch::dflash2_output_plan(8, 0).head_rows, 0u);
+  LSE_EXPECT_EQ(dispatch::dflash2_output_plan(8, 8).head_rows, 0u);
+  LSE_EXPECT_EQ(dispatch::dflash2_output_plan(0, 1).head_rows, 0u);
+}
+LSE_TEST(dflash2_selector_prefix_depends_only_on_consumed_positions) {
+  constexpr std::uint32_t positions = 7, top = 3, prefix = 3;
+  std::vector<std::uint32_t> candidates(positions * top);
+  std::vector<float> scores(positions * top * top);
+  for (std::size_t i = 0; i < candidates.size(); ++i)
+    candidates[i] = static_cast<std::uint32_t>((i * 7) % 19);
+  for (std::size_t i = 0; i < scores.size(); ++i)
+    scores[i] = static_cast<float>((i * 11) % 5);
+  const auto full = model::dflash2_select_path(scores, candidates, positions, top);
+  LSE_EXPECT(full.ok()); if (!full.ok()) return;
+  const auto take_prefix = [&] {
+    return model::dflash2_select_path(std::span(scores).first(prefix * top * top),
+        std::span(candidates).first(prefix * top), prefix, top);
+  };
+  auto short_path = take_prefix();
+  LSE_EXPECT(short_path.ok()); if (!short_path.ok()) return;
+  const std::vector<std::uint32_t> expected(full->begin(), full->begin() + prefix);
+  LSE_EXPECT(*short_path == expected);
+  // Unconsumed selector positions are not evaluated by the prefix pass.
+  std::fill(scores.begin() + prefix * top * top, scores.end(),
+            std::numeric_limits<float>::quiet_NaN());
+  short_path = take_prefix();
+  LSE_EXPECT(short_path.ok());
+  if (short_path.ok()) LSE_EXPECT(*short_path == expected);
+  LSE_EXPECT(!model::dflash2_select_path(scores, candidates, positions, top).ok());
+  scores[0] = std::numeric_limits<float>::infinity();
+  LSE_EXPECT(!take_prefix().ok());
+}
+LSE_TEST(dflash2_eight_row_body_prefix_matches_full_path_after_wrap_rewind_and_replay) {
+  Fixture fixture;
+  const auto opened = fixture.open(FixtureWeights::kDefault, 8);
+  LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+  std::vector<float> input(16 * 8);
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = std::sin(static_cast<float>(i) * .71f) * .37f;
+  LSE_EXPECT_OK(fixture.draft->append_context(filled({1, 16, 8}, input), 0));
+  const auto verify = [&](std::int32_t position) {
+    for (std::uint32_t anchor = 0; anchor < 4; ++anchor) {
+      auto full = fixture.draft->draft(anchor, position, 7);
+      LSE_EXPECT(full.ok()); if (!full.ok()) return;
+      for (std::uint32_t width : {3u, 1u, 2u, 6u, 4u, 5u, 3u}) {
+        auto prefix_path = fixture.draft->draft(anchor, position, width);
+        LSE_EXPECT(prefix_path.ok()); if (!prefix_path.ok()) return;
+        const std::vector<std::uint32_t> expected(full->begin(), full->begin() + width);
+        LSE_EXPECT(*prefix_path == expected);
+        LSE_EXPECT_EQ(fixture.draft->context_position(), position);
+      }
+    }
+  };
+  verify(16);
+  LSE_EXPECT_OK(fixture.draft->append_context(filled({1, 4, 8}, std::vector<float>(32, .13f)), 16));
+  verify(20);
+  LSE_EXPECT_OK(fixture.draft->rewind(18));
+  verify(18);
+  LSE_EXPECT_OK(fixture.draft->append_context(filled({1, 2, 8}, std::vector<float>(16, -.29f)), 18));
+  verify(20);
+  LSE_EXPECT(!fixture.draft->draft(0, 20, 0).ok());
+  LSE_EXPECT(!fixture.draft->draft(0, 20, 8).ok());
 }
 LSE_TEST(dflash2_context_overwrite_matches_fresh_prefix_and_does_not_alias_features) {
   Fixture fixture;

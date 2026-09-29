@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "lse/dispatch/dflash2.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
@@ -229,7 +230,7 @@ struct DFlash2Module::Impl {
 
   Status load(WeightBinder& binder);
   Result<ContextPass> context_pass(std::int64_t rows);
-  Result<DraftPass> draft_pass(std::uint32_t proposals);
+  Result<DraftPass> draft_pass(std::uint32_t head_rows, std::uint32_t proposals);
   Result<Array> attention(Array x, Layer& layer, const DraftPass& pass);
   std::pair<Array, Array> prepare(Array x, const Conv& conv) const;
 };
@@ -328,9 +329,10 @@ Result<Array> DFlash2Module::Impl::attention(Array x, Layer& l, const DraftPass&
       {static_cast<float>(config.q_heads), static_cast<float>(q.shape().dim(2)), static_cast<float>(config.head_dim), static_cast<float>(partial.shape().dim(2))}));
   return graph::linear(ops::merge_heads(attended), l.o);
 }
-Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint32_t proposals) {
+Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
+    std::uint32_t head_rows, std::uint32_t proposals) {
   DraftPass p;
-  const auto rows = static_cast<std::int64_t>(proposals + 1);
+  const auto rows = static_cast<std::int64_t>(config.block_size);
   LSE_ASSIGN_OR(p.tokens, slot(Shape{1, rows}));
   LSE_ASSIGN_OR(p.anchor, slot(Shape{1, 1}));
   LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
@@ -346,8 +348,13 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(std::uint
     base = graph::reshape(graph::slice(l.mlp_conv.base, 0, 1, 2), Shape{2, config.hidden_size});
     x = graph::add(x, dflash2_convolve(mlp, mlp_after, base, config.conv_group_size));
   }
-  x = norm(graph::slice(x, 1, 1, rows), final_norm, config.rms_eps);
+  x = norm(graph::slice(x, 1, 1, static_cast<std::int64_t>(head_rows) + 1),
+           final_norm, config.rms_eps);
   LSE_ASSIGN_OR(Array logits, target->lm_head(x));
+  if (head_rows != proposals) {
+    x = graph::slice(x, 1, 0, proposals);
+    logits = graph::slice(logits, 1, 0, proposals);
+  }
   Array unary = graph::topk(logits, config.selector_top_k, -1, &p.indices);
   if (!unary.valid() || !p.indices.valid()) return LSE_ERROR(kInternal, "DFlash2 top-k failed");
   const auto rank = static_cast<std::int64_t>(config.selector_rank), top = static_cast<std::int64_t>(config.selector_top_k);
@@ -431,11 +438,11 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, st
       impl_->live <= 0 || proposals == 0 || proposals >= impl_->config.block_size ||
       static_cast<std::int64_t>(first) + proposals >= impl_->max_position)
     return LSE_ERROR(kInvalidArgument, "invalid DFlash2 draft request");
-  const auto full_proposals = impl_->config.block_size - 1;
-  auto it = impl_->drafts.find(full_proposals);
+  const auto output = dispatch::dflash2_output_plan(impl_->config.block_size, proposals);
+  auto it = impl_->drafts.find(output.selector_positions);
   if (it == impl_->drafts.end()) {
-    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(full_proposals));
-    it = impl_->drafts.emplace(full_proposals, std::move(pass)).first;
+    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(output.head_rows, output.selector_positions));
+    it = impl_->drafts.emplace(output.selector_positions, std::move(pass)).first;
   }
   auto& pass = it->second;
   std::vector<float> tokens(impl_->config.block_size, static_cast<float>(impl_->config.mask_token)); tokens[0] = static_cast<float>(anchor);
@@ -445,7 +452,7 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, st
   LSE_RETURN_IF_ERROR(poke(pass.tokens, tokens)); LSE_RETURN_IF_ERROR(poke(pass.anchor, std::span(&anchor_id, 1)));
   LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1))); LSE_RETURN_IF_ERROR(poke(pass.meta, meta));
   LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
-  std::vector<std::uint32_t> path(full_proposals + 1);
+  std::vector<std::uint32_t> path(output.selector_positions + 1);
   LSE_RETURN_IF_ERROR(pass.path.to_host(path.data(), path.size() * sizeof(std::uint32_t)));
   const auto validation = path.back();
   if (validation & 2u) return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
