@@ -10,7 +10,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 49> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 51> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -195,6 +195,22 @@ constexpr std::array<graph::PrimitiveSource, 49> kLoomSources{{
      "$t48 = vector.fptrunc $t47 : vector<4xf32> to vector<4xf8E4M3>\n"
      "$t49 = vector.bitcast $t48 : vector<4xf8E4M3> to vector<1xi32>\n"
      "$r = vector.extract $t49[0] : vector<1xi32> -> i32"},
+    {"value.fp8.dynamic",
+     "$t0 = scalar.constant 8 : i32\n"
+     "$t1 = scalar.muli $1, $t0 : i32\n"
+     "$t2 = scalar.shrui $0, $t1 : i32\n"
+     "$t3 = vector.splat $t2 : vector<1xi32>\n"
+     "$t4 = vector.bitcast $t3 : vector<1xi32> to vector<4xf8E4M3>\n"
+     "$t5 = vector.extract $t4[0] : vector<4xf8E4M3> -> f8E4M3\n"
+     "$r = scalar.extf $t5 : f8E4M3 to f32"},
+    {"value.bf8.dynamic",
+     "$t0 = scalar.constant 8 : i32\n"
+     "$t1 = scalar.muli $1, $t0 : i32\n"
+     "$t2 = scalar.shrui $0, $t1 : i32\n"
+     "$t3 = vector.splat $t2 : vector<1xi32>\n"
+     "$t4 = vector.bitcast $t3 : vector<1xi32> to vector<4xf8E5M2>\n"
+     "$t5 = vector.extract $t4[0] : vector<4xf8E5M2> -> f8E5M2\n"
+     "$r = scalar.extf $t5 : f8E5M2 to f32"},
     {"value.fp8.0",
      "$t0 = vector.splat $0 : vector<1xi32>\n"
      "$t1 = vector.bitcast $t0 : vector<1xi32> to vector<4xf8E4M3>\n"

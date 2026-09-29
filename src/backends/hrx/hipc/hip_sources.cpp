@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 73> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 75> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -162,6 +162,8 @@ constexpr std::array<graph::PrimitiveSource, 73> kHipSources{{
 
     // OCP conversion: finite saturation, RNE; exceptional inputs retain HIP semantics.
     {"pack4.fp8.ocp", "__builtin_amdgcn_cvt_pk_fp8_f32((__builtin_isfinite($2) ? __builtin_amdgcn_fmed3f($2, 448.0f, -448.0f) : $2), (__builtin_isfinite($3) ? __builtin_amdgcn_fmed3f($3, 448.0f, -448.0f) : $3), __builtin_amdgcn_cvt_pk_fp8_f32((__builtin_isfinite($0) ? __builtin_amdgcn_fmed3f($0, 448.0f, -448.0f) : $0), (__builtin_isfinite($1) ? __builtin_amdgcn_fmed3f($1, 448.0f, -448.0f) : $1), 0, false), true)"},
+    {"value.fp8.dynamic", "__builtin_amdgcn_cvt_f32_fp8((unsigned)($0) >> (8u * (unsigned)($1)), 0)"},
+    {"value.bf8.dynamic", "__builtin_amdgcn_cvt_f32_bf8((unsigned)($0) >> (8u * (unsigned)($1)), 0)"},
     {"value.fp8.0", "__builtin_amdgcn_cvt_f32_fp8($0, 0)"},
     {"value.fp8.1", "__builtin_amdgcn_cvt_f32_fp8($0, 1)"},
     {"value.fp8.2", "__builtin_amdgcn_cvt_f32_fp8($0, 2)"},

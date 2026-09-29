@@ -1,5 +1,7 @@
 // Flash selection, typed metadata and aliased input binding without a GPU.
 #include "harness.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/dispatch/cache.hpp"
@@ -235,6 +237,100 @@ LSE_TEST(split_decode_attention_preserves_portable_graph_for_unsupported_request
     LSE_EXPECT(out.node()->prim->name() == "attention");
     LSE_EXPECT(out.node()->kind == OpKind::kAttention);
   }
+}
+
+
+LSE_TEST(flash_wmma_fp16_policy_requires_typed_kv_and_matrix_resources) {
+  using namespace lse;
+  using namespace lse::graph;
+  backend::DeviceInfo device;
+  backend::AmdDeviceInfo amd;
+  device.arch = "gfx1201";
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
+  const auto types = backend::loom_types();
+  const auto intrinsics = backend::loom_sources();
+  std::array<Shape,5> inputs{Shape{1,24,512,256}, Shape{64,4,16,256},
+                             Shape{64,4,16,256}, Shape{kv::step_meta_elems(1)}, Shape{1,32}};
+  std::array<DType,5> dtypes{DType::kF32,DType::kF16,DType::kF16,DType::kF32,DType::kF32};
+  KernelShapes s;
+  s.inputs = inputs; s.input_dtypes = dtypes; s.output = inputs[0];
+  s.device = &device; s.types = types; s.intrinsics = &intrinsics;
+  s.attrs = {0.0625f,1.0f,0,0}; s.iattrs = {1,0,0,16};
+  for (int capacity : {512,1024,2048,4096,8192,16384}) {
+    inputs[4] = Shape{1,capacity/16};
+    for (int rows : {16,17,64,128,256,512}) {
+      inputs[0] = Shape{1,24,rows,256}; s.output = inputs[0];
+      const bool selected = rows >= 64 || (rows == 16 && capacity == 8192);
+      LSE_EXPECT(dispatch::flash_wmma_f16_supported(s) == selected);
+      LSE_EXPECT(dispatch::attention_plan(s) == (selected ? dispatch::AttentionPlan::kFlashWmmaF16 : dispatch::AttentionPlan::kFlash12));
+    }
+  }
+  inputs[0] = Shape{3,24,512,256}; inputs[4] = Shape{3,64}; s.output=inputs[0];
+  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  inputs[0] = Shape{1,24,512,256}; inputs[4] = Shape{1,64}; s.output=inputs[0];
+  dtypes[1] = dtypes[2] = DType::kF32; s.attrs[1] = 0;
+  LSE_EXPECT(dispatch::attention_plan(s) == dispatch::AttentionPlan::kFlash12);
+  dtypes[1] = dtypes[2] = DType::kBF16; s.attrs[1] = 2;
+  LSE_EXPECT(dispatch::attention_plan(s) == dispatch::AttentionPlan::kFlash12);
+  dtypes[1] = dtypes[2] = DType::kF16; s.attrs[1] = 1;
+  device.lds_bytes_per_workgroup = 24767;
+  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  device.lds_bytes_per_workgroup = 24768;
+  LSE_EXPECT(dispatch::flash_wmma_f16_supported(s));
+  device.extension = nullptr;
+  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  device.extension = &amd;
+  inputs[4] = Shape{1,2048};
+  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+  inputs[4] = Shape{1,64}; inputs[0] = Shape{1,24,8,256}; s.output=inputs[0];
+  LSE_EXPECT(!dispatch::flash_wmma_f16_supported(s));
+}
+
+LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
+  using namespace lse;
+  using namespace lse::graph;
+  auto leaf=[](Shape shape,DType dtype=DType::kF32) {
+    auto n=std::make_shared<Node>(); n->shape=shape; n->dtype=dtype; n->materialized=true;
+    return Array(n);
+  };
+  auto output=sdpa_paged(leaf({1,24,512,256}),leaf({64,4,16,256},DType::kF16),
+      leaf({64,4,16,256},DType::kF16),0.0625f,MaskKind::kCausal,0,
+      leaf({kv::step_meta_elems(1)}),leaf({1,32}),16);
+  output.node()->attrs[1]=1;
+  const NodePtr roots[]{output.node()};
+  const auto groups=Partitioner::partition(roots);
+  LSE_EXPECT_EQ(groups.size(),1u);
+  if(groups.size()!=1) return;
+  backend::DeviceInfo device; backend::AmdDeviceInfo amd;
+  device.arch="gfx1201"; backend::apply_arch_defaults(device,amd);
+  device.extension_id=backend::AmdDeviceInfo::kExtensionId; device.extension=&amd;
+  backend::LoomEmitter loom;
+  const auto key=loom.cache_key(groups[0],device);
+  auto emitted=loom.emit(groups[0],device);
+  LSE_EXPECT(emitted.ok());
+  if(emitted.ok()) {
+    LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],768u);
+    LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,24768u);
+    LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
+    LSE_EXPECT(emitted->source.find("vector<8xf16>")!=std::string::npos);
+    LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
+  }
+  auto hip=backend::HipEmitter{}.emit(groups[0],device);
+  LSE_EXPECT(hip.ok());
+  if(hip.ok()) LSE_EXPECT(hip->source.find("__builtin_amdgcn_wmma_f32_16x16x16_f16")!=std::string::npos);
+  device.extension=nullptr;
+  LSE_EXPECT(loom.cache_key(groups[0],device)!=key);
+  auto fallback=loom.emit(groups[0],device);
+  LSE_EXPECT(fallback.ok());
+  if(fallback.ok()) LSE_EXPECT(fallback->source.find("vector.mma")==std::string::npos);
+  device.extension=&amd;
+  LSE_EXPECT_EQ(loom.cache_key(groups[0],device),key);
+  auto restored=loom.emit(groups[0],device);
+  LSE_EXPECT(restored.ok());
+  if(emitted.ok()&&restored.ok()) LSE_EXPECT(restored->source==emitted->source);
 }
 
 LSE_TEST_MAIN()

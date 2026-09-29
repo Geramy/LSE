@@ -18,6 +18,7 @@
 #include "lse/graph/ops.hpp"
 #include "lse/kv/allocator.hpp"
 #include "lse/kv/block.hpp"
+#include "lse/kv/cache_dtype.hpp"
 #include "lse/ops/rope.hpp"
 
 namespace lse::ops {
@@ -49,6 +50,7 @@ struct GatedAttentionSpec {
   // Tokens a sequence may reach. 0 keeps the growing-concat path, used only by
   // tests that build a cache by hand.
   std::int32_t kv_length = 0;
+  kv::CacheDType kv_cache_dtype = kv::CacheDType::kF32;
 };
 
 // g_proj stays invalid under kFusedInQProj.
@@ -69,6 +71,7 @@ struct GatedAttentionWeights {
 // attention layer covers the same positions, so the tables agree layer to layer
 // even though the pools do not.
 struct PagedKvLayer {
+  kv::CacheDType storage = kv::CacheDType::kF32;
   Array keys;
   Array values;
   // [rows, stride] block ids as f32. The stride grows with the pool rung,

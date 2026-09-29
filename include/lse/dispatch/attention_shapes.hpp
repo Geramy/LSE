@@ -23,6 +23,20 @@ inline constexpr std::array kFlashRules{
     FlashRule{{}, 2, kFlashDefaultQueryTile, AttentionPlan::kFlash8, false},
 };
 
+struct FlashWmmaRule {
+  std::string_view arch;
+  std::uint32_t wave, threads, tile_rows, min_rows, max_rows;
+  std::uint32_t max_batch, query_heads, key_heads, head_dim, block;
+  std::uint32_t min_keys, max_keys, lds_bytes;
+  std::int32_t mask, window;
+};
+inline constexpr std::array kFlashWmmaRules{
+    FlashWmmaRule{"gfx1201", 32, 256, 16, 64, 512, 1, 24, 4, 256, 16,
+                  512, 16384, 24768, 1, 0},
+    FlashWmmaRule{"gfx1201", 32, 256, 16, 16, 16, 1, 24, 4, 256, 16,
+                  8192, 8192, 24768, 1, 0},
+};
+
 [[nodiscard]] constexpr bool flash_reuses_keys(std::uint32_t tile_rows) noexcept {
   for (const auto& rule : kFlashRules)
     if (rule.tile_rows == tile_rows) return rule.reuse_keys;

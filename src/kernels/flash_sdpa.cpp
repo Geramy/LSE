@@ -1,3 +1,5 @@
+#include "lse/kernels/kv_storage.hpp"
+#include "lse/kernels/sdpa.hpp"
 // Tiled paged attention shares FP32 scores and carries online softmax state.
 #include <string_view>
 #include <string>
@@ -25,11 +27,11 @@ constexpr std::uint32_t kPrefillQTile = dispatch::attention_shapes::kFlashPrefil
 constexpr std::uint32_t kKWin = dispatch::attention_shapes::kFlashKeyWindow;
 using Dims = dispatch::FlashDims;
 
-template <class E>
+template <class E, kv::CacheDType Storage = kv::CacheDType::kF32>
 struct FlashArgs {
   env::In<kir::f32, E> q;
-  env::In<kir::f32, E> k;
-  env::In<kir::f32, E> v;
+  env::In<KvElement<Storage>, E> k;
+  env::In<KvElement<Storage>, E> v;
   env::In<kir::f32, E> meta;
   env::In<kir::f32, E> table;
   env::Out<kir::f32, E> out;
@@ -48,6 +50,14 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
   bool supports_epilogue() const noexcept override { return false; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.input_dtypes.size() < 3) return {};
+    return with_kv_storage(s.input_dtypes[1], s.attrs[1], [&]<kv::CacheDType Storage>() {
+      return emit_storage<Storage>(s);
+    });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
     const Dims d = dispatch::flash_dimensions(s);
     if (!dispatch::flash_supported(s, QTile) || s.types.scalar == nullptr || s.intrinsics == nullptr ||
         !s.store) {
@@ -60,7 +70,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    FlashArgs<env::Emit> a;
+    FlashArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
@@ -153,7 +163,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
       }
       if (auto live = e.when(j < row_len)) {
         const auto blk =
-            e.let(kir::cast<kir::u32>(a.table[e.let(tb + j / d.ts)]));
+            e.let(kv_block_index<Storage>(a.table[e.let(tb + j / d.ts)]));
         const auto kb0 =
             e.let(((blk * d.kvh + kh) * d.ts + j % d.ts) * d.dh);
         if constexpr (dispatch::attention_shapes::flash_reuses_keys(QTile)) {
@@ -162,7 +172,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
           scores.reserve(QTile);
           for (std::uint32_t r = 0; r < QTile; ++r) scores.push_back(e.var(0.0f));
           for (auto dd : e.range(d.dh)) {
-            const auto kval = e.let(a.k[e.let(kb0 + dd)]);
+            const auto kval = e.let(kv_load<Storage>(e, a.k, e.let(kb0 + dd), d.dh));
             for (std::uint32_t r = 0; r < QTile; ++r) {
               scores[r] = math::fma(qs[e.let(r * d.dh + dd)].read(),
                                     kval, scores[r].read());
@@ -191,7 +201,7 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
             auto score = e.var(0.0f);
             for (auto dd : e.range(d.dh)) {
               score = math::fma(qs[e.let(r * d.dh + dd)].read(),
-                                a.k[e.let(kb0 + dd)], score.read());
+                                kv_load<Storage>(e, a.k, e.let(kb0 + dd), d.dh), score.read());
             }
             const auto sv = e.let(score.read() * d.scale);
             const auto at = e.let(r * kKWin + lid);
@@ -280,19 +290,40 @@ struct FlashSdpaKernel final : KernelPrimitive<FlashSdpaKernel<QTile>> {
         const auto j0 = e.let(wbase + bi * d.ts);
         if (auto held = e.when(j0 < row_len)) {
           const auto blk =
-              e.let(kir::cast<kir::u32>(a.table[e.let(tb + j0 / d.ts)]));
+              e.let(kv_block_index<Storage>(a.table[e.let(tb + j0 / d.ts)]));
           const auto vb0 = e.let(((blk * d.kvh + kh) * d.ts) * d.dv);
-          for (std::uint32_t jj = 0; jj < d.ts; ++jj) {
-            const std::uint32_t slot = bi * d.ts + jj;
-            if (auto live_value = e.when(j0 + jj < row_len)) {
-              for (std::uint32_t p = 0; p < dpt; ++p) {
-                const auto dd = e.let(lid + p * kThreads);
-                if (auto g = e.when(dd < d.dv)) {
-                  const auto vv = e.let(a.v[e.let(vb0 + jj * d.dv + dd)]);
-                  for (std::uint32_t r = 0; r < QTile; ++r) {
-                    o[r * dpt + p] =
-                        math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
-                                  o[r * dpt + p].read());
+          if constexpr (kv::packed_cache(Storage)) {
+            // Keep packed decoding inside a loop to fit native branch offsets.
+            for (auto jj : e.range(d.ts)) {
+              const auto slot = e.let(bi * d.ts + jj);
+              if (auto live_value = e.when(j0 + jj < row_len)) {
+                for (std::uint32_t p = 0; p < dpt; ++p) {
+                  const auto dd = e.let(lid + p * kThreads);
+                  if (auto g = e.when(dd < d.dv)) {
+                    const auto vv = e.let(kv_load<Storage>(
+                        e, a.v, e.let(vb0 + jj * d.dv + dd), d.dv));
+                    for (std::uint32_t r = 0; r < QTile; ++r) {
+                      o[r * dpt + p] = math::fma(
+                          sc[e.let(r * kKWin + slot)].read(), vv,
+                          o[r * dpt + p].read());
+                    }
+                  }
+                }
+              }
+            }
+          } else {
+            for (std::uint32_t jj = 0; jj < d.ts; ++jj) {
+              const std::uint32_t slot = bi * d.ts + jj;
+              if (auto live_value = e.when(j0 + jj < row_len)) {
+                for (std::uint32_t p = 0; p < dpt; ++p) {
+                  const auto dd = e.let(lid + p * kThreads);
+                  if (auto g = e.when(dd < d.dv)) {
+                    const auto vv = e.let(kv_load<Storage>(e, a.v, e.let(vb0 + jj * d.dv + dd), d.dv));
+                    for (std::uint32_t r = 0; r < QTile; ++r) {
+                      o[r * dpt + p] =
+                          math::fma(sc[e.u32(r * kKWin + slot)].read(), vv,
+                                    o[r * dpt + p].read());
+                    }
                   }
                 }
               }
@@ -352,6 +383,7 @@ const FlashSdpaKernel12 kFlash12{};
 
 const KernelPrimitiveBase* flash_sdpa_for(const KernelShapes& s) {
   switch (dispatch::attention_plan(s)) {
+    case dispatch::AttentionPlan::kFlashWmmaF16: return flash_wmma_sdpa_for(s);
     case dispatch::AttentionPlan::kFlash12: return &kFlash12;
     case dispatch::AttentionPlan::kFlash8: return &kFlash8;
     default: return nullptr;

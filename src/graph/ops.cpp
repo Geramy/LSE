@@ -581,12 +581,13 @@ Array split_paged_attention(const NodePtr& baseline, std::string_view partial_na
 Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  MaskKind mask, int window, const Array& meta,
                  const Array& table, int block_size,
-                 const backend::DeviceInfo* device) {
+                 const backend::DeviceInfo* device, kv::CacheDType storage) {
   const Shape& sq = q.shape();
-  Shape out{sq.dim(0), sq.dim(1), sq.dim(2), v.shape().dim(3)};
+  Shape out{sq.dim(0), sq.dim(1), sq.dim(2), kv::logical_width(storage, v.shape().dim(3))};
   auto n = make(OpKind::kAttention, out, q.dtype(),
                 {q.node(), k.node(), v.node(), meta.node(), table.node()});
   n->attrs[0] = scale;
+  n->attrs[1] = static_cast<float>(storage);
   n->iattrs[0] = static_cast<std::int32_t>(mask);
   n->iattrs[1] = window;
   n->iattrs[2] = 0;
@@ -614,10 +615,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
 }
 
 Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
-                    const Array& table, int block_size) {
+                    const Array& table, int block_size, kv::CacheDType storage) {
   auto n = make(OpKind::kKvPageWrite, dst.shape(), dst.dtype(),
                 {dst.node(), src.node(), meta.node(), table.node()});
   n->iattrs[0] = block_size;
+  n->iattrs[1] = static_cast<std::int32_t>(storage);
   n->prim = find_primitive("kv_page_write");
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);

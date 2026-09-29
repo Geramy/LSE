@@ -145,6 +145,7 @@ class GatedAttention final : public IMixer {
     spec_.window = c.sliding_window;
     spec_.norm_eps = c.rms_eps;
     spec_.kv_length = c.kv_capacity();
+    spec_.kv_cache_dtype = c.kv_cache_dtype;
     LSE_ASSIGN_OR(rope_, shared_rope(c));
     return OkStatus();
   }

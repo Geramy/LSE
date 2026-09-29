@@ -65,6 +65,7 @@ struct Options {
   bool list_cache = false;
   bool debug = false;
   std::int32_t kv_len = 0;
+  std::string kv_cache_dtype;
   // Sequences to decode in one engine. 1 keeps the single-session Generator,
   // which is the path every baseline was taken on.
   std::int32_t batch = 1;
@@ -106,6 +107,7 @@ void usage() {
       "      --cache-dir PATH  kernel cache directory (default ~/.lse/cache)\n"
       "      --list-cache       list the models in the HF cache and whether\n"
       "                         this build can load each one, and exit\n"
+      "      --kv-cache-dtype TYPE  fp32 (default), fp16, bf16, fp8, bf8\n"
       "      --kv-len N         allocate the KV cache for N tokens and keep\n"
       "                         that shape (default: max(2*train_seq, 2048))\n"
       "  -b, --batch N          decode N copies of the prompt as one batch,\n"
@@ -245,6 +247,11 @@ bool parse(int argc, char** argv, Options* opt) {
       std::exit(0);
     } else if (a == "--tokenizer") {
       if (!take_value(argc, argv, i, "--tokenizer", &opt->tokenizer_repo)) return false;
+    } else if (a == "--kv-cache-dtype") {
+      if (!take_value(argc, argv, i, "--kv-cache-dtype", &v)) return false;
+      auto parsed = kv::cache_dtype_from_string(v);
+      if (!parsed.ok()) { std::fprintf(stderr, "lse: %s\n", std::string(parsed.status().message()).c_str()); return false; }
+      opt->kv_cache_dtype = v;
     } else if (a == "--kv-len") {
       if (!take_value(argc, argv, i, "--kv-len", &v)) return false;
       opt->kv_len = std::atoi(v.c_str());
@@ -599,6 +606,10 @@ int main(int argc, char** argv) {
   if (!opt.repetition_penalty_set)
     opt.sampling.repetition_penalty = defaults.repetition_penalty;
   if (opt.kv_len > 0) cfg->kv_length = opt.kv_len;
+  if (!opt.kv_cache_dtype.empty())
+    cfg->kv_cache_dtype = kv::cache_dtype_from_string(opt.kv_cache_dtype).release();
+  std::fprintf(stderr, "KV cache: %s; attention accumulation fp32 (target/MTP paged cache)\n",
+               std::string(kv::to_string(cfg->kv_cache_dtype)).c_str());
 
   auto weights = paths->weights.ends_with(".index.json")
                      ? model::SafeTensors::open_sharded(paths->weights)

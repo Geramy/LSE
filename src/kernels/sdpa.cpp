@@ -1,3 +1,4 @@
+#include "lse/kernels/kv_storage.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -24,11 +25,11 @@ constexpr bool is_pow2(std::uint32_t v) noexcept {
 
 }  // namespace
 
-template <class E>
+template <class E, kv::CacheDType Storage = kv::CacheDType::kF32>
 struct SdpaArgs {
   env::In<kir::f32, E> q;
-  env::In<kir::f32, E> k;
-  env::In<kir::f32, E> v;
+  env::In<KvElement<Storage>, E> k;
+  env::In<KvElement<Storage>, E> v;
   // Optional 4th input. Contiguous form: [1], the live cache offset. Paged
   // form: the step descriptor, kv::step_meta_elems(rows) floats — see
   // kv/block.hpp.
@@ -51,6 +52,14 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
   bool owns_indexing() const noexcept override { return true; }
 
   std::string emit_kernel(const KernelShapes &s) const override {
+    if (s.input_dtypes.size() < 3) return {};
+    return with_kv_storage(s.input_dtypes[1], s.attrs[1], [&]<kv::CacheDType Storage>() {
+      return emit_storage<Storage>(s);
+    });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
     if (!dispatch::shared_decode_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
@@ -60,7 +69,7 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
     const auto capacity = stride * block;
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    SdpaArgs<env::Emit> a;
+    SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s))
       return {};
     env::Emit e{&k};
@@ -88,12 +97,12 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
     for (auto j : e.range(lane, kv_len, kThreads)) {
       scores[j] = math::neg_inf();
       if (auto live = e.when(j < row_len)) {
-        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
         const auto kb =
             e.let(((blk * kvheads + kh) * block + j % block) * 256u);
         auto score = e.var(0.0f);
         for (auto dd : e.range(256u))
-          score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
+          score = math::fma(a.q[qb + dd], kv_load<Storage>(e, a.k, kb + dd, 256u), score.read());
         scores[j] = score.read() * s.attrs[0];
       }
     }
@@ -137,7 +146,7 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
     auto denom = e.var(0.0f), acc = e.var(0.0f);
     for (auto bi : e.range(nblk))
       if (auto mine = e.when(bi < row_blk)) {
-        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
+        const auto blk = e.let(kv_block_index<Storage>(a.table[tb + bi]));
         const auto vb = e.let(((blk * kvheads + kh) * block) * 256u + lane);
         for (auto jj : e.range(block)) {
           const auto j = e.let(bi * block + jj);
@@ -150,7 +159,7 @@ struct DecodeSdpaKernel final : KernelPrimitive<DecodeSdpaKernel<SharedExp>> {
                 weight = math::exp(scores[j].read() - maximum.read());
             }
             denom = denom.read() + weight.read();
-            acc = math::fma(weight.read(), a.v[vb + jj * 256u], acc.read());
+            acc = math::fma(weight.read(), kv_load<Storage>(e, a.v, vb + jj * 256u, 256u), acc.read());
           }
         }
       }
@@ -200,6 +209,14 @@ struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.input_dtypes.size() < 3) return {};
+    return with_kv_storage(s.input_dtypes[1], s.attrs[1], [&]<kv::CacheDType Storage>() {
+      return emit_storage<Storage>(s);
+    });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
     if (!dispatch::split_decode_supported(s) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
@@ -210,7 +227,7 @@ struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
     const auto parts = (capacity + kSplitKeys - 1u) / kSplitKeys;
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    SdpaArgs<env::Emit> a;
+    SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto scores = e.lds<kir::f32>(kSplitKeys);
@@ -238,11 +255,11 @@ struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
       const auto j = e.let(begin + lane);
       scores[lane] = math::neg_inf();
       if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
-        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
         const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
         auto score = e.var(0.0f);
         for (auto dd : e.range(256u))
-          score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
+          score = math::fma(a.q[qb + dd], kv_load<Storage>(e, a.k, kb + dd, 256u), score.read());
         scores[lane] = score.read() * s.attrs[0];
       }
     }
@@ -264,10 +281,10 @@ struct SplitDecodePartial final : KernelPrimitive<SplitDecodePartial> {
       const auto j = e.let(begin + jj);
       if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
         const auto weight = e.let(scores[jj].read());
-        const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+        const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
         const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane);
         denom = denom.read() + weight;
-        acc = math::fma(weight, a.v[vb], acc.read());
+        acc = math::fma(weight, kv_load<Storage>(e, a.v, vb, 256u), acc.read());
       }
     }
     e.store(output + 2u + lane, acc.read());
@@ -371,6 +388,14 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.input_dtypes.size() < 3) return {};
+    return with_kv_storage(s.input_dtypes[1], s.attrs[1], [&]<kv::CacheDType Storage>() {
+      return emit_storage<Storage>(s);
+    });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
     if (!(ShortQuery ? dispatch::split_short_supported(s) : dispatch::split_decode_supported(s)) || !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
@@ -382,7 +407,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
     const auto parts = (capacity + kSplitKeys - 1u) / kSplitKeys;
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    SdpaArgs<env::Emit> a;
+    SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto query_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : 1u;
@@ -457,10 +482,10 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
         std::vector<kir::LValue<kir::f32>> row_scores;
         for (std::uint32_t r = 0; r < query_tile; ++r) row_scores.push_back(e.var(0.0f));
         if (auto live = e.when(any_valid(valid))) {
-          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+          const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
           const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
           for (std::uint32_t d = 0; d < 8u; ++d) {
-            const auto key = e.let(a.k[kb + wl + d * 32u]);
+            const auto key = e.let(kv_load<Storage>(e, a.k, kb + wl + d * 32u, 256u));
             for (std::uint32_t r = 0; r < query_tile; ++r)
               row_scores[r] = math::fma(query_values[r * 8u + d].read(), key, row_scores[r].read());
           }
@@ -500,9 +525,9 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
         const auto j = e.let(begin + jj);
         const auto valid = valid_rows(j);
         if (auto live = e.when(any_valid(valid))) {
-          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+          const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
           const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane * 2u);
-          const auto values = e.load(a.v, vb, 8u);
+          const auto values = kv_load_pair<Storage>(e, a.v, vb, 256u);
           for (std::uint32_t r = 0; r < query_tile; ++r) {
             if (auto row_live = e.when(valid[r])) {
               const auto weight = e.let(scores[r * kSplitKeys + jj].read());
@@ -575,10 +600,10 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
           auto score = e.var(0.0f);
           const auto valid = e.let(b < rows && j < kv_len && j < row_len && allowed(j));
           if (auto live = e.when(valid)) {
-            const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+            const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
             const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
             for (std::uint32_t d = 0; d < 8u; ++d)
-              score = math::fma(query_values[d], a.k[kb + wl + d * 32u], score.read());
+              score = math::fma(query_values[d], kv_load<Storage>(e, a.k, kb + wl + d * 32u, 256u), score.read());
           }
           for (std::uint32_t shift = 16u; shift; shift >>= 1u)
             score = score.read() + math::shfl_xor(score.read(), e.u32(shift));
@@ -590,11 +615,11 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
           const auto j = e.let(begin + lane);
           scores[lane] = math::neg_inf();
           if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
-            const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+            const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
             const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
             auto score = e.var(0.0f);
             for (auto dd : e.range(256u))
-              score = math::fma(a.q[qb + dd], a.k[kb + dd], score.read());
+              score = math::fma(a.q[qb + dd], kv_load<Storage>(e, a.k, kb + dd, 256u), score.read());
             scores[lane] = score.read() * s.attrs[0];
           }
         }
@@ -617,10 +642,10 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuer
         const auto j = e.let(begin + jj);
         if (auto live = e.when(b < rows && j < kv_len && j < row_len && allowed(j))) {
           const auto weight = e.let(scores[jj].read());
-          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + j / block]));
+          const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
           const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane * 2u);
           denom = denom.read() + weight;
-          const auto values = e.load(a.v, vb, 8u);
+          const auto values = kv_load_pair<Storage>(e, a.v, vb, 256u);
           acc0 = math::fma(weight, values[0], acc0.read());
           acc1 = math::fma(values[1], weight, acc1.read());
         }
@@ -750,6 +775,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
   const KernelPrimitiveBase* specialize(const KernelShapes& s) const override {
     switch (dispatch::attention_plan(s)) {
       case dispatch::AttentionPlan::kSharedExp: return &kDecodeSharedExp;
+      case dispatch::AttentionPlan::kFlashWmmaF16:
       case dispatch::AttentionPlan::kFlash8:
       case dispatch::AttentionPlan::kFlash12: return flash_sdpa_for(s);
       case dispatch::AttentionPlan::kScalar: return this;
@@ -758,12 +784,21 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.input_dtypes.size() < 3) return {};
+    return with_kv_storage(s.input_dtypes[1], s.attrs[1], [&]<kv::CacheDType Storage>() {
+      return emit_storage<Storage>(s);
+    });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
     if (s.inputs.size() < 3 || s.inputs.size() > 5 ||
         s.types.scalar == nullptr || s.intrinsics == nullptr ||
         s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
         s.inputs[2].rank() != 4) {
       return {};
     }
+    if (s.inputs.size() == 5 && !dispatch::paged_attention_inputs_valid(s)) return {};
     const Shape& q = s.inputs[0];
     const Shape& ksh = s.inputs[1];
     const Shape& vsh = s.inputs[2];
@@ -774,7 +809,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     const auto kvh = static_cast<std::uint32_t>(ksh.dim(1));
     // Contiguous: the allocated sequence length. Paged: the block size.
     const auto ts = static_cast<std::uint32_t>(ksh.dim(2));
-    const auto dv = static_cast<std::uint32_t>(vsh.dim(3));
+    const auto dv = static_cast<std::uint32_t>(kv::logical_width(Storage, vsh.dim(3)));
     if (qh == 0 || kvh == 0 || qh % kvh != 0 || dh == 0 || ts == 0 || dv == 0) {
       return {};
     }
@@ -804,7 +839,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
     }
 
     kir::KernelBody k(s.types, *s.intrinsics);
-    SdpaArgs<env::Emit> a;
+    SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto i = e.thread_id();
@@ -838,7 +873,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
         auto score = e.var(0.0f);
         for (auto dd : e.range(dh)) {
           const auto kb = ((b * kvh + kh) * ts + j) * dh + dd;
-          score = math::fma(a.q[qb0 + dd], a.k[kb], score.read());
+          score = math::fma(a.q[qb0 + dd], kv_load<Storage>(e, a.k, kb, dh), score.read());
         }
         score = score.read() * scale;
         auto take = [&] { m = math::max(m.read(), score.read()); };
@@ -857,7 +892,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
         auto score = e.var(0.0f);
         for (auto dd : e.range(dh)) {
           const auto kb = ((b * kvh + kh) * ts + j) * dh + dd;
-          score = math::fma(a.q[qb0 + dd], a.k[kb], score.read());
+          score = math::fma(a.q[qb0 + dd], kv_load<Storage>(e, a.k, kb, dh), score.read());
         }
         score = score.read() * scale;
         auto w = e.var(0.0f);
@@ -871,7 +906,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
         }
         denom = denom.read() + w.read();
         const auto vb = ((b * kvh + kh) * ts + j) * dv + d;
-        acc = math::fma(w.read(), a.v[vb], acc.read());
+        acc = math::fma(w.read(), kv_load<Storage>(e, a.v, vb, dv), acc.read());
       }
       e.ret(acc.read() /
             select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
@@ -904,7 +939,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
         if (auto mine = e.when(bi < row_blk)) {
           // One table read per block, not per key: the whole reason a block is 16
           // positions wide is that this load amortizes over them.
-          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
+          const auto blk = e.let(kv_block_index<Storage>(a.table[tb + bi]));
           const auto kb0 = e.let(((blk * kvh + kh) * ts) * dh);
           const auto j0 = e.let(bi * e.u32(ts));
           for (auto jj : e.range(ts)) {
@@ -912,7 +947,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
             if (auto live = e.when(j < row_len)) {
               auto score = e.var(0.0f);
               for (auto dd : e.range(dh)) {
-                score = math::fma(a.q[qb0 + dd], a.k[kb0 + jj * dh + dd],
+                score = math::fma(a.q[qb0 + dd], kv_load<Storage>(e, a.k, kb0 + jj * dh + dd, dh),
                                   score.read());
               }
               score = score.read() * scale;
@@ -933,7 +968,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
       auto acc = e.var(0.0f);
       for (auto bi : e.range(nblk)) {
         if (auto mine = e.when(bi < row_blk)) {
-          const auto blk = e.let(kir::cast<kir::u32>(a.table[tb + bi]));
+          const auto blk = e.let(kv_block_index<Storage>(a.table[tb + bi]));
           const auto kb0 = e.let(((blk * kvh + kh) * ts) * dh);
           const auto vb0 = e.let(((blk * kvh + kh) * ts) * dv + d);
           const auto j0 = e.let(bi * e.u32(ts));
@@ -942,7 +977,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
             if (auto live = e.when(j < row_len)) {
               auto score = e.var(0.0f);
               for (auto dd : e.range(dh)) {
-                score = math::fma(a.q[qb0 + dd], a.k[kb0 + jj * dh + dd],
+                score = math::fma(a.q[qb0 + dd], kv_load<Storage>(e, a.k, kb0 + jj * dh + dd, dh),
                                   score.read());
               }
               score = score.read() * scale;
@@ -956,7 +991,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
                 if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
               }
               denom = denom.read() + w.read();
-              acc = math::fma(w.read(), a.v[vb0 + jj * dv], acc.read());
+              acc = math::fma(w.read(), kv_load<Storage>(e, a.v, vb0 + jj * dv, dv), acc.read());
             }
           }
         }
@@ -991,13 +1026,13 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
 };
 LSE_REGISTER_PRIMITIVE(SdpaKernel);
 
-template <class E>
+template <class E, kv::CacheDType Storage = kv::CacheDType::kF32>
 struct KvPageWriteArgs {
-  env::In<kir::f32, E> dst;  // inplace pool; written through the store hook
+  env::In<KvElement<Storage>, E> dst;  // inplace pool; written through the store hook
   env::In<kir::f32, E> src;
   env::In<kir::f32, E> meta;
   env::In<kir::f32, E> table;
-  env::Out<kir::f32, E> out;
+  env::Out<KvElement<Storage>, E> out;
 };
 
 // Write each row to its absolute paged KV position; leave other pool bytes intact.
@@ -1012,6 +1047,33 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
   int inplace_input() const noexcept override { return 0; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
+        s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
+        s.inputs[3].rank() != 2 || s.inputs[0] != s.output ||
+        s.input_dtypes[0] != s.output_dtype || s.input_dtypes[1] != DType::kF32 ||
+        s.input_dtypes[2] != DType::kF32 || s.input_dtypes[3] != DType::kF32)
+      return {};
+    for (const auto& shape : s.inputs) {
+      std::uint64_t count = 1;
+      for (std::size_t axis = 0; axis < shape.rank(); ++axis) {
+        if (shape.dim(axis) <= 0 || static_cast<std::uint64_t>(shape.dim(axis)) > UINT32_MAX / count)
+          return {};
+        count *= static_cast<std::uint64_t>(shape.dim(axis));
+      }
+    }
+    const auto rows = s.inputs[1].dim(0);
+    if (rows > (INT32_MAX - kv::kStepMetaHeader) / kv::kStepMetaPerRow ||
+        s.inputs[3].dim(0) < rows ||
+        s.inputs[3].dim(1) > UINT32_MAX / s.inputs[0].dim(2)) return {};
+    return with_kv_storage(s.input_dtypes[0], static_cast<float>(s.iattrs[1]),
+        [&]<kv::CacheDType Storage>() {
+          if constexpr (kv::packed_cache(Storage)) return emit_packed<Storage>(s);
+          else return emit_storage<Storage>(s);
+        });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
     if (s.inputs.size() != 4 || s.types.scalar == nullptr ||
         s.intrinsics == nullptr || !s.store || s.inputs[0].rank() != 4 ||
         s.inputs[1].rank() != 4 || s.inputs[3].rank() < 2) {
@@ -1021,7 +1083,7 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
     const Shape& src = s.inputs[1];
     const auto kvh = static_cast<std::uint32_t>(dst.dim(1));
     const auto bs = static_cast<std::uint32_t>(dst.dim(2));
-    const auto width = static_cast<std::uint32_t>(dst.dim(3));
+    const auto width = static_cast<std::uint32_t>(kv::logical_width(Storage, dst.dim(3)));
     const auto t = static_cast<std::uint32_t>(src.dim(2));
     const auto stride =
         static_cast<std::uint32_t>(s.inputs[3].dim(s.inputs[3].rank() - 1));
@@ -1042,7 +1104,7 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
 
     kir::KernelBody k(s.types, *s.intrinsics);
     k.set_store(s.store);
-    KvPageWriteArgs<env::Emit> a;
+    KvPageWriteArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
     const auto i = e.thread_id();
@@ -1070,10 +1132,73 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
     const auto pos = e.let(kir::cast<kir::u32>(a.meta[mb]));
     const auto abs = e.let(pos + tt);
     const auto blk =
-        e.let(kir::cast<kir::u32>(a.table[r * stride + abs / bs]));
+        e.let(kv_block_index<Storage>(a.table[r * stride + abs / bs]));
     const auto slot = e.let(abs % bs);
     const auto dest = e.let(((blk * kvh + h) * bs + slot) * width + w);
     e.store(dest, a.src[i]);
+    return k.str();
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_packed(const KernelShapes& s) const {
+    constexpr auto element = Storage == kv::CacheDType::kFP8
+        ? math::MatrixElem::kFp8 : math::MatrixElem::kBf8;
+    if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
+        s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
+        s.inputs[3].rank() != 2 || !s.types.scalar || !s.intrinsics || !s.store ||
+        s.input_dtypes[1] != DType::kF32 || s.input_dtypes[2] != DType::kF32 ||
+        s.input_dtypes[3] != DType::kF32 || s.output_dtype != DType::kU32) return {};
+    const auto heads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+    const auto tokens = static_cast<std::uint32_t>(s.inputs[1].dim(2));
+    const auto width = static_cast<std::uint32_t>(s.inputs[1].dim(3));
+    const auto block = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+    const auto stride = static_cast<std::uint32_t>(s.inputs[3].dim(1));
+    if (!heads || !tokens || !width || width % 4 || !is_pow2(block) || !stride ||
+        s.inputs[0].dim(1) != heads || s.inputs[0].dim(3) != width / 4u + 1u ||
+        s.iattrs[0] != static_cast<std::int32_t>(block) ||
+        s.inputs[2].elem_count() < static_cast<std::size_t>(kv::step_meta_elems(static_cast<std::int32_t>(s.inputs[1].dim(0)))) ||
+        s.intrinsics->find(math::Fp8Format<element>::pack_key).empty() ||
+        s.intrinsics->find("wave.shfl_xor").empty()) return {};
+    const auto wave = s.device ? s.device->wavefront_size : 32u;
+    if ((wave != 32 && wave != 64) || (s.device && s.device->max_threads_per_workgroup < 64)) return {};
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    KvPageWriteArgs<env::Emit, Storage> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto lid = e.let(math::local_id());
+    const auto wg = e.let(math::workgroup_id_x());
+    const auto token = e.let(wg % tokens);
+    const auto head = e.let((wg / tokens) % heads);
+    const auto row = e.let(wg / (tokens * heads));
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
+    (void)e.ret_if(row >= rows);
+    const auto mb = e.let(e.u32(kv::kStepMetaHeader) + row * e.u32(kv::kStepMetaPerRow));
+    (void)e.ret_if(kir::cast<kir::u32>(a.meta[mb + 1u]) == e.u32(0));
+    const auto position = e.let(kir::cast<kir::u32>(a.meta[mb]) + token);
+    (void)e.ret_if(position >= stride * block);
+    const auto physical = e.let(kir::cast<kir::u32>(a.table[row * stride + position / block]));
+    (void)e.ret_if(physical >= static_cast<std::uint32_t>(s.inputs[0].dim(0)));
+    const auto src = e.let(((row * heads + head) * tokens + token) * width);
+    const auto dst = e.let(((physical * heads + head) * block + position % block) * (width / 4u + 1u));
+    auto maximum = e.var(0.0f);
+    for (auto d : e.range(lid, e.u32(width), 64u))
+      maximum = math::max(maximum.read(), math::abs(a.src[src + d]));
+    for (std::uint32_t bit = wave / 2; bit; bit /= 2)
+      maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(bit)));
+    const auto maxima = e.lds<kir::f32>(64u / wave);
+    if (auto first = e.when(lid % wave == 0)) maxima[lid / wave] = maximum.read();
+    e.barrier();
+    auto amax = e.var(0.0f);
+    for (auto w : e.range(64u / wave)) amax = math::max(amax.read(), maxima[w].read());
+    const auto scale = e.let(select(amax.read() > 0.0f && amax.read() < std::numeric_limits<float>::infinity(),
+        math::max(amax.read() / math::Fp8Format<element>::max_finite, e.f32(std::numeric_limits<float>::min())), e.f32(1.0f)));
+    for (auto word : e.range(lid, e.u32(width / 4u), 64u)) {
+      const auto at = e.let(src + word * 4u);
+      a.out[dst + word] = math::pack_fp8<element>(a.src[at] / scale, a.src[at + 1u] / scale,
+                                                a.src[at + 2u] / scale, a.src[at + 3u] / scale);
+    }
+    if (auto first = e.when(lid == 0)) a.out[dst + width / 4u] = math::bits_of<lse::f32>(scale);
     return k.str();
   }
 
@@ -1088,6 +1213,15 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
   }
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
+    if (s.input_dtypes.size() == 4 && kv::packed_cache(kv::cache_dtype(
+            s.input_dtypes[0], static_cast<float>(s.iattrs[1])))) {
+      ThreadPlan tp;
+      tp.workgroup_size[0] = 64;
+      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.inputs[1].elem_count() / static_cast<std::size_t>(s.inputs[1].dim(3)));
+      const auto wave = s.device ? s.device->wavefront_size : 32u;
+      tp.lds_bytes = 64u / wave * sizeof(float);
+      return tp;
+    }
     ThreadPlan tp;
     const std::uint32_t threads =
         dispatch::scalar_threads(s);

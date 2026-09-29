@@ -140,13 +140,26 @@ struct HttpServer::Impl {
 
   // Parses the parts /v1/chat/completions and /v1/completions share.
   Result<Request> parse_common(const json& body, httplib::Response& res) {
+    if (!body.is_object()) {
+      send_error(res, 400, "request must be a JSON object");
+      return LSE_ERROR(kInvalidArgument, "request");
+    }
     Request r;
     r.model = get_or<std::string>(body, "model", opt.model_id);
     r.stream = get_or<bool>(body, "stream", false);
     r.stop_strings = get_stop_strings(body);
-    if (!body.is_object()) {
-      send_error(res, 400, "request must be a JSON object");
-      return LSE_ERROR(kInvalidArgument, "request");
+    if (body.contains("kv_cache_dtype") && !body["kv_cache_dtype"].is_null()) {
+      const auto reject = [&](std::string message) -> Status {
+        send_error(res, 400, message, "invalid_request_error", "kv_cache_dtype");
+        return LSE_ERROR(kInvalidArgument, message);
+      };
+      if (!body["kv_cache_dtype"].is_string())
+        return reject("kv_cache_dtype must be a string");
+      const auto requested =
+          kv::cache_dtype_from_string(body["kv_cache_dtype"].get<std::string>());
+      if (!requested.ok()) return reject(std::string(requested.status().message()));
+      if (*requested != model.config().kv_cache_dtype)
+        return reject("kv_cache_dtype is fixed by the server's --kv-cache-dtype option");
     }
     if (body.contains("stream_options") && body["stream_options"].is_object())
       r.include_usage = get_or<bool>(body["stream_options"], "include_usage", false);

@@ -7,6 +7,8 @@
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kv/block.hpp"
+#include "lse/kv/cache_dtype.hpp"
+#include "lse/kernels/wmma.hpp"
 
 namespace lse::dispatch {
 namespace {
@@ -61,7 +63,11 @@ bool attention_ops(const KernelShapes& s) {
 }
 
 bool paged_inputs(const KernelShapes& s) {
-  if (s.inputs.size() != 5 || !f32_inputs(s, 5) ||
+  if (s.inputs.size() != 5 || s.input_dtypes.size() != 5 ||
+      s.output_dtype != DType::kF32 || s.input_dtypes[0] != DType::kF32 ||
+      s.input_dtypes[3] != DType::kF32 || s.input_dtypes[4] != DType::kF32 ||
+      s.input_dtypes[1] != s.input_dtypes[2] ||
+      !kv::valid_storage(s.input_dtypes[1], s.attrs[1]) ||
       s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
       s.inputs[2].rank() != 4 || s.inputs[4].rank() != 2 ||
       (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0)) return false;
@@ -71,13 +77,22 @@ bool paged_inputs(const KernelShapes& s) {
   const auto& k = s.inputs[1];
   const auto& v = s.inputs[2];
   const auto& table = s.inputs[4];
+  const auto storage = kv::cache_dtype(s.input_dtypes[1], s.attrs[1]);
   if (q.dim(0) > (INT32_MAX - kv::kStepMetaHeader) / kv::kStepMetaPerRow ||
-      q.dim(1) % k.dim(1) || q.dim(3) != k.dim(3) ||
+      q.dim(1) % k.dim(1) || q.dim(3) != kv::logical_width(storage, k.dim(3)) ||
       k.dim(0) != v.dim(0) || k.dim(1) != v.dim(1) || k.dim(2) != v.dim(2) ||
       table.dim(0) < q.dim(0) || !power_of_two(k.dim(2)) ||
       s.iattrs[3] != k.dim(2) || table.dim(1) > UINT32_MAX / k.dim(2) ||
       s.inputs[3].elem_count() < static_cast<std::size_t>(
           kv::step_meta_elems(static_cast<std::int32_t>(q.dim(0))))) return false;
+  if (kv::packed_cache(storage)) {
+    for (const auto* pool : {&k, &v}) {
+      const auto width = kv::logical_width(storage, pool->dim(3));
+      const auto vectors = pool->elem_count() / static_cast<std::size_t>(pool->dim(3));
+      if (width <= 0 || vectors > UINT32_MAX / static_cast<std::uint64_t>(width))
+        return false;
+    }
+  }
   return true;
 }
 
@@ -86,6 +101,8 @@ std::uint64_t flash_lds_bytes(const FlashDims& d, std::uint32_t rows) {
          (d.dh + 2ull * shapes::kFlashKeyWindow + 4) * sizeof(float);
 }
 }  // namespace
+
+bool paged_attention_inputs_valid(const KernelShapes& s) { return paged_inputs(s); }
 
 FlashDims flash_dimensions(const KernelShapes& s) {
   FlashDims d;
@@ -99,7 +116,8 @@ FlashDims flash_dimensions(const KernelShapes& s) {
   d.dh = static_cast<std::uint32_t>(q.dim(3));
   d.kvh = static_cast<std::uint32_t>(k.dim(1));
   d.ts = static_cast<std::uint32_t>(k.dim(2));
-  d.dv = static_cast<std::uint32_t>(s.inputs[2].dim(3));
+  d.dv = static_cast<std::uint32_t>(kv::logical_width(
+      kv::cache_dtype(s.input_dtypes[1], s.attrs[1]), s.inputs[2].dim(3)));
   d.group = d.qh / d.kvh;
   d.stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
   d.scale = s.attrs[0];
@@ -116,6 +134,40 @@ bool flash_supported(const KernelShapes& s, std::uint32_t query_rows) {
   for (const auto& rule : shapes::kFlashRules)
     if (query_rows == rule.tile_rows)
       return flash_lds_bytes(d, query_rows) <= backend::workgroup_lds_bytes(s.device);
+  return false;
+}
+
+bool flash_wmma_f16_supported(const KernelShapes& s) {
+  const auto d = flash_dimensions(s);
+  if (!d.valid || !s.device || !s.intrinsics || !s.types.scalar ||
+      !attention_ops(s) || !has_ops(s, {"wave.shfl_xor"}) ||
+      s.input_dtypes[1] != DType::kF16 || s.input_dtypes[2] != DType::kF16 ||
+      kv::cache_dtype(s.input_dtypes[1], s.attrs[1]) != kv::CacheDType::kF16 ||
+      s.output != Shape{d.bsz, d.qh, d.tq, d.dv} ||
+      !std::isfinite(d.scale) || d.scale <= 0.0f ||
+      !s.staged.name.empty() || !s.staged_quant.codes.empty()) return false;
+  const auto capacity = static_cast<std::uint64_t>(d.stride) * d.ts;
+  bool geometry = false;
+  for (const auto& rule : shapes::kFlashWmmaRules)
+    if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+        s.device->max_threads_per_workgroup >= rule.threads &&
+        d.bsz <= rule.max_batch && d.qh == rule.query_heads && d.kvh == rule.key_heads &&
+        d.tq >= rule.min_rows && d.tq <= rule.max_rows &&
+        d.dh == rule.head_dim && d.dv == rule.head_dim && d.ts == rule.block &&
+        capacity >= rule.min_keys && capacity <= rule.max_keys && power_of_two(static_cast<std::int64_t>(capacity)) &&
+        d.mask == rule.mask && d.window == static_cast<std::uint32_t>(rule.window) &&
+        backend::workgroup_lds_bytes(s.device) >= rule.lds_bytes &&
+        backend::max_load_bytes(*s.device) >= 16) geometry = true;
+  if (!geometry) return false;
+  const auto target = kernels::matrix_target(*s.device);
+  if (!target) return false;
+  const auto caps = kernels::device_matrix_caps(*s.device);
+  for (const auto& row : math::matrix_core_table())
+    if (row.target == *target && row.wave == s.device->wavefront_size &&
+        row.acc == math::MatrixElem::kF32 && row.operand == math::MatrixElem::kF16 &&
+        row.m == 16 && row.n == 16 && row.k_step == 16 && row.chained == 1 &&
+        row.a_len == 8 && row.b_len == 8 && row.c_len == 8 && row.emittable() &&
+        math::has_cap(caps, row.cap) && !s.intrinsics->find(row.key).empty()) return true;
   return false;
 }
 
@@ -217,6 +269,7 @@ bool split_short_merge_supported(const KernelShapes& s) {
 
 AttentionPlan attention_plan(const KernelShapes& s) {
   if (shared_decode_supported(s)) return AttentionPlan::kSharedExp;
+  if (flash_wmma_f16_supported(s)) return AttentionPlan::kFlashWmmaF16;
   const auto d = flash_dimensions(s);
   if (!d.valid || !s.device || s.device->max_threads_per_workgroup < shapes::kFlashThreads ||
       !attention_ops(s)) return AttentionPlan::kScalar;

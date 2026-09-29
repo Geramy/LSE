@@ -743,8 +743,7 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     }
     if (!stored) {
       if (gdn_pair || group.nodes.size() != 1 || group.outputs.size() != 1 ||
-          sink != anchor || self_indexed->supports_epilogue() ||
-          self_indexed->inplace_input() >= 0)
+          sink != anchor || self_indexed->supports_epilogue())
         return LSE_ERROR(kInternal, "primitive '",
                          std::string(self_indexed->name()),
                          "' owns its indexing but never stored through the hook");

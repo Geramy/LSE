@@ -9,4 +9,7 @@ namespace lse::kernels {
 [[nodiscard]] const graph::KernelPrimitiveBase* flash_sdpa_for(
     const graph::KernelShapes& s);
 
+[[nodiscard]] const graph::KernelPrimitiveBase* flash_wmma_sdpa_for(
+    const graph::KernelShapes& s);
+
 }  // namespace lse::kernels

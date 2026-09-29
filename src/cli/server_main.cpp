@@ -52,6 +52,7 @@ void usage() {
       "                       multi-token-prediction module\n"
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
+      "      --kv-cache-dtype TYPE  fp32 (default), fp16, bf16, fp8, bf8\n"
       "      --kv-len N       allocate the KV cache for N tokens\n"
       "      --cache-dir PATH kernel cache directory (default ~/.lse/cache)\n"
       "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
@@ -83,6 +84,7 @@ int main(int argc, char** argv) {
   std::string dialect;
   std::string cache_dir;
   std::int32_t kv_len = 0;
+  std::string kv_cache_dtype;
   int shutdown_grace_seconds = 30;
 
   for (int i = 1; i < argc; ++i) {
@@ -135,6 +137,11 @@ int main(int argc, char** argv) {
     else if (a == "--dflash2-model") dflash2_model = value("--dflash2-model");
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
+    else if (a == "--kv-cache-dtype") {
+      kv_cache_dtype = value("--kv-cache-dtype");
+      const auto parsed = kv::cache_dtype_from_string(kv_cache_dtype);
+      if (!parsed.ok()) { std::fprintf(stderr, "lse-server: %s\n", std::string(parsed.status().message()).c_str()); return 2; }
+    }
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
     else if (a == "--cache-dir" || a.starts_with("--cache-dir=")) {
       cache_dir = a == "--cache-dir" ? value("--cache-dir") : a.substr(12);
@@ -224,6 +231,10 @@ int main(int argc, char** argv) {
                cfg->sampling_defaults.top_k,
                static_cast<double>(cfg->sampling_defaults.top_p));
   if (kv_len > 0) cfg->kv_length = kv_len;
+  if (!kv_cache_dtype.empty())
+    cfg->kv_cache_dtype = kv::cache_dtype_from_string(kv_cache_dtype).release();
+  std::fprintf(stderr, "KV cache: %s; attention accumulation fp32 (target/MTP paged cache)\n",
+               std::string(kv::to_string(cfg->kv_cache_dtype)).c_str());
 
   auto weights = paths->weights.ends_with(".index.json")
                      ? model::SafeTensors::open_sharded(paths->weights)

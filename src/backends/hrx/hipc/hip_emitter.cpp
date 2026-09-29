@@ -1184,13 +1184,17 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
       std::vector<DType> in_dtypes;
       const KernelShapes shapes = shapes_for(n, in_shapes, in_dtypes);
 
+      const std::string helper_body = kp->emit_kernel(shapes);
+      if (helper_body.empty())
+        return LSE_ERROR(kUnimplemented, "primitive '", std::string(kp->name()),
+                         "' declined to emit its device helper");
       preamble << "__device__ float " << fn
                << "(unsigned int i";
       for (std::size_t a = 0; a < n->inputs.size(); ++a) {
         preamble << ", const " << device_scalar(n->inputs[a]->dtype)
                  << "* __restrict__ in" << a;
       }
-      preamble << ") {\n" << kp->emit_kernel(shapes) << "\n}\n\n";
+      preamble << ") {\n" << helper_body << "\n}\n\n";
     }
   }
 
@@ -1307,8 +1311,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
     // on the floor and produce quietly wrong results, so require the hook.
     if (!stored) {
       if (!cap.has() || group.nodes.size() != 1 || group.outputs.size() != 1 ||
-          sink != anchor || self_indexed->supports_epilogue() ||
-          self_indexed->inplace_input() >= 0)
+          sink != anchor || self_indexed->supports_epilogue())
         return LSE_ERROR(kInternal, "primitive '",
                          std::string(self_indexed->name()),
                          "' owns its indexing but never stored through the hook");

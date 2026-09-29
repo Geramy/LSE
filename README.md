@@ -22,6 +22,18 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
+## Current source: optional KV formats
+
+Use `--kv-cache-dtype fp16` to select FP16 KV storage. Other values are `fp32`,
+`bf16`, `fp8` and `bf8`. FP32 remains the default. The setting applies to target
+and MTP paged caches; DFlash2 retains its private FP32 ring.
+
+FP16 halves paged KV storage. On admitted gfx1201 shapes, it also selects matrix
+attention with FP32 accumulation. One matched 1,024-token check measured
+perplexity **4.9049 with FP32** and **4.9014 with FP16 plus matrix attention**.
+BF16 and the 8-bit formats have component validation; this model comparison
+covers FP16. See [KV cache formats](docs/KV_CACHE.md).
+
 ## v0.4.9: chat sampling and prompt reuse
 
 The CLI and server load each model's supported settings from `generation_config.json`.
@@ -314,7 +326,26 @@ A changed prefix requires new prefill. MTP requests currently start with fresh m
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
-### Current long-context result
+### Current Pi chat measurements
+
+The same two-turn Pi workload used Qwen3.8-27B Q4, Q8 DFlash2 with three proposals,
+temperature 1, top-k 20 and top-p 0.95. Each process started with an empty disk
+kernel cache. The first prompt contained 5,207 tokens. The second reused the
+conversation prefix and added 23 tokens.
+
+| KV and attention | First prefill tokens/s, including compilation | First decode tokens/s | Follow-up decode tokens/s |
+| --- | ---: | ---: | ---: |
+| FP32 baseline | 56.89 | 26.64 | 31.34 |
+| Optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
+
+Total compilation fell from 92.91 to 15.91 seconds. Follow-up prefill fell from
+16.14 to 0.742 seconds. Both generated different text; follow-up proposal
+acceptance was 68% for FP32 and 59% for FP16. These runs establish a cold-start
+improvement, with lower observed decode rates on the FP16 responses. They do
+not establish a decode speedup. FP32 remains the default.
+See the [KV and attention report](docs/benchmarks/kv-storage-attention-2026-09-28.md).
+
+### Earlier 14K synthetic result
 
 The v0.4.8 source reached these rates on an R9700 (`gfx1201`) with Qwen3.8-27B Q4 and a Q8 DFlash2 draft.
 

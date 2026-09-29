@@ -106,4 +106,13 @@ template <MatrixElem Element, unsigned Byte>
   return detail::invoke<lse::f32>(Fp8Format<Element>::value_keys[Byte], packed);
 }
 
+template <MatrixElem Element>
+[[nodiscard]] inline Val<lse::f32> unpack_fp8(
+    const Val<ir::u32>& packed, const Val<ir::i32>& byte) {
+  static_assert(Element == MatrixElem::kFp8 || Element == MatrixElem::kBf8);
+  return detail::invoke<lse::f32>(
+      Element == MatrixElem::kFp8 ? "value.fp8.dynamic" : "value.bf8.dynamic",
+      packed, byte);
+}
+
 }  // namespace lse::math

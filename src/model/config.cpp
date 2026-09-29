@@ -243,6 +243,12 @@ Result<Config> Config::from_json_string(const std::string& text) {
 
   read(j, "train_seq_len", c.train_seq_len);
   read(j, "kv_length", c.kv_length);
+  if (j.contains("kv_cache_dtype")) {
+    if (!j["kv_cache_dtype"].is_string())
+      return LSE_ERROR(kInvalidArgument, "kv_cache_dtype must be a string");
+    LSE_ASSIGN_OR(c.kv_cache_dtype,
+                  kv::cache_dtype_from_string(j["kv_cache_dtype"].get<std::string>()));
+  }
   read(j, "rms_eps", c.rms_eps);
   read(j, "dtype", c.dtype);
   read(j, "grad_checkpoint_segment", c.grad_checkpoint_segment);
@@ -301,6 +307,7 @@ std::string Config::to_json() const {
   j["mod_aux_loss_coef"] = mod_aux_loss_coef;
   j["train_seq_len"] = train_seq_len;
   j["kv_length"] = kv_length;
+  j["kv_cache_dtype"] = kv::to_string(kv_cache_dtype);
   j["rms_eps"] = rms_eps;
   j["dtype"] = dtype;
   j["grad_checkpoint_segment"] = grad_checkpoint_segment;

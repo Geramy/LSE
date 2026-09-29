@@ -1,3 +1,4 @@
+#include "lse/kv/cache_codec.hpp"
 #include "lse/graph/interpreter.hpp"
 
 #include <algorithm>
@@ -924,6 +925,15 @@ Status eval_rope(Node& n) {
 // width] at absolute position meta[0], following the block table. Aliases the
 // pool and touches only the positions it covers, exactly as overwrite_slice
 // does for a contiguous cache.
+float load_kv_element(const Node& node, kv::CacheDType format,
+                      std::size_t logical_index, std::size_t width) {
+  if (!kv::packed_cache(format)) return load_element(node, logical_index);
+  const auto* words = static_cast<const std::uint32_t*>(host_bytes(node));
+  const auto row = logical_index / width;
+  return kv::unpack_cache_element(format, words + row * (width / 4 + 1),
+                                  width, logical_index % width);
+}
+
 Status eval_kv_page_write(Node& n) {
   if (n.inputs.size() != 4) {
     return LSE_ERROR(kInvalidArgument, "kv_page_write takes 4 inputs");
@@ -938,7 +948,11 @@ Status eval_kv_page_write(Node& n) {
   }
   const auto bs = static_cast<std::size_t>(dst.shape.dim(2));
   const auto kvh = static_cast<std::size_t>(dst.shape.dim(1));
-  const auto width = static_cast<std::size_t>(dst.shape.dim(3));
+  const auto format = kv::cache_dtype(dst.dtype, static_cast<float>(n.iattrs[1]));
+  if (!kv::valid_storage(dst.dtype, static_cast<float>(n.iattrs[1])) || src.dtype != DType::kF32)
+    return LSE_ERROR(kInvalidArgument, "invalid paged KV storage format");
+  const auto pitch = static_cast<std::size_t>(dst.shape.dim(3));
+  const auto width = static_cast<std::size_t>(kv::logical_width(format, dst.shape.dim(3)));
   const auto pool_blocks = static_cast<std::size_t>(dst.shape.dim(0));
   const auto batch = static_cast<std::size_t>(src.shape.dim(0));
   const auto t = static_cast<std::size_t>(src.shape.dim(2));
@@ -949,7 +963,6 @@ Status eval_kv_page_write(Node& n) {
   }
   const auto stride =
       static_cast<std::size_t>(table.shape.dim(table.shape.rank() - 1));
-  const auto rows = static_cast<std::size_t>(load_element(meta, 2));
   if (meta.element_count() <
       static_cast<std::size_t>(
           kv::step_meta_elems(static_cast<std::int32_t>(batch)))) {
@@ -958,14 +971,15 @@ Status eval_kv_page_write(Node& n) {
                      std::to_string(batch), " rows");
   }
 
+  const auto rows = static_cast<std::size_t>(load_element(meta, 2));
+
   const bool aliased =
       n.buffer.ptr != nullptr && dst.buffer.valid() &&
       n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr &&
       n.buffer.offset == dst.buffer.offset;
   if (!aliased) {
-    for (std::size_t i = 0; i < n.element_count(); ++i) {
-      store_element(n, i, load_element(dst, i));
-    }
+    const auto bytes = dtype_storage_bytes(dst.dtype, dst.element_count());
+    std::memcpy(host_bytes(n), host_bytes(dst), bytes);
   }
   for (std::size_t r = 0; r < batch && r < rows; ++r) {
     const std::size_t mb = static_cast<std::size_t>(kv::kStepMetaHeader) +
@@ -991,10 +1005,17 @@ Status eval_kv_page_write(Node& n) {
       }
       for (std::size_t h = 0; h < kvh; ++h) {
         const std::size_t di =
-            ((blk * kvh + h) * bs + (abs % bs)) * width;
+            ((blk * kvh + h) * bs + (abs % bs)) * pitch;
         const std::size_t si = ((r * kvh + h) * t + j) * width;
-        for (std::size_t w = 0; w < width; ++w) {
-          store_element(n, di + w, load_element(src, si + w));
+        if (kv::packed_cache(format)) {
+          std::vector<float> values(width);
+          for (std::size_t w = 0; w < width; ++w) values[w] = load_element(src, si + w);
+          auto* words = static_cast<std::uint32_t*>(host_bytes(n)) + di;
+          if (format == kv::CacheDType::kFP8)
+            kv::pack_cache_vector<math::MatrixElem::kFp8>(values, {words, pitch});
+          else kv::pack_cache_vector<math::MatrixElem::kBf8>(values, {words, pitch});
+        } else {
+          for (std::size_t w = 0; w < width; ++w) store_element(n, di + w, load_element(src, si + w));
         }
       }
     }
@@ -1057,7 +1078,10 @@ Status eval_sdpa(Node& n) {
   const auto dh = static_cast<std::size_t>(q.shape.dim(3));
   const auto kvh = static_cast<std::size_t>(k.shape.dim(1));
   const auto ts = static_cast<std::size_t>(k.shape.dim(2));
-  const auto dv = static_cast<std::size_t>(v.shape.dim(3));
+  const auto format = kv::cache_dtype(k.dtype, n.attrs[1]);
+  if (!kv::valid_storage(k.dtype, n.attrs[1]) || v.dtype != k.dtype)
+    return LSE_ERROR(kInvalidArgument, "invalid attention KV storage format");
+  const auto dv = static_cast<std::size_t>(kv::logical_width(format, v.shape.dim(3)));
 
   const float scale = n.attrs[0];
   const auto mask = static_cast<int>(n.iattrs[0]);
@@ -1137,7 +1161,7 @@ Status eval_sdpa(Node& n) {
           double acc = 0.0;
           for (std::size_t d = 0; d < dh; ++d) {
             acc += static_cast<double>(load_element(q, qbase + d)) *
-                   static_cast<double>(load_element(k, kbase + d));
+                   static_cast<double>(load_kv_element(k, format, kbase + d, dh));
           }
           logits[j] = static_cast<float>(acc) * scale;
           m = logits[j] > m ? logits[j] : m;
@@ -1162,7 +1186,7 @@ Status eval_sdpa(Node& n) {
           for (std::size_t j = 0; j < used; ++j) {
             if (logits[j] == 0.0f) continue;
             acc += static_cast<double>(logits[j]) *
-                   static_cast<double>(load_element(v, kv_base(b, kh, j, dv) + d));
+                   static_cast<double>(load_kv_element(v, format, kv_base(b, kh, j, dv) + d, dv));
           }
           store_element(n, obase + d, static_cast<float>(acc / denom));
         }

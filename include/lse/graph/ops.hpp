@@ -1,6 +1,8 @@
 // Op builders. Each records a node and returns immediately.
 #pragma once
 
+#include "lse/kv/cache_dtype.hpp"
+
 #include <array>
 #include <string_view>
 #include <vector>
@@ -169,13 +171,15 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  MaskKind mask, int window, const Array& meta,
                  const Array& table, int block_size,
-                 const backend::DeviceInfo* device = nullptr);
+                 const backend::DeviceInfo* device = nullptr,
+                 kv::CacheDType storage = kv::CacheDType::kF32);
 
 // Writes `src` [rows, Hkv, T, Dh] into the pool `dst` [blocks, Hkv,
 // block_size, Dh] at absolute position meta[0], following `table`. Returns the
 // pool: the write aliases it and touches only the positions it covers.
 Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
-                    const Array& table, int block_size);
+                    const Array& table, int block_size,
+                    kv::CacheDType storage = kv::CacheDType::kF32);
 
 // Records a node for a registered primitive. Returns an invalid Array if the
 // name is unknown or the arity/shapes do not match.

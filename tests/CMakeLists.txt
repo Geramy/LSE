@@ -72,6 +72,10 @@ target_sources(test_loom_words PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_loom_flash lse_graph lse_kernels lse_ir)
 target_sources(test_loom_flash PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+  ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
@@ -477,4 +481,21 @@ if(NOT TARGET lse_backend_hrx)
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+endif()
+
+if(LSE_ENABLE_CPU)
+  lse_add_test(test_kv_cache lse_model lse_ops lse_graph lse_kernels lse_backends lse_ir)
+  set_tests_properties(test_kv_cache PROPERTIES
+    ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
+  if(NOT TARGET lse_backend_hrx)
+    target_sources(test_kv_cache PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_emitter.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/phase_emit.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_sources.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/hipc/hip_types.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+      ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+  endif()
 endif()

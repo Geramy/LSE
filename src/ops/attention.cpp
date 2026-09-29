@@ -187,7 +187,12 @@ std::int32_t pool_ceiling(const PagedKvLayer& layer, std::int32_t rows,
 // row can hold what it is about to have written.
 Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
                     std::int32_t capacity, std::int64_t kvh, std::int64_t hd,
-                    DType dtype) {
+                    kv::CacheDType format) {
+  const auto dtype = kv::storage_dtype(format);
+  const auto pitch = kv::storage_width(format, hd);
+  if (pitch <= 0) return LSE_ERROR(kInvalidArgument, "FP8 KV head width must be a positive multiple of four");
+  if (layer.valid() && layer.storage != format)
+    return LSE_ERROR(kInvalidArgument, "cannot change a live KV pool format");
   if (rows <= 0) {
     return LSE_ERROR(kInvalidArgument, "paged KV needs at least one row");
   }
@@ -228,7 +233,7 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
     layer.table_dirty = true;
   }
 
-  const Shape pool{want_blocks, kvh, kv::kBlockSize, hd};
+  const Shape pool{want_blocks, kvh, kv::kBlockSize, pitch};
   const bool resize = !layer.keys.valid() ||
                       layer.keys.shape().dim(0) != want_blocks;
   if (resize && layer.keys.valid()) {
@@ -247,6 +252,7 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
     LSE_ASSIGN_OR(layer.keys, regrow_pool(layer.keys, pool, dtype));
     LSE_ASSIGN_OR(layer.values, regrow_pool(layer.values, pool, dtype));
     LSE_RETURN_IF_ERROR(layer.alloc.grow(want_blocks));
+    layer.storage = format;
   }
   if (!layer.table.valid() || layer.stride() != stride ||
       layer.table.shape().dim(0) != rows) {
@@ -358,14 +364,14 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
       const auto t = static_cast<std::int32_t>(ks.dim(2));
       LSE_RETURN_IF_ERROR(ensure_paged(
           *cache->paged, rows, cache->used + t,
-          static_cast<std::int32_t>(cache->capacity), kvh, hd, k.dtype()));
+          static_cast<std::int32_t>(cache->capacity), kvh, hd, spec.kv_cache_dtype));
       cache->keys = cache->paged->keys;
       cache->values = cache->paged->values;
       cache->table = cache->paged->table;
       k_attn = graph::kv_page_write(cache->keys, k, cache->meta, cache->table,
-                                    kv::kBlockSize);
+                                    kv::kBlockSize, spec.kv_cache_dtype);
       v_attn = graph::kv_page_write(cache->values, v, cache->meta, cache->table,
-                                    kv::kBlockSize);
+                                    kv::kBlockSize, spec.kv_cache_dtype);
     } else {
       if (cache->keys.valid()) {
         k_attn = graph::concat({cache->keys, k}, 2);
@@ -389,7 +395,7 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
   Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale, spec.mask,
                                       spec.window, cache->meta, cache->table,
-                                      kv::kBlockSize, split_device)
+                                      kv::kBlockSize, split_device, spec.kv_cache_dtype)
                   : graph::sdpa(q, k_attn, v_attn, scale, spec.mask, spec.window,
                                 offset);
 

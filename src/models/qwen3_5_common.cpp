@@ -211,6 +211,7 @@ class Qwen35Attention final : public IMixer {
       sp.norm_eps = c.rms_eps;
       sp.zero_centered_norm = false;
       sp.kv_length = c.kv_capacity();
+      sp.kv_cache_dtype = c.kv_cache_dtype;
     }
     rope_.resize(spec_.size());
     for (std::size_t m = 0; m < spec_.size(); ++m) {
