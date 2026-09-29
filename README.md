@@ -380,7 +380,7 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
-### v0.4.17: combined M8 gate/up
+### Combined M8 gate/up (v0.4.16 measurements)
 
 Same executable, 1024-token coding prompts, 384 generated tokens, temperature 0.6,
 top-k 20, top-p 0.95, BF16 KV and batch/ubatch 1024. Each mode starts with an empty
