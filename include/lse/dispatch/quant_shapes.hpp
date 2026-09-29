@@ -17,9 +17,9 @@ struct QuantMatrixShape {
   std::uint32_t lds, threads;
 };
 inline constexpr std::array kQuantMatrixShapes{
-    QuantMatrixShape{"gfx1201", 32, 4, 64, 16, 512, 17408, 5120,
+    QuantMatrixShape{"gfx1201", 32, 4, 64, 16, 4096, 17408, 5120,
                      QuantMatrix::kInt8Lds, kQ4MatrixLdsBytes, 256},
-    QuantMatrixShape{"gfx1201", 32, 4, 64, 16, 512, 5120, 17408,
+    QuantMatrixShape{"gfx1201", 32, 4, 64, 16, 4096, 5120, 17408,
                      QuantMatrix::kInt8Lds, kQ4MatrixLdsBytes, 256},
     QuantMatrixShape{"gfx1201", 32, 6, 64, 512, 512, 17408, 5120,
                      QuantMatrix::kBF16, 16384, 128},
@@ -93,9 +93,9 @@ inline constexpr std::array kQ4PanelShapes{
     Q4PanelShape{6, 10240, 5120, 8}, Q4PanelShape{6, 6144, 5120, 8},
     Q4PanelShape{6, 12288, 5120, 8}, Q4PanelShape{6, 5120, 6144, 8},
     Q4PanelShape{6, 248320, 5120, 8},
-    Q4PanelShape{8, 17408, 5120, 8}, Q4PanelShape{8, 5120, 17408, 8},
-    Q4PanelShape{8, 10240, 5120, 8}, Q4PanelShape{8, 6144, 5120, 8},
-    Q4PanelShape{8, 12288, 5120, 8}, Q4PanelShape{8, 5120, 6144, 8},
+    Q4PanelShape{8, 17408, 5120, 8, 2}, Q4PanelShape{8, 5120, 17408, 8, 2},
+    Q4PanelShape{8, 10240, 5120, 8, 2}, Q4PanelShape{8, 6144, 5120, 8, 2},
+    Q4PanelShape{8, 12288, 5120, 8}, Q4PanelShape{8, 5120, 6144, 8, 2},
     Q4PanelShape{8, 248320, 5120, 8},
 };
 

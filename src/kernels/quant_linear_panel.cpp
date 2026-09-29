@@ -221,10 +221,10 @@ std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule,
 template <std::uint32_t Rows>
 struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
   static constexpr std::string_view kName =
-      Rows == 8 ? "quant_linear.q4_global_panel.rows8.v1"
+      Rows == 8 ? "quant_linear.q4_global_panel.rows8.v2"
                 : "quant_linear.q4_global_panel.v1";
   static constexpr std::string_view kEntry =
-      Rows == 8 ? "lse_quant_linear_q4_global_panel_rows8_v1"
+      Rows == 8 ? "lse_quant_linear_q4_global_panel_rows8_v2"
                 : "lse_quant_linear_q4_global_panel_v1";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 5; }

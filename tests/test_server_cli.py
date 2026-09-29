@@ -44,6 +44,19 @@ for value in ('fp32', 'fp16', 'bf16', 'fp8', 'bf8'):
 for value in ('int8', '', 'invalid'):
     cases.append((['--kv-cache-dtype', value], 2, 'KV cache dtype must be'))
 cases.append((['--kv-cache-dtype'], 2, '--kv-cache-dtype needs a value'))
+for flag in ('--batch-size', '--ubatch-size'):
+    for value in ('128', '512', '1024', '2048', '4096'):
+        cases.append((['--batch-size', '4096', flag, value, '--help'], 0, '--ubatch-size N'))
+    for value in ('0', '-1', '1023', '8192', '1.5', '1024x', '', '99999999999999999999'):
+        cases.append(([flag, value], 2, 'prefill batch size must be a power of two'))
+    cases.append(([flag], 2, flag + ' needs a value'))
+cases.append((['--batch-size', '1024', '--ubatch-size', '2048', '--model', 'unused'],
+              2, '--ubatch-size must not exceed --batch-size'))
+for value in ('0', '0.6', '1', '2'):
+    cases.append((['--temperature', value, '--help'], 0, '--temperature F'))
+for value in ('-1', '2.1', 'nan', 'inf', '0.6x', ''):
+    cases.append((['--temperature', value], 2, 'temperature must be a finite number'))
+cases.append((['--temperature'], 2, '--temperature needs a value'))
 for args, code, message in cases:
     result = subprocess.run([str(server), *args], env=env, capture_output=True, text=True, timeout=10)
     output = result.stdout + result.stderr
@@ -71,6 +84,14 @@ if len(sys.argv) == 3:
     for value in ('int8', '', 'invalid'):
         cli_cases.append((['--kv-cache-dtype', value], 2, 'KV cache dtype must be'))
     cli_cases.append((['--kv-cache-dtype'], 2, '--kv-cache-dtype needs a value'))
+    for flag in ('--batch-size', '--ubatch-size'):
+        for value in ('1024', '2048', '4096'):
+            cli_cases.append((['--batch-size', '4096', flag, value, '--help'], 0, '--ubatch-size N'))
+        for value in ('0', '-1', '1023', '8192', '1.5', '1024x', '', '99999999999999999999'):
+            cli_cases.append(([flag, value], 2, 'prefill batch size must be a power of two'))
+        cli_cases.append(([flag], 2, flag + ' needs a value'))
+    cli_cases.append((['--batch-size', '1024', '--ubatch-size', '2048'],
+                      2, '--ubatch-size must not exceed --batch-size'))
     for args, code, message in cli_cases:
         result = subprocess.run([str(cli), *args], env=env, capture_output=True,
                                 text=True, timeout=10)

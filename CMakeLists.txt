@@ -252,6 +252,7 @@ add_library(lse_kernels
   src/kernels/dflash2_ring_sdpa.cpp
   src/kernels/dflash2_ring_split.cpp
   src/kernels/dflash2_cache.cpp
+  src/kernels/dflash2_convolve.cpp
   src/kernels/dflash2_selector.cpp
   src/kernels/wmma_q6_linear.cpp
 )
@@ -320,10 +321,14 @@ add_library(lse::ops ALIAS lse_ops)
 target_link_libraries(lse_ops PUBLIC lse_core lse_graph lse_kv)
 lse_apply_common_flags(lse_ops)
 
+add_library(lse_sampling src/runtime/sampler.cpp)
+add_library(lse::sampling ALIAS lse_sampling)
+target_link_libraries(lse_sampling PUBLIC lse_core)
+lse_apply_common_flags(lse_sampling)
+
 add_library(lse_runtime
   src/runtime/batch.cpp
   src/runtime/generator.cpp
-  src/runtime/sampler.cpp
   src/runtime/session.cpp
 )
 add_library(lse::runtime ALIAS lse_runtime)
@@ -351,10 +356,10 @@ else()
   target_link_options(lse_model INTERFACE
   "LINKER:--whole-archive,$<TARGET_FILE:lse_model>,--no-whole-archive")
 endif()
-target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops)
+target_link_libraries(lse_model PUBLIC lse_core lse_graph lse_ops lse_sampling)
 lse_apply_common_flags(lse_model)
 
-target_link_libraries(lse_runtime PUBLIC lse_core lse_graph lse_model)
+target_link_libraries(lse_runtime PUBLIC lse_core lse_graph lse_model lse_sampling)
 
 # ---------------------------------------------------------------------------
 # place — the device SET: which devices this process holds, which of them holds

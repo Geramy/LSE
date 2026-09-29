@@ -402,27 +402,104 @@ LSE_TEST(dflash2_dynamic_convolution_shares_groups_and_respects_left_boundary) {
       LSE_EXPECT(std::fabs(output[t*4+d] - expected) < 1e-5f);
     }
 }
-LSE_TEST(dflash2_output_bucket_keeps_one_prefix_shape_and_full_block_fallback) {
-  for (std::uint32_t proposals = 1; proposals <= 3; ++proposals) {
-    const auto plan = dispatch::dflash2_output_plan(8, proposals);
-    LSE_EXPECT_EQ(plan.head_rows, 4u);
-    LSE_EXPECT_EQ(plan.selector_positions, 3u);
+LSE_TEST(dflash2_convolution_handles_batches_single_rows_and_full_draft_width) {
+  for (int tokens : {1, 2, 7, 8}) {
+    constexpr int batch = 2, width = 20, group_size = 4, groups = width / group_size;
+    std::vector<float> hidden(batch * tokens * width), dynamic(batch * tokens * 2 * groups), base(2 * width);
+    for (std::size_t i = 0; i < hidden.size(); ++i) hidden[i] = std::sin(i * .17f);
+    for (std::size_t i = 0; i < dynamic.size(); ++i) dynamic[i] = std::cos(i * .13f);
+    for (std::size_t i = 0; i < base.size(); ++i) base[i] = std::sin(i * .23f);
+    auto x = filled({batch, tokens, width}, hidden);
+    auto d = filled({batch, tokens, 2, groups}, dynamic);
+    auto b = filled({2, width}, base);
+    auto out = model::dflash2_convolve(x, d, b, group_size);
+    LSE_EXPECT(out.valid()); if (!out.valid()) return;
+    const auto actual = read(out);
+    for (std::size_t at = 0; at < actual.size(); ++at) {
+      const auto row = at / width, channel = at % width;
+      const auto coefficients = row * 2 * groups + channel / group_size;
+      const float previous = row % tokens ? hidden[at - width] : 0;
+      const float expected = (base[channel] + dynamic[coefficients]) * hidden[at] +
+          (base[width + channel] + dynamic[coefficients + groups]) * previous;
+      LSE_EXPECT_NEAR(actual[at], expected, 1e-6f);
+    }
+    LSE_EXPECT(!model::dflash2_convolve(x, d, b, 3).valid());
+    LSE_EXPECT(read(x) == hidden && read(d) == dynamic && read(b) == base);
   }
-  for (std::uint32_t proposals = 4; proposals <= 7; ++proposals) {
-    const auto plan = dispatch::dflash2_output_plan(8, proposals);
-    LSE_EXPECT_EQ(plan.head_rows, 7u);
-    LSE_EXPECT_EQ(plan.selector_positions, 7u);
-  }
-  for (std::uint32_t block = 2; block < 8; ++block)
+}
+
+LSE_TEST(dflash2_convolution_emits_one_native_group_at_full_width) {
+  auto leaf = [](Shape shape) {
+    auto n = std::make_shared<graph::Node>(); n->shape = shape;
+    n->dtype = DType::kF32; n->materialized = true;
+    return graph::Array(n);
+  };
+  auto out = model::dflash2_convolve(leaf({1,8,5120}), leaf({1,8,2,320}), leaf({2,5120}),16);
+  LSE_EXPECT(out.valid()); if (!out.valid()) return;
+  const graph::NodePtr roots[]{out.node()};
+  const auto groups = graph::Partitioner::partition(roots);
+  LSE_EXPECT_EQ(groups.size(), 1u);
+  if (groups.size() != 1) return;
+  backend::DeviceInfo device; device.arch = "gfx1201";
+  device.wavefront_size = 32; device.max_threads_per_workgroup = 1024;
+  auto emitted = backend::LoomEmitter{}.emit(groups[0], device);
+  LSE_EXPECT(emitted.ok()); if (!emitted.ok()) return;
+  LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
+  LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 160u);
+  LSE_EXPECT_EQ(emitted->lds_bytes, 0u);
+#if defined(LSE_HRX_LINKED) && LSE_HAVE_LOOMC
+  auto compiled = backend::LoomcCompiler{}.compile(emitted->source, "gfx1201");
+  if (!compiled.ok()) std::fprintf(stderr, "%s\n", compiled.status().to_string().c_str());
+  LSE_EXPECT(compiled.ok());
+#endif
+}
+
+LSE_TEST(dflash2_output_uses_all_trained_proposals_with_one_stable_head_shape) {
+  for (std::uint32_t block = 2; block <= 8; ++block) {
+#if defined(LSE_DFLASH2_RUNTIME_TESTS)
+    LSE_EXPECT_EQ(runtime::dflash2_verify_depth(block), block - 1);
+#endif
     for (std::uint32_t proposals = 1; proposals < block; ++proposals) {
       const auto plan = dispatch::dflash2_output_plan(block, proposals);
       LSE_EXPECT_EQ(plan.head_rows, block - 1);
       LSE_EXPECT_EQ(plan.selector_positions, block - 1);
     }
+  }
   LSE_EXPECT_EQ(dispatch::dflash2_output_plan(8, 0).head_rows, 0u);
   LSE_EXPECT_EQ(dispatch::dflash2_output_plan(8, 8).head_rows, 0u);
+  LSE_EXPECT_EQ(dispatch::dflash2_output_plan(9, 1).head_rows, 0u);
   LSE_EXPECT_EQ(dispatch::dflash2_output_plan(0, 1).head_rows, 0u);
 }
+LSE_TEST(dflash2_sampled_path_uses_the_selected_predecessor_row) {
+  const std::vector<std::uint32_t> ids{1, 2, 3, 4, 5, 6};
+  std::vector<float> scores{0, 80, 0, 80, 80, 0, 0, 80, 80, 0, 0, 80};
+  runtime::SpeculativeSampler sampler(42);
+  auto path = model::dflash2_sample_path(scores, ids, 3, 2, 16, 1, sampler);
+  LSE_EXPECT(path.ok());
+  if (!path.ok()) return;
+  LSE_EXPECT(path->tokens == std::vector<std::uint32_t>({2, 4, 6}));
+  LSE_EXPECT(path->conditionals[1].probability(4) > .999999);
+  LSE_EXPECT(path->conditionals[1].probability(3) < 1e-30);
+  sampler.reseed(42);
+  auto replay = model::dflash2_sample_path(scores, ids, 3, 2, 16, 1, sampler);
+  LSE_EXPECT(replay.ok());
+  if (replay.ok()) LSE_EXPECT(path->tokens == replay->tokens);
+  const std::vector<float> soft_scores{0, 1, 0, 1};
+  for (float temperature : {0.6f, 1.0f}) {
+    auto soft = model::dflash2_sample_path(soft_scores, std::span(ids).first(2),
+        1, 2, 16, temperature, sampler);
+    LSE_EXPECT(soft.ok());
+    if (soft.ok()) LSE_EXPECT(std::abs(soft->conditionals[0].probability(2) -
+        1 / (1 + std::exp(-1.0 / temperature))) < 1e-12);
+  }
+  auto invalid = ids; invalid[1] = invalid[0];
+  LSE_EXPECT(!model::dflash2_sample_path(scores, invalid, 3, 2, 16, 1, sampler).ok());
+  scores[0] = std::numeric_limits<float>::quiet_NaN();
+  LSE_EXPECT(!model::dflash2_sample_path(scores, ids, 3, 2, 16, 1, sampler).ok());
+  LSE_EXPECT(!model::dflash2_sample_path(soft_scores, std::span(ids).first(2),
+      1, 2, 16, 0, sampler).ok());
+}
+
 LSE_TEST(dflash2_selector_prefix_depends_only_on_consumed_positions) {
   constexpr std::uint32_t positions = 7, top = 3, prefix = 3;
   std::vector<std::uint32_t> candidates(positions * top);
@@ -542,6 +619,53 @@ void expect_retained_dflash(const Fixture& fixture, runtime::Session& session,
     LSE_EXPECT_EQ(state.position, covered);
   }
 }
+LSE_TEST(dflash2_sampled_generator_retains_only_verified_prefix_and_replays) {
+  for (const auto mode : {FixtureWeights::kConstantTokens, FixtureWeights::kRejectedTokens,
+                         FixtureWeights::kStopTransition}) {
+    std::vector<std::uint32_t> expected;
+    for (int replay = 0; replay < 2; ++replay) {
+      Fixture fixture;
+      const auto opened = fixture.open(mode, 8);
+      LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+      runtime::Session session("sampled", 1);
+      runtime::SamplingParams params;
+      params.temperature = 1; params.top_k = 3; params.top_p = .95f; params.seed = 177;
+      runtime::Generator request(*fixture.target, params);
+      request.use_dflash2(*fixture.draft);
+      runtime::GenerationLimits limits; limits.max_tokens = 17;
+      const std::vector<std::uint32_t> prompt{1, 2};
+      auto output = request.generate(session, prompt, limits);
+      LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+      LSE_EXPECT_EQ(output->size(), 17u);
+      if (replay == 0) expected = *output;
+      else LSE_EXPECT(expected == *output);
+      auto history = prompt; history.insert(history.end(), output->begin(), output->end());
+      LSE_EXPECT(session.history() == history);
+      expect_retained_dflash(fixture, session, static_cast<std::int32_t>(history.size()) - 1);
+      std::uint32_t tested = 0, accepted = 0;
+      for (std::size_t i = 0; i < 7; ++i) {
+        tested += request.stats().spec_tested_by_position[i];
+        accepted += request.stats().spec_accepted_by_position[i];
+      }
+      LSE_EXPECT_EQ(tested, request.stats().spec_tested);
+      LSE_EXPECT_EQ(accepted, request.stats().spec_accepted);
+      history.push_back(5);
+      runtime::Generator next(*fixture.target, params); next.use_dflash2(*fixture.draft);
+      limits.max_tokens = 8;
+      std::size_t callbacks = 0;
+      auto continued = next.generate(session, history, limits,
+          [&](std::uint32_t) { return ++callbacks < 3; });
+      LSE_EXPECT(continued.ok());
+      if (continued.ok()) {
+        LSE_EXPECT_EQ(continued->size(), 3u);
+        history.insert(history.end(), continued->begin(), continued->end());
+        LSE_EXPECT(session.history() == history);
+        expect_retained_dflash(fixture, session, static_cast<std::int32_t>(history.size()) - 1);
+      }
+    }
+  }
+}
+
 void terminal_and_next_turn(FixtureWeights mode, std::int32_t max_tokens,
                             std::size_t cancel_after,
                             const std::vector<std::uint32_t>& stops,
@@ -1293,6 +1417,19 @@ int gpu_ring_split() {
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--gpu-convolution") {
+    auto* scheduler = graph::default_scheduler();
+    if (!scheduler) return 1;
+    scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+    scheduler->set_dialect(graph::Dialect::kLoom);
+    dflash2_convolution_handles_batches_single_rows_and_full_draft_width();
+    const auto trace = scheduler->accumulated_trace();
+    LSE_EXPECT_EQ(trace.host_groups, 0u);
+    LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+    LSE_EXPECT_EQ(trace.device_groups, 4u);
+    std::printf("convolution device_groups=%u host_groups=%u host_fallbacks=%u\n", trace.device_groups, trace.host_groups, trace.host_fallbacks);
+    return lse::test::Registry::get().failures ? 1 : 0;
+  }
   if (argc == 2 && std::string(argv[1]) == "--gpu-attention") return gpu_attention();
   if (argc == 2 && std::string(argv[1]) == "--gpu-selector") return gpu_selector();
   if (argc == 2 && std::string(argv[1]) == "--gpu-ring-cache") return gpu_ring_cache();

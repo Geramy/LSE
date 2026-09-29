@@ -7,6 +7,7 @@
 // know which kind a given layer is.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -22,6 +23,7 @@
 #include "lse/model/mtp.hpp"
 #include "lse/model/dflash2.hpp"
 #include "lse/runtime/sampler.hpp"
+#include "lse/runtime/prefill_batch.hpp"
 #include "lse/runtime/session.hpp"
 
 namespace lse::runtime {
@@ -33,7 +35,7 @@ inline constexpr std::uint32_t kMaxMtpDepth = 7;
 
 [[nodiscard]] constexpr std::uint32_t dflash2_verify_depth(
     std::uint32_t draft_block_size) noexcept {
-  return draft_block_size > 4 ? 3 : draft_block_size > 1 ? draft_block_size - 1 : 0;
+  return draft_block_size >= 2 && draft_block_size <= 8 ? draft_block_size - 1 : 0;
 }
 
 [[nodiscard]] constexpr bool valid_mtp_depth(std::uint32_t depth) noexcept {
@@ -105,6 +107,8 @@ struct GenerationStats {
   std::uint32_t spec_steps = 0;
   std::uint32_t spec_accepted = 0;
   std::uint32_t spec_tested = 0;
+  std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
+  std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint32_t mtp_depth = 0;
   std::uint32_t dflash2_depth = 0;
   // Where a speculative step's time goes: the decoder passes that verify a
@@ -140,8 +144,8 @@ struct GenerationStats {
 
 class Generator {
  public:
-  Generator(HybridLM& model, SamplingParams params)
-      : model_(model), sampler_(params) {}
+  Generator(HybridLM& model, SamplingParams params, PrefillBatch prefill = {})
+      : model_(model), sampler_(params), prefill_batch_(prefill) {}
 
   // Called with each token as it is produced. Returning false stops early,
   // which is how a server cancels a stream mid-flight.
@@ -197,6 +201,7 @@ class Generator {
 
   HybridLM& model_;
   Sampler sampler_;
+  PrefillBatch prefill_batch_;
   std::unique_ptr<Session> owned_;
   GenerationStats stats_;
   std::vector<std::string> host_reasons_;

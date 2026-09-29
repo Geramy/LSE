@@ -22,6 +22,24 @@ location. The startup log prints the selected directory. The flag takes preceden
 over the legacy `LSE_CACHE_DIR` environment override. No environment setting is
 required. Cache entries check compiler identity, device properties and kernel source.
 
+## Development: full-width DFlash2
+
+The current development build verifies all seven proposals from the block-8
+checkpoint. Conditional drafting uses the request temperature and preserves
+target sampling through probability-ratio rejection and residual sampling.
+Both prefill batch limits default to 1024. Use `--batch-size 2048 --ubatch-size 2048`
+to select larger passes. The HTTP server accepts `--temperature 0.6`; an explicit
+request temperature overrides it.
+
+On exact 1024- and 2048-token coding requests at temperature 0.6, the second
+requests measured **501.38 / 508.09 prompt tokens/s** and **35.04 / 34.53 decode
+tokens/s**, respectively. Both generated 384 tokens, reused no prompt KV and had
+zero host fallbacks. The process retained compiled code, but further compilation
+remained inside these timings. Different temperatures produce different answers.
+These are workload measurements, not general rates or achieved 103 TPS/600 PP/s
+goals. Published v0.4.12 remains the preceding three-proposal build.
+See [full-width DFlash2 results](docs/benchmarks/dflash-fullwidth-2026-09-29.md).
+
 ## v0.4.12: typed attention and automatic buffer views
 
 This version adds typed WMMA attention, cooperative single-token attention, and

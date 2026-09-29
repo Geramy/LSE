@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -23,6 +26,33 @@
 namespace lse::model {
 namespace {
 using graph::Array;
+
+class DraftProfile {
+ public:
+  explicit DraftProfile(const char* phase) : phase_(phase) {
+    static const bool enabled = std::getenv("LSE_TIME_STEPS") != nullptr;
+    enabled_ = enabled;
+    if (enabled_) start_ = std::chrono::steady_clock::now();
+  }
+  ~DraftProfile() {
+    if (!enabled_) return;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start_).count();
+    std::fprintf(stderr, "[dflash2-spans] phase=%s elapsed_ns=%lld\n",
+                 phase_, static_cast<long long>(ns));
+  }
+ private:
+  const char* phase_;
+  bool enabled_ = false;
+  std::chrono::steady_clock::time_point start_;
+};
+
+Array slot_view(const Array& owner, Shape shape, std::size_t begin) {
+  auto buffer = owner.node()->buffer;
+  buffer.offset += begin * sizeof(float);
+  buffer.size_bytes = shape.elem_count() * sizeof(float);
+  return Array::from_buffer(std::move(buffer), std::move(shape), DType::kF32);
+}
 
 Result<Array> slot(Shape shape) {
   auto* scheduler = graph::default_scheduler();
@@ -176,6 +206,46 @@ Result<std::vector<std::uint32_t>> dflash2_select_path(
   return path;
 }
 
+Result<DFlash2Proposal> dflash2_sample_path(
+    std::span<const float> scores, std::span<const std::uint32_t> candidates,
+    std::uint32_t positions, std::uint32_t top_k, std::uint32_t vocab_size,
+    float temperature, runtime::SpeculativeSampler& sampler) {
+  if (positions == 0 || top_k == 0 || vocab_size == 0 ||
+      !std::isfinite(temperature) || temperature <= 0 ||
+      candidates.size() != static_cast<std::size_t>(positions) * top_k ||
+      scores.size() != static_cast<std::size_t>(positions) * top_k * top_k)
+    return LSE_ERROR(kInvalidArgument, "invalid sampled DFlash2 lattice");
+  DFlash2Proposal result;
+  result.tokens.reserve(positions);
+  result.conditionals.reserve(positions);
+  std::uint32_t predecessor = 0;
+  for (std::uint32_t p = 0; p < positions; ++p) {
+    const auto row = scores.subspan((static_cast<std::size_t>(p) * top_k + predecessor) * top_k, top_k);
+    const auto ids = candidates.subspan(static_cast<std::size_t>(p) * top_k, top_k);
+    runtime::DiscreteDistribution q;
+    q.ids.assign(ids.begin(), ids.end());
+    q.probabilities.resize(top_k);
+    double maximum = -INFINITY;
+    for (std::uint32_t k = 0; k < top_k; ++k) {
+      if (!std::isfinite(row[k]) || ids[k] >= vocab_size ||
+          std::find(ids.begin(), ids.begin() + k, ids[k]) != ids.begin() + k)
+        return LSE_ERROR(kInvalidArgument, "invalid sampled DFlash2 candidate");
+      maximum = std::max(maximum, static_cast<double>(row[k]));
+    }
+    double total = 0;
+    for (std::uint32_t k = 0; k < top_k; ++k) {
+      q.probabilities[k] = std::exp((static_cast<double>(row[k]) - maximum) / temperature);
+      total += q.probabilities[k];
+    }
+    for (auto& probability : q.probabilities) probability /= total;
+    LSE_ASSIGN_OR(auto token, sampler.sample_proposal(q));
+    predecessor = static_cast<std::uint32_t>(std::find(ids.begin(), ids.end(), token) - ids.begin());
+    result.tokens.push_back(token);
+    result.conditionals.push_back(std::move(q));
+  }
+  return result;
+}
+
 Array dflash2_convolve(const Array& hidden, const Array& dynamic,
                        const Array& base, std::int32_t group_size) {
   if (!hidden.valid() || !dynamic.valid() || !base.valid() || hidden.shape().rank() != 3 ||
@@ -183,22 +253,11 @@ Array dflash2_convolve(const Array& hidden, const Array& dynamic,
     return {};
   const auto b = hidden.shape().dim(0), t = hidden.shape().dim(1), d = hidden.shape().dim(2);
   if (d % group_size || dynamic.shape() != Shape{b, t, 2, d / group_size} || base.shape() != Shape{2, d}) return {};
-  const auto groups = d / group_size;
-  Array output;
-  for (std::int64_t tap = 0; tap < 2; ++tap) {
-    Array values = hidden;
-    if (tap == 1) {
-      Array zero = Array::zeros(Shape{b, 1, d}, hidden.dtype());
-      values = t == 1 ? zero : graph::concat({zero, graph::slice(hidden, 1, 0, t - 1)}, 1);
-    }
-    Array coefficients = graph::add(
-        graph::reshape(graph::slice(base, 0, tap, tap + 1), Shape{1, 1, groups, group_size}),
-        graph::reshape(graph::slice(dynamic, 2, tap, tap + 1), Shape{b, t, groups, 1}));
-    Array term = graph::reshape(graph::mul(coefficients,
-        graph::reshape(values, Shape{b, t, groups, group_size})), hidden.shape());
-    output = tap == 0 ? term : graph::add(output, term);
-  }
-  return output;
+  if (hidden.dtype() != DType::kF32 || dynamic.dtype() != DType::kF32 ||
+      base.dtype() != DType::kF32) return {};
+  auto result = graph::custom("dflash2.convolve2.v1", {hidden, dynamic, base},
+      {static_cast<float>(t), static_cast<float>(d), static_cast<float>(group_size), 0.0f});
+  return result.ok() ? result.release() : Array{};
 }
 
 struct DFlash2Module::Impl {
@@ -221,16 +280,18 @@ struct DFlash2Module::Impl {
     std::vector<graph::NodePtr> roots;
   };
   struct DraftPass {
-    Array tokens, anchor, offset, meta, indices, scores, path;
+    Array inputs, tokens, anchor, offset, meta, indices, scores, path;
+    std::vector<float> input_image;
     graph::Program program;
     std::vector<graph::NodePtr> roots;
   };
   std::map<std::int64_t, ContextPass> contexts;
-  std::map<std::uint32_t, DraftPass> drafts;
+  std::map<std::pair<std::uint32_t, bool>, DraftPass> drafts;
 
   Status load(WeightBinder& binder);
   Result<ContextPass> context_pass(std::int64_t rows);
-  Result<DraftPass> draft_pass(std::uint32_t head_rows, std::uint32_t proposals);
+  Result<DraftPass> draft_pass(std::uint32_t head_rows, std::uint32_t proposals, bool sampled);
+  Result<DraftPass*> run_draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals, bool sampled);
   Result<Array> attention(Array x, Layer& layer, const DraftPass& pass);
   std::pair<Array, Array> prepare(Array x, const Conv& conv) const;
 };
@@ -330,13 +391,15 @@ Result<Array> DFlash2Module::Impl::attention(Array x, Layer& l, const DraftPass&
   return graph::linear(ops::merge_heads(attended), l.o);
 }
 Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
-    std::uint32_t head_rows, std::uint32_t proposals) {
+    std::uint32_t head_rows, std::uint32_t proposals, bool sampled) {
   DraftPass p;
   const auto rows = static_cast<std::int64_t>(config.block_size);
-  LSE_ASSIGN_OR(p.tokens, slot(Shape{1, rows}));
-  LSE_ASSIGN_OR(p.anchor, slot(Shape{1, 1}));
-  LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
-  LSE_ASSIGN_OR(p.meta, slot(Shape{3}));
+  LSE_ASSIGN_OR(p.inputs, slot(Shape{rows + 5}));
+  p.tokens = slot_view(p.inputs, Shape{1, rows}, 0);
+  p.anchor = slot_view(p.inputs, Shape{1, 1}, rows);
+  p.offset = slot_view(p.inputs, Shape{1}, rows + 1);
+  p.meta = slot_view(p.inputs, Shape{3}, rows + 2);
+  p.input_image.resize(static_cast<std::size_t>(rows) + 5);
   LSE_ASSIGN_OR(Array x, target->embed(p.tokens));
   for (Layer& l : layers) {
     auto [prepared, after] = prepare(norm(x, l.input_norm, config.rms_eps), l.attention_conv);
@@ -365,9 +428,13 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
   Array gate = graph::reshape(graph::linear(x, selector_projection), Shape{1, proposals, rank});
   LSE_ASSIGN_OR(p.scores, graph::custom("dflash2.selector", {pred, gate, succ, unary},
       {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(top), static_cast<float>(rank)}));
-  LSE_ASSIGN_OR(p.path, graph::custom("dflash2.selector_walk.v1", {p.scores, p.indices},
-      {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(config.vocab_size), 0.0f}));
-  p.roots = {p.path.node()};
+  if (sampled) {
+    p.roots = {p.scores.node(), p.indices.node()};
+  } else {
+    LSE_ASSIGN_OR(p.path, graph::custom("dflash2.selector_walk.v1", {p.scores, p.indices},
+        {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(config.vocab_size), 0.0f}));
+    p.roots = {p.path.node()};
+  }
   return p;
 }
 
@@ -422,9 +489,19 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
     it = impl_->contexts.emplace(rows, std::move(pass)).first;
   }
   auto& pass = it->second;
-  LSE_RETURN_IF_ERROR(copy_slot(pass.features, input));
-  const float offset = static_cast<float>(first); LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1)));
-  LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  {
+    DraftProfile profile("context-copy");
+    LSE_RETURN_IF_ERROR(copy_slot(pass.features, input));
+  }
+  {
+    DraftProfile profile("context-offset-upload");
+    const float offset = static_cast<float>(first);
+    LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1)));
+  }
+  {
+    DraftProfile profile("context-submit");
+    LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  }
   for (std::size_t i = 0; i < impl_->layers.size(); ++i) {
     accept_cache_write(impl_->layers[i].keys, pass.keys[i]);
     accept_cache_write(impl_->layers[i].values, pass.values[i]);
@@ -433,27 +510,53 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
   impl_->live = std::min(impl_->capacity, impl_->live + static_cast<std::int32_t>(rows));
   return OkStatus();
 }
-Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals) {
-  if (anchor >= static_cast<std::uint32_t>(impl_->config.vocab_size) || first != impl_->position ||
-      impl_->live <= 0 || proposals == 0 || proposals >= impl_->config.block_size ||
-      static_cast<std::int64_t>(first) + proposals >= impl_->max_position)
+Result<DFlash2Module::Impl::DraftPass*> DFlash2Module::Impl::run_draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals, bool sampled) {
+  if (anchor >= static_cast<std::uint32_t>(config.vocab_size) || first != position ||
+      live <= 0 || proposals == 0 || proposals >= config.block_size ||
+      static_cast<std::int64_t>(first) + proposals >= max_position)
     return LSE_ERROR(kInvalidArgument, "invalid DFlash2 draft request");
-  const auto output = dispatch::dflash2_output_plan(impl_->config.block_size, proposals);
-  auto it = impl_->drafts.find(output.selector_positions);
-  if (it == impl_->drafts.end()) {
-    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(output.head_rows, output.selector_positions));
-    it = impl_->drafts.emplace(output.selector_positions, std::move(pass)).first;
+  const auto output = dispatch::dflash2_output_plan(config.block_size, proposals);
+  const auto key = std::pair(output.selector_positions, sampled);
+  auto it = drafts.find(key);
+  if (it == drafts.end()) {
+    LSE_ASSIGN_OR(auto pass, draft_pass(output.head_rows, output.selector_positions, sampled));
+    it = drafts.emplace(key, std::move(pass)).first;
   }
   auto& pass = it->second;
-  std::vector<float> tokens(impl_->config.block_size, static_cast<float>(impl_->config.mask_token)); tokens[0] = static_cast<float>(anchor);
-  const float offset = static_cast<float>(first), anchor_id = static_cast<float>(anchor);
-  const float meta[] = {static_cast<float>(impl_->live), static_cast<float>(impl_->capacity),
-                        static_cast<float>(impl_->position % impl_->capacity)};
-  LSE_RETURN_IF_ERROR(poke(pass.tokens, tokens)); LSE_RETURN_IF_ERROR(poke(pass.anchor, std::span(&anchor_id, 1)));
-  LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1))); LSE_RETURN_IF_ERROR(poke(pass.meta, meta));
-  LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  const auto block = config.block_size;
+  auto& image = pass.input_image;
+  std::fill_n(image.begin(), block, static_cast<float>(config.mask_token));
+  image[0] = image[block] = static_cast<float>(anchor);
+  image[block + 1] = static_cast<float>(first);
+  image[block + 2] = static_cast<float>(live);
+  image[block + 3] = static_cast<float>(capacity);
+  image[block + 4] = static_cast<float>(position % capacity);
+  {
+    DraftProfile profile("input-upload");
+    LSE_RETURN_IF_ERROR(poke(pass.inputs, image));
+    for (auto* view : {&pass.tokens, &pass.anchor, &pass.offset, &pass.meta}) {
+      view->node()->materialized = true;
+      view->node()->host_dirty = false;
+      view->node()->device_dirty = true;
+    }
+  }
+  {
+    DraftProfile profile("draft-submit");
+    LSE_RETURN_IF_ERROR(evaluate(pass.program, pass.roots));
+  }
+  return &pass;
+}
+
+Result<std::vector<std::uint32_t>> DFlash2Module::draft(
+    std::uint32_t anchor, std::int32_t first, std::uint32_t proposals) {
+  LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, proposals, false));
+  auto& pass = *ready;
+  const auto output = dispatch::dflash2_output_plan(impl_->config.block_size, proposals);
   std::vector<std::uint32_t> path(output.selector_positions + 1);
-  LSE_RETURN_IF_ERROR(pass.path.to_host(path.data(), path.size() * sizeof(std::uint32_t)));
+  {
+    DraftProfile profile("path-readback");
+    LSE_RETURN_IF_ERROR(pass.path.to_host(path.data(), path.size() * sizeof(std::uint32_t)));
+  }
   const auto validation = path.back();
   if (validation & 2u) return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
   if (validation & 1u) return LSE_ERROR(kInvalidArgument, "nonfinite DFlash2 selector score");
@@ -461,4 +564,29 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(std::uint32_t anchor, st
   path.resize(proposals);
   return path;
 }
+Result<DFlash2Proposal> DFlash2Module::draft_sampled(
+    std::uint32_t anchor, std::int32_t first, std::uint32_t proposals,
+    float temperature, runtime::SpeculativeSampler& sampler) {
+  LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, proposals, true));
+  const auto positions = impl_->config.block_size - 1;
+  const auto top = static_cast<std::uint32_t>(impl_->config.selector_top_k);
+  std::vector<float> scores(static_cast<std::size_t>(positions) * top * top);
+  std::vector<float> raw_ids(static_cast<std::size_t>(positions) * top);
+  {
+    DraftProfile profile("lattice-readback");
+    LSE_RETURN_IF_ERROR(ready->scores.to_host(scores.data(), scores.size() * sizeof(float)));
+    LSE_RETURN_IF_ERROR(ready->indices.to_host(raw_ids.data(), raw_ids.size() * sizeof(float)));
+  }
+  std::vector<std::uint32_t> ids(raw_ids.size());
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (!std::isfinite(raw_ids[i]) || raw_ids[i] < 0 ||
+        raw_ids[i] >= impl_->config.vocab_size || std::floor(raw_ids[i]) != raw_ids[i])
+      return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
+    ids[i] = static_cast<std::uint32_t>(raw_ids[i]);
+  }
+  return dflash2_sample_path(std::span(scores).first(static_cast<std::size_t>(proposals) * top * top),
+      std::span(ids).first(static_cast<std::size_t>(proposals) * top), proposals,
+      top, impl_->config.vocab_size, temperature, sampler);
+}
+
 }  // namespace lse::model

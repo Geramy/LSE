@@ -1,6 +1,8 @@
 // lse-server — the /v1 HTTP surface over one loaded model.
 #include <atomic>
 #include <charconv>
+#include <cmath>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -41,6 +43,7 @@ void usage() {
       "      --api-key KEY    require Authorization: Bearer KEY\n"
       "      --served-name ID model id reported by /v1/models (default: the\n"
       "                       model argument)\n"
+      "      --temperature F default request temperature, 0..2 (default: model)\n"
       "      --max-tokens N   refuse requests asking for more (default 4096)\n"
       "      --shutdown-grace-seconds N  drain requests before failing (1..600, default 30)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
@@ -54,6 +57,9 @@ void usage() {
       "                       directory has none\n"
       "      --kv-cache-dtype TYPE  fp32, fp16, bf16, fp8, bf8\n"
       "                           default: bf16 for BF16 models, fp16 otherwise\n"
+      "      --batch-size N   prompt token batch limit (default 1024)\n"
+      "      --ubatch-size N  tokens per physical prefill pass (default 1024)\n"
+      "                       powers of two from 128 to 4096; ubatch <= batch\n"
       "      --kv-len N       allocate the KV cache for N tokens\n"
       "      --cache-dir PATH kernel cache directory (default ~/.lse/cache)\n"
       "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
@@ -85,6 +91,7 @@ int main(int argc, char** argv) {
   std::string dialect;
   std::string cache_dir;
   std::int32_t kv_len = 0;
+  std::optional<float> temperature_override;
   std::string kv_cache_dtype;
   int shutdown_grace_seconds = 30;
 
@@ -143,6 +150,27 @@ int main(int argc, char** argv) {
       const auto parsed = kv::cache_dtype_from_string(kv_cache_dtype);
       if (!parsed.ok()) { std::fprintf(stderr, "lse-server: %s\n", std::string(parsed.status().message()).c_str()); return 2; }
     }
+    else if (a == "--temperature") {
+      const auto text = value("--temperature");
+      float temperature = 0;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), temperature);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          !std::isfinite(temperature) || temperature < 0 || temperature > 2) {
+        std::fputs("lse-server: temperature must be a finite number from 0 to 2\n", stderr);
+        return 2;
+      }
+      temperature_override = temperature;
+    }
+    else if (a == "--batch-size" || a == "--ubatch-size") {
+      const auto text = value(a.c_str());
+      auto& size = a == "--batch-size" ? opt.prefill.batch_size : opt.prefill.ubatch_size;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), size);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          !runtime::PrefillBatch::valid_size(size)) {
+        std::fputs("lse-server: prefill batch size must be a power of two from 128 to 4096\n", stderr);
+        return 2;
+      }
+    }
     else if (a == "--kv-len") kv_len = std::atoi(value("--kv-len").c_str());
     else if (a == "--cache-dir" || a.starts_with("--cache-dir=")) {
       cache_dir = a == "--cache-dir" ? value("--cache-dir") : a.substr(12);
@@ -165,6 +193,13 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+
+  if (!opt.prefill.valid()) {
+    std::fputs("lse-server: --ubatch-size must not exceed --batch-size\n", stderr);
+    return 2;
+  }
+  std::fprintf(stderr, "lse-server: prefill batch=%u ubatch=%u\n",
+               opt.prefill.batch_size, opt.prefill.ubatch_size);
 
   if (model.empty()) {
     std::fputs("lse-server: no model. Pass --model or set $LSE_MODEL.\n", stderr);
@@ -227,6 +262,7 @@ int main(int argc, char** argv) {
 
   auto cfg = model::Config::from_json_file(paths->config);
   if (!cfg.ok()) return fail(cfg.status(), "reading the config");
+  if (temperature_override) cfg->sampling_defaults.temperature = *temperature_override;
   std::fprintf(stderr, "sampling defaults: temperature=%.3g top_k=%d top_p=%.3g\n",
                static_cast<double>(cfg->sampling_defaults.temperature),
                cfg->sampling_defaults.top_k,

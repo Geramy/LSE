@@ -59,9 +59,6 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
   return a;
 }
 
-// Bound retained pass shapes to the measured prefill chunk.
-constexpr std::size_t kPrefillChunk = 512;
-
 // Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
 // two below it}, so the whole engine only ever compiles that many prefill
 // shapes. 0 is one pass, whatever the length.
@@ -260,7 +257,14 @@ Result<std::vector<float>> Generator::step(
   }
   Array hidden;
   std::size_t at = 0;
-  for (std::size_t take : prefill_plan(tokens.size(), kPrefillChunk)) {
+  if (!prefill_batch_.valid())
+    return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
+  std::vector<std::size_t> passes;
+  for (const auto batch : prefill_plan(tokens.size(), prefill_batch_.batch_size)) {
+    const auto chunks = prefill_plan(batch, prefill_batch_.ubatch_size);
+    passes.insert(passes.end(), chunks.begin(), chunks.end());
+  }
+  for (std::size_t take : passes) {
     const auto first = tokens.begin() + static_cast<std::ptrdiff_t>(at);
     LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(
                                  first, first + static_cast<std::ptrdiff_t>(take))));
@@ -405,6 +409,10 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
                                   ? dflash2_verify_depth(dflash2_->block_size())
                                   : limits.mtp_depth;
   std::size_t m = 0;
+  const bool sampled_dflash = dflash2_ != nullptr && sampler_.params().temperature > 0;
+  SpeculativeSampler speculative_sampler(sampler_.params().seed ^
+      (static_cast<std::uint64_t>(session.position()) * 0x9e3779b97f4a7c15ull));
+  std::vector<DiscreteDistribution> proposal_distributions;
   const auto next_width = [&] {
     return mtp_verify_rows(
         depth, static_cast<std::uint64_t>(limits.max_tokens) - generated.size(),
@@ -416,6 +424,13 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       -> Result<std::vector<std::uint32_t>> {
     if (dflash2_ != nullptr) {
       if (proposals == 0) return std::vector<std::uint32_t>{};
+      if (sampled_dflash) {
+        LSE_ASSIGN_OR(auto proposal, dflash2_->draft_sampled(tokens.back(),
+            first + static_cast<std::int32_t>(tokens.size()) - 1,
+            proposals, sampler_.params().temperature, speculative_sampler));
+        proposal_distributions = std::move(proposal.conditionals);
+        return std::move(proposal.tokens);
+      }
       return dflash2_->draft(tokens.back(),
                             first + static_cast<std::int32_t>(tokens.size()) - 1,
                             proposals);
@@ -441,14 +456,18 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     return static_cast<std::int32_t>(generated.size()) < limits.max_tokens;
   };
   // The decoder's answer for row i of the pass just verified.
-  const auto answer = [&](std::size_t i) -> std::uint32_t {
+  const auto answer = [&](std::size_t i) -> Result<std::uint32_t> {
     if (spec_.greedy) {
       return static_cast<std::uint32_t>(
           graph::interpreter::load_element(*spec_.pick.node(), i));
     }
     const std::size_t v = spec_logits_.size() / m;
-    return sampler_.sample(std::span<float>(spec_logits_.data() + i * v, v),
-                           session.history());
+    auto logits = std::span<float>(spec_logits_.data() + i * v, v);
+    if (sampled_dflash) {
+      LSE_ASSIGN_OR(auto target, sampler_.distribution(logits, session.history()));
+      return speculative_sampler.sample_target(target);
+    }
+    return sampler_.sample(logits, session.history());
   };
 
   std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
@@ -484,14 +503,40 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     bool mismatch = false;
     std::vector<std::uint32_t> answers(m, 0);
     for (std::size_t i = 0; i < m; ++i) {
-      answers[i] = answer(i);
+      bool accepted = false;
+      double overlap = 0, candidate_mass = 0, deterministic_mass = 0;
+      if (sampled_dflash && i + 1 < m) {
+        const auto v = spec_logits_.size() / m;
+        LSE_ASSIGN_OR(auto target, sampler_.distribution(
+            std::span<float>(spec_logits_.data() + i * v, v), session.history()));
+        const auto& proposal = proposal_distributions[i];
+        const auto best = static_cast<std::size_t>(std::max_element(
+            proposal.probabilities.begin(), proposal.probabilities.end()) - proposal.probabilities.begin());
+        deterministic_mass = target.probability(proposal.ids[best]);
+        for (std::size_t k = 0; k < proposal.ids.size(); ++k) {
+          const auto p = target.probability(proposal.ids[k]);
+          candidate_mass += p;
+          overlap += std::min(p, proposal.probabilities[k]);
+        }
+        LSE_ASSIGN_OR(auto verified, speculative_sampler.verify(target, proposal, row_in[i + 1]));
+        answers[i] = verified.token;
+        accepted = verified.accepted;
+      } else {
+        LSE_ASSIGN_OR(answers[i], answer(i));
+        accepted = i + 1 < m && answers[i] == row_in[i + 1];
+      }
       running = give(answers[i]);
       emitted_to = i + 1;
       if (!running) break;
       if (i + 1 < m) {
         ++stats_.spec_tested;
-        if (answers[i] == row_in[i + 1]) {
+        ++stats_.spec_tested_by_position[i];
+        stats_.spec_overlap_sum[i] += overlap;
+        stats_.spec_candidate_mass_sum[i] += candidate_mass;
+        stats_.spec_deterministic_mass_sum[i] += deterministic_mass;
+        if (accepted) {
           ++stats_.spec_accepted;
+          ++stats_.spec_accepted_by_position[i];
         } else {
           mismatch = true;
           break;
@@ -600,6 +645,8 @@ Result<std::vector<std::uint32_t>> Generator::generate(
 Result<std::vector<std::uint32_t>> Generator::generate(
     Session& session, const std::vector<std::uint32_t>& prompt,
     const GenerationLimits& limits, const TokenCallback& on_token) {
+  if (!prefill_batch_.valid())
+    return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
   if (!valid_mtp_depth(limits.mtp_depth)) {
     return LSE_ERROR(kInvalidArgument, "mtp_depth must be an integer from 1 to 7");
   }

@@ -51,9 +51,9 @@ template<class E> struct SplitMergeArgs {
 template <bool ShortQuery>
 struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2<ShortQuery>> {
   static constexpr std::string_view kName = ShortQuery
-      ? "attention.short_partial128.wg128c2.v3" : "attention.decode_partial128.wg128c2.v3";
+      ? "attention.short_partial128.wg128c2.v4" : "attention.decode_partial128.wg128c2.v3";
   static constexpr std::string_view kEntry = ShortQuery
-      ? "lse_sdpa_short_partial128_wg128c2_v3" : "lse_sdpa_decode_partial128_wg128c2_v3";
+      ? "lse_sdpa_short_partial128_wg128c2_v4" : "lse_sdpa_decode_partial128_wg128c2_v3";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }

@@ -276,6 +276,8 @@ struct Outcome {
   std::uint32_t mtp_depth = 0;
   std::uint32_t dflash2_depth = 0;
   std::uint32_t spec_steps = 0, spec_tested = 0, spec_accepted = 0;
+  std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
+  std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint64_t spec_draft_ns = 0, spec_verify_ns = 0;
   double acceptance = -1.0;  // negative when nothing was speculated
 };
@@ -293,7 +295,7 @@ struct HttpServer::Run {
     // work after shutdown has asked the active generation to stop.
     if (impl.stopping.load()) return LSE_ERROR(kCancelled, "server is stopping");
 
-    runtime::Generator gen(impl.model, r.sampling);
+    runtime::Generator gen(impl.model, r.sampling, impl.opt.prefill);
     if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
     if (impl.dflash2 != nullptr) gen.use_dflash2(*impl.dflash2);
 
@@ -354,6 +356,11 @@ struct HttpServer::Run {
     out.spec_steps = st.spec_steps;
     out.spec_tested = st.spec_tested;
     out.spec_accepted = st.spec_accepted;
+    out.spec_tested_by_position = st.spec_tested_by_position;
+    out.spec_accepted_by_position = st.spec_accepted_by_position;
+    out.spec_overlap_sum = st.spec_overlap_sum;
+    out.spec_candidate_mass_sum = st.spec_candidate_mass_sum;
+    out.spec_deterministic_mass_sum = st.spec_deterministic_mass_sum;
     out.spec_draft_ns = st.spec_draft_ns;
     out.spec_verify_ns = st.spec_verify_ns;
     out.prefill_tokens = st.prompt_tokens;
@@ -414,6 +421,11 @@ json timings_of(const Outcome& o) {
     t["spec_steps"] = o.spec_steps;
     t["spec_tested"] = o.spec_tested;
     t["spec_accepted"] = o.spec_accepted;
+    t["spec_tested_by_position"] = o.spec_tested_by_position;
+    t["spec_accepted_by_position"] = o.spec_accepted_by_position;
+    t["spec_overlap_sum"] = o.spec_overlap_sum;
+    t["spec_candidate_mass_sum"] = o.spec_candidate_mass_sum;
+    t["spec_deterministic_mass_sum"] = o.spec_deterministic_mass_sum;
     t["spec_draft_ms"] = static_cast<double>(o.spec_draft_ns) / 1e6;
     t["spec_verify_ms"] = static_cast<double>(o.spec_verify_ns) / 1e6;
   }

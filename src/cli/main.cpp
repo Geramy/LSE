@@ -69,6 +69,7 @@ struct Options {
   // Sequences to decode in one engine. 1 keeps the single-session Generator,
   // which is the path every baseline was taken on.
   std::int32_t batch = 1;
+  runtime::PrefillBatch prefill;
   // Blocks one attention layer's KV pool may hold. 0 sizes it so nothing is
   // ever preempted.
   std::int32_t kv_blocks = 0;
@@ -109,6 +110,9 @@ void usage() {
       "                         this build can load each one, and exit\n"
       "      --kv-cache-dtype TYPE  fp32, fp16, bf16, fp8, bf8\n"
       "                           default: bf16 for BF16 models, fp16 otherwise\n"
+      "      --batch-size N   prompt token batch limit (default 1024)\n"
+      "      --ubatch-size N  tokens per physical prefill pass (default 1024)\n"
+      "                       powers of two from 128 to 4096; ubatch <= batch\n"
       "      --kv-len N         allocate the KV cache for N tokens and keep\n"
       "                         that shape (default: max(2*train_seq, 2048))\n"
       "  -b, --batch N          decode N copies of the prompt as one batch,\n"
@@ -253,6 +257,15 @@ bool parse(int argc, char** argv, Options* opt) {
       auto parsed = kv::cache_dtype_from_string(v);
       if (!parsed.ok()) { std::fprintf(stderr, "lse: %s\n", std::string(parsed.status().message()).c_str()); return false; }
       opt->kv_cache_dtype = v;
+    } else if (a == "--batch-size" || a == "--ubatch-size") {
+      if (!take_value(argc, argv, i, a.c_str(), &v)) return false;
+      auto& size = a == "--batch-size" ? opt->prefill.batch_size : opt->prefill.ubatch_size;
+      const auto parsed = std::from_chars(v.data(), v.data() + v.size(), size);
+      if (parsed.ec != std::errc{} || parsed.ptr != v.data() + v.size() ||
+          !runtime::PrefillBatch::valid_size(size)) {
+        std::fputs("lse: prefill batch size must be a power of two from 128 to 4096\n", stderr);
+        return false;
+      }
     } else if (a == "--kv-len") {
       if (!take_value(argc, argv, i, "--kv-len", &v)) return false;
       opt->kv_len = std::atoi(v.c_str());
@@ -265,6 +278,11 @@ bool parse(int argc, char** argv, Options* opt) {
     } else {
       positional.push_back(a);
     }
+  }
+
+  if (!opt->prefill.valid()) {
+    std::fputs("lse: --ubatch-size must not exceed --batch-size\n", stderr);
+    return false;
   }
 
   if (opt->token_ids && (opt->batch != 1 || !opt->prompts.empty())) {
@@ -771,7 +789,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "dflash2: block %u from %s\n",
                  dflash2->block_size(), opt.dflash2_model.c_str());
   }
-  runtime::Generator gen(*lm, opt.sampling);
+  runtime::Generator gen(*lm, opt.sampling, opt.prefill);
   if (mtp != nullptr) gen.use_mtp(*mtp);
   if (dflash2 != nullptr) gen.use_dflash2(*dflash2);
   auto stream = tok->stream();

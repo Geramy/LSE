@@ -68,8 +68,8 @@ struct ShortTileRule {
 };
 inline constexpr std::array kShortTileRules{
     ShortTileRule{4, 4, 8192, 4, true},
-    ShortTileRule{5, 8, 8192, 4},
-    ShortTileRule{4, 8, 16384, 4},
+    ShortTileRule{5, 8, 8192, 4, true},
+    ShortTileRule{4, 8, 16384, 4, true},
 };
 
 [[nodiscard]] constexpr std::uint32_t short_query_tile(std::uint32_t rows,

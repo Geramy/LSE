@@ -11,6 +11,7 @@
 #include <string>
 
 #include "lse/core/status.hpp"
+#include "lse/runtime/prefill_batch.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/dflash2.hpp"
@@ -30,6 +31,7 @@ struct ServerOptions {
   // Refused above this, so one request cannot take the whole KV pool.
   std::int32_t max_tokens_cap = 4096;
   std::uint32_t mtp_depth = 3;
+  runtime::PrefillBatch prefill;
 };
 
 class HttpServer {

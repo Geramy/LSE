@@ -10,6 +10,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/hybrid_lm.hpp"
+#include "lse/runtime/sampler.hpp"
 
 namespace lse::model {
 
@@ -32,6 +33,16 @@ struct DFlash2Config {
 Result<std::vector<std::uint32_t>> dflash2_select_path(
     std::span<const float> scores, std::span<const std::uint32_t> candidates,
     std::uint32_t positions, std::uint32_t top_k);
+
+struct DFlash2Proposal {
+  std::vector<std::uint32_t> tokens;
+  std::vector<runtime::DiscreteDistribution> conditionals;
+};
+
+Result<DFlash2Proposal> dflash2_sample_path(
+    std::span<const float> scores, std::span<const std::uint32_t> candidates,
+    std::uint32_t positions, std::uint32_t top_k, std::uint32_t vocab_size,
+    float temperature, runtime::SpeculativeSampler& sampler);
 
 // hidden [B,T,D], dynamic [B,T,2,D/group], base [2,D].
 graph::Array dflash2_convolve(const graph::Array& hidden,
@@ -58,6 +69,10 @@ class DFlash2Module {
   Result<std::vector<std::uint32_t>> draft(std::uint32_t anchor,
                                           std::int32_t first,
                                           std::uint32_t proposals);
+
+  Result<DFlash2Proposal> draft_sampled(std::uint32_t anchor,
+      std::int32_t first, std::uint32_t proposals, float temperature,
+      runtime::SpeculativeSampler& sampler);
 
  private:
   struct Impl;

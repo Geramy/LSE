@@ -1127,7 +1127,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   for (const auto& group : cache_.program.groups())
     for (const auto& node : group.nodes)
       if (node->prim && (node->prim->name() == "attention.decode_partial128.wg128c2.v3" ||
-                         node->prim->name() == "attention.short_partial128.wg128c2.v3"))
+                         node->prim->name() == "attention.short_partial128.wg128c2.v4"))
         cache_.split_decode_attention = true;
   cache_.tokens = tokens;
   cache_.hidden = y;

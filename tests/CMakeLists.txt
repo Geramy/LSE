@@ -12,6 +12,7 @@ function(lse_add_test name)
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endfunction()
 
+lse_add_test(test_speculative_sampler lse_sampling)
 lse_add_test(test_generation_stats)
 lse_add_test(test_mtp_options)
 lse_add_test(test_http_timings)

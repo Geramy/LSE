@@ -6,6 +6,7 @@
 // distributions for the same settings.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -28,6 +29,37 @@ struct SamplingParams {
   std::uint64_t seed = 0;
 };
 
+struct DiscreteDistribution {
+  std::vector<std::uint32_t> ids;
+  std::vector<double> probabilities;
+  [[nodiscard]] double probability(std::uint32_t token) const noexcept;
+};
+
+struct ProposalVerification {
+  std::uint32_t token = 0;
+  bool accepted = false;
+};
+
+[[nodiscard]] Result<std::uint32_t> sample_distribution(
+    const DiscreteDistribution&, double uniform);
+[[nodiscard]] Result<ProposalVerification> verify_proposal(
+    const DiscreteDistribution& target, const DiscreteDistribution& proposal,
+    std::uint32_t drafted_token, double acceptance_uniform,
+    double residual_uniform);
+
+class SpeculativeSampler {
+ public:
+  explicit SpeculativeSampler(std::uint64_t seed) noexcept { reseed(seed); }
+  void reseed(std::uint64_t seed) noexcept;
+  [[nodiscard]] Result<std::uint32_t> sample_proposal(const DiscreteDistribution&);
+  [[nodiscard]] Result<std::uint32_t> sample_target(const DiscreteDistribution&);
+  [[nodiscard]] Result<ProposalVerification> verify(
+      const DiscreteDistribution& target, const DiscreteDistribution& proposal,
+      std::uint32_t drafted_token);
+ private:
+  std::uint64_t draft_state_ = 0, accept_state_ = 0, residual_state_ = 0;
+};
+
 class Sampler {
  public:
   explicit Sampler(SamplingParams params) noexcept;
@@ -38,10 +70,22 @@ class Sampler {
   [[nodiscard]] std::uint32_t sample(std::span<float> logits,
                                      std::span<const std::uint32_t> history);
 
+  // Applies the same transforms as sample() without consuming its RNG.
+  [[nodiscard]] Result<DiscreteDistribution> distribution(
+      std::span<float> logits, std::span<const std::uint32_t> history);
+
   [[nodiscard]] const SamplingParams& params() const noexcept { return params_; }
   void reseed(std::uint64_t seed) noexcept { state_ = mix_seed(seed); }
 
  private:
+  struct PreparedWeights {
+    std::size_t keep = 0;
+    double total = 0;
+    bool indexed = false, point_mass = false;
+    std::uint32_t token = 0;
+  };
+  [[nodiscard]] PreparedWeights prepare_weights(
+      std::span<float> logits, std::span<const std::uint32_t> history);
   [[nodiscard]] static std::uint64_t mix_seed(std::uint64_t seed) noexcept;
   [[nodiscard]] float next_uniform() noexcept;
 

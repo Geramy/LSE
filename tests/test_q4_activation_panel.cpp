@@ -23,7 +23,7 @@ using namespace lse::graph;
 namespace {
 constexpr auto kProducer = "quant_activation.q4_shared_panel.v1";
 constexpr auto kConsumer = "quant_linear.q4_global_panel.v1";
-constexpr auto kRows8Consumer = "quant_linear.q4_global_panel.rows8.v1";
+constexpr auto kRows8Consumer = "quant_linear.q4_global_panel.rows8.v2";
 using Projection = std::array<std::size_t, 2>;
 constexpr std::array kFFNProjections{Projection{17408, 5120},
                                      Projection{5120, 17408}};
@@ -356,7 +356,12 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
                                 {6, 6144, 5120},
                                 {6, 12288, 5120},
                                 {6, 5120, 6144},
-                                {6, 248320, 5120}}) {
+                                {6, 248320, 5120},
+                                {8, 17408, 5120},
+                                {8, 5120, 17408},
+                                {8, 10240, 5120},
+                                {8, 6144, 5120},
+                                {8, 5120, 6144}}) {
     auto out = contraction(leaf({1, dimensions[0], dimensions[2]}, DType::kF32),
                            dimensions[1], dimensions[2]);
     std::vector<Shape> input_shapes;
@@ -376,8 +381,14 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     auto original_shape = invocation;
     original_shape.inputs = invocation.inputs.first(4);
     original_shape.input_dtypes = invocation.input_dtypes.first(4);
-    const bool adjacent = dimensions[0] == 4 && dimensions[2] == 5120 &&
-        (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144);
+    const bool adjacent =
+        (dimensions[0] == 4 && dimensions[2] == 5120 &&
+         (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144)) ||
+        (dimensions[0] == 8 &&
+         ((dimensions[2] == 5120 &&
+           (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144)) ||
+          (dimensions[1] == 5120 &&
+           (dimensions[2] == 17408 || dimensions[2] == 6144))));
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
                   adjacent ? 2u : 1u);
     const auto *consumer =
@@ -391,7 +402,8 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
         auto original = invocation;
         original.inputs = invocation.inputs.first(4);
         original.input_dtypes = invocation.input_dtypes.first(4);
-        LSE_EXPECT_EQ(lse::kernels::dot4_schedule(original).k_splits, 1u);
+        if (dimensions[0] != 8)
+          LSE_EXPECT_EQ(lse::kernels::dot4_schedule(original).k_splits, 1u);
         LSE_EXPECT_EQ(dispatch::q4_shared_panel_rows(original), 8u);
         LSE_EXPECT_EQ(selected->plan(invocation).workgroup_count[1], 1u);
       }
