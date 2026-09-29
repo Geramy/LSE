@@ -57,6 +57,11 @@ namespace lse::dispatch {
       if (inputs.size() == 5) {
         mix(implementation_id("quant.shared_activation_panel.v1"));
         mix(plan.shared_activation_panel);
+        const auto load_chunks = q4_shared_panel_load_chunks(quant_probe);
+        if (load_chunks != 1) {
+          mix(implementation_id("quant.panel-adjacent-loads.v1"));
+          mix(load_chunks);
+        }
       }
       if (inputs.size() == 7) {
         const auto packed = q8_packed_matrix_plan(probe);

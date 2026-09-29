@@ -54,6 +54,12 @@ struct QuantPlan {
 }
 
 [[nodiscard]] QuantPlan quant_plan(const graph::KernelShapes&, bool indexed = false);
+[[nodiscard]] inline std::uint32_t q4_shared_panel_load_chunks(
+    const graph::KernelShapes& s) {
+  const auto* rule = q4_shared_panel_rule(s);
+  return rule && quant_plan(s).shared_activation_panel ? rule->load_chunks : 1;
+}
+
 [[nodiscard]] const math::MatrixCoreRow* linear_matrix_row(const graph::KernelShapes&);
 
 inline constexpr std::uint32_t kTableRevision = 1;

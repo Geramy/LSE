@@ -49,35 +49,76 @@ void emit_run_dot(env::Emit &e, const Args &a,
                   const kir::Val<kir::u32> &chunk0, std::uint32_t count,
                   std::span<const kir::LValue<kir::f32>> acc, std::uint32_t cpg,
                   const kir::Val<kir::u32> &row, std::uint32_t m,
-                  std::uint32_t k) {
+                  std::uint32_t k, std::uint32_t load_chunks) {
   std::vector<kir::LValue<kir::f32>> facc;
   facc.reserve(acc.size());
   for (std::size_t r = 0; r < acc.size(); ++r)
     facc.push_back(e.var(e.f32(0.0f)));
   const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
-  for (auto uu : e.unroll(count)) {
-    const auto chunk = e.let(chunk0 + uu);
-    const auto word = e.let(words[uu]);
-    std::array<kir::Val<kir::u32>, 2> planes;
-    for (std::size_t p = 0; p < 2; ++p) {
-      planes[p] = quant::dot4_code_plane(e, word, static_cast<int>(p));
-    }
-    for (std::size_t r = 0; r < acc.size(); ++r) {
-      const auto input_row =
-          e.let(select(row + static_cast<std::uint32_t>(r) < m,
-                       row + static_cast<std::uint32_t>(r), e.u32(0)));
-      const auto panel_base = e.let(input_row * ((k / 64u) * 25u));
-      const auto codes = e.load(a.panel, e.let(panel_base + chunk * 2u), 8u);
-      auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
-      for (std::size_t p = 0; p < 2; ++p) {
-        const auto x = e.let(codes[static_cast<int>(p)]);
-        iacc = math::dot4_iu8(kir::cast<kir::i32>(x),
-                              kir::cast<kir::i32>(planes[p]), iacc.read());
+  if (load_chunks == 2 && count % 2 == 0) {
+    for (std::uint32_t first = 0; first < count; first += 2) {
+      std::vector<kir::Pack<kir::u32>> code_pairs;
+      std::vector<kir::Pack<kir::u32>> step_pairs;
+      code_pairs.reserve(acc.size());
+      step_pairs.reserve(acc.size());
+      const auto first_chunk = e.let(chunk0 + first);
+      for (std::size_t r = 0; r < acc.size(); ++r) {
+        const auto input_row =
+            e.let(select(row + static_cast<std::uint32_t>(r) < m,
+                         row + static_cast<std::uint32_t>(r), e.u32(0)));
+        const auto panel_base = e.let(input_row * ((k / 64u) * 25u));
+        code_pairs.push_back(
+            e.load(a.panel, e.let(panel_base + first_chunk * 2u), 16u));
+        step_pairs.push_back(
+            e.load(a.panel, e.let(panel_base + k / 4u + first_chunk), 8u));
       }
-      const auto step = e.let(
-          math::from_bits<lse::f32>(a.panel[panel_base + k / 4u + chunk]));
-      facc[r] =
-          math::fma(step, kir::cast<kir::f32>(iacc.read()), facc[r].read());
+      for (std::uint32_t j = 0; j < 2; ++j) {
+        const auto word = e.let(words[static_cast<int>(first + j)]);
+        std::array<kir::Val<kir::u32>, 2> planes;
+        for (std::size_t plane = 0; plane < 2; ++plane)
+          planes[plane] =
+              quant::dot4_code_plane(e, word, static_cast<int>(plane));
+        for (std::size_t r = 0; r < acc.size(); ++r) {
+          auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
+          for (std::size_t plane = 0; plane < 2; ++plane) {
+            const auto x =
+                e.let(code_pairs[r][static_cast<int>(j * 2u + plane)]);
+            iacc = math::dot4_iu8(kir::cast<kir::i32>(x),
+                                  kir::cast<kir::i32>(planes[plane]),
+                                  iacc.read());
+          }
+          const auto step = e.let(
+              math::from_bits<lse::f32>(step_pairs[r][static_cast<int>(j)]));
+          facc[r] = math::fma(step, kir::cast<kir::f32>(iacc.read()),
+                              facc[r].read());
+        }
+      }
+    }
+  } else {
+    for (auto uu : e.unroll(count)) {
+      const auto chunk = e.let(chunk0 + uu);
+      const auto word = e.let(words[uu]);
+      std::array<kir::Val<kir::u32>, 2> planes;
+      for (std::size_t p = 0; p < 2; ++p) {
+        planes[p] = quant::dot4_code_plane(e, word, static_cast<int>(p));
+      }
+      for (std::size_t r = 0; r < acc.size(); ++r) {
+        const auto input_row =
+            e.let(select(row + static_cast<std::uint32_t>(r) < m,
+                         row + static_cast<std::uint32_t>(r), e.u32(0)));
+        const auto panel_base = e.let(input_row * ((k / 64u) * 25u));
+        const auto codes = e.load(a.panel, e.let(panel_base + chunk * 2u), 8u);
+        auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
+        for (std::size_t p = 0; p < 2; ++p) {
+          const auto x = e.let(codes[static_cast<int>(p)]);
+          iacc = math::dot4_iu8(kir::cast<kir::i32>(x),
+                                kir::cast<kir::i32>(planes[p]), iacc.read());
+        }
+        const auto step = e.let(
+            math::from_bits<lse::f32>(a.panel[panel_base + k / 4u + chunk]));
+        facc[r] =
+            math::fma(step, kir::cast<kir::f32>(iacc.read()), facc[r].read());
+      }
     }
   }
   const auto group = e.let(chunk0 / cpg);
@@ -107,7 +148,8 @@ void emit_bias(env::Emit &e, const Args &a,
   }
 }
 
-std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule) {
+std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule,
+                       std::uint32_t load_chunks) {
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   const auto k =
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
@@ -152,13 +194,13 @@ std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule) {
         for (auto c0 : e.range(cb, cb + aligned, span)) {
           const auto chunk0 = e.let(c0 + lane * cpl);
           emit_run_dot(e, a, row_base, scale_base, chunk0, cpl, accs,
-                       chunks_per_group, row, m, k);
+                       chunks_per_group, row, m, k, load_chunks);
         }
         if (aligned < ntile) {
           for (auto chunk :
                e.range(e.u32(cb + aligned) + lane, e.u32(ce), wave))
             emit_run_dot(e, a, row_base, scale_base, chunk, 1, accs,
-                         chunks_per_group, row, m, k);
+                         chunks_per_group, row, m, k, load_chunks);
         }
         emit_bias(e, a, scale_base, lane, cb / chunks_per_group,
                   ce / chunks_per_group, wave, accs, row, m, k);
@@ -227,7 +269,9 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
       return kernel ? kernel->emit_kernel(original) : std::string{};
     }
     const auto schedule = schedule_for(original);
-    return schedule.valid() ? emit_panel(s, schedule) : std::string{};
+    return schedule.valid()
+        ? emit_panel(s, schedule, dispatch::q4_shared_panel_load_chunks(original))
+        : std::string{};
   }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     if (!valid_panel(s))

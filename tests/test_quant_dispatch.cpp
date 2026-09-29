@@ -316,4 +316,36 @@ LSE_TEST(q4_generic_prefill_projections_use_the_same_continuous_range) {
   }
 }
 
+
+LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
+  for (bool loom : {false, true}) {
+    for (int n : {17408, 10240, 6144}) {
+      Fixture f(4, n, 5120, 4, loom);
+      LSE_EXPECT(f.plan().shared_activation_panel);
+      LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(f.shapes), 2u);
+      for (int fault = 0; fault < 9; ++fault) {
+        Fixture declined(4, n, 5120, 4, loom);
+        if (fault == 0) declined.device.arch = "gfx1200";
+        if (fault == 1) declined.device.wavefront_size = 64;
+        if (fault == 2) declined.amd.has_dot4_iu8 = false;
+        if (fault == 3) declined.device.max_threads_per_workgroup = 255;
+        if (fault == 4) declined.shapes.staged = {"caller", 5120};
+        if (fault == 5) declined.shapes.staged_quant.codes = "caller";
+        if (fault == 6) declined.dtypes[2] = declined.dtypes[3] = DType::kF32;
+        if (fault == 7) declined.intrinsics = {};
+        if (fault == 8) declined.shapes.device = nullptr;
+        LSE_EXPECT(!declined.plan().shared_activation_panel);
+        LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(declined.shapes), 1u);
+      }
+    }
+    for (auto [m, n, k] : {std::array{4, 5120, 17408}, {4, 12288, 5120},
+                           {4, 5120, 6144}, {4, 248320, 5120},
+                           {6, 17408, 5120}, {8, 17408, 5120},
+                           {3, 17408, 5120}, {4, 17, 5120}}) {
+      Fixture unchanged(m, n, k, 4, loom);
+      LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(unchanged.shapes), 1u);
+    }
+  }
+}
+
 LSE_TEST_MAIN()

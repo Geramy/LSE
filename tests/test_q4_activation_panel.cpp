@@ -373,6 +373,13 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     invocation.device = &device;
     invocation.intrinsics = &loom_intrinsics;
     invocation.types = backend::loom_types();
+    auto original_shape = invocation;
+    original_shape.inputs = invocation.inputs.first(4);
+    original_shape.input_dtypes = invocation.input_dtypes.first(4);
+    const bool adjacent = dimensions[0] == 4 && dimensions[2] == 5120 &&
+        (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144);
+    LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
+                  adjacent ? 2u : 1u);
     const auto *consumer =
         dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);
     LSE_EXPECT(consumer != nullptr);
