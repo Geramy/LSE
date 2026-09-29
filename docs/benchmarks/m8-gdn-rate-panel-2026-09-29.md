@@ -36,3 +36,12 @@ The first registered check was run inside the workspace sandbox and failed befor
 This is a component gain. Baseline, MTP and DFlash2 token throughput have not been remeasured for this table entry. The previous v0.4.14 comparison remains explicitly scoped to source c11f103 and its measured binary. No additional perplexity run is added for this bit-identical schedule selection.
 
 Local evidence is stored under build/release/pi-performance/m8-rate-panel-component: source/code-object hashes, resource census, raw CP samples, timing distributions, graph proof, coherent build and CPU logs, registered emission identity and native loader/output logs. Bundled HSA, HRX and Loom hashes match the earlier successful native probe. The accepted v0.4.14 executable is preserved in its release artifact directory.
+
+## Later HTTP qualification
+
+The final v0.4.15 source (`cb285b1`) also includes release-owned cache identities.
+A later matching DFlash2 HTTP pair passes exact responses and acceptance statistics,
+with zero host groups/fallbacks. Its resident request measures 616.38 PP/s and
+43.05 TPS, compared with 616.78 PP/s and 42.41 TPS in the preceding v0.4.14 pair.
+This is a single pair; baseline and MTP=3 were not rerun. See the
+[HTTP report](m8-gdn-http-2026-09-29.md) for the separate scope and binary identity.

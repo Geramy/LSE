@@ -40,13 +40,15 @@ remain active. Floating-point accumulation remains FP32.
 M8 GDN alpha and beta projections now reuse the activation panel shared by QKV
 and the GDN gate. Their preparation-inclusive paired GPU time falls from
 0.0500 to 0.0249 ms, with complete fused outputs matching exactly. This is a
-component result; token throughput has not been remeasured for this addition.
+component result. The later matched DFlash2 HTTP check measured 616.38 PP/s
+and 43.05 TPS on its resident request, with exact responses and unchanged acceptance.
+See the [v0.4.15 check](docs/benchmarks/m8-gdn-http-2026-09-29.md).
 
 The last same-binary comparison, collected with v0.4.14, measured **624.10 PP/s / 24.73 TPS** for
 baseline, **608.19 PP/s / 48.62 TPS** for MTP=3, and **616.78 PP/s / 42.41 TPS** for
 seven-proposal DFlash2. These are 1024-token coding requests at temperature 0.6.
 They do not establish these rates for every context or Pi conversation. See
-[measured performance](#current-bf16-source-measurements) for cold results and method.
+[measured performance](#measured-performance) for cold results and method.
 
 | Optimization | Evidence |
 | --- | --- |
@@ -354,6 +356,22 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
+
+### v0.4.15 DFlash2 check
+
+Measured source `cb285b1`. One matching cold/resident pair uses the same
+1,024-token requests and sampling settings as the earlier comparison below.
+
+| DFlash2, seven proposals | Prefill tokens/s | Decode tokens/s |
+| --- | ---: | ---: |
+| Cold | 413.74 | 32.01 |
+| Resident | 616.38 | 43.05 |
+
+Both complete responses and acceptance statistics match v0.4.14. There are zero
+host groups, fallbacks or reused prompt KV tokens. The new release cache namespace
+is verified. The resident decode difference is about +1.5% in this single pair.
+It is not a statistical result or a long-context Pi guarantee. Baseline and MTP=3
+were not rerun for this addition. See the [HTTP check](docs/benchmarks/m8-gdn-http-2026-09-29.md).
 
 ### Last same-binary BF16 measurements
 

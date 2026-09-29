@@ -25,3 +25,15 @@ Full-width conditional DFlash2 sampling, completed prefill workspace retirement,
 The macOS archive bundles HSA, HRX, Loom and its runtime dependency closure. Use `bin/lse` or `bin/lse-server`; install and activate MacAMDGPU separately. Linux uses the bundled HRX/Loom runtimes and compatible installed ROCm/HSA. Each archive includes a source/runtime manifest and checksum.
 
 K/V defaults to model-declared BF16 for BF16 checkpoints and FP16 otherwise, with explicit overrides. Batch/ubatch 1,024 and seven-proposal DFlash2 remain defaults. `--temperature` sets the server default; request settings take precedence. Launch examples use 0.6.
+
+### Later v0.4.15 DFlash2 snapshot
+
+Source `cb285b136fbb7d45b23ce4d0ffc7f0dfb0a4d665`, local server SHA256
+`b78f36a45355f5cade9bf5b960f5080e5e6607fc3e86e5eccd14a79c8795329f`.
+One matching DFlash2 cold/resident pair measures 413.74 PP/s / 32.01 TPS cold
+and 616.38 PP/s / 43.05 TPS resident. Complete responses and acceptance statistics
+match v0.4.14; zero host groups/fallbacks and zero prompt KV reuse. The real GPU
+cache uses the release namespace. Resident decode differs by about +1.5% in one
+pair, not a statistical estimate or long-context Pi guarantee. Baseline/MTP were
+not rerun; their table above remains explicitly the older v0.4.14 snapshot.
+See `docs/benchmarks/m8-gdn-http-2026-09-29.md`.
