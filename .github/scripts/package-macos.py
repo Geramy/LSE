@@ -158,9 +158,11 @@ def main():
     (package / 'licenses/rust-dependencies.json').write_text(json.dumps(rust_notices, indent=2) + '\n')
     shutil.copy2(root / 'README.md', package / 'README.md')
     (package / 'docs').mkdir()
-    for doc_name in ('KV-STORAGE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md'):
+    for doc_name in ('KV-STORAGE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md', 'RELEASE_HISTORY.md'):
         shutil.copy2(root / 'docs' / doc_name, package / 'docs' / doc_name)
     (package / 'docs' / 'benchmarks').mkdir()
+    shutil.copy2(root / 'docs/benchmarks/q4-prefill-2026-09-30.md',
+                 package / 'docs/benchmarks/q4-prefill-2026-09-30.md')
     shutil.copy2(root / 'docs/benchmarks/attention-vector-staging-2026-09-29.md',
                  package / 'docs/benchmarks/attention-vector-staging-2026-09-29.md')
     shutil.copy2(root / 'docs/benchmarks/automatic-split-2026-09-29.md',
