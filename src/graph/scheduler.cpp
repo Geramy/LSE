@@ -1529,6 +1529,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       place_span.close();
 
       bool launched_phase = true;
+      std::vector<FusionGroup> partial_launches;
       std::size_t done = 0;
       for (const FusionGroup& g : staged_groups) {
         const std::uint32_t gi = static_cast<std::uint32_t>(done);
@@ -1624,9 +1625,11 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           if (each.ok()) {
             st = OkStatus();
           } else {
-            trace_.device_groups -= static_cast<std::uint32_t>(split.size());
-            trace_.kernels_launched -= static_cast<std::uint32_t>(split.size());
-            split.clear();
+            // These members already ran even though a later member failed.
+            // Keep their storage and replay coverage with the launched prefix.
+            for (const auto& one : split)
+              trace_.nodes_evaluated += static_cast<std::uint32_t>(one.nodes.size());
+            partial_launches = std::move(split);
           }
         }
         if (st.ok() && impl_->plan.record_after[gi] != 0) {
@@ -1693,6 +1696,35 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       ran.assign(staged_groups.begin(),
                  staged_groups.begin() + static_cast<std::ptrdiff_t>(done));
     }
+    for (auto& group : partial_launches) ran.push_back(std::move(group));
+
+    // Slot reuse was proved against the phase schedule. Repartitioning can
+    // move independent producers earlier or fuse them into one launch, so
+    // its pending outputs cannot keep the old schedule's shared allocations.
+    // Drain every member before rebinding: the successful prefix may still
+    // be running on another stream, including a partly dispatched joined run.
+    LSE_RETURN_IF_ERROR(drain());
+    std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
+    const auto remaining = Partitioner::unmaterialized(roots);
+    for (const auto& node : remaining) {
+      if (node->fclass == FusionClass::kLeaf ||
+          buffer_allocation_owner(node.get()) != node.get()) continue;
+      FusionGroup one;
+      one.nodes = {node};
+      one.inputs = node->inputs;
+      const auto member = member_for(one);
+      const auto stream = devices_.stream_for(member).value_or(backend::kDefaultStream);
+      LSE_ASSIGN_OR(auto fresh, devices_.device(member).allocate(
+          dtype_storage_bytes(node->dtype, node->element_count()),
+          backend::MemoryClass::kDevice, stream));
+      node->buffer = std::move(fresh);
+      node->host_mirror.clear();
+      node->host_dirty = false;
+      node->device_dirty = false;
+    }
+    // Views and inplace results can already have bindings from slot setup.
+    // Refresh them after all new owners exist, before fallback placement.
+    LSE_RETURN_IF_ERROR(refresh_buffer_aliases(remaining));
   }
 
   // Already-closed is a no-op, so a failed device-first attempt contributes its

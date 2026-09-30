@@ -43,6 +43,8 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/jit.hpp"
+#include "lse/graph/program.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/primitive.hpp"
 #include "lse/graph/primitive_library.hpp"
@@ -6159,3 +6161,123 @@ LSE_TEST(resource_reader_rejects_missing_and_truncated_target_values) {
   }
 }
 #endif  // !LSE_HAVE_COMGR
+
+namespace {
+struct RepartitionCaptureCompiler final : IKernelCompiler {
+  Result<CompiledKernel> compile(std::string_view, std::string_view) const override {
+    CompiledKernel kernel;
+    kernel.code.push_back(std::byte{1});
+    return kernel;
+  }
+  bool available() const override { return true; }
+  std::string identity() const override { return "repartition-storage-test-v1"; }
+};
+struct RepartitionCaptureDevice : backend::CpuBackend {
+  mutable backend::HipEmitter emitter;
+  mutable RepartitionCaptureCompiler compiler;
+  mutable KernelToolchain chain{Dialect::kHip, &emitter, &compiler};
+  backend::DeviceInfo info = gfx1151();
+  unsigned launches = 0, fail_at = 0, fail_again = 0, failures = 0, drains = 0;
+  const backend::DeviceInfo& device_info() const noexcept { return info; }
+  std::span<const KernelToolchain> toolchains() const noexcept { return {&chain, 1}; }
+  Result<backend::KernelHandle> load_executable(std::string_view name,
+                                               std::span<const std::byte>) {
+    return backend::KernelHandle{1, 0, std::string(name)};
+  }
+  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
+                const backend::DispatchArgs&, const backend::DispatchTarget&) {
+    if (++launches == fail_at || launches == fail_again) {
+      ++failures;
+      return LSE_ERROR(kUnimplemented, "intentional phase submission failure");
+    }
+    return OkStatus();
+  }
+  Status synchronize() { ++drains; return OkStatus(); }
+};
+}  // namespace
+
+LSE_TEST(repartitioned_phase_preserves_live_output_storage) {
+  for (bool replay : {false, true}) {
+    backend::BackendAdapter<RepartitionCaptureDevice> backend;
+    LSE_EXPECT_OK(backend.init(0));
+    Scheduler scheduler(backend);
+    scheduler.set_dialect(Dialect::kHip);
+    auto leaf = [&](Shape shape) {
+      auto buffer = backend.allocate(shape.elem_count() * sizeof(float),
+          backend::MemoryClass::kDevice, backend::kDefaultStream);
+      LSE_EXPECT_OK(buffer.status());
+      std::fill_n(static_cast<float*>(buffer->ptr), shape.elem_count(), 0.25f);
+      return Array::from_buffer(std::move(*buffer), shape, DType::kF32);
+    };
+    auto x = leaf({1, 32}), wa = leaf({16, 32}), wb = leaf({16, 32});
+    auto gain = leaf({16});
+    auto a = linear(x, wa);
+    auto norm = rms_norm(transpose(reshape(a, {1, 1, 1, 16}), {0, 2, 1, 3}), gain, 1e-6f);
+    auto front = silu(slice(norm, -1, 0, 4));
+    auto joined = concat({front, slice(norm, -1, 4, 16)}, -1);
+    auto b = linear(x, wb);
+    auto result = add(joined, transpose(reshape(b, {1, 1, 1, 16}), {0, 2, 1, 3}));
+    const NodePtr roots[]{result.node()};
+    Program program;
+    if (replay) {
+      LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
+      program.reset_compute();
+    }
+    backend.impl().fail_at = backend.impl().launches + 1;
+    const auto previous_drains = backend.impl().drains;
+    LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
+    LSE_EXPECT_EQ(backend.impl().failures, 1u);
+    LSE_EXPECT(backend.impl().drains > previous_drains);
+    LSE_EXPECT(!buffer_bindings_may_alias(*a.node(), *b.node()));
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    std::size_t covered = 0;
+    for (const auto& group : program.groups())
+      for (const auto& node : group.nodes)
+        if (node == a.node() || node == b.node()) ++covered;
+    LSE_EXPECT_EQ(covered, 2u);
+  }
+}
+
+LSE_TEST(repartition_retains_successful_members_of_a_partly_failed_join) {
+  for (bool replay : {false, true}) {
+    backend::BackendAdapter<RepartitionCaptureDevice> backend;
+    LSE_EXPECT_OK(backend.init(0));
+    Scheduler scheduler(backend);
+    scheduler.set_dialect(Dialect::kHip);
+    auto leaf = [&](Shape shape) {
+      auto buffer = backend.allocate(shape.elem_count() * sizeof(float),
+          backend::MemoryClass::kDevice, backend::kDefaultStream);
+      LSE_EXPECT_OK(buffer.status());
+      std::fill_n(static_cast<float*>(buffer->ptr), shape.elem_count(), 0.25f);
+      return Array::from_buffer(std::move(*buffer), shape, DType::kF32);
+    };
+    auto x = leaf({1, 32}), wa = leaf({128, 32}), wb = leaf({128, 32});
+    auto a = linear(x, wa), b = linear(x, wb);
+    auto result = add(a, b);
+    const NodePtr roots[]{result.node()};
+    Program program;
+    if (replay) {
+      LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
+      program.reset_compute();
+    }
+    // Decline the joined submission, accept its first separate member, then
+    // decline the second. Repartition must retain the member already issued.
+    backend.impl().fail_at = backend.impl().launches + 1;
+    backend.impl().fail_again = backend.impl().launches + 3;
+    LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
+    LSE_EXPECT_EQ(backend.impl().failures, 2u);
+    std::size_t a_count = 0, b_count = 0;
+    for (const auto& group : program.groups())
+      for (const auto& node : group.nodes) {
+        if (node == a.node()) ++a_count;
+        if (node == b.node()) ++b_count;
+      }
+    LSE_EXPECT_EQ(a_count, 1u);
+    LSE_EXPECT_EQ(b_count, 1u);
+    LSE_EXPECT_EQ(scheduler.last_trace().device_groups, 2u);
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    program.reset_compute();
+    LSE_EXPECT(!a.node()->materialized && !b.node()->materialized);
+    LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
+  }
+}
