@@ -4,6 +4,7 @@
 #include <unordered_map>
 
 #include "lse/graph/interpreter.hpp"
+#include "lse/graph/view.hpp"
 
 namespace lse::graph {
 
@@ -257,6 +258,22 @@ std::uint64_t FusionGroup::emission_signature() const {
     const auto name = node->prim ? node->prim->name() : std::string_view{};
     mix(name.size());
     for (unsigned char c : name) mix(c);
+  }
+  // Phase lowering resolves boundary views to their allocation owners. The
+  // producer graph is outside this kernel, but shared-owner relationships
+  // still determine which binding each operand names.
+  std::unordered_map<const Node*, std::uint64_t> owners;
+  std::vector<std::uint64_t> ownership;
+  bool shared = false;
+  for (const Node* node : identified) {
+    const Node* owner = buffer_allocation_owner(node);
+    const auto [it, inserted] = owners.emplace(owner, owners.size() + 1);
+    ownership.push_back(it->second);
+    shared |= !inserted;
+  }
+  if (shared) {
+    mix(0x6f776e6572732e31ull);  // owners.1
+    for (auto owner : ownership) mix(owner);
   }
   return hash;
 }

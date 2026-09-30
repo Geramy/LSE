@@ -404,6 +404,44 @@ LSE_TEST(hip_cache_identity_preserves_operand_wiring) {
   }
 }
 
+LSE_TEST(hip_phase_cache_preserves_boundary_view_ownership) {
+  const auto make_group = [](bool reverse) {
+    auto leaf = [] {
+      auto node = std::make_shared<Node>();
+      node->shape = {1, 128};
+      node->dtype = DType::kF32;
+      node->materialized = true;
+      return Array(node);
+    };
+    Array a = leaf(), b = leaf();
+    Array first = reshape(a, {128});
+    Array second = reshape(reverse ? b : a, {128});
+    Array third = reshape(reverse ? a : b, {128});
+    Array output = first - second;
+    FusionGroup group;
+    group.inputs = {first.node(), second.node(), third.node()};
+    group.nodes = {output.node()};
+    group.outputs = {output.node()};
+    group.anchor = output.node()->kind;
+    group.anchor_class = output.node()->fclass;
+    group.is_phase = true;
+    return group;
+  };
+  const auto normal = make_group(false), changed = make_group(true);
+  backend::HipEmitter reused;
+  LSE_EXPECT(reused.cache_key(normal, gfx1151()) != reused.cache_key(changed, gfx1151()));
+  const auto first = reused.emit(normal, gfx1151());
+  const auto warm = reused.emit(changed, gfx1151());
+  const auto fresh = backend::HipEmitter{}.emit(changed, gfx1151());
+  LSE_EXPECT_OK(first.status());
+  LSE_EXPECT_OK(warm.status());
+  LSE_EXPECT_OK(fresh.status());
+  if (first.ok() && warm.ok() && fresh.ok()) {
+    LSE_EXPECT(first->source != fresh->source);
+    LSE_EXPECT(warm->source == fresh->source);
+  }
+}
+
 LSE_TEST(hip_phases_do_not_assert_disjoint_inplace_bindings) {
   auto leaf = [](Shape shape) {
     auto node = std::make_shared<Node>();
