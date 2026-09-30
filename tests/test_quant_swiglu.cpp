@@ -54,7 +54,7 @@ LSE_TEST(swiglu_pair_replaces_two_projections_and_preserves_root_identity) {
     return;
   LSE_EXPECT(f.result.node() == root && root->shape == Shape{1, 8, 17408});
   LSE_EXPECT(root->prim &&
-             root->prim->name() == "quant_swiglu.q4_shared_panel.v1");
+             root->prim->name() == "quant_swiglu.q4_shared_panel.v2");
   LSE_EXPECT_EQ(root->inputs.size(), 8u);
   LSE_EXPECT(root->inputs[7] == panel);
   const std::array roots{root};
@@ -69,7 +69,7 @@ LSE_TEST(swiglu_pair_fuses_single_token_decode) {
   auto root = f.result.node();
   LSE_EXPECT_EQ(f.run(), 1u);
   LSE_EXPECT(root->prim &&
-             root->prim->name() == "quant_swiglu.q4_shared_panel.v1");
+             root->prim->name() == "quant_swiglu.q4_shared_panel.v2");
   LSE_EXPECT(root->shape == Shape{1, 1, 17408});
   LSE_EXPECT_EQ(root->inputs.size(), 8u);
   LSE_EXPECT(root->inputs[7] == f.gate.node()->inputs[4]);
@@ -174,7 +174,7 @@ LSE_TEST(swiglu_pair_typed_reference_rejects_invalid_buffers_before_access) {
 }
 LSE_TEST(
     swiglu_pair_typed_reference_preserves_signed_codes_and_distinct_weights) {
-  const auto *pair = find_primitive("quant_swiglu.q4_shared_panel.v1");
+  const auto *pair = find_primitive("quant_swiglu.q4_shared_panel.v2");
   LSE_EXPECT(pair != nullptr);
   if (!pair)
     return;

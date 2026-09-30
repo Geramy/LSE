@@ -96,9 +96,9 @@ KernelShapes original(const KernelShapes &s) {
   return t;
 }
 struct Pair final : KernelPrimitive<Pair> {
-  static constexpr std::string_view kName = "quant_swiglu.q4_shared_panel.v1";
+  static constexpr std::string_view kName = "quant_swiglu.q4_shared_panel.v2";
   static constexpr std::string_view kEntry =
-      "lse_quant_swiglu_q4_shared_panel_v1";
+      "lse_quant_swiglu_q4_shared_panel_v2";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 8; }
   bool owns_indexing() const noexcept override { return true; }
@@ -164,7 +164,7 @@ struct Pair final : KernelPrimitive<Pair> {
         if (aligned < ce - cb)
           for (auto c : e.range(e.u32(cb + aligned) + lane, e.u32(ce), 32u))
             dot(e, a, wb, sb, c, 1, ga, ua);
-        for (auto g : e.range(e.u32(cb / 8u) + lane, e.u32(ce / 8u), 32u)) {
+        auto accumulate_bias = [&](auto g) {
           auto gb = e.let(math::widen(a.gb[sb + g]));
           auto ub = e.let(math::widen(a.ub[sb + g]));
           for (std::uint32_t r = 0; r < rows; ++r) {
@@ -174,6 +174,15 @@ struct Pair final : KernelPrimitive<Pair> {
             ga[r] = math::fma(gb, sum, ga[r].read());
             ua[r] = math::fma(ub, sum, ua[r].read());
           }
+        };
+        if (rows == 1 && sched.k_splits == 1) {
+          accumulate_bias(lane);
+          accumulate_bias(e.let(lane + 32u));
+          if (auto tail = e.when(lane < 16u))
+            accumulate_bias(e.let(lane + 64u));
+        } else {
+          for (auto g : e.range(e.u32(cb / 8u) + lane, e.u32(ce / 8u), 32u))
+            accumulate_bias(g);
         }
       }
     }

@@ -13,7 +13,7 @@ std::size_t optimize_quant_swiglu(std::span<const NodePtr> roots,
   if (emitter.dialect() != Dialect::kLoom)
     return 0;
   const auto *pair = dynamic_cast<const KernelPrimitiveBase *>(
-      find_primitive("quant_swiglu.q4_shared_panel.v1"));
+      find_primitive("quant_swiglu.q4_shared_panel.v2"));
   if (!pair)
     return 0;
   const auto sources = emitter.sources();
