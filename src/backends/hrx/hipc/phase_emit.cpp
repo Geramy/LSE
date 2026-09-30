@@ -521,7 +521,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
 
   EmittedKernel out;
   out.pointer_table = false;
-  out.entry_name = "lse_phase_" + std::to_string(group.signature());
+  out.entry_name = "lse_phase_" + std::to_string(group.emission_signature());
   out.constants.add("count", 4);
   bind_phase(group, out);
 

@@ -1,6 +1,7 @@
 #include "lse/graph/graph.hpp"
 
 #include <ostream>
+#include <unordered_map>
 
 #include "lse/graph/interpreter.hpp"
 
@@ -211,6 +212,53 @@ std::uint64_t FusionGroup::signature() const noexcept {
     }
   }
   return h;
+}
+
+std::uint64_t FusionGroup::emission_signature() const {
+  std::uint64_t hash = 1469598103934665603ull;
+  auto mix = [&](std::uint64_t value) { hash ^= value; hash *= 1099511628211ull; };
+  mix(0x65646765732e7631ull);  // edges.v1
+  mix(static_cast<std::uint64_t>(anchor));
+  mix(static_cast<std::uint64_t>(anchor_class));
+  mix(is_phase);
+  std::unordered_map<const Node*, std::uint64_t> ids;
+  std::vector<const Node*> identified;
+  auto identify = [&](const NodePtr& node) {
+    if (!node) return std::uint64_t{0};
+    const auto [it, inserted] = ids.emplace(node.get(), ids.size() + 1);
+    if (inserted) identified.push_back(node.get());
+    return it->second;
+  };
+  auto sequence = [&](const auto& list) {
+    mix(list.size());
+    for (const auto& node : list) mix(identify(node));
+  };
+  sequence(inputs);
+  sequence(nodes);
+  sequence(outputs);
+  for (const auto& node : nodes) sequence(node->inputs);
+  mix(identified.size());
+  for (const Node* node : identified) {
+    mix(static_cast<std::uint64_t>(node->kind));
+    mix(static_cast<std::uint64_t>(node->fclass));
+    mix(static_cast<std::uint64_t>(node->dtype));
+    mix(node->kv_fragments ? 1 : 0);
+    mix(node->shape.rank());
+    for (std::size_t i = 0; i < node->shape.rank(); ++i)
+      mix(static_cast<std::uint64_t>(node->shape.dim(i)));
+    mix(node->iattrs.size());
+    for (auto value : node->iattrs) mix(static_cast<std::uint64_t>(value));
+    mix(node->attrs.size());
+    for (float value : node->attrs) {
+      std::uint32_t bits;
+      __builtin_memcpy(&bits, &value, sizeof(bits));
+      mix(bits);
+    }
+    const auto name = node->prim ? node->prim->name() : std::string_view{};
+    mix(name.size());
+    for (unsigned char c : name) mix(c);
+  }
+  return hash;
 }
 
 }  // namespace lse::graph

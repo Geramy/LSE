@@ -363,6 +363,47 @@ LSE_TEST(quant_linear_small_prefill_uses_the_float_codec) {
   }
 }
 
+LSE_TEST(hip_cache_identity_preserves_operand_wiring) {
+  auto group_for = [](bool reverse, bool phase) {
+    auto leaf = [] {
+      auto node = std::make_shared<Node>();
+      node->shape = {128};
+      node->dtype = DType::kF32;
+      node->materialized = true;
+      return Array(node);
+    };
+    Array a = leaf(), b = leaf();
+    Array result = reverse ? b - a : a - b;
+    FusionGroup group;
+    group.inputs = {a.node(), b.node()};
+    group.nodes = {result.node()};
+    group.outputs = {result.node()};
+    group.anchor = result.node()->kind;
+    group.anchor_class = result.node()->fclass;
+    group.is_phase = phase;
+    return group;
+  };
+  for (bool phase : {false, true}) {
+    backend::HipEmitter reused;
+    const auto normal = group_for(false, phase);
+    const auto reverse = group_for(true, phase);
+    const auto equivalent = group_for(false, phase);
+    LSE_EXPECT_EQ(normal.signature(), reverse.signature());
+    LSE_EXPECT(reused.cache_key(normal, gfx1151()) != reused.cache_key(reverse, gfx1151()));
+    LSE_EXPECT_EQ(reused.cache_key(normal, gfx1151()), reused.cache_key(equivalent, gfx1151()));
+    const auto first = reused.emit(normal, gfx1151());
+    const auto changed = reused.emit(reverse, gfx1151());
+    const auto fresh = backend::HipEmitter{}.emit(reverse, gfx1151());
+    LSE_EXPECT_OK(first.status());
+    LSE_EXPECT_OK(changed.status());
+    LSE_EXPECT_OK(fresh.status());
+    if (!first.ok() || !changed.ok() || !fresh.ok()) continue;
+    LSE_EXPECT(first->source != changed->source);
+    LSE_EXPECT(changed->source == fresh->source);
+    LSE_EXPECT(changed->binding_order.front() == reverse.inputs.front());
+  }
+}
+
 LSE_TEST(hip_phases_do_not_assert_disjoint_inplace_bindings) {
   auto leaf = [](Shape shape) {
     auto node = std::make_shared<Node>();

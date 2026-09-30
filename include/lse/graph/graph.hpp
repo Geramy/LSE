@@ -279,9 +279,12 @@ struct FusionGroup {
   // Whole decode or prefill phase: one staged kernel, not one launch per op.
   bool is_phase = false;
 
-  // Identity of the computation's shape, independent of buffer addresses.
-  // JIT cache key together with the arch string.
+  // Shape summary for graph diagnostics, independent of buffer addresses.
+  // Operand edges are intentionally absent; this cannot identify reusable code.
   [[nodiscard]] std::uint64_t signature() const noexcept;
+  // Reusable code identity includes operand wiring and boundary-node metadata;
+  // signature() remains the compact shape summary used by graph diagnostics.
+  [[nodiscard]] std::uint64_t emission_signature() const;
 };
 
 class Partitioner {

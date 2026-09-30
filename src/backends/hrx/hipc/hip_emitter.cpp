@@ -380,7 +380,9 @@ std::vector<std::string> solo_entry_names(
     one.nodes.push_back(st.node);
     one.outputs.push_back(st.node);
     one.inputs = st.node->inputs;
-    out.push_back("lse_fused_" + std::to_string(one.signature()));
+    one.anchor = st.node->kind;
+    one.anchor_class = st.node->fclass;
+    out.push_back("lse_fused_" + std::to_string(one.emission_signature()));
   }
   return out;
 }
@@ -517,7 +519,7 @@ graph::DialectSourceTable HipEmitter::sources() const noexcept {
 
 std::uint64_t HipEmitter::cache_key(const FusionGroup& group,
                                     const DeviceInfo& device) const {
-  std::uint64_t h = dispatch::specialization_cache_key(group.signature(), group, device, hip_types(), hip_sources());
+  std::uint64_t h = dispatch::specialization_cache_key(group.emission_signature(), group, device, hip_types(), hip_sources());
   if (group.is_phase) mix_name(h, "hip.phase-virtual-workgroups.v1");
   const KernelPrimitiveBase* self = nullptr;
   if (kernels::linked_bindings(group).ok) {
@@ -608,7 +610,7 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   g.anchor = run.front()->kind;
   g.anchor_class = run.front()->fclass;
 
-  const std::uint64_t key = dispatch::specialization_cache_key(g.signature(), g, device, hip_types(), hip_sources());
+  const std::uint64_t key = dispatch::specialization_cache_key(g.emission_signature(), g, device, hip_types(), hip_sources());
   if (const auto it = run_scratch_cache_.find(key);
       it != run_scratch_cache_.end()) {
     return it->second;
@@ -733,7 +735,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   // Scratch admission and emission must use the same policy-specialized
   // name, so measured launch costs are looked up for the body we emit.
   const std::uint64_t run_key = dispatch::specialization_cache_key(
-      group.signature(),
+      group.emission_signature(),
       group, device, hip_types(), hip_sources());
   const std::string run_entry = "lse_fused_" + std::to_string(run_key);
 
@@ -1095,7 +1097,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
   }
 
   EmittedKernel out;
-  out.entry_name = "lse_fused_" + std::to_string(group.signature());
+  out.entry_name = "lse_fused_" + std::to_string(group.emission_signature());
   if (self_indexed != nullptr) out.traffic = self_indexed->traffic(si_shapes);
 
   std::unordered_map<const Node*, std::size_t> binding_of;
@@ -1143,7 +1145,7 @@ Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
 
   // specialize() picks a different body (LDS vs WMMA vs scalar) for the same
   // graph node; the group hash only sees the generic primitive name.
-  std::uint64_t sig = dispatch::specialization_cache_key(group.signature(), group, device, hip_types(), hip_sources());
+  std::uint64_t sig = dispatch::specialization_cache_key(group.emission_signature(), group, device, hip_types(), hip_sources());
   if (self_indexed != nullptr) {
     sig ^= 0x9e3779b97f4a7c15ull;
     for (char c : self_indexed->name()) {
