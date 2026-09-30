@@ -15,6 +15,7 @@
 #include "harness.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/program.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/layer.hpp"
 #include "lse/model/qwen3_5_common.hpp"
@@ -2536,6 +2537,55 @@ void compare_paged_shard_contents(MixerState& whole,
 }
 
 
+
+void audit_attention_slot_lifetimes(const graph::Program& program) {
+  struct Lifetime { const graph::Node* node; std::size_t first, last; };
+  std::vector<Lifetime> values;
+  std::unordered_map<const graph::Node*, std::size_t> index;
+  const auto& groups = program.groups();
+  for (std::size_t g = 0; g < groups.size(); ++g) {
+    for (const auto& node : groups[g].nodes) {
+      const auto* owner = graph::buffer_allocation_owner(node.get());
+      if (!owner || owner != node.get() || !owner->buffer.valid() ||
+          owner->fclass == graph::FusionClass::kLeaf) continue;
+      if (index.emplace(owner, values.size()).second) values.push_back({owner,g,g});
+    }
+  }
+  for (std::size_t g = 0; g < groups.size(); ++g) {
+    for (const auto& node : groups[g].nodes) {
+      for (const auto& input : node->inputs) {
+        const auto* owner = graph::buffer_allocation_owner(input.get());
+        if (auto it = index.find(owner); it != index.end()) {
+          const auto& value = values[it->second];
+          if (g < value.first)
+            std::fprintf(stderr, "       slot read before producer: %s%s read=%zu first=%zu\n",
+                std::string(graph::to_string(owner->kind)).c_str(), owner->shape.to_string().c_str(), g, value.first);
+          LSE_EXPECT(g >= value.first);
+          values[it->second].last = std::max(values[it->second].last, g);
+        }
+      }
+    }
+  }
+  for (const auto& root : program.roots()) {
+    if (auto it = index.find(graph::buffer_allocation_owner(root.get())); it != index.end())
+      values[it->second].last = groups.size();
+  }
+  std::size_t conflicts = 0;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    for (std::size_t j = 0; j < i; ++j) {
+      const auto& a = values[i]; const auto& b = values[j];
+      if (a.last < b.first || b.last < a.first ||
+          !graph::buffer_bindings_may_alias(*a.node, *b.node)) continue;
+      ++conflicts;
+      std::fprintf(stderr, "       live slot conflict: %s%s [%zu,%zu] and %s%s [%zu,%zu]\n",
+          std::string(graph::to_string(a.node->kind)).c_str(),a.node->shape.to_string().c_str(),a.first,a.last,
+          std::string(graph::to_string(b.node->kind)).c_str(),b.node->shape.to_string().c_str(),b.first,b.last);
+    }
+  }
+  std::fprintf(stderr,"       slot audit: groups=%zu owners=%zu conflicts=%zu\n",groups.size(),values.size(),conflicts);
+  LSE_EXPECT_EQ(conflicts,0u);
+}
+
 graph::NodePtr state_checkpoint(const graph::NodePtr& root, graph::OpKind kind) {
   if (!root) return {};
   if (root->kind == kind) return root;
@@ -2600,8 +2650,26 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
                         const std::string& prefix, std::int32_t layer,
                         bool attn, double* out_decode,
                         double* out_reference_peak = nullptr,
-                        bool retain_intermediates = false) {
+                        bool retain_intermediates = false, bool audit_lifetimes = false,
+                        bool unique_storage = false) {
   auto drain = [&](graph::Array& array) {
+    if (unique_storage) {
+      std::vector<graph::NodePtr> nodes;
+      std::unordered_set<const graph::Node*> seen;
+      graph::collect_reachable(array.node(), nodes, seen);
+      for (const auto& node : nodes) {
+        if (node->fclass == graph::FusionClass::kLeaf ||
+            graph::buffer_allocation_owner(node.get()) != node.get()) continue;
+        LSE_EXPECT_OK(graph::interpreter::ensure_output_buffer(
+            *node, graph::default_scheduler()->backend()));
+      }
+    }
+    if (audit_lifetimes) {
+      graph::Program program;
+      const graph::NodePtr roots[]{array.node()};
+      LSE_EXPECT_OK(graph::default_scheduler()->eval(roots, true, &program));
+      audit_attention_slot_lifetimes(program);
+    }
     if (retain_intermediates) {
       std::vector<graph::NodePtr> roots;
       std::unordered_set<const graph::Node*> seen;
@@ -2747,6 +2815,42 @@ LSE_TEST(a_small_split_attention_preserves_intermediate_checkpoints) {
   const double prefill = shard_state_step(
       qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
       nullptr, "language_model.model.layers.3", 3, true, &decode, &peak, true);
+  std::fprintf(stderr, "       small attention state: prefill=%.9g decode=%.9g peak=%.9g\n", prefill, decode, peak);
+  LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
+  LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
+  LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
+}
+
+LSE_TEST(a_small_split_attention_has_no_overlapping_live_slots) {
+  Config cfg = tiny_qwen_config(false);
+  cfg.attn_q_heads = 4;
+  cfg.attn_kv_heads = 2;
+  auto checkpoint = SafeTensors::open(write_shaped_fixture(
+      "split_attention_state", qwen_checkpoint(cfg)));
+  LSE_EXPECT_OK(checkpoint.status());
+  if (!checkpoint.ok()) return;
+  double decode = -1.0, peak = 0.0;
+  const double prefill = shard_state_step(
+      qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
+      nullptr, "language_model.model.layers.3", 3, true, &decode, &peak, false, true);
+  std::fprintf(stderr, "       small attention state: prefill=%.9g decode=%.9g peak=%.9g\n", prefill, decode, peak);
+  LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
+  LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
+  LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
+}
+
+LSE_TEST(a_small_split_attention_preserves_preallocated_intermediates) {
+  Config cfg = tiny_qwen_config(false);
+  cfg.attn_q_heads = 4;
+  cfg.attn_kv_heads = 2;
+  auto checkpoint = SafeTensors::open(write_shaped_fixture(
+      "split_attention_state", qwen_checkpoint(cfg)));
+  LSE_EXPECT_OK(checkpoint.status());
+  if (!checkpoint.ok()) return;
+  double decode = -1.0, peak = 0.0;
+  const double prefill = shard_state_step(
+      qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
+      nullptr, "language_model.model.layers.3", 3, true, &decode, &peak, false, true, true);
   std::fprintf(stderr, "       small attention state: prefill=%.9g decode=%.9g peak=%.9g\n", prefill, decode, peak);
   LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
   LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
