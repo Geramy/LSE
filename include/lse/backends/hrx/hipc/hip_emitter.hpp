@@ -84,6 +84,8 @@ class HipEmitter final : public graph::IKernelEmitter,
       std::string_view source);
 
  private:
+  static Status validate_bindings(const graph::FusionGroup& group);
+
   // Workgroup size and per-thread element count, chosen against the device's
   // occupancy limits. Returns the candidate with the highest occupancy that
   // does not exceed lds_bytes_per_workgroup.

@@ -644,8 +644,27 @@ graph::IKernelEmitter::RunScratch HipEmitter::run_scratch(
   return out;
 }
 
+Status HipEmitter::validate_bindings(const FusionGroup& group) {
+  const auto fragmented = [](const NodePtr& node) {
+    const Node* owner = graph::buffer_allocation_owner(node.get());
+    return (node && node->kv_fragments) || (owner && owner->kv_fragments);
+  };
+  for (const auto& input : group.inputs)
+    if (fragmented(input))
+      return LSE_ERROR(kUnimplemented, "HIP kernels require contiguous K/V storage; select Loom for fragment tables");
+  for (const auto& node : group.nodes) {
+    if (fragmented(node))
+      return LSE_ERROR(kUnimplemented, "HIP kernels require contiguous K/V storage; select Loom for fragment tables");
+    if (node) for (const auto& input : node->inputs)
+      if (fragmented(input))
+        return LSE_ERROR(kUnimplemented, "HIP kernels require contiguous K/V storage; select Loom for fragment tables");
+  }
+  return OkStatus();
+}
+
 Result<graph::EmittedKernel> HipEmitter::emit(const FusionGroup& group,
                                               const DeviceInfo& device) const {
+  LSE_RETURN_IF_ERROR(validate_bindings(group));
   if (group.nodes.empty()) {
     return LSE_ERROR(kInvalidArgument, "cannot emit an empty fusion group");
   }

@@ -47,6 +47,7 @@
 #include "lse/graph/primitive.hpp"
 #include "lse/graph/primitive_library.hpp"
 #include "lse/math.hpp"
+#include "lse/kv/memory.hpp"
 
 using namespace lse;
 using namespace lse::graph;
@@ -360,6 +361,65 @@ LSE_TEST(quant_linear_small_prefill_uses_the_float_codec) {
       LSE_EXPECT(count(e->source, "fmaf(") > 32);
     }
   }
+}
+
+LSE_TEST(hip_phases_do_not_assert_disjoint_inplace_bindings) {
+  auto leaf = [](Shape shape) {
+    auto node = std::make_shared<Node>();
+    node->shape = shape;
+    node->dtype = DType::kF32;
+    node->materialized = true;
+    return Array(node);
+  };
+  for (bool table : {false, true}) {
+    Array pool = leaf({1, 32});
+    Array source = leaf({1, 4});
+    Array begin = leaf({1});
+    Array write = overwrite_slice(pool, source, 1, begin);
+    Array output = pool + write;
+    FusionGroup group;
+    group.is_phase = true;
+    group.inputs = {pool.node(), source.node(), begin.node()};
+    group.nodes = {write.node(), output.node()};
+    group.outputs = {output.node()};
+    if (table)
+      for (int i = 0; i < 65; ++i) group.inputs.push_back(leaf({1}).node());
+    const auto emitted = backend::HipEmitter::emit_phase(group, gfx1151());
+    LSE_EXPECT_OK(emitted.status());
+    if (!emitted.ok()) continue;
+    LSE_EXPECT_EQ(emitted->pointer_table, table);
+    LSE_EXPECT(emitted->source.find("float* __restrict__ b") == std::string::npos);
+    LSE_EXPECT(emitted->source.find("float* b") != std::string::npos);
+  }
+}
+
+LSE_TEST(hip_refuses_fragment_tables_before_emission_or_cache_reuse) {
+  auto cpu = backend::create_backend("cpu");
+  LSE_EXPECT_OK(cpu.status());
+  if (!cpu.ok()) return;
+  auto storage = std::make_shared<kv::FragmentStorage>(
+      kv::MemoryManager::create(), **cpu, backend::kDefaultStream);
+  auto node = std::make_shared<Node>();
+  node->shape = {32};
+  node->dtype = DType::kF32;
+  node->materialized = true;
+  Array input(node);
+  Array output = silu(input);
+  FusionGroup group;
+  group.inputs = {node};
+  group.nodes = {output.node()};
+  group.outputs = {output.node()};
+  backend::HipEmitter emitter;
+  // Populate the ordinary emission cache before changing the storage layout.
+  LSE_EXPECT_OK(emitter.emit(group, gfx1151()).status());
+  node->kv_fragments = storage;
+  const auto direct = emitter.emit(group, gfx1151());
+  LSE_EXPECT(!direct.ok());
+  if (!direct.ok()) LSE_EXPECT(direct.status().message().find("fragment tables") != std::string::npos);
+  group.is_phase = true;
+  const auto phase = backend::HipEmitter::emit_phase(group, gfx1151());
+  LSE_EXPECT(!phase.ok());
+  if (!phase.ok()) LSE_EXPECT(phase.status().message().find("fragment tables") != std::string::npos);
 }
 
 LSE_TEST(phase_emits_syncthreads_only_on_cross_lane_deps) {

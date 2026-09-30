@@ -5,6 +5,7 @@
 
 #include "lse/dispatch/attention.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/graph/view.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/math.hpp"
@@ -281,9 +282,8 @@ StageUse stage_use(const Node& n) noexcept {
   return u;
 }
 
-// Any recorded RAW/WAR/WAW needs a barrier. Bindings are __restrict__, so
-// two nodes that share a slot look like distinct pointers; skipping the
-// barrier lets the compiler reorder those accesses. What the StageUse decides
+// Any recorded RAW/WAR/WAW needs a barrier so every participating lane sees
+// the preceding stage's writes. What the StageUse decides
 // is not whether to order but how wide the barrier has to be — see
 // lane_aligned_edge.
 bool needs_sync(const StageUse&, const StageUse&) noexcept { return true; }
@@ -494,6 +494,7 @@ bool HipEmitter::lane_aligned(const Node& producer,
 
 Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
                                              const DeviceInfo& device) {
+  LSE_RETURN_IF_ERROR(validate_bindings(group));
   if (group.nodes.empty()) {
     return LSE_ERROR(kInvalidArgument, "empty phase group");
   }
@@ -1046,7 +1047,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   // lets a phase hold a whole step instead of being diced at the kernarg
   // ceiling (the old 480-binding chunk cap). The scheduler builds and
   // uploads the table when the kernel declares it (pointer_table below);
-  // the b<i> locals keep their names and their restrict promise, so every
+  // the b<i> locals keep their names and alias qualifications, so every
   // stage body is unchanged. A persistent kernel stays on direct bindings —
   // its grid barrier rides the binding list the table path replaces.
   //
@@ -1059,13 +1060,14 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
   // and lost: the table costs an allocation and an upload per dispatch, and
   // decode issues ~1765 of those a token (7.8 tok/s against 14.5).
   const bool table_mode = !persist && out.binding_order.size() > 64;
+  const char* qualifier = bindings_may_alias(out.binding_order) ? "" : "__restrict__ ";
   src << "extern \"C\" __global__ __launch_bounds__(" << kPhaseBlock
       << ") void " << out.entry_name << "(\n";
   if (table_mode) {
     src << "    const unsigned long long* __restrict__ btab,\n";
   } else {
     for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
-      src << "    float* __restrict__ b" << i << ",\n";
+      src << "    float* " << qualifier << "b" << i << ",\n";
     }
   }
   if (persist) src << "    unsigned* gbar,\n";
@@ -1073,7 +1075,7 @@ Result<EmittedKernel> HipEmitter::emit_phase(const FusionGroup& group,
       << "  (void)k;\n";
   if (table_mode) {
     for (std::size_t i = 0; i < out.binding_order.size(); ++i) {
-      src << "  float* __restrict__ b" << i << " = (float*)(btab[" << i
+      src << "  float* " << qualifier << "b" << i << " = (float*)(btab[" << i
           << "]);\n";
     }
   }
