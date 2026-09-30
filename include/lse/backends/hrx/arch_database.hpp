@@ -151,7 +151,7 @@ inline const ResidencyCurve* residency_curve(std::string_view arch) noexcept {
 inline constexpr BoardFallback kBoardFallback[] = {
     {"gfx1151", 40, 2u << 20, true},
     {"gfx1100", 96, 4u << 20, false},
-    {"gfx1201", 64, 4u << 20, false},
+    {"gfx1201", 64, 8u << 20, false},
     {"gfx90a", 110, 8u << 20, false},
     {"gfx942", 304, 4u << 20, false},
     {"gfx950", 256, 4u << 20, false},

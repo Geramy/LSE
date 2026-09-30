@@ -10,6 +10,8 @@ namespace lse::dispatch::attention_shapes {
 
 inline constexpr std::uint32_t kFlashThreads = 256, kFlashKeyWindow = 256;
 inline constexpr std::uint32_t kFlashQueryTile = 16;
+inline constexpr std::uint32_t kFlashValueRows = 16, kFlashValueColumns = 128;
+inline constexpr std::uint32_t kFlashValueStride = kFlashValueColumns + 8;
 inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;
 
 struct FlashWmmaRule {
@@ -20,9 +22,26 @@ inline constexpr std::array kFlashWmmaRules{
     FlashWmmaRule{"gfx1201", 32, 256, 2, 512},
 };
 
+struct FlashCacheRule {
+  std::string_view arch;
+  std::uint32_t min_rows, min_capacity;
+};
+inline constexpr std::array kFlashCacheRules{
+    FlashCacheRule{"gfx1201", 1024, 65536},
+};
+
+[[nodiscard]] constexpr bool flash_retain_far_cache(std::string_view arch,
+    std::uint32_t rows, std::uint64_t capacity) noexcept {
+  for (const auto& rule : kFlashCacheRules)
+    if (arch == rule.arch && rows >= rule.min_rows && capacity >= rule.min_capacity)
+      return true;
+  return false;
+}
+
 [[nodiscard]] constexpr std::uint64_t flash_wmma_lds_bytes(std::uint32_t head_dim) {
   const auto padded = (static_cast<std::uint64_t>(head_dim) + 15u) / 16u * 16u;
-  return kFlashQueryTile * (padded * 2u + kFlashKeyWindow * 4u + 3u * 4u);
+  return kFlashQueryTile * (padded * 2u + kFlashKeyWindow * 4u + 3u * 4u) +
+         kFlashValueRows * kFlashValueStride * 2u;
 }
 
 struct DecodeRule {

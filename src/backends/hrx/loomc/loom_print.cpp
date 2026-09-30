@@ -522,6 +522,7 @@ class Printer {
       view_of_[o.result] = it->second.view;
       extent_of_[o.result] = it->second.elements;
       kv_fragment_elements_[o.result] = it->second.kv_fragment_elements;
+      read_cache_[o.result] = it->second.read_cache;
       define(o.result, loom_view_type(it->second.elem, it->second.elements),
              it->second.elem, Cls::kOther);
       return Status{};
@@ -857,6 +858,13 @@ class Printer {
     Scalar elem = Scalar::kF32;
     std::uint64_t extent = 0;
     std::uint64_t fragment_elements = 0;
+    LoomReadCachePolicy read_cache = LoomReadCachePolicy::kDefault;
+
+    [[nodiscard]] std::string load_attributes() const {
+      return read_cache == LoomReadCachePolicy::kStreamNearRetainFar
+          ? " {cache_scope = cu, cache_temporal = non_temporal_high_temporal}"
+          : "";
+    }
   };
 
   Result<Access> access_of(ValueId base) const {
@@ -871,8 +879,10 @@ class Printer {
                        "loom printer: a view with no name in this kernel");
     }
     const auto fragment = kv_fragment_elements_.find(base);
+    const auto cache = read_cache_.find(base);
     return Access{it->second, t->type, t->elem, extent_of_.at(base),
-                  fragment == kv_fragment_elements_.end() ? 0 : fragment->second};
+                  fragment == kv_fragment_elements_.end() ? 0 : fragment->second,
+                  cache == read_cache_.end() ? LoomReadCachePolicy::kDefault : cache->second};
   }
 
   Status fragment_access(Access& access, std::string& at, int depth,
@@ -1003,7 +1013,7 @@ class Printer {
     LSE_RETURN_IF_ERROR(fragment_access(*acc, *at, depth));
     const std::string elem(loom_storage_type(acc->elem));
     line(depth, name(o.result) + " = view.load " + acc->view + "[" + *at +
-                    "] : " + acc->view_type + " -> " + elem);
+                    "]" + acc->load_attributes() + " : " + acc->view_type + " -> " + elem);
     define(o.result, elem, acc->elem,
            class_of(acc->elem, acc->elem == Scalar::kU32));
     return Status{};
@@ -1130,14 +1140,14 @@ class Printer {
     const std::string res = name(o.result);
     if (n <= 1) {
       const std::string elem(loom_storage_type(acc->elem));
-      line(depth, res + " = view.load " + acc->view + "[" + *at + "] : " +
+      line(depth, res + " = view.load " + acc->view + "[" + *at + "]" + acc->load_attributes() + " : " +
                       acc->view_type + " -> " + elem);
       define(o.result, elem, acc->elem,
              class_of(acc->elem, acc->elem == Scalar::kU32));
       return Status{};
     }
     const std::string vt = loom_vector_type(acc->elem, n);
-    line(depth, res + " = vector.load " + acc->view + "[" + *at + "] : " +
+    line(depth, res + " = vector.load " + acc->view + "[" + *at + "]" + acc->load_attributes() + " : " +
                     acc->view_type + " -> " + vt);
     define(o.result, vt, acc->elem, Cls::kOther);
     return Status{};
@@ -1395,6 +1405,7 @@ class Printer {
   std::unordered_map<ValueId, std::string> view_of_;
   std::unordered_map<ValueId, std::uint64_t> extent_of_;
   std::unordered_map<ValueId, std::uint64_t> kv_fragment_elements_;
+  std::unordered_map<ValueId, LoomReadCachePolicy> read_cache_;
   // The SSA name each accumulator currently holds. Reading one reads this.
   std::unordered_map<ValueId, std::string> cur_;
   std::map<RegionId, std::set<ValueId>> region_assigns_;

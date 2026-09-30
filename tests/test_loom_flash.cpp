@@ -213,9 +213,9 @@ LSE_TEST(flash_wmma_policy_covers_kv_formats_ragged_tiles_and_matrix_resources) 
       LSE_EXPECT(dispatch::flash_wmma_supported(s));
     }
   }
-  device.lds_bytes_per_workgroup = 24767;
+  device.lds_bytes_per_workgroup = 29119;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
-  device.lds_bytes_per_workgroup = 24768;
+  device.lds_bytes_per_workgroup = 29120;
   LSE_EXPECT(dispatch::flash_wmma_supported(s));
   device.extension = nullptr;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
@@ -249,7 +249,7 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()) {
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],768u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    LSE_EXPECT_EQ(emitted->lds_bytes,24768u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,29120u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf16>")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
@@ -300,7 +300,7 @@ LSE_TEST(flash_wmma_emits_typed_operands_for_packed_and_unequal_widths) {
     if(!emitted.ok()) continue;
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],24u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    LSE_EXPECT_EQ(emitted->lds_bytes,17600u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,21952u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find(storage==kv::CacheDType::kF16
         ? "vector<8xf16>" : "vector<8xbf16>")!=std::string::npos);
@@ -339,7 +339,7 @@ LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   if (!emitted.ok()) return;
   LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u);
   LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
-  LSE_EXPECT_EQ(emitted->lds_bytes, 24768u);
+  LSE_EXPECT_EQ(emitted->lds_bytes, 29120u);
   LSE_EXPECT(emitted->source.size() < 384u * 1024u);
   std::size_t loops = 0;
   for (auto at = emitted->source.find(" = scf.for "); at != std::string::npos;
@@ -347,4 +347,38 @@ LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   LSE_EXPECT(loops >= 3u);
 }
 
+LSE_TEST(long_prefill_cache_policy_follows_the_shape_table) {
+  using namespace lse;
+  using namespace lse::graph;
+  backend::DeviceInfo device;
+  backend::AmdDeviceInfo amd;
+  device.arch = "gfx1201";
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
+  auto leaf = [](Shape shape, DType dtype) {
+    auto n = std::make_shared<Node>();
+    n->shape = shape; n->dtype = dtype; n->materialized = true;
+    return Array(n);
+  };
+  for (int rows : {512, 1024}) {
+    for (int capacity : {32768, 65536}) {
+      auto q = leaf({1, 24, rows, 256}, DType::kF32);
+      auto k = leaf({capacity / 16, 4, 16, 256}, DType::kBF16);
+      auto v = leaf(k.shape(), DType::kBF16);
+      auto meta = leaf({5}, DType::kF32);
+      auto table = leaf({1, capacity / 16}, DType::kF32);
+      auto output = sdpa_paged(q, k, v, 0.0625f, MaskKind::kCausal,
+          0, meta, table, 16, &device, kv::CacheDType::kBF16);
+      const NodePtr roots[]{output.node()};
+      for (const auto& group : Partitioner::partition(roots, &device)) {
+        auto emitted = backend::LoomEmitter{}.emit(group, device);
+        LSE_EXPECT(emitted.ok());
+        if (!emitted.ok()) continue;
+        const bool hinted = emitted->source.find("non_temporal_high_temporal") != std::string::npos;
+        LSE_EXPECT_EQ(hinted, rows == 1024 && capacity == 65536);
+      }
+    }
+  }
+}
 LSE_TEST_MAIN()

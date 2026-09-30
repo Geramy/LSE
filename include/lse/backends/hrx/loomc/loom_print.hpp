@@ -27,6 +27,8 @@
 
 namespace lse::backend {
 
+enum class LoomReadCachePolicy : std::uint8_t { kDefault, kStreamNearRetainFar };
+
 // What the emitter knows about a buffer parameter and the IR does not.
 struct LoomBufferView {
   graph::kir::Scalar elem = graph::kir::Scalar::kF32;
@@ -36,6 +38,7 @@ struct LoomBufferView {
   // SSA name of the `buffer.view` the emitter already emitted, with the `%`.
   std::string view;
   std::uint64_t kv_fragment_elements = 0;
+  LoomReadCachePolicy read_cache = LoomReadCachePolicy::kDefault;
 };
 
 struct LoomPrintOptions {

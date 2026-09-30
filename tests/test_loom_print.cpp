@@ -74,4 +74,39 @@ LSE_TEST(float_inequality_preserves_cpp_nan_and_finite_semantics) {
     }
   }
 }
+LSE_TEST(read_cache_policy_applies_to_data_loads_only) {
+  for (bool fragmented : {false, true}) {
+    for (bool hinted : {false, true}) {
+      ir::KernelBody body(types, intrinsics);
+      env::Emit e{&body};
+      ir::Buffer<ir::f32> input(&body, &types, "input");
+      const auto values = input.load(e.u32(0u), 16u);
+      const auto scalar = e.let(input[e.u32(4u)].read());
+      input[e.u32(5u)] = scalar;
+      e.ret(values[0] + scalar);
+      lse::backend::LoomPrintOptions options;
+      options.buffers.emplace("input", lse::backend::LoomBufferView{
+          ir::Scalar::kF32, 64, "%input_view", fragmented ? 16u : 0u,
+          hinted ? lse::backend::LoomReadCachePolicy::kStreamNearRetainFar
+                 : lse::backend::LoomReadCachePolicy::kDefault});
+      auto printed = lse::backend::loom_print(body.ir(), options);
+      LSE_EXPECT(printed.ok());
+      if (!printed.ok()) continue;
+      std::size_t hints = 0;
+      std::size_t at = 0;
+      while (at < printed->text.size()) {
+        auto end = printed->text.find('\n', at);
+        if (end == std::string::npos) end = printed->text.size();
+        const auto line = printed->text.substr(at, end - at);
+        if (line.find("cache_temporal") != std::string::npos) {
+          ++hints;
+          LSE_EXPECT(line.find("view.store") == std::string::npos);
+          if (fragmented) LSE_EXPECT(line.find("view.load %input_view") == std::string::npos);
+        }
+        at = end + 1;
+      }
+      LSE_EXPECT_EQ(hints, hinted ? 2u : 0u);
+    }
+  }
+}
 LSE_TEST_MAIN()

@@ -3,6 +3,7 @@
 #include "lse/graph/epilogue_input.hpp"
 #include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
+#include "lse/dispatch/attention_shapes.hpp"
 #include "lse/kv/memory.hpp"
 
 #include <algorithm>
@@ -763,6 +764,15 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
 
     LoomPrintOptions popts;
     popts.buffers = views;
+    if (self_indexed->name() == "attention.flash.wmma16.v2") {
+      const auto d = dispatch::flash_dimensions(si_shapes);
+      if (d.valid && dispatch::attention_shapes::flash_retain_far_cache(
+              device.arch, d.tq, static_cast<std::uint64_t>(d.stride) * d.ts)) {
+        for (std::size_t input : {1u, 2u})
+          popts.buffers.at(input_names[input]).read_cache =
+              LoomReadCachePolicy::kStreamNearRetainFar;
+      }
+    }
     popts.name_prefix = "s";
     auto printed = loom_print(cap.body(), popts);
     if (!printed.ok()) {
