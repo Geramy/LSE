@@ -3,6 +3,26 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.21: real-world interactive performance
+
+Real-world interactive use on the local macOS R9700 (`gfx1201`), running
+Qwen3.8-27B Q4 with the Q8 DFlash2 block-8 drafter through HRX/Loom, measured:
+
+- **Decode: 35.8 tokens/s overall**, with a **36.1 tokens/s median** per request
+  and an observed range of **20.5–67.6 tokens/s**.
+- **Prefill: 243.6 tokens/s overall**, ranging from **32.5–390.2 tokens/s**
+  across short follow-ups and larger input chunks.
+- **DFlash2 acceptance: 86% median** per request, ranging from **59–96%**.
+
+These summarize user-supplied server logs. Overall rates are total logged tokens
+divided by total phase time (approximately, because printed times are rounded).
+Prompt counts represent newly processed input, not the full retained context;
+short follow-ups include request overhead. Decode timing excludes the first token.
+The results describe this live workload, not a fixed-context benchmark or a
+before/after speedup measurement.
+
+[Release details and downloads](https://github.com/Geramy/LSE/releases/tag/v0.4.21).
+
 ## v0.4.19: long-context KV growth and split attention
 
 Consumed prefill chunk graphs and the scheduler's previous program are released

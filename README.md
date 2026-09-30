@@ -26,7 +26,12 @@ LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
 
-## Current release: v0.4.20
+## Current release: v0.4.21
+
+Eligible short-query paged attention now shares K/V reads across query heads
+and token rows. The bundled Loom compiler enables automatic loop-invariant
+code motion. See the [release notes](https://github.com/Geramy/LSE/releases/tag/v0.4.21)
+and the [real-world performance summary](#real-world-interactive-performance-v0421).
 
 Paged K/V on the Loom backend now uses a dedicated shared memory manager.
 It packs 256 KiB fragments into 256 MiB arenas and fills available slots before
@@ -159,7 +164,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.19`.
+The examples below use `v0.4.21`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -168,7 +173,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.19
+   lse_tag=v0.4.21
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -201,7 +206,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.19
+   lse_tag=v0.4.21
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -403,6 +408,24 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
+
+### Real-world interactive performance (v0.4.21)
+
+Real-world interactive use on the local macOS R9700 (`gfx1201`), running
+Qwen3.8-27B Q4 with the Q8 DFlash2 block-8 drafter through HRX/Loom, measured:
+
+- **Decode: 35.8 tokens/s overall**, with a **36.1 tokens/s median** per request
+  and an observed range of **20.5–67.6 tokens/s**.
+- **Prefill: 243.6 tokens/s overall**, ranging from **32.5–390.2 tokens/s**
+  across short follow-ups and larger input chunks.
+- **DFlash2 acceptance: 86% median** per request, ranging from **59–96%**.
+
+These summarize user-supplied server logs. Overall rates are total logged tokens
+divided by total phase time (approximately, because printed times are rounded).
+Prompt counts represent newly processed input, not the full retained context;
+short follow-ups include request overhead. Decode timing excludes the first token.
+The results describe this live workload, not a fixed-context benchmark or a
+before/after speedup measurement.
 
 ### Long-context vector staging (2026-09-29)
 
