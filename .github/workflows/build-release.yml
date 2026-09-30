@@ -216,6 +216,8 @@ jobs:
           cp README.md LICENSE.md "dist/$name/"
           mkdir -p "dist/$name/docs"
           cp docs/KV-STORAGE.md docs/CHAT-COMPATIBILITY.md docs/pi-models.example.json docs/DFLASH2.md docs/RELEASE_HISTORY.md "dist/$name/docs/"
+          mkdir -p "dist/$name/docs/experimental"
+          cp docs/experimental/sparse-attention.md "dist/$name/docs/experimental/"
           mkdir -p "dist/$name/docs/benchmarks"
           cp docs/benchmarks/q4-prefill-2026-09-30.md "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/attention-vector-staging-2026-09-29.md docs/benchmarks/automatic-split-2026-09-29.md "dist/$name/docs/benchmarks/"

@@ -101,6 +101,19 @@ def main():
     p.add_argument("--out", default="-")
     a = p.parse_args()
 
+    curated = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "release-notes", os.path.basename(a.tag) + ".md")
+    if os.path.isfile(curated):
+        with open(curated) as f:
+            text = f.read()
+        if a.out == "-":
+            sys.stdout.write(text)
+        else:
+            os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+            with open(a.out, "w") as f:
+                f.write(text)
+        return 0
+
     sha = run("git", "rev-parse", "HEAD")
     short = run("git", "rev-parse", "--short", "HEAD")
     prev = previous_tag(a.tag)

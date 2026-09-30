@@ -160,6 +160,9 @@ def main():
     (package / 'docs').mkdir()
     for doc_name in ('KV-STORAGE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md', 'RELEASE_HISTORY.md'):
         shutil.copy2(root / 'docs' / doc_name, package / 'docs' / doc_name)
+    (package / 'docs' / 'experimental').mkdir()
+    shutil.copy2(root / 'docs/experimental/sparse-attention.md',
+                 package / 'docs/experimental/sparse-attention.md')
     (package / 'docs' / 'benchmarks').mkdir()
     shutil.copy2(root / 'docs/benchmarks/q4-prefill-2026-09-30.md',
                  package / 'docs/benchmarks/q4-prefill-2026-09-30.md')

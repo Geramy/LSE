@@ -183,6 +183,12 @@ compilation from an empty private cache. Both output pairs matched exactly,
 with zero CPU fallback. These are code-review prompt execution checks;
 retrieval and broader model-quality calibration remain open.
 
+The merged master default-on/opt-out smoke pair at 16K measured **632.09**
+versus **492.91** prompt tok/s, respectively. Both used the same binary and
+request, cold private compilation caches, alpha 0.1 for FlashPrefill, and
+batch/ubatch 1024. The 64-token greedy output matched, with zero CPU fallback.
+The new flag passed 130 CLI checks. This is the prefill peak quoted for v0.4.23.
+
 ## Speculative prompt prefill
 
 MTP3 and DFlash2 native 16K checks passed with the same 64-token greedy output

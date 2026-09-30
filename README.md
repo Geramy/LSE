@@ -14,17 +14,17 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 [Performance](#measured-performance) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
-## Current release: v0.4.22
+## Current release: v0.4.23
 
-Run a 27B model locally with **up to 597.9 prompt tokens/s**, speculative
-decoding, and reusable prompt state.
+Run a 27B model locally with **up to 632.1 prompt tokens/s** and faster
+long-context prefill through FlashPrefill V2.
 
-- **Faster Q4 prefill:** efficient nibble expansion and paired activation staging reduce repeated work.
-- **Fused single-token Q4 SwiGLU:** combines eligible gate/up projections and activation.
-- **Correct RDNA4 prefetch lowering:** fixes address calculation and span encoding in the bundled Loom compiler.
-- **Ready-to-run packages:** macOS ARM64 and Linux x86-64 with matching HRX and Loom libraries.
+- **FlashPrefill V2 on by default** for supported R9700 HRX/LOOM baseline configurations.
+- **Easy opt-out:** add `--FlashPrefillV2=off` for dense prefill.
+- **Faster selection:** cooperative Wave32 block selection cuts measured selector time by about 5×.
+- **SwiGLU improvement:** unrolled single-token Q4 bias tail, with MTP and DFlash2 output checks.
 
-[Download v0.4.22](https://github.com/Geramy/LSE/releases/tag/v0.4.22)
+[Download v0.4.23](https://github.com/Geramy/LSE/releases/tag/v0.4.23)
 
 ## Measured performance
 
@@ -32,27 +32,29 @@ Qwen3.8-27B Q4 on an AMD R9700 (`gfx1201`) through HRX/Loom on macOS:
 
 | Metric | Peak observed |
 |---|---:|
-| Prefill (input tokens/s) | **597.9 pp/s** |
+| Prefill (input tokens/s) | **632.1 pp/s** |
 | Decode (output tokens/s, Q8 DFlash2) | **67.6 tok/s** |
 | Draft acceptance (Q8 DFlash2) | **96%** |
 
-Prefill is a warm, greedy full-prompt measurement with BF16 KV and no prompt
-cache reuse. Decode and acceptance are separate peaks from the earlier live
-DFlash2 block-8 session; these peaks were not measured together.
+Prefill was measured on a cold 16,384-token prompt with BF16 KV, alpha 0.1,
+batch/ubatch 1024 and no prompt cache reuse; compilation time is included.
+Decode and acceptance are separate peaks from the earlier live DFlash2 block-8
+session; these peaks were not measured together.
 
-[Prefill measurements](docs/benchmarks/q4-prefill-2026-09-30.md)
+[FlashPrefill measurements](docs/experimental/sparse-attention.md)
 · [Earlier measurements](docs/RELEASE_HISTORY.md)
 
 ## FlashPrefill V2
 
 The HTTP server enables FlashPrefill V2 prefill by default on supported R9700
 HRX/LOOM configurations, with alpha 0.1 and batch/ubatch 1024.
-Use **`--FlashPrefillV2=off`** for dense prefill. MTP and DFlash2 also use
-FlashPrefill V2 for prompt prefill; their draft and verification passes stay dense.
+Use **`--FlashPrefillV2=off`** for dense prefill. The current master branch also
+enables it for MTP and DFlash2 prompt prefill; their draft and verification
+passes stay dense. This speculative support follows the v0.4.23 release.
 Unsupported configurations use dense attention automatically.
 
-At 32K, the tested Q4/BF16-KV workload reached **604.9 prompt tok/s**, versus
-378.1 with dense attention. The 64-token greedy output matched; perplexity
+At 16K, the merged build reached **632.1 prompt tok/s** versus 492.9 dense.
+At 32K, the earlier matched pair reached **604.9 prompt tok/s** versus 378.1 dense. The 64-token greedy output matched; perplexity
 has not been measured. [Configuration and measurements](docs/experimental/sparse-attention.md).
 
 ## Kernel cache
@@ -112,7 +114,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.22`.
+The examples below use `v0.4.23`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -121,7 +123,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.22
+   lse_tag=v0.4.23
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -154,7 +156,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.22
+   lse_tag=v0.4.23
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
