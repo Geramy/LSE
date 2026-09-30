@@ -246,6 +246,132 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
   LSE_EXPECT_OK(run());
 }
 
+LSE_TEST(native_f16_paged_prefill_and_decode_match_reference) {
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler || !scheduler->backend().emitter())
+    LSE_SKIP("requires native kernel dispatch");
+  auto& backend = scheduler->backend();
+  struct Restore {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode mode;
+    graph::DialectPreference dialect;
+    ~Restore() {
+      scheduler.set_mode(mode);
+      if (dialect) scheduler.set_dialect(*dialect);
+      else scheduler.clear_dialect();
+    }
+  } restore{*scheduler, scheduler->mode(), scheduler->dialect()};
+  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  for (const auto dialect : {graph::Dialect::kHip, graph::Dialect::kLoom}) {
+    const auto* toolchain = backend.toolchain(dialect);
+    if (!toolchain || toolchain->dialect != dialect || !toolchain->compiler ||
+        !toolchain->compiler->available()) continue;
+    scheduler->set_dialect(dialect);
+    const auto run = [&]() -> Status {
+      // Exceed the matrix attention width limit so both compilers execute the
+      // same FP32 scalar reduction even for the four-query prefill.
+      constexpr int heads = 4, kvheads = 2, dim = 528, block = 16, blocks = 2;
+      const Shape pool_shape{blocks, kvheads, block, dim};
+      std::vector<std::uint16_t> keys(pool_shape.elem_count()), values(keys.size());
+      auto upload = [&](Shape shape, DType dtype, const void* data) -> Result<graph::Array> {
+        const auto bytes = dtype_storage_bytes(dtype, shape.elem_count());
+        LSE_ASSIGN_OR(auto buffer, backend.allocate(bytes, backend::MemoryClass::kDevice));
+        LSE_RETURN_IF_ERROR(backend.copy_h2d(data, buffer, bytes, 0));
+        return graph::Array::from_buffer(std::move(buffer), shape, dtype);
+      };
+      LSE_ASSIGN_OR(auto key_pool, upload(pool_shape, DType::kF16, keys.data()));
+      LSE_ASSIGN_OR(auto value_pool, upload(pool_shape, DType::kF16, values.data()));
+      const float block_ids[]{1, 0};
+      LSE_ASSIGN_OR(auto table, upload({1, blocks}, DType::kF32, block_ids));
+      for (const int first : {0, 4}) {
+        const int queries = first == 0 ? 4 : 1;
+        const int live = first + queries;
+        const float positions[]{static_cast<float>(first), static_cast<float>(live), 1,
+                                static_cast<float>(first), static_cast<float>(live)};
+        LSE_ASSIGN_OR(auto meta, upload({5}, DType::kF32, positions));
+        std::vector<float> q(heads * queries * dim), k(kvheads * queries * dim), v(k.size());
+        for (std::size_t i = 0; i < q.size(); ++i)
+          q[i] = static_cast<float>(static_cast<int>((i + first) % 31) - 15) / 32.f;
+        for (std::size_t i = 0; i < k.size(); ++i) {
+          k[i] = static_cast<float>(static_cast<int>((i + first) % 29) - 14) / 32.f;
+          v[i] = static_cast<float>(static_cast<int>((i + first) % 23) - 11) / 32.f;
+        }
+        LSE_ASSIGN_OR(auto query, upload({1, heads, queries, dim}, DType::kF32, q.data()));
+        LSE_ASSIGN_OR(auto key_source, upload({1, kvheads, queries, dim}, DType::kF32, k.data()));
+        LSE_ASSIGN_OR(auto value_source, upload({1, kvheads, queries, dim}, DType::kF32, v.data()));
+        // Keep the producers lazy: model K/V writes consume generated values,
+        // and HIP may stage these producers with the in-place stores.
+        key_source = key_source + graph::Array::full({1}, DType::kF32, .03125f);
+        value_source = value_source - graph::Array::full({1}, DType::kF32, .03125f);
+        auto written_k = graph::kv_page_write(key_pool, key_source, meta, table, block, kv::CacheDType::kF16);
+        auto written_v = graph::kv_page_write(value_pool, value_source, meta, table, block, kv::CacheDType::kF16);
+        auto output = graph::sdpa_paged(query, written_k, written_v, .25f,
+            graph::MaskKind::kCausal, 0, meta, table, block, &backend.device_info(), kv::CacheDType::kF16);
+        LSE_RETURN_IF_ERROR(output.eval());
+        const auto trace = scheduler->last_trace();
+        LSE_EXPECT(trace.device_groups > 0);
+        LSE_EXPECT_EQ(trace.host_groups, 0u);
+        LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+        const auto index = [&](int h, int t, int d) {
+          return static_cast<std::size_t>(((static_cast<int>(block_ids[t / block]) * kvheads + h) * block + t % block) * dim + d);
+        };
+        for (int h = 0; h < kvheads; ++h)
+          for (int t = 0; t < queries; ++t)
+            for (int d = 0; d < dim; ++d) {
+              const auto src = static_cast<std::size_t>((h * queries + t) * dim + d);
+              keys[index(h, first + t, d)] = float16_t::from_float(k[src] + .03125f);
+              values[index(h, first + t, d)] = float16_t::from_float(v[src] - .03125f);
+            }
+        std::vector<std::uint16_t> actual(keys.size());
+        const auto check_pool = [&](const graph::Array& pool, const auto& expected, const char* label) -> Status {
+          LSE_RETURN_IF_ERROR(backend.copy_d2h(pool.node()->buffer, actual.data(), actual.size() * 2, 0));
+          if (actual != expected) {
+            const auto at = std::mismatch(actual.begin(), actual.end(), expected.begin()).first - actual.begin();
+            std::fprintf(stderr, "       %s %s write first=%d index=%zu actual=%u expected=%u\n",
+                std::string(to_string(dialect)).c_str(), label, first, static_cast<std::size_t>(at),
+                unsigned(actual[at]), unsigned(expected[at]));
+          }
+          LSE_EXPECT(actual == expected);
+          return OkStatus();
+        };
+        LSE_RETURN_IF_ERROR(check_pool(key_pool, keys, "K"));
+        LSE_RETURN_IF_ERROR(check_pool(value_pool, values, "V"));
+        std::vector<float> got(q.size());
+        LSE_RETURN_IF_ERROR(output.to_host(got.data(), got.size() * sizeof(float)));
+        auto decode = [](std::uint16_t bits) { float16_t x; x.bits = bits; return x.to_float(); };
+        double worst = 0;
+        for (int h = 0; h < heads; ++h)
+          for (int t = 0; t < queries; ++t) {
+            std::vector<double> scores(static_cast<std::size_t>(first + t + 1));
+            double maximum = -std::numeric_limits<double>::infinity();
+            for (std::size_t j = 0; j < scores.size(); ++j) {
+              double score = 0;
+              for (int d = 0; d < dim; ++d)
+                score += q[(h * queries + t) * dim + d] * decode(keys[index(h / 2, static_cast<int>(j), d)]);
+              maximum = std::max(maximum, scores[j] = score * .25);
+            }
+            double denominator = 0;
+            for (auto& score : scores) { score = std::exp(score - maximum); denominator += score; }
+            for (int d = 0; d < dim; ++d) {
+              double numerator = 0;
+              for (std::size_t j = 0; j < scores.size(); ++j)
+                numerator += scores[j] * decode(values[index(h / 2, static_cast<int>(j), d)]);
+              const auto at = static_cast<std::size_t>((h * queries + t) * dim + d);
+              LSE_EXPECT(std::isfinite(got[at]));
+              worst = std::max(worst, std::abs(got[at] - numerator / denominator));
+            }
+          }
+        std::fprintf(stderr, "       %s F16 paged first=%d queries=%d max_abs=%.9g device=%u host=%u\n",
+            std::string(to_string(dialect)).c_str(), first, queries, worst,
+            unsigned(trace.device_groups), unsigned(trace.host_groups));
+        LSE_EXPECT(worst < 2e-6);
+      }
+      return OkStatus();
+    };
+    LSE_EXPECT_OK(run());
+  }
+}
+
 LSE_TEST(greedy_sampling_ignores_every_other_knob) {
   SamplingParams p;
   p.temperature = 0.0f;
