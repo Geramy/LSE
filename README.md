@@ -404,6 +404,25 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 **Prefill** processes input tokens. **Decode** generates output tokens.
 Both rates below use tokens per second.
 
+### Long-context vector staging (2026-09-29)
+
+Matched cold HTTP requests use Q4, Q8 DFlash2 with seven proposals, BF16 K/V,
+temperature 0.6, top-k 20, top-p 0.95, and batch/ubatch 1024. Each server starts
+with an empty kernel cache and generates 128 tokens.
+
+| Context | Before PP/s | After PP/s | Before TPS | After TPS |
+|---:|---:|---:|---:|---:|
+| 1,024 | 413.16 | 408.43 | 27.75 | 27.55 |
+| 65,536 | 146.06 | **224.02** | 13.85 | 13.79 |
+
+At 64K, vector staging and K/V cache hints improve prefill throughput by 53.4%.
+Prompt time falls from 448.70 to 292.54 seconds. Decode is essentially unchanged.
+The 1K comparison is about 1% slower. Each row is one measurement pair;
+these are not guarantees for other prompts. Both pairs produce identical text
+and acceptance counts with zero CPU fallback. See the
+[vector staging report](docs/benchmarks/attention-vector-staging-2026-09-29.md)
+for the method, kernel resources, and correctness checks.
+
 ### Combined M8 gate/up (v0.4.16 measurements)
 
 Same executable, 1024-token coding prompts, 384 generated tokens, temperature 0.6,
