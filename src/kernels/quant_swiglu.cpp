@@ -5,6 +5,7 @@
 #include "lse/kernels/lds_linear.hpp"
 #include "lse/math.hpp"
 #include "lse/quant/group_affine_codec.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -31,7 +32,7 @@ void dot(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
          std::uint32_t count, std::span<const kir::LValue<kir::f32>> ga,
          std::span<const kir::LValue<kir::f32>> ua) {
   std::vector<kir::LValue<kir::f32>> gf, uf;
-  for (std::size_t r = 0; r < 8; ++r) {
+  for (std::size_t r = 0; r < ga.size(); ++r) {
     gf.push_back(e.var(0.0f));
     uf.push_back(e.var(0.0f));
   }
@@ -47,9 +48,10 @@ void dot(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
     gp.push_back(g);
     up.push_back(u);
   }
-  for (std::size_t rp = 0; rp < 8; rp += 2) {
+  for (std::size_t rp = 0; rp < ga.size(); rp += 2) {
     std::vector<kir::Pack<kir::u32>> first, second, steps;
-    for (std::size_t at = 0; at < 2; ++at) {
+    const auto pair_rows = std::min<std::size_t>(2, ga.size() - rp);
+    for (std::size_t at = 0; at < pair_rows; ++at) {
       auto base = e.u32(static_cast<std::uint32_t>((rp + at) * 2000));
       first.push_back(
           e.load(a.panel, e.let(base + chunk * 2u), count == 4 ? 16u : 8u));
@@ -58,7 +60,7 @@ void dot(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
       steps.push_back(e.load(a.panel, e.let(base + 1280u + chunk), count * 4u));
     }
     for (std::uint32_t j = 0; j < count; ++j) {
-      for (std::size_t at = 0; at < 2; ++at) {
+      for (std::size_t at = 0; at < pair_rows; ++at) {
         auto gi = e.var(kir::cast<kir::i32>(e.u32(0)));
         auto ui = e.var(kir::cast<kir::i32>(e.u32(0)));
         for (int p = 0; p < 2; ++p) {
@@ -82,7 +84,7 @@ void dot(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
   auto group = e.let(chunk / 8u);
   auto gs = e.let(math::widen(a.gs[sb + group]));
   auto us = e.let(math::widen(a.us[sb + group]));
-  for (std::size_t r = 0; r < 8; ++r) {
+  for (std::size_t r = 0; r < ga.size(); ++r) {
     ga[r] = math::fma(gs, gf[r].read(), ga[r].read());
     ua[r] = math::fma(us, uf[r].read(), ua[r].read());
   }
@@ -136,6 +138,7 @@ struct Pair final : KernelPrimitive<Pair> {
     if (!valid(s) || !s.types.scalar || !s.store || !s.intrinsics)
       return {};
     auto sched = dot4_schedule(original(s));
+    const auto rows = sched.rows;
     kir::KernelBody kb(s.types, *s.intrinsics, 0);
     kb.set_store(s.store);
     Args a;
@@ -146,7 +149,7 @@ struct Pair final : KernelPrimitive<Pair> {
     auto lane = e.let(lid % 32u);
     auto col = e.let(math::workgroup_id_x() * 8u + lid / 32u);
     std::vector<kir::LValue<kir::f32>> ga, ua;
-    for (int r = 0; r < 8; ++r) {
+    for (std::uint32_t r = 0; r < rows; ++r) {
       ga.push_back(e.var(0.0f));
       ua.push_back(e.var(0.0f));
     }
@@ -164,7 +167,7 @@ struct Pair final : KernelPrimitive<Pair> {
         for (auto g : e.range(e.u32(cb / 8u) + lane, e.u32(ce / 8u), 32u)) {
           auto gb = e.let(math::widen(a.gb[sb + g]));
           auto ub = e.let(math::widen(a.ub[sb + g]));
-          for (std::size_t r = 0; r < 8; ++r) {
+          for (std::uint32_t r = 0; r < rows; ++r) {
             auto sum = e.let(math::from_bits<lse::f32>(
                 a.panel[e.u32(static_cast<std::uint32_t>(r * 2000 + 1920)) +
                         g]));
@@ -174,14 +177,14 @@ struct Pair final : KernelPrimitive<Pair> {
         }
       }
     }
-    for (std::size_t r = 0; r < 8; ++r) {
+    for (std::uint32_t r = 0; r < rows; ++r) {
       for (std::uint32_t bit = 1; bit < 32; bit <<= 1)
         ga[r] = ga[r].read() + math::shfl_xor(ga[r].read(), e.u32(bit));
       for (std::uint32_t bit = 1; bit < 32; bit <<= 1)
         ua[r] = ua[r].read() + math::shfl_xor(ua[r].read(), e.u32(bit));
     }
     if (auto lane0 = e.when(lane == 0u && col < 17408u))
-      for (std::size_t r = 0; r < 8; ++r) {
+      for (std::uint32_t r = 0; r < rows; ++r) {
         auto g = ga[r].read();
         auto silu = e.let(math::emit<Silu>(g));
         e.store(e.u32(static_cast<std::uint32_t>(r * 17408)) + col,

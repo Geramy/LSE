@@ -85,6 +85,7 @@ struct Q4PanelShape {
   std::uint32_t load_chunks = 1;
 };
 inline constexpr std::array kQ4PanelShapes{
+    Q4PanelShape{1, 17408, 5120, 0, 4},
     Q4PanelShape{4, 17408, 5120, 0, 2},  Q4PanelShape{4, 5120, 17408},
     Q4PanelShape{4, 10240, 5120, 0, 2},  Q4PanelShape{4, 6144, 5120, 0, 2},
     Q4PanelShape{4, 12288, 5120},  Q4PanelShape{4, 5120, 6144},
@@ -106,6 +107,7 @@ struct Q4SwiGluShape {
   std::int64_t m, n, k;
 };
 inline constexpr std::array kQ4SwiGluShapes{
+    Q4SwiGluShape{"gfx1201", 32, 4, 64, 256, 4, 1, 1, 17408, 5120},
     Q4SwiGluShape{"gfx1201", 32, 4, 64, 256, 4, 2, 8, 17408, 5120},
 };
 
