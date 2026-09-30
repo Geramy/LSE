@@ -59,6 +59,167 @@ bool have_model() {
 
 }  // namespace
 
+LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
+  auto* scheduler = graph::default_scheduler();
+  LSE_EXPECT(scheduler != nullptr);
+  if (!scheduler) return;
+  auto& backend = scheduler->backend();
+  const auto* toolchain = backend.toolchain(graph::Dialect::kLoom);
+  if (!backend.emitter() || !toolchain)
+    LSE_SKIP("requires native Loom attention dispatch");
+  struct RestoreMode {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode saved;
+    ~RestoreMode() { scheduler.set_mode(saved); }
+  } restore{*scheduler, scheduler->mode()};
+  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  const auto run = [&]() -> Status {
+    std::fprintf(stderr, "       F16 fragmented check: begin arch=%s\n",
+        std::string(backend.device_info().arch).c_str());
+    constexpr int rows = 2, heads = 4, kvheads = 2, dim = 32, block = 16;
+    constexpr int blocks = 256, stride = 256;
+    const Shape pool_shape{blocks, kvheads, block, dim};
+    const auto bytes = pool_shape.elem_count() * sizeof(std::uint16_t);
+    std::vector<std::uint16_t> keys(pool_shape.elem_count()), values(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      keys[i] = float16_t::from_float(static_cast<float>(static_cast<int>(i % 97) - 48) / 64.f);
+      values[i] = float16_t::from_float(static_cast<float>(static_cast<int>(i % 83) - 41) / 64.f);
+    }
+    auto upload = [&](const Shape& shape, DType dtype, const void* data) -> Result<graph::Array> {
+      const auto size = dtype_storage_bytes(dtype, shape.elem_count());
+      LSE_ASSIGN_OR(auto buffer, backend.allocate(size + 32, backend::MemoryClass::kDevice));
+      LSE_ASSIGN_OR(auto base_address, backend.device_pointer(buffer));
+      buffer.offset = 32;
+      buffer.size_bytes = size;
+      LSE_ASSIGN_OR(auto view_address, backend.device_pointer(buffer));
+      LSE_EXPECT_EQ(reinterpret_cast<std::uintptr_t>(view_address),
+                    reinterpret_cast<std::uintptr_t>(base_address) + 32);
+      std::fprintf(stderr, "       upload bytes=%zu address=%p offset=%zu\n",
+          size, view_address, buffer.offset);
+      LSE_RETURN_IF_ERROR(backend.copy_h2d(data, buffer, size, 0));
+      return graph::Array::from_buffer(std::move(buffer), shape, dtype);
+    };
+    LSE_ASSIGN_OR(auto contiguous_k, upload(pool_shape, DType::kF16, keys.data()));
+    LSE_ASSIGN_OR(auto contiguous_v, upload(pool_shape, DType::kF16, values.data()));
+    auto manager = kv::MemoryManager::create();
+    auto key_storage = std::make_shared<kv::FragmentStorage>(manager, backend, backend::kDefaultStream);
+    auto value_storage = std::make_shared<kv::FragmentStorage>(manager, backend, backend::kDefaultStream);
+    // Each pool spans two fragments; interleave them to prohibit assuming
+    // that consecutive logical fragments occupy consecutive GPU addresses.
+    std::fprintf(stderr, "       F16 fragmented check: grow pools\n");
+    LSE_RETURN_IF_ERROR(key_storage->grow(kv::kFragmentBytes));
+    LSE_RETURN_IF_ERROR(value_storage->grow(kv::kFragmentBytes));
+    LSE_RETURN_IF_ERROR(key_storage->grow(bytes));
+    LSE_RETURN_IF_ERROR(value_storage->grow(bytes));
+    std::fprintf(stderr, "       F16 fragmented check: initialize pools\n");
+    LSE_RETURN_IF_ERROR(key_storage->write(keys.data(), bytes));
+    LSE_RETURN_IF_ERROR(value_storage->write(values.data(), bytes));
+    LSE_ASSIGN_OR(auto key_binding, key_storage->binding());
+    LSE_ASSIGN_OR(auto value_binding, value_storage->binding());
+    auto fragmented_k = graph::Array::from_buffer(std::move(key_binding), pool_shape, DType::kF16);
+    auto fragmented_v = graph::Array::from_buffer(std::move(value_binding), pool_shape, DType::kF16);
+    fragmented_k.node()->kv_fragments = key_storage;
+    fragmented_v.node()->kv_fragments = value_storage;
+    std::vector<float> table_values(rows * stride);
+    for (int row = 0; row < rows; ++row)
+      for (int i = 0; i < stride; ++i)
+        table_values[row * stride + i] = static_cast<float>((i * 13 + 7 + row * 126) % blocks);
+    LSE_ASSIGN_OR(auto table, upload({rows, stride}, DType::kF32, table_values.data()));
+    const float write_values[]{255, 258, rows, 255, 258, 127, 130};
+    LSE_ASSIGN_OR(auto write_meta, upload({7}, DType::kF32, write_values));
+    std::vector<float> additions(rows * kvheads * 3 * dim);
+    for (std::size_t i = 0; i < additions.size(); ++i)
+      additions[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 32.f;
+    LSE_ASSIGN_OR(auto source, upload({rows, kvheads, 3, dim}, DType::kF32, additions.data()));
+    for (int row = 0; row < rows; ++row)
+      for (int h = 0; h < kvheads; ++h)
+        for (int t = 0; t < 3; ++t)
+          for (int d = 0; d < dim; ++d) {
+            const int position = (row == 0 ? 255 : 127) + t;
+            const auto physical = static_cast<int>(table_values[row * stride + position / block]);
+            const auto at = static_cast<std::size_t>(((physical * kvheads + h) * block + position % block) * dim + d);
+            keys[at] = float16_t::from_float(additions[((row * kvheads + h) * 3 + t) * dim + d]);
+          }
+    std::vector<float> query(rows * heads * dim);
+    for (std::size_t i = 0; i < query.size(); ++i)
+      query[i] = static_cast<float>(static_cast<int>(i % 71) - 35) / 64.f;
+    LSE_ASSIGN_OR(auto q, upload({rows, heads, 1, dim}, DType::kF32, query.data()));
+    const float metadata[]{272, 273, rows, 272, 273, 129, 130};
+    LSE_ASSIGN_OR(auto meta, upload({7}, DType::kF32, metadata));
+    std::vector<float> contiguous;
+    for (bool fragmented : {false, true}) {
+      // Q=1 and D=32 deliberately select scalar attention on both gfx11 and
+      // gfx12, independently of short-query matrix/split specialization.
+      auto written = graph::kv_page_write(fragmented ? fragmented_k : contiguous_k,
+          source, write_meta, table, block, kv::CacheDType::kF16);
+      auto output = graph::sdpa_paged(q, written,
+          fragmented ? fragmented_v : contiguous_v, .125f,
+          graph::MaskKind::kCausal, 0, meta, table, block,
+          &backend.device_info(), kv::CacheDType::kF16);
+      std::fprintf(stderr, "       F16 fragmented check: eval fragmented=%d\n", fragmented);
+      LSE_RETURN_IF_ERROR(output.eval());
+      const auto trace = scheduler->last_trace();
+      LSE_EXPECT(trace.device_groups >= 2);
+      LSE_EXPECT_EQ(trace.host_groups, 0u);
+      LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+      std::vector<float> got(query.size());
+      LSE_RETURN_IF_ERROR(output.to_host(got.data(), got.size() * sizeof(float)));
+      std::fprintf(stderr, "       F16 fragmented check: read output fragmented=%d\n", fragmented);
+      std::vector<std::uint16_t> actual(keys.size());
+      if (fragmented) LSE_RETURN_IF_ERROR(key_storage->read(actual.data(), bytes));
+      else LSE_RETURN_IF_ERROR(backend.copy_d2h(contiguous_k.node()->buffer, actual.data(), bytes, 0));
+      if (actual != keys) {
+        const auto mismatch = std::mismatch(actual.begin(), actual.end(), keys.begin());
+        std::fprintf(stderr, "       F16 page write fragmented=%d index=%zu actual_bits=%u expected_bits=%u\n",
+            fragmented, static_cast<std::size_t>(mismatch.first - actual.begin()),
+            static_cast<unsigned>(*mismatch.first), static_cast<unsigned>(*mismatch.second));
+        return LSE_ERROR(kInternal, "F16 page write mismatch");
+      }
+      LSE_EXPECT_EQ(got.size(), query.size());
+      if (got.size() != query.size()) return LSE_ERROR(kInternal, "incomplete attention output");
+      double worst = 0;
+      std::size_t worst_index = 0;
+      double worst_expected = 0;
+      auto decode = [](std::uint16_t bits) { float16_t value; value.bits = bits; return value.to_float(); };
+      for (int row = 0; row < rows; ++row)
+        for (int h = 0; h < heads; ++h) {
+          const int live = row == 0 ? 273 : 130;
+          std::vector<double> scores(static_cast<std::size_t>(live));
+          double maximum = -std::numeric_limits<double>::infinity();
+          auto at = [&](int key, int d) {
+            const int physical = static_cast<int>(table_values[row * stride + key / block]);
+            return static_cast<std::size_t>(((physical * kvheads + h / (heads / kvheads)) * block + key % block) * dim + d);
+          };
+          for (int key = 0; key < live; ++key) {
+            double score = 0;
+            for (int d = 0; d < dim; ++d)
+              score += static_cast<double>(query[(row * heads + h) * dim + d]) * decode(keys[at(key, d)]);
+            maximum = std::max(maximum, scores[key] = score * .125);
+          }
+          double denominator = 0;
+          for (auto& score : scores) { score = std::exp(score - maximum); denominator += score; }
+          for (int d = 0; d < dim; ++d) {
+            double numerator = 0;
+            for (int key = 0; key < live; ++key) numerator += scores[key] * decode(values[at(key, d)]);
+            const double expected = numerator / denominator;
+            const auto index = static_cast<std::size_t>((row * heads + h) * dim + d);
+            LSE_EXPECT(std::isfinite(got[index]));
+            const double error = std::abs(static_cast<double>(got[index]) - expected);
+            if (error > worst) { worst = error; worst_index = index; worst_expected = expected; }
+          }
+        }
+      std::fprintf(stderr, "       F16 scalar arch=%s fragmented=%d max_abs=%.9g index=%zu actual=%.9g expected=%.9g\n",
+          std::string(backend.device_info().arch).c_str(), fragmented, worst, worst_index,
+          static_cast<double>(got[worst_index]), worst_expected);
+      LSE_EXPECT(worst < 2e-6);
+      if (!fragmented) contiguous = got;
+      else LSE_EXPECT(std::memcmp(contiguous.data(), got.data(), got.size() * sizeof(float)) == 0);
+    }
+    return OkStatus();
+  };
+  LSE_EXPECT_OK(run());
+}
+
 LSE_TEST(greedy_sampling_ignores_every_other_knob) {
   SamplingParams p;
   p.temperature = 0.0f;
@@ -4425,157 +4586,4 @@ LSE_TEST(kv_growth_releases_obsolete_recurrent_graphs) {
   LSE_EXPECT_OK(session.restart());
   auto restarted = fx.lm->hidden(ids_array({2}), &session.states(), nullptr);
   LSE_EXPECT_OK(restarted.status());
-}
-
-
-LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
-  auto* scheduler = graph::default_scheduler();
-  LSE_EXPECT(scheduler != nullptr);
-  if (!scheduler) return;
-  auto& backend = scheduler->backend();
-  const auto* toolchain = backend.toolchain(graph::Dialect::kLoom);
-  if (!backend.emitter() || !toolchain)
-    LSE_SKIP("requires native Loom attention dispatch");
-  struct RestoreMode {
-    graph::Scheduler& scheduler;
-    graph::Scheduler::Mode saved;
-    ~RestoreMode() { scheduler.set_mode(saved); }
-  } restore{*scheduler, scheduler->mode()};
-  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
-  const auto run = [&]() -> Status {
-    constexpr int rows = 2, heads = 4, kvheads = 2, dim = 32, block = 16;
-    constexpr int blocks = 256, stride = 256;
-    const Shape pool_shape{blocks, kvheads, block, dim};
-    const auto bytes = pool_shape.elem_count() * sizeof(std::uint16_t);
-    std::vector<std::uint16_t> keys(pool_shape.elem_count()), values(keys.size());
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-      keys[i] = float16_t::from_float(static_cast<float>(static_cast<int>(i % 97) - 48) / 64.f);
-      values[i] = float16_t::from_float(static_cast<float>(static_cast<int>(i % 83) - 41) / 64.f);
-    }
-    auto upload = [&](const Shape& shape, DType dtype, const void* data) -> Result<graph::Array> {
-      const auto size = dtype_storage_bytes(dtype, shape.elem_count());
-      LSE_ASSIGN_OR(auto buffer, backend.allocate(size + 32, backend::MemoryClass::kDevice));
-      LSE_ASSIGN_OR(auto base_address, backend.device_pointer(buffer));
-      buffer.offset = 32;
-      buffer.size_bytes = size;
-      LSE_ASSIGN_OR(auto view_address, backend.device_pointer(buffer));
-      LSE_EXPECT_EQ(reinterpret_cast<std::uintptr_t>(view_address),
-                    reinterpret_cast<std::uintptr_t>(base_address) + 32);
-      LSE_RETURN_IF_ERROR(backend.copy_h2d(data, buffer, size, 0));
-      return graph::Array::from_buffer(std::move(buffer), shape, dtype);
-    };
-    LSE_ASSIGN_OR(auto contiguous_k, upload(pool_shape, DType::kF16, keys.data()));
-    LSE_ASSIGN_OR(auto contiguous_v, upload(pool_shape, DType::kF16, values.data()));
-    auto manager = kv::MemoryManager::create();
-    auto key_storage = std::make_shared<kv::FragmentStorage>(manager, backend, backend::kDefaultStream);
-    auto value_storage = std::make_shared<kv::FragmentStorage>(manager, backend, backend::kDefaultStream);
-    // Each pool spans two fragments; interleave them to prohibit assuming
-    // that consecutive logical fragments occupy consecutive GPU addresses.
-    LSE_RETURN_IF_ERROR(key_storage->grow(kv::kFragmentBytes));
-    LSE_RETURN_IF_ERROR(value_storage->grow(kv::kFragmentBytes));
-    LSE_RETURN_IF_ERROR(key_storage->grow(bytes));
-    LSE_RETURN_IF_ERROR(value_storage->grow(bytes));
-    LSE_RETURN_IF_ERROR(key_storage->write(keys.data(), bytes));
-    LSE_RETURN_IF_ERROR(value_storage->write(values.data(), bytes));
-    LSE_ASSIGN_OR(auto key_binding, key_storage->binding());
-    LSE_ASSIGN_OR(auto value_binding, value_storage->binding());
-    auto fragmented_k = graph::Array::from_buffer(std::move(key_binding), pool_shape, DType::kF16);
-    auto fragmented_v = graph::Array::from_buffer(std::move(value_binding), pool_shape, DType::kF16);
-    fragmented_k.node()->kv_fragments = key_storage;
-    fragmented_v.node()->kv_fragments = value_storage;
-    std::vector<float> table_values(rows * stride);
-    for (int row = 0; row < rows; ++row)
-      for (int i = 0; i < stride; ++i)
-        table_values[row * stride + i] = static_cast<float>((i * 13 + 7 + row * 126) % blocks);
-    LSE_ASSIGN_OR(auto table, upload({rows, stride}, DType::kF32, table_values.data()));
-    const float write_values[]{255, 258, rows, 255, 258, 127, 130};
-    LSE_ASSIGN_OR(auto write_meta, upload({7}, DType::kF32, write_values));
-    std::vector<float> additions(rows * kvheads * 3 * dim);
-    for (std::size_t i = 0; i < additions.size(); ++i)
-      additions[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 32.f;
-    LSE_ASSIGN_OR(auto source, upload({rows, kvheads, 3, dim}, DType::kF32, additions.data()));
-    for (int row = 0; row < rows; ++row)
-      for (int h = 0; h < kvheads; ++h)
-        for (int t = 0; t < 3; ++t)
-          for (int d = 0; d < dim; ++d) {
-            const int position = (row == 0 ? 255 : 127) + t;
-            const auto physical = static_cast<int>(table_values[row * stride + position / block]);
-            const auto at = static_cast<std::size_t>(((physical * kvheads + h) * block + position % block) * dim + d);
-            keys[at] = float16_t::from_float(additions[((row * kvheads + h) * 3 + t) * dim + d]);
-          }
-    std::vector<float> query(rows * heads * dim);
-    for (std::size_t i = 0; i < query.size(); ++i)
-      query[i] = static_cast<float>(static_cast<int>(i % 71) - 35) / 64.f;
-    LSE_ASSIGN_OR(auto q, upload({rows, heads, 1, dim}, DType::kF32, query.data()));
-    const float metadata[]{272, 273, rows, 272, 273, 129, 130};
-    LSE_ASSIGN_OR(auto meta, upload({7}, DType::kF32, metadata));
-    std::vector<float> contiguous;
-    for (bool fragmented : {false, true}) {
-      // Q=1 and D=32 deliberately select scalar attention on both gfx11 and
-      // gfx12, independently of short-query matrix/split specialization.
-      auto written = graph::kv_page_write(fragmented ? fragmented_k : contiguous_k,
-          source, write_meta, table, block, kv::CacheDType::kF16);
-      auto output = graph::sdpa_paged(q, written,
-          fragmented ? fragmented_v : contiguous_v, .125f,
-          graph::MaskKind::kCausal, 0, meta, table, block,
-          &backend.device_info(), kv::CacheDType::kF16);
-      LSE_RETURN_IF_ERROR(output.eval());
-      const auto trace = scheduler->last_trace();
-      LSE_EXPECT(trace.device_groups >= 2);
-      LSE_EXPECT_EQ(trace.host_groups, 0u);
-      LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
-      const auto got = read_all(output);
-      std::vector<std::uint16_t> actual(keys.size());
-      if (fragmented) LSE_RETURN_IF_ERROR(key_storage->read(actual.data(), bytes));
-      else LSE_RETURN_IF_ERROR(backend.copy_d2h(contiguous_k.node()->buffer, actual.data(), bytes, 0));
-      if (actual != keys) {
-        const auto mismatch = std::mismatch(actual.begin(), actual.end(), keys.begin());
-        std::printf("       F16 page write fragmented=%d index=%zu actual_bits=%u expected_bits=%u\n",
-            fragmented, static_cast<std::size_t>(mismatch.first - actual.begin()),
-            static_cast<unsigned>(*mismatch.first), static_cast<unsigned>(*mismatch.second));
-        return LSE_ERROR(kInternal, "F16 page write mismatch");
-      }
-      LSE_EXPECT_EQ(got.size(), query.size());
-      if (got.size() != query.size()) return LSE_ERROR(kInternal, "incomplete attention output");
-      double worst = 0;
-      std::size_t worst_index = 0;
-      double worst_expected = 0;
-      auto decode = [](std::uint16_t bits) { float16_t value; value.bits = bits; return value.to_float(); };
-      for (int row = 0; row < rows; ++row)
-        for (int h = 0; h < heads; ++h) {
-          const int live = row == 0 ? 273 : 130;
-          std::vector<double> scores(static_cast<std::size_t>(live));
-          double maximum = -std::numeric_limits<double>::infinity();
-          auto at = [&](int key, int d) {
-            const int physical = static_cast<int>(table_values[row * stride + key / block]);
-            return static_cast<std::size_t>(((physical * kvheads + h / (heads / kvheads)) * block + key % block) * dim + d);
-          };
-          for (int key = 0; key < live; ++key) {
-            double score = 0;
-            for (int d = 0; d < dim; ++d)
-              score += static_cast<double>(query[(row * heads + h) * dim + d]) * decode(keys[at(key, d)]);
-            maximum = std::max(maximum, scores[key] = score * .125);
-          }
-          double denominator = 0;
-          for (auto& score : scores) { score = std::exp(score - maximum); denominator += score; }
-          for (int d = 0; d < dim; ++d) {
-            double numerator = 0;
-            for (int key = 0; key < live; ++key) numerator += scores[key] * decode(values[at(key, d)]);
-            const double expected = numerator / denominator;
-            const auto index = static_cast<std::size_t>((row * heads + h) * dim + d);
-            LSE_EXPECT(std::isfinite(got[index]));
-            const double error = std::abs(static_cast<double>(got[index]) - expected);
-            if (error > worst) { worst = error; worst_index = index; worst_expected = expected; }
-          }
-        }
-      std::printf("       F16 scalar arch=%s fragmented=%d max_abs=%.9g index=%zu actual=%.9g expected=%.9g\n",
-          std::string(backend.device_info().arch).c_str(), fragmented, worst, worst_index,
-          static_cast<double>(got[worst_index]), worst_expected);
-      LSE_EXPECT(worst < 2e-6);
-      if (!fragmented) contiguous = got;
-      else LSE_EXPECT(std::memcmp(contiguous.data(), got.data(), got.size() * sizeof(float)) == 0);
-    }
-    return OkStatus();
-  };
-  LSE_EXPECT_OK(run());
 }
