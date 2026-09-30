@@ -14,6 +14,7 @@
 
 #include "harness.hpp"
 #include "lse/graph/interpreter.hpp"
+#include "lse/graph/program.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/layer.hpp"
 #include "lse/model/qwen3_5_common.hpp"
@@ -2534,13 +2535,86 @@ void compare_paged_shard_contents(MixerState& whole,
   }
 }
 
+
+graph::NodePtr state_checkpoint(const graph::NodePtr& root, graph::OpKind kind) {
+  if (!root) return {};
+  if (root->kind == kind) return root;
+  for (const auto& input : root->inputs)
+    if (auto found = state_checkpoint(input, kind)) return found;
+  return {};
+}
+
+void compare_attention_checkpoints(const graph::Array& whole,
+                                    const std::vector<graph::Array>& shards,
+                                    const char* stage) {
+  const auto wa = state_checkpoint(whole.node(), graph::OpKind::kAttention);
+  LSE_EXPECT(wa && wa->inputs.size() == 5);
+  if (!wa || wa->inputs.size() != 5) return;
+  for (int role = 0; role < 5; ++role) {
+    auto select = [&](const graph::NodePtr& attention) {
+      if (role == 4) return attention;
+      const auto rotated = role < 2 ? attention->inputs[0] : attention->inputs[1]->inputs[1];
+      const auto norm = state_checkpoint(rotated, graph::OpKind::kRMS);
+      return role % 2 == 0 ? norm : rotated;
+    };
+    const char* names[]{"Q norm", "Q rotary", "K norm", "K rotary", "attention"};
+    const auto w = select(wa);
+    LSE_EXPECT(w && w->shape.rank() == 4);
+    if (!w || w->shape.rank() != 4) continue;
+    const auto per_head = w->shape.dim(2) * w->shape.dim(3);
+    std::size_t head_base = 0;
+    double worst = 0, peak = 0;
+    std::size_t worst_index = 0;
+    float worst_a = 0, worst_b = 0;
+    for (const auto& shard : shards) {
+      const auto sa = state_checkpoint(shard.node(), graph::OpKind::kAttention);
+      LSE_EXPECT(sa && sa->inputs.size() == 5);
+      if (!sa || sa->inputs.size() != 5) continue;
+      const auto s = select(sa);
+      LSE_EXPECT(s && s->shape.rank() == 4);
+      if (!s || s->shape.rank() != 4) continue;
+      const auto offset = head_base * static_cast<std::size_t>(per_head);
+      for (std::size_t i = 0; i < s->shape.elem_count(); ++i) {
+        const float a = graph::interpreter::load_element(*w, offset + i);
+        const float b = graph::interpreter::load_element(*s, i);
+        LSE_EXPECT(std::isfinite(a) && std::isfinite(b));
+        peak = std::max(peak, std::abs(static_cast<double>(a)));
+        const double error = std::abs(static_cast<double>(a) - b);
+        if (error > worst) { worst = error; worst_index = offset + i; worst_a = a; worst_b = b; }
+      }
+      head_base += static_cast<std::size_t>(s->shape.dim(1));
+    }
+    const auto relative = worst / std::max(peak, 1e-30);
+    std::fprintf(stderr, "       retained %s %s max_rel=%.9g peak=%.9g index=%zu whole=%.9g shard=%.9g\n",
+        stage, names[role], relative, peak, worst_index, worst_a, worst_b);
+    LSE_EXPECT_EQ(head_base, static_cast<std::size_t>(w->shape.dim(1)));
+    LSE_EXPECT(peak > 1e-8);
+    LSE_EXPECT(relative < 1e-4);
+  }
+}
+
 double shard_state_step(std::unique_ptr<IMixer> whole,
                         std::unique_ptr<IMixer> split, const Config& cfg,
                         const SafeTensors& ckpt,
                         const quant::GroupAffineMap* quant,
                         const std::string& prefix, std::int32_t layer,
                         bool attn, double* out_decode,
-                        double* out_reference_peak = nullptr) {
+                        double* out_reference_peak = nullptr,
+                        bool retain_intermediates = false) {
+  auto drain = [&](graph::Array& array) {
+    if (retain_intermediates) {
+      std::vector<graph::NodePtr> roots;
+      std::unordered_set<const graph::Node*> seen;
+      graph::collect_reachable(array.node(), roots, seen);
+      const auto status = graph::default_scheduler()->eval(roots, true);
+      LSE_EXPECT_OK(status);
+      const auto trace = graph::default_scheduler()->last_trace();
+      std::fprintf(stderr, "       retained execution: device=%zu host=%zu fallbacks=%zu\n",
+          std::size_t(trace.device_groups), std::size_t(trace.host_groups), std::size_t(trace.host_fallbacks));
+      if (!status.ok()) return std::vector<float>{};
+    }
+    return drain_all(array);
+  };
   WeightBinder bw(ckpt, quant);
   LayerContext cw{&cfg, layer, false, 1};
   if (!whole->load(bw, prefix, cw).ok()) return -1.0;
@@ -2561,8 +2635,8 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   if (!yw.ok() || !ps.ok() || ps->empty()) return -1.0;
   graph::Array sum = (*ps)[0];
   for (std::size_t i = 1; i < ps->size(); ++i) sum = graph::add(sum, (*ps)[i]);
-  const auto a = drain_all(*yw);
-  const auto b = drain_all(sum);
+  const auto a = drain(*yw);
+  const auto b = drain(sum);
   if (a.empty() || a.size() != b.size()) return -1.0;
   double absmax = 0.0, worst = 0.0;
   for (std::size_t i = 0; i < a.size(); ++i) {
@@ -2572,6 +2646,7 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   if (out_reference_peak != nullptr) *out_reference_peak = absmax;
   const double prefill = absmax > 0.0 ? worst / absmax : 0.0;
   if (attn) compare_paged_shard_contents(w_st, s_st, 4, "prefill");
+  if (attn && retain_intermediates) compare_attention_checkpoints(*yw, *ps, "prefill");
 
   // One decode token against the carried state -- the recurrence and the KV
   // pool the prefill just wrote, which is the whole point of this test.
@@ -2585,8 +2660,8 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   for (std::size_t i = 1; i < ps2->size(); ++i) {
     sum2 = graph::add(sum2, (*ps2)[i]);
   }
-  const auto a2 = drain_all(*yw2);
-  const auto b2 = drain_all(sum2);
+  const auto a2 = drain(*yw2);
+  const auto b2 = drain(sum2);
   if (a2.empty() || a2.size() != b2.size()) return -1.0;
   double absmax2 = 0.0, worst2 = 0.0;
   for (std::size_t i = 0; i < a2.size(); ++i) {
@@ -2595,6 +2670,7 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   }
   *out_decode = absmax2 > 0.0 ? worst2 / absmax2 : 0.0;
   if (attn) compare_paged_shard_contents(w_st, s_st, 5, "decode");
+  if (attn && retain_intermediates) compare_attention_checkpoints(*yw2, *ps2, "decode");
   return prefill;
 }
 
@@ -2653,6 +2729,24 @@ LSE_TEST(a_small_split_attention_carries_prefill_and_decode_state_without_a_chec
   const double prefill = shard_state_step(
       qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
       nullptr, "language_model.model.layers.3", 3, true, &decode, &peak);
+  std::fprintf(stderr, "       small attention state: prefill=%.9g decode=%.9g peak=%.9g\n", prefill, decode, peak);
+  LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
+  LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
+  LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
+}
+
+LSE_TEST(a_small_split_attention_preserves_intermediate_checkpoints) {
+  Config cfg = tiny_qwen_config(false);
+  cfg.attn_q_heads = 4;
+  cfg.attn_kv_heads = 2;
+  auto checkpoint = SafeTensors::open(write_shaped_fixture(
+      "split_attention_state", qwen_checkpoint(cfg)));
+  LSE_EXPECT_OK(checkpoint.status());
+  if (!checkpoint.ok()) return;
+  double decode = -1.0, peak = 0.0;
+  const double prefill = shard_state_step(
+      qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
+      nullptr, "language_model.model.layers.3", 3, true, &decode, &peak, true);
   std::fprintf(stderr, "       small attention state: prefill=%.9g decode=%.9g peak=%.9g\n", prefill, decode, peak);
   LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
   LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
