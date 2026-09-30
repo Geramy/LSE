@@ -12,6 +12,7 @@
 #include "lse/backends/hrx/loomc/loom_sources.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/ir/lower.hpp"
+#include "lse/kv/memory.hpp"
 #include "lse/math.hpp"
 
 namespace lse::backend {
@@ -520,6 +521,7 @@ class Printer {
       }
       view_of_[o.result] = it->second.view;
       extent_of_[o.result] = it->second.elements;
+      kv_fragment_elements_[o.result] = it->second.kv_fragment_elements;
       define(o.result, loom_view_type(it->second.elem, it->second.elements),
              it->second.elem, Cls::kOther);
       return Status{};
@@ -854,6 +856,7 @@ class Printer {
     std::string view_type;
     Scalar elem = Scalar::kF32;
     std::uint64_t extent = 0;
+    std::uint64_t fragment_elements = 0;
   };
 
   Result<Access> access_of(ValueId base) const {
@@ -867,7 +870,44 @@ class Printer {
       return LSE_ERROR(kUnimplemented,
                        "loom printer: a view with no name in this kernel");
     }
-    return Access{it->second, t->type, t->elem, extent_of_.at(base)};
+    const auto fragment = kv_fragment_elements_.find(base);
+    return Access{it->second, t->type, t->elem, extent_of_.at(base),
+                  fragment == kv_fragment_elements_.end() ? 0 : fragment->second};
+  }
+
+  Status fragment_access(Access& access, std::string& at, int depth,
+                         std::uint32_t lanes = 1) {
+    if (!access.fragment_elements) return OkStatus();
+    const auto elements = access.fragment_elements;
+    if (!lanes || elements % lanes)
+      return unsupported("a vector width that does not divide the K/V fragment");
+    const auto count = (access.extent + elements - 1) / elements;
+    const auto size = fresh("frag_size"), slot = fresh("frag_slot");
+    const auto local = fresh("frag_at"), address = fresh("frag_address");
+    const auto root = fresh("frag_root"), zero = fresh("frag_zero");
+    const auto view = fresh("frag_view");
+    line(depth, size + " = index.constant " + std::to_string(elements) + " : index");
+    line(depth, slot + " = index.div " + at + ", " + size + " : index");
+    line(depth, local + " = index.rem " + at + ", " + size + " : index");
+    line(depth, address + " = view.load " + access.view + "[" + slot + "] : " +
+                loom_view_type(Scalar::kU64, count) + " -> i64");
+    line(depth, root + " = buffer.from_address " + address +
+                " {byte_length = " + std::to_string(kv::kFragmentBytes) +
+                ", base_alignment = 16} : i64 -> buffer");
+    line(depth, zero + " = index.constant 0 : offset");
+    access.view_type = loom_view_type(access.elem, elements);
+    line(depth, view + " = buffer.view " + root + "[" + zero +
+                "] : buffer -> " + access.view_type);
+    access.view = view;
+    at = local;
+    if (lanes > 1) {
+      // Buffer::load/store require vector alignment. A fragment contains an
+      // integral number of vectors, so an aligned vector cannot cross it.
+      at = fresh("frag_vector_at");
+      line(depth, at + " = index.assume " + local + " [range(" + local + ", 0, " +
+                  std::to_string(elements - lanes) + ")] : index");
+    }
+    return OkStatus();
   }
 
   // The address a Loom memory op reads, with the range the caller is required
@@ -960,6 +1000,7 @@ class Printer {
     if (!acc.ok()) return acc.status();
     auto at = bounded(o.operands[1], acc->extent, 1, depth);
     if (!at.ok()) return at.status();
+    LSE_RETURN_IF_ERROR(fragment_access(*acc, *at, depth));
     const std::string elem(loom_storage_type(acc->elem));
     line(depth, name(o.result) + " = view.load " + acc->view + "[" + *at +
                     "] : " + acc->view_type + " -> " + elem);
@@ -1070,9 +1111,11 @@ class Printer {
     if (v == nullptr) return unsupported("assigned value was never defined");
     auto at = bounded(sub.operands[1], it->second.extent, 1, depth);
     if (!at.ok()) return at.status();
-    line(depth, "view.store " + name(o.operands[1]) + ", " + it->second.view +
+    auto access = it->second;
+    LSE_RETURN_IF_ERROR(fragment_access(access, *at, depth));
+    line(depth, "view.store " + name(o.operands[1]) + ", " + access.view +
                     "[" + *at + "] : " + v->type + ", " +
-                    it->second.view_type);
+                    access.view_type);
     return Status{};
   }
 
@@ -1083,6 +1126,7 @@ class Printer {
     const auto n = static_cast<std::uint32_t>(o.imm);
     auto at = bounded(o.operands[1], acc->extent, n, depth);
     if (!at.ok()) return at.status();
+    LSE_RETURN_IF_ERROR(fragment_access(*acc, *at, depth, n));
     const std::string res = name(o.result);
     if (n <= 1) {
       const std::string elem(loom_storage_type(acc->elem));
@@ -1108,6 +1152,7 @@ class Printer {
     const auto n = static_cast<std::uint32_t>(o.imm);
     auto at = bounded(o.operands[1], acc->extent, n, depth);
     if (!at.ok()) return at.status();
+    LSE_RETURN_IF_ERROR(fragment_access(*acc, *at, depth, n));
     const std::string op = n <= 1 ? "view.store " : "vector.store ";
     line(depth, op + name(o.operands[2]) + ", " + acc->view + "[" + *at +
                     "] : " + v->type + ", " + acc->view_type);
@@ -1349,6 +1394,7 @@ class Printer {
   std::vector<char> store_target_;
   std::unordered_map<ValueId, std::string> view_of_;
   std::unordered_map<ValueId, std::uint64_t> extent_of_;
+  std::unordered_map<ValueId, std::uint64_t> kv_fragment_elements_;
   // The SSA name each accumulator currently holds. Reading one reads this.
   std::unordered_map<ValueId, std::string> cur_;
   std::map<RegionId, std::set<ValueId>> region_assigns_;

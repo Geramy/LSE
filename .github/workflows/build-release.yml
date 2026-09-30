@@ -154,6 +154,8 @@ jobs:
             -DLSE_GPU_TARGETS="${{ steps.targets.outputs.gpu_targets }}" \
             -DLSE_ROCM_PATH="$ROCM_PATH" \
             "${hrx_args[@]}" \
+            -DLSE_HRX_INCLUDE_DIR="$LSE_HRX_INCLUDE_DIR" \
+            -DLSE_HRX_LIBRARY="$LSE_HRX_LIBRARY" \
             -DLSE_LOOMC_INCLUDE_DIR="$LSE_LOOMC_INCLUDE_DIR" \
             -DLSE_LOOMC_LIBRARY="$LSE_LOOMC_LIBRARY" \
             -DCMAKE_BUILD_RPATH="$(dirname "$LSE_LOOMC_LIBRARY")" \
@@ -175,7 +177,7 @@ jobs:
           # ROCM_PATH/lib can belong to a different LLVM release than bitcode.
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
           echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
-          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):$(dirname "$LSE_HRX_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           ctest --test-dir build --output-on-failure | tee ctest.log
           echo "summary=$(grep -oE '[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+' ctest.log | tail -1)" >> "$GITHUB_OUTPUT"
 
@@ -184,7 +186,7 @@ jobs:
         run: |
           set -euo pipefail
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
-          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):$(dirname "$LSE_HRX_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           # Skipped rather than failed when the model is not cached on this
           # runner: a missing checkpoint is a runner fact, not a defect, and
           # asserting on generated text needs the weights that produced it.
@@ -213,9 +215,9 @@ jobs:
           find build -maxdepth 2 -name '*.a' -exec cp {} "dist/$name/" \;
           cp README.md LICENSE.md "dist/$name/"
           mkdir -p "dist/$name/docs"
-          cp docs/CHAT-COMPATIBILITY.md docs/pi-models.example.json docs/DFLASH2.md "dist/$name/docs/"
+          cp docs/KV-STORAGE.md docs/CHAT-COMPATIBILITY.md docs/pi-models.example.json docs/DFLASH2.md "dist/$name/docs/"
           mkdir -p "dist/$name/docs/benchmarks"
-          cp docs/benchmarks/m8-gate-up-pair-2026-09-29.md "dist/$name/docs/benchmarks/"
+          cp docs/benchmarks/kv-fragments-2026-09-29.md docs/benchmarks/m8-gate-up-pair-2026-09-29.md "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/prefill-workspace-memory-2026-09-29.md "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/weight-slab-memory-2026-09-29.md "dist/$name/docs/benchmarks/"
           python3 .github/scripts/package-linux.py \

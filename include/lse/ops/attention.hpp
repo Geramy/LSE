@@ -19,6 +19,7 @@
 #include "lse/kv/allocator.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/kv/cache_dtype.hpp"
+#include "lse/kv/memory.hpp"
 #include "lse/ops/rope.hpp"
 
 namespace lse::ops {
@@ -71,6 +72,8 @@ struct GatedAttentionWeights {
 // attention layer covers the same positions, so the tables agree layer to layer
 // even though the pools do not.
 struct PagedKvLayer {
+  std::shared_ptr<kv::MemoryManager> memory;
+  std::int32_t resident_blocks = 1;
   kv::CacheDType storage = kv::CacheDType::kF32;
   Array keys;
   Array values;
@@ -129,9 +132,9 @@ struct AttentionCache {
 
 // Tops each row's block list up to cover what `layer.row_tokens` asks for —
 // or `tokens` positions on every row when it is empty — and re-uploads the
-// device table if it changed. Returns true when the pool has to move to a
-// bigger rung, which a retained program cannot absorb: the pool buffer changes
-// identity, so the caller must rebuild the graph.
+// device table if it changed. Returns true when the pool needs a larger
+// compiled shape and the caller must rebuild the graph. Fragmented storage
+// preserves the physical K/V bytes across that rebuild.
 //
 // Separate from gated_attention because the decode fast path replays a held
 // program and never re-records the layer, yet still crosses a block boundary

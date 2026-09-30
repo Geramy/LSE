@@ -35,6 +35,7 @@ struct LoomBufferView {
   std::uint64_t elements = 0;
   // SSA name of the `buffer.view` the emitter already emitted, with the `%`.
   std::string view;
+  std::uint64_t kv_fragment_elements = 0;
 };
 
 struct LoomPrintOptions {

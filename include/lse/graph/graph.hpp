@@ -25,6 +25,8 @@
 #include "lse/graph/workgroup.hpp"
 #include "lse/trace/record.hpp"
 
+namespace lse::kv { class FragmentStorage; class MemoryManager; }
+
 namespace lse::graph {
 
 #define LSE_OPKIND_LIST(X) \
@@ -148,6 +150,7 @@ class Node {
   std::array<std::int32_t, 4> iattrs{};
 
   backend::DeviceBuffer buffer;
+  std::shared_ptr<kv::FragmentStorage> kv_fragments;
   bool materialized = false;
   // Persistent state requests an independent output, rather than a view.
   bool requires_owned_storage = false;
@@ -554,6 +557,7 @@ class Scheduler {
   [[nodiscard]] backend::IBackend& backend() const noexcept {
     return devices_.device(devices_.primary());
   }
+  [[nodiscard]] std::shared_ptr<kv::MemoryManager> kv_memory() const;
   [[nodiscard]] backend::IDeviceSet& devices() const noexcept {
     return devices_;
   }

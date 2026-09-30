@@ -1,75 +1,18 @@
-### Long-context split attention
+### Fragmented K/V memory management
 
-The separate single-token and short-query split kernels are consolidated into
-one partial and one merge family. Four verifier query rows share KV loads at
-capacities through 65K keys. In matched cold 65,126-token HTTP requests on the
-local R9700, Q4+DFlash2 decode rose from 8.51 to 14.57 tokens/s. Prefill was
-147.7 versus 147.0 tokens/s, and the 64-token output matched. The prompts
-repeat a short sequence; this is not a general chat throughput claim.
-[Method and limits](https://github.com/Geramy/LSE/blob/v0.4.19/docs/benchmarks/long-context-attention-2026-09-29.md).
+Paged K/V on the Loom backend now uses a dedicated shared memory manager.
+It packs 256 KiB fragments into 256 MiB arenas and fills available slots before
+allocating another arena. Growing a cache preserves its existing K/V addresses
+and data. This removes whole-pool K/V copies during growth. Weights and general
+tensor allocations keep their existing policy.
 
-### Long-context KV growth
-
-The macOS R9700 with a Q4 target, Q8 DFlash2 draft and BF16 KV completed
-successive 30,726, 33,126, 37,126 and 41,126-token prompts in one HTTP
-process. It then completed a 65,354-token prompt with 41,394 cached tokens.
-Peak reserved device memory during that extension was 29.72 GB, leaving at
-least 4.22 GB free in sampled counters. A 32-token continuation at 65K
-completed without device allocation growth. The shorter seeded 8,192-token
-request generated exactly the same 128-token response as v0.4.18.
-
-The long prompts repeat a short synthetic sequence. Its decode rates are not
-representative of general conversations. The configured 262,100-token KV limit
-is not a measured usable capacity. [Method and limits](https://github.com/Geramy/LSE/blob/v0.4.19/docs/benchmarks/kv-growth-2026-09-29.md).
-
-### Weight slab VRAM reduction
-
-The macOS HRX weight allocator now packs the Q4 target and Q8 DFlash2 draft
-into 512 MiB slabs. In matched local R9700 runs, reserved GPU memory after
-loading fell from 20.583 to 18.870 GB and after a request from 24.694 to
-22.978 GB. Warm repeated requests measured 545.5 versus 548.3 prompt
-tokens/s and 49.9 decode tokens/s in both builds. Generated output hashes and
-80% DFlash2 acceptance matched. These numbers use decimal GB and driver
-reserved-memory counters; timing does not show a throughput regression, but
-does not establish identical performance for every workload.
-
-[Method and limits](https://github.com/Geramy/LSE/blob/v0.4.18/docs/benchmarks/weight-slab-memory-2026-09-29.md).
-
-### Earlier prefill workspace memory fixes
-
-Completed target graphs are released before the next request's prefill and
-when the prefill chunk width changes. Consecutive full-size chunks keep replay.
-DFlash2 releases completed large context-projection programs while preserving
-narrow decode programs. Live recurrent state, KV pools, weights and compiled
-kernels remain reusable.
-
-The matched local macOS/R9700 test uses Qwen3.8-27B Q4, Q8 DFlash2, BF16 KV,
-FP32 accumulation, batch/ubatch 1024, temperature 0.6, top-k 20, top-p 0.95,
-seed 1234 and KV capacity 262100. A 5120-token request precedes a 6143-token
-request with a 1023-token remainder. Each generates 128 tokens.
-
-| Metric | v0.4.16 control | Memory fix |
-| --- | ---: | ---: |
-| Reserved VRAM after ragged request | 29.77 GB | 28.26 GB |
-| Sampled peak reserved VRAM | 30.09 GB | 28.87 GB |
-| Ragged request prefill | 457.82 tok/s | 458.49 tok/s |
-| Ragged request decode | 68.21 tok/s | 67.88 tok/s |
-
-Responses and acceptance results match exactly. The synthetic decode request
-has 100% proposal acceptance; its rate is not a general DFlash2 rate. The small
-timing differences do not establish a throughput improvement or regression.
-An eight-turn cached-follow-up comparison also matches all outputs and cache
-lengths. Reserved VRAM grows only 12.14 MB over those turns. Aggregate decode
-is 42.89 tok/s for control and 42.94 tok/s for the memory fix.
-
-Measurements use memory-fix source `ec71e14`; v0.4.17 adds version, documentation
-and packaging changes. Numbers use decimal GB and driver reserved-memory
-counters sampled every 0.5 seconds. Sampling can miss instantaneous peaks.
-The reported allocation failure has not been replayed. The result
-establishes reduced workspace retention, not elimination of every possible OOM.
-
-[Full memory method and limits](https://github.com/Geramy/LSE/blob/v0.4.17/docs/benchmarks/prefill-workspace-memory-2026-09-29.md).
-The earlier combined M8 gate/up kernels and all accepted typed attention,
-activation panels, buffer views and speculative decoding paths remain active.
-[Earlier all-mode throughput](https://github.com/Geramy/LSE/blob/v0.4.17/docs/benchmarks/m8-gate-up-pair-2026-09-29.md)
-uses a different 1024-token workload and is not a new v0.4.17 measurement.
+The local Q4 target with Q8 DFlash2 and BF16 K/V completed 68,301 total tokens.
+Peak VRAM was 27.83 GB, with at least 6.11 GB free. Isolated fragment-addressing
+cost was 0.7–8.9% at 16K context and 2.5% for eight queries at 68K context.
+A matched short-context server throughput comparison has not been run.
+The existing optimized attention shape limit above 65,536 keys remains.
+This release is a K/V growth and memory-management fix; it does not claim a
+throughput improvement or validate the full configured context capacity.
+See [K/V storage](https://github.com/Geramy/LSE/blob/v0.4.20/docs/KV-STORAGE.md) and the
+[measurement report](https://github.com/Geramy/LSE/blob/v0.4.20/docs/benchmarks/kv-fragments-2026-09-29.md).
+The archives bundle the matching HRX runtime and Loom compiler.

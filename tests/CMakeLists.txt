@@ -36,6 +36,11 @@ lse_add_test(test_ir lse_ir lse_graph lse_backends)
 # The Loom text printer only needs kernel IR; keep these regressions usable
 # without libhrx, the Loom compiler, or a GPU.
 lse_add_test(test_loom_print lse_ir)
+if(LSE_HRX_LIBRARY AND LSE_LOOMC_LIBRARY)
+  add_executable(kv_fragment_probe kv_fragment_probe.cpp)
+  lse_apply_common_flags(kv_fragment_probe)
+  target_link_libraries(kv_fragment_probe PRIVATE lse_backend_hrx lse_graph lse_kernels lse_kv)
+endif()
 target_sources(test_loom_print PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
@@ -496,6 +501,8 @@ if(NOT TARGET lse_backend_hrx)
 endif()
 
 if(LSE_ENABLE_CPU)
+  lse_add_test(test_kv_memory lse_backends)
+  target_link_libraries(test_kv_memory PRIVATE lse_kv)
   lse_add_test(test_kv_cache lse_model lse_ops lse_graph lse_kernels lse_backends lse_ir)
   set_tests_properties(test_kv_cache PROPERTIES
     ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")

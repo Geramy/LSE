@@ -816,7 +816,8 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
         e.let(kv_block_index<Storage>(a.table[r * stride + abs / bs]));
     const auto slot = e.let(abs % bs);
     const auto dest = e.let(((blk * kvh + h) * bs + slot) * width + w);
-    e.store(dest, a.src[i]);
+    if constexpr (Storage == kv::CacheDType::kF32) a.out[dest] = a.src[i];
+    else a.out[dest] = kir::cast<KvElement<Storage>>(a.src[i]);
     return k.str();
   }
 

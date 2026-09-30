@@ -3,6 +3,7 @@
 #include "lse/graph/epilogue_input.hpp"
 #include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
+#include "lse/kv/memory.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -113,6 +114,7 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
     number(static_cast<std::uint64_t>(node->kind));
     number(static_cast<std::uint64_t>(node->fclass));
     number(static_cast<std::uint64_t>(node->dtype));
+    number(node->kv_fragments ? 1 : 0);
     number(node->shape.rank());
     for (std::size_t i = 0; i < node->shape.rank(); ++i) {
       number(static_cast<std::uint64_t>(node->shape.dim(i)));
@@ -535,6 +537,8 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
     params.push_back("%" + name + ": buffer");
     views[name] = LoomBufferView{elem_of(n->dtype), n->element_count(),
                                  "%" + name + "_view"};
+    if (n->kv_fragments)
+      views[name].kv_fragment_elements = kv::kFragmentBytes / dtype_storage_bytes(n->dtype, 1);
   }
   for (const ConstantsLayout::Field& f : out.constants.fields) {
     params.push_back("%" + f.name + ": " + (f.size == 4 ? "i32" : "i64"));
@@ -592,7 +596,11 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                                                    : "%" + names[i];
     prologue += "  %" + names[i] + "_view = buffer.view " + src + "[%kbase] : "
                 "buffer -> " +
-                loom_view_type(elem_of(n->dtype), n->element_count()) + "\n";
+                (n->kv_fragments
+                     ? loom_view_type(kir::Scalar::kU64,
+                         (n->element_count() + views[names[i]].kv_fragment_elements - 1) /
+                         views[names[i]].kv_fragment_elements)
+                     : loom_view_type(elem_of(n->dtype), n->element_count())) + "\n";
   }
   // blockIdx.x * blockDim.x + threadIdx.x, said once and shared by the guard
   // and by every body spliced below.

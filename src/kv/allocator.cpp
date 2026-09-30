@@ -34,7 +34,10 @@ Status BlockAllocator::grow(std::int32_t blocks) {
   const std::size_t was = refs_.size();
   refs_.resize(want, 0);
   free_.reserve(free_.size() + (want - was));
-  for (std::size_t i = want; i-- > was;) free_.push_back(static_cast<BlockId>(i));
+  std::vector<BlockId> added;
+  added.reserve(want - was);
+  for (std::size_t i = want; i-- > was;) added.push_back(static_cast<BlockId>(i));
+  free_.insert(free_.begin(), added.begin(), added.end());
   return OkStatus();
 }
 

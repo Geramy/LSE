@@ -167,6 +167,7 @@ std::uint64_t FusionGroup::signature() const noexcept {
     h *= 1099511628211ull;
   };
   for (const NodePtr& n : nodes) {
+    mix(n->kv_fragments ? 1 : 0);
     mix(static_cast<std::uint64_t>(n->kind));
     mix(static_cast<std::uint64_t>(n->dtype));
     mix(n->shape.rank());
@@ -193,6 +194,7 @@ std::uint64_t FusionGroup::signature() const noexcept {
   // indexing far past its buffer.
   mix(inputs.size());
   for (const NodePtr& n : inputs) {
+    mix(n->kv_fragments ? 1 : 0);
     mix(static_cast<std::uint64_t>(n->dtype));
     mix(n->shape.rank());
     for (std::size_t i = 0; i < n->shape.rank(); ++i) {
@@ -201,6 +203,7 @@ std::uint64_t FusionGroup::signature() const noexcept {
   }
   mix(outputs.size());
   for (const NodePtr& n : outputs) {
+    mix(n->kv_fragments ? 1 : 0);
     mix(static_cast<std::uint64_t>(n->dtype));
     mix(n->shape.rank());
     for (std::size_t i = 0; i < n->shape.rank(); ++i) {

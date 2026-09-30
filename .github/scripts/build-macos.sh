@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=3095ae4b78cc930b733f896970e790e748ac7447
+mac_rev=16efaa870be07df4a911bc9ddd8ade6f4142be5f
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
@@ -83,6 +83,8 @@ git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/symbo
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch"
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch"
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch"
+git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch"
+git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch"
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
@@ -114,7 +116,7 @@ cmake -S "$work/source" -B "$work/lse-build" -G Ninja \
   -DLSE_LOOMC_LIBRARY="$work/hrx-build/loom/binding/c/libloomc.dylib"
 # All these tests are host-only; do not run the entire suite on a runner with
 # no external AMD GPU, and never report CPU checks as GPU qualification.
-tests=(test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu
+tests=(test_kv_memory test_kv_cache test_kernel_env test_ir test_dtype test_shape test_quant test_graph test_backend_cpu
   test_primitive test_trace test_loom_print test_loom_repeat test_loom_gdn
   test_loom_extent test_loom_conv test_loom_words test_loom_flash
   test_generation_stats test_http_timings test_server_shutdown test_chat_protocol test_dispatch_profile test_loom_cache

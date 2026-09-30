@@ -156,7 +156,7 @@ def main():
         'lse_revision': run('git', '-C', str(Path(__file__).resolve().parents[2]), 'rev-parse', 'HEAD').strip(),
         'loom_compiler': compiler,
         'bundled_libraries': bundled,
-        'hrx_runtime_source_revision': None,
+        'hrx_runtime_source_revision': compiler['hrx_revision'],
         'external_runtime_requirements': ['Compatible Linux C/C++ system runtime', 'ROCm 7.x and HSA'],
         'gpu_execution_tested_by_packager': False,
     }, indent=2) + '\n')

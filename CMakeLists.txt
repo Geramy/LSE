@@ -10,7 +10,7 @@ if(NOT CMAKE_CXX_COMPILER)
 endif()
 
 project(lse
-  VERSION 0.4.19
+  VERSION 0.4.20
   DESCRIPTION "Lemon Seed Engine — modular LLM training/inference engine on HRX"
   LANGUAGES CXX)
 
@@ -307,10 +307,12 @@ endif()
 add_library(lse_kv
   src/kv/allocator.cpp
   src/kv/block.cpp
+  src/kv/memory.cpp
   src/kv/policy.cpp
 )
 add_library(lse::kv ALIAS lse_kv)
 target_link_libraries(lse_kv PUBLIC lse_core)
+target_link_libraries(lse_graph PUBLIC lse_kv)
 lse_apply_common_flags(lse_kv)
 
 add_library(lse_ops

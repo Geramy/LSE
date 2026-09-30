@@ -2495,11 +2495,11 @@ Result<void*> HrxBackend::device_pointer_impl(const DeviceBuffer& buf) const {
   if (buf.handle == 0) {
     return LSE_ERROR(kInvalidArgument, "null buffer in device_pointer");
   }
-  void* p = nullptr;
+  std::uint64_t address = 0;
   LSE_RETURN_IF_ERROR(from_hrx(
-      hrx_buffer_get_device_ptr(reinterpret_cast<hrx_buffer_t>(buf.handle), &p),
-      "hrx_buffer_get_device_ptr"));
-  return static_cast<void*>(static_cast<std::byte*>(p) + buf.offset);
+      hrx_buffer_get_device_address(reinterpret_cast<hrx_buffer_t>(buf.handle), &address),
+      "hrx_buffer_get_device_address"));
+  return reinterpret_cast<void*>(static_cast<std::uintptr_t>(address) + buf.offset);
 #endif
 }
 

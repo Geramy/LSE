@@ -26,22 +26,24 @@ LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
 
-## Current release: v0.4.19
+## Current release: v0.4.20
 
-This version releases consumed prefill graphs before paged KV growth and uses
-smaller growth steps above 32K tokens. The local R9700 with a Q4 target, Q8
-DFlash2 draft and BF16 KV completed a 65,354-token prompt and a subsequent
-32-token decode request. Peak reserved GPU memory in the extension was 29.72 GB.
-One split-attention kernel family now covers single-token decode and short
-verification queries. In a matched cold 65,126-token HTTP request, DFlash2
-decode increased from 8.51 to 14.57 tokens/s; prefill stayed near 147 tokens/s.
-The output text matched. See the
-[attention comparison](docs/benchmarks/long-context-attention-2026-09-29.md).
-The configured KV limit is not a measured usable capacity; see the
-[long-context test](docs/benchmarks/kv-growth-2026-09-29.md).
-The v0.4.18 weight-allocation reduction and v0.4.17 workspace-retirement fix
-remain active; see [weight slab measurements](docs/benchmarks/weight-slab-memory-2026-09-29.md) and
-[prefill memory ownership](#prefill-memory-ownership).
+Paged K/V on the Loom backend now uses a dedicated shared memory manager.
+It packs 256 KiB fragments into 256 MiB arenas and fills available slots before
+allocating another arena. Growing a cache preserves its existing K/V addresses
+and data. This removes whole-pool K/V copies during growth. Weights and general
+tensor allocations keep their existing policy.
+
+The local Q4 target with Q8 DFlash2 and BF16 K/V completed 68,301 total tokens.
+Peak VRAM was 27.83 GB, with at least 6.11 GB free. Isolated fragment-addressing
+cost was 0.7–8.9% at 16K context and 2.5% for eight queries at 68K context.
+A matched short-context server throughput comparison has not been run.
+The existing optimized attention shape limit above 65,536 keys remains.
+This release is a K/V growth and memory-management fix; it does not claim a
+throughput improvement or validate the full configured context capacity.
+See [K/V storage](docs/KV-STORAGE.md) and the
+[measurement report](docs/benchmarks/kv-fragments-2026-09-29.md).
+The archives bundle the matching HRX runtime and Loom compiler.
 
 The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
 Conditional drafting uses the request temperature. Probability-ratio rejection

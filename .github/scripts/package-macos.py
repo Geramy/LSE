@@ -106,6 +106,7 @@ def main():
         'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
         'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
         'loom_symbolic_memo_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch').read_bytes()).hexdigest(),
+        'kv_fragment_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch').read_bytes()).hexdigest(),
         'loom_vopd_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch').read_bytes()).hexdigest(),
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
@@ -155,9 +156,11 @@ def main():
     (package / 'licenses/rust-dependencies.json').write_text(json.dumps(rust_notices, indent=2) + '\n')
     shutil.copy2(root / 'README.md', package / 'README.md')
     (package / 'docs').mkdir()
-    for doc_name in ('CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md'):
+    for doc_name in ('KV-STORAGE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md'):
         shutil.copy2(root / 'docs' / doc_name, package / 'docs' / doc_name)
     (package / 'docs' / 'benchmarks').mkdir()
+    shutil.copy2(root / 'docs/benchmarks/kv-fragments-2026-09-29.md',
+                 package / 'docs/benchmarks/kv-fragments-2026-09-29.md')
     shutil.copy2(root / 'docs/benchmarks/m8-gate-up-pair-2026-09-29.md',
                  package / 'docs/benchmarks/m8-gate-up-pair-2026-09-29.md')
     shutil.copy2(root / 'docs/benchmarks/prefill-workspace-memory-2026-09-29.md',
@@ -179,6 +182,7 @@ def main():
         'jit_cache_build_inputs': build_inputs,
         'hrx_adapter_patch_sha256': build_inputs['hrx_adapter_patch'],
         'loom_symbolic_memo_patch_sha256': build_inputs['loom_symbolic_memo_patch'],
+        'kv_fragment_patch_sha256': build_inputs['kv_fragment_patch'],
         'loom_vopd_patch_sha256': build_inputs['loom_vopd_patch'],
     }
     (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')

@@ -1,4 +1,5 @@
 #include "lse/kv/cache_codec.hpp"
+#include "lse/kv/memory.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/view.hpp"
 
@@ -992,7 +993,7 @@ Status eval_kv_page_write(Node& n) {
   const auto rows = static_cast<std::size_t>(load_element(meta, 2));
 
   const bool aliased =
-      n.buffer.ptr != nullptr && dst.buffer.valid() &&
+      !n.kv_fragments && n.buffer.ptr != nullptr && dst.buffer.valid() &&
       n.buffer.handle == dst.buffer.handle && n.buffer.ptr == dst.buffer.ptr &&
       n.buffer.offset == dst.buffer.offset;
   if (!aliased) {
@@ -1217,7 +1218,7 @@ Status eval_sdpa(Node& n) {
 }  // namespace
 
 void* host_bytes(Node& node) {
-  if (node.buffer.ptr != nullptr) {
+  if (!node.kv_fragments && node.buffer.ptr != nullptr) {
     return static_cast<std::byte*>(node.buffer.ptr) + node.buffer.offset;
   }
   const std::size_t bytes =
@@ -1227,13 +1228,23 @@ void* host_bytes(Node& node) {
 }
 
 const void* host_bytes(const Node& node) noexcept {
-  if (node.buffer.ptr != nullptr) {
+  if (!node.kv_fragments && node.buffer.ptr != nullptr) {
     return static_cast<const std::byte*>(node.buffer.ptr) + node.buffer.offset;
   }
   return node.host_mirror.empty() ? nullptr : node.host_mirror.data();
 }
 
 Status sync_to_device(Node& node, backend::IBackend& backend) {
+  if (node.kv_fragments) {
+    if (!node.host_dirty) return OkStatus();
+    const auto bytes = dtype_storage_bytes(node.dtype, node.element_count());
+    if (node.host_mirror.size() < bytes)
+      return LSE_ERROR(kInternal, "incomplete K/V host mirror");
+    LSE_RETURN_IF_ERROR(node.kv_fragments->write(node.host_mirror.data(),
+        std::min(bytes, node.kv_fragments->size_bytes())));
+    node.host_dirty = false;
+    return OkStatus();
+  }
   if (node.buffer.ptr != nullptr || !node.host_dirty) return OkStatus();
   if (!node.buffer.valid()) return OkStatus();
   const std::size_t bytes =
@@ -1246,6 +1257,15 @@ Status sync_to_device(Node& node, backend::IBackend& backend) {
 }
 
 Status sync_from_device(Node& node, backend::IBackend& backend) {
+  if (node.kv_fragments) {
+    const auto bytes = dtype_storage_bytes(node.dtype, node.element_count());
+    if (!node.device_dirty && node.host_mirror.size() >= bytes) return OkStatus();
+    node.host_mirror.resize(bytes);
+    LSE_RETURN_IF_ERROR(node.kv_fragments->read(node.host_mirror.data(),
+        std::min(bytes, node.kv_fragments->size_bytes())));
+    node.device_dirty = false;
+    return OkStatus();
+  }
   if (node.buffer.ptr != nullptr || !node.device_dirty) return OkStatus();
   if (!node.buffer.valid()) return OkStatus();
   const std::size_t bytes =
@@ -1409,14 +1429,16 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
       const Node& source = *input;
       const std::size_t bytes = dtype_storage_bytes(source.dtype, source.element_count());
       const auto* data = static_cast<const std::byte*>(host_bytes(source));
-      if (data == nullptr || bytes == 0 || bytes > source.buffer.size_bytes ||
-          (source.buffer.ptr == nullptr && source.host_mirror.size() < bytes))
+      const auto available = source.kv_fragments || source.buffer.ptr == nullptr
+          ? source.host_mirror.size() : source.buffer.size_bytes;
+      if (data == nullptr || bytes == 0 || bytes > available)
         return LSE_ERROR(kInvalidArgument, "typed host input has no complete buffer");
       inputs.push_back({{data, bytes}, source.shape, source.dtype});
     }
     const std::size_t bytes = dtype_storage_bytes(n.dtype, count);
     auto* data = static_cast<std::byte*>(host_bytes(n));
-    if (data == nullptr || bytes == 0 || bytes > n.buffer.size_bytes)
+    const auto available = n.kv_fragments ? n.host_mirror.size() : n.buffer.size_bytes;
+    if (data == nullptr || bytes == 0 || bytes > available)
       return LSE_ERROR(kInvalidArgument, "typed host output has no complete buffer");
     LSE_RETURN_IF_ERROR(n.prim->eval_cpu_typed(
         inputs, {{data, bytes}, n.shape, n.dtype}, n.attrs, n.iattrs));

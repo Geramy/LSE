@@ -96,6 +96,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-16 \
             -DLSE_ROCM_PATH="$ROCM_PATH" \
             "$hrx_arg" \
+            -DLSE_HRX_INCLUDE_DIR="$LSE_HRX_INCLUDE_DIR" \
+            -DLSE_HRX_LIBRARY="$LSE_HRX_LIBRARY" \
             -DLSE_LOOMC_INCLUDE_DIR="$LSE_LOOMC_INCLUDE_DIR" \
             -DLSE_LOOMC_LIBRARY="$LSE_LOOMC_LIBRARY" \
             -DCMAKE_BUILD_RPATH="$(dirname "$LSE_LOOMC_LIBRARY")" \
@@ -128,14 +130,14 @@ jobs:
           # resolved the right directory; read it back and put it alone.
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
           echo "ROCm runtime for the JIT: ${RT:-<unresolved>}"
-          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):$(dirname "$LSE_HRX_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           ctest --test-dir build --output-on-failure
 
       - name: Smoke test the engine and the HTTP API
         run: |
           set -euo pipefail
           RT="$(sed -n 's/^LSE_ROCM_RUNTIME_DIR:PATH=//p' build/CMakeCache.txt)"
-          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(dirname "$LSE_LOOMC_LIBRARY"):$(dirname "$LSE_HRX_LIBRARY"):${RT:+$RT:}${HRX_ROOT:-}/lib:${LD_LIBRARY_PATH:-}"
           if ! ./build/lse --list-cache 2>/dev/null | grep -q "$LSE_SMOKE_MODEL"; then
             echo "::error::$LSE_SMOKE_MODEL is not cached on this runner. The end-to-end check asserts on generated text and on the work running on the device, and neither can be checked without the weights."
             exit 1

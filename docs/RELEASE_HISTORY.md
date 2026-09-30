@@ -203,3 +203,20 @@ on the second identical request, with temperature 0 and 100% proposal acceptance
 The first request measured 15.51 decode tokens/s even without new kernel compilation;
 request setup and reuse remain under investigation.
 See the [memory report](benchmarks/kv-growth-memory-2026-09-28.md).
+
+## v0.4.19
+
+This version releases consumed prefill graphs before paged KV growth and uses
+smaller growth steps above 32K tokens. The local R9700 with a Q4 target, Q8
+DFlash2 draft and BF16 KV completed a 65,354-token prompt and a subsequent
+32-token decode request. Peak reserved GPU memory in the extension was 29.72 GB.
+One split-attention kernel family now covers single-token decode and short
+verification queries. In a matched cold 65,126-token HTTP request, DFlash2
+decode increased from 8.51 to 14.57 tokens/s; prefill stayed near 147 tokens/s.
+The output text matched. See the
+[attention comparison](docs/benchmarks/long-context-attention-2026-09-29.md).
+The configured KV limit is not a measured usable capacity; see the
+[long-context test](docs/benchmarks/kv-growth-2026-09-29.md).
+The v0.4.18 weight-allocation reduction and v0.4.17 workspace-retirement fix
+remain active; see [weight slab measurements](docs/benchmarks/weight-slab-memory-2026-09-29.md) and
+[prefill memory ownership](#prefill-memory-ownership).

@@ -1,6 +1,7 @@
 #include "lse/graph/gdn_pair.hpp"
 #include "lse/graph/quant_swiglu.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/kv/memory.hpp"
 #include "lse/graph/view.hpp"
 
 #include <algorithm>
@@ -132,6 +133,7 @@ struct ConstKeyHash {
 };
 
 struct Scheduler::Impl {
+  std::shared_ptr<kv::MemoryManager> kv_memory = kv::MemoryManager::create();
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
   // One per stream: a persistent-grid kernel spins on this counter across its
@@ -190,6 +192,10 @@ Scheduler::Scheduler(backend::IBackend& backend)
 }
 
 Scheduler::~Scheduler() = default;
+
+std::shared_ptr<kv::MemoryManager> Scheduler::kv_memory() const {
+  return impl_->kv_memory;
+}
 
 Scheduler::JitStats Scheduler::jit_stats() const noexcept {
   if (impl_->jit == nullptr) return {};
@@ -323,6 +329,8 @@ Status Scheduler::make_local(Node& n, std::size_t member) {
                                 ? static_cast<std::size_t>(n.buffer.member)
                                 : devices_.member_of(held);
   backend::DeviceBuffer& mirror = impl_->peer_mirrors[{&n, member}];
+  if (n.kv_fragments)
+    return LSE_ERROR(kUnimplemented, "K/V fragment tables must execute on their owning device");
   if (!mirror.valid() || mirror.size_bytes != n.buffer.size_bytes) {
     auto fresh = devices_.device(member).allocate(
         n.buffer.size_bytes, backend::MemoryClass::kDevice,

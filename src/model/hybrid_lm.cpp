@@ -222,6 +222,7 @@ void detach_state(Array& a) {
   if (!a.valid() || !a.node()->buffer.valid()) return;
   const graph::NodePtr old = a.node();
   a = Array::from_buffer(old->buffer, old->shape, old->dtype);
+  a.node()->kv_fragments = old->kv_fragments;
   a.node()->member = old->member;
   a.node()->host_mirror = old->host_mirror;
   a.node()->host_dirty = old->host_dirty;

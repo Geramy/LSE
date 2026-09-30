@@ -631,6 +631,7 @@ Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
   n->iattrs[0] = block_size;
   n->iattrs[1] = static_cast<std::int32_t>(storage);
   n->prim = find_primitive("kv_page_write");
+  n->kv_fragments = dst.node()->kv_fragments;
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
 }

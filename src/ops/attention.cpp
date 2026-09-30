@@ -28,10 +28,14 @@ Array merge_heads(const Array& x) {
 std::size_t PagedKvLayer::pool_bytes() const noexcept {
   std::size_t total = 0;
   if (keys.valid()) {
-    total += dtype_storage_bytes(keys.dtype(), keys.shape().elem_count());
+    total += keys.node()->kv_fragments
+        ? keys.node()->kv_fragments->fragment_count() * kv::kFragmentBytes
+        : dtype_storage_bytes(keys.dtype(), keys.shape().elem_count());
   }
   if (values.valid()) {
-    total += dtype_storage_bytes(values.dtype(), values.shape().elem_count());
+    total += values.node()->kv_fragments
+        ? values.node()->kv_fragments->fragment_count() * kv::kFragmentBytes
+        : dtype_storage_bytes(values.dtype(), values.shape().elem_count());
   }
   return total;
 }
@@ -109,6 +113,41 @@ Result<Array> alloc_pool(const Shape& shape, DType dtype,
 
 Result<Array> alloc_zeroed(const Shape& shape, DType dtype) {
   return alloc_pool(shape, dtype, 0);
+}
+
+Result<Array> grow_fragments(PagedKvLayer& layer, const Array& old,
+                             const Shape& shape, DType dtype, std::size_t capacity_bytes) {
+  auto* sched = graph::default_scheduler();
+  if (!sched) return LSE_ERROR(kInternal, "no backend for K/V fragments");
+  auto& set = sched->devices();
+  const auto member = graph::preferred_member();
+  auto& be = member < set.size() ? set.device(member) : sched->backend();
+  const auto stream = member < set.size()
+      ? set.stream_for(member).value_or(backend::kDefaultStream)
+      : backend::kDefaultStream;
+  auto storage = old.valid() ? old.node()->kv_fragments : nullptr;
+  if (old.valid() && !storage)
+    return LSE_ERROR(kInvalidArgument, "cannot change a live K/V storage layout");
+  if (!layer.memory) layer.memory = sched->kv_memory();
+  if (!storage)
+    storage = std::make_shared<kv::FragmentStorage>(layer.memory, be, stream);
+  LSE_RETURN_IF_ERROR(storage->reserve(capacity_bytes));
+  const auto block_bytes = dtype_storage_bytes(dtype, shape.elem_count() / shape.dim(0));
+  LSE_RETURN_IF_ERROR(storage->grow(layer.resident_blocks * block_bytes));
+  LSE_ASSIGN_OR(auto buffer, storage->binding());
+  auto result = Array::from_buffer(std::move(buffer), shape, dtype);
+  result.node()->kv_fragments = std::move(storage);
+  return result;
+}
+
+Status grow_resident_fragments(PagedKvLayer& layer) {
+  for (const auto* pool : {&layer.keys, &layer.values}) {
+    if (!pool->valid() || !pool->node()->kv_fragments) continue;
+    const auto block_bytes = dtype_storage_bytes(pool->dtype(),
+        pool->shape().elem_count() / pool->shape().dim(0));
+    LSE_RETURN_IF_ERROR(pool->node()->kv_fragments->grow(layer.resident_blocks * block_bytes));
+  }
+  return OkStatus();
 }
 
 // Moves a pool to a bigger rung. Block ids keep their meaning — the allocator
@@ -254,11 +293,8 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
   const bool resize = !layer.keys.valid() ||
                       layer.keys.shape().dim(0) != want_blocks;
   if (resize && layer.keys.valid()) {
-    // Two reasons, both fatal without it. Reading the old pool back needs the
-    // previous pass's writes to have landed, and the old buffer is freed when the
-    // program that referenced it is replaced — which happens while the previous
-    // pass's dispatches may still be reading it. Growth is one event per rung, so
-    // the drain costs nothing per token.
+    // Complete users of the old graph before changing its pool shape. On the
+    // contiguous backends this also orders the old-to-new pool copy.
     graph::Scheduler* sched = graph::default_scheduler();
     if (sched == nullptr) {
       return LSE_ERROR(kInternal, "no backend to grow the KV pool");
@@ -266,8 +302,22 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
     LSE_RETURN_IF_ERROR(sched->backend().synchronize());
   }
   if (resize) {
-    LSE_ASSIGN_OR(layer.keys, regrow_pool(layer.keys, pool, dtype));
-    LSE_ASSIGN_OR(layer.values, regrow_pool(layer.values, pool, dtype));
+    auto* sched = graph::default_scheduler();
+    const auto member = graph::preferred_member();
+    auto* owner = sched ? (member < sched->devices().size()
+        ? &sched->devices().device(member) : &sched->backend()) : nullptr;
+    const auto* toolchain = owner ? owner->toolchain(sched->dialect()) : nullptr;
+    const bool fragmented = layer.keys.valid() ? bool(layer.keys.node()->kv_fragments)
+        : toolchain && toolchain->dialect == graph::Dialect::kLoom;
+    if (fragmented) {
+      const auto capacity_bytes = dtype_storage_bytes(dtype,
+          static_cast<std::size_t>(pool_ceiling(layer, rows, capacity)) * kvh * kv::kBlockSize * pitch);
+      LSE_ASSIGN_OR(layer.keys, grow_fragments(layer, layer.keys, pool, dtype, capacity_bytes));
+      LSE_ASSIGN_OR(layer.values, grow_fragments(layer, layer.values, pool, dtype, capacity_bytes));
+    } else {
+      LSE_ASSIGN_OR(layer.keys, regrow_pool(layer.keys, pool, dtype));
+      LSE_ASSIGN_OR(layer.values, regrow_pool(layer.values, pool, dtype));
+    }
     LSE_RETURN_IF_ERROR(layer.alloc.grow(want_blocks));
     layer.storage = format;
   }
@@ -281,8 +331,12 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
     kv::BlockTable& t = layer.tables[r];
     const std::int32_t before = t.size();
     LSE_RETURN_IF_ERROR(layer.alloc.cover(t, want_tokens[r]));
+    for (std::int32_t i = before; i < t.size(); ++i)
+      layer.resident_blocks = std::max(layer.resident_blocks,
+          static_cast<std::int32_t>(t.blocks()[i]) + 1);
     if (t.size() != before) layer.table_dirty = true;
   }
+  LSE_RETURN_IF_ERROR(grow_resident_fragments(layer));
   if (layer.table_dirty) LSE_RETURN_IF_ERROR(upload_table(layer));
   return OkStatus();
 }
@@ -300,13 +354,17 @@ Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens) {
     kv::BlockTable& t = layer.tables[r];
     const std::int32_t want = kv::blocks_for(want_tokens[r], kv::kBlockSize);
     if (want <= t.size()) continue;
-    // Out of blocks: the pool has to move to a bigger rung, and that is a new
-    // buffer. Say so rather than failing, so the caller rebuilds instead of
-    // replaying a program that points at the old pool.
+    // A larger logical pool changes the compiled shape. Rebuild the graph;
+    // fragmented storage keeps its existing bytes and addresses in place.
     if (want - t.size() > layer.alloc.free_count()) return true;
+    const auto before = t.size();
     LSE_RETURN_IF_ERROR(layer.alloc.cover(t, want_tokens[r]));
+    for (std::int32_t i = before; i < t.size(); ++i)
+      layer.resident_blocks = std::max(layer.resident_blocks,
+          static_cast<std::int32_t>(t.blocks()[i]) + 1);
     layer.table_dirty = true;
   }
+  LSE_RETURN_IF_ERROR(grow_resident_fragments(layer));
   if (layer.table_dirty) LSE_RETURN_IF_ERROR(upload_table(layer));
   return false;
 }

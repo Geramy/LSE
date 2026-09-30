@@ -7,7 +7,7 @@ deps="$root/build/deps/linux-loom"
   echo 'This compiler build requires Linux.' >&2; exit 1;
 }
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
-mac_rev=3095ae4b78cc930b733f896970e790e748ac7447
+mac_rev=16efaa870be07df4a911bc9ddd8ade6f4142be5f
 fetch() {
   local url="$1" rev="$2" path="$3"
   if [[ ! -d "$path/.git" ]]; then
@@ -42,20 +42,34 @@ for patch in "${patches[@]}"; do
   git -C "$work/source" apply --check "$path"
   git -C "$work/source" apply "$path"
 done
-# Build the compiler only. HRX/HSA/ROCm continue to use the runner's selected runtime.
+for patch in "$root"/patches/*.patch; do
+  git -C "$work/source" apply --check "$patch"
+  git -C "$work/source" apply "$patch"
+done
+rocm="${ROCM_PATH:-/opt/rocm}"
+if [[ ! -f "$rocm/include/hsa/hsa.h" ]]; then
+  for candidate in "$rocm"/core-*; do
+    if [[ -f "$candidate/include/hsa/hsa.h" ]]; then rocm="$candidate"; break; fi
+  done
+fi
+cc="${CC:-$(command -v clang)}"
+cxx="${CXX:-${cc}++}"
+# Build the runtime and compiler together for the native K/V address API.
 # The upstream loom-compile configuration requires the VM execution target when
-# its VM emitter is enabled; only loomc_shared is built below.
+# its VM emitter is enabled.
 cmake -S "$work/source" -B "$work/build" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DLIBHRX_BUILD=OFF \
+  -DCMAKE_BUILD_TYPE=Release -DLIBHRX_BUILD=ON \
+  -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" \
+  -DIREE_ROCM_PATH="$rocm" -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
   -DIREE_ENABLE_LIBBACKTRACE=OFF -DIREE_HAL_DRIVER_DEFAULTS=OFF \
-  -DIREE_HAL_DRIVER_AMDGPU=OFF -DIREE_HAL_DRIVER_HIP=OFF \
+  -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_HIP=OFF \
   -DIREE_HAL_DRIVER_HIP_RCCL=OFF -DIREE_HAL_DRIVER_VULKAN=OFF \
   -DLOOM_BUILD=ON -DLOOM_TARGET_DEFAULTS=OFF -DLOOM_EXECUTE_DEFAULTS=OFF \
   -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults \
   -DLOOM_TARGET_IREE_VM=ON -DLOOM_EXECUTE_IREE_VM=ON -DLOOM_TARGET_LLVMIR=ON \
   -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON
-cmake --build "$work/build" --target loomc_shared --parallel "${LSE_BUILD_JOBS:-3}"
+cmake --build "$work/build" --target hrx loomc_shared --parallel "${LSE_BUILD_JOBS:-3}"
 python3 - "$work" "$deps" "$hrx_rev" "$mac_rev" <<'PY'
 from pathlib import Path
 import hashlib, json, os, re, subprocess, sys
@@ -71,6 +85,8 @@ patches = []
 for name in ('symbolic-memo-touched-reset.patch', 'gfx12-vopd-identical-source.patch'):
     path = deps / f'mac-amdgpu-{mac_rev}' / 'patches/hrx' / name
     patches.append({'path': f'patches/hrx/{name}', 'sha256': digest(path)})
+for path in sorted((work.parents[1] / 'patches').glob('*.patch')):
+    patches.append({'path': 'patches/' + path.name, 'sha256': digest(path)})
 cache = {}
 for line in (work / 'build/CMakeCache.txt').read_text().splitlines():
     if match := re.match(r'([^/#:][^:]*):[^=]+=(.*)', line):
@@ -88,13 +104,15 @@ manifest = {
     'library': str(library), 'library_sha256': digest(library),
     'include_directory': str(include), 'version_file': str(version),
     'amdgpu_targets': 'loom_defaults',
-    'compiler_only': True, 'host_compilers': compilers,
+    'compiler_only': False, 'host_compilers': compilers,
     'configuration': configuration,
     'build_script_sha256': digest(work.parents[1] / '.github/scripts/build-linux-loom.sh'),
     'cmake': subprocess.check_output(['cmake', '--version'], text=True).splitlines()[0],
 }
 (work / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
 variables = {
+    'LSE_HRX_INCLUDE_DIR': work / 'source/libhrx/include',
+    'LSE_HRX_LIBRARY': (work / 'build/libhrx/src/libhrx/libhrx.so').resolve(strict=True),
     'LSE_LOOMC_INCLUDE_DIR': include,
     'LSE_LOOMC_LIBRARY': library,
     'LSE_LOOMC_VERSION_FILE': version,
