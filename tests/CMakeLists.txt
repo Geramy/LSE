@@ -254,7 +254,7 @@ target_sources(test_submission_constants PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 if(TARGET lse_backend_cpu)
   lse_add_test(test_decode_sample lse_graph lse_kernels lse_backend_cpu)
-  lse_add_test(test_submission_decode lse_runtime lse_model lse_graph lse_backends lse_backend_cpu)
+  lse_add_test(test_submission_decode lse_runtime lse_model lse_graph lse_kernels lse_backends lse_backend_cpu)
   if(NOT TARGET lse_backend_hrx)
     target_sources(test_submission_decode PRIVATE
       ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)
