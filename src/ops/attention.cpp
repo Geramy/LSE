@@ -387,13 +387,14 @@ Status release_row(PagedKvLayer& layer, std::int32_t row) {
 Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
                               const GatedAttentionSpec& spec,
                               const RopeTables& rope, std::int32_t offset,
-                              AttentionCache* cache) {
+                              AttentionCache* cache, AttentionExecutionPhase phase) {
   if (spec.q_heads <= 0 || spec.kv_heads <= 0 ||
       spec.q_heads % spec.kv_heads != 0 || spec.head_dim <= 0) {
     return LSE_ERROR(kInvalidArgument,
                      "q_heads must be a positive multiple of kv_heads");
   }
-  if ((spec.sparse_attention.prefill.enabled() || spec.sparse_attention.decode.enabled()) &&
+  const auto sparse = attention_for_phase(spec.sparse_attention, phase, x.shape().dim(1));
+  if (sparse.enabled() &&
       (!cache || !cache->paged))
     return LSE_ERROR(kInvalidArgument, "Sparse attention requires paged attention storage");
   const auto qh = static_cast<std::int64_t>(spec.q_heads);
@@ -474,8 +475,7 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
   Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale, spec.mask,
                                       spec.window, cache->meta, cache->table,
                                       kv::kBlockSize, split_device, spec.kv_cache_dtype,
-                                      q.shape().dim(2) == 1 ? spec.sparse_attention.decode
-                                                            : spec.sparse_attention.prefill)
+                                      sparse)
                   : graph::sdpa(q, k_attn, v_attn, scale, spec.mask, spec.window,
                                 offset);
 

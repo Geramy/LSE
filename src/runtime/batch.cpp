@@ -427,8 +427,13 @@ Result<std::vector<std::uint32_t>> BatchScheduler::run_step(std::int32_t width) 
     plan.first[r] = slots_[r].occupied ? slots_[r].position : -1;
   }
 
+  // This scheduler has no speculative rows: a multi-token step consumes
+  // pending prompt tokens, while a one-token step is the decode schedule.
   LSE_ASSIGN_OR(Array hidden,
-                model_.hidden(ids_, &states_, nullptr, nullptr, &plan));
+                model_.hidden(ids_, &states_, nullptr, nullptr, &plan, false,
+                              nullptr, false,
+                              width > 1 ? ops::AttentionExecutionPhase::kPrefill
+                                        : ops::AttentionExecutionPhase::kDecode));
 
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {

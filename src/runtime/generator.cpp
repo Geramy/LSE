@@ -280,7 +280,8 @@ Result<std::vector<float>> Generator::step(
     if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
     LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr,
                                        nullptr, nullptr, false,
-                                       dflash2_ != nullptr ? &capture : nullptr));
+                                       dflash2_ != nullptr ? &capture : nullptr, false,
+                                       ops::AttentionExecutionPhase::kPrefill));
     if (dflash2_ != nullptr) {
       LSE_RETURN_IF_ERROR(dflash2_->append_context(
           capture.features, base + static_cast<std::int32_t>(at)));
@@ -348,7 +349,7 @@ Status Generator::verify(Session& session,
                 model_.hidden(spec_ids_, &session.states(), nullptr, nullptr,
                               nullptr, replaces_previous,
                               dflash2_ != nullptr ? &capture : nullptr,
-                              m > 1));
+                              m > 1, ops::AttentionExecutionPhase::kSpeculative));
   spec_features_ = std::move(capture.features);
 
   const SamplingParams& sp = sampler_.params();

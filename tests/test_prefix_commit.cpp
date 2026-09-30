@@ -271,7 +271,9 @@ LSE_TEST(hybrid_prefix_commit_advances_cursor_and_preserves_same_width_carry_rep
   std::vector<MixerState> sa(1),sr(1);
   auto run=[&](HybridLM& model,std::vector<MixerState>& states,std::vector<float> tokens,bool retained=false) {
     auto ids=upload(scheduler->backend(),{1,static_cast<std::int64_t>(tokens.size())},tokens);
-    auto hidden=model.hidden(ids,&states,nullptr,nullptr,nullptr,false,nullptr,retained);
+    auto hidden=model.hidden(ids,&states,nullptr,nullptr,nullptr,false,nullptr,retained,
+                             retained ? ops::AttentionExecutionPhase::kSpeculative
+                                      : ops::AttentionExecutionPhase::kDecode);
     LSE_EXPECT(hidden.ok()); if (!hidden.ok()) return Array{};
     LSE_EXPECT_OK(hidden->eval()); return hidden.release();
   };

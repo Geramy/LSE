@@ -60,7 +60,7 @@ void usage() {
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
       "      --FlashPrefillV2=off  disable default FlashPrefill V2 prefill (on/off)\n"
-      "                       default on for supported baseline HRX/LOOM configurations\n"
+      "                       default on for supported HRX/LOOM prompt prefill, including MTP/DFlash2\n"
       "      --attention-prefill MODE  dense, blasst, flashprefill-v2 (experimental)\n"
       "      --attention-decode MODE   dense (default) or blasst (experimental)\n"
       "      --attention-calibration FILE  JSON with version=1 and phase scale values\n"
@@ -250,8 +250,9 @@ int main(int argc, char** argv) {
   const bool automatic_flashprefill = !prefill_explicit && !flashprefill_toggle.has_value();
   const bool sparse_requested = sparse_attention.prefill.enabled() || sparse_attention.decode.enabled();
   if (sparse_requested) {
-    if (!no_mtp || dflash2_on) {
-      std::fputs("lse-server: experimental sparse attention requires --no-mtp and DFlash2 off until verifier phases are qualified\n", stderr);
+    if ((!no_mtp || dflash2_on) &&
+        (sparse_attention.prefill.blasst || sparse_attention.decode.enabled())) {
+      std::fputs("lse-server: BLASST requires --no-mtp and DFlash2 off; FlashPrefill V2 supports prompt prefill with dense speculative verification\n", stderr);
       return 2;
     }
     if (attention_calibration.empty() &&
@@ -386,7 +387,7 @@ int main(int argc, char** argv) {
   if (automatic_flashprefill) {
     auto arch = model::detect_architecture(*cfg, *weights);
     bool supported = arch.ok() && (*arch)->name == "qwen3.5" &&
-                     cfg->attn_head_dim == 256 && !dflash2_on && mtp_where.empty() &&
+                     cfg->attn_head_dim == 256 &&
                      (cfg->kv_cache_dtype == kv::CacheDType::kBF16 ||
                       cfg->kv_cache_dtype == kv::CacheDType::kF32);
     for (std::size_t i = 0; i < devices->size(); ++i) {

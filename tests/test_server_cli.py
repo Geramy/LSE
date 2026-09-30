@@ -66,10 +66,13 @@ for value in ('true', 'false', '1', '', 'ON'):
     cases.append(([f'--FlashPrefillV2={value}'], 2, '--FlashPrefillV2 must be on or off'))
 cases += [(['--FlashPrefillV2'], 2, '--FlashPrefillV2 needs a value'),
           (['--FlashPrefillV2=off'], 2, 'no model.'),
-          (['--FlashPrefillV2=on'], 2, 'requires --no-mtp'),
+          (['--FlashPrefillV2=on'], 2, 'requires --dialect loom'),
           (['--FlashPrefillV2=on', '--no-mtp', '--dialect', 'loom'], 2, 'no model.'),
           (['--attention-prefill', 'flashprefill-v2', '--no-mtp', '--dialect', 'loom'], 2, 'no model.'),
-          (['--FlashPrefillV2=off', '--dflash2=on'], 2, 'no model.')]
+          (['--FlashPrefillV2=off', '--dflash2=on'], 2, 'no model.'),
+          (['--FlashPrefillV2=on', '--mtp-depth', '3', '--dialect', 'loom'], 2, 'no model.'),
+          (['--FlashPrefillV2=on', '--dflash2=on', '--dialect', 'loom'], 2, 'no model.'),
+          (['--attention-prefill', 'blasst', '--dflash2=on', '--dialect', 'loom'], 2, 'requires --no-mtp')]
 for flags in (['--FlashPrefillV2=off', '--attention-prefill', 'flashprefill-v2'],
               ['--attention-prefill', 'flashprefill-v2', '--FlashPrefillV2=off'],
               ['--FlashPrefillV2=on', '--attention-prefill', 'dense'],

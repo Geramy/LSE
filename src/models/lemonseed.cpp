@@ -153,8 +153,7 @@ class GatedAttention final : public IMixer {
 
   Result<Array> forward(const Array& x, MixerState* state,
                         const LayerContext& ctx) override {
-    (void)ctx;
-    if (state == nullptr) return ops::gated_attention(x, w_, spec_, rope_, 0);
+    if (state == nullptr) return ops::gated_attention(x, w_, spec_, rope_, 0, nullptr, ctx.attention_phase);
 
     ops::AttentionCache cache;
     cache.keys = state->key_cache;
@@ -166,7 +165,7 @@ class GatedAttention final : public IMixer {
     cache.used = state->position;
     LSE_ASSIGN_OR(Array y,
                   ops::gated_attention(x, w_, spec_, rope_, state->position,
-                                       &cache));
+                                       &cache, ctx.attention_phase));
     state->key_cache = cache.keys;
     state->value_cache = cache.values;
     return y;

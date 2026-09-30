@@ -156,12 +156,16 @@ class HybridLM {
   // recurrent layers — a rejected proposal's Gated DeltaNet state is never
   // committed, because the pass that produced it is overwritten. The caller
   // must put the mixer positions back first; see MixerState::position.
+  // Explicit phase selects prompt sparsity; verification stays dense even when
+  // it has the same width as a prompt chunk. Retained programs include phase.
   Result<Array> hidden(const Array& tokens, std::vector<MixerState>* states,
                        Array* aux_loss, std::vector<Array>* trace = nullptr,
                        const StepRows* rows = nullptr,
                        bool replaces_previous = false,
                        FeatureCapture* capture = nullptr,
-                       bool retain_prefix_state = false);
+                       bool retain_prefix_state = false,
+                       ops::AttentionExecutionPhase attention_phase =
+                           ops::AttentionExecutionPhase::kDecode);
 
   // Puts every mixer's sequence cursor back to `position`. The paged
   // pool is overwritten in place by the pass that follows, so this plus a
@@ -235,6 +239,7 @@ class HybridLM {
     // The pass shape this slot serves: the token count of its retained
     // program. -1 is an empty slot.
     std::int64_t t_key = -1;
+    ops::AttentionExecutionPhase attention_phase = ops::AttentionExecutionPhase::kDecode;
     // Actual retained schedule, stamped once after partition/evaluation.
     bool split_decode_attention = false;
     // Chain identity. pass_id names the build that retained this slot;
@@ -256,11 +261,9 @@ class HybridLM {
     bool prefix_committed = false;
     std::int32_t prefix_end = 0;
   };
-  // One slot per pass shape, so decode retention (T=1) stops evicting the
-  // prefill program (T=N) — with one slot every server request rebuilt its
-  // prefill graph because the first decode had overwritten it. Four covers
-  // decode, an MTP verify width, and two prompt shapes; eviction is
-  // round-robin among full slots.
+  // One slot per execution phase and pass shape, so decode (T=1) cannot reuse
+  // a prompt tail or evict the
+  // prefill program (T=N). Eviction is round-robin among full slots.
   // Wide enough for the deepest prefill ladder a 256-chunk plan can produce
   // (a 511-token prompt uses widths 1..256 = nine passes) plus decode.
   std::array<ForwardCache, 12> caches_;
@@ -271,19 +274,21 @@ class HybridLM {
   std::uint64_t pass_counter_ = 0;
   std::uint64_t last_pass_id_ = 0;
   std::size_t next_cache_ = 0;
-  [[nodiscard]] ForwardCache& cache_slot(std::int64_t t) {
+  [[nodiscard]] ForwardCache& cache_slot(std::int64_t t, ops::AttentionExecutionPhase phase) {
     for (ForwardCache& c : caches_) {
-      if (c.t_key == t) return c;
+      if (c.t_key == t && c.attention_phase == phase) return c;
     }
     for (ForwardCache& c : caches_) {
       if (c.t_key < 0) {
         c.t_key = t;
+        c.attention_phase = phase;
         return c;
       }
     }
     ForwardCache& c = caches_[next_cache_++ % caches_.size()];
     c = ForwardCache{};
     c.t_key = t;
+    c.attention_phase = phase;
     return c;
   }
   // Groups the last pass could not put on the device. A pass that ran anywhere

@@ -59,6 +59,30 @@ LSE_TEST(sparse_attention_routing_is_opt_in_and_phase_shape_specific) {
   }
 }
 
+LSE_TEST(prompt_and_speculative_attention_use_explicit_phase) {
+  using Phase = ops::AttentionExecutionPhase;
+  ops::SparseAttentionOptions options;
+  options.prefill = {false, .1f, true};
+  options.decode = {true, 1.0f, false};
+  const auto d = gpu();
+  for (int queries : {1, 2, 4, 8, 17}) {
+    const auto prompt = ops::attention_for_phase(options, Phase::kPrefill, queries);
+    const auto verify = ops::attention_for_phase(options, Phase::kSpeculative, queries);
+    LSE_EXPECT_EQ(prompt.flashprefill, queries > 1);
+    LSE_EXPECT(!verify.enabled());
+    LSE_EXPECT(ops::attention_for_phase(options, Phase::kDecode, queries).blasst);
+    auto q = leaf({1, 4, queries, 256}), k = leaf({48, 2, 16, 256}), v = leaf(k.shape());
+    auto meta = leaf({5}), table = leaf({1, 48});
+    auto p = sdpa_paged(q, k, v, .0625f, MaskKind::kCausal, 0, meta, table, 16,
+                        &d, kv::CacheDType::kF32, prompt);
+    auto verification = sdpa_paged(q, k, v, .0625f, MaskKind::kCausal, 0, meta, table,
+                                   16, &d, kv::CacheDType::kF32, verify);
+    LSE_EXPECT_EQ(p.node()->prim->name() == "attention.flashprefill.wmma.v1", queries > 1);
+    LSE_EXPECT(verification.node()->prim->name() != "attention.flashprefill.wmma.v1");
+    LSE_EXPECT_EQ(verification.node()->attrs[3], 0.0f);
+  }
+}
+
 LSE_TEST(flashprefill_native_graph_has_pool_selector_and_correction) {
   const auto d=gpu(); backend::LoomEmitter emitter;
   auto q=leaf({2,4,2,256}),k=leaf({80,2,16,256}),v=leaf(k.shape());

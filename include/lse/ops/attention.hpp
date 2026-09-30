@@ -168,6 +168,7 @@ Status release_row(PagedKvLayer& layer, std::int32_t row);
 Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
                               const GatedAttentionSpec& spec,
                               const RopeTables& rope, std::int32_t offset,
-                              AttentionCache* cache = nullptr);
+                              AttentionCache* cache = nullptr,
+                              AttentionExecutionPhase phase = AttentionExecutionPhase::kDecode);
 
 }  // namespace lse::ops

@@ -300,6 +300,7 @@ Result<Array> MtpModule::record(std::int64_t rows) {
   LayerContext ctx;
   ctx.config = &config_;
   ctx.layer_index = 0;
+  ctx.attention_phase = ops::AttentionExecutionPhase::kSpeculative;
   LSE_ASSIGN_OR(x, block_->forward(x, &state_, nullptr, ctx));
   x = ops::rms_norm(x, final_norm_, config_.rms_eps);
 

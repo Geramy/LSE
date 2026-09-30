@@ -228,24 +228,22 @@ class Qwen35Attention final : public IMixer {
   Result<std::vector<Array>> forward_shards(const std::vector<Array>& xs,
                                             MixerState* state,
                                             const LayerContext& ctx) override {
-    (void)ctx;
     std::vector<Array> parts(w_.size());
     for (std::size_t m = 0; m < w_.size(); ++m) {
       const graph::ScopedMember on(m);
-      LSE_ASSIGN_OR(parts[m], shard_forward(xs[m], state, m));
+      LSE_ASSIGN_OR(parts[m], shard_forward(xs[m], state, m, ctx.attention_phase));
     }
     return parts;
   }
 
   Result<Array> forward(const Array& x, MixerState* state,
                         const LayerContext& ctx) override {
-    (void)ctx;
     Array sum;
     for (std::size_t m = 0; m < w_.size(); ++m) {
       const std::optional<graph::ScopedMember> on =
           w_.size() > 1 ? std::optional<graph::ScopedMember>(std::in_place, m)
                         : std::nullopt;
-      LSE_ASSIGN_OR(Array part, shard_forward(x, state, m));
+      LSE_ASSIGN_OR(Array part, shard_forward(x, state, m, ctx.attention_phase));
       sum = m == 0 ? part : graph::add(sum, part);
     }
     return sum;
@@ -253,9 +251,9 @@ class Qwen35Attention final : public IMixer {
 
  private:
   Result<Array> shard_forward(const Array& x, MixerState* state,
-                              std::size_t m) {
+                              std::size_t m, ops::AttentionExecutionPhase phase) {
     if (state == nullptr) {
-      return ops::gated_attention(x, w_[m], spec_[m], rope_[m], 0);
+      return ops::gated_attention(x, w_[m], spec_[m], rope_[m], 0, nullptr, phase);
     }
     MixerState& st = state[m];
     ops::AttentionCache cache;
@@ -267,7 +265,7 @@ class Qwen35Attention final : public IMixer {
     cache.capacity = spec_[m].kv_length;
     cache.used = st.position;
     LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_[m], spec_[m], rope_[m],
-                                                st.position, &cache));
+                                                st.position, &cache, phase));
     st.key_cache = cache.keys;
     st.value_cache = cache.values;
     return y;

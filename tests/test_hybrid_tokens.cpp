@@ -52,9 +52,15 @@ backend::IDeviceSet* token_devices() {
 }
 class ZeroMixer final : public model::IMixer {
  public:
+  explicit ZeroMixer(std::vector<ops::AttentionExecutionPhase>* phases = nullptr) : phases_(phases) {}
   Status load(model::WeightBinder&, std::string_view, const model::LayerContext&) override { return OkStatus(); }
-  Result<graph::Array> forward(const graph::Array& x, model::MixerState*, const model::LayerContext&) override { return graph::Array::zeros(x.shape(), DType::kF32); }
+  Result<graph::Array> forward(const graph::Array& x, model::MixerState*, const model::LayerContext& ctx) override {
+    if (phases_) phases_->push_back(ctx.attention_phase);
+    return graph::Array::zeros(x.shape(), DType::kF32);
+  }
   std::string_view name() const noexcept override { return "fixture.zero_mixer"; }
+ private:
+  std::vector<ops::AttentionExecutionPhase>* phases_;
 };
 class ZeroFfn final : public model::IFeedForward {
  public:
@@ -84,8 +90,9 @@ LSE_TEST(opaque_tokens_replay_the_uploaded_ids_without_a_host_mirror) {
   auto opened = model::SafeTensors::open((directory / "model.safetensors").string()); LSE_EXPECT(opened.ok()); if (!opened.ok()) return;
   model::Config config; config.hidden_size = 8; config.vocab_size = 16; config.num_layers = 1; config.full_attention_interval = 1;
   model::HybridLMSpec spec; spec.zero_centered_norm = false;
-  model::HybridLM lm(config, spec, [](std::int32_t) -> Result<std::unique_ptr<model::HybridBlock>> {
-    return std::make_unique<model::HybridBlock>(std::make_unique<ZeroMixer>(), std::make_unique<ZeroFfn>(), false);
+  std::vector<ops::AttentionExecutionPhase> phases;
+  model::HybridLM lm(config, spec, [&phases](std::int32_t) -> Result<std::unique_ptr<model::HybridBlock>> {
+    return std::make_unique<model::HybridBlock>(std::make_unique<ZeroMixer>(&phases), std::make_unique<ZeroFfn>(), false);
   });
   model::WeightBinder binder(*opened); LSE_EXPECT_OK(lm.load(binder));
   auto states = lm.make_states(); graph::NodePtr retained;
@@ -106,6 +113,30 @@ LSE_TEST(opaque_tokens_replay_the_uploaded_ids_without_a_host_mirror) {
     }
     LSE_EXPECT_EQ(states[0].position, static_cast<std::int32_t>((pass + 1) * 8));
   }
+  // Equal-width prompt and verification passes must have separate retained
+  // programs, while repeated verification can still replay its own program.
+  using Phase = ops::AttentionExecutionPhase;
+  auto input = graph::Array::zeros(Shape{1, 8}, DType::kF32);
+  auto prompt = lm.hidden(input, &states, nullptr, nullptr, nullptr, false,
+                          nullptr, false, Phase::kPrefill);
+  LSE_EXPECT(prompt.ok()); if (!prompt.ok()) return;
+  LSE_EXPECT(prompt->node() != retained);
+  LSE_EXPECT(phases.back() == Phase::kPrefill);
+  auto verify = lm.hidden(input, &states, nullptr, nullptr, nullptr, false,
+                          nullptr, false, Phase::kSpeculative);
+  LSE_EXPECT(verify.ok()); if (!verify.ok()) return;
+  LSE_EXPECT(verify->node() != prompt->node());
+  LSE_EXPECT(phases.back() == Phase::kSpeculative);
+  auto replay = lm.hidden(input, &states, nullptr, nullptr, nullptr, false,
+                          nullptr, false, Phase::kSpeculative);
+  LSE_EXPECT(replay.ok()); if (!replay.ok()) return;
+  LSE_EXPECT(replay->node() == verify->node());
+  const auto position = states[0].position;
+  auto invalid = lm.hidden(input, &states, nullptr, nullptr, nullptr, true,
+                           nullptr, false, Phase::kPrefill);
+  LSE_EXPECT(!invalid.ok());
+  LSE_EXPECT(invalid.status().to_string().find("cannot change attention phase") != std::string::npos);
+  LSE_EXPECT_EQ(states[0].position, position);
 }
 }
 int main() { graph::register_device_set_factory(token_devices); return lse::test::run_all(); }

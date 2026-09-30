@@ -1,12 +1,13 @@
 # Experimental sparse attention through HRX / LOOM
 
-The HTTP server enables FlashPrefill V2 by default for baseline Qwen3.5-family
+The HTTP server enables FlashPrefill V2 by default for Qwen3.5-family
 models with 256-wide heads on gfx1201 Wave32 through LOOM, using BF16 or FP32
 KV. The default alpha is 0.1; decode remains dense. Disable it with
 `--FlashPrefillV2=off`. Batch/ubatch remain 1024.
 
-MTP, DFlash2, other devices, other architectures and other KV formats retain
-dense attention automatically. Explicit sparse modes still require a supported
+MTP and DFlash2 use FlashPrefill V2 for target prompt prefill only. Their draft
+and verification passes stay dense. Other devices, architectures and KV formats
+retain dense attention automatically. Explicit sparse modes still require a supported
 configuration. Linear-attention layers and KV retention are unchanged.
 BLASST remains opt-in.
 
@@ -32,9 +33,18 @@ For BLASST, add these arguments to an existing baseline server command:
 ```
 
 Each mode can independently be `dense` or `blasst`; prefill also accepts
-`flashprefill-v2`. MTP and DFlash2 are rejected while sparse attention is enabled until verifier-phase behavior is
-qualified. Multi-row calls use the prefill setting; single-row calls use the
-decode setting, including a single-token prompt or prefill tail.
+`flashprefill-v2`. BLASST remains unavailable with MTP/DFlash2. Execution phase
+is explicit: prompt chunks use prefill, ordinary decode uses decode, and every
+speculative draft/verification call is dense regardless of query width.
+Singleton prompt tails are dense. Retained forward programs are keyed by phase
+and width so a short prompt tail cannot be replayed as a verifier. Replacement
+passes cannot change phase; KV writes, rewind and accepted-prefix commit retain
+the existing semantics.
+
+Approximate prefill can change prompt KV, recurrent state, captured DFlash2
+features and subsequent tokens. Dense verification preserves the speculative
+protocol for that resulting target state; it does not imply equivalence to an
+all-dense prompt or unchanged acceptance.
 
 BLASST requires a calibration file; FlashPrefill V2 optionally accepts one to
 override alpha 0.1. The file must name the exact `--model` argument and provide a
@@ -172,3 +182,9 @@ The prompt and binary were identical within each pair; prompt times include
 compilation from an empty private cache. Both output pairs matched exactly,
 with zero CPU fallback. These are code-review prompt execution checks;
 retrieval and broader model-quality calibration remain open.
+
+## Speculative prompt prefill
+
+MTP3 and DFlash2 native 16K checks passed with the same 64-token greedy output
+and aggregate acceptance as dense controls, with zero CPU fallback. See the
+[speculative phase and measurement report](../benchmarks/flashprefill-speculative-2026-09-30.md).

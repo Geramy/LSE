@@ -553,7 +553,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                                std::vector<Array>* trace, const StepRows* rows,
                                bool replaces_previous,
                                FeatureCapture* capture,
-                               bool retain_prefix_state) {
+                               bool retain_prefix_state,
+                               ops::AttentionExecutionPhase attention_phase) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -594,12 +595,12 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   // allocating state, extending pools or changing any retention slot.
   if (replaces_previous) {
     for (const ForwardCache& cache : caches_) {
-      if ((cache.t_key == t_now ||
+      if (((cache.t_key == t_now && cache.attention_phase == attention_phase) ||
            (last_pass_id_ != 0 && cache.pass_id == last_pass_id_)) &&
-          (!feature_layers_match(cache) ||
+          (cache.attention_phase != attention_phase || !feature_layers_match(cache) ||
            cache.retains_prefix_state != retain_prefix_state)) {
         return LSE_ERROR(kInvalidArgument,
-                         "a replacement pass cannot change feature or prefix retention");
+                         "a replacement pass cannot change attention phase, feature or prefix retention");
       }
     }
   }
@@ -630,7 +631,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
 
   // The retention slot for THIS pass shape. Named cache_ so the thirty uses
   // below read as they always did; the member is caches_ now.
-  ForwardCache& cache_ = cache_slot(t_now);
+  ForwardCache& cache_ = cache_slot(t_now, attention_phase);
 
   if (states != nullptr && tokens.valid()) {
     const auto batch = tokens.shape().dim(0);
@@ -805,6 +806,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     }
     for (ForwardCache& c : caches_) c = ForwardCache{};
     cache_.t_key = t_now;
+    cache_.attention_phase = attention_phase;
     next_cache_ = 0;
     last_pass_id_ = 0;
   }
@@ -1012,6 +1014,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       LayerContext ctx;
       ctx.config = &config_;
       ctx.layer_index = static_cast<std::int32_t>(i);
+      ctx.attention_phase = attention_phase;
       ctx.shards = static_cast<std::int32_t>(shards);
       MixerState* state =
           states != nullptr ? &(*states)[i * shards] : nullptr;
@@ -1025,6 +1028,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     LayerContext ctx;
     ctx.config = &config_;
     ctx.layer_index = static_cast<std::int32_t>(i);
+    ctx.attention_phase = attention_phase;
     ctx.shards = static_cast<std::int32_t>(state_shards());
     MixerState* state =
         states != nullptr ? &(*states)[i * state_shards()] : nullptr;
