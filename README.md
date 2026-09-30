@@ -38,9 +38,15 @@ The local Q4 target with Q8 DFlash2 and BF16 K/V completed 68,301 total tokens.
 Peak VRAM was 27.83 GB, with at least 6.11 GB free. Isolated fragment-addressing
 cost was 0.7–8.9% at 16K context and 2.5% for eight queries at 68K context.
 A matched short-context server throughput comparison has not been run.
-The existing optimized attention shape limit above 65,536 keys remains.
-This release is a K/V growth and memory-management fix; it does not claim a
-throughput improvement or validate the full configured context capacity.
+Short-query split attention now derives partition counts from the K/V table
+and checks device LDS capacity. It remains active above 65,536 keys. In the local
+64K HTTP check, decode measured **13.87 TPS**, versus 5.72 TPS from the preserved
+earlier executable; prefill stayed near 146 PP/s. The executables have other
+revision differences, so this is not an isolated measurement of the dispatch fix.
+A same-executable attention comparison measured 8.12 ms for fragmented split
+attention versus 71.79 ms for unsplit attention at 65,656 live keys.
+See [automatic split-attention validation](docs/benchmarks/automatic-split-2026-09-29.md).
+The full configured context capacity has not been validated.
 See [K/V storage](docs/KV-STORAGE.md) and the
 [measurement report](docs/benchmarks/kv-fragments-2026-09-29.md).
 The archives bundle the matching HRX runtime and Loom compiler.
