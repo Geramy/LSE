@@ -2479,6 +2479,61 @@ void prep_state(MixerState& st, const Config& cfg, bool attn,
   }
 }
 
+
+void compare_paged_shard_contents(MixerState& whole,
+                                  std::vector<MixerState>& shards,
+                                  std::int32_t tokens, const char* stage) {
+  if (!whole.paged.valid() || whole.paged.tables.empty()) return;
+  for (bool values : {false, true}) {
+    auto& wa = values ? whole.value_cache : whole.key_cache;
+    const auto w = drain_all(wa);
+    LSE_EXPECT(!w.empty());
+    const auto heads = wa.shape().dim(1), block = wa.shape().dim(2);
+    const auto dim = wa.shape().dim(3);
+    double peak = 0.0, worst = 0.0;
+    std::int64_t worst_token = -1, worst_head = -1, worst_dim = -1;
+    float worst_whole = 0.0f, worst_shard = 0.0f;
+    bool finite = true;
+    std::int64_t head_base = 0;
+    for (auto& state : shards) {
+      auto& sa = values ? state.value_cache : state.key_cache;
+      const auto s = drain_all(sa);
+      LSE_EXPECT(!s.empty());
+      const auto shard_heads = sa.shape().dim(1);
+      for (std::int64_t token = 0; token < tokens; ++token) {
+        const auto wb = whole.paged.tables[0].blocks()[token / block];
+        const auto sb = state.paged.tables[0].blocks()[token / block];
+        for (std::int64_t head = 0; head < shard_heads; ++head)
+          for (std::int64_t d = 0; d < dim; ++d) {
+            const auto wi = ((wb * heads + head_base + head) * block + token % block) * dim + d;
+            const auto si = ((sb * shard_heads + head) * block + token % block) * dim + d;
+            if (wi >= static_cast<std::int64_t>(w.size()) || si >= static_cast<std::int64_t>(s.size())) {
+              LSE_EXPECT(false);
+              return;
+            }
+            const float a = w[wi], b = s[si];
+            finite &= std::isfinite(a) && std::isfinite(b);
+            peak = std::max(peak, std::abs(static_cast<double>(a)));
+            const double error = std::abs(static_cast<double>(a) - b);
+            if (error > worst) {
+              worst = error; worst_token = token; worst_head = head_base + head;
+              worst_dim = d; worst_whole = a; worst_shard = b;
+            }
+          }
+      }
+      head_base += shard_heads;
+    }
+    const double relative = worst / std::max(peak, 1e-30);
+    std::fprintf(stderr, "       %s raw %s state: max_abs=%.9g max_rel=%.9g peak=%.9g token=%lld head=%lld dim=%lld whole=%.9g shard=%.9g\n",
+        stage, values ? "V" : "K", worst, relative, peak,
+        static_cast<long long>(worst_token), static_cast<long long>(worst_head),
+        static_cast<long long>(worst_dim), worst_whole, worst_shard);
+    LSE_EXPECT_EQ(head_base, heads);
+    LSE_EXPECT(finite);
+    LSE_EXPECT(relative < 1e-4);
+  }
+}
+
 double shard_state_step(std::unique_ptr<IMixer> whole,
                         std::unique_ptr<IMixer> split, const Config& cfg,
                         const SafeTensors& ckpt,
@@ -2516,6 +2571,7 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   }
   if (out_reference_peak != nullptr) *out_reference_peak = absmax;
   const double prefill = absmax > 0.0 ? worst / absmax : 0.0;
+  if (attn) compare_paged_shard_contents(w_st, s_st, 4, "prefill");
 
   // One decode token against the carried state -- the recurrence and the KV
   // pool the prefill just wrote, which is the whole point of this test.
@@ -2538,6 +2594,7 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
     worst2 = std::max(worst2, std::abs(static_cast<double>(a2[i]) - b2[i]));
   }
   *out_decode = absmax2 > 0.0 ? worst2 / absmax2 : 0.0;
+  if (attn) compare_paged_shard_contents(w_st, s_st, 5, "decode");
   return prefill;
 }
 
@@ -2596,6 +2653,7 @@ LSE_TEST(a_small_split_attention_carries_prefill_and_decode_state_without_a_chec
   const double prefill = shard_state_step(
       qwen3_5::make_attention(), qwen3_5::make_attention(), cfg, *checkpoint,
       nullptr, "language_model.model.layers.3", 3, true, &decode, &peak);
+  std::fprintf(stderr, "       small attention state: prefill=%.9g decode=%.9g peak=%.9g\n", prefill, decode, peak);
   LSE_EXPECT(std::isfinite(peak) && peak > 0.0);
   LSE_EXPECT(prefill >= 0.0 && prefill < 1e-4);
   LSE_EXPECT(decode >= 0.0 && decode < 1e-4);
