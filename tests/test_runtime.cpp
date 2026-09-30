@@ -246,6 +246,96 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
   LSE_EXPECT_OK(run());
 }
 
+LSE_TEST(native_partial_rope_to_paged_keys_matches_reference) {
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler || !scheduler->backend().emitter())
+    LSE_SKIP("requires native kernel dispatch");
+  auto& backend = scheduler->backend();
+  struct Restore {
+    graph::Scheduler& scheduler;
+    graph::Scheduler::Mode mode;
+    graph::DialectPreference dialect;
+    ~Restore() {
+      scheduler.set_mode(mode);
+      if (dialect) scheduler.set_dialect(*dialect);
+      else scheduler.clear_dialect();
+    }
+  } restore{*scheduler, scheduler->mode(), scheduler->dialect()};
+  scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  for (const auto dialect : {graph::Dialect::kHip, graph::Dialect::kLoom}) {
+    const auto* toolchain = backend.toolchain(dialect);
+    if (!toolchain || toolchain->dialect != dialect || !toolchain->compiler ||
+        !toolchain->compiler->available()) continue;
+    scheduler->set_dialect(dialect);
+    const auto run = [&]() -> Status {
+      auto upload = [&](Shape shape, DType dtype, const void* data) -> Result<graph::Array> {
+        const auto bytes = dtype_storage_bytes(dtype, shape.elem_count());
+        LSE_ASSIGN_OR(auto buffer, backend.allocate(bytes, backend::MemoryClass::kDevice));
+        LSE_RETURN_IF_ERROR(backend.copy_h2d(data, buffer, bytes, 0));
+        return graph::Array::from_buffer(std::move(buffer), shape, dtype);
+      };
+      constexpr int dim = 16, rotary = 4, block = 16;
+      LSE_ASSIGN_OR(auto angles, ops::build_rope(rotary, block, 10000000.f));
+      for (const int heads : {1, 2, 4}) for (const int queries : {1, 4}) {
+        constexpr int first = 4;
+        const int live = first + queries;
+        const float positions[]{first, static_cast<float>(live), 1, first, static_cast<float>(live)};
+        const float block_id[]{0};
+        LSE_ASSIGN_OR(auto meta, upload({5}, DType::kF32, positions));
+        LSE_ASSIGN_OR(auto table, upload({1, 1}, DType::kF32, block_id));
+        const Shape shape{1, heads, queries, dim};
+        std::vector<float> input(shape.elem_count()), gain(dim, 1.f);
+        for (std::size_t i = 0; i < input.size(); ++i)
+          input[i] = static_cast<float>(static_cast<int>(i % 29) - 14) / 32.f;
+        LSE_ASSIGN_OR(auto x, upload(shape, DType::kF32, input.data()));
+        LSE_ASSIGN_OR(auto weight, upload({dim}, DType::kF32, gain.data()));
+        auto norm = graph::rms_norm(x, weight, 1e-6f, false);
+        LSE_ASSIGN_OR(auto rotated, ops::apply_rope(norm, angles, meta));
+        std::vector<std::uint16_t> expected(heads * block * dim);
+        LSE_ASSIGN_OR(auto pool, upload({1, heads, block, dim}, DType::kF16, expected.data()));
+        auto written = graph::kv_page_write(pool, rotated, meta, table, block, kv::CacheDType::kF16);
+        LSE_RETURN_IF_ERROR(written.eval());
+        const auto trace = scheduler->last_trace();
+        LSE_EXPECT(trace.device_groups > 0);
+        LSE_EXPECT_EQ(trace.host_groups, 0u);
+        LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+        for (int h = 0; h < heads; ++h) for (int t = 0; t < queries; ++t) {
+          const auto base = (h * queries + t) * dim;
+          double squares = 0;
+          for (int d = 0; d < dim; ++d) squares += static_cast<double>(input[base + d]) * input[base + d];
+          const float scale = static_cast<float>(1.0 / std::sqrt(squares / dim + 1e-6));
+          for (int d = 0; d < dim; ++d) {
+            float value = input[base + d] * scale;
+            if (d < rotary) {
+              const int pair = d / 2 * 2;
+              const double angle = (first + t) / std::pow(10000000.0, static_cast<double>(pair / 2) / (rotary / 2));
+              const float c = static_cast<float>(std::cos(angle)), s = static_cast<float>(std::sin(angle));
+              const float a = input[base + pair] * scale, b = input[base + pair + 1] * scale;
+              value = d % 2 ? b * c + a * s : a * c - b * s;
+            }
+            expected[(h * block + first + t) * dim + d] = float16_t::from_float(value);
+          }
+        }
+        std::vector<std::uint16_t> got(expected.size());
+        LSE_RETURN_IF_ERROR(backend.copy_d2h(written.node()->buffer, got.data(), got.size() * sizeof(got[0]), 0));
+        auto decode = [](std::uint16_t bits) { float16_t v; v.bits = bits; return v.to_float(); };
+        double worst = 0; std::size_t at = 0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+          LSE_EXPECT(std::isfinite(decode(got[i])));
+          const double error = std::abs(static_cast<double>(decode(got[i])) - decode(expected[i]));
+          if (error > worst) { worst = error; at = i; }
+        }
+        std::fprintf(stderr, "       %s partial RoPE to K heads=%d queries=%d max_abs=%.9g index=%zu actual=%.9g expected=%.9g device=%u host=%u\n",
+            dialect == graph::Dialect::kHip ? "hip" : "loom", heads, queries, worst, at,
+            decode(got[at]), decode(expected[at]), trace.device_groups, trace.host_groups);
+        LSE_EXPECT(worst < .002);
+      }
+      return OkStatus();
+    };
+    LSE_EXPECT_OK(run());
+  }
+}
+
 LSE_TEST(native_f16_paged_prefill_and_decode_match_reference) {
   auto* scheduler = graph::default_scheduler();
   if (!scheduler || !scheduler->backend().emitter())
