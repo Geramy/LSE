@@ -67,12 +67,19 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
   const auto* toolchain = backend.toolchain(graph::Dialect::kLoom);
   if (!backend.emitter() || !toolchain)
     LSE_SKIP("requires native Loom attention dispatch");
-  struct RestoreMode {
+  struct RestoreScheduler {
     graph::Scheduler& scheduler;
-    graph::Scheduler::Mode saved;
-    ~RestoreMode() { scheduler.set_mode(saved); }
-  } restore{*scheduler, scheduler->mode()};
+    graph::Scheduler::Mode mode;
+    graph::DialectPreference dialect;
+    ~RestoreScheduler() {
+      scheduler.set_mode(mode);
+      if (dialect) scheduler.set_dialect(*dialect);
+      else scheduler.clear_dialect();
+    }
+  } restore{*scheduler, scheduler->mode(), scheduler->dialect()};
   scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(graph::Dialect::kLoom);
+  LSE_EXPECT(scheduler->toolchain(0)->dialect == graph::Dialect::kLoom);
   const auto run = [&]() -> Status {
     std::fprintf(stderr, "       F16 fragmented check: begin arch=%s\n",
         std::string(backend.device_info().arch).c_str());
