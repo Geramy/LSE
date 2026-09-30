@@ -14,6 +14,39 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 [Performance](#measured-performance) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
+## Current release: v0.4.21
+
+Run a 27B model locally with speculative decoding, reusable prompt state, and
+GPU kernels optimized for your hardware.
+
+- **Shared K/V reads:** eligible attention kernels reuse data across query heads and token rows.
+- **Automatic Loom optimization:** cooperative operand staging and loop-invariant code motion.
+- **K/V that grows with your conversation:** a dedicated manager packs fragments into shared arenas without copying the existing cache.
+- **Ready-to-run packages:** macOS ARM64 and Linux x86-64 downloads include matching HRX and Loom libraries.
+
+[Download v0.4.21](https://github.com/Geramy/LSE/releases/tag/v0.4.21)
+
+## Measured performance
+
+**Up to 67.6 output tokens/s in real-world interactive use.**
+Qwen3.8-27B Q4 with Q8 DFlash2 block-8, running on an AMD R9700
+(`gfx1201`) through HRX/Loom on macOS:
+
+| Metric | Peak observed | Overall | Per-request median |
+|---|---:|---:|---:|
+| Decode (output tokens/s) | **67.6** | **35.8** | 36.1 |
+| Prefill (input tokens/s) | **390.2** | **243.6** | 152.5 |
+| Draft acceptance | **96%** | — | 86% |
+
+From user-supplied live-session logs before the reported tool-call loop.
+Peaks are individual request results; overall throughput is total processed
+tokens divided by total phase time, using rounded logs. Prefill counts newly
+processed input; decode excludes the first token. Rates vary with context and
+workload. The subsequent looping behavior is under investigation.
+
+[Controlled context tests](https://github.com/lemonade-sdk/mac-amdgpu/blob/3fea739/docs/benchmarks/lse-v0.4.21-context-speed.md)
+· [Earlier measurements](docs/RELEASE_HISTORY.md)
+
 ## Kernel cache
 
 The CLI and HTTP server create `~/.lse/cache/` automatically and reuse compiled
@@ -25,78 +58,6 @@ identity, device properties and kernel source. Startup removes complete older
 LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
-
-## Current release: v0.4.21
-
-Eligible short-query paged attention now shares K/V reads across query heads
-and token rows. The bundled Loom compiler enables automatic loop-invariant
-code motion. See the [release notes](https://github.com/Geramy/LSE/releases/tag/v0.4.21)
-and the [real-world performance summary](#real-world-interactive-performance-v0421).
-
-Paged K/V on the Loom backend now uses a dedicated shared memory manager.
-It packs 256 KiB fragments into 256 MiB arenas and fills available slots before
-allocating another arena. Growing a cache preserves its existing K/V addresses
-and data. This removes whole-pool K/V copies during growth. Weights and general
-tensor allocations keep their existing policy.
-
-The local Q4 target with Q8 DFlash2 and BF16 K/V completed 68,301 total tokens.
-Peak VRAM was 27.83 GB, with at least 6.11 GB free. Isolated fragment-addressing
-cost was 0.7–8.9% at 16K context and 2.5% for eight queries at 68K context.
-A matched short-context server throughput comparison has not been run.
-Short-query split attention now derives partition counts from the K/V table
-and checks device LDS capacity. It remains active above 65,536 keys. In the local
-64K HTTP check, decode measured **13.87 TPS**, versus 5.72 TPS from the preserved
-earlier executable; prefill stayed near 146 PP/s. The executables have other
-revision differences, so this is not an isolated measurement of the dispatch fix.
-A same-executable attention comparison measured 8.12 ms for fragmented split
-attention versus 71.79 ms for unsplit attention at 65,656 live keys.
-See [automatic split-attention validation](docs/benchmarks/automatic-split-2026-09-29.md).
-The full configured context capacity has not been validated.
-See [K/V storage](docs/KV-STORAGE.md) and the
-[measurement report](docs/benchmarks/kv-fragments-2026-09-29.md).
-The archives bundle the matching HRX runtime and Loom compiler.
-
-The server verifies all seven proposals from the DFlash2 block-8 checkpoint.
-Conditional drafting uses the request temperature. Probability-ratio rejection
-and residual sampling preserve the target sampling distribution.
-
-Prefill uses shared Q4 activation panels for the measured M1024 projection
-shapes. M8 gate/up and QKV projections now consume two activation rows at a time.
-The accepted M8 down WMMA, typed attention, buffer views and memory retirement
-remain active. Floating-point accumulation remains FP32.
-
-M8 GDN alpha and beta projections now reuse the activation panel shared by QKV
-and the GDN gate. Their preparation-inclusive paired GPU time falls from
-0.0500 to 0.0249 ms, with complete fused outputs matching exactly. This is a
-component result. The later matched DFlash2 HTTP check measured 616.38 PP/s
-and 43.05 TPS on its resident request, with exact responses and unchanged acceptance.
-See the [v0.4.15 check](docs/benchmarks/m8-gdn-http-2026-09-29.md).
-
-The current source combines the measured M8 Q4 gate/up sequence in one kernel.
-Its matched DFlash2 resident decode rate increases from 43.44 to 45.64 TPS, with
-identical output. The latest same-executable resident comparison measures
-**634.34 PP/s / 24.86 TPS** for baseline, **607.88 PP/s / 48.42 TPS** for MTP=3,
-and **629.80 PP/s / 45.64 TPS** for seven-proposal DFlash2. These are 1024-token
-coding requests at temperature 0.6. See the
-[combined gate/up report](docs/benchmarks/m8-gate-up-pair-2026-09-29.md) for cold
-results, resource costs and method. These rates do not apply to every context
-or Pi conversation.
-
-| Optimization | Evidence |
-| --- | --- |
-| Full-width DFlash2 and conditional sampling | [DFlash2 results](docs/benchmarks/dflash-fullwidth-2026-09-29.md) |
-| M8 down WMMA and prefill memory retirement | [M8 and memory results](docs/benchmarks/wmma-m8-down-2026-09-29.md) |
-| M1024 down activation panel | [Down prefill results](docs/benchmarks/prefill-m1024-down-2026-09-29.md) |
-| Skip fully masked attention windows | [Attention results](docs/benchmarks/attention-causal-windows-2026-09-29.md) |
-| Cooperative M1024 gate/up | [Gate/up results](docs/benchmarks/prefill-m1024-up-2026-09-29.md) |
-| Cooperative QKV, GDN gate and attention projections | [Projection results](docs/benchmarks/prefill-projections-2026-09-29.md) |
-| M8 activation register lifetime | [Decode scheduling results](docs/benchmarks/m8-dot4-rowpairs-2026-09-29.md) |
-| Combined M8 gate/up | [Gate/up pairing results](docs/benchmarks/m8-gate-up-pair-2026-09-29.md) |
-| M8 GDN alpha/beta panel reuse | [Rate projection results](docs/benchmarks/m8-gdn-rate-panel-2026-09-29.md) |
-
-The launch examples use temperature 0.6 and batch/ubatch 1024. Explicit request
-parameters override launch defaults. Earlier versions and measurements remain
-in [release history](docs/RELEASE_HISTORY.md).
 
 ## KV storage
 
@@ -114,31 +75,10 @@ Q/K/P/V matrix operands; FP32, BF16, FP8 and BF8 storage use BF16 operands after
 decoding or conversion. Matrix accumulators, softmax state and output remain
 FP32. Single-token and selected short-query split attention keep FP32 calculation.
 
-An earlier matched 1,024-token check measured perplexity **4.9049 with FP32 KV**
-and **4.9014 with FP16 KV plus WMMA v1**. The generalized family has native
-component coverage across all five formats. A later BF16 v2 check scored 1,024
-pinned targets at PPL **4.8499**, with zero host fallback. This prefill result
-does not establish sampled-conversation quality or a statistical improvement.
-See [KV cache formats](docs/KV_CACHE.md) for selection and evidence.
-
-## Prefill memory ownership
-
-This release frees completed forward workspaces before a new request and
-when prefill changes chunk width. Consecutive chunks of the same width retain
-replay. Model weights, compiled kernels and live KV storage remain resident.
-DFlash2 also releases completed large context-projection programs.
-
-The generator releases each consumed chunk's hidden graph before recording the
-next chunk. When the KV pool moves, the scheduler releases its previous
-program and the model drops redundant paged KV references. This removes old
-pool ownership during long-context growth. See the
-[65K-token test](docs/benchmarks/kv-growth-2026-09-29.md).
-
-A matched 6143-token ragged request reduced reserved GPU memory from 29.77 GB
-to 28.26 GB, with identical output and acceptance counts. Prefill and decode
-rates remained within 0.5% in that comparison. See the
-[memory report](docs/benchmarks/prefill-workspace-memory-2026-09-29.md) for the
-earlier workspace method and limits.
+See [KV cache formats](docs/KV_CACHE.md) and [K/V storage](docs/KV-STORAGE.md)
+for format selection, memory management, and validation details.
+Completed prefill workspaces are released while live K/V and compiled kernels
+remain available for reuse.
 
 ## Supported platforms
 
@@ -403,180 +343,6 @@ Set the client context limit to the same value as the server limit.
 
 The HTTP server can reuse an exact consumed prompt prefix for ordinary decoding and DFlash2.
 A changed prefix requires new prefill. MTP also retains verified state for an exact continuation.
-
-## Measured performance
-
-**Prefill** processes input tokens. **Decode** generates output tokens.
-Both rates below use tokens per second.
-
-### Real-world interactive performance (v0.4.21)
-
-Real-world interactive use on the local macOS R9700 (`gfx1201`), running
-Qwen3.8-27B Q4 with the Q8 DFlash2 block-8 drafter through HRX/Loom, measured:
-
-- **Decode: 35.8 tokens/s overall**, with a **36.1 tokens/s median** per request
-  and an observed range of **20.5–67.6 tokens/s**.
-- **Prefill: 243.6 tokens/s overall**, ranging from **32.5–390.2 tokens/s**
-  across short follow-ups and larger input chunks.
-- **DFlash2 acceptance: 86% median** per request, ranging from **59–96%**.
-
-These summarize user-supplied server logs. Overall rates are total logged tokens
-divided by total phase time (approximately, because printed times are rounded).
-Prompt counts represent newly processed input, not the full retained context;
-short follow-ups include request overhead. Decode timing excludes the first token.
-The results describe this live workload, not a fixed-context benchmark or a
-before/after speedup measurement.
-
-### Long-context vector staging (2026-09-29)
-
-Matched cold HTTP requests use Q4, Q8 DFlash2 with seven proposals, BF16 K/V,
-temperature 0.6, top-k 20, top-p 0.95, and batch/ubatch 1024. Each server starts
-with an empty kernel cache and generates 128 tokens.
-
-| Context | Before PP/s | After PP/s | Before TPS | After TPS |
-|---:|---:|---:|---:|---:|
-| 1,024 | 413.16 | 408.43 | 27.75 | 27.55 |
-| 65,536 | 146.06 | **224.02** | 13.85 | 13.79 |
-
-At 64K, vector staging and K/V cache hints improve prefill throughput by 53.4%.
-Prompt time falls from 448.70 to 292.54 seconds. Decode is essentially unchanged.
-The 1K comparison is about 1% slower. Each row is one measurement pair;
-these are not guarantees for other prompts. Both pairs produce identical text
-and acceptance counts with zero CPU fallback. See the
-[vector staging report](docs/benchmarks/attention-vector-staging-2026-09-29.md)
-for the method, kernel resources, and correctness checks.
-
-### Combined M8 gate/up (v0.4.16 measurements)
-
-Same executable, 1024-token coding prompts, 384 generated tokens, temperature 0.6,
-top-k 20, top-p 0.95, BF16 KV and batch/ubatch 1024. Each mode starts with an empty
-kernel cache. The resident request reuses compiled code and no prompt KV.
-
-| Mode | Cold PP/s | Cold TPS | Resident PP/s | Resident TPS |
-|---|---:|---:|---:|---:|
-| Baseline | 446.28 | 24.23 | 634.34 | 24.86 |
-| MTP=3 | 403.89 | 37.44 | 607.88 | 48.42 |
-| DFlash2 | 418.73 | 33.42 | 629.80 | 45.64 |
-
-DFlash2 improves 5.07% against a matched 43.44 TPS control; output and acceptance
-are identical. Higher register use is included in these measurements. See the
-[gate/up report](docs/benchmarks/m8-gate-up-pair-2026-09-29.md). The published
-v0.4.15 binaries retain the results below.
-
-### v0.4.15 DFlash2 check
-
-Measured source `cb285b1`. One matching cold/resident pair uses the same
-1,024-token requests and sampling settings as the earlier comparison below.
-
-| DFlash2, seven proposals | Prefill tokens/s | Decode tokens/s |
-| --- | ---: | ---: |
-| Cold | 413.74 | 32.01 |
-| Resident | 616.38 | 43.05 |
-
-Both complete responses and acceptance statistics match v0.4.14. There are zero
-host groups, fallbacks or reused prompt KV tokens. The new release cache namespace
-is verified. The resident decode difference is about +1.5% in this single pair.
-It is not a statistical result or a long-context Pi guarantee. Baseline and MTP=3
-were not rerun for this addition. See the [HTTP check](docs/benchmarks/m8-gdn-http-2026-09-29.md).
-
-### Last same-binary BF16 measurements
-
-Measured source `c11f103` (v0.4.14). One binary, identical 1024-token coding requests and 384 generated tokens per
-request. The decode rate times 383 tokens after the first token. Each mode starts
-with an empty private disk cache. The resident request retains compiled code
-but reuses zero prompt KV. Compilation is included. All requests have zero host
-fallbacks. The GPU is R9700/gfx1201; target is Qwen3.8-27B Q4 with Q8 draft modules.
-
-Sampling: temperature 0.6, top-k 20, top-p 0.95 and seed 1234. BF16 KV,
-FP32 floating accumulation, batch/ubatch 1024 and configured KV capacity 262100.
-
-| Mode | Cold prefill tokens/s | Cold decode tokens/s | Resident prefill tokens/s | Resident decode tokens/s |
-| --- | ---: | ---: | ---: | ---: |
-| Baseline | 442.18 | 24.14 | 624.10 | 24.73 |
-| MTP=3 | 403.95 | 37.96 | 608.19 | 48.62 |
-| DFlash2, seven proposals | 417.14 | 31.39 | 616.78 | 42.41 |
-
-This is one pair per mode, not a statistical estimate or long-context Pi replay.
-The 600 PP/s threshold is met on these resident requests. The 29 baseline,
-49 MTP and 103 DFlash2 TPS targets remain unmet. See the
-[final mode comparison](docs/benchmarks/forward-modes-final-2026-09-29.md) for binary
-identity, request hashes, acceptance and timing limits.
-
-### Earlier FP32 Pi chat measurements
-
-The same two-turn Pi workload used Qwen3.8-27B Q4, Q8 DFlash2 with three proposals,
-temperature 1, top-k 20 and top-p 0.95. Each process started with an empty disk
-kernel cache. The first prompt contained 5,207 tokens. The second reused the
-conversation prefix and added 23 tokens.
-
-| KV and attention | First prefill tokens/s, including compilation | First decode tokens/s | Follow-up decode tokens/s |
-| --- | ---: | ---: | ---: |
-| Earlier FP32 baseline | 56.89 | 26.64 | 31.34 |
-| FP32 with bounded attention source and compiled-code reuse | 308.54 | 27.11 | 31.28 |
-| FP32 with materialized DFlash feature views | 309.10 | 27.20 | 32.13 |
-| Final FP32 run with paired M4 activation loads | **310.72** | **28.59** | **34.03** |
-| Earlier optional FP16 with matrix attention | 179.51 | 23.89 | 27.10 |
-
-After the compiler changes, FP32 compilation took 3.35 seconds across 372 unique
-kernels, compared
-with 92.91 seconds across 427 kernels in the baseline. Follow-up prefill took
-0.760 seconds. Both FP32 runs generated identical responses and acceptance
-counts. This establishes a reduction in cold compilation stalls; steady decode
-is effectively unchanged. The subsequent buffer-view change removes 65 copy
-dispatches and three compiled kernels while preserving both responses; its
-small decode improvement is from one pair, not a statistical result.
-Prompt rates exclude model loading. See the
-[execution profile](docs/benchmarks/pi-execution-profile-2026-09-28.md).
-
-The earlier FP16 run predates the compiler fixes. It generated different text,
-with 59% follow-up acceptance versus 68% for FP32, and does not establish a
-decode speedup. These measurements used an explicit FP32 control; the current
-model policy defaults to BF16 for BF16 checkpoints and FP16 otherwise. See the
-[KV and attention report](docs/benchmarks/kv-storage-attention-2026-09-28.md).
-
-### Earlier 14K synthetic result
-
-The v0.4.8 source reached these rates on an R9700 (`gfx1201`) with Qwen3.8-27B Q4 and a Q8 DFlash2 draft.
-
-| Mode | Prompt tokens | Prefill | Decode |
-|---|---:|---:|---:|
-| DFlash2, three verified proposals | 14,000 | **312.67** | **42.56** |
-
-The request used FP32 KV, temperature zero, and a 32 µs blocked-poll interval.
-It generated 64 tokens; the decode timer covers 63 tokens after the first token.
-The sample followed one initialization request and required no new compilation.
-The synthetic prompt was repetitive and gave 100% draft acceptance. General coding workloads can give different rates.
-
-In one baseline/candidate comparison, decode increased from 33.43 to 42.56 tokens per second (**27.32%**).
-Generated text matched exactly. Both runs used GPU kernels with zero host fallback.
-The baseline prefill compiled new kernels, so its prefill rate is not a comparable performance baseline.
-These are local source-build results, not measurements of the downloadable archive.
-See the [14K HTTP comparison](docs/benchmarks/short-query4-key-reuse-2026-09-28.md#http-comparison-at-14000-tokens).
-
-### Earlier short-context results
-
-These measurements used an R9700 (`gfx1201`), a Qwen3.8-27B Q4 target, and Q8 draft modules.
-The prompt contained 1,024 tokens. Each request generated 64 tokens at temperature zero.
-The measurements exclude initial compilation and warmup.
-
-| Mode | Prefill | Decode |
-|---|---:|---:|
-| Ordinary Q4 | 466.26 | 24.20 |
-| MTP, three proposals | 467.20 | 36.53 |
-| DFlash2, three verified proposals | 471.47 | 38.23 |
-
-These measurements predate v0.4.6. They do not measure the release archive.
-See the [speculative decoding report](docs/benchmarks/speculative-decoding-2026-09-28.md) for the full method and results.
-
-Recent component results:
-
-- Flash12 attention GPU time decreased by 74.66% at 5,610 live keys and 59.72% at 14,000 keys.
-- Six attention kernels compiled in 71.54 seconds instead of 117.07 seconds with the macOS compiler change.
-- Both changes preserved the tested outputs. These component results do not establish the same improvement in total engine speed.
-
-See the [Flash12 report](docs/benchmarks/flash12-key-reuse-2026-09-28.md)
-and [long-context report](docs/benchmarks/long-context-http-2026-09-28.md).
-Model quality uses perplexity on 1,024–2,048 target tokens.
 
 ## Troubleshooting
 
