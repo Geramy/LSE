@@ -159,6 +159,8 @@ def main():
     for doc_name in ('KV-STORAGE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md'):
         shutil.copy2(root / 'docs' / doc_name, package / 'docs' / doc_name)
     (package / 'docs' / 'benchmarks').mkdir()
+    shutil.copy2(root / 'docs/benchmarks/attention-vector-staging-2026-09-29.md',
+                 package / 'docs/benchmarks/attention-vector-staging-2026-09-29.md')
     shutil.copy2(root / 'docs/benchmarks/automatic-split-2026-09-29.md',
                  package / 'docs/benchmarks/automatic-split-2026-09-29.md')
     shutil.copy2(root / 'docs/benchmarks/kv-fragments-2026-09-29.md',
