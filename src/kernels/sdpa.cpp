@@ -80,7 +80,8 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     const auto block = static_cast<std::uint32_t>(s.inputs[1].dim(2));
     const auto stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
     const auto capacity = stride * block;
-    const auto parts = (capacity + kSplitKeys - 1u) / kSplitKeys;
+    const auto parts = static_cast<std::uint32_t>(
+        dispatch::attention_shapes::split_partitions(capacity));
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     SdpaArgs<env::Emit, Storage> a;

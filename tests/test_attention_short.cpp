@@ -37,10 +37,10 @@ struct Fixture {
 };
 }  // namespace
 
-LSE_TEST(short_split_selects_bounded_capacity_range_and_two_ordered_native_stages) {
+LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
   backend::LoomEmitter emitter;
   for (int queries : {2, 3, 4, 5, 6, 7, 8}) {
-    for (int capacity : {1024, 2048, 4096, 8192, 16384, 32768, 65536}) {
+    for (int capacity : {1024, 2048, 4096, 8192, 16384, 32768, 65536, 69632, 131072, 262144}) {
       Fixture fx(queries, capacity);
       auto baseline = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal,
                                  0, fx.meta, fx.table, 16);
@@ -109,7 +109,7 @@ LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
     for (int capacity : {512, 1024, 2048, 4096, 8192, 16384, 16385, 32768, 65536, 262100}) {
       const Shape q{1, 24, queries, 256};
       const bool accepted = ((queries >= 2 && queries <= 8) &&
-                             (capacity >= 1024 && capacity <= 65536));
+                             (capacity >= 1024));
       LSE_EXPECT(dispatch::split_short_scope(q, 512, capacity) == accepted);
       LSE_EXPECT(dispatch::split_short_scope(q, 1024, capacity) == accepted);
       LSE_EXPECT(!dispatch::split_short_scope(q, 511, capacity));
@@ -124,7 +124,7 @@ LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
 LSE_TEST(short_split_merge_covers_more_partitions_than_weight_writers) {
   backend::LoomEmitter emitter;
   Fixture fx(6, 16384);
-  for (int partitions : {64, 65, 128, 129, 256, 512}) {
+  for (int partitions : {64, 65, 128, 129, 256, 512, 544, 1024, 2048}) {
     auto partial = leaf({1, 24, 6, partitions, 258});
     auto merged = custom("attention.split_merge128.wg128c2.v1", {partial});
     LSE_EXPECT(merged.ok());
@@ -151,7 +151,7 @@ LSE_TEST(short_split_large_declared_limit_uses_actual_table_geometry) {
     LSE_EXPECT(capacity < declared_limit);
     Fixture fx(4, capacity);
     LSE_EXPECT(dispatch::split_short_scope(fx.q.shape(), live - 4, capacity));
-    LSE_EXPECT(!dispatch::split_short_scope(fx.q.shape(), live - 4, declared_limit));
+    LSE_EXPECT(dispatch::split_short_scope(fx.q.shape(), live - 4, declared_limit));
     auto split = fx.split();
     LSE_EXPECT(split.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
     const auto partial = split.node()->inputs[0];
@@ -171,7 +171,7 @@ LSE_TEST(short_split_large_declared_limit_uses_actual_table_geometry) {
   auto merge = emitter.emit(groups[1], ragged.gpu);
   LSE_EXPECT(partial.ok() && merge.ok());
   if (!partial.ok() || !merge.ok()) return;
-  LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 24u * 6u * 65u);
+  LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 24u * 2u * 65u);
   LSE_EXPECT_EQ(merge->lds_bytes, 272u);
 }
 
@@ -207,13 +207,13 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
         LSE_EXPECT(sliding == (causal && signed_distance < 7));
       }
 }
-LSE_TEST(short_split_query_tile_has_measured_scope_and_matching_lds_contract) {
+LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
   for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
-    for (int capacity : {1024, 2048, 4096, 8192, 8208, 16384, 32768}) {
+    for (int capacity : {1024, 2048, 4096, 8192, 8208, 16384, 32768, 65536, 69632, 262144}) {
       const auto tile = dispatch::attention_shapes::short_query_tile(
           static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
       const bool measured = queries >= 4 && queries <= 8 &&
-                            (capacity == 8192 || capacity == 16384 || capacity == 32768);
+                            capacity >= 8192;
       LSE_EXPECT_EQ(tile, measured ? 4u : 1u);
     }
   for (int capacity : {8192, 16384})
@@ -225,12 +225,27 @@ LSE_TEST(short_split_query_tile_has_measured_scope_and_matching_lds_contract) {
           (lds >= 2048u ? "attention.split_merge128.wg128c2.v1" : "attention"));
     }
 }
-LSE_TEST(short_split_empty_partition_shortcut_has_measured_scope) {
+LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
   for (std::uint32_t queries : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u})
-    for (std::uint32_t capacity : {1024u, 2048u, 4096u, 8192u, 8208u, 16384u, 32768u})
+    for (std::uint32_t capacity : {1024u, 2048u, 4096u, 8192u, 8208u, 16384u, 32768u, 65536u, 69632u, 262144u})
       LSE_EXPECT(dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity) ==
                  (queries >= 4u && queries <= 8u &&
-                  (capacity == 8192u || capacity == 16384u || capacity == 32768u)));
+                  capacity >= 8192u));
+}
+
+LSE_TEST(short_split_checks_merge_lds_before_selecting_both_stages) {
+  for (unsigned lds : {2048u, 2175u, 2176u, 8192u}) {
+    Fixture fx(8, 69632);
+    fx.gpu.lds_bytes_per_workgroup = lds;
+    const auto output = fx.split();
+    LSE_EXPECT(output.node()->prim->name() ==
+        (lds >= 2176u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+  }
+  Fixture fx(8, 262144);
+  fx.gpu.lds_bytes_per_workgroup = 8191;
+  LSE_EXPECT(fx.split().node()->prim->name() == "attention");
+  fx.gpu.lds_bytes_per_workgroup = 8192;
+  LSE_EXPECT(fx.split().node()->prim->name() == "attention.split_merge128.wg128c2.v1");
 }
 
 LSE_TEST_MAIN()

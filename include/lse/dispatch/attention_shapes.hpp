@@ -51,49 +51,38 @@ inline constexpr std::array kDecodeHeadRules{
 
 struct SplitShortRule {
   std::string_view arch;
-  std::uint32_t wave, min_rows, max_rows, threads, head_dim, max_partitions;
-
-  [[nodiscard]] constexpr std::uint32_t max_keys() const {
-    return kShortKeyWindow * max_partitions;
-  }
+  std::uint32_t wave, min_rows, max_rows, threads, head_dim;
 };
 inline constexpr std::array kSplitShortRules{
-    SplitShortRule{"gfx1201", 32, 2, 8, 128, 256, 512},
+    SplitShortRule{"gfx1201", 32, 2, 8, 128, 256},
 };
 
 struct ShortTileRule {
-  std::uint32_t min_rows, max_rows, capacity, query_tile;
-  bool skip_empty_partitions = false;
+  std::uint32_t min_rows, max_rows, min_capacity, query_tile;
 };
 inline constexpr std::array kShortTileRules{
-    ShortTileRule{4, 4, 8192, 4, true},
-    ShortTileRule{5, 8, 8192, 4, true},
-    ShortTileRule{4, 8, 16384, 4, true},
-    ShortTileRule{4, 8, 32768, 4, true},
-    ShortTileRule{4, 8, 36864, 4, true},
-    ShortTileRule{4, 8, 40960, 4, true},
-    ShortTileRule{4, 8, 45056, 4, true},
-    ShortTileRule{4, 8, 49152, 4, true},
-    ShortTileRule{4, 8, 53248, 4, true},
-    ShortTileRule{4, 8, 57344, 4, true},
-    ShortTileRule{4, 8, 61440, 4, true},
-    ShortTileRule{4, 8, 65536, 4, true},
+    ShortTileRule{4, 8, 8192, 4},
 };
+
+[[nodiscard]] constexpr std::uint64_t split_partitions(std::uint64_t capacity) noexcept {
+  return capacity / kShortKeyWindow + (capacity % kShortKeyWindow != 0);
+}
+
+[[nodiscard]] constexpr std::uint64_t split_merge_lds_bytes(std::uint64_t parts) noexcept {
+  return (parts * sizeof(float) + 15u) / 16u * 16u;
+}
 
 [[nodiscard]] constexpr std::uint32_t short_query_tile(std::uint32_t rows,
                                                       std::uint32_t capacity) noexcept {
   for (const auto& rule : kShortTileRules)
-    if (rows >= rule.min_rows && rows <= rule.max_rows && capacity == rule.capacity)
+    if (rows >= rule.min_rows && rows <= rule.max_rows && capacity >= rule.min_capacity)
       return rule.query_tile;
   return 1;
 }
 
 [[nodiscard]] constexpr bool short_skips_empty_partitions(std::uint32_t rows,
                                                          std::uint32_t capacity) noexcept {
-  for (const auto& rule : kShortTileRules)
-    if (rows >= rule.min_rows && rows <= rule.max_rows && capacity == rule.capacity)
-      return rule.skip_empty_partitions;
-  return false;
+  return short_query_tile(rows, capacity) > 1;
 }
 
 struct ShortDefaultRule {

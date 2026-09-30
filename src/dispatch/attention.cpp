@@ -24,7 +24,7 @@ bool short_default_shape(const Shape& query, std::int64_t capacity,
     if (query.dim(0) == geometry.batch && query.dim(1) == geometry.query_heads &&
         query.dim(2) >= rule.min_rows && query.dim(2) <= rule.max_rows &&
         query.dim(3) == rule.head_dim && capacity >= geometry.min_keys &&
-        capacity <= rule.max_keys()) return true;
+        capacity <= UINT32_MAX) return true;
   return false;
 }
 
@@ -222,13 +222,15 @@ bool split_short_supported(const KernelShapes& s) {
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
-        capacity <= rule.max_keys() && s.inputs[0].dim(3) == rule.head_dim &&
+        s.inputs[0].dim(3) == rule.head_dim &&
+        shapes::split_merge_lds_bytes(shapes::split_partitions(capacity)) <=
+            backend::workgroup_lds_bytes(s.device) &&
         backend::workgroup_lds_bytes(s.device) >= rule.threads * sizeof(float) *
             shapes::short_query_tile(static_cast<std::uint32_t>(s.inputs[0].dim(2)),
                                      static_cast<std::uint32_t>(capacity))) {
       const Shape partial{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2),
-                          (capacity + shapes::kShortKeyWindow - 1) / shapes::kShortKeyWindow,
+                          static_cast<std::int64_t>(shapes::split_partitions(capacity)),
                           shapes::kSplitRecord};
       return positive_shape(partial);
     }
@@ -243,8 +245,9 @@ bool split_short_merge_supported(const KernelShapes& s) {
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
-        s.inputs[0].dim(3) <= rule.max_keys() / shapes::kShortKeyWindow &&
-        ((static_cast<std::uint32_t>(s.inputs[0].dim(3)) * sizeof(float) + 15u) / 16u) * 16u <=
+        s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1),
+                          s.inputs[0].dim(2), rule.head_dim} &&
+        shapes::split_merge_lds_bytes(s.inputs[0].dim(3)) <=
             backend::workgroup_lds_bytes(s.device)) return true;
   return false;
 }
