@@ -585,8 +585,16 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
   // it aliases, because that is what the outside reader reads.
   std::unordered_map<const Node*, std::uint32_t> direct_readers;
   for (const NodePtr& m : members_) {
-    for (const NodePtr& in : m->inputs) {
-      if (in && member.count(in.get())) ++direct_readers[in.get()];
+    // consumer_count counts distinct consumer nodes: y + y is one reader.
+    // Counting both operand edges here can hide a separate external reader
+    // and recycle its allocation while that reader still needs it.
+    for (std::size_t i = 0; i < m->inputs.size(); ++i) {
+      const NodePtr& in = m->inputs[i];
+      const auto before = m->inputs.begin() + static_cast<std::ptrdiff_t>(i);
+      if (in && member.count(in.get()) &&
+          std::find(m->inputs.begin(), before, in) == before) {
+        ++direct_readers[in.get()];
+      }
     }
   }
   for (const NodePtr& n : members_) {

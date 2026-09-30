@@ -569,3 +569,26 @@ LSE_TEST(slot_allocation_failure_keeps_original_status_and_size_context) {
 }
 
 LSE_TEST_MAIN()
+
+LSE_TEST(repeated_operand_does_not_hide_an_external_consumer) {
+  backend::BackendAdapter<backend::CpuBackend> backend;
+  LSE_EXPECT_OK(backend.init(0));
+  AllocationTestKernel ordinary;
+  auto input = Array::zeros({1024}, DType::kF32).node();
+  auto stage = make_test_node(&ordinary, {1024}, {input});
+  auto twice = add(Array(stage), Array(stage)).node();
+  auto outside = add(Array(stage), Array(input)).node();
+  auto scratch = make_test_node(&ordinary, {1024}, {input});
+  auto final = make_test_node(&ordinary, {1024}, {scratch, twice});
+  LSE_EXPECT_EQ(stage->consumer_count, 2u);
+  const std::vector<NodePtr> order{stage, twice, scratch, final};
+  Workgroup workgroup;
+  for (const auto& node : order) LSE_EXPECT(workgroup.try_add(node));
+  const NodePtr roots[]{final, outside};
+  workgroup.plan_slots(roots, separate_launches(order));
+  LSE_EXPECT_OK(workgroup.bind_slots(backend));
+  LSE_EXPECT(stage->buffer.ptr != scratch->buffer.ptr);
+  std::fill_n(static_cast<float*>(stage->buffer.ptr), 1024, 3.25f);
+  std::fill_n(static_cast<float*>(scratch->buffer.ptr), 1024, -11.0f);
+  LSE_EXPECT_EQ(static_cast<float*>(stage->buffer.ptr)[0], 3.25f);
+}
