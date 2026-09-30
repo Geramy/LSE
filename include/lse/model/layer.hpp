@@ -57,11 +57,11 @@ struct LayerContext {
   const Config* config = nullptr;
   std::int32_t layer_index = 0;
   bool training = false;
-  ops::AttentionExecutionPhase attention_phase = ops::AttentionExecutionPhase::kDecode;
   // How many ways this layer's weights are split across the pool, and so how
   // many MixerStates the `state` pointer addresses: one per member, laid out
   // consecutively. One under every scheme but a tensor split.
   std::int32_t shards = 1;
+  ops::AttentionExecutionPhase attention_phase = ops::AttentionExecutionPhase::kDecode;
 };
 
 // Names bound so far, used to report anything the checkpoint had that no layer
