@@ -1,6 +1,6 @@
 #pragma once
 #include "lse/graph/kernel_primitive.hpp"
-#include "lse/dispatch/q8_shapes.hpp"
+#include "lse/dispatch/q8_tuneconfig.h"
 #include "lse/math.hpp"
 namespace lse::dispatch {
 struct AffineMatrixPlan {

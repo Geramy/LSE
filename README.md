@@ -43,6 +43,17 @@ DFlash2 block-8 session; these peaks were not measured together.
 [Prefill measurements](docs/benchmarks/q4-prefill-2026-09-30.md)
 · [Earlier measurements](docs/RELEASE_HISTORY.md)
 
+## FlashPrefill V2
+
+The HTTP server enables FlashPrefill V2 prefill by default on supported R9700
+HRX/LOOM baseline configurations, with alpha 0.1 and batch/ubatch 1024.
+Use **`--FlashPrefillV2=off`** for dense prefill. Decode stays dense; MTP,
+DFlash2 and unsupported configurations use dense attention automatically.
+
+At 32K, the tested Q4/BF16-KV workload reached **604.9 prompt tok/s**, versus
+378.1 with dense attention. The 64-token greedy output matched; perplexity
+has not been measured. [Configuration and measurements](docs/experimental/sparse-attention.md).
+
 ## Kernel cache
 
 The CLI and HTTP server create `~/.lse/cache/` automatically and reuse compiled
@@ -402,9 +413,9 @@ The disk cache checks device, compiler, and emitted-source identity before reuse
 
 Architecture and shape policies are in these headers:
 
-- [Q4 and Q6 policies](include/lse/dispatch/quant_shapes.hpp)
-- [Q8 policies](include/lse/dispatch/q8_shapes.hpp)
-- [Attention policies](include/lse/dispatch/attention_shapes.hpp)
+- [Q4 and Q6 policies](include/lse/dispatch/quant_tuneconfig.h)
+- [Q8 policies](include/lse/dispatch/q8_tuneconfig.h)
+- [Attention policies](include/lse/dispatch/attention_tuneconfig.h)
 - [Matrix instruction table](include/lse/math.hpp)
 
 The engine includes device probes, a cost model, tracing, and dispatch profiling.

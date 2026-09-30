@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "lse/backend/backend.hpp"
-#include "lse/backends/hrx/submission_tuner.hpp"
+#include "lse/backends/hrx/submission_tuneconfig.h"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"

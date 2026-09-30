@@ -6,7 +6,7 @@ Date: 2026-09-29. The graph optimizer selects the combined kernel for the measur
 
 The optimizer replaces `SiLU(quant_linear(x, gate)) * quant_linear(x, up)` with `quant_swiglu.q4_shared_panel.v1`. Both projections read one existing group8 activation panel. The combined consumer removes one launch and the gate temporary. Each projection retains its own integer dot products, FP32 accumulation order, affine restoration and wave reduction. SiLU uses the existing backend intrinsic.
 
-The rule is in `include/lse/dispatch/quant_shapes.hpp`: gfx1201, wave32, Q4/group64, M8/N17408/K5120, WG256. Input is F32 `[1,8,5120]`; packed weights are U32 `[17408,640]`; scales and biases are BF16 `[17408,80]`; the shared panel is U32 `[8,2000]`. Output is F32 `[1,8,17408]`. The optimizer applies the rewrite before retaining a device execution plan. It preserves the output node and checks intermediate consumers, requested roots, storage contracts, placement and the qualified DOT4 schedule. The accepted kernels for other shapes retain their existing selection.
+The rule is in `include/lse/dispatch/quant_tuneconfig.h`: gfx1201, wave32, Q4/group64, M8/N17408/K5120, WG256. Input is F32 `[1,8,5120]`; packed weights are U32 `[17408,640]`; scales and biases are BF16 `[17408,80]`; the shared panel is U32 `[8,2000]`. Output is F32 `[1,8,17408]`. The optimizer applies the rewrite before retaining a device execution plan. It preserves the output node and checks intermediate consumers, requested roots, storage contracts, placement and the qualified DOT4 schedule. The accepted kernels for other shapes retain their existing selection.
 
 ## Component measurement
 

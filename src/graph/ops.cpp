@@ -565,14 +565,15 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 }
 
 namespace {
-Array split_paged_attention(const NodePtr& baseline) {
-  const auto* partial_prim = find_primitive("attention.split_partial128.wg128c2.v1");
+Array split_paged_attention(const NodePtr& baseline, bool blasst=false) {
+  const auto* partial_prim = find_primitive(blasst ? "attention.blasst.partial1024.v2" : "attention.split_partial128.wg128c2.v1");
   const auto* merge_prim = find_primitive("attention.split_merge128.wg128c2.v1");
   if (!partial_prim || !merge_prim) return Array(baseline);
   const auto& q = baseline->inputs[0]->shape;
   const bool short_query = q.dim(2) > 1;
   const auto capacity = baseline->inputs[1]->shape.dim(2) * baseline->inputs[4]->shape.dim(1);
-  const auto parts = (capacity + 127) / 128;
+  const auto partition_keys=blasst?1024:128;
+  const auto parts = (capacity + partition_keys - 1) / partition_keys;
   const Shape shape = short_query ? Shape{q.dim(0), q.dim(1), q.dim(2), parts, 258}
                                   : Shape{q.dim(0), q.dim(1), parts, 258};
   auto partial = make(OpKind::kCustom, shape, DType::kF32, baseline->inputs);
@@ -594,18 +595,47 @@ Array split_paged_attention(const NodePtr& baseline) {
 Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  MaskKind mask, int window, const Array& meta,
                  const Array& table, int block_size,
-                 const backend::DeviceInfo* device, kv::CacheDType storage) {
+                 const backend::DeviceInfo* device, kv::CacheDType storage,
+                 ops::SparseAttentionPhase sparse) {
   const Shape& sq = q.shape();
   Shape out{sq.dim(0), sq.dim(1), sq.dim(2), kv::logical_width(storage, v.shape().dim(3))};
   auto n = make(OpKind::kAttention, out, q.dtype(),
                 {q.node(), k.node(), v.node(), meta.node(), table.node()});
   n->attrs[0] = scale;
   n->attrs[1] = static_cast<float>(storage);
+  n->attrs[2] = sparse.scale;
+  n->attrs[3] = sparse.flashprefill ? 2.0f : sparse.blasst ? 1.0f : 0.0f;
   n->iattrs[0] = static_cast<std::int32_t>(mask);
   n->iattrs[1] = window;
   n->iattrs[2] = 0;
   n->iattrs[3] = block_size;
-  n->prim = find_primitive("attention");
+  n->prim = find_primitive(sparse.blasst
+      ? (sq.dim(2) == 1 ? "attention.blasst.partial1024.v2" : "attention.flash.wmma16.v3")
+      : "attention");
+  if(sparse.blasst && sq.dim(2)==1) return split_paged_attention(n,true);
+  if (sparse.flashprefill) {
+    const auto blocks = (table.shape().dim(1) * block_size + 255) / 256;
+    const auto tiles = (sq.dim(2) + 15) / 16;
+    auto pooled = make(OpKind::kCustom, Shape{sq.dim(0), k.shape().dim(1), blocks, 513},
+                       DType::kF32, n->inputs);
+    pooled->prim = find_primitive("attention.flashprefill.pool.v1");
+    pooled->fclass = pooled->prim->fusion_class();
+    pooled->attrs = n->attrs; pooled->iattrs = n->iattrs;
+    auto selected = make(OpKind::kCustom, Shape{sq.dim(0), sq.dim(1), tiles, blocks},
+                         DType::kF32, {q.node(), pooled, meta.node()});
+    selected->prim = find_primitive("attention.flashprefill.select.v2");
+    selected->fclass = selected->prim->fusion_class();
+    selected->attrs = n->attrs; selected->iattrs = n->iattrs;
+    auto inputs = n->inputs; inputs.push_back(pooled); inputs.push_back(selected);
+    auto result = make(OpKind::kCustom, out, DType::kF32, inputs);
+    result->prim = find_primitive("attention.flashprefill.wmma.v1");
+    result->fclass = result->prim->fusion_class();
+    result->attrs = n->attrs; result->iattrs = n->iattrs;
+    for (std::size_t i = 0; i < n->inputs.size(); ++i)
+      if (std::find(n->inputs.begin(), n->inputs.begin() + static_cast<std::ptrdiff_t>(i), n->inputs[i]) ==
+          n->inputs.begin() + static_cast<std::ptrdiff_t>(i)) --n->inputs[i]->consumer_count;
+    return Array(result);
+  }
   if (device != nullptr) {
     const Shape shapes[] = {q.shape(), k.shape(), v.shape(), meta.shape(), table.shape()};
     const DType dtypes[] = {q.dtype(), k.dtype(), v.dtype(), meta.dtype(), table.dtype()};
@@ -617,6 +647,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     request.attrs = n->attrs;
     request.iattrs = n->iattrs;
     request.device = device;
+    if (sparse.blasst) {
+      n->prim = find_primitive(sq.dim(2) == 1
+          ? "attention.blasst.partial1024.v2" : "attention.flash.wmma16.v3");
+      return Array(n);
+    }
     if (dispatch::split_short_default_supported(request) ||
         dispatch::split_decode_supported(request))
       return split_paged_attention(n);

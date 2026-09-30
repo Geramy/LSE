@@ -10,6 +10,9 @@ namespace lse::dispatch::attention_shapes {
 
 inline constexpr std::uint32_t kFlashThreads = 256, kFlashKeyWindow = 256;
 inline constexpr std::uint32_t kFlashQueryTile = 16;
+inline constexpr std::uint32_t kFlashPrefillSelectorThreads = 128;
+static_assert(kFlashPrefillSelectorThreads % 32 == 0 &&
+              kFlashPrefillSelectorThreads >= 32 && kFlashPrefillSelectorThreads <= 1024);
 inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;
 
 struct FlashWmmaRule {

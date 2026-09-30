@@ -5,10 +5,11 @@
 #include "lse/kv/block.hpp"
 #include "lse/kernels/sdpa.hpp"
 #include "lse/dispatch/attention.hpp"
-#include "lse/dispatch/attention_shapes.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/math.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,309 @@ template<class E> struct SplitMergeArgs {
   env::In<kir::f32, E> partial;
   env::Out<kir::f32, E> out;
 };
+
+// Each partition maintains a local maximum across eight 128-key tiles.
+// Local maxima make pruning conservative relative to a global maximum;
+// stable merging combines retained mass without communicating across groups.
+struct BlasstDecode final : KernelPrimitive<BlasstDecode> {
+  static constexpr std::string_view kName = "attention.blasst.partial1024.v2";
+  static constexpr std::string_view kEntry = "lse_blasst_partial1024_v2";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 5; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if(s.inputs.size()!=5 || s.inputs[0].rank()!=4) return {};
+    auto request=s;
+    request.output=Shape{s.inputs[0].dim(0),s.inputs[0].dim(1),1,256};
+    if (!dispatch::split_decode_supported(request) || !s.store ||
+        !std::isfinite(s.attrs[2]) || s.attrs[2] < 0.0f) return {};
+    return with_kv_storage(s.input_dtypes[1], s.attrs[1],
+        [&]<kv::CacheDType Storage>() { return emit_storage<Storage>(s); });
+  }
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
+    const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+    const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+    const auto block = static_cast<std::uint32_t>(s.inputs[1].dim(2));
+    const auto stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
+    const auto capacity = stride * block;
+    const auto parts = (capacity + 1023u) / 1024u;
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    SdpaArgs<env::Emit, Storage> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto scores = e.lds<kir::f32>(kSplitKeys);
+    const auto lane = e.let(math::local_id()), wg = e.let(math::workgroup_id_x());
+    const auto partition=e.let(wg%parts),head_group=e.let(wg/parts);
+    const auto h = e.let(head_group % heads), b = e.let(head_group / heads);
+    const auto record=e.let(wg*kSplitRecord);
+    const auto kh = e.let(h / (heads / kvheads));
+    const auto qb = e.let(head_group * 256u);
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
+    if (auto padding = e.when(b >= rows)) {
+      e.store(record + 2u + lane * 2u, e.f32(0));
+      e.store(record + 3u + lane * 2u, e.f32(0));
+      if(auto leader=e.when(lane==0u)) {
+        e.store(record,math::neg_inf());e.store(record+1u,e.f32(0));
+      }
+    }
+    (void)e.ret_if(b >= rows);
+    const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
+    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto length = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    const auto row_len = e.let(select(length < capacity, length, e.u32(capacity)));
+    if(auto empty=e.when(partition*1024u>=row_len)) {
+      e.store(record+2u+lane*2u,e.f32(0));e.store(record+3u+lane*2u,e.f32(0));
+      if(auto leader=e.when(lane==0u)) { e.store(record,math::neg_inf());e.store(record+1u,e.f32(0)); }
+    }
+    (void)e.ret_if(partition*1024u>=row_len);
+    const auto tb = e.let(b * stride);
+    const auto wl = e.let(lane % 32u), wi = e.let(lane / 32u);
+    auto allowed = [&](auto j) {
+      if (s.iattrs[0] == 0) return e.u32(1) == e.u32(1);
+      if (s.iattrs[0] == 1 || s.iattrs[1] == 0) return j <= offset;
+      return j <= offset && j + static_cast<std::uint32_t>(s.iattrs[1]) > offset;
+    };
+    std::vector<kir::Val<kir::f32>> query;
+    for (std::uint32_t d = 0; d < 8; ++d) query.push_back(e.let(a.q[qb + wl + d * 32u]));
+    auto running = e.var(math::neg_inf());
+    auto denom = e.var(0.0f), acc0 = e.var(0.0f), acc1 = e.var(0.0f);
+    const auto safe_length = e.let(select(row_len > 0u, row_len, e.u32(1)));
+    const auto raw_lambda = e.let(e.f32(s.attrs[2]) / kir::cast<kir::f32>(safe_length));
+    const auto lambda = e.let(select(raw_lambda < 1.0f, raw_lambda, e.f32(1)));
+    for (auto tile : e.range(8u)) {
+      const auto begin = e.let(partition*1024u + tile * kSplitKeys);
+      for (auto chunk : e.range(kSplitKeys / 4u)) {
+        const auto index = e.let(chunk * 4u + wi), j = e.let(begin + index);
+        const auto valid = e.let(j < row_len && allowed(j));
+        auto score = e.var(0.0f);
+        if (auto live = e.when(valid)) {
+          const auto page = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
+          const auto kb = e.let(((page * kvheads + kh) * block + j % block) * 256u);
+          for (std::uint32_t d = 0; d < 8; ++d)
+            score = math::fma(query[d], kv_load<Storage>(e, a.k, kb + wl + d * 32u, 256u), score.read());
+        }
+        for (std::uint32_t bit = 16; bit; bit /= 2)
+          score = score.read() + math::shfl_xor(score.read(), e.u32(bit));
+        if (auto first = e.when(wl == 0u))
+          scores[index] = select(valid, score.read() * s.attrs[0], math::neg_inf());
+      }
+      e.barrier();
+      auto maximum = e.var(math::neg_inf());
+      for (auto j : e.range(kSplitKeys)) maximum = math::max(maximum.read(), scores[j].read());
+      const auto updated = e.let(math::max(maximum.read(), running.read()));
+      // Every lane reads the same published scores and maximum. Barriers
+      // remain unconditional while the uniform decision gates value loads.
+      const auto retained = e.let(maximum.read() != math::neg_inf() &&
+            math::exp(maximum.read() - updated) >= lambda);
+      e.barrier();
+      if (auto keep = e.when(retained)) {
+        const auto alpha = e.let(math::exp(running.read() - updated));
+        running = updated;
+        denom = denom.read() * alpha;
+        acc0 = acc0.read() * alpha;
+        acc1 = acc1.read() * alpha;
+        const auto j = e.let(begin + lane);
+        auto probability = e.var(0.0f);
+        if (auto live = e.when(j < row_len && allowed(j)))
+          probability = math::exp(scores[lane].read() - updated);
+        scores[lane] = probability.read();
+      }
+      e.barrier();
+      if (auto keep = e.when(retained)) {
+        for (auto index : e.range(kSplitKeys)) {
+          const auto key = e.let(begin + index);
+          if (auto live = e.when(key < row_len && allowed(key))) {
+            const auto weight = e.let(scores[index].read());
+            const auto page = e.let(kv_block_index<Storage>(a.table[tb + key / block]));
+            const auto vb = e.let(((page * kvheads + kh) * block + key % block) * 256u + lane * 2u);
+            const auto values = kv_load_pair<Storage>(e, a.v, vb, 256u);
+            denom = denom.read() + weight;
+            acc0 = math::fma(weight, values[0], acc0.read());
+            acc1 = math::fma(weight, values[1], acc1.read());
+          }
+        }
+      }
+      e.barrier();
+    }
+    e.store(record + 2u + lane * 2u, acc0.read());
+    e.store(record + 3u + lane * 2u, acc1.read());
+    if(auto leader=e.when(lane==0u)) {
+      e.store(record,running.read());e.store(record+1u,denom.read());
+    }
+    return k.lds().ok() ? k.str() : std::string{};
+  }
+  Result<Shape> infer_shape(std::span<const Shape>) const override {
+    return LSE_ERROR(kInvalidArgument, "BLASST decode is selected through sdpa_paged");
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan p;
+    p.workgroup_size[0] = 128;
+    p.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1) * s.output.dim(2));
+    p.lds_bytes = kSplitKeys * sizeof(float);
+    return p;
+  }
+};
+LSE_REGISTER_PRIMITIVE(BlasstDecode);
+
+// Pooled K/V means and counts for FlashPrefill's correction path. The pool
+// follows logical paged positions, never assuming contiguous physical pages.
+struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
+  static constexpr std::string_view kName="attention.flashprefill.pool.v1";
+  static constexpr std::string_view kEntry="lse_flashprefill_pool_v1";
+  static constexpr std::string_view kSource={};
+  std::size_t arity() const noexcept override { return 5; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if(!dispatch::paged_attention_inputs_valid(s) || !s.device || s.device->arch!="gfx1201" ||
+       s.inputs[0].dim(3)!=256 || s.iattrs[0]!=1 || !s.store) return {};
+    return with_kv_storage(s.input_dtypes[1],s.attrs[1],[&]<kv::CacheDType Storage>() {
+      kir::KernelBody k(s.types,*s.intrinsics,workgroup_lds_bytes(s.device)); k.set_store(s.store);
+      SdpaArgs<env::Emit,Storage> a; if(!env::bind(k,a,s)) return std::string{};
+      env::Emit e{&k};
+      const auto blocks=static_cast<std::uint32_t>(s.output.dim(2));
+      const auto heads=static_cast<std::uint32_t>(s.inputs[1].dim(1));
+      const auto page_size=static_cast<std::uint32_t>(s.inputs[1].dim(2));
+      const auto stride=static_cast<std::uint32_t>(s.inputs[4].dim(1));
+      const auto lane=e.let(math::local_id()),wg=e.let(math::workgroup_id_x());
+      const auto block=e.let(wg%blocks),head=e.let((wg/blocks)%heads),batch=e.let(wg/(blocks*heads));
+      auto sumk=e.var(0.0f),sumv=e.var(0.0f),count=e.var(0.0f);
+      const auto rows=e.let(kir::cast<kir::u32>(a.meta[2u]));
+      if(auto real=e.when(batch<rows)) {
+        const auto mb=e.let(e.u32(kv::kStepMetaHeader)+batch*e.u32(kv::kStepMetaPerRow));
+        const auto len=e.let(kir::cast<kir::u32>(a.meta[mb+1u]));
+        for(auto slot:e.range(256u)) {
+          const auto key=e.let(block*256u+slot);
+          if(auto live=e.when(key<len && key<stride*page_size)) {
+            const auto page=e.let(kv_block_index<Storage>(a.table[batch*stride+key/page_size]));
+            const auto base=e.let(((page*heads+head)*page_size+key%page_size)*256u+lane);
+            sumk=sumk.read()+kv_load<Storage>(e,a.k,base,256u);
+            sumv=sumv.read()+kv_load<Storage>(e,a.v,base,256u);
+            count=count.read()+1.0f;
+          }
+        }
+      }
+      const auto denominator=e.let(select(count.read()>0.0f,count.read(),e.f32(1)));
+      e.store(wg*513u+lane,sumk.read()/denominator);
+      e.store(wg*513u+256u+lane,sumv.read()/denominator);
+      if(auto first=e.when(lane==0u)) e.store(wg*513u+512u,count.read());
+      return k.str();
+    });
+  }
+  Result<Shape> infer_shape(std::span<const Shape>) const override {
+    return LSE_ERROR(kInvalidArgument,"FlashPrefill pool requires sdpa_paged");
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan p; p.workgroup_size[0]=256;
+    p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/513);
+    return p;
+  }
+};
+LSE_REGISTER_PRIMITIVE(FlashPrefillPool);
+
+template<class E> struct FlashSelectArgs {
+  env::In<kir::f32,E> q,pooled,meta;
+  env::Out<kir::f32,E> out;
+};
+struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
+  static constexpr std::string_view kName="attention.flashprefill.select.v2";
+  static constexpr std::string_view kEntry="lse_flashprefill_select_v2";
+  static constexpr std::string_view kSource={};
+  std::size_t arity() const noexcept override { return 3; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if(s.inputs.size()!=3 || s.inputs[0].rank()!=4 || s.inputs[1].rank()!=4 ||
+       s.inputs[0].dim(3)!=256 || !s.device || s.device->arch!="gfx1201" ||
+       !s.store || !std::isfinite(s.attrs[2]) || s.attrs[2]<0 || s.attrs[2]>1) return {};
+    constexpr auto threads = dispatch::attention_shapes::kFlashPrefillSelectorThreads;
+    const auto heads=static_cast<std::uint32_t>(s.inputs[0].dim(1));
+    const auto queries=static_cast<std::uint32_t>(s.inputs[0].dim(2));
+    const auto kvheads=static_cast<std::uint32_t>(s.inputs[1].dim(1));
+    const auto blocks=static_cast<std::uint32_t>(s.inputs[1].dim(2));
+    const auto tiles=(queries+15u)/16u;
+    kir::KernelBody k(s.types,*s.intrinsics,workgroup_lds_bytes(s.device)); k.set_store(s.store);
+    FlashSelectArgs<env::Emit> a; if(!env::bind(k,a,s)) return {};
+    env::Emit e{&k};
+    // The sole sink block is always exact. Avoid a masked single-iteration
+    // selector loop during tiny-cache server warmup.
+    if(blocks==1u) {
+      if(auto leader=e.when(math::local_id()==0u)) e.store(math::workgroup_id_x(),e.f32(1));
+      return k.str();
+    }
+    const auto maxima=e.lds<kir::f32>(blocks),totals=e.lds<kir::f32>(blocks);
+    const auto lane=e.let(math::local_id()),wg=e.let(math::workgroup_id_x());
+    const auto qt=e.let(wg%tiles),head=e.let((wg/tiles)%heads),batch=e.let(wg/(tiles*heads));
+    const auto q0=e.let(qt*16u),kh=e.let(head/(heads/kvheads));
+    const auto rows=e.let(kir::cast<kir::u32>(a.meta[2u]));
+    if(auto pad=e.when(batch>=rows))
+      for(auto block:e.range(lane,e.u32(blocks),threads)) e.store(wg*blocks+block,e.f32(0));
+    (void)e.ret_if(batch>=rows);
+    const auto mb=e.let(e.u32(kv::kStepMetaHeader)+batch*e.u32(kv::kStepMetaPerRow));
+    const auto offset=e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto first_position=e.let(offset+q0);
+    const auto last_row=e.let(select(q0+15u<queries,q0+15u,e.u32(queries-1u)));
+    const auto last_position=e.let(offset+last_row);
+    const auto wave=e.let(lane/32u),wl=e.let(lane%32u);
+    // A wave cooperates on each 256-wide probe dot product. Retain the
+    // pooled key in registers across all query rows in this tile.
+    for(auto block:e.range(wave,e.u32(blocks),threads/32u)) {
+      const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
+      auto maximum=e.var(math::neg_inf()),sum=e.var(0.0f);
+      auto scores=e.local<kir::f32,16>();
+      const auto visible=e.let(block*256u<=last_position && a.pooled[pool+512u]>0.0f);
+      std::vector<kir::Val<kir::f32>> pooled_key;
+      for(std::uint32_t c=0;c<8;++c) pooled_key.push_back(e.let(a.pooled[pool+wl+c*32u]));
+      for(auto r:e.unroll(16u)) {
+        scores[r]=math::neg_inf();
+        if(auto valid=e.when(q0+r<queries && visible)) {
+          auto dot=e.var(0.0f);
+          const auto qb=e.let(((batch*heads+head)*queries+q0+r)*256u);
+          for(std::uint32_t c=0;c<8;++c)
+            dot=math::fma(a.q[qb+wl+c*32u],pooled_key[c],dot.read());
+          for(std::uint32_t bit=16;bit;bit/=2)
+            dot=dot.read()+math::shfl_xor(dot.read(),e.u32(bit));
+          scores[r]=dot.read()*s.attrs[0]; maximum=math::max(maximum.read(),scores[r].read());
+        }
+      }
+      if(auto nonempty=e.when(maximum.read()!=math::neg_inf()))
+        for(auto r:e.unroll(16u)) sum=sum.read()+math::exp(scores[r].read()-maximum.read());
+      if(auto leader=e.when(wl==0u)) { maxima[block]=maximum.read(); totals[block]=sum.read(); }
+    }
+    e.barrier();
+    auto global=e.var(math::neg_inf());
+    for(auto block:e.range(blocks)) global=math::max(global.read(),maxima[block].read());
+    auto peak=e.var(0.0f);
+    const auto safe=e.let(select(global.read()==math::neg_inf(),e.f32(0),global.read()));
+    for(auto block:e.range(blocks))
+      peak=math::max(peak.read(),totals[block].read()*math::exp(maxima[block].read()-safe));
+    for(auto block:e.range(lane,e.u32(blocks),threads)) {
+      const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
+      const auto weight=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
+      // Sink, recent block, diagonal band and partial block always exact.
+      const auto exact=e.let(block==0u || (block+2u)*256u>first_position ||
+          a.pooled[pool+512u]!=256.0f || weight>=peak.read()*s.attrs[2]);
+      e.store(wg*blocks+block,select(exact,e.f32(1),e.f32(0)));
+    }
+    return k.lds().ok()?k.str():std::string{};
+  }
+  Result<Shape> infer_shape(std::span<const Shape>) const override {
+    return LSE_ERROR(kInvalidArgument,"FlashPrefill selector requires sdpa_paged");
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan p;p.workgroup_size[0]=dispatch::attention_shapes::kFlashPrefillSelectorThreads;
+    p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/static_cast<std::uint64_t>(s.output.dim(3)));
+    p.lds_bytes=static_cast<std::uint32_t>(s.output.dim(3)*8);
+    return p;
+  }
+};
+LSE_REGISTER_PRIMITIVE(FlashPrefillSelect);
 
 struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
   static constexpr std::string_view kName = "attention.split_partial128.wg128c2.v1";

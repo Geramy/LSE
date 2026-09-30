@@ -11,6 +11,8 @@
 #include <csignal>
 #include <string>
 #include <thread>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 #include "lse/graph/graph.hpp"
 #include "lse/graph/jit.hpp"
@@ -57,6 +59,11 @@ void usage() {
       "                       multi-token-prediction module\n"
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
+      "      --FlashPrefillV2=off  disable default FlashPrefill V2 prefill (on/off)\n"
+      "                       default on for supported baseline HRX/LOOM configurations\n"
+      "      --attention-prefill MODE  dense, blasst, flashprefill-v2 (experimental)\n"
+      "      --attention-decode MODE   dense (default) or blasst (experimental)\n"
+      "      --attention-calibration FILE  JSON with version=1 and phase scale values\n"
       "      --kv-cache-dtype TYPE  fp32, fp16, bf16, fp8, bf8\n"
       "                           default: bf16 for BF16 models, fp16 otherwise\n"
       "      --batch-size N   prompt token batch limit (default 1024)\n"
@@ -95,6 +102,10 @@ int main(int argc, char** argv) {
   std::int32_t kv_len = 0;
   std::optional<float> temperature_override;
   std::string kv_cache_dtype;
+  ops::SparseAttentionOptions sparse_attention;
+  std::string attention_calibration;
+  std::optional<bool> flashprefill_toggle;
+  bool prefill_explicit = false;
   int shutdown_grace_seconds = 30;
 
   for (int i = 1; i < argc; ++i) {
@@ -147,6 +158,29 @@ int main(int argc, char** argv) {
     else if (a == "--dflash2-model") dflash2_model = value("--dflash2-model");
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
+    else if (a == "--FlashPrefillV2" || a.starts_with("--FlashPrefillV2=")) {
+      const auto text = a == "--FlashPrefillV2"
+                            ? value("--FlashPrefillV2")
+                            : a.substr(std::string("--FlashPrefillV2=").size());
+      if (text != "on" && text != "off") {
+        std::fputs("lse-server: --FlashPrefillV2 must be on or off\n", stderr);
+        return 2;
+      }
+      flashprefill_toggle = text == "on";
+    }
+    else if (a == "--attention-prefill" || a == "--attention-decode") {
+      const auto mode = value(a.c_str());
+      if (mode != "dense" && mode != "blasst" &&
+          !(a == "--attention-prefill" && mode == "flashprefill-v2")) {
+        std::fputs("lse-server: attention mode must be dense or blasst; flashprefill-v2 is prefill only\n", stderr);
+        return 2;
+      }
+      auto& phase = a == "--attention-prefill" ? sparse_attention.prefill : sparse_attention.decode;
+      phase.blasst = mode == "blasst";
+      phase.flashprefill = mode == "flashprefill-v2";
+      if (a == "--attention-prefill") prefill_explicit = true;
+    }
+    else if (a == "--attention-calibration") attention_calibration = value(a.c_str());
     else if (a == "--kv-cache-dtype") {
       kv_cache_dtype = value("--kv-cache-dtype");
       const auto parsed = kv::cache_dtype_from_string(kv_cache_dtype);
@@ -205,6 +239,55 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "lse-server: prefill batch=%u ubatch=%u\n",
                opt.prefill.batch_size, opt.prefill.ubatch_size);
 
+  if (prefill_explicit && flashprefill_toggle.has_value() &&
+      sparse_attention.prefill.flashprefill != *flashprefill_toggle) {
+    std::fputs("lse-server: conflicting --FlashPrefillV2 and --attention-prefill settings\n", stderr);
+    return 2;
+  }
+  if (flashprefill_toggle.value_or(false)) sparse_attention.prefill.flashprefill = true;
+  if (sparse_attention.prefill.flashprefill)
+    sparse_attention.prefill.scale = ops::kFlashPrefillDefaultAlpha;
+  const bool automatic_flashprefill = !prefill_explicit && !flashprefill_toggle.has_value();
+  const bool sparse_requested = sparse_attention.prefill.enabled() || sparse_attention.decode.enabled();
+  if (sparse_requested) {
+    if (!no_mtp || dflash2_on) {
+      std::fputs("lse-server: experimental sparse attention requires --no-mtp and DFlash2 off until verifier phases are qualified\n", stderr);
+      return 2;
+    }
+    if (attention_calibration.empty() &&
+        (sparse_attention.prefill.blasst || sparse_attention.decode.blasst)) {
+      std::fputs("lse-server: BLASST requires --attention-calibration\n", stderr);
+      return 2;
+    }
+    if (dialect != "loom") {
+      std::fputs("lse-server: experimental sparse attention requires --dialect loom\n", stderr);
+      return 2;
+    }
+    if (!attention_calibration.empty()) try {
+      std::ifstream input(attention_calibration);
+      const auto calibration = nlohmann::json::parse(input);
+      if (calibration.at("version").get<int>() != 1)
+        throw std::runtime_error("unsupported calibration version");
+      if (calibration.at("model").get<std::string>() != model)
+        throw std::runtime_error("calibration model must match --model exactly");
+      auto load_phase = [&](const char* name, ops::SparseAttentionPhase& phase) {
+        if (!phase.enabled()) return;
+        const auto& value = calibration.at(name).at("scale");
+        if (!value.is_number()) throw std::runtime_error("phase scale must be numeric");
+        phase.scale = value.get<float>();
+        if (!std::isfinite(phase.scale) || phase.scale < 0 || (phase.flashprefill && phase.scale > 1))
+          throw std::runtime_error("phase scale must be finite, nonnegative, and at most 1 for flashprefill-v2");
+      };
+      load_phase("prefill", sparse_attention.prefill);
+      load_phase("decode", sparse_attention.decode);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "lse-server: invalid attention calibration: %s\n", error.what());
+      return 2;
+    }
+    std::fprintf(stderr, "lse-server: experimental sparse attention prefill=%s scale=%g decode=%s scale=%g; approximate attention, full KV retained\n",
+        sparse_attention.prefill.flashprefill ? "flashprefill-v2" : sparse_attention.prefill.blasst ? "blasst" : "dense", double(sparse_attention.prefill.scale),
+        sparse_attention.decode.blasst ? "blasst" : "dense", double(sparse_attention.decode.scale));
+  }
   if (model.empty()) {
     std::fputs("lse-server: no model. Pass --model or set $LSE_MODEL.\n", stderr);
     return 2;
@@ -222,6 +305,15 @@ int main(int argc, char** argv) {
   if (devices == nullptr || devices->size() == 0) {
     return fail(LSE_ERROR(kDeviceError, "no device came up"),
                 "opening the device set");
+  }
+  if (sparse_requested) {
+    for (std::size_t i = 0; i < devices->size(); ++i) {
+      const auto& info = devices->device(i).device_info();
+      if (info.arch != "gfx1201" || info.wavefront_size != 32) {
+        std::fputs("lse-server: experimental sparse attention is qualified only for gfx1201 Wave32\n", stderr);
+        return 2;
+      }
+    }
   }
   backend::IBackend& first_device = devices->device(devices->primary());
   if (first_device.emitter() == nullptr) {
@@ -266,6 +358,11 @@ int main(int argc, char** argv) {
 
   auto cfg = model::Config::from_json_file(paths->config);
   if (!cfg.ok()) return fail(cfg.status(), "reading the config");
+  cfg->sparse_attention = sparse_attention;
+  if (sparse_requested && cfg->attn_head_dim != 256) {
+    std::fputs("lse-server: experimental sparse attention requires head dimension 256\n", stderr);
+    return 2;
+  }
   if (temperature_override) cfg->sampling_defaults.temperature = *temperature_override;
   std::fprintf(stderr, "sampling defaults: temperature=%.3g top_k=%d top_p=%.3g\n",
                static_cast<double>(cfg->sampling_defaults.temperature),
@@ -281,6 +378,51 @@ int main(int argc, char** argv) {
                      ? model::SafeTensors::open_sharded(paths->weights)
                      : model::SafeTensors::open(paths->weights);
   if (!weights.ok()) return fail(weights.status(), "opening the weights");
+
+  const std::string mtp_where =
+      (no_mtp || dflash2_on) ? std::string()
+             : (mtp_path.empty() ? model::MtpModule::find_beside(model)
+                                 : mtp_path);
+  if (automatic_flashprefill) {
+    auto arch = model::detect_architecture(*cfg, *weights);
+    bool supported = arch.ok() && (*arch)->name == "qwen3.5" &&
+                     cfg->attn_head_dim == 256 && !dflash2_on && mtp_where.empty() &&
+                     (cfg->kv_cache_dtype == kv::CacheDType::kBF16 ||
+                      cfg->kv_cache_dtype == kv::CacheDType::kF32);
+    for (std::size_t i = 0; i < devices->size(); ++i) {
+      const auto& info = devices->device(i).device_info();
+      const auto* tc = sched->toolchain(i);
+      supported = supported && info.arch == "gfx1201" && info.wavefront_size == 32 &&
+                  tc != nullptr && tc->dialect == graph::Dialect::kLoom;
+    }
+    if (supported) {
+      cfg->sparse_attention.prefill = {false, ops::kFlashPrefillDefaultAlpha, true};
+      if (!attention_calibration.empty()) {
+        try {
+          std::ifstream input(attention_calibration);
+          const auto calibration = nlohmann::json::parse(input);
+          if (calibration.at("version").get<int>() != 1 ||
+              calibration.at("model").get<std::string>() != model)
+            throw std::runtime_error("calibration version/model mismatch");
+          const auto& value = calibration.at("prefill").at("scale");
+          if (!value.is_number()) throw std::runtime_error("phase scale must be numeric");
+          const float alpha = value.get<float>();
+          if (!std::isfinite(alpha) || alpha < 0 || alpha > 1)
+            throw std::runtime_error("FlashPrefill V2 alpha must be in [0, 1]");
+          cfg->sparse_attention.prefill.scale = alpha;
+        } catch (const std::exception& error) {
+          std::fprintf(stderr, "lse-server: invalid attention calibration: %s\n", error.what());
+          return 2;
+        }
+      }
+      std::fprintf(stderr, "lse-server: FlashPrefillV2=on alpha=%g (default); disable with --FlashPrefillV2=off\n",
+                   double(cfg->sparse_attention.prefill.scale));
+    } else {
+      std::fputs("lse-server: FlashPrefillV2 inactive for this configuration; prefill=dense\n", stderr);
+    }
+  } else if (flashprefill_toggle == false && !sparse_attention.prefill.enabled()) {
+    std::fputs("lse-server: FlashPrefillV2=off; prefill=dense\n", stderr);
+  }
 
   auto built = model::build_model(*cfg, *weights, "");
   if (!built.ok()) return fail(built.status(), "building the model");
@@ -300,10 +442,6 @@ int main(int argc, char** argv) {
   // Speculative decoding when the checkpoint ships a module, exactly as the
   // CLI resolves it.
   std::unique_ptr<model::MtpModule> mtp;
-  const std::string mtp_where =
-      (no_mtp || dflash2_on) ? std::string()
-             : (mtp_path.empty() ? model::MtpModule::find_beside(model)
-                                 : mtp_path);
   if (!mtp_where.empty()) {
     auto opened = model::MtpModule::open(mtp_where, *cfg, *lm);
     if (opened.ok()) {

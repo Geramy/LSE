@@ -1,5 +1,5 @@
 #include "harness.hpp"
-#include "lse/backends/hrx/submission_tuner.hpp"
+#include "lse/backends/hrx/submission_tuneconfig.h"
 #include <limits>
 using lse::backend::SubmissionTuner;
 
