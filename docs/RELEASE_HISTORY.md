@@ -3,6 +3,12 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.23: FlashPrefill V2
+
+1. **Faster long-context prefill:** FlashPrefill V2 reached **632.1 pp/s at 16K** and **604.9 pp/s at 32K** on Qwen3.8-27B Q4, R9700/HRX/LOOM. Default on for supported baseline configurations; use `--FlashPrefillV2=off` for dense prefill.
+2. **Optimized GPU kernels:** approximately **5× faster block selection**, single-token Q4 SwiGLU bias-tail unrolling, and discoverable `*_tuneconfig.h` tuning headers. MTP and DFlash2 retain dense attention in this release.
+3. **Previously observed DFlash2 peaks:** **67.6 tok/s decode** and **96% acceptance**. These are separate workload peaks. FlashPrefill's 16K/32K checks matched the dense 64-token responses; perplexity is not yet measured.
+
 ## v0.4.22: faster Q4 prefill
 
 1. Faster Q4 prefill with optimized nibble expansion and paired activation staging: **597.9 pp/s peak** on a warm full prompt with BF16 KV and no prompt cache reuse.
