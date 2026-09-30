@@ -405,15 +405,13 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
           e.let(a.packed[e.let(safe_col * lanes + g * 8u + t * 2u + hi)]);
       bf.push_back(e.local<kir::u32, frag>());
       for (int f = 0; f < frag; ++f) {
-        auto expanded = e.let(e.u32(0));
-        for (std::uint32_t b = 0; b < 4u; ++b) {
-          const auto code =
-              e.let((weight /
-                     (1u << (4u * (static_cast<std::uint32_t>(f) * 4u + b)))) %
-                    16u);
-          expanded = e.let(expanded + code * (1u << (8u * b)));
-        }
-        bf[t][f] = expanded;
+        const auto half = e.let(weight / (1u << (16u * f)));
+        const auto paired = e.let(
+            math::bit_and(half, e.u32(0xffu)) +
+            math::bit_and(half, e.u32(0xff00u)) * 256u);
+        bf[t][f] = e.let(
+            math::bit_and(paired, e.u32(0x000f000fu)) +
+            math::bit_and(paired, e.u32(0x00f000f0u)) * 16u);
       }
     }
     if constexpr (!Cooperative)
