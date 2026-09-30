@@ -52,7 +52,13 @@ if [[ ! -f "$rocm/include/hsa/hsa.h" ]]; then
     if [[ -f "$candidate/include/hsa/hsa.h" ]]; then rocm="$candidate"; break; fi
   done
 fi
-cc="${CC:-$(command -v clang)}"
+if [[ -x "$rocm/llvm/bin/clang" ]]; then
+  default_cc="$rocm/llvm/bin/clang"
+else
+  default_cc="$(command -v clang)"
+fi
+cc="${CC:-$default_cc}"
+export PATH="$(dirname "$cc"):$PATH"
 cxx="${CXX:-${cc}++}"
 # Build the runtime and compiler together for the native K/V address API.
 # The upstream loom-compile configuration requires the VM execution target when
