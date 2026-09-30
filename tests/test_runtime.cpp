@@ -2338,7 +2338,7 @@ LSE_TEST(q4_mtp_rows_match_a_scalar_reference_on_device) {
   }
 }
 
-LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
+static void check_split_attention_masks_and_replay(int queries) {
   auto* scheduler = graph::default_scheduler();
   LSE_EXPECT(scheduler != nullptr);
   if (!scheduler) return;
@@ -2368,14 +2368,15 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
   };
   for (int heads : {2, 6})
   for (int capacity : {16, 512, 8192, 16384, 32768, 262144}) {
-    const int live = std::min(capacity, 513);
+    if (queries > 1 && (heads != 6 || capacity != 8192)) continue;
+    const int live = queries > 1 ? 43 : std::min(capacity, 513);
     const int lengths[]{live, std::max(1, live / 2), 0};
     const int blocks = (live + block - 1) / block;
     const int pool_blocks = 2 * blocks + 1, stride = capacity / block;
-    std::vector<float> query(batch * heads * dim), keys(pool_blocks * block * dim, poison);
+    std::vector<float> query(batch * heads * queries * dim), keys(pool_blocks * block * dim, poison);
     std::vector<float> values(keys.size(), poison), table(batch * stride, 999999.0f);
     for (std::size_t i = 0; i < query.size(); ++i) query[i] = noise(i + 137) * .25f;
-    std::fill(query.begin() + 2 * heads * dim, query.end(), poison);
+    std::fill(query.begin() + 2 * heads * queries * dim, query.end(), poison);
     for (int row = 0; row < 2; ++row) {
       for (int bi = 0; bi < blocks; ++bi)
         table[row * stride + bi] = static_cast<float>(1 + row * blocks + blocks - bi - 1);
@@ -2388,19 +2389,32 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
         }
       }
     }
-    auto q = filled(Shape{batch, heads, 1, dim}, query);
+    auto q = filled(Shape{batch, heads, queries, dim}, query);
     auto k = filled(Shape{pool_blocks, 1, block, dim}, keys);
     auto v = filled(k.shape(), values);
     auto t = filled(Shape{batch, stride}, table);
-    std::vector<float> metadata{static_cast<float>(live - 1), static_cast<float>(capacity + 17), 2,
-                               static_cast<float>(live - 1), static_cast<float>(lengths[0]),
-                               static_cast<float>(lengths[1] - 1), static_cast<float>(lengths[1]), 0, 0};
+    std::vector<float> metadata{static_cast<float>(live - queries), static_cast<float>(capacity + 17), 2,
+                               static_cast<float>(live - queries), static_cast<float>(lengths[0]),
+                               static_cast<float>(lengths[1] - queries), static_cast<float>(lengths[1]), 0, 0};
     auto meta = filled(Shape{kv::step_meta_elems(batch)}, metadata);
     for (const auto [mask, window] : {
          std::pair{graph::MaskKind::kCausal, 0},
          std::pair{graph::MaskKind::kSlidingWindow, 7},
          std::pair{graph::MaskKind::kSlidingWindow, 0}}) {
-      auto out = graph::sdpa_paged(q, k, v, .0625f, mask, window, meta, t, block, &device);
+      graph::Array out;
+      if (queries == 1) {
+        out = graph::sdpa_paged(q, k, v, .0625f, mask, window, meta, t, block, &device);
+      } else {
+        auto made_partial = graph::custom("attention.split_partial128.wg128c2.v1",
+            {q, k, v, meta, t}, {.0625f, 0, 0, 0});
+        LSE_EXPECT_OK(made_partial.status());
+        if (!made_partial.ok()) return;
+        made_partial->node()->iattrs = {static_cast<int>(mask), window, 0, block};
+        auto made_out = graph::custom("attention.split_merge128.wg128c2.v1", {*made_partial});
+        LSE_EXPECT_OK(made_out.status());
+        if (!made_out.ok()) return;
+        out = *made_out;
+      }
       LSE_EXPECT(out.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
       if (out.node()->prim->name() != "attention.split_merge128.wg128c2.v1") return;
       auto partial = graph::Array(out.node()->inputs[0]);
@@ -2419,18 +2433,18 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
       if (actual.size() != query.size()) return;
       double max_abs = 0;
       for (int row = 0; row < batch; ++row) {
-        for (int h = 0; h < heads; ++h) {
-          const int offset = row < 2 ? lengths[row] - 1 : 0;
+        for (int h = 0; h < heads; ++h) for (int qi = 0; qi < queries; ++qi) {
+          const int offset = row < 2 ? lengths[row] - queries + qi : 0;
           std::vector<double> score(static_cast<std::size_t>(lengths[row]),
                                     -std::numeric_limits<double>::infinity());
           double maximum = -std::numeric_limits<double>::infinity();
           for (int key = 0; key < lengths[row]; ++key) {
-            if (mask == graph::MaskKind::kSlidingWindow && offset - key >= window) continue;
+            if (key > offset || (mask == graph::MaskKind::kSlidingWindow && offset - key >= window)) continue;
             double dot = 0;
             const int physical = static_cast<int>(table[row * stride + key / block]);
             const auto base = static_cast<std::size_t>((physical * block + key % block) * dim);
             for (int d = 0; d < dim; ++d)
-              dot += static_cast<double>(query[(row * heads + h) * dim + d]) * keys[base + d];
+              dot += static_cast<double>(query[((row * heads + h) * queries + qi) * dim + d]) * keys[base + d];
             score[key] = dot * .0625;
             maximum = std::max(maximum, score[key]);
           }
@@ -2446,7 +2460,7 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
           }
           for (int d = 0; d < dim; ++d) {
             const auto expected = denominator > 0 ? numerator[d] / denominator : 0;
-            const auto got = actual[(row * heads + h) * dim + d];
+            const auto got = actual[((row * heads + h) * queries + qi) * dim + d];
             LSE_EXPECT(std::isfinite(got));
             max_abs = std::max(max_abs, std::abs(static_cast<double>(got) - expected));
           }
@@ -2478,10 +2492,18 @@ LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
       LSE_EXPECT_EQ(scheduler->last_trace().host_groups, 0u);
       LSE_EXPECT_EQ(scheduler->last_trace().host_fallbacks, 0u);
       rewrite(meta, metadata);
-      std::printf("       split T1 capacity=%d live=%d mask=%d window=%d max_abs=%.3e device=2 host=0 fallback=0 empty-replay=pass\n",
-                  capacity, live, static_cast<int>(mask), window, max_abs);
+      std::printf("       split T%d capacity=%d live=%d mask=%d window=%d max_abs=%.3e device=2 host=0 fallback=0 empty-replay=pass\n",
+                  queries, capacity, live, static_cast<int>(mask), window, max_abs);
     }
   }
+}
+
+LSE_TEST(single_token_split_attention_covers_long_tables_and_empty_replay) {
+  check_split_attention_masks_and_replay(1);
+}
+
+LSE_TEST(joint_head_query_attention_preserves_masks_and_empty_replay) {
+  check_split_attention_masks_and_replay(7);
 }
 
 LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {

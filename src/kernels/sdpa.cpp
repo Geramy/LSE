@@ -87,17 +87,20 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
-    const auto head_tile = ShortQuery ? 1u : dispatch::attention_shapes::decode_head_tile(heads, kvheads);
-    const auto query_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : head_tile;
-    if (query_tile > 1u) {
-      const auto scores = e.lds<kir::f32>(query_tile * kSplitKeys);
+    const auto head_tile = ShortQuery
+        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, capacity)
+        : dispatch::attention_shapes::decode_head_tile(heads, kvheads);
+    const auto token_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : 1u;
+    const auto row_tile = token_tile * head_tile;
+    if (row_tile > 1u) {
+      const auto scores = e.lds<kir::f32>(row_tile * kSplitKeys);
       const auto lane = e.let(math::local_id());
       const auto wg = e.let(math::workgroup_id_x());
-      const auto query_tiles = ShortQuery ? (queries + query_tile - 1u) / query_tile : 1u;
+      const auto row_tiles = ShortQuery ? (queries + token_tile - 1u) / token_tile : 1u;
       const auto part = e.let(wg % parts);
-      const auto q0 = e.let(((wg / parts) % query_tiles) * query_tile);
-      const auto h = e.let(((wg / (parts * query_tiles)) % (heads / head_tile)) * head_tile);
-      const auto b = e.let(wg / (parts * query_tiles * (heads / head_tile)));
+      const auto q0 = e.let(((wg / parts) % row_tiles) * token_tile);
+      const auto h = e.let(((wg / (parts * row_tiles)) % (heads / head_tile)) * head_tile);
+      const auto b = e.let(wg / (parts * row_tiles * (heads / head_tile)));
       const auto kh = e.let(h / (heads / kvheads));
       const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
       const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
@@ -108,18 +111,18 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
       const auto begin = e.let(part * kSplitKeys), tb = e.let(b * stride);
       auto row_live = [&](std::uint32_t r) {
-        if constexpr (ShortQuery) return q0 + r < queries;
+        if constexpr (ShortQuery) return q0 + r % token_tile < queries;
         else return h + r < heads;
       };
       auto record_offset = [&](std::uint32_t r) {
         if constexpr (ShortQuery)
-          return e.let((((b * heads + h) * queries + q0 + r) * parts + part) * kSplitRecord);
+          return e.let((((b * heads + h + r / token_tile) * queries + q0 + r % token_tile) * parts + part) * kSplitRecord);
         else return e.let(((b * heads + h + r) * parts + part) * kSplitRecord);
       };
       if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity)) {
         const auto no_keys = e.let(begin >= kv_len);
         if (auto empty = e.when(no_keys)) {
-          for (std::uint32_t r = 0; r < query_tile; ++r) {
+          for (std::uint32_t r = 0; r < row_tile; ++r) {
             if (auto row = e.when(row_live(r))) {
               const auto output = record_offset(r);
               e.store(output + 2u + lane * 2u, e.f32(0.0f));
@@ -138,7 +141,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
         if (s.iattrs[0] == 0) return e.u32(1) == e.u32(1);
         const auto position = [&] {
           if constexpr (ShortQuery)
-            return e.let(kir::cast<std::int64_t>(offset) + kir::cast<std::int64_t>(q0 + r));
+            return e.let(kir::cast<std::int64_t>(offset) + kir::cast<std::int64_t>(q0 + r % token_tile));
           else return e.let(kir::cast<std::int64_t>(offset));
         }();
         const auto key = e.let(kir::cast<std::int64_t>(j));
@@ -147,20 +150,20 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       };
       auto valid_rows = [&](auto j) {
         std::vector<kir::Val<kir::boolean>> valid;
-        for (std::uint32_t r = 0; r < query_tile; ++r)
+        for (std::uint32_t r = 0; r < row_tile; ++r)
           valid.push_back(e.let(row_live(r) && b < rows && j < kv_len && j < row_len && allowed(j, r)));
         return valid;
       };
       auto any_valid = [&](const auto& valid) {
         auto any = valid[0];
-        for (std::uint32_t r = 1; r < query_tile; ++r) any = any || valid[r];
+        for (std::uint32_t r = 1; r < row_tile; ++r) any = any || valid[r];
         return e.let(any);
       };
       const auto wl = e.let(lane % 32u), wi = e.let(lane / 32u);
       std::vector<kir::LValue<kir::f32>> query_values;
-      for (std::uint32_t r = 0; r < query_tile; ++r) {
+      for (std::uint32_t r = 0; r < row_tile; ++r) {
         const auto qb = [&] {
-          if constexpr (ShortQuery) return e.let(((b * heads + h) * queries + q0 + r) * 256u);
+          if constexpr (ShortQuery) return e.let(((b * heads + h + r / token_tile) * queries + q0 + r % token_tile) * 256u);
           else return e.let((b * heads + h + r) * 256u);
         }();
         for (std::uint32_t d = 0; d < 8u; ++d) {
@@ -173,34 +176,34 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
         const auto key_lane = e.let(tile * 4u + wi), j = e.let(begin + key_lane);
         const auto valid = valid_rows(j);
         std::vector<kir::LValue<kir::f32>> row_scores;
-        for (std::uint32_t r = 0; r < query_tile; ++r) row_scores.push_back(e.var(0.0f));
+        for (std::uint32_t r = 0; r < row_tile; ++r) row_scores.push_back(e.var(0.0f));
         if (auto live = e.when(any_valid(valid))) {
           const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
           const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
           for (std::uint32_t d = 0; d < 8u; ++d) {
             const auto key = e.let(kv_load<Storage>(e, a.k, kb + wl + d * 32u, 256u));
-            for (std::uint32_t r = 0; r < query_tile; ++r)
+            for (std::uint32_t r = 0; r < row_tile; ++r)
               row_scores[r] = math::fma(query_values[r * 8u + d].read(), key, row_scores[r].read());
           }
         }
         for (std::uint32_t shift = 16u; shift; shift >>= 1u)
-          for (std::uint32_t r = 0; r < query_tile; ++r)
+          for (std::uint32_t r = 0; r < row_tile; ++r)
             row_scores[r] = row_scores[r].read() + math::shfl_xor(row_scores[r].read(), e.u32(shift));
         if (auto first = e.when(wl == 0u))
-          for (std::uint32_t r = 0; r < query_tile; ++r)
+          for (std::uint32_t r = 0; r < row_tile; ++r)
             scores[r * kSplitKeys + key_lane] = select(valid[r], row_scores[r].read() * s.attrs[0], math::neg_inf());
       }
       e.barrier();
       std::vector<kir::LValue<kir::f32>> maximum;
-      for (std::uint32_t r = 0; r < query_tile; ++r) maximum.push_back(e.var(math::neg_inf()));
+      for (std::uint32_t r = 0; r < row_tile; ++r) maximum.push_back(e.var(math::neg_inf()));
       for (auto jj : e.range(kSplitKeys))
-        for (std::uint32_t r = 0; r < query_tile; ++r)
+        for (std::uint32_t r = 0; r < row_tile; ++r)
           maximum[r] = math::max(maximum[r].read(), scores[r * kSplitKeys + jj].read());
       e.barrier();
       if (auto owns = e.when(lane < kSplitKeys)) {
         const auto j = e.let(begin + lane);
         const auto valid = valid_rows(j);
-        for (std::uint32_t r = 0; r < query_tile; ++r) {
+        for (std::uint32_t r = 0; r < row_tile; ++r) {
           auto weight = e.var(0.0f);
           if (auto live = e.when(valid[r]))
             weight = math::exp(scores[r * kSplitKeys + lane].read() - maximum[r].read());
@@ -209,7 +212,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       }
       e.barrier();
       std::vector<kir::LValue<kir::f32>> denom, acc0, acc1;
-      for (std::uint32_t r = 0; r < query_tile; ++r) {
+      for (std::uint32_t r = 0; r < row_tile; ++r) {
         denom.push_back(e.var(0.0f));
         acc0.push_back(e.var(0.0f));
         acc1.push_back(e.var(0.0f));
@@ -221,7 +224,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
           const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
           const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane * 2u);
           const auto values = kv_load_pair<Storage>(e, a.v, vb, 256u);
-          for (std::uint32_t r = 0; r < query_tile; ++r) {
+          for (std::uint32_t r = 0; r < row_tile; ++r) {
             if (auto row_live = e.when(valid[r])) {
               const auto weight = e.let(scores[r * kSplitKeys + jj].read());
               denom[r] = denom[r].read() + weight;
@@ -231,7 +234,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
           }
         }
       }
-      for (std::uint32_t r = 0; r < query_tile; ++r) {
+      for (std::uint32_t r = 0; r < row_tile; ++r) {
         if (auto row = e.when(row_live(r))) {
           const auto output = record_offset(r);
           e.store(output + 2u + lane * 2u, acc0[r].read());
@@ -367,8 +370,14 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       query_tile = dispatch::attention_shapes::short_query_tile(
           static_cast<std::uint32_t>(s.inputs[0].dim(2)),
           static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
-      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * s.output.dim(1) *
+      const auto head_tile = dispatch::attention_shapes::short_head_tile(
+          static_cast<std::uint32_t>(s.inputs[0].dim(2)),
+          static_cast<std::uint32_t>(s.inputs[0].dim(1)),
+          static_cast<std::uint32_t>(s.inputs[1].dim(1)),
+          static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
+      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * (s.output.dim(1) / head_tile) *
           ((s.output.dim(2) + query_tile - 1) / query_tile) * s.output.dim(3));
+      query_tile *= head_tile;
     } else {
       query_tile = dispatch::attention_shapes::decode_head_tile(
           static_cast<std::uint32_t>(s.inputs[0].dim(1)),

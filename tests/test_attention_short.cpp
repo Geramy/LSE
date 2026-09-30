@@ -61,10 +61,12 @@ LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
         const auto tile = dispatch::attention_shapes::short_query_tile(
             static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
+        const auto head_tile = dispatch::attention_shapes::short_head_tile(
+            static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity));
         LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], partial
-                      ? 24u * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
+                      ? (24u / head_tile) * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
                       : 24u * static_cast<unsigned>(queries));
-        LSE_EXPECT_EQ(emitted->lds_bytes, partial ? tile * 512u : static_cast<unsigned>(capacity / 32));
+        LSE_EXPECT_EQ(emitted->lds_bytes, partial ? tile * head_tile * 512u : static_cast<unsigned>(capacity / 32));
         LSE_EXPECT_EQ(emitted->binding_order.size(), partial ? 6u : 2u);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       }
@@ -171,7 +173,7 @@ LSE_TEST(short_split_large_declared_limit_uses_actual_table_geometry) {
   auto merge = emitter.emit(groups[1], ragged.gpu);
   LSE_EXPECT(partial.ok() && merge.ok());
   if (!partial.ok() || !merge.ok()) return;
-  LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 24u * 2u * 65u);
+  LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 12u * 2u * 65u);
   LSE_EXPECT_EQ(merge->lds_bytes, 272u);
 }
 
@@ -217,12 +219,12 @@ LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
       LSE_EXPECT_EQ(tile, measured ? 4u : 1u);
     }
   for (int capacity : {8192, 16384})
-    for (unsigned lds : {512u, 2047u, 2048u}) {
+    for (unsigned lds : {512u, 2048u, 4095u, 4096u}) {
       Fixture fx(4, capacity);
       fx.gpu.lds_bytes_per_workgroup = lds;
       auto out = fx.split();
       LSE_EXPECT(out.node()->prim->name() ==
-          (lds >= 2048u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+          (lds >= 4096u ? "attention.split_merge128.wg128c2.v1" : "attention"));
     }
 }
 LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
@@ -234,12 +236,12 @@ LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
 }
 
 LSE_TEST(short_split_checks_merge_lds_before_selecting_both_stages) {
-  for (unsigned lds : {2048u, 2175u, 2176u, 8192u}) {
+  for (unsigned lds : {2048u, 2175u, 2176u, 4095u, 4096u, 8192u}) {
     Fixture fx(8, 69632);
     fx.gpu.lds_bytes_per_workgroup = lds;
     const auto output = fx.split();
     LSE_EXPECT(output.node()->prim->name() ==
-        (lds >= 2176u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+        (lds >= 4096u ? "attention.split_merge128.wg128c2.v1" : "attention"));
   }
   Fixture fx(8, 262144);
   fx.gpu.lds_bytes_per_workgroup = 8191;

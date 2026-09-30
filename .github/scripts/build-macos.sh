@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=ca563bf8acbbf3ef2d9d4333d9c8fc999b747597
+mac_rev=2621a96367df09e07b2de43a9bad8b5d953769c2
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
@@ -87,6 +87,8 @@ git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/kv-fr
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch"
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/cooperative-matrix-operands.patch"
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/cooperative-matrix-operands.patch"
+git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/loop-invariant-motion.patch"
+git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/loop-invariant-motion.patch"
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \

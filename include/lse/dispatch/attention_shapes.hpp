@@ -96,6 +96,23 @@ inline constexpr std::array kShortTileRules{
   return 1;
 }
 
+struct ShortHeadRule {
+  std::uint32_t queries_per_kv, query_tile, head_tile;
+};
+inline constexpr std::array kShortHeadRules{
+    ShortHeadRule{6, 4, 2},
+};
+
+[[nodiscard]] constexpr std::uint32_t short_head_tile(std::uint32_t rows,
+    std::uint32_t heads, std::uint32_t kvheads, std::uint32_t capacity) noexcept {
+  if (kvheads == 0 || heads % kvheads != 0) return 1;
+  const auto tile = short_query_tile(rows, capacity);
+  for (const auto& rule : kShortHeadRules)
+    if (heads / kvheads == rule.queries_per_kv && tile == rule.query_tile)
+      return rule.head_tile;
+  return 1;
+}
+
 [[nodiscard]] constexpr bool short_skips_empty_partitions(std::uint32_t rows,
                                                          std::uint32_t capacity) noexcept {
   return short_query_tile(rows, capacity) > 1;

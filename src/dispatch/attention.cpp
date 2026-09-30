@@ -227,7 +227,11 @@ bool split_short_supported(const KernelShapes& s) {
             backend::workgroup_lds_bytes(s.device) &&
         backend::workgroup_lds_bytes(s.device) >= rule.threads * sizeof(float) *
             shapes::short_query_tile(static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-                                     static_cast<std::uint32_t>(capacity))) {
+                                     static_cast<std::uint32_t>(capacity)) *
+            shapes::short_head_tile(static_cast<std::uint32_t>(s.inputs[0].dim(2)),
+                                    static_cast<std::uint32_t>(s.inputs[0].dim(1)),
+                                    static_cast<std::uint32_t>(s.inputs[1].dim(1)),
+                                    static_cast<std::uint32_t>(capacity))) {
       const Shape partial{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2),
                           static_cast<std::int64_t>(shapes::split_partitions(capacity)),
