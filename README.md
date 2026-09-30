@@ -605,6 +605,10 @@ Use `Release` or `RelWithDebInfo` for performance measurements.
 
 LSE records tensor operations in a graph. The optimizer combines operations and selects supported kernel implementations.
 The compiler generates device code. HRX submits that code to the GPU.
+The Loom compiler automatically stages eligible FP16/BF16 matrix operand loads
+through shared memory. It checks alignment, lane independence, barrier safety,
+and the shared-memory budget. This optimization applies by access pattern,
+without model or kernel-name checks.
 The disk cache checks device, compiler, and emitted-source identity before reuse.
 
 Architecture and shape policies are in these headers:

@@ -25,9 +25,6 @@ namespace {
 constexpr std::uint32_t kThreads = dispatch::attention_shapes::kFlashThreads;
 constexpr std::uint32_t QTile = dispatch::attention_shapes::kFlashQueryTile;
 constexpr std::uint32_t kKWin = dispatch::attention_shapes::kFlashKeyWindow;
-constexpr std::uint32_t kValueRows = dispatch::attention_shapes::kFlashValueRows;
-constexpr std::uint32_t kValueColumns = dispatch::attention_shapes::kFlashValueColumns;
-constexpr std::uint32_t kValueStride = dispatch::attention_shapes::kFlashValueStride;
 using Dims = dispatch::FlashDims;
 
 template <class E, kv::CacheDType Storage>
@@ -79,7 +76,6 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
-    const auto vs = e.lds<Narrow>(kValueRows * kValueStride);
     const auto qs = e.lds<Narrow>(QTile * padded_depth);
     // The window's scores, then the window's probabilities in place.
     const auto sc = e.lds<kir::f32>(QTile * kKWin);
@@ -270,33 +266,7 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
             const auto row = e.let(f + lane_hi * 8u);
             o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
           }
-          for (auto tile : e.range(0u, kKWin, kValueRows)) {
-            const auto vr = e.let(lid / 16u);
-            const auto vc = e.let((lid % 16u) * 8u);
-            const auto vk = e.let(wbase + tile + vr);
-            const auto vd = e.let(column_tile * kValueColumns + vc);
-            auto loaded = e.local<Narrow, 8>();
-            for (auto f : e.unroll(8u)) loaded[f] = math::narrow<Narrow>(e.f32(0.0f));
-            if (auto valid = e.when(vk < row_len && vd < d.dv)) {
-              const auto vp = e.let(kir::cast<kir::u32>(a.table[e.let(tb + vk / d.ts)]));
-              const auto vector = e.let((vp * d.kvh + kh) * d.ts + vk % d.ts);
-              if constexpr (Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16) {
-                if (d.dv % 8u == 0) {
-                  const auto values = e.load(a.v, e.let(vector * d.dv + vd), 16u);
-                  for (auto f : e.unroll(8u)) loaded[f] = values[f];
-                } else {
-                  for (auto f : e.unroll(8u))
-                    if (auto tail = e.when(vd + f < d.dv))
-                      loaded[f] = a.v[e.let(vector * d.dv + vd + f)];
-                }
-              } else {
-                for (auto f : e.unroll(8u))
-                  if (auto tail = e.when(vd + f < d.dv))
-                    loaded[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.v, vector, e.let(vd + f), d.dv));
-              }
-            }
-            for (auto f : e.unroll(8u)) vs[e.let(vr * kValueStride + vc + f)] = loaded[f].read();
-            e.barrier();
+          for (auto tile : e.range(0u, kKWin, 16u)) {
             auto af = e.local<Narrow, 8>();
             auto bf = e.local<Narrow, 8>();
             const auto key_half = e.let(lane_hi * 8u);
@@ -306,7 +276,12 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
               af[f] = math::narrow<Narrow>(sc[e.let(lane_lo * kKWin + key_slot)].read());
               bf[f] = math::narrow<Narrow>(e.f32(0.0f));
               auto load_value = [&] {
-                bf[f] = vs[e.let((key_half + f) * kValueStride + wave * 16u + lane_lo)].read();
+                const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + key / d.ts)]));
+                const auto vector = e.let((page * d.kvh + kh) * d.ts + key % d.ts);
+                if constexpr (Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16)
+                  bf[f] = a.v[e.let(vector * d.dv + dimension)];
+                else
+                  bf[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.v, vector, dimension, d.dv));
               };
               if (auto live_key = e.when(key < row_len && dimension < d.dv)) {
                 if (mask == 0) load_value();
@@ -323,7 +298,6 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
               }
             }
             o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
-            e.barrier();
           }
         }
         e.barrier();

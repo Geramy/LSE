@@ -7,7 +7,7 @@ deps="$root/build/deps/linux-loom"
   echo 'This compiler build requires Linux.' >&2; exit 1;
 }
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
-mac_rev=16efaa870be07df4a911bc9ddd8ade6f4142be5f
+mac_rev=e635baca4b6bd280347b76ea201153d4fcd1d1ad
 fetch() {
   local url="$1" rev="$2" path="$3"
   if [[ ! -d "$path/.git" ]]; then
@@ -36,7 +36,7 @@ source.mkdir()
 PY
 git -C "$deps/hrx-$hrx_rev" archive HEAD | tar -x -C "$work/source"
 git -C "$work/source" init -q
-patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch)
+patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch)
 for patch in "${patches[@]}"; do
   path="$deps/mac-amdgpu-$mac_rev/patches/hrx/$patch"
   git -C "$work/source" apply --check "$path"
@@ -88,7 +88,7 @@ if not version.is_file() or not (include / 'loomc/loomc.h').is_file():
     raise SystemExit('Missing built Loom C API headers or version metadata')
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 patches = []
-for name in ('symbolic-memo-touched-reset.patch', 'gfx12-vopd-identical-source.patch'):
+for name in ('symbolic-memo-touched-reset.patch', 'gfx12-vopd-identical-source.patch', 'cooperative-matrix-operands.patch'):
     path = deps / f'mac-amdgpu-{mac_rev}' / 'patches/hrx' / name
     patches.append({'path': f'patches/hrx/{name}', 'sha256': digest(path)})
 for path in sorted((work.parents[1] / 'patches').glob('*.patch')):

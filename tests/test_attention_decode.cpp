@@ -207,8 +207,8 @@ LSE_TEST(attention_dispatch_matrix_tiles_follow_device_and_lds_limits) {
   using dispatch::AttentionPlan;
   for (const auto [bytes, expected] : {
        std::pair{65536u, AttentionPlan::kFlashWmma},
-       std::pair{29120u, AttentionPlan::kFlashWmma},
-       std::pair{29119u, AttentionPlan::kScalar}}) {
+       std::pair{24768u, AttentionPlan::kFlashWmma},
+       std::pair{24767u, AttentionPlan::kScalar}}) {
     fx.gpu.lds_bytes_per_workgroup = bytes;
     LSE_EXPECT(dispatch::attention_plan(request) == expected);
   }

@@ -213,9 +213,9 @@ LSE_TEST(flash_wmma_policy_covers_kv_formats_ragged_tiles_and_matrix_resources) 
       LSE_EXPECT(dispatch::flash_wmma_supported(s));
     }
   }
-  device.lds_bytes_per_workgroup = 29119;
+  device.lds_bytes_per_workgroup = 24767;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
-  device.lds_bytes_per_workgroup = 29120;
+  device.lds_bytes_per_workgroup = 24768;
   LSE_EXPECT(dispatch::flash_wmma_supported(s));
   device.extension = nullptr;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
@@ -249,7 +249,7 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()) {
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],768u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    LSE_EXPECT_EQ(emitted->lds_bytes,29120u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,24768u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf16>")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
@@ -300,7 +300,7 @@ LSE_TEST(flash_wmma_emits_typed_operands_for_packed_and_unequal_widths) {
     if(!emitted.ok()) continue;
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],24u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    LSE_EXPECT_EQ(emitted->lds_bytes,21952u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,17600u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find(storage==kv::CacheDType::kF16
         ? "vector<8xf16>" : "vector<8xbf16>")!=std::string::npos);
@@ -339,7 +339,7 @@ LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   if (!emitted.ok()) return;
   LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u);
   LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
-  LSE_EXPECT_EQ(emitted->lds_bytes, 29120u);
+  LSE_EXPECT_EQ(emitted->lds_bytes, 24768u);
   LSE_EXPECT(emitted->source.size() < 384u * 1024u);
   std::size_t loops = 0;
   for (auto at = emitted->source.find(" = scf.for "); at != std::string::npos;

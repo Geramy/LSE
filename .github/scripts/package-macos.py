@@ -107,6 +107,7 @@ def main():
         'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
         'loom_symbolic_memo_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch').read_bytes()).hexdigest(),
         'kv_fragment_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch').read_bytes()).hexdigest(),
+        'loom_matrix_staging_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/cooperative-matrix-operands.patch').read_bytes()).hexdigest(),
         'loom_vopd_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch').read_bytes()).hexdigest(),
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
