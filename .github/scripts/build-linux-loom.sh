@@ -7,7 +7,7 @@ deps="$root/build/deps/linux-loom"
   echo 'This compiler build requires Linux.' >&2; exit 1;
 }
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
-mac_rev=e635baca4b6bd280347b76ea201153d4fcd1d1ad
+mac_rev=ca563bf8acbbf3ef2d9d4333d9c8fc999b747597
 fetch() {
   local url="$1" rev="$2" path="$3"
   if [[ ! -d "$path/.git" ]]; then

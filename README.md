@@ -605,10 +605,14 @@ Use `Release` or `RelWithDebInfo` for performance measurements.
 
 LSE records tensor operations in a graph. The optimizer combines operations and selects supported kernel implementations.
 The compiler generates device code. HRX submits that code to the GPU.
-The Loom compiler automatically stages eligible FP16/BF16 matrix operand loads
-through shared memory. It checks alignment, lane independence, barrier safety,
-and the shared-memory budget. This optimization applies by access pattern,
-without model or kernel-name checks.
+The Loom compiler automatically stages eligible matrix operand loads through
+shared memory. This includes FP16/BF16 loads and FP8/BF8 loads with decoding and
+per-vector scales. It shares packed words, scales, and address calculations when
+their values are equal. It preserves masks and FP32 accumulation. Selection checks
+the access pattern, lane independence, barrier safety, and shared-memory budget.
+The [FP8/BF8 compiler measurements](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/benchmarks/loom-packed-staging-2026-09-29.md)
+show 18.3% and 17.8% less time in the tested 64K attention kernel. These are
+isolated kernel measurements, not end-to-end token rates.
 The disk cache checks device, compiler, and emitted-source identity before reuse.
 
 Architecture and shape policies are in these headers:

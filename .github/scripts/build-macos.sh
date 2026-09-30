@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=e635baca4b6bd280347b76ea201153d4fcd1d1ad
+mac_rev=ca563bf8acbbf3ef2d9d4333d9c8fc999b747597
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
