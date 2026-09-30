@@ -14,37 +14,33 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 [Performance](#measured-performance) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
-## Current release: v0.4.21
+## Current release: v0.4.22
 
-Run a 27B model locally with speculative decoding, reusable prompt state, and
-GPU kernels optimized for your hardware.
+Run a 27B model locally with **up to 597.9 prompt tokens/s**, speculative
+decoding, and reusable prompt state.
 
-- **Shared K/V reads:** eligible attention kernels reuse data across query heads and token rows.
-- **Automatic Loom optimization:** cooperative operand staging and loop-invariant code motion.
-- **K/V that grows with your conversation:** a dedicated manager packs fragments into shared arenas without copying the existing cache.
-- **Ready-to-run packages:** macOS ARM64 and Linux x86-64 downloads include matching HRX and Loom libraries.
+- **Faster Q4 prefill:** efficient nibble expansion and paired activation staging reduce repeated work.
+- **Fused single-token Q4 SwiGLU:** combines eligible gate/up projections and activation.
+- **Correct RDNA4 prefetch lowering:** fixes address calculation and span encoding in the bundled Loom compiler.
+- **Ready-to-run packages:** macOS ARM64 and Linux x86-64 with matching HRX and Loom libraries.
 
-[Download v0.4.21](https://github.com/Geramy/LSE/releases/tag/v0.4.21)
+[Download v0.4.22](https://github.com/Geramy/LSE/releases/tag/v0.4.22)
 
 ## Measured performance
 
-**Up to 67.6 output tokens/s in real-world interactive use.**
-Qwen3.8-27B Q4 with Q8 DFlash2 block-8, running on an AMD R9700
-(`gfx1201`) through HRX/Loom on macOS:
+Qwen3.8-27B Q4 on an AMD R9700 (`gfx1201`) through HRX/Loom on macOS:
 
-| Metric | Peak observed | Overall | Per-request median |
-|---|---:|---:|---:|
-| Decode (output tokens/s) | **67.6** | **35.8** | 36.1 |
-| Prefill (input tokens/s) | **390.2** | **243.6** | 152.5 |
-| Draft acceptance | **96%** | — | 86% |
+| Metric | Peak observed |
+|---|---:|
+| Prefill (input tokens/s) | **597.9 pp/s** |
+| Decode (output tokens/s, Q8 DFlash2) | **67.6 tok/s** |
+| Draft acceptance (Q8 DFlash2) | **96%** |
 
-From user-supplied live-session logs before the reported tool-call loop.
-Peaks are individual request results; overall throughput is total processed
-tokens divided by total phase time, using rounded logs. Prefill counts newly
-processed input; decode excludes the first token. Rates vary with context and
-workload. The subsequent looping behavior is under investigation.
+Prefill is a warm, greedy full-prompt measurement with BF16 KV and no prompt
+cache reuse. Decode and acceptance are separate peaks from the earlier live
+DFlash2 block-8 session; these peaks were not measured together.
 
-[Controlled context tests](https://github.com/lemonade-sdk/mac-amdgpu/blob/3fea739/docs/benchmarks/lse-v0.4.21-context-speed.md)
+[Prefill measurements](docs/benchmarks/q4-prefill-2026-09-30.md)
 · [Earlier measurements](docs/RELEASE_HISTORY.md)
 
 ## Kernel cache
@@ -104,7 +100,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.21`.
+The examples below use `v0.4.22`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -113,7 +109,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.21
+   lse_tag=v0.4.22
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -146,7 +142,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.21
+   lse_tag=v0.4.22
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"

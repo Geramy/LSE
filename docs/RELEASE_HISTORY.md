@@ -3,6 +3,14 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.22: faster Q4 prefill
+
+1. Faster Q4 prefill with optimized nibble expansion and paired activation staging: **597.9 pp/s peak** on a warm full prompt with BF16 KV and no prompt cache reuse.
+2. Fused eligible single-token Q4 SwiGLU gate/up projections and activation; updated dispatch regression coverage.
+3. Fixed RDNA4 prefetch address/span lowering in bundled Loom. Previously observed live DFlash2 peaks: **67.6 tok/s decode** and **96% acceptance** on Qwen3.8-27B Q4, R9700/macOS. These are separate workload peaks.
+
+[Prefill measurements](benchmarks/q4-prefill-2026-09-30.md).
+
 ## v0.4.21: real-world interactive performance
 
 Real-world interactive use on the local macOS R9700 (`gfx1201`), running

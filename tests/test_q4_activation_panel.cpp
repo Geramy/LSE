@@ -129,8 +129,17 @@ LSE_TEST(q4_panel_graph_shares_siblings_but_rejects_cloned_input_cache) {
   b = {};
   LSE_EXPECT(weak.expired());
 }
+LSE_TEST(q4_panel_single_token_ffn_uses_shared_activation_panel) {
+  auto x = leaf({1, 5120}, DType::kF32);
+  auto gate = contraction(x, 17408, 5120);
+  auto up = contraction(x, 17408, 5120);
+  LSE_EXPECT_EQ(gate.node()->inputs.size(), 5u);
+  LSE_EXPECT(gate.node()->prim && gate.node()->prim->name() == kConsumer);
+  LSE_EXPECT(gate.node()->inputs[4] == up.node()->inputs[4]);
+  LSE_EXPECT(gate.node()->inputs[4]->shape == Shape{1, 2000});
+}
 LSE_TEST(q4_panel_graph_keeps_unmeasured_shapes_and_formats_on_legacy_route) {
-  for (auto m : {1, 3, 7, 9, 512}) {
+  for (auto m : {2, 3, 7, 9, 512}) {
     auto y = contraction(leaf({m, 5120}, DType::kF32), 17408, 5120);
     LSE_EXPECT_EQ(y.node()->inputs.size(), 4u);
     LSE_EXPECT(y.node()->prim && y.node()->prim->name() == "quant_linear");
