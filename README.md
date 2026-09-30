@@ -19,7 +19,7 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 Run a 27B model locally with **up to 632.1 prompt tokens/s** and faster
 long-context prefill through FlashPrefill V2.
 
-- **FlashPrefill V2 on by default** for supported R9700 HRX/LOOM baseline configurations.
+- **FlashPrefill V2 on by default** for supported R9700 HRX/LOOM configurations, including MTP and DFlash2 prompt prefill.
 - **Easy opt-out:** add `--FlashPrefillV2=off` for dense prefill.
 - **Faster selection:** cooperative Wave32 block selection cuts measured selector time by about 5×.
 - **SwiGLU improvement:** unrolled single-token Q4 bias tail, with MTP and DFlash2 output checks.
@@ -48,9 +48,8 @@ session; these peaks were not measured together.
 
 The HTTP server enables FlashPrefill V2 prefill by default on supported R9700
 HRX/LOOM configurations, with alpha 0.1 and batch/ubatch 1024.
-Use **`--FlashPrefillV2=off`** for dense prefill. The current master branch also
-enables it for MTP and DFlash2 prompt prefill; their draft and verification
-passes stay dense. This speculative support follows the v0.4.23 release.
+Use **`--FlashPrefillV2=off`** for dense prefill. MTP and DFlash2 prompt prefill also use it;
+their draft and verification passes stay dense.
 Unsupported configurations use dense attention automatically.
 
 At 16K, the merged build reached **632.1 prompt tok/s** versus 492.9 dense.

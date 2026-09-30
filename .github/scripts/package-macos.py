@@ -164,6 +164,8 @@ def main():
     shutil.copy2(root / 'docs/experimental/sparse-attention.md',
                  package / 'docs/experimental/sparse-attention.md')
     (package / 'docs' / 'benchmarks').mkdir()
+    shutil.copy2(root / 'docs/benchmarks/flashprefill-speculative-2026-09-30.md',
+                 package / 'docs/benchmarks/flashprefill-speculative-2026-09-30.md')
     shutil.copy2(root / 'docs/benchmarks/q4-prefill-2026-09-30.md',
                  package / 'docs/benchmarks/q4-prefill-2026-09-30.md')
     shutil.copy2(root / 'docs/benchmarks/attention-vector-staging-2026-09-29.md',
