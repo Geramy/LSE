@@ -259,9 +259,8 @@ std::uint64_t FusionGroup::emission_signature() const {
     mix(name.size());
     for (unsigned char c : name) mix(c);
   }
-  // Phase lowering resolves boundary views to their allocation owners. The
-  // producer graph is outside this kernel, but shared-owner relationships
-  // still determine which binding each operand names.
+  // The producer graph can be outside this kernel, but shared allocations
+  // still determine aliasing relationships between its bindings.
   std::unordered_map<const Node*, std::uint64_t> owners;
   std::vector<std::uint64_t> ownership;
   bool shared = false;
@@ -274,6 +273,22 @@ std::uint64_t FusionGroup::emission_signature() const {
   if (shared) {
     mix(0x6f776e6572732e31ull);  // owners.1
     for (auto owner : ownership) mix(owner);
+  }
+  // Phase argument naming strips reshapes but retains slice identities:
+  // two slices of one allocation can have different offsets, and reshapes
+  // of those slices must resolve to the correct distinct argument slots.
+  std::unordered_map<const Node*, std::uint64_t> view_targets;
+  std::vector<std::uint64_t> binding_views;
+  for (const Node* node : identified) {
+    while (node && node->kind == OpKind::kReshape && node->inputs.size() == 1)
+      node = node->inputs[0].get();
+    const auto [it, inserted] = view_targets.emplace(node, view_targets.size() + 1);
+    (void)inserted;
+    binding_views.push_back(it->second);
+  }
+  if (binding_views != ownership) {
+    mix(0x76696577732e7631ull);  // views.v1
+    for (auto view : binding_views) mix(view);
   }
   return hash;
 }
