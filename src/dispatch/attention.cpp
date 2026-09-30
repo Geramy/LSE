@@ -1,5 +1,5 @@
 #include "lse/dispatch/attention.hpp"
-#include "lse/dispatch/attention_shapes.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 
 #include <cmath>
 #include <initializer_list>

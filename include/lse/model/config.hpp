@@ -10,6 +10,7 @@
 #pragma once
 
 #include "lse/kv/cache_dtype.hpp"
+#include "lse/ops/sparse_attention_tuneconfig.h"
 
 #include <cstdint>
 #include <string>
@@ -102,6 +103,7 @@ struct Config {
   std::int32_t kv_length = 0;
   // Parsed BF16 model metadata selects BF16; other models use FP16.
   // An explicit model setting or CLI override takes precedence.
+  ops::SparseAttentionOptions sparse_attention;
   kv::CacheDType kv_cache_dtype = kv::CacheDType::kF16;
 
   // Engine allocation, not a checkpoint fact. Attention reserves

@@ -518,3 +518,7 @@ if(LSE_ENABLE_CPU)
       ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
   endif()
 endif()
+
+if(TARGET lse_backend_hrx)
+  lse_add_test(test_sparse_attention lse_graph lse_kernels lse_ir lse_backends)
+endif()

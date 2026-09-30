@@ -1087,6 +1087,8 @@ Status eval_overwrite_slice(Node& n) {
 }
 
 Status eval_sdpa(Node& n) {
+  if (n.attrs[3] != 0.0f)
+    return LSE_ERROR(kInvalidArgument, "Sparse attention requires a supported native LOOM kernel; host fallback is disabled");
   const Node& q = *n.inputs[0];
   const Node& k = *n.inputs[1];
   const Node& v = *n.inputs[2];

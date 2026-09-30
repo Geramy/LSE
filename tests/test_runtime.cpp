@@ -21,7 +21,7 @@
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
-#include "lse/dispatch/attention_shapes.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/allocator.hpp"

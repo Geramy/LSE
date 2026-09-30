@@ -2,6 +2,7 @@
 #pragma once
 
 #include "lse/kv/cache_dtype.hpp"
+#include "lse/ops/sparse_attention_tuneconfig.h"
 
 #include <array>
 #include <string_view>
@@ -172,7 +173,8 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  MaskKind mask, int window, const Array& meta,
                  const Array& table, int block_size,
                  const backend::DeviceInfo* device = nullptr,
-                 kv::CacheDType storage = kv::CacheDType::kF32);
+                 kv::CacheDType storage = kv::CacheDType::kF32,
+                 ops::SparseAttentionPhase sparse = {});
 
 // Writes `src` [rows, Hkv, T, Dh] into the pool `dst` [blocks, Hkv,
 // block_size, Dh] at absolute position meta[0], following `table`. Returns the

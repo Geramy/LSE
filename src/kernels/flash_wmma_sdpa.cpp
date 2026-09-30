@@ -1,11 +1,12 @@
 // Typed paged KV; FP32 matrix accumulators and online softmax state.
+#include <cmath>
 #include <string_view>
 #include <string>
 #include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/attention.hpp"
-#include "lse/dispatch/attention_shapes.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -37,20 +38,41 @@ struct FlashArgs {
   env::Out<kir::f32, E> out;
 };
 
+template <class E, kv::CacheDType Storage>
+struct FlashMeanArgs {
+  env::In<kir::f32, E> q;
+  env::In<KvElement<Storage>, E> k, v;
+  env::In<kir::f32, E> meta, table, pooled, selected;
+  env::Out<kir::f32, E> out;
+};
+
 // Q/P and decoded KV use F16 operands for F16 storage, BF16 otherwise.
 // Both matrix accumulators, softmax state and output remain FP32.
-struct FlashWmma final : KernelPrimitive<FlashWmma> {
-  static constexpr std::string_view kName = "attention.flash.wmma16.v2";
-  static constexpr std::string_view kEntry = "lse_flash_wmma16_v2";
+template <bool MeanCorrection>
+struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
+  static constexpr std::string_view kName = MeanCorrection ? "attention.flashprefill.wmma.v1" : "attention.flash.wmma16.v3";
+  static constexpr std::string_view kEntry = MeanCorrection ? "lse_flashprefill_wmma_v1" : "lse_flash_wmma16_v3";
   static constexpr std::string_view kSource = {};
 
-  std::size_t arity() const noexcept override { return 5; }
+  std::size_t arity() const noexcept override { return MeanCorrection ? 7 : 5; }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
 
+  static KernelShapes dense_request(const KernelShapes& s) {
+    auto dense=s;
+    if constexpr (MeanCorrection) {
+      if(s.inputs.size()>=5) dense.inputs=s.inputs.first(5);
+      if(s.input_dtypes.size()>=5) dense.input_dtypes=s.input_dtypes.first(5);
+    }
+    return dense;
+  }
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (s.input_dtypes.size() != 5 || !dispatch::flash_wmma_supported(s) || !s.store)
+    if (s.input_dtypes.size() != (MeanCorrection ? 7 : 5) || !dispatch::flash_wmma_supported(dense_request(s)) || !s.store ||
+        (s.attrs[3] == 1.0f && (!std::isfinite(s.attrs[2]) || s.attrs[2] < 0)))
       return {};
+    if constexpr(MeanCorrection)
+      if(s.iattrs[0]!=1 || s.inputs[0].dim(3)!=256 || s.output.dim(3)!=256 ||
+         !std::isfinite(s.attrs[2]) || s.attrs[2]<0 || s.attrs[2]>1) return {};
     return with_kv_storage(s.input_dtypes[1], s.attrs[1],
                            [&]<kv::CacheDType Storage>() { return emit_storage<Storage>(s); });
   }
@@ -62,7 +84,7 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
     using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kF32,
                               operand, 16, 16, 16>;
     using Narrow = math::matrix_scalar_t<Mma::kRow.a_elem>;
-    const Dims d = dispatch::flash_dimensions(s);
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
     const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
     const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
     const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
@@ -72,7 +94,8 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
-    FlashArgs<env::Emit, Storage> a;
+    std::conditional_t<MeanCorrection, FlashMeanArgs<env::Emit, Storage>,
+                       FlashArgs<env::Emit, Storage>> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
@@ -82,6 +105,8 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
     const auto mrow = e.lds<kir::f32>(QTile);
     const auto drow = e.lds<kir::f32>(QTile);
     const auto arow = e.lds<kir::f32>(QTile);
+    // Reuse alpha scratch for the uniform block-retention vote before softmax.
+    const bool sparse = s.attrs[3] == 1.0f;
 
     const auto lid = e.let(math::local_id());
     const auto wg = e.let(math::workgroup_id_x());
@@ -159,13 +184,26 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
     const auto kv_len = e.runtime_extent(
         "kv_len", select(loaded_max < capacity, loaded_max, capacity));
     const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
-    for (auto w : e.range(nwin)) {
+    // A static capacity bound keeps pooled address arithmetic provably narrow.
+    // Runtime metadata still gates every live window.
+    const auto loop_windows = [&] {
+      if constexpr (MeanCorrection) return e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+      else return nwin;
+    }();
+    for (auto w : e.range(loop_windows)) {
       const auto wbase = e.let(w * kKWin);
 
       const auto signed_start = e.let(kir::cast<std::int64_t>(wbase));
       const auto useful = mask == 0 ? wbase < row_len
                                    : wbase < row_len && signed_start <= last_position;
-      if (auto live_window = e.when(useful)) {
+      if (auto live_window = e.when(useful && w < nwin)) {
+        const auto selected=[&] {
+          if constexpr(MeanCorrection) {
+            const auto blocks=e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+            return e.let(a.selected[((b*d.qh+h)*ntiles+qt)*blocks+w]);
+          } else return e.f32(1);
+        }();
+        if(auto exact_block=e.when(selected!=0.0f)) {
         auto write_score = [&](const kir::Val<kir::u32>& row,
                                const kir::Val<kir::u32>& key,
                                const kir::Val<kir::f32>& value) {
@@ -226,6 +264,35 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
         }
         e.barrier();
 
+        auto retain = e.var(1.0f);
+        if (sparse) {
+          // All rows in this query tile must vote to omit it. Invalid query
+          // rows and fully masked rows cannot prevent an otherwise safe skip.
+          for (std::uint32_t wr = 0; wr < 2; ++wr) {
+            const auto row = e.let(wave * 2u + wr);
+            auto block_max = e.var(math::neg_inf());
+            for (auto f : e.unroll(8u))
+              block_max = math::max(block_max.read(), sc[e.let(row * kKWin + lane + f * 32u)].read());
+            for (std::uint32_t bit = 16; bit; bit /= 2)
+              block_max = math::max(block_max.read(), math::shfl_xor(block_max.read(), e.u32(bit)));
+            const auto running = e.let(math::max(mrow[row].read(), block_max.read()));
+            const auto length = e.let(select(row_len > 0u, row_len, e.u32(1)));
+            const auto raw_lambda = e.let(e.f32(s.attrs[2]) / kir::cast<kir::f32>(length));
+            const auto lambda = e.let(select(raw_lambda < 1.0f, raw_lambda, e.f32(1)));
+            const auto keep = e.let(block_max.read() != math::neg_inf() &&
+                math::exp(block_max.read() - running) >= lambda);
+            if (auto leader = e.when(lane == 0u))
+              arow[row] = select(keep, e.f32(1.0f), e.f32(0.0f));
+          }
+          e.barrier();
+          retain = e.f32(0);
+          for (auto row : e.range(QTile))
+            if (auto votes = e.when(arow[row].read() != 0.0f)) retain = e.f32(1);
+          // Complete all vote reads before any wave reuses arow for alpha.
+          e.barrier();
+        }
+        // Uniform across the workgroup: every nested barrier is convergent.
+        if (auto retained = e.when(retain.read() != 0.0f)) {
         // A wave owns two rows; each lane owns eight contiguous-bank keys.
         for (std::uint32_t wave_row = 0; wave_row < 2; ++wave_row) {
           const auto row = e.let(wave * 2u + wave_row);
@@ -257,8 +324,10 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
             drow[row] = math::fma(drow[row].read(), alpha, total.read());
           }
         }
+        }  // retained softmax
         e.barrier();
 
+        if (auto retained_values = e.when(retain.read() != 0.0f)) {
         // A wave owns one D16 tile per 128-channel slice; C remains FP32.
         for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
           const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
@@ -300,7 +369,50 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
             o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
           }
         }
+        }  // retained block
         e.barrier();
+        }  // exact block
+        if constexpr(MeanCorrection) {
+          const auto blocks=e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+          const auto pool=e.let(((b*d.kvh+kh)*blocks+w)*513u);
+          if(auto correction=e.when(selected==0.0f)) {
+            // Selector only omits complete blocks visible to every query.
+            // log(256) accounts for their full mass in both softmax sums.
+            for(std::uint32_t wr=0;wr<2;++wr) {
+              const auto row=e.let(wave*2u+wr);
+              auto score=e.var(0.0f);
+              if(auto live=e.when(q0+row<d.tq)) {
+                const auto qb=e.let(((b*d.qh+h)*d.tq+q0+row)*d.dh);
+                for(std::uint32_t c=0;c<8;++c)
+                  score=math::fma(a.q[qb+lane+c*32u],a.pooled[pool+lane+c*32u],score.read());
+              }
+              for(std::uint32_t bit=16;bit;bit/=2)
+                score=score.read()+math::shfl_xor(score.read(),e.u32(bit));
+              const auto logit=e.let(score.read()*d.scale+e.f32(std::log(256.0f)));
+              const auto old=e.let(mrow[row].read());
+              const auto updated=e.let(math::max(old,logit));
+              const auto alpha=e.let(math::exp(old-updated));
+              const auto weight=e.let(math::exp(logit-updated));
+              if(auto leader=e.when(lane==0u)) {
+                mrow[row]=updated; arow[row]=alpha;
+                sc[row]=weight; drow[row]=math::fma(drow[row].read(),alpha,weight);
+              }
+            }
+          }
+          e.barrier();
+          if(auto correction_values=e.when(selected==0.0f)) {
+            for(std::uint32_t column_tile=0;column_tile<value_tiles;++column_tile) {
+              const auto dimension=e.let((wave+column_tile*8u)*16u+lane_lo);
+              const auto value=e.let(a.pooled[pool+256u+dimension]);
+              for(auto f:e.unroll(8u)) {
+                const auto row=e.let(f+lane_hi*8u);
+                o[column_tile][f]=math::fma(sc[row].read(),value,
+                    o[column_tile][f].read()*arow[row].read());
+              }
+            }
+          }
+          e.barrier();
+        }
       }
     }
 
@@ -329,7 +441,7 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
-    const Dims d = dispatch::flash_dimensions(s);
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
     const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
     tp.workgroup_size[0] = kThreads;
     tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles : 1u;
@@ -338,7 +450,10 @@ struct FlashWmma final : KernelPrimitive<FlashWmma> {
     return tp;
   }
 };
+using FlashWmma=FlashWmmaImpl<false>;
+using FlashMean=FlashWmmaImpl<true>;
 LSE_REGISTER_PRIMITIVE(FlashWmma);
+LSE_REGISTER_PRIMITIVE(FlashMean);
 const FlashWmma kFlashWmma{};
 }  // namespace
 

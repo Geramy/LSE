@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Validate CLI options without backend initialization, model loading, or sockets."""
+import json
+import tempfile
 import os
 from pathlib import Path
 import subprocess
@@ -57,11 +59,53 @@ for value in ('0', '0.6', '1', '2'):
 for value in ('-1', '2.1', 'nan', 'inf', '0.6x', ''):
     cases.append((['--temperature', value], 2, 'temperature must be a finite number'))
 cases.append((['--temperature'], 2, '--temperature needs a value'))
+for value in ('on', 'off'):
+    cases += [([f'--FlashPrefillV2={value}', '--help'], 0, '--FlashPrefillV2=off'),
+              (['--FlashPrefillV2', value, '--help'], 0, '--FlashPrefillV2=off')]
+for value in ('true', 'false', '1', '', 'ON'):
+    cases.append(([f'--FlashPrefillV2={value}'], 2, '--FlashPrefillV2 must be on or off'))
+cases += [(['--FlashPrefillV2'], 2, '--FlashPrefillV2 needs a value'),
+          (['--FlashPrefillV2=off'], 2, 'no model.'),
+          (['--FlashPrefillV2=on'], 2, 'requires --no-mtp'),
+          (['--FlashPrefillV2=on', '--no-mtp', '--dialect', 'loom'], 2, 'no model.'),
+          (['--attention-prefill', 'flashprefill-v2', '--no-mtp', '--dialect', 'loom'], 2, 'no model.'),
+          (['--FlashPrefillV2=off', '--dflash2=on'], 2, 'no model.')]
+for flags in (['--FlashPrefillV2=off', '--attention-prefill', 'flashprefill-v2'],
+              ['--attention-prefill', 'flashprefill-v2', '--FlashPrefillV2=off'],
+              ['--FlashPrefillV2=on', '--attention-prefill', 'dense'],
+              ['--attention-prefill', 'dense', '--FlashPrefillV2=on']):
+    cases.append((flags, 2, 'conflicting --FlashPrefillV2'))
+for flag in ('--attention-prefill', '--attention-decode'):
+    for mode in ('dense', 'blasst'):
+        cases.append(([flag, mode, '--help'], 0, '--attention-calibration'))
+    for mode in ('unknown', ''):
+        cases.append(([flag, mode], 2, 'attention mode must be dense or blasst'))
+    cases.append(([flag], 2, flag + ' needs a value'))
+cases += [(['--attention-prefill', 'flashprefill-v2', '--help'], 0, '--attention-calibration'),
+          (['--attention-decode', 'flashprefill-v2'], 2, 'prefill only'),
+          (['--attention-prefill', 'blasst'], 2, 'requires --no-mtp'),
+          (['--attention-decode', 'blasst', '--no-mtp'], 2, 'requires --attention-calibration'),
+          (['--attention-calibration'], 2, '--attention-calibration needs a value'),
+          (['--attention-decode', 'blasst', '--no-mtp', '--attention-calibration', '/not-present'], 2, 'requires --dialect loom'),
+          (['--attention-decode', 'blasst', '--no-mtp', '--attention-calibration', '/not-present', '--dialect', 'loom'], 2, 'invalid attention calibration')]
+calibration_dir = tempfile.TemporaryDirectory()
+for index, (payload, mode, message) in enumerate([
+    ({'version': 2, 'model': '/not-opened'}, 'blasst', 'unsupported calibration version'),
+    ({'version': 1, 'model': '/wrong'}, 'blasst', 'match --model exactly'),
+    ({'version': 1, 'model': '/not-opened', 'prefill': {'scale': -1}}, 'blasst', 'finite, nonnegative'),
+    ({'version': 1, 'model': '/not-opened', 'prefill': {'scale': '0'}}, 'blasst', 'must be numeric'),
+    ({'version': 1, 'model': '/not-opened', 'prefill': {'scale': 1.1}}, 'flashprefill-v2', 'at most 1'),
+]):
+    calibration = Path(calibration_dir.name) / f'{index}.json'
+    calibration.write_text(json.dumps(payload))
+    cases.append((['--model', '/not-opened', '--no-mtp', '--dialect', 'loom',
+                   '--attention-prefill', mode, '--attention-calibration', str(calibration)], 2, message))
 for args, code, message in cases:
     result = subprocess.run([str(server), *args], env=env, capture_output=True, text=True, timeout=10)
     output = result.stdout + result.stderr
     if result.returncode != code or message not in output:
         raise SystemExit(f'FAIL {args!r}: exit={result.returncode}\n{output}')
+calibration_dir.cleanup()
 print(f'PASS {len(cases)} server CLI cases; no backend, model, or HTTP server opened')
 
 if len(sys.argv) == 3:

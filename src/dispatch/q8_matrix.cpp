@@ -1,5 +1,5 @@
 #include "lse/dispatch/q8_matrix.hpp"
-#include "lse/dispatch/q8_shapes.hpp"
+#include "lse/dispatch/q8_tuneconfig.h"
 #include <algorithm>
 #include <limits>
 #include "lse/kernels/wmma.hpp"

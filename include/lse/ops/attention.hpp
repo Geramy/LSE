@@ -19,6 +19,7 @@
 #include "lse/kv/allocator.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/kv/cache_dtype.hpp"
+#include "lse/ops/sparse_attention_tuneconfig.h"
 #include "lse/kv/memory.hpp"
 #include "lse/ops/rope.hpp"
 
@@ -51,6 +52,7 @@ struct GatedAttentionSpec {
   // Tokens a sequence may reach. 0 keeps the growing-concat path, used only by
   // tests that build a cache by hand.
   std::int32_t kv_length = 0;
+  ops::SparseAttentionOptions sparse_attention;
   kv::CacheDType kv_cache_dtype = kv::CacheDType::kF32;
 };
 

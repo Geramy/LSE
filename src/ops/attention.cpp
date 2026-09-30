@@ -393,6 +393,9 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
     return LSE_ERROR(kInvalidArgument,
                      "q_heads must be a positive multiple of kv_heads");
   }
+  if ((spec.sparse_attention.prefill.enabled() || spec.sparse_attention.decode.enabled()) &&
+      (!cache || !cache->paged))
+    return LSE_ERROR(kInvalidArgument, "Sparse attention requires paged attention storage");
   const auto qh = static_cast<std::int64_t>(spec.q_heads);
   const auto kvh = static_cast<std::int64_t>(spec.kv_heads);
   const auto hd = static_cast<std::int64_t>(spec.head_dim);
@@ -470,7 +473,9 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
   Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale, spec.mask,
                                       spec.window, cache->meta, cache->table,
-                                      kv::kBlockSize, split_device, spec.kv_cache_dtype)
+                                      kv::kBlockSize, split_device, spec.kv_cache_dtype,
+                                      q.shape().dim(2) == 1 ? spec.sparse_attention.decode
+                                                            : spec.sparse_attention.prefill)
                   : graph::sdpa(q, k_attn, v_attn, scale, spec.mask, spec.window,
                                 offset);
 

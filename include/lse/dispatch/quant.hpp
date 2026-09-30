@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "lse/dispatch/quant_shapes.hpp"
+#include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
 

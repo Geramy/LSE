@@ -333,7 +333,7 @@ LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   device.extension = &amd;
   LSE_EXPECT(find_primitive("attention.flash.qtile12.v2") == nullptr);
   LSE_EXPECT(find_primitive("attention.flash.v2") == nullptr);
-  LSE_EXPECT(find_primitive("attention.flash.wmma16.v2") != nullptr);
+  LSE_EXPECT(find_primitive("attention.flash.wmma16.v3") != nullptr);
   const auto emitted = backend::LoomEmitter{}.emit(groups[0], device);
   LSE_EXPECT(emitted.ok());
   if (!emitted.ok()) return;
