@@ -28,7 +28,7 @@ std::size_t broadcast_index(const Shape& src, const Shape& out,
 
 void finish_host_write(Node& n) {
   n.materialized = true;
-  if (n.buffer.ptr != nullptr || n.prim == nullptr) return;
+  if ((!n.kv_fragments && n.buffer.ptr != nullptr) || n.prim == nullptr) return;
   const int at = n.prim->inplace_input();
   if (at < 0 || static_cast<std::size_t>(at) >= n.inputs.size() ||
       !n.inputs[static_cast<std::size_t>(at)]) return;
@@ -1259,7 +1259,9 @@ Status sync_to_device(Node& node, backend::IBackend& backend) {
 Status sync_from_device(Node& node, backend::IBackend& backend) {
   if (node.kv_fragments) {
     const auto bytes = dtype_storage_bytes(node.dtype, node.element_count());
-    if (!node.device_dirty && node.host_mirror.size() >= bytes) return OkStatus();
+    // Fragment aliases have separate host mirrors. Another alias can update
+    // shared storage without changing this node's dirty flags.
+    if (node.host_dirty) return OkStatus();
     node.host_mirror.resize(bytes);
     LSE_RETURN_IF_ERROR(node.kv_fragments->read(node.host_mirror.data(),
         std::min(bytes, node.kv_fragments->size_bytes())));
@@ -1444,6 +1446,7 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
         inputs, {{data, bytes}, n.shape, n.dtype}, n.attrs, n.iattrs));
     n.host_dirty = true;
     n.device_dirty = false;
+    if (n.kv_fragments) LSE_RETURN_IF_ERROR(sync_to_device(n, backend));
     finish_host_write(n);
     return OkStatus();
   }
@@ -1475,6 +1478,7 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
     std::vector<float> result(count);
     n.prim->eval_cpu(ptrs, result.data(), count, n.attrs);
     for (std::size_t e = 0; e < count; ++e) store_element(n, e, result[e]);
+    if (n.kv_fragments) LSE_RETURN_IF_ERROR(sync_to_device(n, backend));
     finish_host_write(n);
     return OkStatus();
   }
@@ -1605,6 +1609,7 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
                        std::string(to_string(n.kind)));
   }
 
+  if (n.kv_fragments) LSE_RETURN_IF_ERROR(sync_to_device(n, backend));
   finish_host_write(n);
   return OkStatus();
 }

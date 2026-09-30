@@ -7,6 +7,7 @@
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/cache_codec.hpp"
+#include "lse/kv/memory.hpp"
 #include "lse/model/config.hpp"
 #include "lse/ops/attention.hpp"
 
@@ -55,6 +56,41 @@ Array pool(backend::IBackend &cpu, kv::CacheDType format) {
                             kv::storage_dtype(format));
 }
 } // namespace
+
+
+LSE_TEST(fragmented_host_writes_refresh_other_aliases) {
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT_OK(cpu.init(0));
+  auto manager = kv::MemoryManager::create();
+  auto storage = std::make_shared<kv::FragmentStorage>(manager, cpu,
+      backend::kDefaultStream);
+  const Shape shape{2, 1, 16, 8};
+  const auto bytes = shape.elem_count() * sizeof(float);
+  LSE_EXPECT_OK(storage->reserve(bytes));
+  LSE_EXPECT_OK(storage->grow(bytes));
+  auto binding = storage->binding();
+  LSE_EXPECT_OK(binding.status());
+  if (!binding.ok()) return;
+  auto first = Array::from_buffer(*binding, shape, DType::kF32);
+  auto alias = Array::from_buffer(*binding, shape, DType::kF32);
+  first.node()->kv_fragments = storage;
+  alias.node()->kv_fragments = storage;
+  LSE_EXPECT_OK(interpreter::sync_from_device(*alias.node(), cpu));
+  auto table = upload(cpu, {1, 2}, {1, 0});
+  auto src = upload(cpu, {1, 1, 1, 8}, std::vector<float>(8, 3.0f));
+  auto write = kv_page_write(first, src, upload(cpu, {5}, {0, 1, 1, 0, 1}),
+                             table, 16, kv::CacheDType::kF32);
+  LSE_EXPECT_OK(interpreter::evaluate(write.node(), cpu));
+  LSE_EXPECT_OK(interpreter::sync_from_device(*alias.node(), cpu));
+  LSE_EXPECT_EQ(interpreter::load_element(*alias.node(), 16 * 8), 3.0f);
+  auto next = kv_page_write(alias,
+      upload(cpu, {1, 1, 1, 8}, std::vector<float>(8, 7.0f)),
+      upload(cpu, {5}, {0, 2, 1, 1, 2}), table, 16, kv::CacheDType::kF32);
+  LSE_EXPECT_OK(interpreter::evaluate(next.node(), cpu));
+  LSE_EXPECT_OK(interpreter::sync_from_device(*first.node(), cpu));
+  LSE_EXPECT_EQ(interpreter::load_element(*first.node(), 16 * 8), 3.0f);
+  LSE_EXPECT_EQ(interpreter::load_element(*first.node(), 17 * 8), 7.0f);
+}
 
 LSE_TEST(kv_formats_parse_and_keep_explicit_overrides) {
   model::Config cfg;
