@@ -120,6 +120,12 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
     auto fragmented_v = graph::Array::from_buffer(std::move(value_binding), pool_shape, DType::kF16);
     fragmented_k.node()->kv_fragments = key_storage;
     fragmented_v.node()->kv_fragments = value_storage;
+    std::vector<std::uint64_t> key_addresses(key_storage->fragment_count());
+    LSE_RETURN_IF_ERROR(backend.copy_d2h(fragmented_k.node()->buffer,
+        key_addresses.data(), key_addresses.size() * sizeof(std::uint64_t), 0));
+    for (std::size_t i = 0; i < key_addresses.size(); ++i)
+      std::fprintf(stderr, "       K fragment[%zu]=0x%llx\n", i,
+          static_cast<unsigned long long>(key_addresses[i]));
     std::vector<float> table_values(rows * stride);
     for (int row = 0; row < rows; ++row)
       for (int i = 0; i < stride; ++i)
@@ -173,7 +179,20 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
         std::fprintf(stderr, "       F16 page write fragmented=%d index=%zu actual_bits=%u expected_bits=%u\n",
             fragmented, static_cast<std::size_t>(mismatch.first - actual.begin()),
             static_cast<unsigned>(*mismatch.first), static_cast<unsigned>(*mismatch.second));
-        return LSE_ERROR(kInternal, "F16 page write mismatch");
+        std::size_t unchanged = 0, changed = 0, bad = 0;
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+          const auto original = float16_t::from_float(
+              static_cast<float>(static_cast<int>(i % 97) - 48) / 64.f);
+          if (actual[i] == original) ++unchanged;
+          else if (changed++ < 8)
+            std::fprintf(stderr, "       changed K[%zu]=%u expected=%u original=%u\n",
+                i, static_cast<unsigned>(actual[i]), static_cast<unsigned>(keys[i]),
+                static_cast<unsigned>(original));
+          bad += actual[i] != keys[i];
+        }
+        std::fprintf(stderr, "       write changed=%zu unchanged=%zu incorrect=%zu\n",
+            changed, unchanged, bad);
+        LSE_EXPECT(actual == keys);
       }
       LSE_EXPECT_EQ(got.size(), query.size());
       if (got.size() != query.size()) return LSE_ERROR(kInternal, "incomplete attention output");
