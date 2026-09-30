@@ -121,7 +121,7 @@ struct Q4MatrixPanelShape {
 inline constexpr std::array kQ4MatrixPanelShapes{
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 8, 5120, 17408},
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 5120, 17408, 64},
-    Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 17408, 5120, 64, 1152},
+    Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 17408, 5120, 64, 2304},
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 10240, 5120, 64, 1152},
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 6144, 5120, 64, 1152},
     Q4MatrixPanelShape{"gfx1201", 32, 4, 64, 256, 1024, 12288, 5120, 64, 1152},

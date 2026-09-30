@@ -341,8 +341,9 @@ std::string emit_matrix(const KernelShapes &s) {
   }
   return kb.str();
 }
-template <bool Cooperative>
+template <bool Cooperative, bool PairStage = false>
 std::string emit_prefill_matrix(const KernelShapes &s) {
+  static_assert(!PairStage || Cooperative);
   using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
                             math::MatrixElem::kSU8, 16, 16, 16>;
   constexpr auto row = Mma::kRow;
@@ -354,6 +355,9 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
       s.output.elem_count() / static_cast<std::uint64_t>(s.inputs[1].dim(0)));
   const auto groups =
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1) / 64);
+  if constexpr (PairStage)
+    if (groups % 2u != 0u)
+      return {};
   const auto lanes = static_cast<std::uint32_t>(s.inputs[1].dim(1));
   constexpr std::uint32_t waves = kBlock / 32u;
   const auto tiles_n = (n + 15u) / 16u;
@@ -367,7 +371,7 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
   env::Emit e{&kb};
   std::optional<kir::Tile<kir::u32>> cached_panel;
   if constexpr (Cooperative)
-    cached_panel = e.lds<kir::u32>(1152u);
+    cached_panel = e.lds<kir::u32>(PairStage ? 2304u : 1152u);
   const auto lid = e.let(math::local_id());
   const auto lane = e.let(lid % 32u);
   const auto lo = e.let(lane % 16u);
@@ -382,73 +386,78 @@ std::string emit_prefill_matrix(const KernelShapes &s) {
   std::vector<kir::LValue<kir::f32>> out;
   for (int z = 0; z < 4 * slots; ++z)
     out.push_back(e.var(0.0f));
-  for (auto g : e.range(0u, groups, 1u)) {
-    std::optional<kir::Val<kir::u32>> group_base;
+  for (auto g : e.range(0u, groups, PairStage ? 2u : 1u)) {
     if constexpr (Cooperative) {
-      group_base = e.let((mblock * groups + g) * 1152u);
-      const auto copy_chunk = [&](std::uint32_t chunk) {
-        const auto at = e.let(lid * 4u + chunk * 1024u);
-        const auto packed = e.load(a.panel, e.let(*group_base + at), 16u);
-        kb.store_pack<kir::u32>(cached_panel->id(), at, packed, 16u);
-      };
-      copy_chunk(0u);
-      if (auto tail = e.when(lid < 32u))
-        copy_chunk(1u);
+      for (std::uint32_t pair = 0; pair < (PairStage ? 2u : 1u); ++pair) {
+        const auto stage_base = e.let((mblock * groups + g + pair) * 1152u);
+        const auto copy_chunk = [&](std::uint32_t chunk) {
+          const auto offset = e.let(lid * 4u + chunk * 1024u);
+          const auto packed = e.load(a.panel, e.let(stage_base + offset), 16u);
+          const auto local_at = e.let(offset + pair * 1152u);
+          kb.store_pack<kir::u32>(cached_panel->id(), local_at, packed, 16u);
+        };
+        copy_chunk(0u);
+        if (auto tail = e.when(lid < 32u))
+          copy_chunk(1u);
+      }
       e.barrier();
     }
-    const auto sa = e.let(safe_col * groups + g);
-    const auto scale = e.let(math::widen(a.scales[sa]));
-    const auto bias = e.let(math::widen(a.biases[sa]));
-    std::vector<kir::Local<kir::u32, frag>> bf;
-    for (std::uint32_t t = 0; t < 4u; ++t) {
-      const auto weight =
-          e.let(a.packed[e.let(safe_col * lanes + g * 8u + t * 2u + hi)]);
-      bf.push_back(e.local<kir::u32, frag>());
-      for (int f = 0; f < frag; ++f) {
-        const auto half = e.let(weight / (1u << (16u * f)));
-        const auto paired = e.let(
-            math::bit_and(half, e.u32(0xffu)) +
-            math::bit_and(half, e.u32(0xff00u)) * 256u);
-        bf[t][f] = e.let(
-            math::bit_and(paired, e.u32(0x000f000fu)) +
-            math::bit_and(paired, e.u32(0x00f000f0u)) * 16u);
-      }
-    }
-    if constexpr (!Cooperative)
-      group_base = e.let((mblock * groups + g) * 1152u);
-    for (std::uint32_t i = 0; i < 4u; ++i) {
-      const auto block_base =
-          Cooperative ? e.let(e.u32(i * 288u)) : e.let(*group_base + i * 288u);
-      const auto acc = e.local<kir::i32, slots>();
-      for (int z = 0; z < slots; ++z)
-        acc[z] = kir::cast<kir::i32>(e.u32(0));
+    for (std::uint32_t pair = 0; pair < (PairStage ? 2u : 1u); ++pair) {
+      const auto group = e.let(g + pair);
+      std::optional<kir::Val<kir::u32>> group_base;
+      const auto sa = e.let(safe_col * groups + group);
+      const auto scale = e.let(math::widen(a.scales[sa]));
+      const auto bias = e.let(math::widen(a.biases[sa]));
+      std::vector<kir::Local<kir::u32, frag>> bf;
       for (std::uint32_t t = 0; t < 4u; ++t) {
-        const auto index = e.let(block_base + t * 64u + hi * 32u + lo * 2u);
-        const auto av = Cooperative ? cached_panel->load(index, 8u)
-                                    : e.load(a.panel, index, 8u);
-        const auto af = e.local<kir::u32, frag>();
-        for (int f = 0; f < frag; ++f)
-          af[f] = av[f];
-        acc = math::mma<Mma>(af.value(), bf[t].value(), acc.value());
+        const auto weight =
+            e.let(a.packed[e.let(safe_col * lanes + group * 8u + t * 2u + hi)]);
+        bf.push_back(e.local<kir::u32, frag>());
+        for (int f = 0; f < frag; ++f) {
+          const auto half = e.let(weight / (1u << (16u * f)));
+          const auto paired = e.let(math::bit_and(half, e.u32(0xffu)) +
+                                    math::bit_and(half, e.u32(0xff00u)) * 256u);
+          bf[t][f] = e.let(math::bit_and(paired, e.u32(0x000f000fu)) +
+                           math::bit_and(paired, e.u32(0x00f000f0u)) * 16u);
+        }
       }
-      std::vector<kir::Pack<kir::u32>> metadata;
-      for (std::uint32_t z = 0; z < 8u; z += 2u)
-        metadata.push_back(
-            Cooperative
-                ? cached_panel->load(
-                      e.let(block_base + 256u + hi * 16u + z * 2u), 16u)
-                : e.load(a.panel, e.let(block_base + 256u + hi * 16u + z * 2u),
-                         16u));
-      for (int z = 0; z < slots; ++z) {
-        const auto step = e.let(math::from_bits<lse::f32>(
-            metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
-        const auto sum = e.let(math::from_bits<lse::f32>(
-            metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2 + 1]));
-        const auto term = e.let(scale * step);
-        const auto at = i * slots + static_cast<std::uint32_t>(z);
-        out[at] = math::fma(term, kir::cast<kir::f32>(acc[z].read()),
-                            out[at].read()) +
-                  bias * sum;
+      if constexpr (!Cooperative)
+        group_base = e.let((mblock * groups + group) * 1152u);
+      for (std::uint32_t i = 0; i < 4u; ++i) {
+        const auto block_base = Cooperative
+                                    ? e.let(e.u32(pair * 1152u + i * 288u))
+                                    : e.let(*group_base + i * 288u);
+        const auto acc = e.local<kir::i32, slots>();
+        for (int z = 0; z < slots; ++z)
+          acc[z] = kir::cast<kir::i32>(e.u32(0));
+        for (std::uint32_t t = 0; t < 4u; ++t) {
+          const auto index = e.let(block_base + t * 64u + hi * 32u + lo * 2u);
+          const auto av = Cooperative ? cached_panel->load(index, 8u)
+                                      : e.load(a.panel, index, 8u);
+          const auto af = e.local<kir::u32, frag>();
+          for (int f = 0; f < frag; ++f)
+            af[f] = av[f];
+          acc = math::mma<Mma>(af.value(), bf[t].value(), acc.value());
+        }
+        std::vector<kir::Pack<kir::u32>> metadata;
+        for (std::uint32_t z = 0; z < 8u; z += 2u)
+          metadata.push_back(
+              Cooperative
+                  ? cached_panel->load(
+                        e.let(block_base + 256u + hi * 16u + z * 2u), 16u)
+                  : e.load(a.panel,
+                           e.let(block_base + 256u + hi * 16u + z * 2u), 16u));
+        for (int z = 0; z < slots; ++z) {
+          const auto step = e.let(math::from_bits<lse::f32>(
+              metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
+          const auto sum = e.let(math::from_bits<lse::f32>(
+              metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2 + 1]));
+          const auto term = e.let(scale * step);
+          const auto at = i * slots + static_cast<std::uint32_t>(z);
+          out[at] = math::fma(term, kir::cast<kir::f32>(acc[z].read()),
+                              out[at].read()) +
+                    bias * sum;
+        }
       }
     }
     if constexpr (Cooperative)
@@ -492,8 +501,10 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
       const auto *rule = dispatch::q4_matrix_panel_rule(original);
       if (rule->rows == kRows)
         return emit_matrix(s);
-      return rule->shared_words ? emit_prefill_matrix<true>(s)
-                                : emit_prefill_matrix<false>(s);
+      return rule->shared_words
+                 ? (rule->n == 17408 ? emit_prefill_matrix<true, true>(s)
+                                     : emit_prefill_matrix<true>(s))
+                 : emit_prefill_matrix<false>(s);
     }
     const auto *kernel = legacy(original);
     return kernel ? kernel->emit_kernel(original) : std::string{};

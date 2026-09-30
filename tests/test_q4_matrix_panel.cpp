@@ -309,12 +309,12 @@ LSE_TEST(q4_matrix_panel_cooperative_up_requires_exact_shape_and_lds_capacity) {
   LSE_EXPECT(dispatch::q4_matrix_panel_shape(f.original()));
   LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) != nullptr);
   LSE_EXPECT_EQ(dispatch::q4_matrix_panel_rule(f.original())->shared_words,
-                1152u);
-  for (const auto bytes : {0u, 4096u, 4607u}) {
+                2304u);
+  for (const auto bytes : {0u, 4608u, 9215u}) {
     f.device.lds_bytes_per_workgroup = bytes;
     LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) == nullptr);
   }
-  f.device.lds_bytes_per_workgroup = 4608;
+  f.device.lds_bytes_per_workgroup = 9216;
   LSE_EXPECT(dispatch::q4_matrix_panel_row(f.original()) != nullptr);
   for (const auto rows : {512, 1023, 1025}) {
     Fixture other(rows, 17408, 5120);
@@ -333,7 +333,7 @@ LSE_TEST(q4_matrix_panel_requires_barriers_only_for_shared_staging) {
   if (!matrix)
     return;
   const std::array symbols{"bits.f32", "value.f32", "wave.shfl_xor",
-                           "rint", "max", "abs"};
+                           "rint",     "max",       "abs"};
   std::vector<ir::PrimitiveSource> entries;
   for (const auto symbol : symbols)
     entries.push_back({symbol, up.sources.find(symbol)});
@@ -448,7 +448,7 @@ LSE_TEST(
       LSE_EXPECT(admitted.ok());
       if (!admitted.ok())
         continue;
-      LSE_EXPECT_EQ(admitted->lds_bytes, columns == 17408 ? 4608u : 0u);
+      LSE_EXPECT_EQ(admitted->lds_bytes, columns == 17408 ? 9216u : 0u);
       LSE_EXPECT_EQ(admitted->dims.workgroup_size[0], 256u);
       LSE_EXPECT_EQ(admitted->dims.workgroup_count[0], rows == 8 ? 40u
                                                        : columns == 17408
