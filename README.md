@@ -11,40 +11,10 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 
 [Install](#install-a-release) · [Start the server](#start-the-http-server) ·
 [MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
-[Performance](#measured-performance) · [Build](#build-from-source) ·
+[Benchmarks](#humaneval-through-32k) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
-## Current release: v0.4.23
-
-Run a 27B model locally with **up to 632.1 prompt tokens/s** and faster
-long-context prefill through FlashPrefill V2.
-
-- **FlashPrefill V2 on by default** for supported R9700 HRX/LOOM configurations, including MTP and DFlash2 prompt prefill.
-- **Easy opt-out:** add `--FlashPrefillV2=off` for dense prefill.
-- **Faster selection:** cooperative Wave32 block selection cuts measured selector time by about 5×.
-- **SwiGLU improvement:** unrolled single-token Q4 bias tail, with MTP and DFlash2 output checks.
-
-[Download v0.4.23](https://github.com/Geramy/LSE/releases/tag/v0.4.23)
-
-## Measured performance
-
-Qwen3.8-27B Q4 on an AMD R9700 (`gfx1201`) through HRX/Loom on macOS:
-
-| Metric | Peak observed |
-|---|---:|
-| Prefill (input tokens/s) | **632.1 pp/s** |
-| Decode (output tokens/s, Q8 DFlash2) | **67.6 tok/s** |
-| Draft acceptance (Q8 DFlash2) | **96%** |
-
-Prefill was measured on a cold 16,384-token prompt with BF16 KV, alpha 0.1,
-batch/ubatch 1024 and no prompt cache reuse; compilation time is included.
-Decode and acceptance are separate peaks from the earlier live DFlash2 block-8
-session; these peaks were not measured together.
-
-[FlashPrefill measurements](docs/experimental/sparse-attention.md)
-· [Earlier measurements](docs/RELEASE_HISTORY.md)
-
-### HumanEval+ through 32K
+## HumanEval+ through 32K
 
 **51–55% faster prefill at 32K** with FlashPrefill alpha 0.1 across Baseline,
 MTP3 and DFlash2. The completed comparison covers **1,368 generations**;
