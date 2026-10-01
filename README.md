@@ -56,6 +56,9 @@ At 16K, the merged build reached **632.1 prompt tok/s** versus 492.9 dense.
 At 32K, the earlier matched pair reached **604.9 prompt tok/s** versus 378.1 dense. The 64-token greedy output matched; perplexity
 has not been measured. [Configuration and measurements](docs/experimental/sparse-attention.md).
 
+Credit to [shcherbakov22](https://github.com/shcherbakov22/) for providing research on FlashPrefill v2
+[FlashPrefill v2 paper](https://arxiv.org/html/2608.19758v1)
+
 ## Kernel cache
 
 The CLI and HTTP server create `~/.lse/cache/` automatically and reuse compiled
