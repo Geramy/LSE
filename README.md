@@ -1,7 +1,9 @@
 # Lemon Seed Engine (LSE)
 
-LSE runs text models on AMD GPUs. It provides an HTTP server and a command-line program.
-It generates GPU kernels for the model and device, then stores compiled kernels in a local cache.
+LSE is an LLM inference engine with a built-in kernel compiler and optimization engine.
+It specializes GPU kernels for the model and device, compiles them through HIP or Loom,
+and caches the compiled kernels for reuse. LSE runs text models on AMD GPUs through
+an HTTP server or command-line program.
 
 - **HTTP server:** Chat Completions, text completions, reasoning output, and function tool calls.
 - **Model formats:** MLX group-affine Q4, Q6, and Q8 weights; BF16, FP16, and FP32 weights.
