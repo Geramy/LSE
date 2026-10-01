@@ -44,6 +44,16 @@ session; these peaks were not measured together.
 [FlashPrefill measurements](docs/experimental/sparse-attention.md)
 · [Earlier measurements](docs/RELEASE_HISTORY.md)
 
+### HumanEval+ through 32K
+
+**51–55% faster prefill at 32K** with FlashPrefill alpha 0.1 across Baseline,
+MTP3 and DFlash2. The completed comparison covers **1,368 generations**;
+correctness matches Off at Standard and 32K, with one additional failure per mode at 16K.
+
+[![HumanEval+ correctness, prompt speed and decode speed for all six configurations at Standard, 16K and 32K context](docs/benchmarks/flashprefill-humaneval-32k.png)](docs/benchmarks/flashprefill-humaneval-32k.png)
+
+[research](docs/benchmarks/FlashPrefill-Results-Redesigned.pdf) · [Benchmark data](docs/benchmarks/flashprefill-humaneval-32k.json)
+
 ## FlashPrefill V2
 
 The HTTP server enables FlashPrefill V2 prefill by default on supported R9700
