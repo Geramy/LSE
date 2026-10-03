@@ -334,6 +334,11 @@ if(LSE_ENABLE_HRX)
   add_executable(compile_loom_matrix compile_loom_matrix.cpp)
   lse_apply_common_flags(compile_loom_matrix)
   target_link_libraries(compile_loom_matrix PRIVATE lse_backend_hrx lse_graph lse_kernels)
+  # What one cached kernel's loomc compile costs the host (peak RSS and the
+  # largest allocation): the size of an on-device compile.
+  add_executable(measure_loomc_compile measure_loomc_compile.cpp)
+  lse_apply_common_flags(measure_loomc_compile)
+  target_link_libraries(measure_loomc_compile PRIVATE lse_backend_hrx lse_graph lse_kernels)
 endif()
 
 # Mixed-sign dot and activation rounding remain independently typed and gated.

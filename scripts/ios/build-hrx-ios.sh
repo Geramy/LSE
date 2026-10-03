@@ -41,6 +41,10 @@ isa_xml="${LOOM_AMDGPU_ISA_XML:-$dev/mac_amdgpu/build/hrx-macos-adapter/_deps/am
 deployment="${IOS_DEPLOYMENT_TARGET:-26.0}"
 jobs="${LSE_BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
 patch="$root/patches/hrx/ios-static-runtime.patch"
+# loomc grew four arrays on every append, doubling their capacity each time:
+# a 1024-token prefill kernel asked for 16 GiB in stage-matrix-operands, which
+# macOS maps lazily and iOS refuses. Applied until the fix is upstream.
+loom_patch="$root/patches/hrx/loom-grow-arrays-only-when-full.patch"
 
 die() { echo "$*" >&2; exit 1; }
 
@@ -57,6 +61,7 @@ done
 lipo -info "$hsa_library" 2>/dev/null | grep -q arm64 ||
   die "HSA_IOS_LIBRARY is not an arm64 archive: $hsa_library"
 [[ -f "$patch" ]] || die "missing $patch"
+[[ -f "$loom_patch" ]] || die "missing $loom_patch"
 
 # The host compiler is Xcode's Apple clang so the archives link into an Xcode
 # app against the SDK libc++. The AMDGPU HAL configure step still insists on
@@ -106,6 +111,8 @@ rsync -a --exclude=/.git --exclude=/build/ --exclude=__pycache__ \
 git -C "$src" init -q
 git -C "$src" apply --check "$patch"
 git -C "$src" apply "$patch"
+git -C "$src" apply --check "$loom_patch"
+git -C "$src" apply "$loom_patch"
 
 # 2. Generators that run during the build (embed_data, flatcc) must run on the
 # Mac, not on the device. Build them for macOS and point the iOS build at them.

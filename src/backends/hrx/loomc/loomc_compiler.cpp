@@ -14,6 +14,115 @@
 #include "loomc/target/amdgpu.h"
 #endif
 
+#if LSE_HAVE_LOOMC
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/mman.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <malloc/malloc.h>
+#if TARGET_OS_IOS
+#include <os/proc.h>
+#endif
+#endif
+
+namespace {
+// Every loomc allocation goes through this: the system allocator, with what
+// a compile asked for counted, so a compile that runs out of host memory says
+// how much it wanted and how much the process had, and a traced run
+// (LSE_TRACE_COMPILE_MEMORY=1) reports each compile's peak.
+struct CompileMemory {
+  std::atomic<std::uint64_t> live{0}, peak{0}, largest{0};
+  void add(std::uint64_t n) {
+    const auto now = live.fetch_add(n, std::memory_order_relaxed) + n;
+    auto p = peak.load(std::memory_order_relaxed);
+    while (now > p && !peak.compare_exchange_weak(p, now, std::memory_order_relaxed)) {}
+    auto l = largest.load(std::memory_order_relaxed);
+    while (n > l && !largest.compare_exchange_weak(l, n, std::memory_order_relaxed)) {}
+  }
+  void sub(std::uint64_t n) { live.fetch_sub(std::min(n, live.load(std::memory_order_relaxed)), std::memory_order_relaxed); }
+};
+CompileMemory g_compile_memory;
+
+std::uint64_t allocation_size(void* p) {
+#if defined(__APPLE__)
+  return p != nullptr ? malloc_size(p) : 0;
+#else
+  (void)p;
+  return 0;
+#endif
+}
+
+std::uint64_t available_memory() {
+#if defined(__APPLE__) && TARGET_OS_IOS
+  return os_proc_available_memory();
+#else
+  return 0;
+#endif
+}
+
+// The largest address range the process can still reserve, to tell an
+// exhausted address space from exhausted memory.
+std::uint64_t largest_reservable() {
+  std::uint64_t lo = 0, hi = std::uint64_t{1} << 40;
+  while (hi - lo > (std::uint64_t{16} << 20)) {
+    const std::uint64_t mid = lo + (hi - lo) / 2;
+    void* p = ::mmap(nullptr, mid, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p != MAP_FAILED) {
+      ::munmap(p, mid);
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+loomc_status_t accounted_ctl(void* self, loomc_allocator_command_t command, const void* params,
+                             void** inout_ptr) {
+  (void)self;
+  const loomc_allocator_t system = loomc_allocator_system();
+  std::uint64_t before = 0;
+  if ((command == LOOMC_ALLOCATOR_COMMAND_REALLOC || command == LOOMC_ALLOCATOR_COMMAND_FREE) &&
+      inout_ptr != nullptr)
+    before = allocation_size(*inout_ptr);
+  const std::uint64_t asked =
+      params != nullptr && command != LOOMC_ALLOCATOR_COMMAND_FREE
+          ? static_cast<const loomc_allocator_alloc_params_t*>(params)->byte_length
+          : 0;
+  const loomc_status_t status = system.ctl(system.self, command, params, inout_ptr);
+  if (command == LOOMC_ALLOCATOR_COMMAND_FREE) {
+    g_compile_memory.sub(before);
+    return status;
+  }
+  if (status != nullptr) {
+    std::fprintf(stderr,
+                 "lse: loomc allocation of %llu bytes failed (compile holds %.1f MiB, peak %.1f MiB; "
+                 "available %.1f MiB; largest reservable address range %.1f MiB)\n",
+                 static_cast<unsigned long long>(asked), g_compile_memory.live.load() / 1048576.0,
+                 g_compile_memory.peak.load() / 1048576.0, available_memory() / 1048576.0,
+                 largest_reservable() / 1048576.0);
+    return status;
+  }
+  const std::uint64_t after = inout_ptr != nullptr ? allocation_size(*inout_ptr) : 0;
+  g_compile_memory.sub(before);
+  g_compile_memory.add(after != 0 ? after : asked);
+  return status;
+}
+
+loomc_allocator_t accounted_allocator() { return loomc_allocator_t{nullptr, accounted_ctl}; }
+
+bool trace_compile_memory() {
+  static const bool on = [] {
+    const char* v = std::getenv("LSE_TRACE_COMPILE_MEMORY");
+    return v != nullptr && v[0] == '1';
+  }();
+  return on;
+}
+}  // namespace
+#endif
+
 namespace lse::backend {
 
 namespace {
@@ -263,7 +372,7 @@ struct LoomcCompiler::State {
 
     {
       OwnedStatus st(
-          loomc_target_environment_create_amdgpu(loomc_allocator_system(), &env));
+          loomc_target_environment_create_amdgpu(accounted_allocator(), &env));
       if (!st.ok()) return st.to_status("loomc_target_environment_create_amdgpu");
     }
 
@@ -277,17 +386,17 @@ struct LoomcCompiler::State {
     context_options.next = &target_options;
     {
       OwnedStatus st(loomc_context_create(&context_options,
-                                          loomc_allocator_system(), &context));
+                                          accounted_allocator(), &context));
       if (!st.ok()) return st.to_status("loomc_context_create");
     }
     {
       OwnedStatus st(
-          loomc_workspace_create(nullptr, loomc_allocator_system(), &workspace));
+          loomc_workspace_create(nullptr, accounted_allocator(), &workspace));
       if (!st.ok()) return st.to_status("loomc_workspace_create");
     }
     {
       OwnedStatus st(loomc_compiler_create(context, nullptr,
-                                           loomc_allocator_system(), &compiler));
+                                           accounted_allocator(), &compiler));
       if (!st.ok()) return st.to_status("loomc_compiler_create");
     }
 
@@ -300,7 +409,7 @@ struct LoomcCompiler::State {
     pipeline_options.source_to_low_max_errors = kOptions.source_to_low_max_errors;
     OwnedResult result;
     OwnedStatus st(loomc_pass_program_create_from_target_pipeline(
-        context, &pipeline_options, loomc_allocator_system(), &pass_program,
+        context, &pipeline_options, accounted_allocator(), &pass_program,
         result.out()));
     if (!st.ok()) {
       return st.to_status("loomc_pass_program_create_from_target_pipeline");
@@ -321,7 +430,7 @@ struct LoomcCompiler::State {
     profile_options.identity = parse_identity(arch, &selector);
     loomc_target_profile_t* profile = nullptr;
     OwnedStatus st(loomc_target_profile_create_amdgpu(
-        env, &profile_options, loomc_allocator_system(), &profile));
+        env, &profile_options, accounted_allocator(), &profile));
     if (!st.ok()) {
       return st.to_status("no loom target profile for '" + arch + "'");
     }
@@ -392,6 +501,27 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
   State& s = *state_;
   const std::lock_guard<std::mutex> lock(s.mutex);
   LSE_RETURN_IF_ERROR(s.ensure());
+  // What this compile costs the host, reported when traced, and always for a
+  // compile that needed more than 64 MiB at once.
+  struct CompileReport {
+    std::size_t source_bytes;
+    std::uint64_t held_before = g_compile_memory.live.load();
+    std::uint64_t available_before = available_memory();
+    CompileReport(std::size_t bytes) : source_bytes(bytes) {
+      g_compile_memory.peak.store(held_before);
+      g_compile_memory.largest.store(0);
+    }
+    ~CompileReport() {
+      const auto peak = g_compile_memory.peak.load() - std::min(g_compile_memory.peak.load(), held_before);
+      if (!trace_compile_memory() && peak < (std::uint64_t{64} << 20)) return;
+      std::fprintf(stderr,
+                   "lse: loomc compile of %zu bytes: peak %.1f MiB over %.1f MiB held, largest allocation "
+                   "%.1f MiB; available %.1f -> %.1f MiB\n",
+                   source_bytes, peak / 1048576.0, held_before / 1048576.0,
+                   g_compile_memory.largest.load() / 1048576.0, available_before / 1048576.0,
+                   available_memory() / 1048576.0);
+    }
+  } report(source.size());
 
   const std::string arch_key(arch);
   auto profile = s.profile_for(arch_key);
@@ -409,7 +539,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
   source_options.storage = LOOMC_SOURCE_STORAGE_COPY;
   OwnedSource loom_source;
   {
-    OwnedStatus st(loomc_source_create(&source_options, loomc_allocator_system(),
+    OwnedStatus st(loomc_source_create(&source_options, accounted_allocator(),
                                        loom_source.out()));
     if (!st.ok()) return st.to_status("loomc_source_create");
   }
@@ -419,7 +549,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
     OwnedResult result;
     OwnedStatus st(loomc_module_deserialize_from_source(
         s.context, s.workspace, loom_source.get(), nullptr,
-        loomc_allocator_system(), module.out(), result.out()));
+        accounted_allocator(), module.out(), result.out()));
     if (!st.ok()) return st.to_status("loomc_module_deserialize_from_source");
     LSE_RETURN_IF_ERROR(result_status(result.get(), "parse", arch));
   }
@@ -436,7 +566,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
     loomc_host_size_t count = 0;
     OwnedResult result;
     OwnedStatus st(loomc_module_query_functions(module.get(), &query,
-                                                loomc_allocator_system(), 0,
+                                                accounted_allocator(), 0,
                                                 nullptr, &count, result.out()));
     if (!st.ok()) return st.to_status("loomc_module_query_functions");
     LSE_RETURN_IF_ERROR(result_status(result.get(), "kernel query", arch));
@@ -447,7 +577,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
     functions.resize(count);
     OwnedResult filled;
     OwnedStatus st2(loomc_module_query_functions(
-        module.get(), &query, loomc_allocator_system(), count, functions.data(),
+        module.get(), &query, accounted_allocator(), count, functions.data(),
         &count, filled.out()));
     if (!st2.ok()) return st2.to_status("loomc_module_query_functions");
     LSE_RETURN_IF_ERROR(result_status(filled.get(), "kernel query", arch));
@@ -486,7 +616,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
     OwnedResult result;
     OwnedStatus st(loomc_compile_module(s.compiler, s.workspace, s.pass_program,
                                         module.get(), &compile_options,
-                                        loomc_allocator_system(), result.out()));
+                                        accounted_allocator(), result.out()));
     if (!st.ok()) return st.to_status("loomc_compile_module");
     LSE_RETURN_IF_ERROR(result_status(result.get(), "lowering", arch));
   }
@@ -512,7 +642,7 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
   {
     OwnedResult result;
     OwnedStatus st(loomc_emit_module(s.env, s.workspace, module.get(),
-                                    &emit_options, loomc_allocator_system(),
+                                    &emit_options, accounted_allocator(),
                                     result.out()));
     if (!st.ok()) return st.to_status("loomc_emit_module");
     LSE_RETURN_IF_ERROR(result_status(result.get(), "emit", arch));

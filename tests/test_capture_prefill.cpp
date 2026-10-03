@@ -7,6 +7,9 @@
 // of running out of memory part way.
 #include "harness.hpp"
 
+#include <mach/mach.h>
+#include <malloc/malloc.h>
+
 #include <unistd.h>
 
 #include <cstdio>
@@ -15,6 +18,8 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <mutex>
+#include <condition_variable>
 #include <string>
 #include <vector>
 
@@ -26,6 +31,8 @@
 #include "lse/backends/hrx/code_object.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
+#include <sys/resource.h>
 #include "lse/graph/codegen.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/model/config.hpp"
@@ -36,14 +43,40 @@
 #include "lse/server/router.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 #include "lse/lse.h"
-#include <mach/mach.h>
-#include <malloc/malloc.h>
 
 using namespace lse;
 using namespace lse::graph;
 using json = nlohmann::json;
 
 namespace lse::backend {
+// LSE_TEST_REAL_COMPILE=1: compile with loomc on the host and report each
+// compile's footprint growth and the process peak, to size what an on-device
+// compile needs.
+struct MeasuredLoomc final : IKernelCompiler {
+  mutable LoomcCompiler real;
+  Result<CompiledKernel> compile(std::string_view source, std::string_view arch) const override {
+    const auto before = footprint_now();
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    const auto peak_before = static_cast<std::uint64_t>(ru.ru_maxrss);
+    auto r = real.compile(source, arch);
+    getrusage(RUSAGE_SELF, &ru);
+    const auto after = footprint_now();
+    std::fprintf(stderr, "capture: loomc compile %zu bytes of source: footprint %+.1f MiB, peak RSS %.1f -> %.1f MiB%s%s\n",
+                 source.size(), (double(after) - double(before)) / 1048576.0, peak_before / 1048576.0,
+                 static_cast<double>(ru.ru_maxrss) / 1048576.0, r.ok() ? "" : ": ",
+                 r.ok() ? "" : r.status().to_string().c_str());
+    return r;
+  }
+  bool available() const override { return real.available(); }
+  std::string identity() const override { return real.identity(); }
+  static std::uint64_t footprint_now() {
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count);
+    return info.phys_footprint;
+  }
+};
 struct NullCompiler final : IKernelCompiler {
   Result<CompiledKernel> compile(std::string_view, std::string_view) const override {
     CompiledKernel k; k.code.push_back(std::byte{1}); return k;
@@ -65,13 +98,17 @@ struct CaptureEmitter final : IKernelEmitter {
   std::string_view prelude() const noexcept override { return {}; }
   DialectSourceTable sources() const noexcept override { return real.sources(); }
   std::uint64_t cache_key(const FusionGroup& g, const DeviceInfo& d) const override { return real.cache_key(g, d); }
+  bool joins_run(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.joins_run(run, d); }
+  RunScratch run_scratch(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.run_scratch(run, d); }
 };
 struct CaptureBackend : Backend<CaptureBackend> {
   static constexpr std::string_view kName = "capture";
   CpuBackend cpu;
   mutable CaptureEmitter emitter;
   mutable NullCompiler compiler;
-  mutable KernelToolchain chain{Dialect::kLoom, &emitter, &compiler};
+  mutable MeasuredLoomc loomc;
+  mutable KernelToolchain chain{Dialect::kLoom, &emitter,
+      std::getenv("LSE_TEST_REAL_COMPILE") ? static_cast<const IKernelCompiler*>(&loomc) : &compiler};
   DeviceInfo info;
   AmdDeviceInfo amd;
   std::uint64_t launches = 0;
@@ -570,6 +607,22 @@ LSE_TEST(a_loaded_engine_keeps_little_host_memory) {
               footprint / 1048576.0, device / 1048576.0, host_heap / 1048576.0, budget / 1048576.0,
               host / 1048576.0, host_report.c_str());
   LSE_EXPECT(host_heap <= budget);
+  if (std::getenv("LSE_TEST_REAL_COMPILE")) {
+    std::string text;
+    for (int i = 0; i < 3500; ++i) text += (i % 7 ? " lemon" : " tree");
+    const json body{{"prompt", text}, {"max_tokens", 4}, {"temperature", 0}};
+    const std::string payload = body.dump();
+    struct Wait { std::mutex m; std::condition_variable cv; bool done = false; } wait;
+    (void)lse_request(engine, "POST", "/v1/completions", payload.c_str(), payload.size(),
+        [](void* u, lse_request_id, lse_event ev, int status, const char* data, size_t len) {
+          if (ev == LSE_EVENT_CHUNK) return;
+          std::printf("       request %d: %.*s\n", status, int(std::min<size_t>(len, 300)), data ? data : "");
+          auto* w = static_cast<Wait*>(u);
+          std::lock_guard l(w->m); w->done = true; w->cv.notify_all();
+        }, &wait, nullptr);
+    std::unique_lock l(wait.m);
+    wait.cv.wait(l, [&] { return wait.done; });
+  }
   if (const char* pause = std::getenv("LSE_TEST_PAUSE_SECONDS")) {
     std::printf("       pid %d paused\n", getpid());
     std::fflush(stdout);
