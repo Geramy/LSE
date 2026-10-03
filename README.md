@@ -5,6 +5,8 @@ It specializes GPU kernels for the model and device, compiles them through HIP o
 and caches the compiled kernels for reuse. LSE runs text models on AMD GPUs through
 an HTTP server or command-line program.
 
+**LemonSeed Engine** · [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu) · [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg)
+
 - **HTTP server:** Chat Completions, text completions, reasoning output, and function tool calls.
 - **Model formats:** MLX group-affine Q4, Q6, and Q8 weights; BF16, FP16, and FP32 weights.
 - **Speculative decoding:** Native multi-token prediction (MTP) or an optional DFlash2 draft model.
@@ -79,14 +81,19 @@ remain available for reuse.
 | Platform | GPU requirements | Kernel source |
 |---|---|---|
 | Linux x86_64 | ROCm 7.x and [HRX](https://github.com/ROCm/hrx-system) | HIP or Loom |
-| macOS on Apple Silicon | An external AMD GPU and the activated [MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu) | Loom |
+| macOS on Apple Silicon | An external AMD GPU and the installed [mac_linuxgpu driver](https://github.com/lemonade-sdk/mac_linuxgpu) | Loom |
 | CPU | A build with the CPU backend | CPU reference execution |
 
 The tested macOS GPU is the R9700 (`gfx1201`). The macOS package includes HRX, Loom, and their runtime libraries.
 It uses the HSA runtime installed by the GPU driver and does not install the DriverKit extension.
 
-The macOS binaries target macOS 15 or later. GPU use also requires a macOS version supported by MacAMDGPU.
+The macOS binaries target macOS 15 or later. GPU use also requires a macOS version supported by mac_linuxgpu.
 See the driver instructions for that requirement.
+[mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu) replaces the earlier MacAMDGPU driver.
+
+![amdgpu_mtopg monitoring an AMD Radeon AI PRO R9700 on macOS](docs/benchmarks/amdgpu_mtopg-r9700.png)
+
+amdgpu_mtopg monitoring an AMD Radeon AI PRO R9700 over Thunderbolt 5 on an Apple M5 Max while LSE runs Qwen3.8-27B through mac_linuxgpu.
 
 Linux release targets include `gfx942`, `gfx1150`, `gfx1151`, `gfx1200`, and `gfx1201`.
 The Linux archive bundles its selected HRX runtime and patched Loom compiler;
@@ -136,7 +143,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 
 ### macOS on Apple Silicon
 
-1. Install and activate the [MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu).
+1. Install and activate the [mac_linuxgpu driver](https://github.com/lemonade-sdk/mac_linuxgpu). It also installs the HSA runtime the package uses.
 2. Download the archive and checksum.
 
    ```bash
@@ -408,6 +415,12 @@ Architecture and shape policies are in these headers:
 The engine includes device probes, a cost model, tracing, and dispatch profiling.
 A device pool can discover multiple devices. Model execution currently uses one selected device.
 Multi-device model partitioning and continuous HTTP batching remain development work.
+
+## Related projects
+
+- [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu): the unmodified upstream Linux amdgpu and amdkfd driver for macOS.
+  It provides the HSA runtime the macOS package uses.
+- [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg): a live GPU monitor for macOS, with a signed, notarized download.
 
 ## More documentation
 

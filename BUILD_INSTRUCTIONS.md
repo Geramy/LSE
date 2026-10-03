@@ -1,8 +1,8 @@
 # Building Lemon Seed Engine
 
 Two first-class targets: **Linux + ROCm** (the original, full path) and
-**macOS + Apple Silicon** (via the [MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu)
-DriverKit driver and HSA runtime). Both produce the same `lse` / `lse-server`
+**macOS + Apple Silicon** (via the [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu)
+driver and HSA runtime). Both produce the same `lse` / `lse-server`
 binaries; the difference is the GPU runtime and the kernel AOT target.
 
 The core library and CPU backend build on either platform with **no GPU and no
@@ -82,16 +82,18 @@ is `gfx1151;gfx1201;gfx942`.
 ## macOS + Apple Silicon
 
 macOS has no native AMD GPU driver, so the GPU path runs through
-[MacAMDGPU](https://github.com/lemonade-sdk/mac-amdgpu): a DriverKit system
-extension that exposes an HSA runtime for the HRX/Loom path. The build itself
+[mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu): the unmodified
+upstream Linux amdgpu and amdkfd driver running as a DriverKit system
+extension, which installs the HSA runtime for the HRX/Loom path. It replaces
+the earlier MacAMDGPU driver. The build itself
 is a normal Apple-Silicon (arm64) host build; it needs LLVM 21.1.8 + LLD 21.1.8
 (from Homebrew), CMake, Ninja, and the Rust toolchain.
 
-> **GPU execution requires the MacAMDGPU driver installed and activated on the
-> host.** The build and the host test-suite run with no GPU; only the live
-> inference needs the driver. See the
-> [MacAMDGPU quickstart](https://github.com/lemonade-sdk/mac-amdgpu/blob/main/docs/LSE_QUICKSTART.md)
-> for the driver install/activation steps.
+> **GPU execution requires the mac_linuxgpu driver installed and activated on
+> the host.** The build and the host test-suite run with no GPU; only the live
+> inference needs the driver. See
+> [Building and installing](https://github.com/lemonade-sdk/mac_linuxgpu#building-and-installing)
+> in the mac_linuxgpu README for the driver install/activation steps.
 
 ### Toolchain
 
