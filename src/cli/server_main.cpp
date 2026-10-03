@@ -1,4 +1,5 @@
-// lse-server — the /v1 HTTP surface over one loaded model.
+// lse-server — the /v1 HTTP surface over one loaded model: parse the command
+// line into an lse_config, open the engine, serve it over HTTP until a signal.
 #include <atomic>
 #include <charconv>
 #include <cmath>
@@ -11,21 +12,14 @@
 #include <csignal>
 #include <string>
 #include <thread>
-#include <fstream>
-#include <nlohmann/json.hpp>
 
-#include "lse/graph/graph.hpp"
+#include "lse/lse.h"
 #include "lse/graph/jit.hpp"
-#include "lse/model/config.hpp"
-#include "lse/model/mtp.hpp"
-#include "lse/model/dflash2.hpp"
-#include "lse/model/registry.hpp"
-#include "lse/place/devices.hpp"
-#include "lse/model/weights.hpp"
-#include "lse/server/http_server.hpp"
+#include "lse/graph/graph.hpp"
+#include "lse/kv/cache_dtype.hpp"
 #include "lse/runtime/generator.hpp"
+#include "lse/runtime/prefill_batch.hpp"
 #include "lse/server/shutdown.hpp"
-#include "lse/tokenizer/tokenizer.hpp"
 
 namespace {
 
@@ -80,32 +74,29 @@ void usage() {
       "sets \"stream\": true.");
 }
 
-int fail(const Status& s, const char* what) {
-  std::fprintf(stderr, "lse-server: %s: %s\n", what, std::string(s.message()).c_str());
-  return 1;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
-  server::ServerOptions opt;
+  lse_config cfg;
+  lse_config_init(&cfg);
   std::string model = std::getenv("LSE_MODEL") ? std::getenv("LSE_MODEL") : "";
   std::string mtp_path;
   bool no_mtp = false;
   bool dflash2_on = false;
   std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
-  std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
+  std::string tokenizer_repo;
   std::string served_name;
+  std::string host;
+  std::string api_key;
   std::string pool;
   std::string dialect;
   std::string cache_dir;
   std::int32_t kv_len = 0;
   std::optional<float> temperature_override;
   std::string kv_cache_dtype;
-  ops::SparseAttentionOptions sparse_attention;
+  std::string attention_prefill, attention_decode;
   std::string attention_calibration;
   std::optional<bool> flashprefill_toggle;
-  bool prefill_explicit = false;
   int shutdown_grace_seconds = 30;
 
   for (int i = 1; i < argc; ++i) {
@@ -119,11 +110,11 @@ int main(int argc, char** argv) {
     };
     if (a == "-h" || a == "--help") { usage(); return 0; }
     else if (a == "-m" || a == "--model") model = value("--model");
-    else if (a == "--host") opt.host = value("--host");
-    else if (a == "--port") opt.port = std::atoi(value("--port").c_str());
-    else if (a == "--api-key") opt.api_key = value("--api-key");
+    else if (a == "--host") { host = value("--host"); cfg.host = host.c_str(); }
+    else if (a == "--port") cfg.port = std::atoi(value("--port").c_str());
+    else if (a == "--api-key") api_key = value("--api-key");
     else if (a == "--served-name") served_name = value("--served-name");
-    else if (a == "--max-tokens") opt.max_tokens_cap = std::atoi(value("--max-tokens").c_str());
+    else if (a == "--max-tokens") cfg.max_tokens = std::atoi(value("--max-tokens").c_str());
     else if (a == "--shutdown-grace-seconds") {
       const auto text = value("--shutdown-grace-seconds");
       const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
@@ -138,9 +129,9 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-depth") {
       const auto text = value("--mtp-depth");
       const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
-                                          opt.mtp_depth);
+                                          cfg.mtp_depth);
       if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
-          !runtime::valid_mtp_depth(opt.mtp_depth)) {
+          !runtime::valid_mtp_depth(cfg.mtp_depth)) {
         std::fputs("lse-server: MTP depth must be an integer from 1 to 7\n", stderr);
         return 2;
       }
@@ -175,10 +166,7 @@ int main(int argc, char** argv) {
         std::fputs("lse-server: attention mode must be dense or blasst; flashprefill-v2 is prefill only\n", stderr);
         return 2;
       }
-      auto& phase = a == "--attention-prefill" ? sparse_attention.prefill : sparse_attention.decode;
-      phase.blasst = mode == "blasst";
-      phase.flashprefill = mode == "flashprefill-v2";
-      if (a == "--attention-prefill") prefill_explicit = true;
+      (a == "--attention-prefill" ? attention_prefill : attention_decode) = mode;
     }
     else if (a == "--attention-calibration") attention_calibration = value(a.c_str());
     else if (a == "--kv-cache-dtype") {
@@ -201,7 +189,7 @@ int main(int argc, char** argv) {
     }
     else if (a == "--batch-size" || a == "--ubatch-size") {
       const auto text = value(a.c_str());
-      auto& size = a == "--batch-size" ? opt.prefill.batch_size : opt.prefill.ubatch_size;
+      auto& size = a == "--batch-size" ? cfg.batch_size : cfg.ubatch_size;
       const auto parsed = std::from_chars(text.data(), text.data() + text.size(), size);
       if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
           !runtime::PrefillBatch::valid_size(size)) {
@@ -232,256 +220,58 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!opt.prefill.valid()) {
-    std::fputs("lse-server: --ubatch-size must not exceed --batch-size\n", stderr);
-    return 2;
-  }
-  std::fprintf(stderr, "lse-server: prefill batch=%u ubatch=%u\n",
-               opt.prefill.batch_size, opt.prefill.ubatch_size);
+  // Everything after the command line — the checks that combine options,
+  // the devices, the model — is the engine's, shared with every embedder.
+  cfg.model = model.c_str();
+  if (!served_name.empty()) cfg.served_name = served_name.c_str();
+  if (!api_key.empty()) cfg.api_key = api_key.c_str();
+  if (!tokenizer_repo.empty()) cfg.tokenizer_repo = tokenizer_repo.c_str();
+  if (!mtp_path.empty()) cfg.mtp_path = mtp_path.c_str();
+  cfg.no_mtp = no_mtp;
+  cfg.dflash2 = dflash2_on;
+  cfg.dflash2_model = dflash2_model.c_str();
+  cfg.flashprefill_v2 = flashprefill_toggle ? (*flashprefill_toggle ? 1 : 0) : -1;
+  if (!attention_prefill.empty()) cfg.attention_prefill = attention_prefill.c_str();
+  if (!attention_decode.empty()) cfg.attention_decode = attention_decode.c_str();
+  if (!attention_calibration.empty()) cfg.attention_calibration = attention_calibration.c_str();
+  if (!kv_cache_dtype.empty()) cfg.kv_cache_dtype = kv_cache_dtype.c_str();
+  cfg.kv_len = kv_len;
+  cfg.has_temperature = temperature_override.has_value();
+  cfg.temperature = temperature_override.value_or(0.0f);
+  if (!pool.empty()) cfg.pool = pool.c_str();
+  if (!dialect.empty()) cfg.dialect = dialect.c_str();
+  if (!cache_dir.empty()) cfg.cache_dir = cache_dir.c_str();
+  cfg.shutdown_grace_seconds = shutdown_grace_seconds;
 
-  if (prefill_explicit && flashprefill_toggle.has_value() &&
-      sparse_attention.prefill.flashprefill != *flashprefill_toggle) {
-    std::fputs("lse-server: conflicting --FlashPrefillV2 and --attention-prefill settings\n", stderr);
-    return 2;
-  }
-  if (flashprefill_toggle.value_or(false)) sparse_attention.prefill.flashprefill = true;
-  if (sparse_attention.prefill.flashprefill)
-    sparse_attention.prefill.scale = ops::kFlashPrefillDefaultAlpha;
-  const bool automatic_flashprefill = !prefill_explicit && !flashprefill_toggle.has_value();
-  const bool sparse_requested = sparse_attention.prefill.enabled() || sparse_attention.decode.enabled();
-  if (sparse_requested) {
-    if ((!no_mtp || dflash2_on) &&
-        (sparse_attention.prefill.blasst || sparse_attention.decode.enabled())) {
-      std::fputs("lse-server: BLASST requires --no-mtp and DFlash2 off; FlashPrefill V2 supports prompt prefill with dense speculative verification\n", stderr);
-      return 2;
-    }
-    if (attention_calibration.empty() &&
-        (sparse_attention.prefill.blasst || sparse_attention.decode.blasst)) {
-      std::fputs("lse-server: BLASST requires --attention-calibration\n", stderr);
-      return 2;
-    }
-    if (dialect != "loom") {
-      std::fputs("lse-server: experimental sparse attention requires --dialect loom\n", stderr);
-      return 2;
-    }
-    if (!attention_calibration.empty()) try {
-      std::ifstream input(attention_calibration);
-      const auto calibration = nlohmann::json::parse(input);
-      if (calibration.at("version").get<int>() != 1)
-        throw std::runtime_error("unsupported calibration version");
-      if (calibration.at("model").get<std::string>() != model)
-        throw std::runtime_error("calibration model must match --model exactly");
-      auto load_phase = [&](const char* name, ops::SparseAttentionPhase& phase) {
-        if (!phase.enabled()) return;
-        const auto& value = calibration.at(name).at("scale");
-        if (!value.is_number()) throw std::runtime_error("phase scale must be numeric");
-        phase.scale = value.get<float>();
-        if (!std::isfinite(phase.scale) || phase.scale < 0 || (phase.flashprefill && phase.scale > 1))
-          throw std::runtime_error("phase scale must be finite, nonnegative, and at most 1 for flashprefill-v2");
-      };
-      load_phase("prefill", sparse_attention.prefill);
-      load_phase("decode", sparse_attention.decode);
-    } catch (const std::exception& error) {
-      std::fprintf(stderr, "lse-server: invalid attention calibration: %s\n", error.what());
-      return 2;
-    }
-    std::fprintf(stderr, "lse-server: experimental sparse attention prefill=%s scale=%g decode=%s scale=%g; approximate attention, full KV retained\n",
-        sparse_attention.prefill.flashprefill ? "flashprefill-v2" : sparse_attention.prefill.blasst ? "blasst" : "dense", double(sparse_attention.prefill.scale),
-        sparse_attention.decode.blasst ? "blasst" : "dense", double(sparse_attention.decode.scale));
-  }
-  if (model.empty()) {
-    std::fputs("lse-server: no model. Pass --model or set $LSE_MODEL.\n", stderr);
-    return 2;
-  }
-  opt.model_id = served_name.empty() ? model : served_name;
-
-  // Bring the devices up BEFORE the weights are bound. Without this the
-  // model loads against no backend: nothing reaches the GPU, the forward
-  // pass runs through the host interpreter, and from outside it looks like
-  // the server never loaded a model at all.
-  if (const Status opened = place::open_default_devices(pool); !opened.ok()) {
-    return fail(opened, "opening the device set");
-  }
-  place::Devices* devices = place::default_devices();
-  if (devices == nullptr || devices->size() == 0) {
-    return fail(LSE_ERROR(kDeviceError, "no device came up"),
-                "opening the device set");
-  }
-  if (sparse_requested) {
-    for (std::size_t i = 0; i < devices->size(); ++i) {
-      const auto& info = devices->device(i).device_info();
-      if (info.arch != "gfx1201" || info.wavefront_size != 32) {
-        std::fputs("lse-server: experimental sparse attention is qualified only for gfx1201 Wave32\n", stderr);
-        return 2;
-      }
-    }
-  }
-  backend::IBackend& first_device = devices->device(devices->primary());
-  if (first_device.emitter() == nullptr) {
-    // Say which backend declined and why. Without the reason this reads as the
-    // server choosing the host interpreter, when what happened is that every
-    // code-generating backend refused and only the fallback was left.
-    std::fprintf(stderr,
-                 "lse-server: no code-generating backend came up (%s); running on '%s' through the host interpreter, which is far slower\n",
-                 std::string(devices->declined()).c_str(),
-                 std::string(first_device.name()).c_str());
-  } else {
-    std::fprintf(stderr, "lse-server: device %s\n",
-                 std::string(first_device.name()).c_str());
-  }
-
-  graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) {
-    return fail(LSE_ERROR(kDeviceError, "no scheduler could be built"),
-                "selecting the kernel dialect");
-  }
-  if (!dialect.empty()) {
-    const graph::Dialect want = *graph::dialect_from_name(dialect);
-    sched->set_dialect(want);
-    for (std::size_t i = 0; i < devices->size(); ++i) {
-      const graph::KernelToolchain* tc = sched->toolchain(i);
-      if (tc == nullptr) continue;
-      std::fprintf(stderr, "lse-server: %s generates %s%s\n",
-                   std::string(devices->device(i).name()).c_str(),
-                   std::string(to_string(tc->dialect)).c_str(),
-                   tc->dialect == want
-                       ? ""
-                       : " -- it does not declare the one asked for");
-    }
-  }
-
-  std::fprintf(stderr, "lse-server: loading %s\n", model.c_str());
-  const Status cache_status = graph::prepare_cache_dir(cache_dir);
-  if (!cache_status.ok()) return fail(cache_status, "kernel cache");
-  std::fprintf(stderr, "lse-server: kernel cache %s\n", graph::default_cache_dir().c_str());
-  auto paths = model::resolve_model(model);
-  if (!paths.ok()) return fail(paths.status(), "resolving the model");
-
-  auto cfg = model::Config::from_json_file(paths->config);
-  if (!cfg.ok()) return fail(cfg.status(), "reading the config");
-  cfg->sparse_attention = sparse_attention;
-  if (sparse_requested && cfg->attn_head_dim != 256) {
-    std::fputs("lse-server: experimental sparse attention requires head dimension 256\n", stderr);
-    return 2;
-  }
-  if (temperature_override) cfg->sampling_defaults.temperature = *temperature_override;
-  std::fprintf(stderr, "sampling defaults: temperature=%.3g top_k=%d top_p=%.3g\n",
-               static_cast<double>(cfg->sampling_defaults.temperature),
-               cfg->sampling_defaults.top_k,
-               static_cast<double>(cfg->sampling_defaults.top_p));
-  if (kv_len > 0) cfg->kv_length = kv_len;
-  if (!kv_cache_dtype.empty())
-    cfg->kv_cache_dtype = kv::cache_dtype_from_string(kv_cache_dtype).release();
-  std::fprintf(stderr, "KV cache: %s; attention accumulation fp32 (target/MTP paged cache)\n",
-               std::string(kv::to_string(cfg->kv_cache_dtype)).c_str());
-
-  auto weights = paths->weights.ends_with(".index.json")
-                     ? model::SafeTensors::open_sharded(paths->weights)
-                     : model::SafeTensors::open(paths->weights);
-  if (!weights.ok()) return fail(weights.status(), "opening the weights");
-
-  const std::string mtp_where =
-      (no_mtp || dflash2_on) ? std::string()
-             : (mtp_path.empty() ? model::MtpModule::find_beside(model)
-                                 : mtp_path);
-  if (automatic_flashprefill) {
-    auto arch = model::detect_architecture(*cfg, *weights);
-    bool supported = arch.ok() && (*arch)->name == "qwen3.5" &&
-                     cfg->attn_head_dim == 256 &&
-                     (cfg->kv_cache_dtype == kv::CacheDType::kBF16 ||
-                      cfg->kv_cache_dtype == kv::CacheDType::kF32);
-    for (std::size_t i = 0; i < devices->size(); ++i) {
-      const auto& info = devices->device(i).device_info();
-      const auto* tc = sched->toolchain(i);
-      supported = supported && info.arch == "gfx1201" && info.wavefront_size == 32 &&
-                  tc != nullptr && tc->dialect == graph::Dialect::kLoom;
-    }
-    if (supported) {
-      cfg->sparse_attention.prefill = {false, ops::kFlashPrefillDefaultAlpha, true};
-      if (!attention_calibration.empty()) {
-        try {
-          std::ifstream input(attention_calibration);
-          const auto calibration = nlohmann::json::parse(input);
-          if (calibration.at("version").get<int>() != 1 ||
-              calibration.at("model").get<std::string>() != model)
-            throw std::runtime_error("calibration version/model mismatch");
-          const auto& value = calibration.at("prefill").at("scale");
-          if (!value.is_number()) throw std::runtime_error("phase scale must be numeric");
-          const float alpha = value.get<float>();
-          if (!std::isfinite(alpha) || alpha < 0 || alpha > 1)
-            throw std::runtime_error("FlashPrefill V2 alpha must be in [0, 1]");
-          cfg->sparse_attention.prefill.scale = alpha;
-        } catch (const std::exception& error) {
-          std::fprintf(stderr, "lse-server: invalid attention calibration: %s\n", error.what());
-          return 2;
-        }
-      }
-      std::fprintf(stderr, "lse-server: FlashPrefillV2=on alpha=%g (default); disable with --FlashPrefillV2=off\n",
-                   double(cfg->sparse_attention.prefill.scale));
-    } else {
-      std::fputs("lse-server: FlashPrefillV2 inactive for this configuration; prefill=dense\n", stderr);
-    }
-  } else if (flashprefill_toggle == false && !sparse_attention.prefill.enabled()) {
-    std::fputs("lse-server: FlashPrefillV2=off; prefill=dense\n", stderr);
-  }
-
-  auto built = model::build_model(*cfg, *weights, "");
-  if (!built.ok()) return fail(built.status(), "building the model");
-  std::unique_ptr<model::HybridLM> lm = built.release();
-
-  model::WeightBinder binder(*weights, &cfg->quantization);
-  if (const Status s = lm->load(binder); !s.ok()) {
-    return fail(s, "binding the weights");
-  }
-
-  const std::string tok_dir = paths->weights.substr(0, paths->weights.find_last_of('/'));
-  auto tok = tokenizer::Tokenizer::for_model_dir(tok_dir, tokenizer_repo);
-  if (!tok.ok()) return fail(tok.status(), "loading the tokenizer");
-
-  server::HttpServer http(*lm, *tok, opt);
-
-  // Speculative decoding when the checkpoint ships a module, exactly as the
-  // CLI resolves it.
-  std::unique_ptr<model::MtpModule> mtp;
-  if (!mtp_where.empty()) {
-    auto opened = model::MtpModule::open(mtp_where, *cfg, *lm);
-    if (opened.ok()) {
-      mtp = opened.release();
-      http.use_mtp(*mtp);
-      std::fprintf(stderr, "lse-server: MTP depth %u from %s\n",
-                   opt.mtp_depth, mtp_where.c_str());
-    } else if (!mtp_path.empty()) {
-      // Named explicitly and it did not load: that is an error, where a
-      // module merely found beside the model is not.
-      return fail(opened.status(), "loading the MTP module");
-    } else {
-      std::fprintf(stderr, "lse-server: MTP unavailable: %s\n",
-                   opened.status().to_string().c_str());
-    }
-  }
-
-  std::unique_ptr<model::DFlash2Module> dflash2;
-  if (dflash2_on) {
-    auto opened = model::DFlash2Module::open(dflash2_model, *cfg, *lm);
-    if (!opened.ok()) return fail(opened.status(), "loading DFlash2");
-    dflash2 = opened.release();
-    http.use_dflash2(*dflash2);
-    std::fprintf(stderr, "lse-server: DFlash2 block %u from %s\n",
-                 dflash2->block_size(), dflash2_model.c_str());
+  char* err = nullptr;
+  lse_engine* engine = lse_open(&cfg, &err);
+  if (engine == nullptr) {
+    std::fprintf(stderr, "lse-server: %s\n", err != nullptr ? err : "could not open the engine");
+    lse_free(err);
+    return lse_last_error() == LSE_ERR_INVALID_ARGUMENT ? 2 : 1;
   }
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
   server::detail::ShutdownWatch shutdown(
-      g_stopping, std::chrono::seconds(shutdown_grace_seconds), [&] { http.stop(); });
+      g_stopping, std::chrono::seconds(shutdown_grace_seconds), [&] { lse_http_stop(engine); });
 
-  std::fprintf(stderr, "lse-server: %s on http://%s:%d\n", opt.model_id.c_str(),
-               opt.host.c_str(), opt.port);
-  const Status served = http.listen();
-  // httplib joins every request worker before listen returns. Only now may the
-  // model, cached executables, device allocations and runtime be destroyed.
+  std::fprintf(stderr, "lse-server: %s on http://%s:%d\n",
+               served_name.empty() ? model.c_str() : served_name.c_str(),
+               host.empty() ? "127.0.0.1" : host.c_str(), cfg.port);
+  lse_result served = lse_http_start(engine, nullptr, 0, &err);
+  // httplib joins every request worker before the listener returns. Only now
+  // may the model, cached executables, device allocations and runtime be
+  // destroyed.
+  if (served == LSE_OK) served = lse_http_wait(engine, &err);
   shutdown.finish();
-  if (!served.ok()) return fail(served, "listening");
+  if (served != LSE_OK) {
+    std::fprintf(stderr, "lse-server: listening: %s\n", err != nullptr ? err : "failed");
+    lse_free(err);
+    lse_close(engine);
+    return 1;
+  }
   std::fprintf(stderr, "lse-server: requests drained; releasing model and runtime\n");
+  lse_close(engine);
   return 0;
 }

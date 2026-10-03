@@ -38,6 +38,7 @@ include(LSERust)
 # ---------------------------------------------------------------------------
 add_library(lse_core
   src/core/debug.cpp
+  src/core/progress.cpp
   src/core/dtype.cpp
   src/core/shape.cpp
   src/core/sha256.cpp
@@ -415,11 +416,24 @@ if(TARGET lse_tokenizer)
 
   # The OpenAI-shaped HTTP surface. httplib and nlohmann/json are vendored
   # headers, so this adds no package to find.
-  add_library(lse_server src/server/http_server.cpp src/server/chat.cpp src/server/chat_protocol.cpp)
+  add_library(lse_server src/server/router.cpp src/server/in_process.cpp src/server/http_server.cpp src/server/chat.cpp src/server/chat_protocol.cpp)
   target_link_libraries(lse_server PUBLIC lse_core lse_model lse_runtime lse_tokenizer)
   lse_apply_common_flags(lse_server)
   find_package(Threads REQUIRED)
   target_link_libraries(lse_server PUBLIC Threads::Threads)
+
+  # libLSE: the engine as an in-process library behind one plain-C header
+  # (include/lse/lse.h). lse-server is a command line over it, and an app
+  # links it directly (on iOS, as an XCFramework; see scripts/ios/).
+  add_library(lse_api src/api/lse.cpp)
+  add_library(lse::api ALIAS lse_api)
+  set_target_properties(lse_api PROPERTIES OUTPUT_NAME LSE)
+  target_link_libraries(lse_api PUBLIC lse_server lse_runtime lse_model
+                                       lse_tokenizer lse_place lse_probe
+                                       lse_backends)
+  target_compile_definitions(lse_api PRIVATE
+    "LSE_ENGINE_VERSION=\"${PROJECT_VERSION}\"")
+  lse_apply_common_flags(lse_api)
 
   add_executable(lse-server src/cli/server_main.cpp)
   if(LSE_ROCM_RUNTIME_DIR)
@@ -436,9 +450,7 @@ if(TARGET lse_tokenizer)
     target_compile_definitions(lse-server PRIVATE
       LSE_HSA_RUNTIME_DIR="${LSE_ROCM_RUNTIME_DIR}")
   endif()
-  target_link_libraries(lse-server PRIVATE lse_server lse_runtime lse_model
-                                           lse_tokenizer lse_place lse_probe
-                                           lse_backends)
+  target_link_libraries(lse-server PRIVATE lse_api)
   lse_apply_common_flags(lse-server)
 endif()
 
