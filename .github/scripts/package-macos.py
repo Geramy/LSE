@@ -43,8 +43,7 @@ def main():
     for directory in ('bin', 'lib', 'libexec', 'licenses'):
         (package / directory).mkdir(parents=True)
     search = [llvm / 'lib/c++', llvm / 'lib/unwind', llvm / 'lib',
-              work / 'hrx-build/loom/binding/c', work / 'hrx-build/libhrx/src/libhrx',
-              work / 'hsa-build']
+              work / 'hrx-build/loom/binding/c', work / 'hrx-build/libhrx/src/libhrx']
     sources = {}
     pending = []
 
@@ -62,9 +61,10 @@ def main():
     for binary in ('lse', 'lse-server', 'compile_loom_matrix'):
         add(work / 'lse-build' / ('tests/' + binary if binary == 'compile_loom_matrix' else binary),
             package / 'libexec' / binary)
-    # HRX opens HSA by basename at runtime; it is absent from otool's closure.
-    add(work / 'hsa-build/libhsa-runtime64.dylib', package / 'lib/libhsa-runtime64.1.dylib')
-    (package / 'lib/libhsa-runtime64.dylib').symlink_to('libhsa-runtime64.1.dylib')
+    # The HSA runtime belongs to the installed GPU driver and must match its
+    # DriverKit extension, so the archive does not bundle one. HRX opens it by
+    # basename (found in /usr/local/lib) and LSE falls back to the driver's
+    # /Library/MacAMDGPU/runtime copy.
     for dst in pending:
         src = sources[dst]
         own_id = run('otool', '-D', str(src)).splitlines()[1:]
@@ -209,7 +209,8 @@ def main():
         './bin/lse --help\n'
         './bin/lse --model /path/to/model --pool hrx:0 --dialect loom --prompt "Hello"\n'
         './bin/lse-server --model /path/to/model --pool hrx:0 --dialect loom\n\n'
-        'Use the bin wrappers so HRX finds the bundled HSA runtime.\n'
+        'The HSA runtime is installed by the GPU driver, not this archive;\n'
+        'LSE loads it from /usr/local/lib or /Library/MacAMDGPU/runtime.\n'
         'Default JIT cache: ~/.lse/cache (created automatically).\n'
         'Cache entries validate the loaded compiler, device and emitted source.\n'
         'Use --cache-dir PATH to select another kernel cache directory.\n'
@@ -231,10 +232,10 @@ def main():
         output = Path(tmp) / 'matrix'
         output.mkdir()
         subprocess.run([str(relocated / 'libexec/compile_loom_matrix'), str(output)], env=env, check=True)
-        # Load the late-bound runtime without hsa_init / opening a device.
-        subprocess.run(['/usr/bin/python3', '-c',
-                        'import ctypes,sys; ctypes.CDLL(sys.argv[1])',
-                        str(relocated / 'lib/libhsa-runtime64.1.dylib')], env=env, check=True)
+        # A bundled HSA runtime would shadow the driver's and fail to open it.
+        bundled = sorted(p.name for p in (relocated / 'lib').glob('libhsa-runtime64*'))
+        if bundled:
+            raise RuntimeError(f'package must not bundle the HSA runtime: {bundled}')
     # The compiler fixture is a build check, not a public inference command.
     (package / 'libexec/compile_loom_matrix').unlink()
     archive = dist / (name + '.tar.gz')
