@@ -22,12 +22,32 @@ LSE_TEST(submission_tuner_selects_measured_win_and_caches_it) {
   LSE_EXPECT_EQ(s->attempts, attempts);
   LSE_EXPECT(tuner.find(42) == s);
 }
-LSE_TEST(submission_tuner_preserves_baseline_without_five_percent_win) {
+LSE_TEST(submission_tuner_preserves_baseline_without_two_percent_win) {
+  SubmissionTuner tuner;
+  auto* s = tuner.find(1);
+  train(*s, {200, 198, 199, 199});
+  LSE_EXPECT(s->done && !s->selected);
+  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 16u);
+}
+LSE_TEST(submission_tuner_accepts_small_separated_win) {
   SubmissionTuner tuner;
   auto* s = tuner.find(1);
   train(*s, {200, 194, 197, 199});
+  LSE_EXPECT(s->done && s->selected);
+  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 64u);
+}
+LSE_TEST(submission_tuner_rejects_overlapping_middle_samples) {
+  SubmissionTuner tuner;
+  auto* s = tuner.find(1);
+  constexpr std::array<double,5> baseline{190, 194, 200, 205, 209};
+  constexpr std::array<double,5> candidate{184, 189, 194, 200, 204};
+  for(unsigned attempt=0;attempt<40&&!s->done;++attempt) {
+    const auto interval=SubmissionTuner::next(*s);
+    const auto round=s->samples/4;
+    SubmissionTuner::observe(*s,123,interval==16?baseline[round]:candidate[round],true);
+  }
   LSE_EXPECT(s->done && !s->selected);
-  LSE_EXPECT_EQ(SubmissionTuner::next(*s), 16u);
+  LSE_EXPECT_EQ(SubmissionTuner::next(*s),16u);
 }
 LSE_TEST(submission_tuner_can_select_deferred_only_when_measurably_best) {
   SubmissionTuner tuner;

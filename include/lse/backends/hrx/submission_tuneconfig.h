@@ -11,7 +11,8 @@ namespace lse::backend {
 // Measures natural, completed decode work. No extra model evaluation, token
 // replay, synthetic host pacing, GPU timestamp claim, or persistent pointer key.
 // Five interleaved observations per candidate reduce monotonic clock/context
-// drift. The baseline survives noise, insufficient evidence, and <5% wins.
+// drift. Require a 2% median win and separated middle sample ranges so small,
+// repeatable submission savings survive without accepting overlapping noise.
 class SubmissionTuner {
  public:
   static constexpr std::array<std::uint32_t, 4> candidates{16, 64, 256, 0};
@@ -65,11 +66,14 @@ class SubmissionTuner {
     if (++state.samples != candidates.size() * samples_per_candidate) return;
     state.done = true;
     std::array<bool, candidates.size()> stable{};
+    std::array<double, candidates.size()> lower{}, upper{};
     for (unsigned i = 0; i < candidates.size(); ++i) {
       auto sorted = state.times[i];
       std::sort(sorted.begin(), sorted.end());
       const double median = sorted[samples_per_candidate / 2];
       state.medians[i] = median;
+      lower[i] = sorted[1];
+      upper[i] = sorted[samples_per_candidate - 2];
       for (auto& value : sorted) value = std::abs(value - median);
       std::sort(sorted.begin(), sorted.end());
       stable[i] = sorted[samples_per_candidate / 2] <= median * 0.05;
@@ -79,12 +83,14 @@ class SubmissionTuner {
     if (!stable[0]) return;
     double best = state.medians[0];
     for (unsigned i = 1; i < candidates.size(); ++i)
-      if (stable[i]) best = std::min(best, state.medians[i]);
+      if (stable[i] && upper[i] < lower[0])
+        best = std::min(best, state.medians[i]);
     // Prefer the smallest bounded batch within 2% of the best. Deferred-only
     // (0) is last, because equivalent throughput does not justify later start.
     for (unsigned i = 0; i < candidates.size(); ++i) {
-      if (stable[i] && state.medians[i] <= best * 1.02 &&
-          state.medians[i] <= state.medians[0] * 0.95) {
+      if (stable[i] && upper[i] < lower[0] &&
+          state.medians[i] <= best * 1.02 &&
+          state.medians[i] <= state.medians[0] * 0.98) {
         state.interval = candidates[i];
         state.selected = true;
         break;
