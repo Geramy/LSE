@@ -227,10 +227,44 @@ std::size_t trim_device_memory() {
   return released;
 }
 
+namespace {
+struct Reporters {
+  std::mutex mu;
+  std::vector<RuntimeMemoryReporter> all;
+};
+Reporters& reporters() {
+  static Reporters r;
+  return r;
+}
+}  // namespace
+
+void register_runtime_memory_reporter(RuntimeMemoryReporter reporter) {
+  Reporters& r = reporters();
+  std::lock_guard lock(r.mu);
+  r.all.push_back(std::move(reporter));
+}
+
+std::string runtime_memory_report() {
+  std::vector<RuntimeMemoryReporter> run;
+  {
+    Reporters& r = reporters();
+    std::lock_guard lock(r.mu);
+    run = r.all;
+  }
+  std::string text;
+  for (const auto& reporter : run) text += reporter();
+  return text;
+}
+
 Status out_of_device_memory(std::size_t bytes, const Status& cause) {
+  const std::string held = describe_device_allocations();
+  // Also logged: a failure deep in a pass may surface only as a failed
+  // request, and the runtime's own account says what the engine's does not.
+  std::fprintf(stderr, "lse: out of GPU memory allocating %zu bytes; the engine holds %s\n%s",
+               bytes, held.c_str(), runtime_memory_report().c_str());
   return Status(StatusCode::kOutOfMemory,
                 "out of GPU memory allocating " + std::to_string(bytes) + " bytes; the engine holds " +
-                    describe_device_allocations() + "; " + std::string(cause.message()));
+                    held + "; " + std::string(cause.message()));
 }
 
 void register_backend(std::string_view name, BackendFactory factory,

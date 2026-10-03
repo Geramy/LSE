@@ -65,6 +65,8 @@ void lse_linked_hsa_signal_create() __asm__("_hsa_signal_create");
 void lse_linked_hsa_signal_destroy() __asm__("_hsa_signal_destroy");
 void lse_linked_hsa_signal_wait_scacquire() __asm__("_hsa_signal_wait_scacquire");
 void lse_linked_hsa_signal_store_screlease() __asm__("_hsa_signal_store_screlease");
+// The mac_linuxgpu runtime's own extension; the runtime linked here has it.
+void lse_linked_mac_hsa_memory_report() __asm__("_mac_hsa_memory_report");
 }
 
 void* linked_hsa_symbol(const char* name) noexcept {
@@ -83,6 +85,7 @@ void* linked_hsa_symbol(const char* name) noexcept {
       {"hsa_signal_destroy", &lse_linked_hsa_signal_destroy},
       {"hsa_signal_wait_scacquire", &lse_linked_hsa_signal_wait_scacquire},
       {"hsa_signal_store_screlease", &lse_linked_hsa_signal_store_screlease},
+      {"mac_hsa_memory_report", &lse_linked_mac_hsa_memory_report},
   };
   for (const auto& [symbol, address] : kSymbols)
     if (std::strcmp(symbol, name) == 0) return reinterpret_cast<void*>(address);
@@ -274,6 +277,22 @@ class HsaRuntime {
         symbol("hsa_signal_wait_scacquire"));
     signal_store_ = reinterpret_cast<SignalStoreFn>(
         symbol("hsa_signal_store_screlease"));
+    // Optional: only the mac_linuxgpu runtime reports what it holds.
+    memory_report_ = reinterpret_cast<MemoryReportFn>(symbol("mac_hsa_memory_report"));
+  }
+
+  // What the runtime holds from the driver and who asked for it, or empty
+  // when this runtime keeps no such account.
+  [[nodiscard]] std::string memory_report() const {
+    if (memory_report_ == nullptr) return {};
+    std::string text(4096, '\0');
+    std::size_t need = memory_report_(text.data(), text.size());
+    if (need >= text.size()) {
+      text.assign(need + 1, '\0');
+      need = memory_report_(text.data(), text.size());
+    }
+    text.resize(std::min(need, text.size() - 1));
+    return text;
   }
   ~HsaRuntime() {
     if (shared_signal_ready_ && signal_destroy_ != nullptr) {
@@ -501,6 +520,7 @@ class HsaRuntime {
                                        const HsaAgent*, HsaSignal*);
   using SignalDestroyFn = HsaStatus (*)(HsaSignal);
   using SignalStoreFn = void (*)(HsaSignal, std::int64_t);
+  using MemoryReportFn = std::size_t (*)(char*, std::size_t);
   using SignalWaitFn = std::int64_t (*)(HsaSignal, int, std::int64_t,
                                         std::uint64_t, int);
 
@@ -520,6 +540,7 @@ class HsaRuntime {
   SignalCreateFn signal_create_ = nullptr;
   SignalDestroyFn signal_destroy_ = nullptr;
   SignalStoreFn signal_store_ = nullptr;
+  MemoryReportFn memory_report_ = nullptr;
   // One completion signal, reused. Creating one is a driver object and costs
   // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
   // per copy, so a model load pays it per tensor.
@@ -1309,6 +1330,11 @@ Status HrxBackend::init_impl(int device_ordinal) {
 #endif
 
   initialized_ = true;
+  // Once per process: the runtime is shared by every instance.
+  static std::once_flag reporter;
+  std::call_once(reporter, [] {
+    backend::register_runtime_memory_reporter([] { return shared_hsa().memory_report(); });
+  });
   return OkStatus();
 #endif
 }

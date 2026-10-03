@@ -168,6 +168,16 @@ std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer);
 void unregister_memory_trimmer(std::uint64_t id) noexcept;
 // Runs every trimmer; returns the bytes they report released.
 std::size_t trim_device_memory();
+// What the device runtime under a backend holds from its driver, by its own
+// account (for the mac_linuxgpu HSA runtime: buffer counts and bytes, a size
+// histogram and the callers holding the most). A backend whose runtime keeps
+// such an account registers a reporter; the reports are concatenated. Empty
+// when none is registered. Comparing it with allocation_totals shows memory
+// the runtime holds that the engine never asked for.
+using RuntimeMemoryReporter = std::function<std::string()>;
+void register_runtime_memory_reporter(RuntimeMemoryReporter reporter);
+[[nodiscard]] std::string runtime_memory_report();
+
 // The failure of a device allocation, stated as running out of GPU memory,
 // with what the engine holds by site.
 [[nodiscard]] Status out_of_device_memory(std::size_t bytes, const Status& cause);

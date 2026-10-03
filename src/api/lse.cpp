@@ -681,6 +681,12 @@ lse_engine* lse_open(const lse_config* cfg, char** err) {
   }
   g_open_state.store(2);
   t_last_error = LSE_OK;
+  // What the engine holds once ready, beside what the device runtime holds:
+  // the difference is memory the runtime keeps that the engine never asked
+  // for.
+  std::fprintf(stderr, "lse: engine ready; device memory: %s\n%s",
+               backend::describe_device_allocations().c_str(),
+               backend::runtime_memory_report().c_str());
   return engine.release();
 }
 
@@ -757,6 +763,8 @@ lse_result lse_status(const lse_engine* e, char** json_out) {
       by_site[backend::to_string(site.site)] = {{"bytes", site.live}, {"peak_bytes", site.peak},
                                                 {"allocations", site.allocations}};
     }
+    if (const std::string runtime = backend::runtime_memory_report(); !runtime.empty())
+      s["runtime_memory"] = runtime;
     s["memory"] = {{"device_bytes", device.live},
                    {"device_peak_bytes", device.peak},
                    {"device_allocations", device.allocations},

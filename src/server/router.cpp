@@ -715,6 +715,21 @@ Result<Outcome> Router::Impl::generate(
   out.prompt_per_second = st.prompt_tokens_per_second();
   if (st.spec_steps != 0) out.acceptance = st.acceptance_rate();
   impl.record(out);
+  // After every request: what the engine holds and the device runtime's own
+  // count, so growth across requests shows in the log of a run that does
+  // not fail.
+  {
+    // The runtime's totals and size histogram: its first two lines.
+    std::string runtime = backend::runtime_memory_report();
+    std::size_t end = 0;
+    for (int line = 0; line < 2 && end != std::string::npos; ++line) {
+      end = runtime.find('\n', end);
+      if (end != std::string::npos) ++end;
+    }
+    if (end != std::string::npos) runtime.resize(end);
+    std::fprintf(stderr, "lse-server: device memory after request: %s\n%s",
+                 backend::describe_device_allocations().c_str(), runtime.c_str());
+  }
 
   std::fprintf(stderr,
                "lse-server: prompt %d in %.2fs (%.1f tok/s) | decode %d in "
