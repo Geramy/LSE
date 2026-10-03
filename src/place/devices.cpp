@@ -1,6 +1,9 @@
 #include "lse/place/devices.hpp"
 
 #include <dlfcn.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include <sys/resource.h>
 
 #include <cctype>
@@ -525,6 +528,11 @@ void raise_fd_limit() {
 }
 
 void preload_gpu_runtime() {
+#if defined(__APPLE__) && TARGET_OS_IOS
+  // The HSA runtime is linked into the app: there is nothing to find or load,
+  // and an iOS app may not load one from anywhere else.
+  return;
+#else
   namespace fs = std::filesystem;
 #if defined(__APPLE__)
   constexpr const char* kHsaSoname = "libhsa-runtime64.dylib";
@@ -596,6 +604,7 @@ void preload_gpu_runtime() {
     // Held open on purpose when it is wrong: closing it can unload something
     // a later candidate already pulled in. The process keeps one either way.
   }
+#endif
 }
 
 void prepare_device_runtime() {

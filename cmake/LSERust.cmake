@@ -36,12 +36,26 @@ function(lse_provide_fastokens dir)
   endif()
 endfunction()
 
+# Cross builds name cargo's target triple. iOS links PCRE2 statically (the
+# app cannot use a system copy) and pcre2-sys then builds its bundled source
+# without the JIT, which iOS forbids.
+set(LSE_CARGO_TARGET_ARGS "")
+set(LSE_CARGO_TARGET_DIR "release")
+set(LSE_CARGO_ENV "")
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(LSE_CARGO_TARGET_ARGS --target aarch64-apple-ios)
+  set(LSE_CARGO_TARGET_DIR "aarch64-apple-ios/release")
+  set(LSE_CARGO_ENV "PCRE2_SYS_STATIC=1"
+      "IPHONEOS_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
+
 # A Rust staticlib does not carry the native C libraries its crates link
 # against (pcre2, ring, ...), so the consumer must link them. Ask rustc for the
 # list instead of hardcoding it — the set changes with fastokens' dependencies.
 function(_lse_rust_native_libs crate_dir out_var)
   execute_process(
-    COMMAND ${LSE_CARGO} rustc --locked --release --lib
+    COMMAND ${CMAKE_COMMAND} -E env ${LSE_CARGO_ENV}
+            ${LSE_CARGO} rustc --locked --release --lib ${LSE_CARGO_TARGET_ARGS}
             --manifest-path "${crate_dir}/Cargo.toml"
             -- --print native-static-libs
     OUTPUT_VARIABLE _out ERROR_VARIABLE _err RESULT_VARIABLE _rc)
@@ -80,7 +94,7 @@ function(lse_add_rust_staticlib target crate_dir lib_name)
     return()
   endif()
 
-  set(_lib "${crate_dir}/target/release/lib${lib_name}.a")
+  set(_lib "${crate_dir}/target/${LSE_CARGO_TARGET_DIR}/lib${lib_name}.a")
 
   # Depend on the sources so cargo re-runs on change; cargo decides whether a
   # rebuild is actually needed.
@@ -88,7 +102,9 @@ function(lse_add_rust_staticlib target crate_dir lib_name)
 
   add_custom_command(
     OUTPUT "${_lib}"
-    COMMAND ${LSE_CARGO} build --locked --release --manifest-path "${crate_dir}/Cargo.toml"
+    COMMAND ${CMAKE_COMMAND} -E env ${LSE_CARGO_ENV}
+            ${LSE_CARGO} build --locked --release ${LSE_CARGO_TARGET_ARGS}
+            --manifest-path "${crate_dir}/Cargo.toml"
     DEPENDS ${_srcs}
     COMMENT "cargo build --release (${lib_name})"
     VERBATIM)

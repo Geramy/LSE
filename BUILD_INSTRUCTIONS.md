@@ -1,6 +1,6 @@
 # Building Lemon Seed Engine
 
-Two first-class targets: **Linux + ROCm** (the original, full path) and
+Two first-class targets (plus an in-process iOS/iPadOS library, below): **Linux + ROCm** (the original, full path) and
 **macOS + Apple Silicon** (via the [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu)
 driver and HSA runtime). Both produce the same `lse` / `lse-server`
 binaries; the difference is the GPU runtime and the kernel AOT target.
@@ -153,6 +153,32 @@ export DYLD_LIBRARY_PATH=<hrx-install>/lib:$DYLD_LIBRARY_PATH   # so libhsa-runt
 
 Use the `macos-arm64` release asset for Apple Silicon; it bundles the HSA/HRX/Loom
 runtime. Linux release binaries are not macOS builds and vice versa.
+
+---
+
+## iOS / iPadOS (in-process library)
+
+On an iPad with the mac_linuxgpu driver embedded in the app, the engine runs
+inside the app: there is no executable and no subprocess. The app links
+`LSE.xcframework` (libLSE plus HRX, loomc, the tokenizer and the static HSA
+runtime) and talks to the engine through `include/lse/lse.h`: `lse_open`
+loads the model, `lse_request` takes the same JSON requests the HTTP server
+does, and `lse_http_start` optionally serves the OpenAI-compatible HTTP API
+from the same engine.
+
+```bash
+rustup target add aarch64-apple-ios
+MAC_LINUXGPU_DIR=<mac_linuxgpu checkout> bash scripts/ios/build-ios.sh
+# -> build/ios/LSE.xcframework
+```
+
+The script builds the HSA runtime (`make hsa-ios` in mac_linuxgpu), HRX and
+loomc as static archives (`scripts/ios/build-hrx-ios.sh`, which applies
+`patches/hrx/ios-static-runtime.patch` to a copy of the HRX source), the
+engine with `CMAKE_SYSTEM_NAME=iOS`, then prelinks them into one object that
+exports only the `lse_*` API. Kernels are generated on the device by loomc as
+GPU code objects (data); nothing is compiled for the CPU at run time. The
+kernel cache defaults to the app's `Library/Caches/lse/kernels`.
 
 ---
 

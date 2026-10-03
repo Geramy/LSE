@@ -398,24 +398,12 @@ endif()
 lse_apply_common_flags(lse_place)
 
 # ---------------------------------------------------------------------------
-# cli — needs a tokenizer, so it is built only when the Rust shim is available.
+# server and libLSE — need a tokenizer, so they are built only when the Rust
+# shim is available.
 # ---------------------------------------------------------------------------
 if(TARGET lse_tokenizer)
-  add_executable(lse src/cli/main.cpp)
-
-  # Diagnostic: per-block hidden-state comparison across pool shapes.
-  # scratch_probe/ is untracked working material, so the target exists only
-  # where the file does — a clean clone (CI) has neither.
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/scratch_probe/layer_diff.cpp)
-    add_executable(layer_diff scratch_probe/layer_diff.cpp)
-    target_link_libraries(layer_diff PRIVATE lse_runtime lse_model
-                                             lse_tokenizer lse_place lse_probe
-                                             lse_backends)
-    lse_apply_common_flags(layer_diff)
-  endif()
-
-  # The OpenAI-shaped HTTP surface. httplib and nlohmann/json are vendored
-  # headers, so this adds no package to find.
+  # The OpenAI-shaped request surface (Router) and its HTTP adapter. httplib
+  # and nlohmann/json are vendored headers, so this adds no package to find.
   add_library(lse_server src/server/router.cpp src/server/in_process.cpp src/server/http_server.cpp src/server/chat.cpp src/server/chat_protocol.cpp)
   target_link_libraries(lse_server PUBLIC lse_core lse_model lse_runtime lse_tokenizer)
   lse_apply_common_flags(lse_server)
@@ -434,6 +422,25 @@ if(TARGET lse_tokenizer)
   target_compile_definitions(lse_api PRIVATE
     "LSE_ENGINE_VERSION=\"${PROJECT_VERSION}\"")
   lse_apply_common_flags(lse_api)
+endif()
+
+# ---------------------------------------------------------------------------
+# cli — needs a tokenizer, so it is built only when the Rust shim is available.
+# iOS builds the library only: an app links libLSE and runs no executables.
+# ---------------------------------------------------------------------------
+if(TARGET lse_tokenizer AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  add_executable(lse src/cli/main.cpp)
+
+  # Diagnostic: per-block hidden-state comparison across pool shapes.
+  # scratch_probe/ is untracked working material, so the target exists only
+  # where the file does — a clean clone (CI) has neither.
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/scratch_probe/layer_diff.cpp)
+    add_executable(layer_diff scratch_probe/layer_diff.cpp)
+    target_link_libraries(layer_diff PRIVATE lse_runtime lse_model
+                                             lse_tokenizer lse_place lse_probe
+                                             lse_backends)
+    lse_apply_common_flags(layer_diff)
+  endif()
 
   add_executable(lse-server src/cli/server_main.cpp)
   if(LSE_ROCM_RUNTIME_DIR)

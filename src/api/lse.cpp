@@ -4,6 +4,9 @@
 #include "lse/lse.h"
 
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #include <atomic>
 #include <cmath>
@@ -376,7 +379,19 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
 
   std::fprintf(stderr, "lse-server: loading %s\n", model.c_str());
   progress::begin("resolving_model", model);
-  const Status cache_status = graph::prepare_cache_dir(str(c.cache_dir));
+  std::string cache_dir = str(c.cache_dir);
+#if defined(__APPLE__) && TARGET_OS_IOS
+  // An app can write only inside its container, and $HOME is the container's
+  // root, so the dot-directories the engine defaults to elsewhere are not
+  // writable. Kernel, profile and download caches go to Library/Caches unless
+  // the caller chose otherwise.
+  if (const char* home = std::getenv("HOME"); home != nullptr && *home) {
+    const std::string caches = std::string(home) + "/Library/Caches";
+    if (std::getenv("XDG_CACHE_HOME") == nullptr) ::setenv("XDG_CACHE_HOME", caches.c_str(), 0);
+    if (cache_dir.empty() && std::getenv("LSE_CACHE_DIR") == nullptr) cache_dir = caches + "/lse/kernels";
+  }
+#endif
+  const Status cache_status = graph::prepare_cache_dir(cache_dir);
   if (!cache_status.ok()) return fail(cache_status, "kernel cache");
   std::fprintf(stderr, "lse-server: kernel cache %s\n", graph::default_cache_dir().c_str());
   auto paths = model::resolve_model(model);

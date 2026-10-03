@@ -1,0 +1,99 @@
+diff --git a/runtime/src/iree/async/platform/posix/CMakeLists.txt b/runtime/src/iree/async/platform/posix/CMakeLists.txt
+index 8571401..f8122fd 100644
+--- a/runtime/src/iree/async/platform/posix/CMakeLists.txt
++++ b/runtime/src/iree/async/platform/posix/CMakeLists.txt
+@@ -9,7 +9,7 @@
+ 
+ iree_add_all_subdirs()
+ 
+-if(CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
++if(CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+ set(_posix_platform_deps "")
+ if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+   list(APPEND _posix_platform_deps iree::async::platform::linux::signal)
+@@ -65,7 +65,7 @@ iree_cc_library(
+ )
+ endif()
+ 
+-if(CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
++if(CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
+ iree_cc_library(
+   NAME
+     timer_list
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.c b/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.c
+index 9b25df6..2e762ac 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/libaqlprofile.c
+@@ -17,6 +17,19 @@ typedef enum aqlprofile_spm_decode_query_t aqlprofile_spm_decode_query_t;
+ #include "iree/base/internal/dynamic_library.h"
+ #include "iree/base/internal/path.h"
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif  // __APPLE__
++
++// An iOS app can only run code signed into its own bundle and the vendor
++// aqlprofile library is never part of it, so do not probe the filesystem with
++// dlopen there: counter and trace profiling report themselves unavailable.
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++#define IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE 0
++#else
++#define IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE 1
++#endif  // TARGET_OS_IOS
++
+ // Keep vendor aqlprofile headers private to this translation unit. The public
+ // wrapper mirrors only the narrow ABI surface used by the HAL so callers do not
+ // inherit a large global vendor namespace.
+@@ -108,6 +121,7 @@ enum {
+ // Utilities
+ //===----------------------------------------------------------------------===//
+ 
++#if IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE
+ static const char* iree_hal_amdgpu_libaqlprofile_names[] = {
+ #if defined(IREE_PLATFORM_WINDOWS)
+     "hsa-amd-aqlprofile64.dll",
+@@ -173,6 +187,7 @@ static bool iree_hal_amdgpu_libaqlprofile_version_is_supported(
+     iree_hal_amdgpu_aqlprofile_version_t version) {
+   return version.major == IREE_HAL_AMDGPU_AQLPROFILE_SUPPORTED_MAJOR_VERSION;
+ }
++#endif  // IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE
+ 
+ static bool iree_hal_amdgpu_libaqlprofile_has_queried_version(
+     const iree_hal_amdgpu_libaqlprofile_t* libaqlprofile) {
+@@ -181,6 +196,7 @@ static bool iree_hal_amdgpu_libaqlprofile_has_queried_version(
+           libaqlprofile->version.patch);
+ }
+ 
++#if IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE
+ static iree_status_t iree_hal_amdgpu_libaqlprofile_query_version(
+     iree_hal_amdgpu_libaqlprofile_t* libaqlprofile) {
+   iree_hal_amdgpu_aqlprofile_version_t version = {0};
+@@ -370,11 +386,28 @@ iree_status_t iree_hal_amdgpu_libaqlprofile_initialize(
+   IREE_TRACE_ZONE_END(z0);
+   return status;
+ }
++#else
++iree_status_t iree_hal_amdgpu_libaqlprofile_initialize(
++    const iree_hal_amdgpu_libhsa_t* libhsa,
++    iree_string_view_list_t search_paths, iree_allocator_t host_allocator,
++    iree_hal_amdgpu_libaqlprofile_t* out_libaqlprofile) {
++  IREE_ASSERT_ARGUMENT(libhsa);
++  IREE_ASSERT_ARGUMENT(out_libaqlprofile);
++  (void)search_paths;
++  (void)host_allocator;
++  memset(out_libaqlprofile, 0, sizeof(*out_libaqlprofile));
++  return iree_make_status(IREE_STATUS_UNAVAILABLE,
++                          "AMDGPU aqlprofile cannot be loaded on iOS; hardware "
++                          "counter and trace profiling are unavailable");
++}
++#endif  // IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE
+ 
+ void iree_hal_amdgpu_libaqlprofile_deinitialize(
+     iree_hal_amdgpu_libaqlprofile_t* libaqlprofile) {
+   IREE_ASSERT_ARGUMENT(libaqlprofile);
++#if IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE
+   iree_dynamic_library_release(libaqlprofile->library);
++#endif  // IREE_HAL_AMDGPU_LIBAQLPROFILE_LOADABLE
+   memset(libaqlprofile, 0, sizeof(*libaqlprofile));
+ }
+ 
