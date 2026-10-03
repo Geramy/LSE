@@ -127,6 +127,7 @@ target_include_directories(test_api_parity PRIVATE ${CMAKE_SOURCE_DIR}/third_par
 # against what a load on the host backend allocates. No device.
 if(TARGET lse_api)
   lse_add_test(test_model_info lse_api lse_server lse_model lse_backends)
+  lse_add_test(test_power lse_api lse_server lse_backends)
   set_tests_properties(test_model_info PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu:0")
   # The same comparison against real checkpoints on the host backend. Loads a
   # whole model into RAM, so it runs only when pointed at one; see the file.

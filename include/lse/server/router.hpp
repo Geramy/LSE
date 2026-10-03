@@ -13,10 +13,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "lse/backend/backend.hpp"
 #include "lse/core/status.hpp"
 #include "lse/runtime/prefill_batch.hpp"
 #include "lse/model/hybrid_lm.hpp"
@@ -66,7 +68,18 @@ struct RouteReply {
   int status = 200;
   std::string body;  // JSON; empty only for a stream
   std::function<bool(const Send&)> stream;
+  // Extra HTTP headers (Retry-After on a 503 while the device is suspended).
+  std::vector<std::pair<std::string, std::string>> headers;
 };
+
+// What a completion request is answered while the device cannot take work,
+// or nullopt when it can (or its power is not tracked):
+//  - suspended (the host app is in the background, or the host is going to
+//    sleep): 503, type "engine_suspended", with Retry-After; nothing was
+//    started, so the client retries once the device resumes;
+//  - lost (the device's memory went with a host sleep): 503, type
+//    "device_lost"; not retryable until the engine is opened again.
+[[nodiscard]] std::optional<RouteReply> power_refusal(const std::optional<backend::DevicePowerState>& power);
 
 // A route this surface answers: the method and the path pattern (":id" names
 // one path segment), so a transport can register exactly these.

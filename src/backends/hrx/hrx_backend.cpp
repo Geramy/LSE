@@ -67,6 +67,13 @@ void lse_linked_hsa_signal_wait_scacquire() __asm__("_hsa_signal_wait_scacquire"
 void lse_linked_hsa_signal_store_screlease() __asm__("_hsa_signal_store_screlease");
 // The mac_linuxgpu runtime's own extension; the runtime linked here has it.
 void lse_linked_mac_hsa_memory_report() __asm__("_mac_hsa_memory_report");
+#if LSE_HSA_POWER
+// Device power (mac_linuxgpu feature/power and later). The iOS build passes
+// LSE_HSA_POWER only when the runtime it links exports these.
+void lse_linked_mac_hsa_agent_get_power_state() __asm__("_mac_hsa_agent_get_power_state");
+void lse_linked_mac_hsa_agent_prepare_low_power() __asm__("_mac_hsa_agent_prepare_low_power");
+void lse_linked_mac_hsa_agent_resume() __asm__("_mac_hsa_agent_resume");
+#endif
 }
 
 void* linked_hsa_symbol(const char* name) noexcept {
@@ -86,6 +93,11 @@ void* linked_hsa_symbol(const char* name) noexcept {
       {"hsa_signal_wait_scacquire", &lse_linked_hsa_signal_wait_scacquire},
       {"hsa_signal_store_screlease", &lse_linked_hsa_signal_store_screlease},
       {"mac_hsa_memory_report", &lse_linked_mac_hsa_memory_report},
+#if LSE_HSA_POWER
+      {"mac_hsa_agent_get_power_state", &lse_linked_mac_hsa_agent_get_power_state},
+      {"mac_hsa_agent_prepare_low_power", &lse_linked_mac_hsa_agent_prepare_low_power},
+      {"mac_hsa_agent_resume", &lse_linked_mac_hsa_agent_resume},
+#endif
   };
   for (const auto& [symbol, address] : kSymbols)
     if (std::strcmp(symbol, name) == 0) return reinterpret_cast<void*>(address);
@@ -279,6 +291,122 @@ class HsaRuntime {
         symbol("hsa_signal_store_screlease"));
     // Optional: only the mac_linuxgpu runtime reports what it holds.
     memory_report_ = reinterpret_cast<MemoryReportFn>(symbol("mac_hsa_memory_report"));
+    // Optional: device power, mac_linuxgpu runtimes with low-power support.
+    power_state_ = reinterpret_cast<PowerStateFn>(symbol("mac_hsa_agent_get_power_state"));
+    power_prepare_ = reinterpret_cast<PowerPrepareFn>(symbol("mac_hsa_agent_prepare_low_power"));
+    power_resume_ = reinterpret_cast<PowerResumeFn>(symbol("mac_hsa_agent_resume"));
+  }
+
+  // mac_hsa_power_state_t (mac_linuxgpu hsa/include/mac_hsa_power.h).
+  struct PowerRecord {
+    std::uint64_t version = 1;
+    std::uint32_t state = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t generation = 0;
+    std::uint32_t cause = 0;
+    std::int32_t error = 0;
+    std::uint32_t holds = 0;
+    std::uint32_t paused_queues = 0;
+    std::uint64_t quiesces = 0;
+    std::uint64_t losses = 0;
+    std::uint64_t last_transition_us = 0;
+  };
+  static constexpr HsaStatus kHsaSuspended = 46;     // HSA_STATUS_ERROR_RESOURCE_BUSY
+  static constexpr HsaStatus kHsaDeviceLost = 0x1026;  // HSA_STATUS_ERROR_FATAL
+
+  [[nodiscard]] bool tracks_power() const noexcept {
+    return power_state_ != nullptr && power_prepare_ != nullptr && power_resume_ != nullptr;
+  }
+
+  static backend::DevicePowerState convert(const PowerRecord& r) noexcept {
+    backend::DevicePowerState s;
+    switch (r.state) {
+      case 0: s.state = backend::PowerState::kActive; break;
+      case 1: s.state = backend::PowerState::kSuspending; break;
+      case 2: s.state = backend::PowerState::kSuspended; break;
+      case 3: s.state = backend::PowerState::kResuming; break;
+      case 4: s.state = backend::PowerState::kLost; break;
+      default: s.state = backend::PowerState::kUnknown; break;
+    }
+    s.flags = r.flags;
+    s.generation = r.generation;
+    s.cause = r.cause;
+    s.error = r.error;
+    s.holds = r.holds;
+    s.paused_queues = r.paused_queues;
+    s.quiesces = r.quiesces;
+    s.losses = r.losses;
+    s.last_transition_us = r.last_transition_us;
+    return s;
+  }
+
+  // Lost outranks every paused state, a paused state outranks active.
+  static int severity(backend::PowerState s) noexcept {
+    switch (s) {
+      case backend::PowerState::kLost: return 4;
+      case backend::PowerState::kSuspended: return 3;
+      case backend::PowerState::kSuspending:
+      case backend::PowerState::kResuming: return 2;
+      case backend::PowerState::kActive: return 1;
+      case backend::PowerState::kUnknown: break;
+    }
+    return 0;
+  }
+
+  // The most severe state of the GPU agents; nullopt when the runtime does
+  // not track power (or answers for none of them).
+  [[nodiscard]] std::optional<backend::DevicePowerState> power_state(
+      const std::vector<HsaAgent>& agents) const noexcept {
+    if (power_state_ == nullptr) return std::nullopt;
+    std::optional<backend::DevicePowerState> worst;
+    for (HsaAgent agent : agents) {
+      PowerRecord r;
+      if (power_state_(agent, &r, sizeof(r)) != kHsaSuccess) continue;
+      const backend::DevicePowerState s = convert(r);
+      if (!worst || severity(s.state) > severity(worst->state)) worst = s;
+    }
+    return worst;
+  }
+
+  [[nodiscard]] Result<backend::DevicePowerState> prepare_low_power(
+      const std::vector<HsaAgent>& agents, std::uint32_t drain_timeout_ms) const {
+    if (!tracks_power()) return LSE_ERROR(kUnimplemented, "this HSA runtime has no low-power control");
+    std::optional<backend::DevicePowerState> worst;
+    for (HsaAgent agent : agents) {
+      PowerRecord r;
+      const HsaStatus st = power_prepare_(agent, drain_timeout_ms, &r, sizeof(r));
+      if (st == kHsaDeviceLost) r.state = 4;
+      else if (st == kHsaSuspended) r.state = 2;  // already held low by another request
+      else if (st != kHsaSuccess)
+        return LSE_ERROR(kDeviceError, "mac_hsa_agent_prepare_low_power failed (HSA status ", st, ")");
+      const backend::DevicePowerState s = convert(r);
+      if (!worst || severity(s.state) > severity(worst->state)) worst = s;
+    }
+    if (!worst) return LSE_ERROR(kNotFound, "no GPU agent to prepare for low power");
+    return *worst;
+  }
+
+  [[nodiscard]] Result<backend::DevicePowerState> resume(const std::vector<HsaAgent>& agents) const {
+    if (!tracks_power()) return LSE_ERROR(kUnimplemented, "this HSA runtime has no low-power control");
+    std::optional<backend::DevicePowerState> worst;
+    bool lost = false;
+    for (HsaAgent agent : agents) {
+      PowerRecord r;
+      const HsaStatus st = power_resume_(agent, &r, sizeof(r));
+      if (st == kHsaDeviceLost) {
+        lost = true;
+        r.state = 4;
+      } else if (st != kHsaSuccess) {
+        return LSE_ERROR(kDeviceError, "mac_hsa_agent_resume failed (HSA status ", st, ")");
+      }
+      const backend::DevicePowerState s = convert(r);
+      if (!worst || severity(s.state) > severity(worst->state)) worst = s;
+    }
+    if (lost)
+      return LSE_ERROR(kDeviceError,
+                       "device lost: the GPU's memory went with a host sleep; close the engine and open it again");
+    if (!worst) return LSE_ERROR(kNotFound, "no GPU agent to resume");
+    return *worst;
   }
 
   // What the runtime holds from the driver and who asked for it, or empty
@@ -521,6 +649,9 @@ class HsaRuntime {
   using SignalDestroyFn = HsaStatus (*)(HsaSignal);
   using SignalStoreFn = void (*)(HsaSignal, std::int64_t);
   using MemoryReportFn = std::size_t (*)(char*, std::size_t);
+  using PowerStateFn = HsaStatus (*)(HsaAgent, void*, std::size_t);
+  using PowerPrepareFn = HsaStatus (*)(HsaAgent, std::uint32_t, void*, std::size_t);
+  using PowerResumeFn = HsaStatus (*)(HsaAgent, void*, std::size_t);
   using SignalWaitFn = std::int64_t (*)(HsaSignal, int, std::int64_t,
                                         std::uint64_t, int);
 
@@ -541,6 +672,9 @@ class HsaRuntime {
   SignalDestroyFn signal_destroy_ = nullptr;
   SignalStoreFn signal_store_ = nullptr;
   MemoryReportFn memory_report_ = nullptr;
+  PowerStateFn power_state_ = nullptr;
+  PowerPrepareFn power_prepare_ = nullptr;
+  PowerResumeFn power_resume_ = nullptr;
   // One completion signal, reused. Creating one is a driver object and costs
   // about 40 us -- at 1 MB that was two thirds of the transfer, and it is paid
   // per copy, so a model load pays it per tensor.
@@ -1334,6 +1468,17 @@ Status HrxBackend::init_impl(int device_ordinal) {
   static std::once_flag reporter;
   std::call_once(reporter, [] {
     backend::register_runtime_memory_reporter([] { return shared_hsa().memory_report(); });
+    // Device power, when the runtime tracks it. The agents are looked up
+    // each time: after a device loss and a fresh hsa_init they change.
+    if (shared_hsa().tracks_power()) {
+      backend::DevicePower power;
+      power.state = [] { return shared_hsa().power_state(shared_hsa().gpu_agents()); };
+      power.prepare = [](std::uint32_t drain_ms) {
+        return shared_hsa().prepare_low_power(shared_hsa().gpu_agents(), drain_ms);
+      };
+      power.resume = [] { return shared_hsa().resume(shared_hsa().gpu_agents()); };
+      backend::register_device_power(std::move(power));
+    }
   });
   return OkStatus();
 #endif
