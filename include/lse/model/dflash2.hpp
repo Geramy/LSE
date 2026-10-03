@@ -65,6 +65,9 @@ class DFlash2Module {
   Status append_context(const graph::Array& features, std::int32_t first);
   Status rewind(std::int32_t position);
   void reset();
+  // reset(), and the draft programs too: the workspace the module holds
+  // between requests, given back when no session needs it.
+  void release_programs();
   Status retire_prefill();
 
   Result<std::vector<std::uint32_t>> draft(std::uint32_t anchor,

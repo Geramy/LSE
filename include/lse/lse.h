@@ -93,6 +93,14 @@ typedef struct lse_config {
   int32_t port;                  /* --port (default 8080) */
   const char *api_key;           /* --api-key: require Authorization: Bearer KEY */
   int32_t shutdown_grace_seconds;/* --shutdown-grace-seconds, 1..600 (default 30) */
+
+  /* Sessions: a request naming a "session_id" continues that session's KV;
+   * one without runs in a session released when it ends. Beyond either
+   * limit, least recently used idle sessions are evicted (their next request
+   * prefills again); under memory pressure idle sessions are evicted
+   * whatever the limits. 0 means no limit. */
+  uint32_t max_sessions;          /* --max-sessions (default 8) */
+  uint64_t session_memory_budget; /* --session-memory-budget BYTES (default 0) */
 } lse_config;
 
 LSE_API void lse_config_init(lse_config *cfg);
@@ -151,6 +159,13 @@ LSE_API lse_result lse_request(lse_engine *engine, const char *method,
 /* Stops a queued or running request. Its callback receives LSE_EVENT_ERROR
  * (status 499) instead of any further output. */
 LSE_API lse_result lse_cancel(lse_engine *engine, lse_request_id id);
+
+/* Releases a session: its KV, recurrent state and everything the engine
+ * built for it go back to the device, waiting for a generation in flight in
+ * it to finish. LSE_ERR_STATE when there is no such session. The same as
+ * DELETE /v1/lse/sessions/{id}; GET /v1/lse/sessions and lse_status list the
+ * live sessions and the bytes each holds. */
+LSE_API lse_result lse_session_close(lse_engine *engine, const char *session_id);
 
 /* Engine status as JSON (release with lse_free): load phase and progress
  * (also before lse_open returns, with engine NULL), the model being served,

@@ -1214,6 +1214,18 @@ Status HybridLM::retire_prefill(std::vector<MixerState>& states) {
   return retire_completed_passes(states);
 }
 
+Status HybridLM::drop_retained_passes() {
+  if (graph::Scheduler* scheduler = graph::default_scheduler()) {
+    LSE_RETURN_IF_ERROR(scheduler->drain());
+    LSE_RETURN_IF_ERROR(scheduler->release_program());
+  }
+  for (ForwardCache& cache : caches_) cache = ForwardCache{};
+  next_cache_ = 0;
+  last_pass_id_ = 0;
+  last_pass_host_groups_ = 0;
+  return OkStatus();
+}
+
 Status HybridLM::retire_completed_passes(std::vector<MixerState>& states) {
   if (std::none_of(caches_.begin(), caches_.end(),
       [&](const ForwardCache& cache) { return cache.states == &states && cache.pass_id != 0; }))

@@ -100,6 +100,9 @@ struct Request {
   bool include_usage = false;
   bool thinking_enabled = true;
   std::string thinking_level;   // "" | low | medium | high | xhigh
+  // The session whose KV this request continues; empty for a one-shot
+  // request, whose state is released when it finishes.
+  std::string session_id;
 };
 
 // Where a completion stopped, in OpenAI's vocabulary.
@@ -156,12 +159,39 @@ struct Router::Impl {
   // KV pool, so requests queue here instead.
   std::mutex generate_lock;
   std::vector<std::uint32_t> stop_ids;
-  // One resident session, restarted between requests instead of rebuilt: the
-  // state arrays keep their nodes, so the model's retained program replays
-  // and a warm request skips the per-request partition and emit entirely.
-  // Guarded by generate_lock like everything else that touches the device.
-  runtime::Session session{"resident", 0};
-  bool session_live = false;
+  // Sessions, keyed by the request's session_id. Each owns its KV, recurrent
+  // state and history; a request continues its session's prefix when the
+  // prompt extends it. The map's structure is guarded by sessions_lock, a
+  // session's contents by generate_lock (only the generating request touches
+  // them). A request without a session_id runs in a session of its own that
+  // is released, with everything the model built for it, when it ends.
+  struct SessionEntry {
+    explicit SessionEntry(const std::string& id, std::size_t slots) : session(id, slots) {}
+    runtime::Session session;
+    std::uint64_t last_used = 0;
+    std::uint64_t requests = 0;
+    // As of the end of its last request; read without generate_lock.
+    std::size_t bytes = 0;
+    std::int32_t tokens = 0;
+    void snapshot() {
+      bytes = session.cache_bytes();
+      tokens = session.position();
+    }
+  };
+  mutable std::mutex sessions_lock;
+  std::map<std::string, std::unique_ptr<SessionEntry>> sessions;
+  std::uint64_t session_clock = 0;
+  // The session the model's retained passes and the draft modules were last
+  // built for (empty: none). Switching away lets go of them; with a draft
+  // module, the session switched to starts cold, since the draft's context
+  // belongs to the session before it. Guarded by generate_lock.
+  std::string bound;
+  bool bound_live = false;
+  // The session generating now, which memory pressure must not evict.
+  std::string active;
+  bool active_live = false;
+  std::uint64_t evictions = 0;
+  std::uint64_t pressure_trimmer = 0;
   // Watched by requests that brought no stop flag of their own.
   std::atomic<bool> never_stopping{false};
 
@@ -173,6 +203,101 @@ struct Router::Impl {
   Impl(model::HybridLM& m, tokenizer::Tokenizer& t, ServerOptions o)
       : model(m), tok(t), opt(std::move(o)) {
     stop_ids = chat_stop_tokens(tok);
+    // Under memory pressure an idle session is evicted: its next request
+    // prefills again instead of the engine running out of memory.
+    pressure_trimmer = backend::register_memory_trimmer([this] { return evict_idle(SIZE_MAX, 0); });
+  }
+  ~Impl() { backend::unregister_memory_trimmer(pressure_trimmer); }
+
+  // Evicts least recently used idle sessions until at most `keep` remain and,
+  // with a nonzero budget, the sessions together hold at most `budget` bytes.
+  // Never the active session or the one the model is bound to (that one is
+  // released through release_bindings). Returns the bytes released.
+  std::size_t evict_idle(std::size_t keep, std::size_t budget) {
+    std::vector<std::unique_ptr<SessionEntry>> evicted;
+    std::size_t released = 0;
+    {
+      std::lock_guard held(sessions_lock);
+      for (;;) {
+        std::size_t total = 0;
+        for (const auto& [id, e] : sessions) total += e->bytes;
+        const bool over = sessions.size() > keep || (budget != 0 && total > budget);
+        if (!over) break;
+        auto victim = sessions.end();
+        for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+          if ((active_live && it->first == active) || (bound_live && it->first == bound)) continue;
+          if (victim == sessions.end() || it->second->last_used < victim->second->last_used) victim = it;
+        }
+        if (victim == sessions.end()) break;
+        released += victim->second->bytes;
+        evicted.push_back(std::move(victim->second));
+        sessions.erase(victim);
+        ++evictions;
+      }
+    }
+    // Released outside the lock: freeing device memory takes no session lock.
+    for (auto& e : evicted) {
+      std::fprintf(stderr, "lse-server: evicted session '%s' (%zu bytes)\n",
+                   e->session.id().c_str(), e->bytes);
+    }
+    evicted.clear();
+    return released;
+  }
+
+  // Lets go of what the model and the draft modules built for the bound
+  // session. `survivor`, when that session lives on, keeps its KV: its state
+  // is detached from the passes first. With a draft module the survivor is
+  // cleared instead, since the draft's context is lost. Caller holds
+  // generate_lock.
+  void release_bindings(runtime::Session* survivor) {
+    if (survivor != nullptr) {
+      if ((mtp != nullptr || dflash2 != nullptr) ||
+          !model.retire_completed_passes(survivor->states()).ok())
+        survivor->clear();
+      std::lock_guard held(sessions_lock);
+      for (auto& [id, e] : sessions)
+        if (&e->session == survivor) e->snapshot();
+    }
+    (void)model.drop_retained_passes();
+    if (mtp != nullptr) mtp->reset();
+    if (dflash2 != nullptr) dflash2->release_programs();
+    bound.clear();
+    bound_live = false;
+  }
+
+  // Releases the session `id`: its KV and state, and what the model holds for
+  // it. False when there is no such session.
+  bool close_session(const std::string& id) {
+    std::lock_guard<std::mutex> device(generate_lock);
+    std::unique_ptr<SessionEntry> closing;
+    bool empty = false;
+    {
+      std::lock_guard held(sessions_lock);
+      auto it = sessions.find(id);
+      if (it == sessions.end()) return false;
+      closing = std::move(it->second);
+      sessions.erase(it);
+      empty = sessions.empty();
+    }
+    if (bound_live && bound == id) release_bindings(nullptr);
+    closing.reset();
+    // With no session left, the engine's caches are let go too, so the device
+    // holds what it held after load.
+    if (empty) (void)backend::trim_device_memory();
+    return true;
+  }
+
+  json sessions_json() const {
+    json list = json::array();
+    std::lock_guard held(sessions_lock);
+    for (const auto& [id, e] : sessions) {
+      list.push_back({{"id", id},
+                      {"tokens", e->tokens},
+                      {"bytes", e->bytes},
+                      {"requests", e->requests},
+                      {"last_used", e->last_used}});
+    }
+    return list;
   }
 
   // What /v1/models says about the one model: the OpenAI fields, the context
@@ -318,6 +443,15 @@ struct Router::Impl {
     Request r;
     r.model = get_or<std::string>(body, "model", opt.model_id);
     r.stream = get_or<bool>(body, "stream", false);
+    if (body.contains("session_id") && !body["session_id"].is_null()) {
+      if (!body["session_id"].is_string() || body["session_id"].get<std::string>().empty() ||
+          body["session_id"].get<std::string>().find('/') != std::string::npos) {
+        send_error(res, 400, "session_id must be a nonempty string without '/'",
+                   "invalid_request_error", "session_id");
+        return LSE_ERROR(kInvalidArgument, "session_id");
+      }
+      r.session_id = body["session_id"].get<std::string>();
+    }
     r.stop_strings = get_stop_strings(body);
     if (body.contains("kv_cache_dtype") && !body["kv_cache_dtype"].is_null()) {
       const auto reject = [&](std::string message) -> Status {
@@ -446,11 +580,60 @@ Result<Outcome> Router::Impl::generate(
   if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
   if (impl.dflash2 != nullptr) gen.use_dflash2(*impl.dflash2);
 
-  // Generator checks the exact token prefix before reusing resident state.
-  if (!impl.session_live) {
-    impl.session = runtime::Session{"resident", impl.model.state_slots()};
-    impl.session_live = true;
+  // The request's session: a named one is found or created, and continues
+  // its own prefix (the Generator checks the exact tokens before reusing
+  // state); a one-shot request gets a session of its own.
+  const bool ephemeral = r.session_id.empty();
+  std::unique_ptr<SessionEntry> one_shot;
+  SessionEntry* entry = nullptr;
+  if (ephemeral) {
+    one_shot = std::make_unique<SessionEntry>("", impl.model.state_slots());
+    entry = one_shot.get();
+  } else {
+    // Room for this session first: beyond the session cap or the byte budget,
+    // least recently used idle sessions go.
+    bool known = false;
+    {
+      std::lock_guard sessions_held(impl.sessions_lock);
+      known = impl.sessions.count(r.session_id) != 0;
+    }
+    const std::size_t cap = impl.opt.max_sessions == 0 ? SIZE_MAX
+                            : known ? impl.opt.max_sessions : impl.opt.max_sessions - 1;
+    (void)impl.evict_idle(cap, impl.opt.session_memory_budget);
+    std::lock_guard sessions_held(impl.sessions_lock);
+    auto& slot = impl.sessions[r.session_id];
+    if (!slot) slot = std::make_unique<SessionEntry>(r.session_id, impl.model.state_slots());
+    entry = slot.get();
+    entry->last_used = ++impl.session_clock;
+    ++entry->requests;
+    impl.active = r.session_id;
+    impl.active_live = true;
   }
+  struct ActiveScope {
+    Router::Impl& impl;
+    ~ActiveScope() {
+      std::lock_guard held(impl.sessions_lock);
+      impl.active_live = false;
+      impl.active.clear();
+    }
+  } active_scope{impl};
+  runtime::Session& session = entry->session;
+  // The model's retained passes and the draft modules serve one session at a
+  // time. Another session's are let go; that session keeps its KV unless a
+  // draft module makes it start cold.
+  if (impl.bound_live && (ephemeral || impl.bound != r.session_id)) {
+    std::unique_ptr<SessionEntry>* previous = nullptr;
+    {
+      std::lock_guard sessions_held(impl.sessions_lock);
+      auto it = impl.sessions.find(impl.bound);
+      if (it != impl.sessions.end()) previous = &it->second;
+    }
+    impl.release_bindings(previous != nullptr ? &(*previous)->session : nullptr);
+  }
+  if (!impl.bound_live && !ephemeral && (impl.mtp != nullptr || impl.dflash2 != nullptr))
+    session.clear();  // the draft's context is not this session's
+  impl.bound = r.session_id;
+  impl.bound_live = true;
 
   tokenizer::DecodeStream stream(impl.tok);
   Outcome out;
@@ -481,14 +664,28 @@ Result<Outcome> Router::Impl::generate(
     return true;
   };
 
-  auto ids = gen.generate(impl.session, r.prompt, r.limits, on_token);
-  if (!ids.ok()) {
-    impl.session.clear();
-    impl.session_live = false;
-    if (impl.mtp != nullptr) impl.mtp->reset();
-    if (impl.dflash2 != nullptr) impl.dflash2->reset();
-    return ids.status();
+  auto ids = gen.generate(session, r.prompt, r.limits, on_token);
+  // A one-shot session is gone once its request ends, with what the model
+  // built for it. A failed request's session starts cold next time, and
+  // nothing the failed pass built is kept: that is what lets the engine
+  // recover from running out of memory without a restart.
+  if (!ids.ok() || ephemeral) {
+    session.clear();
+    impl.release_bindings(nullptr);
+    one_shot.reset();
+    bool none_left = false;
+    {
+      std::lock_guard sessions_held(impl.sessions_lock);
+      none_left = impl.sessions.empty();
+    }
+    const bool out_of_memory = !ids.ok() && ids.status().code() == StatusCode::kOutOfMemory;
+    if (out_of_memory || none_left) (void)backend::trim_device_memory();
   }
+  if (!ephemeral) {
+    std::lock_guard sessions_held(impl.sessions_lock);
+    entry->snapshot();
+  }
+  if (!ids.ok()) return ids.status();
   out.completion_tokens = static_cast<int>(ids->size());
   out.hit_limit = !stopped_by_string &&
                   out.completion_tokens >= r.limits.max_tokens;
@@ -834,7 +1031,9 @@ const std::vector<Route>& Router::routes() {
                          {"GET", "/v1/lse/estimate"},
                          {"POST", "/v1/lse/estimate"},
                          {"POST", "/v1/chat/completions"},
-                         {"POST", "/v1/completions"}};
+                         {"POST", "/v1/completions"},
+                         {"GET", "/v1/lse/sessions"},
+                         {"DELETE", "/v1/lse/sessions/:id"}};
     for (const char* path : kNotImplemented) t.push_back({"POST", path});
     return t;
   }();
@@ -872,6 +1071,19 @@ RouteReply Router::handle(std::string_view method, std::string_view path,
       impl.estimate(body, res);
       return res;
     }
+    if (method == "GET" && path == "/v1/lse/sessions") {
+      set_content(res, json{{"object", "list"}, {"data", impl.sessions_json()}});
+      return res;
+    }
+    if (method == "DELETE" && matches("/v1/lse/sessions/:id", path)) {
+      const std::string id(path.substr(std::string_view("/v1/lse/sessions/").size()));
+      if (!impl.close_session(id)) {
+        send_error(res, 404, "no session '" + id + "'", "invalid_request_error", "id");
+        return res;
+      }
+      set_content(res, json{{"id", id}, {"object", "lse.session"}, {"deleted", true}});
+      return res;
+    }
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions")) {
       impl.completion(path == "/v1/chat/completions", body, stopping, res);
       return res;
@@ -893,6 +1105,10 @@ RouteReply Router::handle(std::string_view method, std::string_view path,
   return res;
 }
 
+bool Router::close_session(const std::string& id) { return impl_->close_session(id); }
+
+std::string Router::sessions_json() const { return impl_->sessions_json().dump(); }
+
 std::string Router::metrics_json() const {
   std::lock_guard held(impl_->metrics_lock);
   json m{{"model", impl_->opt.model_id},
@@ -900,6 +1116,11 @@ std::string Router::metrics_json() const {
          {"mtp_enabled", impl_->mtp != nullptr},
          {"dflash2_enabled", impl_->dflash2 != nullptr}};
   m["last_timings"] = impl_->last_timings.is_null() ? json(nullptr) : impl_->last_timings;
+  m["sessions"] = impl_->sessions_json();
+  {
+    std::lock_guard sessions_held(impl_->sessions_lock);
+    m["session_evictions"] = impl_->evictions;
+  }
   return m.dump();
 }
 

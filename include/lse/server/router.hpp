@@ -47,6 +47,12 @@ struct ServerOptions {
   std::string draft_path;    // the MTP module or DFlash2 checkpoint, if any
   std::string device_arch;   // e.g. "gfx1201"; empty when unknown
   bool fragmented_kv = true; // K/V in Loom fragments rather than contiguous pools
+  // Sessions kept between requests (keyed by a request's session_id). Beyond
+  // either limit, least recently used idle sessions are evicted; an evicted
+  // session's next request prefills again. 0: no limit. Under memory
+  // pressure idle sessions are evicted whatever the limits.
+  std::size_t max_sessions = 8;
+  std::size_t session_memory_budget = 0;  // bytes of KV and state, all sessions
 };
 
 // What a route answers. A streaming answer has status 200 and carries
@@ -95,6 +101,13 @@ class Router {
 
   // Counters and the timings of the last completed generation, as JSON.
   [[nodiscard]] std::string metrics_json() const;
+
+  // Releases a session's KV, state and what the model holds for it, waiting
+  // for a generation in flight to finish. False when there is no such
+  // session. The same as DELETE /v1/lse/sessions/{id}.
+  bool close_session(const std::string& id);
+  // The live sessions as a JSON array: id, tokens, bytes, requests.
+  [[nodiscard]] std::string sessions_json() const;
 
  private:
   struct Impl;

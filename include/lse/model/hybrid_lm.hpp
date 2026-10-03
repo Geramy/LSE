@@ -176,6 +176,12 @@ class HybridLM {
   Status commit_prefix(std::vector<MixerState>& states, std::size_t rows);
   Status retire_prefill(std::vector<MixerState>& states);
   Status retire_completed_passes(std::vector<MixerState>& states);
+  // Lets go of every retained pass, whichever states it was built against,
+  // and the scheduler's held program: what a session that is being destroyed
+  // still holds through the model. Its states must not be passed to forward
+  // again without a restart. A surviving session's states are first detached
+  // with retire_completed_passes.
+  Status drop_retained_passes();
 
   // [.., D] -> [.., vocab]. Applied to only the positions a caller needs: at
   // long context the full [B,T,vocab] tensor does not fit.

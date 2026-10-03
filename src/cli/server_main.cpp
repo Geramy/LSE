@@ -44,6 +44,9 @@ void usage() {
       "      --temperature F default request temperature, 0..2 (default: model)\n"
       "      --max-tokens N   refuse requests asking for more (default 4096)\n"
       "      --shutdown-grace-seconds N  drain requests before failing (1..600, default 30)\n"
+      "      --max-sessions N   sessions kept between requests (default 8, 0: no limit)\n"
+      "      --session-memory-budget BYTES  KV and state all sessions may hold\n"
+      "                         before idle ones are evicted (default 0: no limit)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
       "                       beside the model, when the checkpoint has one)\n"
       "      --mtp-depth N    draft proposals per verifier pass (1..7, default 3)\n"
@@ -123,6 +126,18 @@ int main(int argc, char** argv) {
     else if (a == "--api-key") api_key = value("--api-key");
     else if (a == "--served-name") served_name = value("--served-name");
     else if (a == "--max-tokens") cfg.max_tokens = std::atoi(value("--max-tokens").c_str());
+    else if (a == "--max-sessions" || a == "--session-memory-budget") {
+      const auto text = value(a.c_str());
+      std::uint64_t n = 0;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), n);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          (a == "--max-sessions" && n > UINT32_MAX)) {
+        std::fprintf(stderr, "lse-server: %s must be a nonnegative integer\n", a.c_str());
+        return 2;
+      }
+      if (a == "--max-sessions") cfg.max_sessions = static_cast<std::uint32_t>(n);
+      else cfg.session_memory_budget = n;
+    }
     else if (a == "--shutdown-grace-seconds") {
       const auto text = value("--shutdown-grace-seconds");
       const auto parsed = std::from_chars(text.data(), text.data() + text.size(),

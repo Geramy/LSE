@@ -172,6 +172,7 @@ set_tests_properties(test_dflash2 test_feature_taps PROPERTIES
 if(LSE_ENABLE_CPU)
   lse_add_test(test_reference lse_model lse_graph lse_backends)
   lse_add_test(test_runtime lse_runtime lse_model lse_graph lse_backends)
+  lse_add_test(test_memory_lifecycle lse_server lse_runtime lse_model lse_graph lse_backends lse_tokenizer)
   if(NOT TARGET lse_backend_hrx)
     target_sources(test_runtime PRIVATE
       ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp)

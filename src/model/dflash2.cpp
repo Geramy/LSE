@@ -466,6 +466,11 @@ void DFlash2Module::reset() {
   impl_->live = 0;
   impl_->contexts.clear();
 }
+void DFlash2Module::release_programs() {
+  if (auto* scheduler = graph::default_scheduler()) (void)scheduler->drain();
+  reset();
+  impl_->drafts.clear();
+}
 Status DFlash2Module::retire_prefill() {
   const auto wide = [this](const auto& entry) {
     return entry.first > static_cast<std::int64_t>(impl_->config.block_size);

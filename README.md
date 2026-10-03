@@ -337,6 +337,13 @@ Streaming responses use server-sent events. Set `"stream": true` to request them
 | `GET`, `POST /v1/lse/estimate` | Device memory for the loaded model at other settings |
 | `POST /v1/chat/completions` | Text chat, reasoning, tools, and streaming |
 | `POST /v1/completions` | Text completions and streaming |
+| `GET /v1/lse/sessions` | Live sessions, with the tokens and device bytes each holds |
+| `DELETE /v1/lse/sessions/{id}` | Releases a session's KV and state |
+
+A request that carries `"session_id"` continues that session's KV when its prompt extends the session's history.
+A request without one runs in a session of its own that is released when the request ends.
+Idle sessions beyond `--max-sessions` (default 8) or `--session-memory-budget` are evicted, least recently used first, and so are idle sessions when the device runs out of memory; an evicted session's next request prefills again.
+With a draft module (MTP or DFlash2), switching to another session starts it cold, because the draft's context belongs to the session before it.
 
 Current API limits:
 

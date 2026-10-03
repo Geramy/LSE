@@ -79,7 +79,7 @@ struct HttpServer::Impl {
         [this](const httplib::Request& req, httplib::Response& res) {
           res.set_header("Access-Control-Allow-Origin", "*");
           res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-          res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+          res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
           if (req.method == "OPTIONS") {
             res.status = 204;
             return httplib::Server::HandlerResponse::Handled;
@@ -99,7 +99,9 @@ struct HttpServer::Impl {
       forward(req, res);
     };
     for (const Route& route : Router::routes()) {
-      if (std::string_view(route.method) == "GET") http.Get(route.pattern, handler);
+      const std::string_view method(route.method);
+      if (method == "GET") http.Get(route.pattern, handler);
+      else if (method == "DELETE") http.Delete(route.pattern, handler);
       else http.Post(route.pattern, handler);
     }
   }

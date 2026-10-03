@@ -217,6 +217,8 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
 
   server::ServerOptions opt;
   opt.max_tokens_cap = c.max_tokens;
+  opt.max_sessions = c.max_sessions;
+  opt.session_memory_budget = static_cast<std::size_t>(c.session_memory_budget);
   if (c.mtp_depth != 0) {
     opt.mtp_depth = c.mtp_depth;
     if (!runtime::valid_mtp_depth(opt.mtp_depth))
@@ -614,6 +616,7 @@ void lse_config_init(lse_config* cfg) {
   cfg->max_tokens = 4096;
   cfg->port = 8080;
   cfg->shutdown_grace_seconds = 30;
+  cfg->max_sessions = 8;
 }
 
 void lse_set_log_callback(lse_log_cb cb, void* user) { log_capture().set(cb, user); }
@@ -696,6 +699,12 @@ lse_result lse_request(lse_engine* e, const char* method, const char* path,
   if (id == 0) return LSE_ERR_STATE;
   if (out_id != nullptr) *out_id = id;
   return LSE_OK;
+}
+
+lse_result lse_session_close(lse_engine* e, const char* session_id) {
+  if (e == nullptr || session_id == nullptr || *session_id == '\0') return LSE_ERR_INVALID_ARGUMENT;
+  if (!e->router || e->closing.load()) return LSE_ERR_STATE;
+  return e->router->close_session(session_id) ? LSE_OK : LSE_ERR_STATE;
 }
 
 lse_result lse_cancel(lse_engine* e, lse_request_id id) {
