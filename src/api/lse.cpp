@@ -68,13 +68,17 @@ std::string str(const char* s) { return s != nullptr ? std::string(s) : std::str
 // ---------------------------------------------------------------------------
 struct LogCapture {
   std::mutex lock;
+  // Held while a callback runs and while the callback changes, so once
+  // lse_set_log_callback returns no call into the previous one is running.
+  std::recursive_mutex calling;
   lse_log_cb cb = nullptr;
   void* user = nullptr;
   int saved_stderr = -1;
   int read_end = -1;
   std::thread reader;
 
-  void deliver(const std::string& line) {
+  void deliver(const std::string& line, lse_log_level level = LSE_LOG_INFO) {
+    std::lock_guard call(calling);
     lse_log_cb f;
     void* u;
     {
@@ -82,7 +86,7 @@ struct LogCapture {
       f = cb;
       u = user;
     }
-    if (f != nullptr) f(u, LSE_LOG_INFO, line.c_str());
+    if (f != nullptr) f(u, level, line.c_str());
   }
 
   void read_loop(int fd, int echo) {
@@ -104,9 +108,13 @@ struct LogCapture {
   }
 
   void set(lse_log_cb f, void* u) {
+    {
+      std::lock_guard call(calling);
+      std::lock_guard held(lock);
+      cb = f;
+      user = u;
+    }
     std::unique_lock held(lock);
-    cb = f;
-    user = u;
     if (f != nullptr && saved_stderr < 0) {
       int fds[2];
       if (::pipe(fds) != 0) return;
@@ -137,17 +145,7 @@ LogCapture& log_capture() {
   return *capture;
 }
 
-void log_error(const std::string& line) {
-  LogCapture& c = log_capture();
-  lse_log_cb f;
-  void* u;
-  {
-    std::lock_guard held(c.lock);
-    f = c.cb;
-    u = c.user;
-  }
-  if (f != nullptr) f(u, LSE_LOG_ERROR, line.c_str());
-}
+void log_error(const std::string& line) { log_capture().deliver(line, LSE_LOG_ERROR); }
 
 // The load state reported before an engine exists.
 std::atomic<int> g_open_state{0};  // 0 idle, 1 loading, 2 ready, 3 failed, 4 closing

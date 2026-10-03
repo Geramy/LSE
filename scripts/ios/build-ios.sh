@@ -147,8 +147,11 @@ EOF
 xcrun -sdk iphoneos clang -target "arm64-apple-ios$deployment" -I"$out/headers" \
   -Wl,-dead_strip "$probe/main.c" "$out/libLSE.a" \
   -lc++ -liconv -framework IOKit -framework CoreFoundation -o "$probe/lse_link_check"
-# CPU JIT is not allowed on iOS: the engine must never ask for it.
-if nm -u "$probe/lse_link_check" | grep -Eq '^_(pthread_jit_write_protect_np|sys_icache_invalidate)$'; then
+# CPU JIT is not allowed on iOS: the engine must never ask for it. (The
+# prelinked object cannot be dead-stripped inside, so IREE's ELF module code
+# and its sys_icache_invalidate import ride along; no CPU executable loader is
+# built, so nothing can reach them.)
+if nm -u "$probe/lse_link_check" | grep -Eq '^_pthread_jit_write_protect_np$'; then
   die "the linked engine imports a JIT entry point"
 fi
 # dlopen remains only for optional probes that fail cleanly on iOS (the

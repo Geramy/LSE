@@ -100,7 +100,9 @@ LSE_API void lse_config_init(lse_config *cfg);
 /* Log lines (what lse-server prints on stderr), one call per line without the
  * trailing newline. Process-wide: the engine's diagnostics are written to
  * stderr, which is redirected through the callback while one is set (and
- * still forwarded to the original stderr). NULL restores plain stderr. */
+ * still forwarded to the original stderr). NULL restores plain stderr. Once
+ * this returns, no call into the previous callback is running. A callback
+ * must not call lse_set_log_callback itself. */
 typedef enum lse_log_level { LSE_LOG_INFO = 0, LSE_LOG_ERROR = 1 } lse_log_level;
 typedef void (*lse_log_cb)(void *user, lse_log_level level, const char *line);
 LSE_API void lse_set_log_callback(lse_log_cb cb, void *user);
