@@ -1,7 +1,9 @@
 # Lemon Seed Engine (LSE)
 
-LSE runs text models on AMD GPUs. It provides an HTTP server and a command-line program.
-It generates GPU kernels for the model and device, then stores compiled kernels in a local cache.
+LSE is an LLM inference engine with a built-in kernel compiler and optimization engine.
+It specializes GPU kernels for the model and device, compiles them through HIP or Loom,
+and caches the compiled kernels for reuse. LSE runs text models on AMD GPUs through
+an HTTP server or command-line program.
 
 - **HTTP server:** Chat Completions, text completions, reasoning output, and function tool calls.
 - **Model formats:** MLX group-affine Q4, Q6, and Q8 weights; BF16, FP16, and FP32 weights.
@@ -11,38 +13,18 @@ It generates GPU kernels for the model and device, then stores compiled kernels 
 
 [Install](#install-a-release) · [Start the server](#start-the-http-server) ·
 [MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
-[Performance](#measured-performance) · [Build](#build-from-source) ·
+[Benchmarks](#humaneval-through-32k) · [Build](#build-from-source) ·
 [Troubleshooting](#troubleshooting)
 
-## Current release: v0.4.23
+## HumanEval+ through 32K
 
-Run a 27B model locally with **up to 632.1 prompt tokens/s** and faster
-long-context prefill through FlashPrefill V2.
+**51–55% faster prefill at 32K** with FlashPrefill alpha 0.1 across Baseline,
+MTP3 and DFlash2. The completed comparison covers **1,368 generations**;
+correctness matches Off at Standard and 32K, with one additional failure per mode at 16K.
 
-- **FlashPrefill V2 on by default** for supported R9700 HRX/LOOM configurations, including MTP and DFlash2 prompt prefill.
-- **Easy opt-out:** add `--FlashPrefillV2=off` for dense prefill.
-- **Faster selection:** cooperative Wave32 block selection cuts measured selector time by about 5×.
-- **SwiGLU improvement:** unrolled single-token Q4 bias tail, with MTP and DFlash2 output checks.
+[![HumanEval+ correctness, prompt speed and decode speed for all six configurations at Standard, 16K and 32K context](docs/benchmarks/flashprefill-humaneval-32k.png)](docs/benchmarks/flashprefill-humaneval-32k.png)
 
-[Download v0.4.23](https://github.com/Geramy/LSE/releases/tag/v0.4.23)
-
-## Measured performance
-
-Qwen3.8-27B Q4 on an AMD R9700 (`gfx1201`) through HRX/Loom on macOS:
-
-| Metric | Peak observed |
-|---|---:|
-| Prefill (input tokens/s) | **632.1 pp/s** |
-| Decode (output tokens/s, Q8 DFlash2) | **67.6 tok/s** |
-| Draft acceptance (Q8 DFlash2) | **96%** |
-
-Prefill was measured on a cold 16,384-token prompt with BF16 KV, alpha 0.1,
-batch/ubatch 1024 and no prompt cache reuse; compilation time is included.
-Decode and acceptance are separate peaks from the earlier live DFlash2 block-8
-session; these peaks were not measured together.
-
-[FlashPrefill measurements](docs/experimental/sparse-attention.md)
-· [Earlier measurements](docs/RELEASE_HISTORY.md)
+[research](docs/benchmarks/FlashPrefill-Results-Redesigned.pdf) · [Benchmark data](docs/benchmarks/flashprefill-humaneval-32k.json)
 
 ## FlashPrefill V2
 
@@ -55,6 +37,9 @@ Unsupported configurations use dense attention automatically.
 At 16K, the merged build reached **632.1 prompt tok/s** versus 492.9 dense.
 At 32K, the earlier matched pair reached **604.9 prompt tok/s** versus 378.1 dense. The 64-token greedy output matched; perplexity
 has not been measured. [Configuration and measurements](docs/experimental/sparse-attention.md).
+
+Credit to [shcherbakov22](https://github.com/shcherbakov22/) for providing research on FlashPrefill v2  
+[FlashPrefill v2 paper](https://arxiv.org/html/2608.19758v1)
 
 ## Kernel cache
 
