@@ -29,6 +29,7 @@
 #include "lse/backend/backend.hpp"
 #include "lse/core/progress.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/model/layer.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/dflash2.hpp"
@@ -154,6 +155,24 @@ std::atomic<int> g_open_state{0};  // 0 idle, 1 loading, 2 ready, 3 failed, 4 cl
 std::mutex g_open_error_lock;
 std::string g_open_error;
 std::atomic<bool> g_engine_open{false};
+
+// The device memory an engine leaves behind once its objects are destroyed:
+// the scheduler's held program, constants and tables (the scheduler and the
+// device runtime stay up for the next engine), the weight slabs, and anything
+// a registered cache still holds. Logs what remains, which is what the next
+// lse_open starts from.
+void release_engine_memory(const char* why) {
+  if (graph::Scheduler* sched = graph::default_scheduler()) {
+    const Status released = sched->release_device_memory();
+    if (!released.ok())
+      std::fprintf(stderr, "lse: releasing the scheduler's device memory: %s\n",
+                   released.to_string().c_str());
+  }
+  (void)model::release_weight_slabs();
+  (void)backend::trim_device_memory();
+  std::fprintf(stderr, "lse: engine %s; device memory still held: %s\n", why,
+               backend::describe_device_allocations().c_str());
+}
 
 const char* state_name(int s) {
   switch (s) {
@@ -639,6 +658,7 @@ lse_engine* lse_open(const lse_config* cfg, char** err) {
     return refuse(LSE_ERR_STATE, "an engine is already open in this process");
 
   g_open_state.store(1);
+  backend::reset_allocation_peaks();
   auto engine = std::make_unique<lse_engine>();
   std::optional<OpenError> error;
   try {
@@ -655,6 +675,7 @@ lse_engine* lse_open(const lse_config* cfg, char** err) {
     progress::begin("failed", error->message);
     log_error("lse: " + error->message);
     engine.reset();
+    release_engine_memory("open failed");
     g_engine_open.store(false);
     return refuse(error->code, error->message);
   }
@@ -671,6 +692,7 @@ void lse_close(lse_engine* e) {
   if (e->requests) e->requests->shutdown();
   (void)lse_http_wait(e, nullptr);
   delete e;
+  release_engine_memory("closed");
   progress::begin("idle");
   g_open_state.store(0);
   g_engine_open.store(false);

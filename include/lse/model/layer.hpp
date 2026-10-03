@@ -93,6 +93,13 @@ struct TensorWindow {
   [[nodiscard]] bool empty() const noexcept { return count <= 0; }
 };
 
+// Weights are bound into a few large device allocations (slabs) shared by
+// every model loaded in the process. A slab is freed once the weight arrays
+// carved from it are gone and this has released the binder's own hold on it:
+// what closing an engine calls after its models are destroyed. Returns the
+// bytes of slabs released. Arrays still alive keep their slab alive.
+std::size_t release_weight_slabs();
+
 class WeightBinder {
  public:
   // `quantization` says which tensors are group-affine and at what geometry.

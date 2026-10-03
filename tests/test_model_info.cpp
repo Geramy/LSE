@@ -8,6 +8,7 @@
 
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -639,6 +640,84 @@ LSE_TEST(allocation_ledger_returns_every_charge) {
     (void)view;
   }
   LSE_EXPECT_EQ(backend::allocation_totals(backend::MemoryClass::kDevice).live, before.live);
+}
+
+// lse_open and lse_close in one process, three times over: everything an
+// engine allocated goes back to the device when it closes, so each open starts
+// from what the process held before the first one, and a second engine is
+// refused while one is open.
+LSE_TEST(closing_an_engine_returns_every_device_byte) {
+  TempDir target("reopen-target"), draft("reopen-draft");
+  write_qwen(target.path, false);
+  write_dflash2(draft.path);
+  {
+    // Character-level, ids below the fixture's vocabulary.
+    json vocab = json::object();
+    int next = 0;
+    for (char c = 'a'; c <= 'z'; ++c) vocab[std::string(1, c)] = next++;
+    vocab[" "] = next++;
+    json added = json::array();
+    for (const char* special : {"<|im_start|>", "<|im_end|>", "<|endoftext|>"})
+      added.push_back({{"id", next++}, {"content", special}, {"special", true},
+                       {"single_word", false}, {"lstrip", false}, {"rstrip", false},
+                       {"normalized", false}});
+    write_text(target.path / "tokenizer.json",
+               json{{"model", {{"type", "BPE"}, {"vocab", vocab}, {"merges", json::array()}}},
+                    {"added_tokens", added}}.dump());
+  }
+  const std::string target_dir = target.path.string(), draft_dir = draft.path.string();
+  lse_config cfg;
+  lse_config_init(&cfg);
+  cfg.model = target_dir.c_str();
+  cfg.dflash2 = 1;
+  cfg.dflash2_model = draft_dir.c_str();
+  cfg.kv_len = 2048;
+  // The ctest environment selects cpu:0 (LSE_POOL), and an earlier test in
+  // this process may already have opened that set.
+  cfg.has_temperature = 1;
+  cfg.temperature = 0.0f;
+  // Earlier tests in this process may still hold arrays (and so slabs) they
+  // made; closing the first engine releases the slabs nothing uses, so the
+  // floor is what remains after that close.
+  const std::uint64_t before = device_live();
+  std::uint64_t loaded = 0, floor = 0;
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    char* err = nullptr;
+    lse_engine* engine = lse_open(&cfg, &err);
+    if (engine == nullptr) {
+      std::printf("       open failed: %s\n", err ? err : "?");
+      lse_free(err);
+      LSE_EXPECT(engine != nullptr);
+      return;
+    }
+    const std::uint64_t open_bytes = device_live();
+    if (cycle == 0) loaded = open_bytes;
+    // Every open allocates what the first one did, on top of the floor.
+    LSE_EXPECT_EQ(open_bytes, loaded);
+    // A second engine is refused while this one is open.
+    char* refused = nullptr;
+    LSE_EXPECT(lse_open(&cfg, &refused) == nullptr);
+    LSE_EXPECT_EQ(lse_last_error(), LSE_ERR_STATE);
+    lse_free(refused);
+    // The peak is this engine's own.
+    char* status = nullptr;
+    LSE_EXPECT_EQ(lse_status(engine, &status), LSE_OK);
+    if (status != nullptr) {
+      const json s = json::parse(status);
+      LSE_EXPECT(s["memory"]["device_peak_bytes"].get<std::uint64_t>() < 2 * loaded);
+    }
+    lse_free(status);
+    lse_close(engine);
+    std::printf("       cycle %d: open %llu, after close %llu (before %llu)\n", cycle,
+                static_cast<unsigned long long>(open_bytes),
+                static_cast<unsigned long long>(device_live()),
+                static_cast<unsigned long long>(before));
+    LSE_EXPECT(device_live() <= before);
+    if (cycle == 0) floor = device_live();
+    LSE_EXPECT_EQ(device_live(), floor);
+    // The model is gone, not merely unreferenced by the engine.
+    LSE_EXPECT(loaded - floor > (std::uint64_t{1} << 20));
+  }
 }
 
 LSE_TEST_MAIN()

@@ -961,6 +961,23 @@ Status Scheduler::release_program() {
   return release_phase_tables();
 }
 
+Status Scheduler::release_device_memory() {
+  LSE_RETURN_IF_ERROR(release_program());
+  impl_->plan = StreamPlan{};
+  impl_->events.clear();
+  impl_->entry_events.clear();
+  std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
+  for (auto& bars : impl_->grid_bars) bars.clear();
+  impl_->peer_mirrors.clear();
+  impl_->member_dirty.clear();
+  {
+    std::lock_guard lock(impl_->constants_mu);
+    impl_->constants.clear();
+  }
+  impl_->pending_constant.reset();
+  return OkStatus();
+}
+
 Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host) {
   return eval(roots, pull_host, nullptr);
 }

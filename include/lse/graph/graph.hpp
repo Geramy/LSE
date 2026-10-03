@@ -347,6 +347,11 @@ class Scheduler {
   // Frees the pointer tables of finished passes; drains the devices first.
   Status release_phase_tables();
   Status release_program();
+  // Everything the scheduler keeps on the device between passes: the held
+  // program, phase tables, grid-sync counters, interned constants and peer
+  // mirrors. Drains first. What an engine that is closing leaves behind;
+  // the next pass rebuilds what it needs.
+  Status release_device_memory();
   Status eval(std::span<const NodePtr> roots, bool pull_host = true);
   // When `plan` is set, replay and retain write that Program instead of the
   // scheduler's leftover one. Same-root reuse is how decode avoids rebuild.

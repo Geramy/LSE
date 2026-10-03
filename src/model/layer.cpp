@@ -73,16 +73,24 @@ std::size_t weight_slab_bytes(const backend::IBackend&) {
   return kWeightSlabBytes;
 }
 
+std::mutex& slab_mutex() {
+  static std::mutex mu;
+  return mu;
+}
+std::vector<WeightSlab>& weight_slabs() {
+  static std::vector<WeightSlab> slabs;
+  return slabs;
+}
+
 Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
                                         backend::IBackend& be,
                                         backend::Stream at) {
   constexpr std::size_t kAlign = kWeightAlignment;
   const auto kSlab = weight_slab_bytes(be);
-  static std::mutex mu;
-  static std::vector<WeightSlab> slabs;
+  std::vector<WeightSlab>& slabs = weight_slabs();
   const std::size_t need = (bytes + kAlign - 1) & ~(kAlign - 1);
 
-  const std::lock_guard lock(mu);
+  const std::lock_guard lock(slab_mutex());
   WeightSlab* use = nullptr;
   for (WeightSlab& s : slabs) {
     if (s.be == &be && s.stream == at.index &&
@@ -146,6 +154,19 @@ std::size_t packed_q8_matrix_bytes(std::int64_t rows,
   const auto groups = padded * static_cast<std::size_t>(features / 64);
   return align(dtype_storage_bytes(DType::kU32, words)) +
          2 * align(dtype_storage_bytes(DType::kBF16, groups));
+}
+
+std::size_t release_weight_slabs() {
+  std::vector<WeightSlab> released;
+  {
+    const std::lock_guard lock(slab_mutex());
+    released.swap(weight_slabs());
+  }
+  std::size_t bytes = 0;
+  for (const WeightSlab& slab : released) bytes += slab.base.size_bytes;
+  // A slab also lives on in every window still held, so dropping this vector
+  // frees exactly the slabs no live weight uses.
+  return bytes;
 }
 
 Result<Array> WeightBinder::require(std::string_view name) {

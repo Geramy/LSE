@@ -111,6 +111,9 @@ struct AllocationTotals {
   std::uint64_t allocations = 0;  // currently live
 };
 [[nodiscard]] AllocationTotals allocation_totals(MemoryClass cls) noexcept;
+// Starts every peak (per class and per site) again from what is live now: an
+// engine's peak is its own, not the process's.
+void reset_allocation_peaks() noexcept;
 // Charges one allocation and wraps its storage so the charge is returned when
 // the last view of it is released. Backend::allocate calls this; a buffer with
 // no managed storage is not counted, because nothing would return its charge.

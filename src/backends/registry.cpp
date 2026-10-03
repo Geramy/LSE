@@ -141,6 +141,15 @@ void track_allocation(DeviceBuffer& buf, std::size_t bytes, MemoryClass cls) {
   buf.storage = std::shared_ptr<void>(std::move(charged), address);
 }
 
+void reset_allocation_peaks() noexcept {
+  const auto reset = [](Ledger& l) {
+    l.peak.store(l.live.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  };
+  reset(ledger(MemoryClass::kDevice));
+  reset(ledger(MemoryClass::kStaging));
+  for (std::size_t i = 0; i < kSites; ++i) reset(site_ledger(static_cast<AllocationSite>(i)));
+}
+
 const char* to_string(AllocationSite site) noexcept {
   switch (site) {
     case AllocationSite::kWeights: return "weights";
