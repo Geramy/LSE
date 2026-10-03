@@ -324,6 +324,26 @@ class Partitioner {
 
 class Program;
 
+// CPU fallback: a group the device path did not plan, or a node no device
+// kernel covers, running on the host interpreter. It is the one fallback the
+// device path has, and it is loud: every occurrence is counted by cause and
+// logged (the first time and at powers of two), and requests report the ones
+// they caused. With fallback disallowed (--no-cpu-fallback) the request fails
+// instead, naming the cause.
+struct CpuFallbackEvent {
+  std::string cause;
+  std::uint64_t count = 0;
+};
+void set_cpu_fallback_allowed(bool allowed) noexcept;
+[[nodiscard]] bool cpu_fallback_allowed() noexcept;
+void record_cpu_fallback(const std::string& cause);
+// Events so far, process-wide; a request takes it before and asks for the
+// events after.
+[[nodiscard]] std::uint64_t cpu_fallback_sequence() noexcept;
+// By cause: every event when `after` is 0, else those after that sequence
+// number (from the last few thousand).
+[[nodiscard]] std::vector<CpuFallbackEvent> cpu_fallback_events(std::uint64_t after = 0);
+
 class Scheduler {
  public:
   // The devices this scheduler may run on. One member or eight is a difference

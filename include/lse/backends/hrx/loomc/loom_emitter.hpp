@@ -46,6 +46,12 @@ class LoomEmitter final : public graph::IKernelEmitter {
     return graph::Dialect::kLoom;
   }
 
+  // A primitive whose chosen specialization owns its indexing (a wave-
+  // cooperative body) can only be a group's sole output, so a run holding
+  // one is not joined.
+  [[nodiscard]] bool joins_run(std::span<const graph::NodePtr> run,
+                               const DeviceInfo& device) const override;
+
   // Loom has no header: a `.loom` file is a bare sequence of top-level ops,
   // with no module wrapper and nothing to include. A primitive that owns a
   // whole translation unit has nothing to be prefixed with, which is also why

@@ -143,7 +143,18 @@ struct Outcome {
   std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint64_t spec_draft_ns = 0, spec_verify_ns = 0;
   double acceptance = -1.0;  // negative when nothing was speculated
+  // CPU fallbacks this request caused, by cause.
+  std::vector<graph::CpuFallbackEvent> cpu_fallbacks;
 };
+
+// What the client is told beside the answer: every CPU fallback the request
+// caused. Absent when there were none.
+json warnings_of(const Outcome& o) {
+  json w = json::array();
+  for (const auto& e : o.cpu_fallbacks)
+    w.push_back({{"type", "cpu_fallback"}, {"cause", e.cause}, {"count", e.count}});
+  return w;
+}
 
 json timings_of(const Outcome& o);
 
@@ -575,6 +586,7 @@ Result<Outcome> Router::Impl::generate(
   // A request queued behind another generation must not start new device
   // work after shutdown has asked the active generation to stop.
   if (stopping.load()) return LSE_ERROR(kCancelled, "server is stopping");
+  const std::uint64_t fallbacks_before = graph::cpu_fallback_sequence();
 
   runtime::Generator gen(impl.model, r.sampling, impl.opt.prefill);
   if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
@@ -678,8 +690,9 @@ Result<Outcome> Router::Impl::generate(
       std::lock_guard sessions_held(impl.sessions_lock);
       none_left = impl.sessions.empty();
     }
-    const bool out_of_memory = !ids.ok() && ids.status().code() == StatusCode::kOutOfMemory;
-    if (out_of_memory || none_left) (void)backend::trim_device_memory();
+    // A failed request leaves nothing behind: what it built is released
+    // above and the caches go too, so the next request starts clean.
+    if (!ids.ok() || none_left) (void)backend::trim_device_memory();
   }
   if (!ephemeral) {
     std::lock_guard sessions_held(impl.sessions_lock);
@@ -714,6 +727,7 @@ Result<Outcome> Router::Impl::generate(
   out.decode_per_second = st.decode_tokens_per_second();
   out.prompt_per_second = st.prompt_tokens_per_second();
   if (st.spec_steps != 0) out.acceptance = st.acceptance_rate();
+  out.cpu_fallbacks = graph::cpu_fallback_events(fallbacks_before);
   impl.record(out);
   // After every request: what the engine holds and the device runtime's own
   // count, so growth across requests shows in the log of a run that does
@@ -906,6 +920,7 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
                                               : text_choice(out->text, out->hit_limit, r.thinking_enabled)})},
                 {"usage", usage_of(*out)},
                 {"timings", timings_of(*out)}};
+      if (!out->cpu_fallbacks.empty()) resp["lse_warnings"] = warnings_of(*out);
       set_content(res, resp);
     } catch (const std::exception& e) {
       send_error(res, 500, e.what(), "model_output_error");
@@ -990,12 +1005,14 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
         json last = chat
             ? json{{"index", 0}, {"delta", json::object()}, {"finish_reason", parser.finish_reason(out->hit_limit)}}
             : json{{"index", 0}, {"text", ""}, {"finish_reason", finish_reason(out->hit_limit)}};
-        send(json{{"id", id},
-                  {"object", chunk_object},
-                  {"created", created},
-                  {"model", impl.opt.model_id},
-                  {"choices", json::array({last})},
-                  {"timings", timings_of(*out)}});
+        json final{{"id", id},
+                   {"object", chunk_object},
+                   {"created", created},
+                   {"model", impl.opt.model_id},
+                   {"choices", json::array({last})},
+                   {"timings", timings_of(*out)}};
+        if (!out->cpu_fallbacks.empty()) final["lse_warnings"] = warnings_of(*out);
+        send(final);
         if (r.include_usage)
           send(json{{"id", id}, {"object", chunk_object}, {"created", created},
                     {"model", impl.opt.model_id}, {"choices", json::array()},
@@ -1132,6 +1149,16 @@ std::string Router::metrics_json() const {
          {"dflash2_enabled", impl_->dflash2 != nullptr}};
   m["last_timings"] = impl_->last_timings.is_null() ? json(nullptr) : impl_->last_timings;
   m["sessions"] = impl_->sessions_json();
+  {
+    json events = json::array();
+    std::uint64_t total = 0;
+    for (const auto& e : graph::cpu_fallback_events()) {
+      events.push_back({{"cause", e.cause}, {"count", e.count}});
+      total += e.count;
+    }
+    m["cpu_fallback"] = {{"allowed", graph::cpu_fallback_allowed()}, {"total", total},
+                         {"events", std::move(events)}};
+  }
   {
     std::lock_guard sessions_held(impl_->sessions_lock);
     m["session_evictions"] = impl_->evictions;

@@ -220,6 +220,17 @@ class IKernelEmitter {
     (void)device;
     return {};
   }
+
+  // Whether this emitter can write `run` -- sibling nodes reading one input --
+  // as one multi-output body. Asked by the planner before it joins them, so a
+  // run the emitter cannot express is never planned as one group. True unless
+  // the emitter knows otherwise.
+  [[nodiscard]] virtual bool joins_run(std::span<const NodePtr> run,
+                                       const backend::DeviceInfo& device) const {
+    (void)run;
+    (void)device;
+    return true;
+  }
 };
 
 // A compiled kernel and what its compiler said about it. The resources travel

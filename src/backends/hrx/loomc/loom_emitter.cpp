@@ -352,6 +352,37 @@ std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
   return identity_hash(emission_identity(group, device));
 }
 
+bool LoomEmitter::joins_run(std::span<const NodePtr> run,
+                            const DeviceInfo& device) const {
+  if (run.size() < 2) return true;
+  const DialectSourceTable spellings = sources();
+  const kir::TypeTable type_table = loom_types();
+  for (const NodePtr& n : run) {
+    const auto* kp = n ? dynamic_cast<const KernelPrimitiveBase*>(n->prim) : nullptr;
+    if (kp == nullptr) continue;
+    std::vector<Shape> shp;
+    std::vector<DType> dts;
+    for (const NodePtr& in : n->inputs) {
+      shp.push_back(in->shape);
+      dts.push_back(in->dtype);
+    }
+    KernelShapes s;
+    s.inputs = shp;
+    s.input_dtypes = dts;
+    s.output = n->shape;
+    s.output_dtype = n->dtype;
+    s.attrs = n->attrs;
+    s.iattrs = n->iattrs;
+    s.device = &device;
+    s.types = type_table;
+    s.intrinsics = &spellings;
+    const KernelPrimitiveBase* chosen = kp->specialize(s);
+    if (chosen == nullptr) chosen = kp;
+    if (chosen->owns_indexing()) return false;
+  }
+  return true;
+}
+
 Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                                         const DeviceInfo& device) const {
   if (group.nodes.empty()) {

@@ -45,6 +45,8 @@ void usage() {
       "      --max-tokens N   refuse requests asking for more (default 4096)\n"
       "      --shutdown-grace-seconds N  drain requests before failing (1..600, default 30)\n"
       "      --max-sessions N   sessions kept between requests (default 8, 0: no limit)\n"
+      "      --no-cpu-fallback  fail a request whose group the device cannot run\n"
+      "                         instead of running it on the CPU (default: allowed, logged)\n"
       "      --session-memory-budget BYTES  KV and state all sessions may hold\n"
       "                         before idle ones are evicted (default 0: no limit)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
     else if (a == "--api-key") api_key = value("--api-key");
     else if (a == "--served-name") served_name = value("--served-name");
     else if (a == "--max-tokens") cfg.max_tokens = std::atoi(value("--max-tokens").c_str());
+    else if (a == "--no-cpu-fallback") cfg.disable_cpu_fallback = 1;
     else if (a == "--max-sessions" || a == "--session-memory-budget") {
       const auto text = value(a.c_str());
       std::uint64_t n = 0;

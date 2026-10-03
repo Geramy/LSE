@@ -159,7 +159,6 @@ const char* to_string(AllocationSite site) noexcept {
     case AllocationSite::kWorkspace: return "workspace";
     case AllocationSite::kConstants: return "constants";
     case AllocationSite::kOutputs: return "outputs";
-    case AllocationSite::kFallback: return "fallback";
     case AllocationSite::kOther:
     case AllocationSite::kCount: break;
   }

@@ -433,36 +433,48 @@ LSE_TEST(a_wide_prefill_on_the_device_path_recycles_its_workspace) {
   if (!e.router) return;
   backend::reset_allocation_peaks();
   for (unsigned r = 0; r < 3; ++r) LSE_EXPECT_EQ(e.complete("", prompt(2500, r)), 200);
-  std::printf("       device path: workspace peak %llu, fallback peak %llu, live %llu (baseline %llu)\n",
+  std::printf("       device path: workspace peak %llu, cpu fallbacks %zu, live %llu (baseline %llu)\n",
               static_cast<unsigned long long>(site_peak(backend::AllocationSite::kWorkspace)),
-              static_cast<unsigned long long>(site_peak(backend::AllocationSite::kFallback)),
+              graph::cpu_fallback_events().size(),
               static_cast<unsigned long long>(live()), static_cast<unsigned long long>(e.baseline));
   LSE_EXPECT(site_peak(backend::AllocationSite::kWorkspace) > 0);
-  LSE_EXPECT_EQ(site_peak(backend::AllocationSite::kFallback), 0u);
+  LSE_EXPECT(graph::cpu_fallback_events().empty());
   LSE_EXPECT(live() <= e.baseline);
 }
 
-LSE_TEST(a_pass_that_leaves_the_device_path_fails_cleanly_when_it_cannot_fit) {
+LSE_TEST(a_refused_device_dispatch_fails_the_request_and_the_engine_recovers) {
   LSE_EXPECT_OK(place::open_default_devices("capture:0"));
   Engine e;
   LSE_EXPECT_OK(e.open(8, 0));
   if (!e.router) return;
-  // The device refuses every launch after the first few, and reports only a
-  // little more free memory than the engine already holds.
+  backend::reset_allocation_peaks();
+  const auto before = backend::allocation_totals(backend::MemoryClass::kDevice);
+  // The device refuses every launch after the first few.
   backend::CaptureBackend::launched = 0;
   backend::CaptureBackend::refuse_launches_after = 8;
-  backend::CaptureBackend::free_bytes = live() + (1u << 20);
   json body{{"model", "memory-fixture"}, {"prompt", prompt(2500, 9)}, {"max_tokens", 4},
             {"temperature", 0}};
   const auto reply = e.router->handle("POST", "/v1/completions", body.dump());
   backend::CaptureBackend::refuse_launches_after = -1;
-  backend::CaptureBackend::free_bytes = 0;
-  std::printf("       %d: %s\n", reply.status, reply.body.substr(0, 400).c_str());
-  LSE_EXPECT(reply.status != 200);
-  LSE_EXPECT(reply.body.find("out of GPU memory") != std::string::npos);
-  LSE_EXPECT(reply.body.find("per-group fallback") != std::string::npos);
+  std::printf("       %d: %s\n", reply.status, reply.body.substr(0, 500).c_str());
+  LSE_EXPECT_EQ(reply.status, 500);
+  // The error names the dispatch and carries the device's own error.
+  LSE_EXPECT(reply.body.find("device dispatch failed") != std::string::npos);
+  LSE_EXPECT(reply.body.find(" group ") != std::string::npos);
+  LSE_EXPECT(reply.body.find("nodes:") != std::string::npos);
   LSE_EXPECT(reply.body.find("capture device refuses this kernel") != std::string::npos);
-  // The engine recovers: the next request runs on the device path again.
+  // No fallback ran: nothing beyond the pass's own workspace was allocated,
+  // and no CPU fallback was recorded.
+  const auto peak = backend::allocation_totals(backend::MemoryClass::kDevice).peak;
+  std::printf("       peak over the request: %llu bytes above load\n",
+              static_cast<unsigned long long>(peak - before.live));
+  // The first pass allocates the KV pool (256 MiB for this fixture's
+  // capacity) and its workspace; a per-node fallback would add every
+  // intermediate of the pass on top.
+  LSE_EXPECT(peak - before.live < (std::uint64_t{288} << 20));
+  LSE_EXPECT(graph::cpu_fallback_events().empty());
+  // The engine recovers: the next request runs, and the device holds what it
+  // held after load.
   LSE_EXPECT_EQ(e.complete("", prompt(600, 3)), 200);
   LSE_EXPECT(live() <= e.baseline);
 }

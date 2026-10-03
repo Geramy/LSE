@@ -237,6 +237,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   server::ServerOptions opt;
   opt.max_tokens_cap = c.max_tokens;
   opt.max_sessions = c.max_sessions;
+  if (c.disable_cpu_fallback) graph::set_cpu_fallback_allowed(false);
   opt.session_memory_budget = static_cast<std::size_t>(c.session_memory_budget);
   if (c.mtp_depth != 0) {
     opt.mtp_depth = c.mtp_depth;

@@ -101,6 +101,12 @@ typedef struct lse_config {
    * whatever the limits. 0 means no limit. */
   uint32_t max_sessions;          /* --max-sessions (default 8) */
   uint64_t session_memory_budget; /* --session-memory-budget BYTES (default 0) */
+
+  /* --no-cpu-fallback: a group the device cannot run fails the request
+   * (naming the cause) instead of running on the CPU. Either way every CPU
+   * fallback is logged, counted in lse_status (engine.cpu_fallback) and
+   * reported to the client as "lse_warnings". */
+  int32_t disable_cpu_fallback;
 } lse_config;
 
 LSE_API void lse_config_init(lse_config *cfg);

@@ -149,6 +149,8 @@ struct Scheduler::Impl {
   // Device buffers for constants, reused across steps. See the use site.
   std::unordered_map<ConstKey, backend::DeviceBuffer, ConstKeyHash> constants;
   std::optional<ConstKey> pending_constant;
+  // Entry name of the kernel the last dispatch emitted, for failure reports.
+  std::string last_entry;
   // The constants are a cache: under memory pressure they are let go and the
   // next pass that needs one binds and fills a fresh buffer.
   std::mutex constants_mu;
@@ -401,21 +403,85 @@ Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
 }
 
 namespace {
-// A phase group the device path could not dispatch sends the rest of the pass
-// to the per-group path, which keeps a buffer for every intermediate of the
-// pass at once: on a wide prefill that is gigabytes more than the phase
-// path's recycled slots. Said once per distinct cause, so a run that falls
-// back is visible in its log rather than only in its memory use.
-void report_phase_fallback(const Status& why, const FusionGroup& g) {
-  static std::mutex mu;
-  static std::unordered_set<std::string> seen;
-  std::string key = why.to_string();
-  std::lock_guard lock(mu);
-  if (seen.size() > 64 || !seen.insert(key).second) return;
-  std::fprintf(stderr,
-               "lse: a %s group of %zu nodes could not run on the device path (%s); "
-               "the rest of this pass runs group by group and holds every intermediate\n",
-               g.is_phase ? "phase" : "fused", g.nodes.size(), key.c_str());
+struct CpuFallbacks {
+  std::mutex mu;
+  bool allowed = [] {
+    // The old qualification switch still refuses CPU fallback.
+    const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+    return !(strict != nullptr && std::string_view(strict) == "1");
+  }();
+  std::uint64_t sequence = 0;
+  struct Event { std::uint64_t sequence; std::string cause; };
+  std::vector<Event> recent;                    // the last kRecent events
+  std::map<std::string, std::uint64_t> totals;  // by cause, for the process
+  static constexpr std::size_t kRecent = 4096;
+};
+CpuFallbacks& cpu_fallbacks() {
+  static CpuFallbacks f;
+  return f;
+}
+}  // namespace
+
+void set_cpu_fallback_allowed(bool allowed) noexcept {
+  std::lock_guard lock(cpu_fallbacks().mu);
+  cpu_fallbacks().allowed = allowed;
+}
+
+bool cpu_fallback_allowed() noexcept {
+  std::lock_guard lock(cpu_fallbacks().mu);
+  return cpu_fallbacks().allowed;
+}
+
+void record_cpu_fallback(const std::string& cause) {
+  CpuFallbacks& f = cpu_fallbacks();
+  std::uint64_t count = 0;
+  {
+    std::lock_guard lock(f.mu);
+    ++f.sequence;
+    count = ++f.totals[cause];
+    if (f.recent.size() == CpuFallbacks::kRecent) f.recent.erase(f.recent.begin());
+    f.recent.push_back({f.sequence, cause});
+  }
+  // Every first time, then at powers of two, so a fallback inside a decode
+  // loop stays visible without one line per token.
+  if ((count & (count - 1)) == 0)
+    std::fprintf(stderr, "lse: CPU FALLBACK (%llu so far for this cause): %s\n",
+                 static_cast<unsigned long long>(count), cause.c_str());
+}
+
+std::uint64_t cpu_fallback_sequence() noexcept {
+  std::lock_guard lock(cpu_fallbacks().mu);
+  return cpu_fallbacks().sequence;
+}
+
+std::vector<CpuFallbackEvent> cpu_fallback_events(std::uint64_t after) {
+  CpuFallbacks& f = cpu_fallbacks();
+  std::lock_guard lock(f.mu);
+  std::map<std::string, std::uint64_t> by_cause;
+  if (after == 0) {
+    by_cause = f.totals;
+  } else {
+    for (const auto& e : f.recent)
+      if (e.sequence > after) ++by_cause[e.cause];
+  }
+  std::vector<CpuFallbackEvent> out;
+  for (auto& [cause, count] : by_cause) out.push_back({cause, count});
+  return out;
+}
+
+namespace {
+// What a refused device group was: its kind, size and the primitives in it.
+std::string describe_group(const FusionGroup& g, std::size_t index) {
+  std::string kernels;
+  std::size_t listed = 0;
+  for (const NodePtr& n : g.nodes) {
+    if (!n) continue;
+    if (listed++ == 6) { kernels += ", ..."; break; }
+    if (!kernels.empty()) kernels += ", ";
+    kernels += n->prim != nullptr ? std::string(n->prim->name()) : std::string(to_string(n->kind));
+  }
+  return ::lse::detail::concat(g.is_phase ? "phase" : "fused", " group ", std::to_string(index), " (",
+                               std::to_string(g.nodes.size()), " nodes: ", kernels, ")");
 }
 }  // namespace
 
@@ -465,6 +531,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   }
   const auto t_emitted = SpanClock::now();
   trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
+  impl_->last_entry = emitted->entry_name;
 
   // Compile only when this kernel is not already loaded for this device.
   // Disk miss / source change / arch change still go through get_or_compile.
@@ -1267,6 +1334,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         // stands as before.
         std::vector<NodePtr> run(prev.nodes.begin(), prev.nodes.end());
         run.push_back(n);
+        // A run the emitter cannot write as one body stays apart, planned
+        // as one group per node rather than discovered at dispatch.
+        if (!emitter->joins_run(run, backend().device_info())) return false;
         const IKernelEmitter::RunScratch cost =
             emitter->run_scratch(run, backend().device_info());
         if (cost.fused != 0 && cost.threads != 0) {
@@ -1585,9 +1655,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       // every emit, compile and submit in the step.
       place_span.close();
 
-      bool launched_phase = true;
-      std::vector<FusionGroup> partial_launches;
-      Status phase_failure = OkStatus();
       std::size_t done = 0;
       for (const FusionGroup& g : staged_groups) {
         const std::uint32_t gi = static_cast<std::uint32_t>(done);
@@ -1659,37 +1726,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         }
         if (st.ok()) st = try_dispatch_group(
             g, on, gm, replayed ? &rec : nullptr, gi);
-        // A joined run the emitter cannot express is not a reason to abandon
-        // the phase: its members are independent by construction, so each one
-        // still dispatches alone. Splitting costs one launch per member;
-        // giving up costs a full repartition of the step and every group in it
-        // re-placed, which measured seconds per wide prefill pass.
-        std::vector<FusionGroup> split;
-        if (!st.ok() && !g.is_phase && g.nodes.size() > 1) {
-          Status each = OkStatus();
-          for (const NodePtr& n : g.nodes) {
-            FusionGroup one;
-            one.nodes.push_back(n);
-            one.outputs.push_back(n);
-            one.inputs = n->inputs;
-            one.anchor = n->kind;
-            one.anchor_class = n->fclass;
-            each = try_dispatch_group(one, on, gm);
-            if (!each.ok()) break;
-            ++trace_.device_groups;
-            ++trace_.kernels_launched;
-            split.push_back(std::move(one));
-          }
-          if (each.ok()) {
-            st = OkStatus();
-          } else {
-            // These members already ran even though a later member failed.
-            // Keep their storage and replay coverage with the launched prefix.
-            for (const auto& one : split)
-              trace_.nodes_evaluated += static_cast<std::uint32_t>(one.nodes.size());
-            partial_launches = std::move(split);
-          }
-        }
         if (st.ok() && impl_->plan.record_after[gi] != 0) {
           auto ev = gbe.record_event(on);
           if (ev.ok()) {
@@ -1699,34 +1735,31 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           }
         }
         if (!st.ok()) {
-          // Running out of memory here is not a reason to fall back: the
-          // fallback below gives every remaining node a buffer of its own
-          // and needs more memory than the phase did, not less.
-          if (st.code() == StatusCode::kOutOfMemory) return st;
-          report_phase_fallback(st, g);
-          phase_failure = st;
-          launched_phase = false;
-          break;
+          // No fallback: a group the device path cannot run fails the
+          // request here, naming the dispatch. Work already issued is
+          // drained so the caller can release the pass and serve the next
+          // request.
+          for (std::size_t m = 0; m < devices_.size(); ++m)
+            (void)devices_.device(m).synchronize();
+          std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
+          (void)release_phase_tables();
+          const std::string kernel = impl_->last_entry.empty()
+              ? std::string() : " last kernel " + impl_->last_entry + ";";
+          const Status failed(st.code(), ::lse::detail::concat(
+              "device dispatch failed: ", describe_group(g, gi), " on member ",
+              std::to_string(gm), ";", kernel, " ", st.to_string()));
+          std::fprintf(stderr, "lse: %s\n", failed.to_string().c_str());
+          return failed;
         }
         alias_ready_views(g);
         if (on.index < stream_count) impl_->outstanding[on.index] = 1;
-        if (split.empty()) {
-          ++trace_.device_groups;
-          ++trace_.kernels_launched;
-        }
+        ++trace_.device_groups;
+        ++trace_.kernels_launched;
         trace_.nodes_evaluated += static_cast<std::uint32_t>(g.nodes.size());
-        // The replay has to see what actually ran, not the group that was
-        // refused, or it re-runs the same refusal every pass.
-        if (!replayed) {
-          if (split.empty()) {
-            ran.push_back(g);
-          } else {
-            for (FusionGroup& one : split) ran.push_back(std::move(one));
-          }
-        }
+        if (!replayed) ran.push_back(g);
         ++done;
       }
-      if (launched_phase) {
+      {
         if (!replayed) rec.retain(roots, std::move(planned), ran, order);
         if (pull_host) {
           const auto t_wait = SpanClock::now();
@@ -1747,67 +1780,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         LSE_RETURN_IF_ERROR(release_phase_tables());
         return OkStatus();
       }
-    // Prefix in `ran` already launched. Partition only the rest; retain
-    // prefix + suffix so the next reset_compute has a full cover. A failed
-    // replay recovers its launched prefix from the retained groups here.
-    if (replayed) {
-      ran.assign(staged_groups.begin(),
-                 staged_groups.begin() + static_cast<std::ptrdiff_t>(done));
-    }
-    for (auto& group : partial_launches) ran.push_back(std::move(group));
-
-    // Slot reuse was proved against the phase schedule. Repartitioning can
-    // move independent producers earlier or fuse them into one launch, so
-    // its pending outputs cannot keep the old schedule's shared allocations.
-    // Drain every member before rebinding: the successful prefix may still
-    // be running on another stream, including a partly dispatched joined run.
-    LSE_RETURN_IF_ERROR(drain());
-    std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
-    const auto remaining = Partitioner::unmaterialized(roots);
-    const backend::ScopedAllocationSite fallback_site(backend::AllocationSite::kFallback);
-    // Every remaining owner gets a buffer of its own and keeps it for the
-    // pass. When that cannot fit, say so and why the pass came here, rather
-    // than failing on whichever allocation runs out.
-    {
-      std::map<std::size_t, std::size_t> wanted;  // member -> bytes
-      for (const auto& node : remaining) {
-        if (node->fclass == FusionClass::kLeaf ||
-            buffer_allocation_owner(node.get()) != node.get()) continue;
-        FusionGroup one;
-        one.nodes = {node};
-        one.inputs = node->inputs;
-        wanted[member_for(one)] += dtype_storage_bytes(node->dtype, node->element_count());
-      }
-      for (const auto& [member, bytes] : wanted) {
-        const auto free = devices_.device(member).sample_free_memory();
-        if (free.ok() && bytes > *free) {
-          return backend::out_of_device_memory(bytes, Status(StatusCode::kOutOfMemory, ::lse::detail::concat(
-              "the device path could not finish this pass (", phase_failure.ok()
-                  ? std::string("a group was refused") : phase_failure.to_string(),
-              ") and its per-group fallback needs ", std::to_string(bytes),
-              " bytes of intermediates with ", std::to_string(*free), " free")));
-        }
-      }
-    }
-    for (const auto& node : remaining) {
-      if (node->fclass == FusionClass::kLeaf ||
-          buffer_allocation_owner(node.get()) != node.get()) continue;
-      FusionGroup one;
-      one.nodes = {node};
-      one.inputs = node->inputs;
-      const auto member = member_for(one);
-      const auto stream = devices_.stream_for(member).value_or(backend::kDefaultStream);
-      LSE_ASSIGN_OR(auto fresh, devices_.device(member).allocate(
-          dtype_storage_bytes(node->dtype, node->element_count()),
-          backend::MemoryClass::kDevice, stream));
-      node->buffer = std::move(fresh);
-      node->host_mirror.clear();
-      node->host_dirty = false;
-      node->device_dirty = false;
-    }
-    // Views and inplace results can already have bindings from slot setup.
-    // Refresh them after all new owners exist, before fallback placement.
-    LSE_RETURN_IF_ERROR(refresh_buffer_aliases(remaining));
   }
 
   // Already-closed is a no-op, so a failed device-first attempt contributes its
@@ -1895,18 +1867,21 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
-      // Inference qualification must not quietly turn a missing GPU kernel
-      // into a CPU result. Drain prior work before reporting the exact gap.
-      if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
-          strict != nullptr && std::string_view(strict) == "1") {
-        for (std::size_t member = 0; member < devices_.size(); ++member) {
-          LSE_RETURN_IF_ERROR(devices_.device(member).synchronize());
-        }
-        return LSE_ERROR(kUnimplemented, "GPU-only execution required: ",
-                         dispatched.message());
+      // The one fallback left in the device path: the group runs on the CPU.
+      // Loud every time, counted, and refused outright when CPU fallback is
+      // disabled for this run.
+      const std::string cause = ::lse::detail::concat(
+          describe_group(g, ran.size()), "; ",
+          impl_->last_entry.empty() ? std::string() : "last kernel " + impl_->last_entry + "; ",
+          dispatched.to_string());
+      if (!cpu_fallback_allowed()) {
+        for (std::size_t member = 0; member < devices_.size(); ++member)
+          (void)devices_.device(member).synchronize();
+        const Status refused(dispatched.code(), "CPU fallback disabled: " + cause);
+        std::fprintf(stderr, "lse: %s\n", refused.to_string().c_str());
+        return refused;
       }
-      // A group the emitter cannot express otherwise falls to the host,
-      // which is the default behaviour. Record why.
+      record_cpu_fallback(cause);
       ++trace_.host_groups;
       trace_.host_group_reasons.push_back(dispatched.message());
     }
@@ -1919,11 +1894,6 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       launched = false;
     }
 
-    if (const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
-        strict != nullptr && std::string_view(strict) == "1") {
-      return LSE_ERROR(kUnimplemented,
-                       "GPU-only execution required: no device kernel backend selected");
-    }
 
     // Host-only mode reaches here without passing the device-first arm above,
     // so nothing had counted this group. Leaving it uncounted printed
@@ -1963,6 +1933,17 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         return LSE_ERROR(kUnimplemented, "node '", std::string(to_string(n->kind)),
                          "' cannot run on ", std::string(backend().name()),
                          " (", gap, ") and no fallback handler accepted it");
+      }
+      if (mode_ == Mode::kDeviceFirst) {
+        const std::string cause = ::lse::detail::concat(
+            "node ", std::string(to_string(n->kind)), " runs on handler '",
+            std::string(handler->name()), "' (", gap, ")");
+        if (!cpu_fallback_allowed()) {
+          const Status refused(StatusCode::kUnimplemented, "CPU fallback disabled: " + cause);
+          std::fprintf(stderr, "lse: %s\n", refused.to_string().c_str());
+          return refused;
+        }
+        record_cpu_fallback(cause);
       }
       LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
       LSE_RETURN_IF_ERROR(handler->execute(*n, backend()));
