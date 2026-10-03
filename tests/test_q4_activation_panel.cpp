@@ -152,6 +152,18 @@ LSE_TEST(q4_panel_graph_keeps_unmeasured_shapes_and_formats_on_legacy_route) {
                           leaf({17408, 80}, DType::kF32), 4, 64);
   LSE_EXPECT_EQ(f32.node()->inputs.size(), 4u);
 }
+LSE_TEST(q4_panel_single_token_down_uses_panel_without_widening_admission) {
+  auto down = contraction(leaf({1, 17408}, DType::kF32), 5120, 17408);
+  LSE_EXPECT_EQ(down.node()->inputs.size(), 5u);
+  LSE_EXPECT(down.node()->prim && down.node()->prim->name() == kConsumer);
+  LSE_EXPECT(down.node()->inputs[4]->shape == Shape{1, 6800});
+  for (const auto& dims : kAdditionalProjections) {
+    auto value = contraction(leaf({1, static_cast<std::int64_t>(dims[1])}, DType::kF32),
+                             static_cast<std::int64_t>(dims[0]),
+                             static_cast<std::int64_t>(dims[1]));
+    LSE_EXPECT_EQ(value.node()->inputs.size(), 4u);
+  }
+}
 LSE_TEST(
     q4_panel_additional_projections_share_M4_panels_and_reject_unmeasured_widths) {
   auto x = leaf({1, 4, 5120}, DType::kF32);
@@ -675,6 +687,10 @@ int gpu_panel(std::size_t m, std::span<const Projection> projections) {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 int main(int argc, char **argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m1-down") {
+    const std::array<Projection, 1> measured{Projection{5120, 17408}};
+    return gpu_panel(1, measured);
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel")
     return gpu_panel(4, kFFNProjections);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-extensions")
