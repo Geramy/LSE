@@ -1117,6 +1117,9 @@ RouteReply Router::handle(std::string_view method, std::string_view path,
       return res;
     }
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions")) {
+      // A suspended or lost device answers at once rather than queueing
+      // work it cannot run.
+      if (auto refused = power_refusal(backend::device_power_state())) return std::move(*refused);
       impl.completion(path == "/v1/chat/completions", body, stopping, res);
       return res;
     }
@@ -1164,6 +1167,38 @@ std::string Router::metrics_json() const {
     m["session_evictions"] = impl_->evictions;
   }
   return m.dump();
+}
+
+std::optional<RouteReply> power_refusal(const std::optional<backend::DevicePowerState>& power) {
+  if (!power) return std::nullopt;
+  if (power->lost()) {
+    RouteReply r;
+    r.status = 503;
+    json e = error_json(
+        "the GPU was reset: its memory went with a host sleep. The engine must be opened again "
+        "(the model reloads); the conversation itself is kept by the client",
+        "device_lost", "");
+    e["error"]["code"] = "device_lost";
+    e["power"] = backend::power_state_name(power->state);
+    r.body = e.dump();
+    return r;
+  }
+  if (power->paused()) {
+    RouteReply r;
+    r.status = 503;
+    json e = error_json(
+        std::string("the GPU is ") + backend::power_state_name(power->state) +
+            " (the app is in the background or the host is going to sleep); nothing was started, "
+            "retry once it resumes",
+        "engine_suspended", "");
+    e["error"]["code"] = "suspended";
+    e["power"] = backend::power_state_name(power->state);
+    e["retry_after"] = 1;
+    r.body = e.dump();
+    r.headers.emplace_back("Retry-After", "1");
+    return r;
+  }
+  return std::nullopt;
 }
 
 }  // namespace lse::server

@@ -88,3 +88,13 @@ else()
 endif()
 
 lse_apply_common_flags(lse_backend_hrx)
+
+# Device power through the mac_linuxgpu HSA runtime's mac_hsa_agent_* calls.
+# Where the runtime is loaded at run time they are looked up with dlsym and
+# are optional; a statically linked runtime (iOS) names them at link time,
+# so the build enables them only when that runtime exports them
+# (scripts/ios/build-ios.sh decides).
+option(LSE_HSA_POWER "Link the HSA runtime's device power calls (static runtimes)" OFF)
+if(LSE_HSA_POWER)
+  target_compile_definitions(lse_backend_hrx PRIVATE LSE_HSA_POWER=1)
+endif()

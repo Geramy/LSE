@@ -173,6 +173,34 @@ LSE_API lse_result lse_cancel(lse_engine *engine, lse_request_id id);
  * live sessions and the bytes each holds. */
 LSE_API lse_result lse_session_close(lse_engine *engine, const char *session_id);
 
+/* Device power, for hosts that suspend the app or the machine (iPadOS
+ * background, macOS sleep), with a device runtime that tracks it (the
+ * mac_linuxgpu HSA runtime). lse_status reports the state under "power":
+ * active, suspending, suspended, resuming, lost, or unknown when untracked.
+ *
+ * lse_power_prepare: before the host stops using the GPU for a while. Waits
+ * up to drain_timeout_ms for work already submitted, then pauses every
+ * queue; device memory is kept and a generation in flight pauses and
+ * continues on resume. Meanwhile new completion requests are answered 503
+ * {"error": {"type": "engine_suspended", "code": "suspended"},
+ * "retry_after": 1} (over HTTP with Retry-After) having started nothing.
+ * lse_power_resume: when the host comes back.
+ *
+ * Lost: the host slept and the device's memory went with it. Requests are
+ * answered 503 {"error": {"type": "device_lost"}}, lse_status reports state
+ * "lost", and lse_power_resume returns LSE_ERR_STATE. The engine cannot
+ * continue: lse_close it and lse_open again (the device is probed afresh
+ * and the model loads again; sessions are gone).
+ *
+ * Both take the engine (NULL acts on the device runtime alone, once an
+ * engine has opened it), fill *json_out with the power state as lse_status
+ * reports it (release with lse_free), and return LSE_ERR_FAILED with a
+ * message in *err when the runtime has no power control or the driver
+ * refused. */
+LSE_API lse_result lse_power_prepare(lse_engine *engine, uint32_t drain_timeout_ms,
+                                     char **json_out, char **err);
+LSE_API lse_result lse_power_resume(lse_engine *engine, char **json_out, char **err);
+
 /* Engine status as JSON (release with lse_free): load phase and progress
  * (also before lse_open returns, with engine NULL), the model being served,
  * request counters, the timings of the last completed generation, and the

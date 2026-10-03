@@ -219,6 +219,29 @@ struct OpenError {
   std::string message;
 };
 
+// The device power state as lse_status and lse_power_* report it.
+json power_json(const std::optional<backend::DevicePowerState>& p) {
+  if (!p) return json{{"state", "unknown"}, {"tracked", false}};
+  json flags = json::array();
+  static constexpr std::pair<std::uint32_t, const char*> kFlags[] = {
+      {1u << 0, "vram_preserved"}, {1u << 1, "system_sleep"}, {1u << 2, "device_low"},
+      {1u << 3, "client_hold"},    {1u << 4, "quiesced"},     {1u << 5, "session_closed"},
+      {1u << 6, "ack_pending"},    {1u << 7, "link_down"}};
+  for (const auto& [bit, name] : kFlags)
+    if ((p->flags & bit) != 0) flags.push_back(name);
+  return json{{"state", backend::power_state_name(p->state)},
+              {"tracked", true},
+              {"flags", std::move(flags)},
+              {"generation", p->generation},
+              {"cause", p->cause},
+              {"error", p->error},
+              {"holds", p->holds},
+              {"paused_queues", p->paused_queues},
+              {"quiesces", p->quiesces},
+              {"losses", p->losses},
+              {"last_transition_us", p->last_transition_us}};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -789,6 +812,51 @@ lse_result lse_cancel(lse_engine* e, lse_request_id id) {
   return LSE_OK;
 }
 
+namespace {
+lse_result power_answer(const Result<backend::DevicePowerState>& r, char** json_out, char** err) {
+  if (r.ok()) {
+    if (json_out != nullptr) *json_out = dup_string(power_json(*r).dump());
+    return LSE_OK;
+  }
+  // Report whatever the runtime says now beside the failure.
+  const auto now = backend::device_power_state();
+  if (json_out != nullptr) *json_out = dup_string(power_json(now).dump());
+  if (err != nullptr) *err = dup_string(std::string(r.status().message()));
+  return now && now->lost() ? LSE_ERR_STATE : LSE_ERR_FAILED;
+}
+}  // namespace
+
+lse_result lse_power_prepare(lse_engine* e, uint32_t drain_timeout_ms, char** json_out, char** err) {
+  (void)e;
+  if (err != nullptr) *err = nullptr;
+  if (json_out != nullptr) *json_out = nullptr;
+  try {
+    const auto r = backend::prepare_device_low_power(drain_timeout_ms);
+    if (r.ok())
+      std::fprintf(stderr, "lse: device %s for low power (drain up to %u ms)\n",
+                   backend::power_state_name(r->state), drain_timeout_ms);
+    return power_answer(r, json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("preparing for low power: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
+}
+
+lse_result lse_power_resume(lse_engine* e, char** json_out, char** err) {
+  (void)e;
+  if (err != nullptr) *err = nullptr;
+  if (json_out != nullptr) *json_out = nullptr;
+  try {
+    const auto r = backend::resume_device();
+    std::fprintf(stderr, "lse: device resume: %s\n",
+                 r.ok() ? backend::power_state_name(r->state) : std::string(r.status().message()).c_str());
+    return power_answer(r, json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("resuming: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
+}
+
 lse_result lse_status(const lse_engine* e, char** json_out) {
   if (json_out == nullptr) return LSE_ERR_INVALID_ARGUMENT;
   const progress::Snapshot p = progress::current();
@@ -820,8 +888,12 @@ lse_result lse_status(const lse_engine* e, char** json_out) {
                    {"device_by_site", std::move(by_site)},
                    {"staging_bytes", staging.live}};
   }
+  const auto power = backend::device_power_state();
+  s["power"] = power_json(power);
   if (e != nullptr) {
     auto& engine = const_cast<lse_engine&>(*e);
+    // A lost device ends this engine: the host closes and opens it again.
+    if (power && power->lost()) s["state"] = "lost";
     s["model"] = engine.model_id;
     if (engine.cfg) {
       s["kv_cache_dtype"] = std::string(kv::to_string(engine.cfg->kv_cache_dtype));

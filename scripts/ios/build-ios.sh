@@ -67,6 +67,14 @@ loomc_archive="$hrx_build/ios-libs/libloomc_ios.a"
 
 echo "== 3/5 engine (iOS, library only)"
 lse_build="$work/lse-build"
+# Device power (low power on background, device loss after sleep) when the
+# HSA runtime has it.
+hsa_power=OFF
+# grep -c reads all of nm's output (grep -q could SIGPIPE nm under pipefail).
+if nm -g "$hsa_library" 2>/dev/null | grep -c ' T _mac_hsa_agent_prepare_low_power$' >/dev/null; then
+  hsa_power=ON
+fi
+echo "   HSA device power: $hsa_power"
 cmake -S "$root" -B "$lse_build" -G Ninja \
   -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
   -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET="$deployment" \
@@ -75,6 +83,7 @@ cmake -S "$root" -B "$lse_build" -G Ninja \
   -DLSE_GPU_TARGETS=gfx1201 \
   -DLSE_HRX_INCLUDE_DIR="$hrx_include" -DLSE_HRX_LIBRARY="$hrx_archive" \
   -DLSE_LOOMC_INCLUDE_DIR="$loomc_include" -DLSE_LOOMC_LIBRARY="$loomc_archive" \
+  -DLSE_HSA_POWER="$hsa_power" \
   > "$work/lse-configure.log"
 cmake --build "$lse_build" --target lse_api --parallel "$jobs" > "$work/lse-build.log" ||
   { tail -40 "$work/lse-build.log"; die "engine build failed (see $work/lse-build.log)"; }

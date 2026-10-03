@@ -178,6 +178,51 @@ using RuntimeMemoryReporter = std::function<std::string()>;
 void register_runtime_memory_reporter(RuntimeMemoryReporter reporter);
 [[nodiscard]] std::string runtime_memory_report();
 
+// Device power. A GPU whose host app goes to the background (iPadOS) or
+// whose host sleeps is suspended: its queues are paused, new work is
+// refused, and device memory is kept; or lost: the host slept with it and
+// every buffer is gone, so the engine must be closed and opened again. A
+// backend whose runtime tracks this (the mac_linuxgpu HSA runtime's
+// mac_hsa_agent_* calls) registers a DevicePower; without one, the state is
+// unknown and preparing for low power is unsupported.
+enum class PowerState { kUnknown, kActive, kSuspending, kSuspended, kResuming, kLost };
+[[nodiscard]] const char* power_state_name(PowerState s) noexcept;
+
+struct DevicePowerState {
+  PowerState state = PowerState::kUnknown;
+  std::uint32_t flags = 0;          // the runtime's MAC_HSA_POWER_FLAG_* bits
+  std::uint64_t generation = 0;     // changes with every transition
+  std::uint32_t cause = 0;          // the driver's cause of the last transition
+  std::int32_t error = 0;           // the driver's error of the last failed step
+  std::uint32_t holds = 0;          // clients holding a low-power request
+  std::uint32_t paused_queues = 0;  // this process's queues waiting for resume
+  std::uint64_t quiesces = 0;       // low-power periods that kept device memory
+  std::uint64_t losses = 0;         // transitions that lost device memory
+  std::uint64_t last_transition_us = 0;
+
+  // New work would be refused now, but may be retried after resume.
+  [[nodiscard]] bool paused() const noexcept {
+    return state == PowerState::kSuspending || state == PowerState::kSuspended ||
+           state == PowerState::kResuming;
+  }
+  [[nodiscard]] bool lost() const noexcept { return state == PowerState::kLost; }
+};
+
+// For several GPUs the most severe state wins (lost, then paused states).
+struct DevicePower {
+  std::function<std::optional<DevicePowerState>()> state;       // nullopt: not tracked
+  std::function<Result<DevicePowerState>(std::uint32_t)> prepare;  // drain timeout, ms
+  std::function<Result<DevicePowerState>()> resume;
+};
+// Replaces any earlier registration (one runtime per process).
+void register_device_power(DevicePower power);
+void clear_device_power();
+[[nodiscard]] std::optional<DevicePowerState> device_power_state();
+// Waits up to drain_timeout_ms for work in flight, then pauses every queue.
+[[nodiscard]] Result<DevicePowerState> prepare_device_low_power(std::uint32_t drain_timeout_ms);
+// kDeviceError naming the device lost when the device's memory is gone.
+[[nodiscard]] Result<DevicePowerState> resume_device();
+
 // The failure of a device allocation, stated as running out of GPU memory,
 // with what the engine holds by site.
 [[nodiscard]] Status out_of_device_memory(std::size_t bytes, const Status& cause);

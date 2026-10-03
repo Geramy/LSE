@@ -43,6 +43,7 @@ struct HttpServer::Impl {
   void forward(const httplib::Request& req, httplib::Response& res) {
     RouteReply reply = router.handle(req.method, req.path, req.body, &stopping);
     res.status = reply.status;
+    for (const auto& [name, value] : reply.headers) res.set_header(name, value);
     if (!reply.stream) {
       res.set_content(reply.body, "application/json");
       return;

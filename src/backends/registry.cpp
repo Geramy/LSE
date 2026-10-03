@@ -256,6 +256,66 @@ std::string runtime_memory_report() {
   return text;
 }
 
+const char* power_state_name(PowerState s) noexcept {
+  switch (s) {
+    case PowerState::kActive: return "active";
+    case PowerState::kSuspending: return "suspending";
+    case PowerState::kSuspended: return "suspended";
+    case PowerState::kResuming: return "resuming";
+    case PowerState::kLost: return "lost";
+    case PowerState::kUnknown: break;
+  }
+  return "unknown";
+}
+
+namespace {
+struct PowerRegistry {
+  std::mutex mu;
+  std::optional<DevicePower> power;
+};
+PowerRegistry& power_registry() {
+  static PowerRegistry r;
+  return r;
+}
+std::optional<DevicePower> registered_power() {
+  PowerRegistry& r = power_registry();
+  std::lock_guard lock(r.mu);
+  return r.power;
+}
+}  // namespace
+
+void register_device_power(DevicePower power) {
+  PowerRegistry& r = power_registry();
+  std::lock_guard lock(r.mu);
+  r.power = std::move(power);
+}
+
+void clear_device_power() {
+  PowerRegistry& r = power_registry();
+  std::lock_guard lock(r.mu);
+  r.power.reset();
+}
+
+std::optional<DevicePowerState> device_power_state() {
+  const auto power = registered_power();
+  if (!power || !power->state) return std::nullopt;
+  return power->state();
+}
+
+Result<DevicePowerState> prepare_device_low_power(std::uint32_t drain_timeout_ms) {
+  const auto power = registered_power();
+  if (!power || !power->prepare)
+    return LSE_ERROR(kUnimplemented, "this device runtime has no low-power control");
+  return power->prepare(drain_timeout_ms);
+}
+
+Result<DevicePowerState> resume_device() {
+  const auto power = registered_power();
+  if (!power || !power->resume)
+    return LSE_ERROR(kUnimplemented, "this device runtime has no low-power control");
+  return power->resume();
+}
+
 Status out_of_device_memory(std::size_t bytes, const Status& cause) {
   const std::string held = describe_device_allocations();
   // Also logged: a failure deep in a pass may surface only as a failed
