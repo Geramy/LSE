@@ -53,6 +53,61 @@ DeviceIndex next_device_index() noexcept {
   return DeviceIndex{static_cast<std::uint16_t>(claimed)};
 }
 
+namespace {
+
+// One ledger per memory class. Relaxed is enough for the counts; the peak is
+// raised with a CAS so a concurrent pair of allocations cannot lose the larger.
+struct Ledger {
+  std::atomic<std::uint64_t> live{0};
+  std::atomic<std::uint64_t> peak{0};
+  std::atomic<std::uint64_t> count{0};
+};
+
+Ledger& ledger(MemoryClass cls) noexcept {
+  static Ledger ledgers[2];
+  return ledgers[cls == MemoryClass::kDevice ? 0 : 1];
+}
+
+// Owns the backend's own storage, so the allocation lives exactly as long as
+// it did before, and returns the charge when the last view lets go.
+struct Charged {
+  std::shared_ptr<void> storage;
+  std::uint64_t bytes;
+  MemoryClass cls;
+  ~Charged() {
+    Ledger& l = ledger(cls);
+    l.live.fetch_sub(bytes, std::memory_order_relaxed);
+    l.count.fetch_sub(1, std::memory_order_relaxed);
+  }
+};
+
+}  // namespace
+
+AllocationTotals allocation_totals(MemoryClass cls) noexcept {
+  const Ledger& l = ledger(cls);
+  return AllocationTotals{l.live.load(std::memory_order_relaxed),
+                          l.peak.load(std::memory_order_relaxed),
+                          l.count.load(std::memory_order_relaxed)};
+}
+
+void track_allocation(DeviceBuffer& buf, std::size_t bytes, MemoryClass cls) {
+  if (!buf.storage) return;
+  Ledger& l = ledger(cls);
+  const std::uint64_t now =
+      l.live.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+  l.count.fetch_add(1, std::memory_order_relaxed);
+  std::uint64_t seen = l.peak.load(std::memory_order_relaxed);
+  while (now > seen &&
+         !l.peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
+  }
+  void* const address = buf.storage.get();
+  // Built in place: a temporary Charged would return the charge as it died.
+  std::shared_ptr<Charged> charged(
+      new Charged{std::move(buf.storage), static_cast<std::uint64_t>(bytes), cls});
+  // Aliased, so storage.get() still names what the backend stored there.
+  buf.storage = std::shared_ptr<void>(std::move(charged), address);
+}
+
 void register_backend(std::string_view name, BackendFactory factory,
                       DeviceEnumerator enumerator,
                       StableRefResolver stable_ref_resolver,

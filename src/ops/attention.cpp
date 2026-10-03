@@ -10,6 +10,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/kv/sizing.hpp"
 
 namespace lse::ops {
 
@@ -239,11 +240,11 @@ std::int32_t pool_ceiling(const PagedKvLayer& layer, std::int32_t rows,
   return kv::blocks_for(capacity, kv::kBlockSize) * rows;
 }
 
-// Allocates or grows the pools, the block table and the block lists so every
-// row can hold what it is about to have written.
-Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
-                    std::int32_t capacity, std::int64_t kvh, std::int64_t hd,
-                    kv::CacheDType format) {
+}  // namespace
+
+Status ensure_paged_kv(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
+                       std::int32_t capacity, std::int64_t kvh, std::int64_t hd,
+                       kv::CacheDType format) {
   const auto dtype = kv::storage_dtype(format);
   const auto pitch = kv::storage_width(format, hd);
   if (pitch <= 0) return LSE_ERROR(kInvalidArgument, "FP8 KV head width must be a positive multiple of four");
@@ -310,8 +311,9 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
     const bool fragmented = layer.keys.valid() ? bool(layer.keys.node()->kv_fragments)
         : toolchain && toolchain->dialect == graph::Dialect::kLoom;
     if (fragmented) {
-      const auto capacity_bytes = dtype_storage_bytes(dtype,
-          static_cast<std::size_t>(pool_ceiling(layer, rows, capacity)) * kvh * kv::kBlockSize * pitch);
+      const auto capacity_bytes =
+          static_cast<std::size_t>(pool_ceiling(layer, rows, capacity)) *
+          kv::block_plane_bytes(format, kvh, hd);
       LSE_ASSIGN_OR(layer.keys, grow_fragments(layer, layer.keys, pool, dtype, capacity_bytes));
       LSE_ASSIGN_OR(layer.values, grow_fragments(layer, layer.values, pool, dtype, capacity_bytes));
     } else {
@@ -340,8 +342,6 @@ Status ensure_paged(PagedKvLayer& layer, std::int32_t rows, std::int32_t tokens,
   if (layer.table_dirty) LSE_RETURN_IF_ERROR(upload_table(layer));
   return OkStatus();
 }
-
-}  // namespace
 
 Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens) {
   if (!layer.valid()) return true;
@@ -441,7 +441,7 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
       const Shape& ks = k.shape();
       const auto rows = static_cast<std::int32_t>(ks.dim(0));
       const auto t = static_cast<std::int32_t>(ks.dim(2));
-      LSE_RETURN_IF_ERROR(ensure_paged(
+      LSE_RETURN_IF_ERROR(ensure_paged_kv(
           *cache->paged, rows, cache->used + t,
           static_cast<std::int32_t>(cache->capacity), kvh, hd, spec.kv_cache_dtype));
       cache->keys = cache->paged->keys;

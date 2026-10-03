@@ -895,6 +895,23 @@ Result<DFlash2CheckpointKind> inspect_dflash2_checkpoint(const ModelPaths& paths
   return DFlash2CheckpointKind::kBF16Source;
 }
 
+Result<std::vector<DFlash2PlannedTensor>> dflash2_q8_layout(const ModelPaths& source) {
+  LSE_ASSIGN_OR(Fd fd, open_read(source.weights));
+  struct stat st {};
+  if (::fstat(fd.get(), &st) != 0) return LSE_ERROR(kIoError, "cannot stat ", source.weights);
+  LSE_ASSIGN_OR(const Plan plan, make_plan(source, fd.get(), static_cast<std::uint64_t>(st.st_size)));
+  std::vector<DFlash2PlannedTensor> out;
+  out.reserve(plan.tensors.size());
+  for (const auto& [name, entry] : plan.tensors.items()) {
+    DFlash2PlannedTensor t;
+    t.name = name;
+    t.dtype = entry.at("dtype").get<std::string>();
+    for (const auto& d : entry.at("shape")) t.shape.push_back(d.get<std::int64_t>());
+    out.push_back(std::move(t));
+  }
+  return out;
+}
+
 Status convert_dflash2_q8(const ModelPaths& source, const fs::path& destination,
                           const DFlash2ConvertOptions& options) {
   std::error_code ec;

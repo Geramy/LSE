@@ -39,5 +39,13 @@ struct AffineMatrixPlan {
 }
 
 [[nodiscard]] bool q8_packed_weight_device(const backend::DeviceInfo&);
+// The architectures q8_packed_weight_device can admit, by name alone. For
+// planning without a device; the device check also asks for the matrix-core
+// capabilities and LDS a real part reports.
+[[nodiscard]] inline bool q8_packed_weight_arch(std::string_view arch) noexcept {
+  for (const auto& rule : q8_shapes::kMatrixRules)
+    if (rule.bits == 8 && rule.rows == 16 && rule.arch == arch) return true;
+  return false;
+}
 [[nodiscard]] AffineMatrixPlan q8_packed_matrix_plan(const graph::KernelShapes&);
 }  // namespace lse::dispatch

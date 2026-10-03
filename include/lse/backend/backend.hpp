@@ -99,6 +99,22 @@ struct DeviceBuffer {
   [[nodiscard]] bool valid() const noexcept { return ptr != nullptr || handle != 0; }
 };
 
+// What the engine holds through Backend::allocate, process-wide, by memory
+// class. `live` is what is allocated now: an allocation is charged when it is
+// made and credited when its last view dies. `peak` is the largest `live` seen
+// so far. These count the bytes the engine asked for, not what a driver
+// reserves around them, so the device's own counters run a little higher.
+struct AllocationTotals {
+  std::uint64_t live = 0;
+  std::uint64_t peak = 0;
+  std::uint64_t allocations = 0;  // currently live
+};
+[[nodiscard]] AllocationTotals allocation_totals(MemoryClass cls) noexcept;
+// Charges one allocation and wraps its storage so the charge is returned when
+// the last view of it is released. Backend::allocate calls this; a buffer with
+// no managed storage is not counted, because nothing would return its charge.
+void track_allocation(DeviceBuffer& buf, std::size_t bytes, MemoryClass cls);
+
 // Either side of a transfer: host memory, or a window into a device buffer.
 // Built implicitly so a caller writes copy(dst, src, n) with whatever it has.
 struct MemRef {
@@ -603,6 +619,7 @@ class Backend {
     if (buf.ok()) {
       buf->residency = device_;
       buf->member = static_cast<std::uint16_t>(stream.index);
+      track_allocation(*buf, bytes, cls);
     }
     return buf;
   }

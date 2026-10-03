@@ -143,6 +143,16 @@ struct AttentionCache {
 // every kv::kBlockSize tokens.
 Result<bool> extend_paged(PagedKvLayer& layer, std::int32_t tokens);
 
+// Allocates or grows `layer`'s pools, block table and block lists so each of
+// `rows` rows can hold what it is about to have written (`tokens` positions,
+// or `layer.row_tokens` when that is set). This is the whole of the paged K/V
+// allocation; gated_attention calls it while recording, and kv/sizing.hpp
+// states its arithmetic for callers that only need the byte count.
+Status ensure_paged_kv(PagedKvLayer& layer, std::int32_t rows,
+                       std::int32_t tokens, std::int32_t capacity,
+                       std::int64_t kv_heads, std::int64_t head_dim,
+                       kv::CacheDType format);
+
 // Hands row `row`'s blocks back to the pool and empties its list. This is what
 // a sequence leaving the batch costs — one table row, not a reallocation — and
 // it is also how a preemption frees the blocks the policy asked for.

@@ -53,6 +53,23 @@ struct MixerState {
   }
 };
 
+// Weights are uploaded into windows of a few large device allocations rather
+// than one allocation per tensor (see slab_window in layer.cpp). A tensor takes
+// its size rounded up to kWeightAlignment out of the first slab with room; one
+// larger than a slab gets an allocation of exactly its own rounded size.
+inline constexpr std::size_t kWeightSlabBytes = std::size_t{512} << 20;
+inline constexpr std::size_t kWeightAlignment = 4096;
+
+// Whether binding this group-affine matrix also uploads a WMMA-ordered copy
+// for the packed Q8 kernels, given a device that runs them and room for it.
+// The original planes stay resident beside the copy.
+[[nodiscard]] bool packs_q8_matrix(const quant::GroupAffine& spec,
+                                   std::size_t rank, DType scales,
+                                   std::int64_t rows, std::int64_t features) noexcept;
+// Bytes of that copy: three 4 KiB-aligned planes in one allocation.
+[[nodiscard]] std::size_t packed_q8_matrix_bytes(std::int64_t rows,
+                                                 std::int64_t features) noexcept;
+
 struct LayerContext {
   const Config* config = nullptr;
   std::int32_t layer_index = 0;

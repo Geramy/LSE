@@ -15,6 +15,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "lse/core/status.hpp"
 #include "lse/model/weights.hpp"
@@ -33,6 +34,19 @@ enum class DFlash2CheckpointKind : std::uint8_t {
 [[nodiscard]] std::string_view to_string(DFlash2CheckpointKind kind) noexcept;
 
 Result<DFlash2CheckpointKind> inspect_dflash2_checkpoint(const ModelPaths& paths);
+
+// One tensor of the checkpoint convert_dflash2_q8 would write, as its
+// safetensors header would describe it.
+struct DFlash2PlannedTensor {
+  std::string name;
+  std::string dtype;  // safetensors spelling: "U32", "BF16", ...
+  std::vector<std::int64_t> shape;
+};
+
+// The tensors the Q8 conversion of `source` would hold, read from the source's
+// config and header only: no payload is read and nothing is written. Fails for
+// a checkpoint the converter would refuse.
+Result<std::vector<DFlash2PlannedTensor>> dflash2_q8_layout(const ModelPaths& source);
 
 struct DFlash2ConvertProgress {
   enum class Phase : std::uint8_t { kHashSource, kQuantize, kFinish };

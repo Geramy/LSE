@@ -70,13 +70,13 @@ struct WeightSlab {
 
 std::size_t weight_slab_bytes(const backend::IBackend&) {
   // Bound unused tail space without returning to per-tensor allocations.
-  return std::size_t{512} << 20;
+  return kWeightSlabBytes;
 }
 
 Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
                                         backend::IBackend& be,
                                         backend::Stream at) {
-  constexpr std::size_t kAlign = 4096;
+  constexpr std::size_t kAlign = kWeightAlignment;
   const auto kSlab = weight_slab_bytes(be);
   static std::mutex mu;
   static std::vector<WeightSlab> slabs;
@@ -123,6 +123,29 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
 }
 }  // namespace
 
+
+bool packs_q8_matrix(const quant::GroupAffine& spec, std::size_t rank,
+                     DType scales, std::int64_t rows,
+                     std::int64_t features) noexcept {
+  return spec.bits == 8 && spec.group_size == 64 && rank == 2 &&
+         scales == DType::kBF16 && rows > 0 && rows <= UINT32_MAX &&
+         features > 0 && features <= UINT32_MAX &&
+         dispatch::q8_packed_weight_shape(static_cast<std::uint32_t>(rows),
+                                          static_cast<std::uint32_t>(features));
+}
+
+std::size_t packed_q8_matrix_bytes(std::int64_t rows,
+                                   std::int64_t features) noexcept {
+  if (rows <= 0 || features <= 0) return 0;
+  const auto align = [](std::size_t bytes) {
+    return (bytes + kWeightAlignment - 1) & ~(kWeightAlignment - 1);
+  };
+  const auto padded = static_cast<std::size_t>((rows + 15) / 16 * 16);
+  const auto words = padded * static_cast<std::size_t>(features / 4);
+  const auto groups = padded * static_cast<std::size_t>(features / 64);
+  return align(dtype_storage_bytes(DType::kU32, words)) +
+         2 * align(dtype_storage_bytes(DType::kBF16, groups));
+}
 
 Result<Array> WeightBinder::require(std::string_view name) {
   auto got = optional(name);
@@ -551,13 +574,8 @@ Result<Array> WeightBinder::bind_quantized(
   planes->bits = spec.bits;
   planes->group_size = spec.group_size;
   planes->in_features = sliced_in;
-  if (spec.bits == 8 && spec.group_size == 64 && rank == 2 &&
-      order == nullptr && window.empty() && scales.dtype == DType::kBF16 &&
-      packed_shape.dim(0) > 0 && packed_shape.dim(0) <= UINT32_MAX &&
-      sliced_in > 0 && sliced_in <= UINT32_MAX &&
-      dispatch::q8_packed_weight_shape(
-          static_cast<std::uint32_t>(packed_shape.dim(0)),
-          static_cast<std::uint32_t>(sliced_in))) {
+  if (order == nullptr && window.empty() &&
+      packs_q8_matrix(spec, rank, scales.dtype, packed_shape.dim(0), sliced_in)) {
     auto *scheduler = graph::default_scheduler();
     if (scheduler == nullptr)
       return LSE_ERROR(kInternal, "no backend for packed Q8 weights");
@@ -590,6 +608,9 @@ Result<Array> WeightBinder::bind_quantized(
           sizes[i] = dtype_storage_bytes(dtypes[i], shapes[i].elem_count());
           allocation_bytes += align(sizes[i]);
         }
+        // packed_q8_matrix_bytes states this sum for callers without a device.
+        if (allocation_bytes != packed_q8_matrix_bytes(columns, features))
+          return LSE_ERROR(kInternal, "packed Q8 layout disagrees with its size rule");
         const auto free = be.sample_free_memory();
         const auto remaining = remaining_original_bytes(a.node()->buffer);
         if (quant::q8_packed_memory_admitted(
