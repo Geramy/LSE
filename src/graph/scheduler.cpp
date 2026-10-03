@@ -400,6 +400,25 @@ Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
   return OkStatus();
 }
 
+namespace {
+// A phase group the device path could not dispatch sends the rest of the pass
+// to the per-group path, which keeps a buffer for every intermediate of the
+// pass at once: on a wide prefill that is gigabytes more than the phase
+// path's recycled slots. Said once per distinct cause, so a run that falls
+// back is visible in its log rather than only in its memory use.
+void report_phase_fallback(const Status& why, const FusionGroup& g) {
+  static std::mutex mu;
+  static std::unordered_set<std::string> seen;
+  std::string key = why.to_string();
+  std::lock_guard lock(mu);
+  if (seen.size() > 64 || !seen.insert(key).second) return;
+  std::fprintf(stderr,
+               "lse: a %s group of %zu nodes could not run on the device path (%s); "
+               "the rest of this pass runs group by group and holds every intermediate\n",
+               g.is_phase ? "phase" : "fused", g.nodes.size(), key.c_str());
+}
+}  // namespace
+
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
                                      std::size_t member, Program* replay,
@@ -1568,6 +1587,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
 
       bool launched_phase = true;
       std::vector<FusionGroup> partial_launches;
+      Status phase_failure = OkStatus();
       std::size_t done = 0;
       for (const FusionGroup& g : staged_groups) {
         const std::uint32_t gi = static_cast<std::uint32_t>(done);
@@ -1679,12 +1699,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           }
         }
         if (!st.ok()) {
-          static const bool dbg_phases =
-              std::getenv("LSE_DEBUG_PHASES") != nullptr;
-          if (dbg_phases) {
-            std::fprintf(stderr, "phase dispatch failed: %s\n",
-                         st.to_string().c_str());
-          }
+          // Running out of memory here is not a reason to fall back: the
+          // fallback below gives every remaining node a buffer of its own
+          // and needs more memory than the phase did, not less.
+          if (st.code() == StatusCode::kOutOfMemory) return st;
+          report_phase_fallback(st, g);
+          phase_failure = st;
           launched_phase = false;
           break;
         }
@@ -1744,6 +1764,31 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     LSE_RETURN_IF_ERROR(drain());
     std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
     const auto remaining = Partitioner::unmaterialized(roots);
+    const backend::ScopedAllocationSite fallback_site(backend::AllocationSite::kFallback);
+    // Every remaining owner gets a buffer of its own and keeps it for the
+    // pass. When that cannot fit, say so and why the pass came here, rather
+    // than failing on whichever allocation runs out.
+    {
+      std::map<std::size_t, std::size_t> wanted;  // member -> bytes
+      for (const auto& node : remaining) {
+        if (node->fclass == FusionClass::kLeaf ||
+            buffer_allocation_owner(node.get()) != node.get()) continue;
+        FusionGroup one;
+        one.nodes = {node};
+        one.inputs = node->inputs;
+        wanted[member_for(one)] += dtype_storage_bytes(node->dtype, node->element_count());
+      }
+      for (const auto& [member, bytes] : wanted) {
+        const auto free = devices_.device(member).sample_free_memory();
+        if (free.ok() && bytes > *free) {
+          return backend::out_of_device_memory(bytes, Status(StatusCode::kOutOfMemory, ::lse::detail::concat(
+              "the device path could not finish this pass (", phase_failure.ok()
+                  ? std::string("a group was refused") : phase_failure.to_string(),
+              ") and its per-group fallback needs ", std::to_string(bytes),
+              " bytes of intermediates with ", std::to_string(*free), " free")));
+        }
+      }
+    }
     for (const auto& node : remaining) {
       if (node->fclass == FusionClass::kLeaf ||
           buffer_allocation_owner(node.get()) != node.get()) continue;

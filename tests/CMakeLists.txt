@@ -541,3 +541,7 @@ endif()
 if(TARGET lse_backend_hrx)
   lse_add_test(test_sparse_attention lse_graph lse_kernels lse_ir lse_backends)
 endif()
+if(LSE_ENABLE_HRX)
+  # The device-first scheduler path on a recording-only host device.
+  lse_add_test(test_capture_prefill lse_server lse_runtime lse_model lse_graph lse_backends lse_tokenizer lse_place)
+endif()

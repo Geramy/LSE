@@ -132,6 +132,7 @@ enum class AllocationSite : std::uint8_t {
   kWorkspace,  // pass activations (workgroup slots)
   kConstants,  // the scheduler's device copies of graph constants
   kOutputs,    // pass outputs and other per-node buffers
+  kFallback,   // per-node buffers of a pass the phase path could not finish
   kCount,
 };
 [[nodiscard]] const char* to_string(AllocationSite site) noexcept;
