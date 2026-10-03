@@ -33,7 +33,7 @@ extern "C" {
  * meaning. lse_config carries the value it was initialized with. */
 #define LSE_ABI_VERSION 1u
 
-/* Engine version string, e.g. "0.5.0". */
+/* Engine version string, e.g. "0.5.1". */
 LSE_API const char *lse_version(void);
 /* LSE_ABI_VERSION of the library actually linked. */
 LSE_API uint32_t lse_abi_version(void);

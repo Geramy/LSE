@@ -3,6 +3,12 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.1: iPad prefill fixes
+
+1. **loomc:** four passes doubled arrays on every append; a prefill kernel asked for 16 GiB and iPadOS refused it. Fixed; compiles peak around 150 MiB.
+2. **Host memory:** weight host mirrors are released after upload, 3.0 GiB down to about 150 MiB.
+3. **Fallbacks:** the device-path fallback is removed; CPU fallback stays, reported and optional (`--no-cpu-fallback`). On an iPad Pro (M4) with an R9700, a full agent turn decoded at **68.9 tok/s** at 94% acceptance, 20.5 GiB peak.
+
 ## v0.5.0: libLSE, iPadOS, DFlash2 BF16 loading and memory estimates
 
 1. **libLSE:** the engine as an in-process library behind a plain C API ([`include/lse/lse.h`](../include/lse/lse.h)): `lse_open`, `lse_request` with the server's JSON, `lse_cancel`, `lse_status`, a log callback and an optional HTTP adapter. `lse-server` is a thin command line over it, and both transports answer identically.
