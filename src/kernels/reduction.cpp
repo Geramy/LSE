@@ -1,6 +1,7 @@
 // Row-wise normalization with cooperative and scalar implementations.
 #include <string>
 #include <array>
+#include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/attention.hpp"
@@ -51,8 +52,8 @@ constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
 }  // namespace
 
 struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel> {
-  static constexpr std::string_view kName = "rms_norm.cooperative.v2";
-  static constexpr std::string_view kEntry = "lse_rms_norm_cooperative_v2";
+  static constexpr std::string_view kName = "rms_norm.cooperative.v3";
+  static constexpr std::string_view kEntry = "lse_rms_norm_cooperative_v3";
   static constexpr std::string_view kSource = {};
   std::size_t arity() const noexcept override { return 2; }
   FusionClass fusion_class() const noexcept override { return FusionClass::kReduction; }
@@ -70,9 +71,21 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       const auto lane = e.let(math::local_id());
       const auto row = e.let(math::workgroup_id_x() * d);
       auto partial = e.var(0.0f);
-      for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
-        const auto value = e.let(a.x[row + col]);
-        partial = math::fma(value, value, partial.read());
+      const bool cache_row = d == 5120 && s.output.elem_count() == d &&
+          s.device && s.device->arch == "gfx1201" && s.device->wavefront_size == 32;
+      std::vector<kir::Val<kir::f32>> row_values;
+      if (cache_row) {
+        // Retain decode inputs across the reduction without changing its order.
+        for (std::uint32_t col = 0; col < d; col += kRmsBlock) {
+          const auto value = e.let(a.x[row + lane + col]);
+          row_values.push_back(value);
+          partial = math::fma(value, value, partial.read());
+        }
+      } else {
+        for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
+          const auto value = e.let(a.x[row + col]);
+          partial = math::fma(value, value, partial.read());
+        }
       }
       auto sums = e.lds<kir::f32>(kRmsBlock);
       if (!sums) return {};
@@ -93,11 +106,20 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       // All row reads precede stores; the hook preserves fused epilogues.
       const auto scale = e.let(math::rsqrt(
           sums[0].read() / static_cast<float>(d) + s.attrs[0]));
-      for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
-        const auto gain = math::widen(a.g[col]);
-        const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
-        const auto index = e.let(row + col);
-        e.store(index, a.x[index] * scale * weight);
+      if (cache_row) {
+        for (std::uint32_t offset = 0; offset < d; offset += kRmsBlock) {
+          const auto col = e.let(lane + offset);
+          const auto gain = math::widen(a.g[col]);
+          const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+          e.store(row + col, row_values[offset / kRmsBlock] * scale * weight);
+        }
+      } else {
+        for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
+          const auto gain = math::widen(a.g[col]);
+          const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+          const auto index = e.let(row + col);
+          e.store(index, a.x[index] * scale * weight);
+        }
       }
       if (!k.lds().ok()) return {};
       return k.str();

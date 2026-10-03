@@ -10,6 +10,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <cstring>
 using namespace lse;
 using namespace lse::graph;
 namespace {
@@ -180,4 +181,60 @@ LSE_TEST(cooperative_rms_parallel_association_and_index_coverage) {
   for(auto count:writes)LSE_EXPECT_EQ(count,2u);
  }
 }
-LSE_TEST_MAIN()
+int gpu_decode_rms() {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  const auto upload = [&](Shape shape, const std::vector<float>& data) {
+    auto allocation = scheduler->backend().allocate(
+        data.size() * sizeof(float), backend::MemoryClass::kDevice);
+    if (!allocation.ok()) return Array{};
+    auto buffer = allocation.release();
+    LSE_EXPECT_OK(scheduler->backend().copy(
+        buffer, data.data(), data.size() * sizeof(float)));
+    return Array::from_buffer(std::move(buffer), shape, DType::kF32);
+  };
+  for (auto dtype : {DType::kF32, DType::kBF16, DType::kF16}) {
+    for (int pattern = 0; pattern < 3; ++pattern) {
+      for (bool centered : {false, true}) {
+        std::vector<float> x(5120), twice(10240), gain(5120);
+        for (std::size_t i = 0; i < x.size(); ++i) {
+          x[i] = pattern == 1 ? 0.0f : std::sin(float(i) * .173f) *
+              (pattern == 2 ? 1e10f : 3.0f);
+          twice[i] = twice[i + 5120] = x[i];
+          gain[i] = std::cos(float(i) * .091f);
+        }
+        const auto g = cast(upload({5120}, gain), dtype);
+        auto fast = rms_norm(upload({1, 1, 5120}, x), g, 1e-6f, centered);
+        // Two rows retain the original loop and the same reduction tree.
+        auto base = rms_norm(upload({1, 2, 5120}, twice), g, 1e-6f, centered);
+        const NodePtr roots[]{fast.node(), base.node()};
+        scheduler->reset_accumulated_trace();
+        LSE_EXPECT_OK(scheduler->eval(roots, false));
+        LSE_EXPECT_OK(scheduler->drain());
+        const auto trace = scheduler->last_trace();
+        LSE_EXPECT(trace.device_groups > 0);
+        LSE_EXPECT_EQ(trace.host_groups, 0u);
+        LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+        std::vector<float> actual(5120), expected(10240);
+        LSE_EXPECT_OK(fast.to_host(actual.data(), actual.size() * sizeof(float)));
+        LSE_EXPECT_OK(base.to_host(expected.data(), expected.size() * sizeof(float)));
+        for (float value : actual) LSE_EXPECT(std::isfinite(value));
+        LSE_EXPECT(std::memcmp(actual.data(), expected.data(),
+                               actual.size() * sizeof(float)) == 0);
+        LSE_EXPECT(std::memcmp(actual.data(), expected.data() + 5120,
+                               actual.size() * sizeof(float)) == 0);
+      }
+    }
+  }
+  if (lse::test::Registry::get().failures) return 1;
+  std::printf("Decode RMS: cached single-row output matches both original-loop "
+              "rows bit for bit; 18 cases, no host fallback\n");
+  return 0;
+}
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--gpu-decode-rms")
+    return gpu_decode_rms();
+  return lse::test::run_all();
+}
