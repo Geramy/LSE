@@ -10,6 +10,8 @@
 #include <sstream>
 #include <vector>
 
+#include "lse/backend/backend.hpp"
+#include "lse/model/inspect.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/server/chat.hpp"
 #include "nlohmann/json.hpp"
@@ -171,6 +173,126 @@ struct Router::Impl {
   Impl(model::HybridLM& m, tokenizer::Tokenizer& t, ServerOptions o)
       : model(m), tok(t), opt(std::move(o)) {
     stop_ids = chat_stop_tokens(tok);
+  }
+
+  // What /v1/models says about the one model: the OpenAI fields, the context
+  // this engine enforces, and the KV settings it was opened with.
+  json model_entry() const {
+    json entry{{"id", opt.model_id},
+               {"object", "model"},
+               {"created", now_seconds()},
+               {"owned_by", "lse"}};
+    entry.update(served());
+    return entry;
+  }
+
+  // The settings this engine was opened with, which a client cannot ask for
+  // per request: the context it enforces and how its KV cache is stored.
+  json served() const {
+    const model::Config& c = model.config();
+    json draft = nullptr;
+    if (mtp != nullptr) draft = {{"kind", "mtp"}, {"depth", opt.mtp_depth}};
+    if (dflash2 != nullptr)
+      draft = {{"kind", "dflash2"},
+               {"block_size", dflash2->block_size()},
+               {"depth", runtime::dflash2_verify_depth(dflash2->block_size())}};
+    return json{{"context_length", c.kv_capacity()},
+                {"max_position_embeddings", c.train_seq_len},
+                {"kv_len", c.kv_capacity()},
+                {"kv_cache_dtype", std::string(kv::to_string(c.kv_cache_dtype))},
+                {"max_tokens", opt.max_tokens_cap},
+                {"draft", std::move(draft)}};
+  }
+
+  // Bytes the engine holds through its backends right now.
+  static json allocated() {
+    const auto device = backend::allocation_totals(backend::MemoryClass::kDevice);
+    const auto staging = backend::allocation_totals(backend::MemoryClass::kStaging);
+    return json{{"device_bytes", device.live},
+                {"device_peak_bytes", device.peak},
+                {"device_allocations", device.allocations},
+                {"staging_bytes", staging.live}};
+  }
+
+  void model_info(RouteReply& res) const {
+    if (opt.model_path.empty()) {
+      send_error(res, 404, "this server does not know where its model was loaded from",
+                 "invalid_request_error");
+      return;
+    }
+    auto info = model::model_info(opt.model_path);
+    if (!info.ok()) {
+      send_error(res, 500, std::string(info.status().message()), "server_error");
+      return;
+    }
+    json out = info.release();
+    out["served"] = served();
+    if (!opt.draft_path.empty()) {
+      auto d = model::model_info(opt.draft_path);
+      out["draft"] = d.ok() ? d.release() : json{{"error", std::string(d.status().message())}};
+    }
+    set_content(res, out);
+  }
+
+  // The memory plan for the loaded model, as opened, with any of the request's
+  // settings changed: what a restart with those settings would allocate.
+  void estimate(std::string_view body, RouteReply& res) const {
+    if (opt.model_path.empty()) {
+      send_error(res, 404, "this server does not know where its model was loaded from",
+                 "invalid_request_error");
+      return;
+    }
+    json b = json::object();
+    if (!body.empty()) {
+      b = json::parse(body.begin(), body.end(), nullptr, false);
+      if (b.is_discarded() || !b.is_object()) {
+        send_error(res, 400, "the request body must be a JSON object");
+        return;
+      }
+    }
+    const model::Config& c = model.config();
+    model::MemoryPlanRequest req;
+    req.model = opt.model_path;
+    req.draft = mtp != nullptr ? model::DraftKind::kMtp
+                : dflash2 != nullptr ? model::DraftKind::kDFlash2 : model::DraftKind::kNone;
+    req.draft_path = opt.draft_path;
+    req.mtp_depth = opt.mtp_depth;
+    req.kv_cache_dtype = c.kv_cache_dtype;
+    req.kv_len = c.kv_capacity();
+    req.batch_size = opt.prefill.batch_size;
+    req.ubatch_size = opt.prefill.ubatch_size;
+    req.fragmented_kv = opt.fragmented_kv;
+    req.device_arch = opt.device_arch;
+    try {
+      if (b.contains("kv_cache_dtype")) {
+        auto f = kv::cache_dtype_from_string(b["kv_cache_dtype"].get<std::string>());
+        if (!f.ok()) {
+          send_error(res, 400, std::string(f.status().message()), "invalid_request_error",
+                     "kv_cache_dtype");
+          return;
+        }
+        req.kv_cache_dtype = *f;
+      }
+      if (b.contains("kv_len")) req.kv_len = b["kv_len"].get<std::int32_t>();
+      if (b.contains("context_tokens")) req.context_tokens = b["context_tokens"].get<std::int32_t>();
+      if (b.contains("batch_size")) req.batch_size = b["batch_size"].get<std::uint32_t>();
+      if (b.contains("ubatch_size")) req.ubatch_size = b["ubatch_size"].get<std::uint32_t>();
+      if (b.contains("sequences")) req.sequences = b["sequences"].get<std::int32_t>();
+      if (b.contains("mtp_depth")) req.mtp_depth = b["mtp_depth"].get<std::uint32_t>();
+      if (b.contains("device_memory_bytes"))
+        req.device_memory_bytes = b["device_memory_bytes"].get<std::uint64_t>();
+    } catch (const json::exception&) {
+      send_error(res, 400, "estimate settings must be numbers, and kv_cache_dtype a string");
+      return;
+    }
+    auto plan = model::estimate_memory(req);
+    if (!plan.ok()) {
+      send_error(res, 400, std::string(plan.status().message()));
+      return;
+    }
+    json out = plan.release();
+    out["allocated"] = allocated();
+    set_content(res, out);
   }
 
   void record(const Outcome& out) {
@@ -701,6 +823,9 @@ const std::vector<Route>& Router::routes() {
     std::vector<Route> t{{"GET", "/health"},
                          {"GET", "/v1/models"},
                          {"GET", "/v1/models/:id"},
+                         {"GET", "/v1/lse/model_info"},
+                         {"GET", "/v1/lse/estimate"},
+                         {"POST", "/v1/lse/estimate"},
                          {"POST", "/v1/chat/completions"},
                          {"POST", "/v1/completions"}};
     for (const char* path : kNotImplemented) t.push_back({"POST", path});
@@ -725,18 +850,19 @@ RouteReply Router::handle(std::string_view method, std::string_view path,
       return res;
     }
     if (method == "GET" && path == "/v1/models") {
-      json m{{"id", impl.opt.model_id},
-             {"object", "model"},
-             {"created", now_seconds()},
-             {"owned_by", "lse"}};
-      set_content(res, json{{"object", "list"}, {"data", json::array({m})}});
+      set_content(res, json{{"object", "list"}, {"data", json::array({impl.model_entry()})}});
       return res;
     }
     if (method == "GET" && matches("/v1/models/:id", path)) {
-      set_content(res, json{{"id", impl.opt.model_id},
-                            {"object", "model"},
-                            {"created", now_seconds()},
-                            {"owned_by", "lse"}});
+      set_content(res, impl.model_entry());
+      return res;
+    }
+    if (method == "GET" && path == "/v1/lse/model_info") {
+      impl.model_info(res);
+      return res;
+    }
+    if (path == "/v1/lse/estimate" && (method == "GET" || method == "POST")) {
+      impl.estimate(body, res);
       return res;
     }
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions")) {

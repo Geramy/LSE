@@ -26,11 +26,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include "lse/backend/backend.hpp"
 #include "lse/core/progress.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/dflash2.hpp"
+#include "lse/model/inspect.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
@@ -480,8 +482,6 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   if (!tok.ok()) return fail(tok.status(), "loading the tokenizer");
   e.tok.emplace(tok.release());
 
-  e.router = std::make_unique<server::Router>(*e.lm, *e.tok, opt);
-
   // Speculative decoding when the checkpoint ships a module, exactly as the
   // CLI resolves it.
   if (!mtp_where.empty()) {
@@ -489,7 +489,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     auto opened = model::MtpModule::open(mtp_where, config, *e.lm);
     if (opened.ok()) {
       e.mtp = opened.release();
-      e.router->use_mtp(*e.mtp);
+      opt.draft_path = mtp_where;
       std::fprintf(stderr, "lse-server: MTP depth %u from %s\n", opt.mtp_depth, mtp_where.c_str());
     } else if (!mtp_path.empty()) {
       // Named explicitly and it did not load: that is an error, where a
@@ -505,13 +505,94 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     auto opened = model::DFlash2Module::open(dflash2_model, config, *e.lm);
     if (!opened.ok()) return fail(opened.status(), "loading DFlash2");
     e.dflash2 = opened.release();
-    e.router->use_dflash2(*e.dflash2);
+    opt.draft_path = dflash2_model;
     std::fprintf(stderr, "lse-server: DFlash2 block %u from %s\n", e.dflash2->block_size(),
                  dflash2_model.c_str());
   }
+
+  // What /v1/lse/model_info and /v1/lse/estimate describe: this model, where
+  // it was loaded from, and the device it runs on.
+  opt.model_path = model;
+  opt.device_arch = first_device.device_info().arch;
+  {
+    const graph::KernelToolchain* tc = sched->toolchain(devices->primary());
+    opt.fragmented_kv = tc != nullptr && tc->dialect == graph::Dialect::kLoom;
+  }
+  e.router = std::make_unique<server::Router>(*e.lm, *e.tok, opt);
+  if (e.mtp) e.router->use_mtp(*e.mtp);
+  if (e.dflash2) e.router->use_dflash2(*e.dflash2);
   e.requests = std::make_unique<server::InProcess>(*e.router);
   progress::begin("ready", opt.model_id);
   return std::nullopt;
+}
+
+}  // namespace
+
+namespace {
+
+lse_result answer(Result<json> got, char** json_out, char** err) {
+  if (!got.ok()) {
+    if (err != nullptr) *err = dup_string(std::string(got.status().message()));
+    const auto code = got.status().code();
+    return code == StatusCode::kInvalidArgument || code == StatusCode::kOutOfRange ||
+                   code == StatusCode::kNotFound
+               ? LSE_ERR_INVALID_ARGUMENT
+               : LSE_ERR_FAILED;
+  }
+  *json_out = dup_string(got->dump());
+  return *json_out != nullptr ? LSE_OK : LSE_ERR_FAILED;
+}
+
+// lse_estimate's reading of an lse_config: the same defaults lse_open applies.
+Result<model::MemoryPlanRequest> plan_request(const lse_config& c, const char* options) {
+  model::MemoryPlanRequest r;
+  r.model = str(c.model);
+  if (r.model.empty()) return LSE_ERROR(kInvalidArgument, "no model. Set lse_config.model.");
+  if (c.mtp_depth != 0) r.mtp_depth = c.mtp_depth;
+  if (c.batch_size != 0) r.batch_size = c.batch_size;
+  if (c.ubatch_size != 0) r.ubatch_size = c.ubatch_size;
+  if (c.kv_len > 0) r.kv_len = c.kv_len;
+  if (c.kv_cache_dtype != nullptr && *c.kv_cache_dtype) {
+    LSE_ASSIGN_OR(r.kv_cache_dtype, kv::cache_dtype_from_string(c.kv_cache_dtype));
+  }
+  if (c.dflash2 != 0) {
+    r.draft = model::DraftKind::kDFlash2;
+    r.draft_path = c.dflash2_model != nullptr ? std::string(c.dflash2_model)
+                                              : "incoai/Qwen3.8-27B-DFlash2";
+  } else if (c.no_mtp == 0) {
+    r.draft = model::DraftKind::kMtp;
+    r.draft_path = str(c.mtp_path);
+  }
+  // Loom keeps K/V in fragments; HIP keeps contiguous pools. With no dialect
+  // named, the device's first toolchain decides, which is HIP only where this
+  // build has COMGR.
+  const std::string dialect = str(c.dialect);
+#if defined(LSE_HAVE_COMGR) && LSE_HAVE_COMGR
+  r.fragmented_kv = dialect == "loom";
+#else
+  r.fragmented_kv = dialect != "hip";
+#endif
+  if (options != nullptr && *options) {
+    const json o = json::parse(options, nullptr, false);
+    if (o.is_discarded() || !o.is_object())
+      return LSE_ERROR(kInvalidArgument, "estimate options must be a JSON object");
+    try {
+      if (o.contains("context_tokens")) r.context_tokens = o["context_tokens"].get<std::int32_t>();
+      if (o.contains("sequences")) r.sequences = o["sequences"].get<std::int32_t>();
+      if (o.contains("device_arch")) r.device_arch = o["device_arch"].get<std::string>();
+      if (o.contains("device_memory_bytes"))
+        r.device_memory_bytes = o["device_memory_bytes"].get<std::uint64_t>();
+      if (o.contains("kv_storage")) {
+        const auto storage = o["kv_storage"].get<std::string>();
+        if (storage != "fragmented" && storage != "contiguous")
+          return LSE_ERROR(kInvalidArgument, "kv_storage must be fragmented or contiguous");
+        r.fragmented_kv = storage == "fragmented";
+      }
+    } catch (const json::exception& e) {
+      return LSE_ERROR(kInvalidArgument, "invalid estimate option: ", e.what());
+    }
+  }
+  return r;
 }
 
 }  // namespace
@@ -636,9 +717,21 @@ lse_result lse_status(const lse_engine* e, char** json_out) {
     std::lock_guard held(g_open_error_lock);
     if (!g_open_error.empty() && g_open_state.load() == 3) s["error"] = g_open_error;
   }
+  {
+    const auto device = backend::allocation_totals(backend::MemoryClass::kDevice);
+    const auto staging = backend::allocation_totals(backend::MemoryClass::kStaging);
+    s["memory"] = {{"device_bytes", device.live},
+                   {"device_peak_bytes", device.peak},
+                   {"device_allocations", device.allocations},
+                   {"staging_bytes", staging.live}};
+  }
   if (e != nullptr) {
     auto& engine = const_cast<lse_engine&>(*e);
     s["model"] = engine.model_id;
+    if (engine.cfg) {
+      s["kv_cache_dtype"] = std::string(kv::to_string(engine.cfg->kv_cache_dtype));
+      s["kv_len"] = engine.cfg->kv_capacity();
+    }
     if (engine.requests) {
       const auto c = engine.requests->counters();
       s["requests"] = {{"started", c.started},
@@ -655,6 +748,43 @@ lse_result lse_status(const lse_engine* e, char** json_out) {
   }
   *json_out = dup_string(s.dump());
   return *json_out != nullptr ? LSE_OK : LSE_ERR_FAILED;
+}
+
+lse_result lse_model_info(const char* model, char** json_out, char** err) {
+  if (err != nullptr) *err = nullptr;
+  if (json_out == nullptr) return LSE_ERR_INVALID_ARGUMENT;
+  *json_out = nullptr;
+  if (model == nullptr || *model == '\0') {
+    if (err != nullptr) *err = dup_string("no model path");
+    return LSE_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    return answer(model::model_info(model), json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("inspecting the model: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
+}
+
+lse_result lse_estimate(const lse_config* cfg, const char* options_json, char** json_out,
+                        char** err) {
+  if (err != nullptr) *err = nullptr;
+  if (json_out == nullptr) return LSE_ERR_INVALID_ARGUMENT;
+  *json_out = nullptr;
+  if (cfg == nullptr || cfg->abi_version != LSE_ABI_VERSION ||
+      cfg->struct_size != sizeof(lse_config)) {
+    if (err != nullptr)
+      *err = dup_string("lse_config was not initialized by lse_config_init for this ABI");
+    return LSE_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    auto request = plan_request(*cfg, options_json);
+    if (!request.ok()) return answer(request.status(), json_out, err);
+    return answer(model::estimate_memory(*request), json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("estimating: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
 }
 
 lse_result lse_http_start(lse_engine* e, const char* host, int32_t port, char** err) {

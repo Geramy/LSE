@@ -33,7 +33,7 @@ extern "C" {
  * meaning. lse_config carries the value it was initialized with. */
 #define LSE_ABI_VERSION 1u
 
-/* Engine version string, e.g. "0.4.24". */
+/* Engine version string, e.g. "0.5.0". */
 LSE_API const char *lse_version(void);
 /* LSE_ABI_VERSION of the library actually linked. */
 LSE_API uint32_t lse_abi_version(void);
@@ -154,8 +154,50 @@ LSE_API lse_result lse_cancel(lse_engine *engine, lse_request_id id);
 
 /* Engine status as JSON (release with lse_free): load phase and progress
  * (also before lse_open returns, with engine NULL), the model being served,
- * request counters, and the timings of the last completed generation. */
+ * request counters, the timings of the last completed generation, and the
+ * device bytes the engine holds ("memory": live and peak). */
 LSE_API lse_result lse_status(const lse_engine *engine, char **json_out);
+
+/* Model inspection and memory planning.
+ *
+ * Neither function opens a device or reads a tensor's payload: config.json
+ * and the safetensors headers are enough. Both are fast, allocate no GPU
+ * memory and may be called at any time, from any thread, with or without an
+ * engine open -- e.g. to fill a model picker or size a context before
+ * lse_open. Results are JSON strings released with lse_free; on failure
+ * *json_out is NULL and *err (when err is not NULL) holds a message to
+ * release with lse_free.
+ *
+ * lse_model_info describes a model directory, .safetensors file or HF repo id
+ * in the local cache: what LSE's loader detects it as (from its tensor names,
+ * not only model_type), dense or MoE, layer count and widths, which layers
+ * hold KV and which are linear-attention (Gated DeltaNet) layers with fixed
+ * recurrent state, max context, vocab, quantization, bytes on disk and the
+ * weights' estimated VRAM, MTP and DFlash2 facts (including whether it is
+ * itself a DFlash2 draft and the fields a draft must match), and, for every
+ * KV cache format LSE supports (fp32, fp16, bf16, fp8, bf8), the KV bytes per
+ * token and per 16-token block as the paged allocator sizes them. */
+LSE_API lse_result lse_model_info(const char *model, char **json_out, char **err);
+
+/* What lse_open with `cfg` would allocate on the device, by component:
+ * weights (packed the way the loader packs them), KV (with the allocator's
+ * paging granularity), recurrent state, RoPE tables, program workspace, the
+ * prefill activation peak, and the MTP or DFlash2 draft, with resident and
+ * peak totals. Reads the fields lse_open reads: model, mtp_path/no_mtp/
+ * mtp_depth, dflash2/dflash2_model, kv_cache_dtype, kv_len, batch_size,
+ * ubatch_size and dialect (Loom stores K/V in fragments, HIP in contiguous
+ * pools). `options_json` may be NULL or an object with any of:
+ *   "context_tokens":      tokens held when estimating (default: kv_len)
+ *   "sequences":           sequences decoded together (default 1)
+ *   "device_arch":         e.g. "gfx1201"; decides whether the packed Q8
+ *                          weight copies are counted (default: assumed)
+ *   "kv_storage":          "fragmented" or "contiguous" (overrides dialect)
+ *   "device_memory_bytes": also report "fits" and "max_kv_len", the largest
+ *                          kv_len whose estimate fits in this many bytes
+ * Weights, KV, recurrent state, RoPE and the DFlash2 ring are computed
+ * exactly; activation and workspace are modelled and flagged approximate. */
+LSE_API lse_result lse_estimate(const lse_config *cfg, const char *options_json,
+                                char **json_out, char **err);
 
 /* Optional HTTP surface over the same engine. host NULL and port <= 0 take
  * the config's. Returns once the socket is bound and listening. */

@@ -32,6 +32,12 @@
 #include "httplib.h"
 
 using namespace lse;
+
+#define LSE_EXPECT_STR(a, b)                                                   \
+  do {                                                                         \
+    const std::string _sa = (a), _sb = (b);                                   \
+    if (_sa != _sb) ::lse::test::fail(__FILE__, __LINE__, _sa + " vs " + _sb); \
+  } while (0)
 using json = nlohmann::json;
 
 namespace {
@@ -265,6 +271,14 @@ LSE_TEST(lse_request_and_http_answer_every_request_identically) {
   server::ServerOptions options;
   options.model_id = "parity-fixture";
   options.max_tokens_cap = 64;
+  // The fixture's directory, so the model-info routes answer about it. It is
+  // no architecture this build loads: model_info says so, estimate refuses.
+  options.model_path = fx.dir.string();
+  {
+    std::ofstream config(fx.dir / "config.json");
+    config << R"({"vocab_size": 96, "hidden_size": 8, "num_layers": 1,
+                 "full_attention_interval": 1, "global_attention_layers": []})";
+  }
   server::Router router(*fx.lm, *fx.tok, options);
   server::InProcess requests(router);
   server::HttpServer http(router, "127.0.0.1", 0);
@@ -288,6 +302,10 @@ LSE_TEST(lse_request_and_http_answer_every_request_identically) {
       {"GET", "/health", ""},
       {"GET", "/v1/models", ""},
       {"GET", "/v1/models/parity-fixture", ""},
+      {"GET", "/v1/lse/model_info", ""},
+      {"GET", "/v1/lse/estimate", ""},
+      {"POST", "/v1/lse/estimate", R"({"kv_len": 256})"},
+      {"POST", "/v1/lse/estimate", R"({"kv_cache_dtype": "int3"})"},
       {"POST", "/v1/completions", with({{"prompt", "hello there"}})},
       {"POST", "/v1/completions", with({{"prompt", "hello there"}, {"stream", true},
                                         {"stream_options", {{"include_usage", true}}}})},
@@ -309,6 +327,27 @@ LSE_TEST(lse_request_and_http_answer_every_request_identically) {
     const Answer l = in_process(requests, c.method, c.path, c.body);
     LSE_EXPECT(same(h, l, what));
     LSE_EXPECT(!h.events.empty() || h.done);
+  }
+
+  // /v1/models reports the settings the engine was opened with.
+  {
+    const Answer m = in_process(requests, "GET", "/v1/models", "");
+    LSE_EXPECT_EQ(m.status, 200);
+    if (!m.events.empty()) {
+      const json& entry = m.events.front()["data"][0];
+      LSE_EXPECT_EQ(entry["context_length"].get<int>(), fx.lm->config().kv_capacity());
+      LSE_EXPECT_EQ(entry["kv_len"].get<int>(), fx.lm->config().kv_capacity());
+      LSE_EXPECT_STR(entry["kv_cache_dtype"].get<std::string>(), std::string(kv::to_string(fx.lm->config().kv_cache_dtype)));
+      LSE_EXPECT(entry["draft"].is_null());
+    }
+    const Answer info = in_process(requests, "GET", "/v1/lse/model_info", "");
+    LSE_EXPECT_EQ(info.status, 200);
+    if (!info.events.empty()) {
+      LSE_EXPECT(!info.events.front()["loadable"].get<bool>());
+      LSE_EXPECT(info.events.front()["served"].contains("context_length"));
+    }
+    const Answer bad = in_process(requests, "POST", "/v1/lse/estimate", R"({"kv_len": "x"})");
+    LSE_EXPECT_EQ(bad.status, 400);
   }
 
   // A cancelled request ends with the cancellation error and nothing else.

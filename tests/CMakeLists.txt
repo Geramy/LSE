@@ -123,6 +123,19 @@ target_include_directories(test_chat_protocol PRIVATE
 # one Router, driven by a tiny host-only model. Opens a loopback socket only.
 lse_add_test(test_api_parity lse_server lse_tokenizer lse_model lse_backends)
 target_include_directories(test_api_parity PRIVATE ${CMAKE_SOURCE_DIR}/third_party/vendor)
+# Model inspection and memory planning against fixture checkpoints, checked
+# against what a load on the host backend allocates. No device.
+if(TARGET lse_api)
+  lse_add_test(test_model_info lse_api lse_server lse_model lse_backends)
+  set_tests_properties(test_model_info PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu:0")
+  # The same comparison against real checkpoints on the host backend. Loads a
+  # whole model into RAM, so it runs only when pointed at one; see the file.
+  add_executable(test_model_info_real test_model_info_real.cpp)
+  target_link_libraries(test_model_info_real PRIVATE lse_core lse_backend_registry lse_model lse_backends)
+  target_include_directories(test_model_info_real PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  lse_apply_common_flags(test_model_info_real)
+endif()
+
 # Socket lifecycle coverage never opens a model or device.
 find_package(Threads REQUIRED)
 add_executable(test_server_shutdown test_server_shutdown.cpp)

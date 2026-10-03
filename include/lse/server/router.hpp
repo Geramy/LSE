@@ -39,6 +39,14 @@ struct ServerOptions {
   std::int32_t max_tokens_cap = 4096;
   std::uint32_t mtp_depth = 3;
   runtime::PrefillBatch prefill;
+  // Where the served model and its draft came from, and what they run on, for
+  // /v1/lse/model_info and /v1/lse/estimate. Those routes describe the loaded
+  // model only: a server never inspects a path a client names. An empty
+  // model_path answers them 404.
+  std::string model_path;
+  std::string draft_path;    // the MTP module or DFlash2 checkpoint, if any
+  std::string device_arch;   // e.g. "gfx1201"; empty when unknown
+  bool fragmented_kv = true; // K/V in Loom fragments rather than contiguous pools
 };
 
 // What a route answers. A streaming answer has status 200 and carries

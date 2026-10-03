@@ -67,11 +67,17 @@ void usage() {
       "      --cache-dir PATH kernel cache directory (default ~/.lse/cache)\n"
       "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
       "      --dialect NAME   source dialect: hip or loom\n"
+      "      --model-info     print what the model is (JSON) and exit; reads\n"
+      "                       config.json and tensor headers only\n"
+      "      --estimate[=JSON]  print the device memory the other options would\n"
+      "                       allocate (JSON) and exit, without opening a device;\n"
+      "                       JSON may set context_tokens, sequences, device_arch,\n"
+      "                       kv_storage and device_memory_bytes\n"
       "  -h, --help           this message\n"
       "\n"
       "Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,\n"
-      "POST /v1/completions. Both completion routes stream when the request\n"
-      "sets \"stream\": true.");
+      "POST /v1/completions, GET /v1/lse/model_info, GET|POST /v1/lse/estimate.\n"
+      "Both completion routes stream when the request sets \"stream\": true.");
 }
 
 }  // namespace
@@ -98,6 +104,8 @@ int main(int argc, char** argv) {
   std::string attention_calibration;
   std::optional<bool> flashprefill_toggle;
   int shutdown_grace_seconds = 30;
+  bool model_info = false;
+  std::optional<std::string> estimate;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -205,6 +213,9 @@ int main(int argc, char** argv) {
         return 2;
       }
     }
+    else if (a == "--model-info") model_info = true;
+    else if (a == "--estimate") estimate = std::string();
+    else if (a.starts_with("--estimate=")) estimate = a.substr(std::string("--estimate=").size());
     else if (a == "--pool") pool = value("--pool");
     else if (a == "--dialect") {
       dialect = value("--dialect");
@@ -244,6 +255,21 @@ int main(int argc, char** argv) {
   cfg.shutdown_grace_seconds = shutdown_grace_seconds;
 
   char* err = nullptr;
+  if (model_info || estimate) {
+    // Answered from config.json and the tensor headers: no device is opened.
+    char* json = nullptr;
+    const lse_result r = model_info
+        ? lse_model_info(model.c_str(), &json, &err)
+        : lse_estimate(&cfg, estimate->empty() ? nullptr : estimate->c_str(), &json, &err);
+    if (r != LSE_OK) {
+      std::fprintf(stderr, "lse-server: %s\n", err != nullptr ? err : "failed");
+      lse_free(err);
+      return r == LSE_ERR_INVALID_ARGUMENT ? 2 : 1;
+    }
+    std::puts(json);
+    lse_free(json);
+    return 0;
+  }
   lse_engine* engine = lse_open(&cfg, &err);
   if (engine == nullptr) {
     std::fprintf(stderr, "lse-server: %s\n", err != nullptr ? err : "could not open the engine");
