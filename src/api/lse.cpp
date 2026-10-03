@@ -1,6 +1,12 @@
 // The in-process engine behind include/lse/lse.h. lse_open is what lse-server
 // does between parsing its command line and listening; lse_request hands a
 // request to the same Router the HTTP server forwards to.
+#include <TargetConditionals.h>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
+#if TARGET_OS_IOS
+#include <os/proc.h>
+#endif
 #include "lse/lse.h"
 
 #include <unistd.h>
@@ -155,6 +161,30 @@ std::atomic<int> g_open_state{0};  // 0 idle, 1 loading, 2 ready, 3 failed, 4 cl
 std::mutex g_open_error_lock;
 std::string g_open_error;
 std::atomic<bool> g_engine_open{false};
+
+// The process's physical footprint: what iOS counts against an app's limit.
+std::uint64_t host_footprint() {
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
+      KERN_SUCCESS)
+    return 0;
+  return info.phys_footprint;
+}
+
+// What the engine's process holds on the host, for lse_status and the log.
+json host_memory_json() {
+  malloc_statistics_t heap{};
+  malloc_zone_statistics(nullptr, &heap);
+  json h{{"phys_footprint", host_footprint()},
+         {"malloc_in_use", heap.size_in_use},
+         {"malloc_allocated", heap.size_allocated},
+         {"staging_bytes", backend::allocation_totals(backend::MemoryClass::kStaging).live}};
+#if TARGET_OS_IOS
+  h["available"] = os_proc_available_memory();
+#endif
+  return h;
+}
 
 // The device memory an engine leaves behind once its objects are destroyed:
 // the scheduler's held program, constants and tables (the scheduler and the
@@ -544,6 +574,23 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   if (e.mtp) e.router->use_mtp(*e.mtp);
   if (e.dflash2) e.router->use_dflash2(*e.dflash2);
   e.requests = std::make_unique<server::InProcess>(*e.router);
+
+  // Every weight is on the device: release what loading left on the host.
+  // The mapped checkpoint stays mapped (views still name it) but its pages
+  // are dropped, and the allocator returns the pages the load freed.
+  progress::begin("releasing");
+  {
+    const std::uint64_t before = host_footprint();
+    // The draft's checkpoint is unmapped when its module finishes loading.
+    const std::size_t mapped = e.weights ? e.weights->release_pages() : 0;
+    const std::size_t relieved = malloc_zone_pressure_relief(nullptr, 0);
+    const std::uint64_t after = host_footprint();
+    std::fprintf(stderr,
+                 "lse: load released %.0f MiB host memory (%.0f MiB of allocator pages; %.0f MiB of "
+                 "checkpoint mapping advised away); footprint %.0f MiB\n",
+                 before > after ? double(before - after) / 1048576.0 : 0.0, double(relieved) / 1048576.0,
+                 double(mapped) / 1048576.0, double(after) / 1048576.0);
+  }
   progress::begin("ready", opt.model_id);
   return std::nullopt;
 }
@@ -685,8 +732,8 @@ lse_engine* lse_open(const lse_config* cfg, char** err) {
   // What the engine holds once ready, beside what the device runtime holds:
   // the difference is memory the runtime keeps that the engine never asked
   // for.
-  std::fprintf(stderr, "lse: engine ready; device memory: %s\n%s",
-               backend::describe_device_allocations().c_str(),
+  std::fprintf(stderr, "lse: engine ready; device memory: %s; host memory: %s\n%s",
+               backend::describe_device_allocations().c_str(), host_memory_json().dump().c_str(),
                backend::runtime_memory_report().c_str());
   return engine.release();
 }
@@ -766,6 +813,7 @@ lse_result lse_status(const lse_engine* e, char** json_out) {
     }
     if (const std::string runtime = backend::runtime_memory_report(); !runtime.empty())
       s["runtime_memory"] = runtime;
+    s["host_memory"] = host_memory_json();
     s["memory"] = {{"device_bytes", device.live},
                    {"device_peak_bytes", device.peak},
                    {"device_allocations", device.allocations},

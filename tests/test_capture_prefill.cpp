@@ -35,6 +35,9 @@
 #include "lse/place/devices.hpp"
 #include "lse/server/router.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
+#include "lse/lse.h"
+#include <mach/mach.h>
+#include <malloc/malloc.h>
 
 using namespace lse;
 using namespace lse::graph;
@@ -93,14 +96,32 @@ struct CaptureBackend : Backend<CaptureBackend> {
   void shutdown_impl() noexcept { cpu.shutdown_impl(); }
   static Result<std::vector<DeviceDescriptor>> enumerate_devices() { return CpuBackend::enumerate_devices(); }
   const DeviceInfo& device_info_impl() const noexcept { return info; }
-  Result<DeviceBuffer> allocate_impl(std::size_t b, MemoryClass c, Stream s) { return cpu.allocate_impl(b, c, s); }
-  void deallocate_impl(DeviceBuffer& b) noexcept { cpu.deallocate_impl(b); }
-  Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t n, std::size_t off) { return cpu.copy_h2d_impl(src, dst, n, off); }
-  Status copy_d2h_impl(const DeviceBuffer& src, void* dst, std::size_t n, std::size_t off) { return cpu.copy_d2h_impl(src, dst, n, off); }
+  // Opaque, as device memory is: the host reaches it only through copies
+  // (handle is the backing address), so host mirrors, staging and uploads
+  // take the paths they take on a GPU.
+  static std::byte* at(const DeviceBuffer& b, std::size_t off) {
+    return reinterpret_cast<std::byte*>(b.handle) + b.offset + off;
+  }
+  Result<DeviceBuffer> allocate_impl(std::size_t b, MemoryClass c, Stream s) {
+    auto buf = cpu.allocate_impl(b, c, s);
+    if (buf.ok() && c == MemoryClass::kDevice) buf->ptr = nullptr;
+    return buf;
+  }
+  void deallocate_impl(DeviceBuffer& b) noexcept { b.storage.reset(); b.handle = 0; b.ptr = nullptr; }
+  Result<void*> device_pointer_impl(const DeviceBuffer& b) const { return static_cast<void*>(at(b, 0)); }
+  Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t n, std::size_t off) {
+    if (!src || !dst.handle || off + n > dst.size_bytes) return LSE_ERROR(kInvalidArgument, "capture copy_h2d");
+    std::memcpy(at(dst, off), src, n);
+    return OkStatus();
+  }
+  Status copy_d2h_impl(const DeviceBuffer& src, void* dst, std::size_t n, std::size_t off) {
+    if (!dst || !src.handle || off + n > src.size_bytes) return LSE_ERROR(kInvalidArgument, "capture copy_d2h");
+    std::memcpy(dst, at(src, off), n);
+    return OkStatus();
+  }
   Status copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst, std::size_t n, std::size_t so, std::size_t d) {
-    if (!src.ptr || !dst.ptr) return LSE_ERROR(kInvalidArgument, "capture copy without host storage");
-    std::memmove(static_cast<std::byte*>(dst.ptr) + dst.offset + d,
-                 static_cast<const std::byte*>(src.ptr) + src.offset + so, n);
+    if (!src.handle || !dst.handle) return LSE_ERROR(kInvalidArgument, "capture copy without storage");
+    std::memmove(at(dst, d), at(src, so), n);
     return OkStatus();
   }
   Status synchronize_impl() { return OkStatus(); }
@@ -477,6 +498,84 @@ LSE_TEST(a_refused_device_dispatch_fails_the_request_and_the_engine_recovers) {
   // held after load.
   LSE_EXPECT_EQ(e.complete("", prompt(600, 3)), 200);
   LSE_EXPECT(live() <= e.baseline);
+}
+
+
+namespace {
+std::uint64_t phys_footprint() {
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+    return 0;
+  return info.phys_footprint;
+}
+std::uint64_t malloc_in_use() {
+  malloc_statistics_t st{};
+  malloc_zone_statistics(nullptr, &st);
+  return st.size_in_use;
+}
+}  // namespace
+
+// Host memory a loaded engine keeps, on a real checkpoint: the process
+// footprint less the device memory (which on the capture device is host
+// memory too). Gated: it loads a whole model. Point it at checkpoints:
+//   LSE_TEST_MODEL_TARGET=.../qwen38-27b-q4 [LSE_TEST_MODEL_DFLASH2=...]
+//   LSE_TEST_HOST_BUDGET_MB=256 (default: the host heap a loaded engine may keep)
+LSE_TEST(a_loaded_engine_keeps_little_host_memory) {
+  const char* target = std::getenv("LSE_TEST_MODEL_TARGET");
+  if (target == nullptr) {
+    lse::test::skip("set LSE_TEST_MODEL_TARGET (and LSE_TEST_MODEL_DFLASH2) to run");
+    return;
+  }
+  const char* draft = std::getenv("LSE_TEST_MODEL_DFLASH2");
+  const char* budget_text = std::getenv("LSE_TEST_HOST_BUDGET_MB");
+  const std::uint64_t budget = (budget_text ? std::strtoull(budget_text, nullptr, 10) : 256) << 20;
+  const auto footprint_before = phys_footprint();
+  const auto heap_before = malloc_in_use();
+  const auto device_before = live();
+  lse_config cfg;
+  lse_config_init(&cfg);
+  cfg.model = target;
+  if (draft != nullptr) { cfg.dflash2 = 1; cfg.dflash2_model = draft; }
+  cfg.kv_len = 32768;
+  cfg.kv_cache_dtype = "bf16";
+  cfg.pool = "capture:0";
+  cfg.dialect = "loom";
+  char* err = nullptr;
+  lse_engine* engine = lse_open(&cfg, &err);
+  if (engine == nullptr) {
+    std::printf("       open failed: %s\n", err ? err : "?");
+    lse_free(err);
+    LSE_EXPECT(engine != nullptr);
+    return;
+  }
+  const auto device = live() - device_before;
+  const auto footprint = phys_footprint() - footprint_before;
+  const auto host = footprint > device ? footprint - device : 0;
+  // On this device the device memory is malloc memory too; what the heap
+  // holds beyond it is what the engine keeps on the host.
+  const auto heap = malloc_in_use() - heap_before;
+  const auto host_heap = heap > device ? heap - device : 0;
+  char* status = nullptr;
+  (void)lse_status(engine, &status);
+  std::string host_report;
+  if (status != nullptr) {
+    const json s = json::parse(status);
+    if (s.contains("host_memory")) host_report = s["host_memory"].dump();
+  }
+  lse_free(status);
+  std::printf("       loaded: footprint +%.0f MiB, device +%.0f MiB; host heap kept %.0f MiB (budget %.0f MiB), "
+              "host footprint beyond device %.0f MiB (includes pages the allocator caches)\n"
+              "       host_memory: %s\n",
+              footprint / 1048576.0, device / 1048576.0, host_heap / 1048576.0, budget / 1048576.0,
+              host / 1048576.0, host_report.c_str());
+  LSE_EXPECT(host_heap <= budget);
+  if (const char* pause = std::getenv("LSE_TEST_PAUSE_SECONDS")) {
+    std::printf("       pid %d paused\n", getpid());
+    std::fflush(stdout);
+    sleep(static_cast<unsigned>(std::atoi(pause)));
+  }
+  lse_close(engine);
 }
 
 LSE_TEST_MAIN()

@@ -359,6 +359,14 @@ Result<Array> upload(const TensorView& v, Shape shape,
     Phase up{&g_load_dev_ms};
     LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
   }
+  // The device holds the weight now. A mirror kept beside opaque device
+  // memory is a second, host copy of the tensor that nothing reads: on
+  // Qwen3.8-27B the reordered and windowed tensors left 3 GiB of them. Drop
+  // it; anything that wants the bytes on the host pulls them back.
+  if (n.buffer.ptr == nullptr && !n.kv_fragments && !n.host_dirty) {
+    std::vector<std::byte>().swap(n.host_mirror);
+    n.device_dirty = true;
+  }
   return a;
 }
 

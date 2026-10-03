@@ -543,5 +543,5 @@ if(TARGET lse_backend_hrx)
 endif()
 if(LSE_ENABLE_HRX)
   # The device-first scheduler path on a recording-only host device.
-  lse_add_test(test_capture_prefill lse_server lse_runtime lse_model lse_graph lse_backends lse_tokenizer lse_place)
+  lse_add_test(test_capture_prefill lse_api lse_server lse_runtime lse_model lse_graph lse_backends lse_tokenizer lse_place)
 endif()

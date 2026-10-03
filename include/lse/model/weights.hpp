@@ -77,6 +77,13 @@ class SafeTensors {
 
   // Maps one safetensors file and merges its tensors into this reader.
   Status map_file(const std::string& path);
+ public:
+  // Tells the kernel the mapped pages are not needed now. The mapping stays
+  // valid (a later read faults the bytes back in from the file); its
+  // resident pages are dropped. What a loaded engine calls once every
+  // weight is on the device. Returns the bytes mapped.
+  std::size_t release_pages() const noexcept;
+ private:
   void unmap_all() noexcept;
 
   std::string path_;

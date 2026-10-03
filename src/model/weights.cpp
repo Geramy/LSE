@@ -183,6 +183,16 @@ SafeTensors& SafeTensors::operator=(SafeTensors&& other) noexcept {
   return *this;
 }
 
+std::size_t SafeTensors::release_pages() const noexcept {
+  std::size_t bytes = 0;
+  for (const Mapping& m : mappings_) {
+    if (m.ptr == nullptr) continue;
+    (void)::madvise(m.ptr, m.size, MADV_DONTNEED);
+    bytes += m.size;
+  }
+  return bytes;
+}
+
 Status SafeTensors::map_file(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return LSE_ERROR(kIoError, "cannot open '", path, "'");
