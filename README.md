@@ -3,20 +3,25 @@
 LSE is an LLM inference engine with a built-in kernel compiler and optimization engine.
 It specializes GPU kernels for the model and device, compiles them through HIP or Loom,
 and caches the compiled kernels for reuse. LSE runs text models on AMD GPUs through
-an HTTP server or command-line program.
+an HTTP server, a command-line program, or inside your own app through libLSE, its C API.
 
 **LemonSeed Engine** · [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu) · [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg)
 
 - **HTTP server:** Chat Completions, text completions, reasoning output, and function tool calls.
 - **Model formats:** MLX group-affine Q4, Q6, and Q8 weights; BF16, FP16, and FP32 weights.
 - **Speculative decoding:** Native multi-token prediction (MTP) or an optional DFlash2 draft model.
+  A BF16 DFlash2 checkpoint is converted to Q8 automatically on first use.
+- **In-process library:** libLSE, a plain C API (`include/lse/lse.h`) on every platform,
+  including an XCFramework for iOS and iPadOS.
+- **Model info and memory estimates:** inspect a checkpoint and size a context before loading it.
 - **GPU execution:** HRX with HIP or Loom kernel source, subject to platform support.
 - **CPU backend:** Reference execution and a fallback when available GPU backends cannot start.
 
 [Install](#install-a-release) · [Start the server](#start-the-http-server) ·
 [MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
-[Benchmarks](#humaneval-through-32k) · [Build](#build-from-source) ·
-[Troubleshooting](#troubleshooting)
+[Memory estimates](#model-info-and-memory-estimates) · [libLSE](#use-lse-as-a-library) ·
+[iPadOS](#ios-and-ipados) · [Benchmarks](#humaneval-through-32k) ·
+[Build](#build-from-source) · [Troubleshooting](#troubleshooting)
 
 ## HumanEval+ through 32K
 
@@ -71,6 +76,18 @@ Q/K/P/V matrix operands; FP32, BF16, FP8 and BF8 storage use BF16 operands after
 decoding or conversion. Matrix accumulators, softmax state and output remain
 FP32. Single-token and selected short-query split attention keep FP32 calculation.
 
+KV bytes per token for Qwen3.8-27B (16 KV layers, four KV heads of 256), both K and V:
+
+| `--kv-cache-dtype` | Bytes per token | 32K tokens |
+| --- | ---: | ---: |
+| `fp32` | 131,072 | 4 GiB |
+| `fp16`, `bf16` | 65,536 | 2 GiB |
+| `fp8`, `bf8` (with scales) | 33,280 | 1.02 GiB |
+
+`--model-info` lists these figures for any checkpoint, and `--estimate` adds
+the weights, recurrent state, draft and workspace for a whole configuration.
+See [Model info and memory estimates](#model-info-and-memory-estimates).
+
 See [KV cache formats](docs/KV_CACHE.md) and [K/V storage](docs/KV-STORAGE.md)
 for format selection, memory management, and validation details.
 Completed prefill workspaces are released while live K/V and compiled kernels
@@ -82,6 +99,7 @@ remain available for reuse.
 |---|---|---|
 | Linux x86_64 | ROCm 7.x and [HRX](https://github.com/ROCm/hrx-system) | HIP or Loom |
 | macOS on Apple Silicon | An external AMD GPU and the installed [mac_linuxgpu driver](https://github.com/lemonade-sdk/mac_linuxgpu) | Loom |
+| iPadOS on an M-series iPad | An external AMD GPU over Thunderbolt and an app that embeds the mac_linuxgpu driver and links `LSE.xcframework` | Loom, in process |
 | CPU | A build with the CPU backend | CPU reference execution |
 
 The tested macOS GPU is the R9700 (`gfx1201`). The macOS package includes HRX, Loom, and their runtime libraries.
@@ -105,7 +123,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.24`.
+The examples below use `v0.5.0`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -114,7 +132,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.24
+   lse_tag=v0.5.0
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -147,7 +165,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.24
+   lse_tag=v0.5.0
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -169,6 +187,12 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 
 Use the programs in `bin/`. These launchers select the runtime libraries supplied with the package.
 You do not need to set `DYLD_LIBRARY_PATH` yourself.
+
+### iOS and iPadOS
+
+Download `lse-v0.5.0-ios-arm64.xcframework.zip` and its `.sha256` from the same
+release, check it with `shasum -a 256 -c`, and unzip it to get `LSE.xcframework`.
+See [iOS and iPadOS](#ios-and-ipados) for how an app uses it.
 
 ### Check the GPU
 
@@ -264,7 +288,13 @@ Without `--no-mtp`, LSE can use an MTP module found beside the target model.
 
 ### DFlash2 with a Q8 draft model
 
-Prepare the matching Q8 draft model with the [DFlash2 conversion instructions](docs/DFLASH2.md#reproduce-q8-conversion).
+`--dflash2-model` accepts the Q8 draft or the original BF16 checkpoint, as a
+directory or a Hugging Face repository ID. LSE converts a BF16 checkpoint to
+affine Q8/group64 once, bit-identical to `scripts/convert_dflash2_q8.py`, caches
+the result in `lse-q8g64/` beside the source (or under `$LSE_DFLASH2_CACHE_DIR`),
+and loads the cached copy afterwards. Conversion streams the source and needs
+only a few MiB of memory. Set `LSE_DFLASH2_AUTOCONVERT=0` to load a BF16 draft
+unconverted. See [automatic Q8 conversion](docs/DFLASH2.md#automatic-q8-conversion).
 
 ```bash
 "$LSE_BIN/lse-server" \
@@ -302,7 +332,9 @@ Streaming responses use server-sent events. Set `"stream": true` to request them
 | Endpoint | Support |
 |---|---|
 | `GET /health` | Server and speculation status |
-| `GET /v1/models`, `GET /v1/models/{id}` | Loaded model information |
+| `GET /v1/models`, `GET /v1/models/{id}` | Loaded model, with `context_length`, `kv_len`, `kv_cache_dtype` and the draft |
+| `GET /v1/lse/model_info` | What the loaded model is; see [model info](#model-info-and-memory-estimates) |
+| `GET`, `POST /v1/lse/estimate` | Device memory for the loaded model at other settings |
 | `POST /v1/chat/completions` | Text chat, reasoning, tools, and streaming |
 | `POST /v1/completions` | Text completions and streaming |
 
@@ -318,6 +350,141 @@ Current API limits:
 For remote access, set `--host 0.0.0.0` and an API key.
 The server has no request rate limit or per-client accounting.
 See the [client compatibility guide](docs/CHAT-COMPATIBILITY.md) for complete behavior and test results.
+
+## Model info and memory estimates
+
+LSE can describe a checkpoint and size a configuration without loading it. Both
+read `config.json` and the safetensors headers only: they take milliseconds,
+open no device and allocate no GPU memory.
+
+```bash
+"$LSE_BIN/lse-server" --model "$LSE_MODEL" --model-info
+"$LSE_BIN/lse-server" --model "$LSE_MODEL" --dflash2=on \
+  --dflash2-model /absolute/path/to/qwen38-27b-dflash2-q8 \
+  --kv-len 65536 --kv-cache-dtype bf16 --dialect loom \
+  --estimate='{"device_memory_bytes": 34359738368}'
+```
+
+`--model-info` reports the architecture LSE's loader detects from the tensor
+names (not only `model_type`), dense or MoE, layer count and widths, which
+layers hold KV and which are linear-attention (Gated DeltaNet) layers with a
+fixed recurrent state, `max_position_embeddings` and the default `--kv-len`,
+vocabulary, quantization, bytes on disk and the weights' device footprint, MTP
+and DFlash2 facts (a draft reports the hidden size, vocabulary and target layer
+count it must match), and KV bytes per token and per 16-token block for `fp32`,
+`fp16`, `bf16`, `fp8` and `bf8`.
+
+`--estimate` takes the same options as a server start and reports the bytes
+that start would allocate: weights, KV, recurrent state, RoPE tables, the MTP
+KV or DFlash2 ring, program workspace and the prefill activation peak, with
+`resident_bytes`, `total_bytes` and `device_total_bytes` (which adds 2 GiB for
+the runtime's own reservations). With `device_memory_bytes` it also reports
+`fits` and `max_kv_len`, the longest context that fits. Its JSON argument can
+also set `context_tokens`, `sequences`, `device_arch` and `kv_storage`.
+
+Weights, KV, recurrent state, RoPE and the DFlash2 ring follow the loader's and
+allocator's own rules; on the host backend a load of Qwen3.8-27B Q4 with its Q8
+DFlash2 or MTP draft matches the estimate to the byte for KV and within 0.001%
+for weights. Activation and workspace are modelled from the layer shapes and
+calibrated against R9700 runs, and are marked approximate. The same estimate
+puts Qwen3.8-27B Q4 with Q8 DFlash2 at 27.73 GB of device memory for a
+68,301-token context; the R9700 run in the
+[K/V fragment report](docs/benchmarks/kv-fragments-2026-09-29.md) peaked at 27.83 GB.
+
+A running server answers the same questions about the model it loaded, at
+`GET /v1/lse/model_info` and `GET`/`POST /v1/lse/estimate` (the body may change
+`kv_cache_dtype`, `kv_len`, `context_tokens`, `batch_size`, `ubatch_size`,
+`sequences`, `mtp_depth` or `device_memory_bytes`). A server never inspects a
+path a client names. libLSE offers both as `lse_model_info` and `lse_estimate`.
+
+## Use LSE as a library
+
+libLSE is the whole engine behind one plain C header, `include/lse/lse.h`, built
+on every platform; `lse-server` is a thin `main` over it. Requests and responses
+are the same OpenAI-shaped JSON the HTTP server uses, without a socket.
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <lse/lse.h>
+
+static void on_response(void *user, lse_request_id id, lse_event event,
+                        int status, const char *data, size_t len) {
+  if (event == LSE_EVENT_CHUNK) printf("%.*s\n", (int)len, data);   /* one SSE chunk */
+  if (event == LSE_EVENT_RESPONSE || event == LSE_EVENT_ERROR)
+    printf("%d %.*s\n", status, (int)len, data);
+}
+
+int main(void) {
+  char *info = NULL, *err = NULL;
+  if (lse_model_info("/models/qwen38-27b-q4", &info, &err) == LSE_OK) {
+    puts(info);                      /* architecture, KV layers, KV bytes per token, ... */
+    lse_free(info);
+  }
+
+  lse_config cfg;
+  lse_config_init(&cfg);             /* the lse-server defaults */
+  cfg.model = "/models/qwen38-27b-q4";
+  cfg.dflash2 = 1;
+  cfg.dflash2_model = "/models/qwen38-27b-dflash2-q8";
+  cfg.kv_len = 32768;
+  cfg.kv_cache_dtype = "bf16";
+  cfg.pool = "hrx:0";
+  cfg.dialect = "loom";
+
+  char *plan = NULL;                 /* what lse_open(&cfg) would allocate */
+  if (lse_estimate(&cfg, "{\"device_memory_bytes\": 34359738368}", &plan, &err) == LSE_OK) {
+    puts(plan);
+    lse_free(plan);
+  }
+
+  lse_engine *engine = lse_open(&cfg, &err);   /* blocks until the model is ready */
+  if (engine == NULL) { fprintf(stderr, "%s\n", err); lse_free(err); return 1; }
+
+  const char *body =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],"
+      "\"max_tokens\":64,\"stream\":true}";
+  lse_request_id id;
+  lse_request(engine, "POST", "/v1/chat/completions", body, strlen(body),
+              on_response, NULL, &id);
+  /* ... wait for LSE_EVENT_DONE or LSE_EVENT_ERROR; lse_cancel(engine, id) stops it ... */
+
+  /* Optional: serve the same engine over HTTP as well, until lse_http_stop. */
+  if (lse_http_start(engine, "127.0.0.1", 8080, &err) == LSE_OK) lse_http_wait(engine, &err);
+  lse_close(engine);
+  return 0;
+}
+```
+
+`lse_status` reports load progress (also while `lse_open` is running), request
+counters, the last generation's timings and the device bytes the engine holds.
+`lse_set_log_callback` receives the log lines `lse-server` prints. Every string
+the library returns is released with `lse_free`. Link `libLSE.a` from a CMake
+build (target `lse_api`); see [Build from source](#build-from-source).
+
+## iOS and iPadOS
+
+On an M-series iPad with an AMD GPU attached over Thunderbolt, LSE runs inside
+the app: [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu)'s driver is
+embedded in the app, and the app links `LSE.xcframework`, which carries libLSE,
+HRX, Loom, the tokenizer and the static HSA runtime and exports only the `lse_*`
+API. Swift imports it as `import LSE`. There is no executable and no subprocess;
+kernels are generated on the device as GPU code objects and cached under the
+app's `Library/Caches/lse/kernels`.
+
+Measured on an iPad Pro (M4) with a Radeon AI PRO R9700 over Thunderbolt,
+Qwen3.8-27B Q4 with the Q8 DFlash2 draft, warm:
+
+| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.4.24 |
+| --- | ---: | ---: |
+| Decode | 40.5 tok/s at 73% draft acceptance | 43.3 tok/s at 74% |
+| Decode at 85–93% acceptance | 57–70 tok/s | — |
+| Model load | about 34 s | — |
+| Operations that fell back to the CPU | 0 | 0 |
+
+Build the XCFramework with
+[`scripts/ios/build-ios.sh`](BUILD_INSTRUCTIONS.md#ios--ipados-in-process-library),
+or download it from the release.
 
 ## Models and context
 
@@ -429,6 +596,8 @@ Multi-device model partitioning and continuous HTTP batching remain development 
 | Build and runtime setup | [Build instructions](BUILD_INSTRUCTIONS.md) |
 | Thinking, tools, pi, and API limits | [Client compatibility](docs/CHAT-COMPATIBILITY.md) |
 | DFlash2 model and Q8 conversion | [DFlash2](docs/DFLASH2.md) |
+| In-process C API | [`include/lse/lse.h`](include/lse/lse.h) |
+| KV formats and memory | [KV cache formats](docs/KV_CACHE.md) |
 | Q4 compute selection | [INT8 policy](docs/INT8_POLICY.md) |
 | Quantized weights and compute formats | [Quantized operands](docs/QUANT_OPERANDS.md) |
 | FP8 and BF8 conversion | [FP8 conversion](docs/FP8_CONVERSION.md) |

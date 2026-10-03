@@ -158,7 +158,7 @@ def main():
     (package / 'licenses/rust-dependencies.json').write_text(json.dumps(rust_notices, indent=2) + '\n')
     shutil.copy2(root / 'README.md', package / 'README.md')
     (package / 'docs').mkdir()
-    for doc_name in ('KV-STORAGE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md', 'RELEASE_HISTORY.md'):
+    for doc_name in ('KV-STORAGE.md', 'KV_CACHE.md', 'CHAT-COMPATIBILITY.md', 'pi-models.example.json', 'DFLASH2.md', 'RELEASE_HISTORY.md'):
         shutil.copy2(root / 'docs' / doc_name, package / 'docs' / doc_name)
     (package / 'docs' / 'experimental').mkdir()
     shutil.copy2(root / 'docs/experimental/sparse-attention.md',
@@ -206,12 +206,15 @@ def main():
         'Binary deployment target: Apple Silicon macOS 15 or newer.\n'
         'External AMD GPU use requires the driver-supported macOS version\n'
         '(currently macOS Tahoe 26.2+); gfx1201/R9700 qualification target.\n'
-        'Install and enable the MacAMDGPU DriverKit extension separately:\n'
-        'https://github.com/lemonade-sdk/mac-amdgpu\n'
-        'The extension is not bundled or installed by this archive.\n\n'
+        'Install and activate the mac_linuxgpu driver separately:\n'
+        'https://github.com/lemonade-sdk/mac_linuxgpu\n'
+        'The driver is not bundled or installed by this archive.\n\n'
         './bin/lse --help\n'
         './bin/lse --model /path/to/model --pool hrx:0 --dialect loom --prompt "Hello"\n'
         './bin/lse-server --model /path/to/model --pool hrx:0 --dialect loom\n\n'
+        'Describe a model, or size a configuration, without loading it:\n'
+        './bin/lse-server --model /path/to/model --model-info\n'
+        './bin/lse-server --model /path/to/model --kv-len 32768 --estimate\n\n'
         'The HSA runtime is installed by the GPU driver, not this archive;\n'
         'LSE loads it from /usr/local/lib or /Library/MacAMDGPU/runtime.\n'
         'Default JIT cache: ~/.lse/cache (created automatically).\n'

@@ -3,6 +3,13 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.0: libLSE, iPadOS, DFlash2 BF16 loading and memory estimates
+
+1. **libLSE:** the engine as an in-process library behind a plain C API ([`include/lse/lse.h`](../include/lse/lse.h)): `lse_open`, `lse_request` with the server's JSON, `lse_cancel`, `lse_status`, a log callback and an optional HTTP adapter. `lse-server` is a thin command line over it, and both transports answer identically.
+2. **iOS and iPadOS:** `scripts/ios/build-ios.sh` builds `LSE.xcframework`. On an iPad Pro (M4) with an R9700 over Thunderbolt, through mac_linuxgpu's embedded driver, Qwen3.8-27B Q4 with the Q8 DFlash2 draft decoded at **40.5 tok/s** warm at 73% acceptance (the M5 Max Mac measured 43.3 tok/s at 74% with v0.4.24) and **57–70 tok/s** at 85–93%, with about 34 s model load and **0** CPU fallbacks.
+3. **DFlash2 BF16 checkpoints:** `--dflash2-model` converts a BF16 draft to Q8/group64 once, bit-identical to `scripts/convert_dflash2_q8.py`, and caches the result.
+4. **Model info and memory estimates:** `lse_model_info`/`--model-info` and `lse_estimate`/`--estimate`, plus `/v1/lse/model_info` and `/v1/lse/estimate` for a running server. Weights, KV, recurrent state, RoPE and the DFlash2 ring follow the allocators' own rules; a host-backend load of Qwen3.8-27B Q4 with its Q8 drafts matches within 0.001%. `/v1/models` reports `context_length`, `kv_len` and `kv_cache_dtype`.
+
 ## v0.4.24: HumanEval+ through 32K and driver HSA runtime
 
 1. **HumanEval+ through 32K:** FlashPrefill V2 (alpha 0.1) prefill is **51–55% faster at 32K** across Baseline, MTP3 and DFlash2 on Qwen3.8-27B Q4, R9700/HRX/LOOM, over **1,368 completed generations**. Correctness matches dense prefill at Standard and 32K, with one additional failure per mode at 16K. [Results and data](benchmarks/flashprefill-humaneval-32k.json).

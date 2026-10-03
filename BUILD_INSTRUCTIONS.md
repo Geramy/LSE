@@ -3,7 +3,8 @@
 Two first-class targets (plus an in-process iOS/iPadOS library, below): **Linux + ROCm** (the original, full path) and
 **macOS + Apple Silicon** (via the [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu)
 driver and HSA runtime). Both produce the same `lse` / `lse-server`
-binaries; the difference is the GPU runtime and the kernel AOT target.
+binaries and the same in-process library, libLSE; the difference is the GPU
+runtime and the kernel AOT target.
 
 The core library and CPU backend build on either platform with **no GPU and no
 external packages**. The HRX (GPU) backend is what needs the platform-specific
@@ -151,12 +152,59 @@ export DYLD_LIBRARY_PATH=<hrx-install>/lib:$DYLD_LIBRARY_PATH   # so libhsa-runt
 ./build/macos/lse-server -m <model-dir> --pool hrx:0 --dialect loom
 ```
 
-Use the `macos-arm64` release asset for Apple Silicon; it bundles the HSA/HRX/Loom
-runtime. Linux release binaries are not macOS builds and vice versa.
+Use the `macos-arm64` release asset for Apple Silicon; it bundles HRX and Loom
+and loads the HSA runtime the mac_linuxgpu driver installs, so the build above
+also needs the driver (or `DYLD_LIBRARY_PATH` pointing at an HSA runtime) to
+reach the GPU. Linux release binaries are not macOS builds and vice versa.
+
+---
+
+## libLSE (in-process C API)
+
+Every build with the tokenizer (that is, with Rust/Cargo available) also builds
+libLSE, the engine as a library behind the plain C header
+[`include/lse/lse.h`](include/lse/lse.h). The CMake target is `lse_api`; the
+archive is `libLSE.a`. `lse-server` is a thin `main` over it, so an app that
+links it gets exactly the server's behavior without a socket.
+
+```bash
+cmake --build build --target lse_api        # -> build/libLSE.a
+```
+
+From CMake, link the target, which brings the engine's own libraries with it:
+
+```cmake
+set(LSE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(path/to/LemonSeed-Engine lse EXCLUDE_FROM_ALL)
+target_link_libraries(my_app PRIVATE lse::api)   # C or C++; include <lse/lse.h>
+```
+
+The API, in order of use:
+
+| Function | Purpose |
+|---|---|
+| `lse_model_info(model, &json, &err)` | Describe a checkpoint from its config and tensor headers; no device |
+| `lse_estimate(&cfg, options, &json, &err)` | Device memory `lse_open(&cfg)` would allocate, by component; no device |
+| `lse_config_init(&cfg)` | Fill an `lse_config` with the `lse-server` defaults, one field per flag |
+| `lse_open(&cfg, &err)` | Open the devices and load the model; `lse_status(NULL, ...)` reports progress meanwhile |
+| `lse_request(...)`, `lse_cancel(...)` | OpenAI-shaped JSON requests answered through a callback, streamed or whole |
+| `lse_status(engine, &json)` | Load phase, model, request counters, last timings, device bytes held |
+| `lse_http_start`, `lse_http_stop`, `lse_http_wait` | Optionally serve the same engine over HTTP |
+| `lse_set_log_callback(cb, user)` | Receive the log lines `lse-server` prints |
+| `lse_close(engine)`, `lse_free(p)` | Release the engine; release every string the library returned |
+
+[README: Use LSE as a library](README.md#use-lse-as-a-library) has a complete
+example. `lse-server --model-info` and `--estimate` print the two planning
+answers from the command line.
 
 ---
 
 ## iOS / iPadOS (in-process library)
+
+Requirements: an Apple Silicon Mac with Xcode and the iOS SDK, CMake, Ninja,
+Rust with the `aarch64-apple-ios` target, and a
+[mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu) checkout (it
+provides the HSA runtime the framework links statically).
 
 On an iPad with the mac_linuxgpu driver embedded in the app, the engine runs
 inside the app: there is no executable and no subprocess. The app links
@@ -170,7 +218,17 @@ from the same engine.
 rustup target add aarch64-apple-ios
 MAC_LINUXGPU_DIR=<mac_linuxgpu checkout> bash scripts/ios/build-ios.sh
 # -> build/ios/LSE.xcframework
+
+# Later builds can reuse the HRX/loomc archives from the first one:
+SKIP_HRX=1 MAC_LINUXGPU_DIR=<mac_linuxgpu checkout> bash scripts/ios/build-ios.sh
+
+# The release asset is the framework zipped with its top-level directory:
+ditto -c -k --keepParent build/ios/LSE.xcframework lse-v0.5.0-ios-arm64.xcframework.zip
 ```
+
+`IOS_DEPLOYMENT_TARGET` (default 26.0), `LSE_IOS_WORK` (default `build/ios`)
+and `LSE_BUILD_JOBS` adjust the build. In Xcode, add `LSE.xcframework` to the
+app target (Do Not Embed: it is a static library) and `import LSE` from Swift.
 
 The script builds the HSA runtime (`make hsa-ios` in mac_linuxgpu), HRX and
 loomc as static archives (`scripts/ios/build-hrx-ios.sh`, which applies
@@ -194,6 +252,24 @@ kernel cache defaults to the app's `Library/Caches/lse/kernels`.
 | `LSE_HRX_ROOT` | — | Path to a built `hrx-install` (enables GPU) |
 | `LSE_WERROR` | OFF | Warnings as errors |
 | `LSE_ASAN` | OFF | AddressSanitizer + UBSan |
+
+## Checking memory estimates against real checkpoints
+
+`test_model_info` checks model info and memory estimates against fixture
+checkpoints and against what a load on the host backend allocates. A gated
+companion repeats the comparison for real checkpoints; it copies the whole
+model into RAM, so it runs only when pointed at one:
+
+```bash
+LSE_BACKEND=cpu \
+LSE_TEST_MODEL_TARGET=/models/qwen38-27b-q4 \
+LSE_TEST_MODEL_DFLASH2=/models/qwen38-27b-dflash2-q8 \
+  build/tests/test_model_info_real
+```
+
+Set `LSE_TEST_MODEL_MTP` instead of `LSE_TEST_MODEL_DFLASH2` to check an MTP
+module. Activation and workspace need a forward pass on a GPU and are not part
+of this check.
 
 ## Release builds
 

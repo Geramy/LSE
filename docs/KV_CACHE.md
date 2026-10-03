@@ -48,6 +48,37 @@ These figures include both K and V. They exclude model weights, recurrent state,
 MTP, the DFlash2 ring and temporary buffers. Allocation follows page capacity;
 live token count can be smaller than allocated capacity.
 
+An MTP module adds one attention layer in the same format: 4,096 bytes per token
+in BF16 for Qwen3.8-27B. The DFlash2 ring is fixed at its sliding window
+(84,172,800 bytes for the Qwen3.8-27B draft) and does not grow with context.
+
+### Allocation granularity
+
+Tokens are paged in blocks of 16. How blocks become device memory depends on
+the kernel dialect:
+
+- **Loom (macOS, iPadOS):** each layer's K and V are backed by 256 KiB
+  fragments covering the blocks in use, drawn from 256 MiB arenas that all
+  layers share. A layer's address table is reserved for the whole `--kv-len`.
+- **HIP:** each layer's K and V are contiguous pools. A pool starts at 8 blocks
+  and doubles up to 2,048 blocks (32K tokens), then grows 256 blocks (4K tokens)
+  at a time, never past `--kv-len`. While a pool moves to its next size, that
+  layer's old and new pools are briefly both allocated.
+
+### Estimating before loading
+
+`lse-server --model-info` lists the bytes per token and per block for every
+format, computed by the same rules the allocator uses. `lse-server --estimate`
+(or `lse_estimate` in libLSE, or `/v1/lse/estimate` on a running server) adds
+the paging granularity, the MTP or DFlash2 cache, weights, recurrent state and
+workspace for a whole configuration, and with `device_memory_bytes` reports the
+longest `--kv-len` that fits:
+
+```bash
+lse-server --model /path/to/qwen38-27b-q4 --kv-len 65536 --kv-cache-dtype fp8 \
+  --dialect loom --estimate='{"device_memory_bytes": 34359738368}'
+```
+
 ## GPU selection
 
 The central shape table selects `attention.flash.wmma16.v2` for eligible paged
