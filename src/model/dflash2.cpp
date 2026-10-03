@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "lse/dispatch/dflash2.hpp"
+#include "lse/model/dflash2_convert.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
@@ -441,7 +442,8 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
 DFlash2Module::DFlash2Module(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 DFlash2Module::~DFlash2Module() = default;
 Result<std::unique_ptr<DFlash2Module>> DFlash2Module::open(const std::string& path, const Config& parent, HybridLM& model) {
-  LSE_ASSIGN_OR(const auto paths, resolve_model(path));
+  // A BF16 source checkpoint is converted to Q8 once and cached.
+  LSE_ASSIGN_OR(const auto paths, prepare_dflash2_checkpoint(path));
   std::ifstream in(paths.config); std::ostringstream text; text << in.rdbuf();
   if (!in) return LSE_ERROR(kNotFound, "DFlash2 config not readable at ", paths.config);
   LSE_ASSIGN_OR(auto config, DFlash2Config::from_json_string(text.str()));
