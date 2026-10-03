@@ -1,8 +1,8 @@
 diff --git a/loom/src/loom/transforms/kernel/stage_matrix_operands.c b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
-index 5d1a6cc..d750b33 100644
+index 5d1a6cc..ba07ac9 100644
 --- a/loom/src/loom/transforms/kernel/stage_matrix_operands.c
 +++ b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
-@@ -1061,9 +1061,12 @@ static iree_status_t collect(void* user, loom_op_t* op,
+@@ -1061,9 +1061,13 @@ static iree_status_t collect(void* user, loom_op_t* op,
    if (!loom_vector_fragment_isa(op) ||
        loom_vector_fragment_role(op) != LOOM_VECTOR_ROLE_RHS)
      return iree_ok_status();
@@ -10,19 +10,20 @@ index 5d1a6cc..d750b33 100644
 -      c->pass->arena, c->count, c->count + 1, sizeof(*c->candidates),
 -      &c->capacity, (void**)&c->candidates));
 +  // Grow only when full: growing on every append doubles the capacity per
-+  // candidate, so 30 fragments asked the arena for 2^30 entries.
-+  if (c->count == c->capacity)
++  // candidate, so 31 fragments asked the arena for 2^31 entries.
++  if (c->count == c->capacity) {
 +    IREE_RETURN_IF_ERROR(iree_arena_grow_array(
 +        c->pass->arena, c->count, c->count + 1, sizeof(*c->candidates),
 +        &c->capacity, (void**)&c->candidates));
++  }
    c->candidates[c->count++] = op;
    return iree_ok_status();
  }
 diff --git a/loom/src/loom/transforms/symbol/symbol_equivalence.c b/loom/src/loom/transforms/symbol/symbol_equivalence.c
-index 44dae30..947f467 100644
+index 44dae30..af95d1b 100644
 --- a/loom/src/loom/transforms/symbol/symbol_equivalence.c
 +++ b/loom/src/loom/transforms/symbol/symbol_equivalence.c
-@@ -171,10 +171,11 @@ static iree_status_t loom_symbol_equivalence_map_block(
+@@ -171,10 +171,12 @@ static iree_status_t loom_symbol_equivalence_map_block(
        return iree_ok_status();
      }
    }
@@ -30,15 +31,16 @@ index 44dae30..947f467 100644
 -      state->arena, state->blocks.count, state->blocks.count + 1,
 -      sizeof(*state->blocks.pairs), &state->blocks.capacity,
 -      (void**)&state->blocks.pairs));
-+  if (state->blocks.count == state->blocks.capacity)
++  if (state->blocks.count == state->blocks.capacity) {
 +    IREE_RETURN_IF_ERROR(iree_arena_grow_array(
 +        state->arena, state->blocks.count, state->blocks.count + 1,
 +        sizeof(*state->blocks.pairs), &state->blocks.capacity,
 +        (void**)&state->blocks.pairs));
++  }
    state->blocks.pairs[state->blocks.count++] =
        (loom_symbol_equivalence_block_pair_t){
            .lhs = lhs_block,
-@@ -493,10 +494,11 @@ static iree_status_t loom_symbol_equivalence_compare_symbol_refs(
+@@ -493,10 +495,12 @@ static iree_status_t loom_symbol_equivalence_compare_symbol_refs(
      }
    }
  
@@ -46,19 +48,20 @@ index 44dae30..947f467 100644
 -      state->arena, state->symbols.count, state->symbols.count + 1,
 -      sizeof(*state->symbols.pairs), &state->symbols.capacity,
 -      (void**)&state->symbols.pairs));
-+  if (state->symbols.count == state->symbols.capacity)
++  if (state->symbols.count == state->symbols.capacity) {
 +    IREE_RETURN_IF_ERROR(iree_arena_grow_array(
 +        state->arena, state->symbols.count, state->symbols.count + 1,
 +        sizeof(*state->symbols.pairs), &state->symbols.capacity,
 +        (void**)&state->symbols.pairs));
++  }
    const iree_host_size_t pair_index = state->symbols.count++;
    state->symbols.pairs[pair_index] = (loom_symbol_equivalence_symbol_pair_t){
        .lhs = lhs,
 diff --git a/loom/src/loom/transforms/symbol/template_selection.c b/loom/src/loom/transforms/symbol/template_selection.c
-index 8393af1..12afb15 100644
+index 8393af1..648b0a6 100644
 --- a/loom/src/loom/transforms/symbol/template_selection.c
 +++ b/loom/src/loom/transforms/symbol/template_selection.c
-@@ -442,12 +442,13 @@ static iree_status_t loom_template_providers_are_equivalent(
+@@ -442,12 +442,14 @@ static iree_status_t loom_template_providers_are_equivalent(
    IREE_RETURN_IF_ERROR(loom_symbol_definitions_equivalent(
        state->module, lhs->symbol, rhs->symbol, state->pass->arena,
        &equivalent));
@@ -68,13 +71,14 @@ index 8393af1..12afb15 100644
 -                            sizeof(*state->equivalence_cache.entries),
 -                            &state->equivalence_cache.capacity,
 -                            (void**)&state->equivalence_cache.entries));
-+  if (state->equivalence_cache.count == state->equivalence_cache.capacity)
++  if (state->equivalence_cache.count == state->equivalence_cache.capacity) {
 +    IREE_RETURN_IF_ERROR(
 +        iree_arena_grow_array(state->pass->arena, state->equivalence_cache.count,
 +                              state->equivalence_cache.count + 1,
 +                              sizeof(*state->equivalence_cache.entries),
 +                              &state->equivalence_cache.capacity,
 +                              (void**)&state->equivalence_cache.entries));
++  }
    state->equivalence_cache.entries[state->equivalence_cache.count++] =
        (loom_template_provider_equivalence_t){
            .lhs = lhs->symbol,
