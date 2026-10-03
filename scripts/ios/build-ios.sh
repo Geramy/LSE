@@ -70,7 +70,8 @@ lse_build="$work/lse-build"
 # Device power (low power on background, device loss after sleep) when the
 # HSA runtime has it.
 hsa_power=OFF
-if nm -g "$hsa_library" 2>/dev/null | grep -q ' T _mac_hsa_agent_prepare_low_power$'; then
+# grep -c reads all of nm's output (grep -q could SIGPIPE nm under pipefail).
+if nm -g "$hsa_library" 2>/dev/null | grep -c ' T _mac_hsa_agent_prepare_low_power$' >/dev/null; then
   hsa_power=ON
 fi
 echo "   HSA device power: $hsa_power"
