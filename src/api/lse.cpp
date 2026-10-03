@@ -1,11 +1,15 @@
 // The in-process engine behind include/lse/lse.h. lse_open is what lse-server
 // does between parsing its command line and listening; lse_request hands a
 // request to the same Router the HTTP server forwards to.
+#if defined(__APPLE__)
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <malloc/malloc.h>
 #if TARGET_OS_IOS
 #include <os/proc.h>
+#endif
+#else
+#include <malloc.h>
 #endif
 #include "lse/lse.h"
 
@@ -164,23 +168,39 @@ std::atomic<bool> g_engine_open{false};
 
 // The process's physical footprint: what iOS counts against an app's limit.
 std::uint64_t host_footprint() {
+#if !defined(__APPLE__)
+  // Resident set size from /proc/self/statm, in pages.
+  unsigned long size = 0, resident = 0;
+  if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+    if (std::fscanf(f, "%lu %lu", &size, &resident) != 2) resident = 0;
+    std::fclose(f);
+  }
+  return std::uint64_t(resident) * std::uint64_t(sysconf(_SC_PAGESIZE));
+#else
   task_vm_info_data_t info{};
   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
   if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) !=
       KERN_SUCCESS)
     return 0;
   return info.phys_footprint;
+#endif
 }
 
 // What the engine's process holds on the host, for lse_status and the log.
 json host_memory_json() {
+#if defined(__APPLE__)
   malloc_statistics_t heap{};
   malloc_zone_statistics(nullptr, &heap);
+  const std::uint64_t in_use = heap.size_in_use, allocated = heap.size_allocated;
+#else
+  const struct mallinfo2 mi = mallinfo2();
+  const std::uint64_t in_use = mi.uordblks + mi.hblkhd, allocated = mi.arena + mi.hblkhd;
+#endif
   json h{{"phys_footprint", host_footprint()},
-         {"malloc_in_use", heap.size_in_use},
-         {"malloc_allocated", heap.size_allocated},
+         {"malloc_in_use", in_use},
+         {"malloc_allocated", allocated},
          {"staging_bytes", backend::allocation_totals(backend::MemoryClass::kStaging).live}};
-#if TARGET_OS_IOS
+#if defined(__APPLE__) && TARGET_OS_IOS
   h["available"] = os_proc_available_memory();
 #endif
   return h;
@@ -606,7 +626,12 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     const std::uint64_t before = host_footprint();
     // The draft's checkpoint is unmapped when its module finishes loading.
     const std::size_t mapped = e.weights ? e.weights->release_pages() : 0;
+#if defined(__APPLE__)
     const std::size_t relieved = malloc_zone_pressure_relief(nullptr, 0);
+#else
+    const std::size_t relieved = 0;
+    malloc_trim(0);
+#endif
     const std::uint64_t after = host_footprint();
     std::fprintf(stderr,
                  "lse: load released %.0f MiB host memory (%.0f MiB of allocator pages; %.0f MiB of "

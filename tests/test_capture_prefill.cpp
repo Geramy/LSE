@@ -7,8 +7,13 @@
 // of running out of memory part way.
 #include "harness.hpp"
 
+#if defined(__APPLE__)
 #include <mach/mach.h>
 #include <malloc/malloc.h>
+#else
+#include <malloc.h>
+#endif
+#include <cstdio>
 
 #include <unistd.h>
 
@@ -71,10 +76,19 @@ struct MeasuredLoomc final : IKernelCompiler {
   bool available() const override { return real.available(); }
   std::string identity() const override { return real.identity(); }
   static std::uint64_t footprint_now() {
+#if defined(__APPLE__)
     task_vm_info_data_t info{};
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count);
     return info.phys_footprint;
+#else
+    unsigned long size = 0, resident = 0;
+    if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+      if (std::fscanf(f, "%lu %lu", &size, &resident) != 2) resident = 0;
+      std::fclose(f);
+    }
+    return std::uint64_t(resident) * std::uint64_t(sysconf(_SC_PAGESIZE));
+#endif
   }
 };
 struct NullCompiler final : IKernelCompiler {
@@ -540,16 +554,30 @@ LSE_TEST(a_refused_device_dispatch_fails_the_request_and_the_engine_recovers) {
 
 namespace {
 std::uint64_t phys_footprint() {
+#if defined(__APPLE__)
   task_vm_info_data_t info{};
   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
   if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
     return 0;
   return info.phys_footprint;
+#else
+  unsigned long size = 0, resident = 0;
+  if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+    if (std::fscanf(f, "%lu %lu", &size, &resident) != 2) resident = 0;
+    std::fclose(f);
+  }
+  return std::uint64_t(resident) * std::uint64_t(sysconf(_SC_PAGESIZE));
+#endif
 }
 std::uint64_t malloc_in_use() {
+#if defined(__APPLE__)
   malloc_statistics_t st{};
   malloc_zone_statistics(nullptr, &st);
   return st.size_in_use;
+#else
+  const struct mallinfo2 mi = mallinfo2();
+  return mi.uordblks + mi.hblkhd;
+#endif
 }
 }  // namespace
 
