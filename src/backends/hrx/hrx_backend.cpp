@@ -4,6 +4,9 @@
 #include "lse/backends/hrx/copy_route.hpp"
 
 #include <dlfcn.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -36,9 +39,55 @@ namespace {
 // runtime dylibs. The HsaRuntime loader below prefers it so a fresh install
 // needs no DYLD_LIBRARY_PATH export. File-scope (not a local constexpr) so the
 // Apple-only probe can reference it without a lambda capture.
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !TARGET_OS_IOS
 constexpr const char* kInstalledRuntimeDir = "/Library/MacAMDGPU/runtime";
 constexpr const char* kInstalledHsaLib = "/Library/MacAMDGPU/runtime/libhsa-runtime64.dylib";
+#endif
+
+#if defined(__APPLE__) && TARGET_OS_IOS
+// An iOS app may not load a runtime from outside its bundle, so the HSA
+// runtime is linked into the app and these are its entry points. Naming them
+// keeps the linker from stripping them and stands in for dlsym, which sees
+// only exported symbols. The asm labels bind the real symbols without
+// redeclaring their prototypes.
+extern "C" {
+void lse_linked_hsa_init() __asm__("_hsa_init");
+void lse_linked_hsa_iterate_agents() __asm__("_hsa_iterate_agents");
+void lse_linked_hsa_agent_get_info() __asm__("_hsa_agent_get_info");
+void lse_linked_hsa_amd_agent_iterate_memory_pools() __asm__("_hsa_amd_agent_iterate_memory_pools");
+void lse_linked_hsa_amd_memory_pool_get_info() __asm__("_hsa_amd_memory_pool_get_info");
+void lse_linked_hsa_amd_agent_memory_pool_get_info() __asm__("_hsa_amd_agent_memory_pool_get_info");
+void lse_linked_hsa_amd_agents_allow_access() __asm__("_hsa_amd_agents_allow_access");
+void lse_linked_hsa_amd_memory_async_copy() __asm__("_hsa_amd_memory_async_copy");
+void lse_linked_hsa_amd_memory_lock() __asm__("_hsa_amd_memory_lock");
+void lse_linked_hsa_amd_memory_unlock() __asm__("_hsa_amd_memory_unlock");
+void lse_linked_hsa_signal_create() __asm__("_hsa_signal_create");
+void lse_linked_hsa_signal_destroy() __asm__("_hsa_signal_destroy");
+void lse_linked_hsa_signal_wait_scacquire() __asm__("_hsa_signal_wait_scacquire");
+void lse_linked_hsa_signal_store_screlease() __asm__("_hsa_signal_store_screlease");
+}
+
+void* linked_hsa_symbol(const char* name) noexcept {
+  static constexpr std::pair<const char*, void (*)()> kSymbols[] = {
+      {"hsa_init", &lse_linked_hsa_init},
+      {"hsa_iterate_agents", &lse_linked_hsa_iterate_agents},
+      {"hsa_agent_get_info", &lse_linked_hsa_agent_get_info},
+      {"hsa_amd_agent_iterate_memory_pools", &lse_linked_hsa_amd_agent_iterate_memory_pools},
+      {"hsa_amd_memory_pool_get_info", &lse_linked_hsa_amd_memory_pool_get_info},
+      {"hsa_amd_agent_memory_pool_get_info", &lse_linked_hsa_amd_agent_memory_pool_get_info},
+      {"hsa_amd_agents_allow_access", &lse_linked_hsa_amd_agents_allow_access},
+      {"hsa_amd_memory_async_copy", &lse_linked_hsa_amd_memory_async_copy},
+      {"hsa_amd_memory_lock", &lse_linked_hsa_amd_memory_lock},
+      {"hsa_amd_memory_unlock", &lse_linked_hsa_amd_memory_unlock},
+      {"hsa_signal_create", &lse_linked_hsa_signal_create},
+      {"hsa_signal_destroy", &lse_linked_hsa_signal_destroy},
+      {"hsa_signal_wait_scacquire", &lse_linked_hsa_signal_wait_scacquire},
+      {"hsa_signal_store_screlease", &lse_linked_hsa_signal_store_screlease},
+  };
+  for (const auto& [symbol, address] : kSymbols)
+    if (std::strcmp(symbol, name) == 0) return reinterpret_cast<void*>(address);
+  return nullptr;
+}
 #endif
 
 // Residencies stamped by live hrx backends. copy_peer receives whatever
@@ -174,6 +223,10 @@ class HsaRuntime {
   // preload_gpu_runtime already loaded rather than a second runtime. The hot
   // path keeps load_if_missing=false, so it behaves exactly as before.
   explicit HsaRuntime(bool load_if_missing = false) noexcept {
+#if defined(__APPLE__) && TARGET_OS_IOS
+    (void)load_if_missing;
+    const auto symbol = [](const char* name) { return linked_hsa_symbol(name); };
+#else
 #if defined(__APPLE__)
     constexpr const char* soname = "libhsa-runtime64.dylib";
 #else
@@ -196,29 +249,31 @@ class HsaRuntime {
     }
 #endif
     if (lib_ == nullptr) return;
-    init_ = reinterpret_cast<InitFn>(dlsym(lib_, "hsa_init"));
-    iterate_ = reinterpret_cast<IterateFn>(dlsym(lib_, "hsa_iterate_agents"));
-    get_info_ = reinterpret_cast<GetInfoFn>(dlsym(lib_, "hsa_agent_get_info"));
+    const auto symbol = [this](const char* name) { return dlsym(lib_, name); };
+#endif
+    init_ = reinterpret_cast<InitFn>(symbol("hsa_init"));
+    iterate_ = reinterpret_cast<IterateFn>(symbol("hsa_iterate_agents"));
+    get_info_ = reinterpret_cast<GetInfoFn>(symbol("hsa_agent_get_info"));
     iterate_pools_ = reinterpret_cast<IteratePoolsFn>(
-        dlsym(lib_, "hsa_amd_agent_iterate_memory_pools"));
+        symbol("hsa_amd_agent_iterate_memory_pools"));
     pool_info_ = reinterpret_cast<PoolInfoFn>(
-        dlsym(lib_, "hsa_amd_memory_pool_get_info"));
+        symbol("hsa_amd_memory_pool_get_info"));
     agent_pool_info_ = reinterpret_cast<AgentPoolInfoFn>(
-        dlsym(lib_, "hsa_amd_agent_memory_pool_get_info"));
+        symbol("hsa_amd_agent_memory_pool_get_info"));
     allow_access_ = reinterpret_cast<AllowAccessFn>(
-        dlsym(lib_, "hsa_amd_agents_allow_access"));
+        symbol("hsa_amd_agents_allow_access"));
     async_copy_ = reinterpret_cast<AsyncCopyFn>(
-        dlsym(lib_, "hsa_amd_memory_async_copy"));
-    lock_ = reinterpret_cast<LockFn>(dlsym(lib_, "hsa_amd_memory_lock"));
-    unlock_ = reinterpret_cast<UnlockFn>(dlsym(lib_, "hsa_amd_memory_unlock"));
+        symbol("hsa_amd_memory_async_copy"));
+    lock_ = reinterpret_cast<LockFn>(symbol("hsa_amd_memory_lock"));
+    unlock_ = reinterpret_cast<UnlockFn>(symbol("hsa_amd_memory_unlock"));
     signal_create_ = reinterpret_cast<SignalCreateFn>(
-        dlsym(lib_, "hsa_signal_create"));
+        symbol("hsa_signal_create"));
     signal_destroy_ = reinterpret_cast<SignalDestroyFn>(
-        dlsym(lib_, "hsa_signal_destroy"));
+        symbol("hsa_signal_destroy"));
     signal_wait_ = reinterpret_cast<SignalWaitFn>(
-        dlsym(lib_, "hsa_signal_wait_scacquire"));
+        symbol("hsa_signal_wait_scacquire"));
     signal_store_ = reinterpret_cast<SignalStoreFn>(
-        dlsym(lib_, "hsa_signal_store_screlease"));
+        symbol("hsa_signal_store_screlease"));
   }
   ~HsaRuntime() {
     if (shared_signal_ready_ && signal_destroy_ != nullptr) {

@@ -1,58 +1,40 @@
-// An OpenAI-shaped HTTP surface over one loaded model.
-//
-// One model, one device, so generation is serialized: requests queue rather
-// than interleave. That is a property of this server and not of the engine,
-// which decodes several sequences in one step; a batching front end belongs
-// here later and does not change the wire format.
+// The OpenAI-shaped HTTP surface: a thin adapter that carries requests from a
+// socket to a Router and its answers back, adding only what is HTTP's own
+// (CORS, the bearer key, server-sent-event framing).
 #pragma once
 
-#include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
 
 #include "lse/core/status.hpp"
-#include "lse/runtime/prefill_batch.hpp"
-#include "lse/model/hybrid_lm.hpp"
-#include "lse/model/mtp.hpp"
-#include "lse/model/dflash2.hpp"
-#include "lse/tokenizer/tokenizer.hpp"
+#include "lse/server/router.hpp"
 
 namespace lse::server {
 
-struct ServerOptions {
-  std::string host = "127.0.0.1";
-  int port = 8080;
-  // Reported as the model id, and what a request's "model" field is matched
-  // against. A request naming something else is still served, since there is
-  // only one model loaded, and the response says which one answered.
-  std::string model_id;
-  // When set, every request must carry `Authorization: Bearer <key>`.
-  std::string api_key;
-  // Refused above this, so one request cannot take the whole KV pool.
-  std::int32_t max_tokens_cap = 4096;
-  std::uint32_t mtp_depth = 3;
-  runtime::PrefillBatch prefill;
-};
-
 class HttpServer {
  public:
-  HttpServer(model::HybridLM& model, tokenizer::Tokenizer& tok,
-             ServerOptions options);
+  // Serves `router` on host:port, requiring router.options().api_key when it
+  // is set.
+  HttpServer(Router& router, std::string host, int port);
   ~HttpServer();
   HttpServer(const HttpServer&) = delete;
   HttpServer& operator=(const HttpServer&) = delete;
 
-  // Speculative decoding, when the checkpoint shipped a module.
-  void use_mtp(model::MtpModule& mtp) noexcept;
-  void use_dflash2(model::DFlash2Module& draft) noexcept;
-
-  // Blocks until stop() is called or the listen fails.
+  // Binds the listening socket without serving yet, so a caller can report a
+  // port that is taken before it commits to listening on another thread.
+  // Port 0 takes any free port; port() then names it.
+  Status bind();
+  [[nodiscard]] int port() const noexcept;
+  // Blocks until stop() is called or the listen fails. Binds first unless
+  // bind() already did.
   Status listen();
+  // Stops the listener and ends HTTP generations in flight; requests that
+  // arrive meanwhile answer 503. Idempotent and safe before listen starts.
   void stop();
 
  private:
   struct Impl;
-  struct Run;
   std::unique_ptr<Impl> impl_;
 };
 
