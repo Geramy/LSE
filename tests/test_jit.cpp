@@ -6196,7 +6196,10 @@ struct RepartitionCaptureDevice : backend::CpuBackend {
 };
 }  // namespace
 
-LSE_TEST(repartitioned_phase_preserves_live_output_storage) {
+// A launch the device refuses fails the step: no repartition and no fallback.
+// The error names the dispatch and the device's error, issued work is
+// drained, nothing ran on the host, and the next step runs whole.
+LSE_TEST(a_refused_phase_launch_fails_the_step_and_the_next_step_runs) {
   for (bool replay : {false, true}) {
     backend::BackendAdapter<RepartitionCaptureDevice> backend;
     LSE_EXPECT_OK(backend.init(0));
@@ -6225,20 +6228,27 @@ LSE_TEST(repartitioned_phase_preserves_live_output_storage) {
     }
     backend.impl().fail_at = backend.impl().launches + 1;
     const auto previous_drains = backend.impl().drains;
-    LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
+    const Status failed = scheduler.eval(roots, false, &program);
+    LSE_EXPECT(!failed.ok());
+    LSE_EXPECT(std::string(failed.message()).find("device dispatch failed") != std::string::npos);
+    LSE_EXPECT(std::string(failed.message()).find("intentional phase submission failure") != std::string::npos);
     LSE_EXPECT_EQ(backend.impl().failures, 1u);
     LSE_EXPECT(backend.impl().drains > previous_drains);
-    LSE_EXPECT(!buffer_bindings_may_alias(*a.node(), *b.node()));
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    // Recovery: a fresh program for the same graph runs whole.
+    Program again;
+    LSE_EXPECT_OK(scheduler.eval(roots, false, &again));
+    LSE_EXPECT_EQ(backend.impl().failures, 1u);
     LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
     std::size_t covered = 0;
-    for (const auto& group : program.groups())
+    for (const auto& group : again.groups())
       for (const auto& node : group.nodes)
         if (node == a.node() || node == b.node()) ++covered;
     LSE_EXPECT_EQ(covered, 2u);
   }
 }
 
-LSE_TEST(repartition_retains_successful_members_of_a_partly_failed_join) {
+LSE_TEST(a_refused_joined_launch_fails_the_step_without_splitting_it) {
   for (bool replay : {false, true}) {
     backend::BackendAdapter<RepartitionCaptureDevice> backend;
     LSE_EXPECT_OK(backend.init(0));
@@ -6260,24 +6270,24 @@ LSE_TEST(repartition_retains_successful_members_of_a_partly_failed_join) {
       LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
       program.reset_compute();
     }
-    // Decline the joined submission, accept its first separate member, then
-    // decline the second. Repartition must retain the member already issued.
-    backend.impl().fail_at = backend.impl().launches + 1;
-    backend.impl().fail_again = backend.impl().launches + 3;
-    LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
-    LSE_EXPECT_EQ(backend.impl().failures, 2u);
+    const auto before = backend.impl().launches;
+    backend.impl().fail_at = before + 1;
+    LSE_EXPECT(!scheduler.eval(roots, false, &program).ok());
+    // One refused launch and nothing after it: the join is not re-issued
+    // member by member.
+    LSE_EXPECT_EQ(backend.impl().failures, 1u);
+    LSE_EXPECT_EQ(backend.impl().launches, before + 1);
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    Program again;
+    LSE_EXPECT_OK(scheduler.eval(roots, false, &again));
     std::size_t a_count = 0, b_count = 0;
-    for (const auto& group : program.groups())
+    for (const auto& group : again.groups())
       for (const auto& node : group.nodes) {
         if (node == a.node()) ++a_count;
         if (node == b.node()) ++b_count;
       }
     LSE_EXPECT_EQ(a_count, 1u);
     LSE_EXPECT_EQ(b_count, 1u);
-    LSE_EXPECT_EQ(scheduler.last_trace().device_groups, 2u);
     LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
-    program.reset_compute();
-    LSE_EXPECT(!a.node()->materialized && !b.node()->materialized);
-    LSE_EXPECT_OK(scheduler.eval(roots, false, &program));
   }
 }

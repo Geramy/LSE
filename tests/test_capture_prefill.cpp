@@ -102,7 +102,14 @@ struct NullCompiler final : IKernelCompiler {
 struct CaptureEmitter final : IKernelEmitter {
   mutable LoomEmitter real;
   mutable unsigned failures = 0;
+  // Test knob: decline every group holding this primitive, as an emitter
+  // with no kernel for it on this target does.
+  static inline std::string decline;
   Result<EmittedKernel> emit(const FusionGroup& g, const DeviceInfo& d) const override {
+    if (!decline.empty())
+      for (const NodePtr& n : g.nodes)
+        if (n && n->prim != nullptr && n->prim->name() == decline)
+          return LSE_ERROR(kUnimplemented, "capture emitter has no kernel for " + decline);
     auto r = real.emit(g, d);
     if (!r.ok() && failures++ < 20)
       std::fprintf(stderr, "capture: emit refused (%zu nodes, phase=%d): %s\n", g.nodes.size(),
@@ -579,6 +586,37 @@ LSE_TEST(a_refused_device_dispatch_fails_the_request_and_the_engine_recovers) {
   LSE_EXPECT(live() <= e.baseline);
 }
 
+
+LSE_TEST(a_group_with_no_device_kernel_runs_on_the_cpu_loudly_or_fails_when_disabled) {
+  if (backend::CaptureBackend::hip_gfx1151) return;  // Loom-only knob
+  LSE_EXPECT_OK(place::open_default_devices("capture:0"));
+  Engine e;
+  LSE_EXPECT_OK(e.open(8, 0));
+  if (!e.router) return;
+  backend::CaptureEmitter::decline = "silu";
+  const auto events_before = graph::cpu_fallback_sequence();
+  json body{{"model", "memory-fixture"}, {"prompt", prompt(300, 4)}, {"max_tokens", 4},
+            {"temperature", 0}};
+  auto reply = e.router->handle("POST", "/v1/completions", body.dump());
+  std::printf("       fallback allowed: %d %s\n", reply.status, reply.body.substr(0, 300).c_str());
+  LSE_EXPECT_EQ(reply.status, 200);
+  LSE_EXPECT(graph::cpu_fallback_sequence() > events_before);
+  const json answer = json::parse(reply.body);
+  LSE_EXPECT(answer.contains("lse_warnings"));
+  if (answer.contains("lse_warnings")) {
+    LSE_EXPECT(answer["lse_warnings"][0]["type"].get<std::string>() == "cpu_fallback");
+    LSE_EXPECT(answer["lse_warnings"][0]["cause"].get<std::string>().find("no kernel for silu") !=
+               std::string::npos);
+  }
+  graph::set_cpu_fallback_allowed(false);
+  reply = e.router->handle("POST", "/v1/completions", body.dump());
+  graph::set_cpu_fallback_allowed(true);
+  backend::CaptureEmitter::decline.clear();
+  std::printf("       fallback disabled: %d %s\n", reply.status, reply.body.substr(0, 300).c_str());
+  LSE_EXPECT_EQ(reply.status, 500);
+  LSE_EXPECT(reply.body.find("CPU fallback disabled") != std::string::npos);
+  LSE_EXPECT_EQ(e.complete("", prompt(300, 5)), 200);
+}
 
 namespace {
 std::uint64_t phys_footprint() {

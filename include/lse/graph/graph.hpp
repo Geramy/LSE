@@ -367,6 +367,8 @@ class Scheduler {
   // Frees the pointer tables of finished passes; drains the devices first.
   Status release_phase_tables();
   Status release_program();
+  // Runs one group's nodes on the host interpreter (or a fallback handler).
+  Status run_group_on_host(const FusionGroup& g);
   // Everything the scheduler keeps on the device between passes: the held
   // program, phase tables, grid-sync counters, interned constants and peer
   // mirrors. Drains first. What an engine that is closing leaves behind;

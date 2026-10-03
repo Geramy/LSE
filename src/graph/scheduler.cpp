@@ -133,6 +133,8 @@ struct ConstKeyHash {
   }
 };
 
+enum class DispatchStage : std::uint8_t { kEmit, kCompileOrLaunch };
+
 struct Scheduler::Impl {
   std::shared_ptr<kv::MemoryManager> kv_memory = kv::MemoryManager::create();
   std::unique_ptr<JitCache> jit;
@@ -151,6 +153,10 @@ struct Scheduler::Impl {
   std::optional<ConstKey> pending_constant;
   // Entry name of the kernel the last dispatch emitted, for failure reports.
   std::string last_entry;
+  // How far the last dispatch got: a group the emitter declines has no
+  // device kernel (the CPU fallback's case); a failure after emission is a
+  // compile or device error.
+  DispatchStage dispatch_stage = DispatchStage::kEmit;
   // The constants are a cache: under memory pressure they are let go and the
   // next pass that needs one binds and fills a fresh buffer.
   std::mutex constants_mu;
@@ -511,6 +517,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   std::optional<EmittedKernel> transient;
   if (emitted == nullptr) {
     ident = emitter->cache_key(group, be.device_info());
+    impl_->dispatch_stage = DispatchStage::kEmit;
     auto generated = emitter->emit(group, be.device_info());
     if (!generated.ok()) {
       trace_.spans.emit.add(elapsed_ns(t_emit, SpanClock::now()));
@@ -532,6 +539,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   const auto t_emitted = SpanClock::now();
   trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
   impl_->last_entry = emitted->entry_name;
+  impl_->dispatch_stage = DispatchStage::kCompileOrLaunch;
 
   // Compile only when this kernel is not already loaded for this device.
   // Disk miss / source change / arch change still go through get_or_compile.
@@ -1160,6 +1168,64 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   return accumulated;
 }
 
+Status Scheduler::run_group_on_host(const FusionGroup& g) {
+  for (const NodePtr& n : g.nodes) {
+    // Routing first: an intercepting handler may claim a node the backend
+    // could have run, which is how per-op device placement is switched at
+    // runtime.
+    if (const FallbackHandler* router =
+            fallback_chain().resolve_intercept(*n, backend())) {
+      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
+      LSE_RETURN_IF_ERROR(router->execute(*n, backend()));
+      if (!n->materialized) {
+        return LSE_ERROR(kInternal, "handler '", std::string(router->name()),
+                         "' returned OK without materializing the node");
+      }
+      ++trace_.intercepted;
+      trace_.fallback_handlers.emplace_back(router->name());
+      ++trace_.nodes_evaluated;
+      continue;
+    }
+
+    const std::string gap = device_gap(*n, backend());
+    if (gap.empty()) {
+      LSE_RETURN_IF_ERROR(interpreter::evaluate(n, backend()));
+      ++trace_.nodes_evaluated;
+      continue;
+    }
+
+    const FallbackHandler* handler = fallback_chain().resolve(*n, backend());
+    if (handler == nullptr) {
+      return LSE_ERROR(kUnimplemented, "node '", std::string(to_string(n->kind)),
+                       "' cannot run on ", std::string(backend().name()),
+                       " (", gap, ") and no fallback handler accepted it");
+    }
+    if (mode_ == Mode::kDeviceFirst) {
+      const std::string cause = ::lse::detail::concat(
+          "node ", std::string(to_string(n->kind)), " runs on handler '",
+          std::string(handler->name()), "' (", gap, ")");
+      if (!cpu_fallback_allowed()) {
+        const Status refused(StatusCode::kUnimplemented, "CPU fallback disabled: " + cause);
+        std::fprintf(stderr, "lse: %s\n", refused.to_string().c_str());
+        return refused;
+      }
+      record_cpu_fallback(cause);
+    }
+    LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
+    LSE_RETURN_IF_ERROR(handler->execute(*n, backend()));
+    if (!n->materialized) {
+      return LSE_ERROR(kInternal, "fallback handler '",
+                       std::string(handler->name()),
+                       "' returned OK without materializing the node");
+    }
+    ++trace_.host_fallbacks;
+    trace_.fallback_reasons.push_back(gap);
+    trace_.fallback_handlers.emplace_back(handler->name());
+    ++trace_.nodes_evaluated;
+  }
+  return OkStatus();
+}
+
 Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
                             Program* plan) {
   Program& rec = plan != nullptr ? *plan : impl_->program;
@@ -1735,8 +1801,38 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
             st = ev.status();
           }
         }
+        if (!st.ok() && impl_->dispatch_stage == DispatchStage::kEmit &&
+            st.code() == StatusCode::kUnimplemented) {
+          // No device kernel for this group: the CPU fallback, loud and
+          // refused when disabled. Device work issued so far is drained
+          // first; the group's outputs keep their planned buffers and reach
+          // the device when the next group binds them.
+          const std::string cause = ::lse::detail::concat(describe_group(g, gi), "; ", st.to_string());
+          for (std::size_t m = 0; m < devices_.size(); ++m)
+            LSE_RETURN_IF_ERROR(devices_.device(m).synchronize());
+          std::fill(impl_->outstanding.begin(), impl_->outstanding.end(), 0);
+          if (!cpu_fallback_allowed()) {
+            const Status refused(st.code(), "CPU fallback disabled: " + cause);
+            std::fprintf(stderr, "lse: %s\n", refused.to_string().c_str());
+            return refused;
+          }
+          record_cpu_fallback(cause);
+          ++trace_.host_groups;
+          trace_.host_group_reasons.push_back(std::string(st.message()));
+          {
+            SpanTimer host_exec_span(trace_.spans.host_exec);
+            LSE_RETURN_IF_ERROR(run_group_on_host(g));
+          }
+          if (impl_->plan.record_after[gi] != 0) {
+            auto ev = gbe.record_event(on);
+            if (ev.ok()) impl_->events[gi] = ev.release();
+          }
+          if (!replayed) ran.push_back(g);
+          ++done;
+          continue;
+        }
         if (!st.ok()) {
-          // No fallback: a group the device path cannot run fails the
+          // No other fallback: a group the device path cannot run fails the
           // request here, naming the dispatch. Work already issued is
           // drained so the caller can release the pass and serve the next
           // request.
@@ -1868,6 +1964,19 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ran.push_back(g);
         continue;
       }
+      // A compile or device error is not a missing kernel: it fails the
+      // request. Only a group the emitter declines runs on the CPU.
+      if (impl_->dispatch_stage != DispatchStage::kEmit ||
+          dispatched.code() != StatusCode::kUnimplemented) {
+        for (std::size_t member = 0; member < devices_.size(); ++member)
+          (void)devices_.device(member).synchronize();
+        const Status failed(dispatched.code(), ::lse::detail::concat(
+            "device dispatch failed: ", describe_group(g, ran.size()), "; ",
+            impl_->last_entry.empty() ? std::string() : "last kernel " + impl_->last_entry + "; ",
+            dispatched.to_string()));
+        std::fprintf(stderr, "lse: %s\n", failed.to_string().c_str());
+        return failed;
+      }
       // The one fallback left in the device path: the group runs on the CPU.
       // Loud every time, counted, and refused outright when CPU fallback is
       // disabled for this run.
@@ -1904,60 +2013,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
     if (mode_ != Mode::kDeviceFirst) ++trace_.host_groups;
 
     SpanTimer host_exec_span(trace_.spans.host_exec);
-    for (const NodePtr& n : g.nodes) {
-      // Routing first: an intercepting handler may claim a node the backend
-      // could have run, which is how per-op device placement is switched at
-      // runtime.
-      if (const FallbackHandler* router =
-              fallback_chain().resolve_intercept(*n, backend())) {
-        LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
-        LSE_RETURN_IF_ERROR(router->execute(*n, backend()));
-        if (!n->materialized) {
-          return LSE_ERROR(kInternal, "handler '", std::string(router->name()),
-                           "' returned OK without materializing the node");
-        }
-        ++trace_.intercepted;
-        trace_.fallback_handlers.emplace_back(router->name());
-        ++trace_.nodes_evaluated;
-        continue;
-      }
-
-      const std::string gap = device_gap(*n, backend());
-      if (gap.empty()) {
-        LSE_RETURN_IF_ERROR(interpreter::evaluate(n, backend()));
-        ++trace_.nodes_evaluated;
-        continue;
-      }
-
-      const FallbackHandler* handler = fallback_chain().resolve(*n, backend());
-      if (handler == nullptr) {
-        return LSE_ERROR(kUnimplemented, "node '", std::string(to_string(n->kind)),
-                         "' cannot run on ", std::string(backend().name()),
-                         " (", gap, ") and no fallback handler accepted it");
-      }
-      if (mode_ == Mode::kDeviceFirst) {
-        const std::string cause = ::lse::detail::concat(
-            "node ", std::string(to_string(n->kind)), " runs on handler '",
-            std::string(handler->name()), "' (", gap, ")");
-        if (!cpu_fallback_allowed()) {
-          const Status refused(StatusCode::kUnimplemented, "CPU fallback disabled: " + cause);
-          std::fprintf(stderr, "lse: %s\n", refused.to_string().c_str());
-          return refused;
-        }
-        record_cpu_fallback(cause);
-      }
-      LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, backend()));
-      LSE_RETURN_IF_ERROR(handler->execute(*n, backend()));
-      if (!n->materialized) {
-        return LSE_ERROR(kInternal, "fallback handler '",
-                         std::string(handler->name()),
-                         "' returned OK without materializing the node");
-      }
-      ++trace_.host_fallbacks;
-      trace_.fallback_reasons.push_back(gap);
-      trace_.fallback_handlers.emplace_back(handler->name());
-      ++trace_.nodes_evaluated;
-    }
+    LSE_RETURN_IF_ERROR(run_group_on_host(g));
     host_exec_span.close();
     if (is_collective(g.anchor)) ++trace_.collectives_issued;
     ++trace_.kernels_launched;
