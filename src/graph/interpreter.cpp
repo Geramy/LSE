@@ -52,6 +52,7 @@ Status ensure_buffer(Node& n, backend::IBackend& backend,
   }
   // Device-local: only kernels are expected to touch it. The host reaches it
   // through the mirror, and only when a node actually falls back to the host.
+  const backend::ScopedAllocationSite site(backend::AllocationSite::kOutputs, true);
   auto buf = backend.allocate(bytes, backend::MemoryClass::kDevice, stream);
   if (!buf.ok()) return buf.status();
   n.buffer = buf.release();

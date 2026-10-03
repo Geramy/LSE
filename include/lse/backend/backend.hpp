@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -114,6 +115,59 @@ struct AllocationTotals {
 // the last view of it is released. Backend::allocate calls this; a buffer with
 // no managed storage is not counted, because nothing would return its charge.
 void track_allocation(DeviceBuffer& buf, std::size_t bytes, MemoryClass cls);
+
+// What a device allocation is for, as the code making it names it. The
+// ledger above is split by site so a report can say where the bytes are, not
+// only how many there are: weights and the KV cache are planned, while
+// workspace, constants and outputs are what a pass holds while it runs.
+enum class AllocationSite : std::uint8_t {
+  kOther,
+  kWeights,    // checkpoint tensors and their device copies
+  kKvCache,    // paged K/V pools, fragments and block tables
+  kState,      // recurrent state, conv tails, MTP/DFlash2 resident tails
+  kDraft,      // draft-model rings and input slots
+  kWorkspace,  // pass activations (workgroup slots)
+  kConstants,  // the scheduler's device copies of graph constants
+  kOutputs,    // pass outputs and other per-node buffers
+  kCount,
+};
+[[nodiscard]] const char* to_string(AllocationSite site) noexcept;
+// Allocations on this thread are charged to `site` while the scope is open.
+// `only_if_unset` leaves an enclosing scope's site in place, so a generic
+// helper can name a default without hiding what its caller is doing.
+class ScopedAllocationSite {
+ public:
+  explicit ScopedAllocationSite(AllocationSite site, bool only_if_unset = false) noexcept;
+  ~ScopedAllocationSite();
+  ScopedAllocationSite(const ScopedAllocationSite&) = delete;
+  ScopedAllocationSite& operator=(const ScopedAllocationSite&) = delete;
+
+ private:
+  AllocationSite previous_;
+};
+struct SiteTotals {
+  AllocationSite site = AllocationSite::kOther;
+  std::uint64_t live = 0;
+  std::uint64_t peak = 0;
+  std::uint64_t allocations = 0;
+};
+// Device-class totals per site, every site listed.
+[[nodiscard]] std::vector<SiteTotals> allocation_sites();
+// "weights 16.1 GiB, kv_cache 1.2 GiB, ..." for the sites holding anything.
+[[nodiscard]] std::string describe_device_allocations();
+
+// Memory pressure. A trimmer releases device memory a cache holds but nobody
+// needs to keep (it is rebuilt on demand) and returns the bytes it let go.
+// When a device allocation fails for lack of memory, every trimmer runs and
+// the allocation is tried once more before the failure is reported.
+using MemoryTrimmer = std::function<std::size_t()>;
+std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer);
+void unregister_memory_trimmer(std::uint64_t id) noexcept;
+// Runs every trimmer; returns the bytes they report released.
+std::size_t trim_device_memory();
+// The failure of a device allocation, stated as running out of GPU memory,
+// with what the engine holds by site.
+[[nodiscard]] Status out_of_device_memory(std::size_t bytes, const Status& cause);
 
 // Either side of a transfer: host memory, or a window into a device buffer.
 // Built implicitly so a caller writes copy(dst, src, n) with whatever it has.
@@ -616,6 +670,12 @@ class Backend {
     // stamped here rather than in each backend's allocate_impl: a backend
     // author cannot forget to do it.
     auto buf = derived().allocate_impl(bytes, cls, stream);
+    if (!buf.ok() && cls == MemoryClass::kDevice &&
+        buf.status().code() == StatusCode::kOutOfMemory) {
+      // Caches that rebuild on demand give their memory back first.
+      if (trim_device_memory() != 0) buf = derived().allocate_impl(bytes, cls, stream);
+      if (!buf.ok()) return out_of_device_memory(bytes, buf.status());
+    }
     if (buf.ok()) {
       buf->residency = device_;
       buf->member = static_cast<std::uint16_t>(stream.index);

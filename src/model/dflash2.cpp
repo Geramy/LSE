@@ -58,6 +58,7 @@ Array slot_view(const Array& owner, Shape shape, std::size_t begin) {
 Result<Array> slot(Shape shape) {
   auto* scheduler = graph::default_scheduler();
   if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+  const backend::ScopedAllocationSite site(backend::AllocationSite::kDraft);
   auto buffer = scheduler->backend().allocate(
       dtype_storage_bytes(DType::kF32, shape.elem_count()), backend::MemoryClass::kDevice);
   if (!buffer.ok()) return buffer.status();

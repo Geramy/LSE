@@ -105,6 +105,7 @@ Status Session::retain_mtp_tail(const graph::Array& hidden,
   const auto bytes = dtype_storage_bytes(hidden.dtype(), hidden.shape().elem_count());
   if (!mtp_tail_.valid() || mtp_tail_.shape() != hidden.shape() ||
       mtp_tail_.node()->buffer.residency != src.buffer.residency) {
+    const backend::ScopedAllocationSite site(backend::AllocationSite::kState);
     LSE_ASSIGN_OR(auto buffer, owner.allocate(bytes, backend::MemoryClass::kDevice));
     mtp_tail_ = graph::Array::from_buffer(std::move(buffer), hidden.shape(), hidden.dtype());
   }

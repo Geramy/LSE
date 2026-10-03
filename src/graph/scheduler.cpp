@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <map>
 #include <memory>
@@ -148,6 +149,21 @@ struct Scheduler::Impl {
   // Device buffers for constants, reused across steps. See the use site.
   std::unordered_map<ConstKey, backend::DeviceBuffer, ConstKeyHash> constants;
   std::optional<ConstKey> pending_constant;
+  // The constants are a cache: under memory pressure they are let go and the
+  // next pass that needs one binds and fills a fresh buffer.
+  std::mutex constants_mu;
+  std::uint64_t trimmer = backend::register_memory_trimmer([this] {
+    std::lock_guard lock(constants_mu);
+    std::size_t released = 0;
+    for (const auto& [key, buffer] : constants) {
+      (void)key;
+      // Only bytes nothing else holds are actually returned.
+      if (buffer.storage.use_count() == 1) released += buffer.size_bytes;
+    }
+    constants.clear();
+    return released;
+  });
+  ~Impl() { backend::unregister_memory_trimmer(trimmer); }
   // Streams still holding work from an earlier step. A plan covers one step,
   // so without this the first group a step puts on a stream would be ordered
   // against nothing at all — the previous step's work on every *other* stream
@@ -514,6 +530,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     if (fresh && n->kind == OpKind::kConstant && !produced.contains(n.get())) {
       const ConstKey key{n->attrs.empty() ? 0.0 : n->attrs[0], n->dtype,
                          n->element_count(), member, stream.index};
+      std::unique_lock constants_lock(impl_->constants_mu);
       if (const auto it = impl_->constants.find(key);
           it != impl_->constants.end()) {
         n->buffer = it->second;
@@ -522,6 +539,9 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
         n->host_dirty = false;
         fresh = false;
       } else {
+        // Unlocked while allocating: a failed allocation runs the trimmers.
+        constants_lock.unlock();
+        const backend::ScopedAllocationSite site(backend::AllocationSite::kConstants);
         LSE_RETURN_IF_ERROR(interpreter::ensure_output_buffer(*n, be, stream));
         impl_->pending_constant = key;
       }
@@ -566,6 +586,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       // next step's copy of this constant binds the same allocation and pays
       // neither the 646 us allocation nor the refill.
       if (impl_->pending_constant.has_value()) {
+        std::lock_guard constants_lock(impl_->constants_mu);
         impl_->constants.emplace(*impl_->pending_constant, n->buffer);
         impl_->pending_constant.reset();
       }

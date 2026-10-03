@@ -207,6 +207,7 @@ Result<Array> mutable_zeros(const Shape& shape) {
           : backend::kDefaultStream;
   const std::size_t bytes = dtype_storage_bytes(
       DType::kF32, static_cast<std::size_t>(shape.elem_count()));
+  const backend::ScopedAllocationSite site(backend::AllocationSite::kState);
   LSE_ASSIGN_OR(backend::DeviceBuffer owned,
                 be.allocate(bytes, backend::MemoryClass::kDevice, at));
   const std::vector<std::byte> zeros(bytes, std::byte{0});

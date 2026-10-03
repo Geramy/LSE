@@ -92,6 +92,7 @@ Result<Array> alloc_pool(const Shape& shape, DType dtype,
       member < set.size()
           ? set.stream_for(member).value_or(backend::kDefaultStream)
           : backend::kDefaultStream;
+  const backend::ScopedAllocationSite site(backend::AllocationSite::kKvCache);
   auto buf = be.allocate(bytes, backend::MemoryClass::kDevice, at);
   if (!buf.ok()) {
     return Status(buf.status().code(), detail::concat(
@@ -129,6 +130,7 @@ Result<Array> grow_fragments(PagedKvLayer& layer, const Array& old,
   auto storage = old.valid() ? old.node()->kv_fragments : nullptr;
   if (old.valid() && !storage)
     return LSE_ERROR(kInvalidArgument, "cannot change a live K/V storage layout");
+  const backend::ScopedAllocationSite site(backend::AllocationSite::kKvCache);
   if (!layer.memory) layer.memory = sched->kv_memory();
   if (!storage)
     storage = std::make_shared<kv::FragmentStorage>(layer.memory, be, stream);

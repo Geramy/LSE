@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 
 #include "lse/backend/backend.hpp"
@@ -61,6 +62,19 @@ struct Ledger {
   std::atomic<std::uint64_t> live{0};
   std::atomic<std::uint64_t> peak{0};
   std::atomic<std::uint64_t> count{0};
+
+  void charge(std::uint64_t bytes) noexcept {
+    const std::uint64_t now = live.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    count.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t seen = peak.load(std::memory_order_relaxed);
+    while (now > seen &&
+           !peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
+    }
+  }
+  void credit(std::uint64_t bytes) noexcept {
+    live.fetch_sub(bytes, std::memory_order_relaxed);
+    count.fetch_sub(1, std::memory_order_relaxed);
+  }
 };
 
 Ledger& ledger(MemoryClass cls) noexcept {
@@ -68,18 +82,42 @@ Ledger& ledger(MemoryClass cls) noexcept {
   return ledgers[cls == MemoryClass::kDevice ? 0 : 1];
 }
 
+constexpr auto kSites = static_cast<std::size_t>(AllocationSite::kCount);
+Ledger& site_ledger(AllocationSite site) noexcept {
+  static Ledger ledgers[kSites];
+  const auto i = static_cast<std::size_t>(site);
+  return ledgers[i < kSites ? i : 0];
+}
+thread_local AllocationSite t_site = AllocationSite::kOther;
+
 // Owns the backend's own storage, so the allocation lives exactly as long as
 // it did before, and returns the charge when the last view lets go.
 struct Charged {
   std::shared_ptr<void> storage;
   std::uint64_t bytes;
   MemoryClass cls;
+  AllocationSite site;
   ~Charged() {
-    Ledger& l = ledger(cls);
-    l.live.fetch_sub(bytes, std::memory_order_relaxed);
-    l.count.fetch_sub(1, std::memory_order_relaxed);
+    ledger(cls).credit(bytes);
+    if (cls == MemoryClass::kDevice) site_ledger(site).credit(bytes);
   }
 };
+
+struct Trimmers {
+  std::mutex mu;
+  std::uint64_t next = 0;
+  std::map<std::uint64_t, MemoryTrimmer> all;
+};
+Trimmers& trimmers() {
+  static Trimmers t;
+  return t;
+}
+
+std::string gib(std::uint64_t bytes) {
+  char text[32];
+  std::snprintf(text, sizeof(text), "%.2f GiB", static_cast<double>(bytes) / double(1ull << 30));
+  return text;
+}
 
 }  // namespace
 
@@ -92,20 +130,98 @@ AllocationTotals allocation_totals(MemoryClass cls) noexcept {
 
 void track_allocation(DeviceBuffer& buf, std::size_t bytes, MemoryClass cls) {
   if (!buf.storage) return;
-  Ledger& l = ledger(cls);
-  const std::uint64_t now =
-      l.live.fetch_add(bytes, std::memory_order_relaxed) + bytes;
-  l.count.fetch_add(1, std::memory_order_relaxed);
-  std::uint64_t seen = l.peak.load(std::memory_order_relaxed);
-  while (now > seen &&
-         !l.peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
-  }
+  const AllocationSite site = t_site;
+  ledger(cls).charge(bytes);
+  if (cls == MemoryClass::kDevice) site_ledger(site).charge(bytes);
   void* const address = buf.storage.get();
   // Built in place: a temporary Charged would return the charge as it died.
   std::shared_ptr<Charged> charged(
-      new Charged{std::move(buf.storage), static_cast<std::uint64_t>(bytes), cls});
+      new Charged{std::move(buf.storage), static_cast<std::uint64_t>(bytes), cls, site});
   // Aliased, so storage.get() still names what the backend stored there.
   buf.storage = std::shared_ptr<void>(std::move(charged), address);
+}
+
+const char* to_string(AllocationSite site) noexcept {
+  switch (site) {
+    case AllocationSite::kWeights: return "weights";
+    case AllocationSite::kKvCache: return "kv_cache";
+    case AllocationSite::kState: return "state";
+    case AllocationSite::kDraft: return "draft";
+    case AllocationSite::kWorkspace: return "workspace";
+    case AllocationSite::kConstants: return "constants";
+    case AllocationSite::kOutputs: return "outputs";
+    case AllocationSite::kOther:
+    case AllocationSite::kCount: break;
+  }
+  return "other";
+}
+
+ScopedAllocationSite::ScopedAllocationSite(AllocationSite site, bool only_if_unset) noexcept
+    : previous_(t_site) {
+  if (!only_if_unset || t_site == AllocationSite::kOther) t_site = site;
+}
+
+ScopedAllocationSite::~ScopedAllocationSite() { t_site = previous_; }
+
+std::vector<SiteTotals> allocation_sites() {
+  std::vector<SiteTotals> out;
+  out.reserve(kSites);
+  for (std::size_t i = 0; i < kSites; ++i) {
+    const auto site = static_cast<AllocationSite>(i);
+    const Ledger& l = site_ledger(site);
+    out.push_back(SiteTotals{site, l.live.load(std::memory_order_relaxed),
+                             l.peak.load(std::memory_order_relaxed),
+                             l.count.load(std::memory_order_relaxed)});
+  }
+  return out;
+}
+
+std::string describe_device_allocations() {
+  const auto all = allocation_totals(MemoryClass::kDevice);
+  std::string text = gib(all.live) + " live (peak " + gib(all.peak) + ")";
+  std::string parts;
+  for (const SiteTotals& s : allocation_sites()) {
+    if (s.live == 0 && s.peak == 0) continue;
+    if (!parts.empty()) parts += ", ";
+    parts += std::string(to_string(s.site)) + " " + gib(s.live) + " (peak " + gib(s.peak) + ")";
+  }
+  return parts.empty() ? text : text + ": " + parts;
+}
+
+std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer) {
+  Trimmers& t = trimmers();
+  std::lock_guard lock(t.mu);
+  const auto id = ++t.next;
+  t.all.emplace(id, std::move(trimmer));
+  return id;
+}
+
+void unregister_memory_trimmer(std::uint64_t id) noexcept {
+  Trimmers& t = trimmers();
+  std::lock_guard lock(t.mu);
+  t.all.erase(id);
+}
+
+std::size_t trim_device_memory() {
+  // Copied out: a trimmer may release buffers whose owners unregister others.
+  std::vector<MemoryTrimmer> run;
+  {
+    Trimmers& t = trimmers();
+    std::lock_guard lock(t.mu);
+    for (const auto& [id, trimmer] : t.all) {
+      (void)id;
+      run.push_back(trimmer);
+    }
+  }
+  std::size_t released = 0;
+  for (const MemoryTrimmer& trimmer : run) released += trimmer();
+  return released;
+}
+
+Status out_of_device_memory(std::size_t bytes, const Status& cause) {
+  return Status(StatusCode::kOutOfMemory,
+                "out of GPU memory allocating " + std::to_string(bytes) + " bytes; the engine holds " +
+                    describe_device_allocations() + "; " + std::string(cause.message()));
 }
 
 void register_backend(std::string_view name, BackendFactory factory,

@@ -720,9 +720,16 @@ lse_result lse_status(const lse_engine* e, char** json_out) {
   {
     const auto device = backend::allocation_totals(backend::MemoryClass::kDevice);
     const auto staging = backend::allocation_totals(backend::MemoryClass::kStaging);
+    json by_site = json::object();
+    for (const auto& site : backend::allocation_sites()) {
+      if (site.live == 0 && site.peak == 0) continue;
+      by_site[backend::to_string(site.site)] = {{"bytes", site.live}, {"peak_bytes", site.peak},
+                                                {"allocations", site.allocations}};
+    }
     s["memory"] = {{"device_bytes", device.live},
                    {"device_peak_bytes", device.peak},
                    {"device_allocations", device.allocations},
+                   {"device_by_site", std::move(by_site)},
                    {"staging_bytes", staging.live}};
   }
   if (e != nullptr) {

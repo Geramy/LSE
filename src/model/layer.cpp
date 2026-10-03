@@ -95,6 +95,7 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
     // A tensor bigger than the slab gets its own exact-sized one rather than
     // rounding a single embedding table up to the next slab boundary.
     const std::size_t want = need > kSlab ? need : kSlab;
+    const backend::ScopedAllocationSite site(backend::AllocationSite::kWeights);
     auto got = be.allocate(want, backend::MemoryClass::kDevice, at);
     if (!got.ok()) return got.status();
     WeightSlab made;

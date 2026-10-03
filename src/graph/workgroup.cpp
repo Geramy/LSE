@@ -659,6 +659,7 @@ Status Workgroup::bind_slots(backend::IBackend& backend,
     // Through the caller's stream: on a device spanning several GPUs the
     // stream is what places the bytes, and the default stream put every
     // member's phase activations in the primary's VRAM.
+    const backend::ScopedAllocationSite site(backend::AllocationSite::kWorkspace);
     auto buf = backend.allocate(s.bytes, backend::MemoryClass::kDevice, stream);
     if (!buf.ok()) {
       const auto available = backend.sample_free_memory();
