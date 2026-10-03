@@ -98,6 +98,16 @@ class IPhaseStaging {
 
   // Can `n` be one stage of a phase body this emitter writes?
   [[nodiscard]] virtual bool can_stage(const Node& n) const noexcept = 0;
+  // Whether `n` can be a stage of a phase body on `device`: can_stage(n),
+  // and the stage body actually emits for this node's shapes on this target.
+  // The planner asks this before staging a node, so a node the phase emitter
+  // would decline is planned as its own group and dispatch never meets a
+  // decline. Defaults to can_stage(n).
+  [[nodiscard]] virtual bool can_stage_on(const Node& n,
+                                          const backend::DeviceInfo& device) const {
+    (void)device;
+    return can_stage(n);
+  }
 
   // Independent work items the node could spend if it owned the launch. The
   // phase splitter breaks a chain here: a stage wanting thousands of them

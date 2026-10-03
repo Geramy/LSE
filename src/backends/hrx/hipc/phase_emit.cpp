@@ -474,6 +474,57 @@ bool HipEmitter::can_stage(const Node& n) const noexcept {
   return node_can_stage(n);
 }
 
+// The planner's question, answered the way emit_phase answers it: a kernel
+// primitive's stage body is emitted for this node's shapes on this device,
+// through the same specialization and hooks, and a body the primitive
+// declines (an empty one, a self-indexed one that never stores, or one whose
+// workgroups a phase cannot host) means the node is not staged. Stages the
+// phase emitter writes itself (linears, RMS, views, element-wise) are not
+// probed here.
+bool HipEmitter::can_stage_on(const Node& n, const DeviceInfo& device) const {
+  if (!node_can_stage(n)) return false;
+  const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
+  if (kp == nullptr || is_linear_name(kp->name()) || n.kind == OpKind::kRMS ||
+      n.kind == OpKind::kRepeat)
+    return true;
+  const DialectSourceTable spellings = hip_sources();
+  const kir::TypeTable type_table = hip_types();
+  std::vector<Shape> storage;
+  std::vector<DType> dtypes;
+  for (const NodePtr& in : n.inputs) {
+    storage.push_back(in->shape);
+    dtypes.push_back(in->dtype);
+  }
+  KernelShapes sh;
+  sh.inputs = storage;
+  sh.input_dtypes = dtypes;
+  sh.output = n.shape;
+  sh.output_dtype = n.dtype;
+  sh.attrs = n.attrs;
+  sh.iattrs = n.iattrs;
+  sh.device = &device;
+  sh.types = type_table;
+  sh.intrinsics = &spellings;
+  const KernelPrimitiveBase* spec = phase_spec(kp, sh);
+  if (spec == nullptr) return false;
+  if (spec->owns_indexing()) {
+    const ThreadPlan plan = spec->plan(sh);
+    if (plan.workgroup_size[0] != 256u || plan.workgroup_size[1] != 1u ||
+        plan.workgroup_size[2] != 1u || plan.workgroup_count[1] != 1u ||
+        plan.workgroup_count[2] != 1u)
+      return false;
+    const auto phase_spellings = hip_phase_sources();
+    sh.intrinsics = &phase_spellings;
+    bool stored = false;
+    sh.store = [&](std::string_view index, std::string_view value) {
+      stored = true;
+      return store_elem("probe_out", std::string(index), n.dtype, std::string(value));
+    };
+    return !spec->emit_kernel(sh).empty() && stored;
+  }
+  return !spec->emit_kernel(sh).empty();
+}
+
 std::uint32_t HipEmitter::stage_threads(const Node& n,
                                         const DeviceInfo& device) const {
   return node_stage_threads(n, device);

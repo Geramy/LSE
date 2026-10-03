@@ -25,6 +25,8 @@ class HipEmitter final : public graph::IKernelEmitter,
       const graph::FusionGroup& group, const DeviceInfo& device);
 
   [[nodiscard]] bool can_stage(const graph::Node& n) const noexcept override;
+  [[nodiscard]] bool can_stage_on(const graph::Node& n,
+                                  const DeviceInfo& device) const override;
   [[nodiscard]] std::uint32_t stage_threads(
       const graph::Node& n, const DeviceInfo& device) const override;
   [[nodiscard]] bool lane_stage(const graph::Node& n) const noexcept override;

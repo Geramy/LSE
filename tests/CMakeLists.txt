@@ -550,4 +550,9 @@ endif()
 if(LSE_ENABLE_HRX)
   # The device-first scheduler path on a recording-only host device.
   lse_add_test(test_capture_prefill lse_api lse_server lse_runtime lse_model lse_graph lse_backends lse_tokenizer lse_place)
+  # The same on a capture device standing in for a HIP target with phase
+  # staging (gfx1151, the Linux CI GPU).
+  add_test(NAME test_capture_prefill_hip_gfx1151 COMMAND test_capture_prefill
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(test_capture_prefill_hip_gfx1151 PROPERTIES ENVIRONMENT "LSE_CAPTURE_TARGET=gfx1151")
 endif()

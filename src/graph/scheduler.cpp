@@ -1393,7 +1393,8 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           phase_groups.push_back(std::move(one));
           continue;
         }
-        if (staging == nullptr || !staging->can_stage(*n)) {
+        if (staging == nullptr ||
+            !staging->can_stage_on(*n, backend().device_info())) {
           flush_staged();
           if (join_gdn_pair(n)) continue;
           // No staged/grid barrier is needed for a single-consumer pointwise

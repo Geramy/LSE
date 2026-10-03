@@ -36,6 +36,7 @@
 #include "lse/backends/hrx/code_object.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 #include <sys/resource.h>
 #include "lse/graph/codegen.hpp"
@@ -115,8 +116,31 @@ struct CaptureEmitter final : IKernelEmitter {
   bool joins_run(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.joins_run(run, d); }
   RunScratch run_scratch(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.run_scratch(run, d); }
 };
+// The HIP emitter, with its phase staging, for a capture device that stands
+// in for a HIP-dialect target (gfx1151 on Linux CI).
+struct CaptureHipEmitter final : IKernelEmitter {
+  mutable HipEmitter real;
+  Result<EmittedKernel> emit(const FusionGroup& g, const DeviceInfo& d) const override { return real.emit(g, d); }
+  Dialect dialect() const noexcept override { return Dialect::kHip; }
+  std::string_view prelude() const noexcept override { return real.prelude(); }
+  DialectSourceTable sources() const noexcept override { return real.sources(); }
+  std::uint64_t cache_key(const FusionGroup& g, const DeviceInfo& d) const override { return real.cache_key(g, d); }
+  const IPhaseStaging* staging() const noexcept override { return real.staging(); }
+  bool joins_run(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.joins_run(run, d); }
+  RunScratch run_scratch(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.run_scratch(run, d); }
+};
+
 struct CaptureBackend : Backend<CaptureBackend> {
   static constexpr std::string_view kName = "capture";
+  // Which target the next capture device stands in for: Loom on gfx1201
+  // (the iPad) by default, or HIP on gfx1151 (Linux CI).
+  static inline const bool hip_gfx1151 = [] {
+    const char* t = std::getenv("LSE_CAPTURE_TARGET");
+    return t != nullptr && std::string_view(t) == "gfx1151";
+  }();
+  mutable CaptureHipEmitter hip_emitter;
+  mutable KernelToolchain hip_chain{Dialect::kHip, &hip_emitter, &compiler_for_hip};
+  static inline NullCompiler compiler_for_hip;
   CpuBackend cpu;
   mutable CaptureEmitter emitter;
   mutable NullCompiler compiler;
@@ -134,7 +158,8 @@ struct CaptureBackend : Backend<CaptureBackend> {
   Status init_impl(int ordinal) {
     LSE_RETURN_IF_ERROR(cpu.init_impl(ordinal));
     info = cpu.device_info_impl();
-    info.arch = "gfx1201"; info.compute_units = 64; info.wavefront_size = 32;
+    info.arch = hip_gfx1151 ? "gfx1151" : "gfx1201";
+    info.compute_units = hip_gfx1151 ? 40 : 64; info.wavefront_size = 32;
     info.max_threads_per_workgroup = 1024; info.lds_bytes_per_workgroup = 65536;
     info.total_memory = 34208743424ull;
     info.name = "capture gfx1201";
@@ -176,7 +201,10 @@ struct CaptureBackend : Backend<CaptureBackend> {
     return OkStatus();
   }
   Status synchronize_impl() { return OkStatus(); }
-  std::span<const KernelToolchain> toolchains_impl() const noexcept { return {&chain, 1}; }
+  std::span<const KernelToolchain> toolchains_impl() const noexcept {
+    return hip_gfx1151 ? std::span<const KernelToolchain>{&hip_chain, 1}
+                       : std::span<const KernelToolchain>{&chain, 1};
+  }
   Result<KernelHandle> load_executable_impl(std::string_view name, std::span<const std::byte>) {
     return KernelHandle{1, 0, std::string(name)};
   }
