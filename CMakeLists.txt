@@ -345,6 +345,7 @@ add_library(lse_model
   src/model/hybrid_lm.cpp
   src/model/mtp.cpp
   src/model/dflash2.cpp
+  src/model/dflash2_convert.cpp
   src/model/layer.cpp
   src/model/registry.cpp
   src/model/weights.cpp

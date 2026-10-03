@@ -79,6 +79,44 @@ context keys obey the 2048-position sliding window. Learned dynamic convolutions
 have two taps and groups of 16 channels. The selector conditions each choice on
 its predecessor using top-16 candidates and rank-256 codebooks.
 
+## Automatic Q8 conversion
+
+`--dflash2-model` accepts the original BF16 checkpoint as well as a converted
+Q8 directory. LSE reads the checkpoint itself to tell them apart. If the config
+has a `quantization` block, the directory is loaded as is. If the config has
+none and the single `model.safetensors` holds BF16 matrices, it is a source
+checkpoint. On first use LSE converts a source checkpoint to affine Q8/group64
+(`src/model/dflash2_convert.cpp`) and loads the result.
+
+The conversion is byte-identical to the Python script below. That covers
+`model.safetensors`, `config.json` and `source-repository.json`. It streams the
+source with bounded memory (one 128-row block at a time) and builds the output
+in a temporary directory, then renames it into place. On an M-series Mac it takes
+about 6 s. The result is cached:
+
+- By default it goes in `lse-q8g64/` inside the source directory. That works in
+  an HF cache snapshot too.
+- With `LSE_DFLASH2_CACHE_DIR` set, it goes in
+  `$LSE_DFLASH2_CACHE_DIR/<org>-<name>@<revision>-q8g64/`.
+
+On later runs LSE checks the cached manifest against the source's sha256 and
+reuses the cached conversion. The source hash comes from a stat stamp, or from
+the blob name in an HF cache, so a warm start does not re-read the source.
+
+- **Recorded origin:** for an HF cache snapshot, the repository and revision
+  come from the snapshot path. Otherwise they come from an `hf-origin.json`
+  (`{"repository": ..., "revision": ...}`) beside the weights.
+- **Progress:** goes to stderr as
+  `[dflash2-convert] phase=<hash-source|quantize|finish> done=N total=N percent=P`.
+- **Turning it off:** set `LSE_DFLASH2_AUTOCONVERT=0` to load a BF16 checkpoint
+  unconverted.
+
+`tests/test_dflash2_convert.cpp` checks the conversion against Python-produced
+hashes on a synthetic checkpoint. To run it on the real checkpoint, set
+`LSE_DFLASH2_CONVERT_SOURCE` to the snapshot below. You can also set
+`LSE_DFLASH2_CONVERT_REFERENCE` to a directory the script wrote, and the test
+compares against it byte for byte.
+
 ## Reproduce Q8 conversion
 
 The converter requires Python and NumPy; the initial conversion used NumPy
