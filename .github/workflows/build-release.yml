@@ -219,6 +219,8 @@ jobs:
           mkdir -p "dist/$name/docs/experimental"
           cp docs/experimental/sparse-attention.md "dist/$name/docs/experimental/"
           mkdir -p "dist/$name/docs/benchmarks"
+          cp docs/benchmarks/flashprefill-humaneval-32k.json docs/benchmarks/flashprefill-humaneval-32k.png "dist/$name/docs/benchmarks/"
+          cp docs/benchmarks/FlashPrefill-Results-Redesigned.pdf "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/flashprefill-speculative-2026-09-30.md "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/q4-prefill-2026-09-30.md "dist/$name/docs/benchmarks/"
           cp docs/benchmarks/attention-vector-staging-2026-09-29.md docs/benchmarks/automatic-split-2026-09-29.md "dist/$name/docs/benchmarks/"

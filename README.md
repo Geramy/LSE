@@ -82,8 +82,8 @@ remain available for reuse.
 | macOS on Apple Silicon | An external AMD GPU and the activated [MacAMDGPU driver](https://github.com/lemonade-sdk/mac-amdgpu) | Loom |
 | CPU | A build with the CPU backend | CPU reference execution |
 
-The tested macOS GPU is the R9700 (`gfx1201`). The macOS package includes HSA, HRX, Loom, and their runtime libraries.
-It does not install the DriverKit extension.
+The tested macOS GPU is the R9700 (`gfx1201`). The macOS package includes HRX, Loom, and their runtime libraries.
+It uses the HSA runtime installed by the GPU driver and does not install the DriverKit extension.
 
 The macOS binaries target macOS 15 or later. GPU use also requires a macOS version supported by MacAMDGPU.
 See the driver instructions for that requirement.
@@ -98,7 +98,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.4.23`.
+The examples below use `v0.4.24`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -107,7 +107,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.23
+   lse_tag=v0.4.24
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -140,7 +140,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.4.23
+   lse_tag=v0.4.24
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"

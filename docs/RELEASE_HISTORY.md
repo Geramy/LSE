@@ -3,6 +3,12 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.4.24: HumanEval+ through 32K and driver HSA runtime
+
+1. **HumanEval+ through 32K:** FlashPrefill V2 (alpha 0.1) prefill is **51–55% faster at 32K** across Baseline, MTP3 and DFlash2 on Qwen3.8-27B Q4, R9700/HRX/LOOM, over **1,368 completed generations**. Correctness matches dense prefill at Standard and 32K, with one additional failure per mode at 16K. [Results and data](benchmarks/flashprefill-humaneval-32k.json).
+2. **Decode refinements:** single-token RMS normalization on gfx1201 keeps each row in registers across the reduction with **bit-identical output**; the single-token Q4 FFN down projection (5120×17408) now uses activation panels; and the submission tuner accepts repeatable wins of **2%** (previously 5%) when the sample ranges separate.
+3. **macOS uses the driver's HSA runtime:** the macOS package **no longer bundles libhsa-runtime64**, which could shadow the driver's copy and fail to find the GPU. LSE now loads the HSA runtime installed by the GPU driver ([mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu)) from `/usr/local/lib` or `/Library/MacAMDGPU/runtime`. Install or update the driver before upgrading.
+
 ## v0.4.23: FlashPrefill V2
 
 1. **Faster long-context prefill:** FlashPrefill V2 reached **632.1 pp/s at 16K** and **604.9 pp/s at 32K** on Qwen3.8-27B Q4, R9700/HRX/LOOM. Default on for supported configurations; use `--FlashPrefillV2=off` for dense prefill.

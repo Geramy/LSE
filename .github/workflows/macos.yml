@@ -68,7 +68,7 @@ jobs:
           retention-days: 30
       - name: Explain verification boundary
         run: |
-          echo 'Apple Silicon binaries, bundled HSA/HRX/Loom runtime, host tests, native gfx1201 compilation, and package relocation verified. The runner has no external AMD GPU; GPU execution and DriverKit activation require the installed MacAMDGPU driver on supported hardware.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Apple Silicon binaries, bundled HRX/Loom runtime (HSA comes from the installed GPU driver), host tests, native gfx1201 compilation, and package relocation verified. The runner has no external AMD GPU; GPU execution and DriverKit activation require the installed MacAMDGPU driver on supported hardware.' >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     if: github.event_name == 'workflow_dispatch' && inputs.release

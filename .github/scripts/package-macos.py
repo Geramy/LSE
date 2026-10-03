@@ -164,6 +164,9 @@ def main():
     shutil.copy2(root / 'docs/experimental/sparse-attention.md',
                  package / 'docs/experimental/sparse-attention.md')
     (package / 'docs' / 'benchmarks').mkdir()
+    for result in ('flashprefill-humaneval-32k.json', 'flashprefill-humaneval-32k.png',
+                   'FlashPrefill-Results-Redesigned.pdf'):
+        shutil.copy2(root / 'docs/benchmarks' / result, package / 'docs/benchmarks' / result)
     shutil.copy2(root / 'docs/benchmarks/flashprefill-speculative-2026-09-30.md',
                  package / 'docs/benchmarks/flashprefill-speculative-2026-09-30.md')
     shutil.copy2(root / 'docs/benchmarks/q4-prefill-2026-09-30.md',
