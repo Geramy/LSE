@@ -1,10 +1,10 @@
-# Output limits, context, thinking levels and sampling defaults
+# Output limits, context, thinking levels, sampling defaults and CPU fallback
 
 This page specifies the request fields and response fields that control how long
 a reply runs, what happens when the context fills, which thinking levels a model
-offers and which sampling defaults it uses. The HTTP server and the in-process C
-API (`lse_request`, `lse_model_info`) share the same JSON, so every shape below
-applies to both. Fields that are not part of the OpenAI schema use LSE's own
+offers, which sampling defaults it uses, and how CPU fallback is reported or
+refused. The HTTP server and the in-process C API (`lse_request`,
+`lse_model_info`) share the same JSON, so every shape below applies to both. Fields that are not part of the OpenAI schema use LSE's own
 names, and OpenAI clients ignore them.
 
 ## Output limits
@@ -289,3 +289,47 @@ Sampling applies the penalties first, then temperature, then top-k, top-p and
 min-p, in that order. The `lse` command line takes `--top-k`, `--top-p`,
 `--min-p`, `--presence-penalty`, `--repeat-penalty` and `--temperature`, each
 defaulting to the model's value.
+
+## CPU fallback
+
+An operation with no device kernel runs on the CPU interpreter. This is the only
+fallback LSE has, and it is reported every time:
+
+- The server log prints `lse: CPU FALLBACK (N so far for this cause): <cause>` the
+  first time a cause occurs and again at each power of two.
+- The response of a request that caused one carries `lse_warnings`. For a
+  streamed reply, it is in the final chunk.
+- `lse_status` counts every cause under `engine.cpu_fallback`, with `allowed`
+  telling whether fallback is permitted.
+
+```json
+"lse_warnings": [
+  {"type": "cpu_fallback", "cause": "fused group 12 (3 nodes: mul, silu, add); ... no kernel for silu", "count": 4}
+]
+```
+
+```json
+"cpu_fallback": {"allowed": true, "total": 4,
+                 "events": [{"cause": "fused group 12 (3 nodes: mul, silu, add); ...", "count": 4}]}
+```
+
+### `--no-cpu-fallback`
+
+`lse-server --no-cpu-fallback`, `lse --no-cpu-fallback` and
+`lse_config.disable_cpu_fallback = 1` refuse the CPU interpreter instead:
+
+| Case | Without the option | With the option |
+|---|---|---|
+| No `--pool`, and no device backend comes up | The CPU backend runs the model, with a startup warning naming each backend that declined | Startup fails: `no device backend came up and CPU fallback is disabled (--no-cpu-fallback)`, followed by each backend and its reason |
+| `--pool` names a CPU device (`cpu:0`) | The CPU device is a pool member | Startup fails: `device cpu:0 is refused: it has no device code generator ...` |
+| `--pool hrx:0` and that device does not come up | Startup fails, naming the device | The same |
+| An operation has no device kernel | It runs on the CPU and is reported as above | The request fails with an error that starts with `CPU fallback disabled:` and names the operation group |
+
+A failed request gets HTTP 500 with `type: "server_error"`. If the reply is
+streamed, the error is sent in the stream. The engine stays loaded, and the next
+request runs. `lse_open` returns NULL when startup fails, and `lse` exits with
+status 1.
+
+`LSE_REQUIRE_DEVICE_KERNELS=1` in the environment has the same effect as the
+option. It is the older qualification switch, kept for test runs. Leaving out the
+option does not override it.

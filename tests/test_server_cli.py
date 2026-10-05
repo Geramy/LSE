@@ -19,6 +19,8 @@ cases = [
     (['--dialect', 'unknown', '--model', '/not-opened'], 2, "no dialect is spelled 'unknown'"),
     (['--dialect'], 2, '--dialect needs a value'),
     (['--dialect', 'loom'], 2, 'no model.'),
+    (['--help'], 0, '--no-cpu-fallback'),
+    (['--no-cpu-fallback'], 2, 'no model.'),
 ]
 for value in ('1', '30', '600'):
     cases.append((['--shutdown-grace-seconds', value, '--help'], 0,
@@ -139,6 +141,8 @@ if len(sys.argv) == 3:
         cli_cases.append(([flag], 2, flag + ' needs a value'))
     cli_cases.append((['--batch-size', '1024', '--ubatch-size', '2048'],
                       2, '--ubatch-size must not exceed --batch-size'))
+    cli_cases += [(['--help'], 0, '--no-cpu-fallback'),
+                  (['--no-cpu-fallback'], 2, 'no model given')]
     for args, code, message in cli_cases:
         result = subprocess.run([str(cli), *args], env=env, capture_output=True,
                                 text=True, timeout=10)

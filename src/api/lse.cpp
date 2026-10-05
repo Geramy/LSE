@@ -313,7 +313,12 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   if (c.max_tokens < 0) return invalid("--max-tokens must be 0 (no cap) or positive");
   opt.max_tokens_cap = c.max_tokens;
   opt.max_sessions = c.max_sessions;
-  if (c.disable_cpu_fallback) graph::set_cpu_fallback_allowed(false);
+  // Set either way, before any device is opened: the device set reads it to
+  // refuse a host-interpreter member, and an earlier lse_open in this process
+  // must not leave its choice behind. LSE_REQUIRE_DEVICE_KERNELS=1 means the
+  // same as the option and is not overridden by its absence.
+  graph::set_cpu_fallback_allowed(c.disable_cpu_fallback == 0 &&
+                                  !graph::device_kernels_required_by_environment());
   opt.session_memory_budget = static_cast<std::size_t>(c.session_memory_budget);
   if (c.mtp_depth != 0) {
     opt.mtp_depth = c.mtp_depth;

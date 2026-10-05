@@ -50,6 +50,15 @@ backend::DeviceDescriptor describe(
   return bare;
 }
 
+// With CPU fallback disallowed, a device with no code generator is refused as a
+// member: everything placed on it would run on the host interpreter. Empty when
+// the member is acceptable.
+std::string host_interpreter_refusal(const backend::IBackend& be) {
+  if (be.emitter() != nullptr || graph::cpu_fallback_allowed()) return {};
+  return "it has no device code generator, so every op would run on the host "
+         "interpreter";
+}
+
 }  // namespace
 
 // A pool entry that names the device by something stable instead of by
@@ -272,10 +281,22 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
         impl.declined += name + ": " + init.to_string();
         continue;
       }
+      // The host backend is the last entry in that order; with CPU fallback
+      // disallowed, reaching it is the failure, not the answer.
+      if (const std::string refusal = host_interpreter_refusal(*candidate);
+          !refusal.empty()) {
+        if (!impl.declined.empty()) impl.declined += "; ";
+        impl.declined += name + ": refused, " + refusal;
+        continue;
+      }
       adopt(std::move(candidate), probe::DeviceId{name, ordinal});
       return set;
     }
-    return LSE_ERROR(kDeviceError, "no backend came up",
+    return LSE_ERROR(kDeviceError,
+                     graph::cpu_fallback_allowed()
+                         ? "no backend came up"
+                         : "no device backend came up and CPU fallback is "
+                           "disabled (--no-cpu-fallback)",
                      impl.declined.empty() ? "" : " (",
                      impl.declined, impl.declined.empty() ? "" : ")");
   }
@@ -300,6 +321,12 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
                        std::to_string(named.size()),
                        " GPUs will not come up: ", init.to_string());
     }
+    if (const std::string refusal = host_interpreter_refusal(*candidate);
+        !refusal.empty()) {
+      return LSE_ERROR(kDeviceError, "the device spanning ",
+                       std::to_string(named.size()), " members is refused: ",
+                       refusal, ", and CPU fallback is disabled (--no-cpu-fallback)");
+    }
     backend::IBackend* shared = candidate.get();
     impl.owned.push_back(std::move(candidate));
     for (std::size_t m = 0; m < named.size(); ++m) {
@@ -323,6 +350,11 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
       return LSE_ERROR(kDeviceError, "device ", id.str(),
                        " was asked for and will not come up: ",
                        init.to_string());
+    }
+    if (const std::string refusal = host_interpreter_refusal(*candidate);
+        !refusal.empty()) {
+      return LSE_ERROR(kDeviceError, "device ", id.str(), " is refused: ",
+                       refusal, ", and CPU fallback is disabled (--no-cpu-fallback)");
     }
     adopt(std::move(candidate), id);
   }

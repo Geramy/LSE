@@ -60,6 +60,8 @@ struct Options {
   // does not say gets.
   std::string dialect;
   std::string cache_dir;
+  // --no-cpu-fallback: refuse the host interpreter instead of falling back to it.
+  bool no_cpu_fallback = false;
   bool show_stats = false;
   bool token_ids = false;
   bool list_devices = false;
@@ -139,6 +141,10 @@ void usage() {
       "                         and best first: hrx:0,cpu:0 (default $LSE_POOL,\n"
       "                         else one device -- the first backend that comes\n"
       "                         up, at $LSE_DEVICE's ordinal)\n"
+      "      --no-cpu-fallback  never run on the CPU interpreter: fail at once\n"
+      "                         when no device backend comes up, when the pool\n"
+      "                         names a cpu device, or when an op has no device\n"
+      "                         kernel (default: allowed, logged and counted)\n"
       "      --dialect NAME     source dialect to generate kernels in: hip or\n"
       "                         loom. A device that does not declare it is\n"
       "                         given its own first choice instead (default:\n"
@@ -171,6 +177,8 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->list_cache = true;
     } else if (a == "--pool") {
       if (!take_value(argc, argv, i, "--pool", &opt->pool)) return false;
+    } else if (a == "--no-cpu-fallback") {
+      opt->no_cpu_fallback = true;
     } else if (a == "--cache-dir" || a.starts_with("--cache-dir=")) {
       if (a == "--cache-dir") {
         if (!take_value(argc, argv, i, "--cache-dir", &opt->cache_dir)) return false;
@@ -608,6 +616,9 @@ int main(int argc, char** argv) {
   }
   if (opt.list_devices) return list_devices();
   if (opt.list_cache) return list_cache();
+  // Before anything opens a device: the device set reads it to refuse a
+  // host-interpreter member.
+  if (opt.no_cpu_fallback) graph::set_cpu_fallback_allowed(false);
   if (opt.debug) {
     lse::set_debug(true);
     const std::string dir = lse::graph::hip_dump_directory();

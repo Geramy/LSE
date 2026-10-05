@@ -16,6 +16,7 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
 - **Model info and memory estimates:** inspect a checkpoint and size a context before loading it.
 - **GPU execution:** HRX with HIP or Loom kernel source, subject to platform support.
 - **CPU backend:** Reference execution and a fallback when available GPU backends cannot start.
+  CPU fallback is always reported; `--no-cpu-fallback` turns it into an error.
 
 [Install](#install-a-release) · [Start the server](#start-the-http-server) ·
 [MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
@@ -252,6 +253,20 @@ curl -fsS http://127.0.0.1:8080/v1/chat/completions \
 
 Press **Ctrl+C** in the server terminal to stop it.
 The default shutdown grace period is 30 seconds.
+
+### Refuse CPU fallback
+
+Add `--no-cpu-fallback` to `lse-server` or `lse` to make sure nothing runs on the CPU interpreter:
+
+- Startup fails when no device backend comes up, or when `--pool` names a CPU device. Without
+  `--pool`, LSE would otherwise fall back to the CPU backend; `--pool hrx:0` already refuses it.
+- A request fails with HTTP 500 when an operation has no device kernel. The error starts with
+  `CPU fallback disabled:` and names the operation group.
+
+Without the option, every CPU fallback is logged, counted under `cpu_fallback` in
+`lse_status`, and reported in the response's `lse_warnings`.
+`LSE_REQUIRE_DEVICE_KERNELS=1` has the same effect as the option.
+See [CPU fallback](docs/API.md#cpu-fallback) for the messages and fields.
 
 ## Select a decoding mode
 
@@ -532,7 +547,7 @@ A changed prefix requires new prefill. MTP also retains verified state for an ex
 |---|---|
 | The executable is missing | Linux programs are at the archive root. macOS launchers are in `bin/`. |
 | No HRX device appears | Check runtime libraries and driver status. On macOS, confirm that the DriverKit extension is active. |
-| The server reports CPU execution | Check `--devices`. Use `--pool hrx:0` after the GPU runtime can start. |
+| The server reports CPU execution | Check `--devices`. Use `--pool hrx:0` after the GPU runtime can start. Add `--no-cpu-fallback` to fail instead of running on the CPU. |
 | First requests are slow | Check kernel compilation counts. New model shapes and KV capacities can require new kernels. |
 | A later request has slow prefill | Check fresh prompt tokens and new compilation time. A request is not warm merely because it is second. |
 | macOS CPU use is near 100% | This can indicate one busy compiler thread. It does not, by itself, show CPU model execution. |

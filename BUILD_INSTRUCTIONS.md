@@ -66,6 +66,7 @@ export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
 
 If the HRX backend cannot initialize, LSE falls back to the CPU backend (the
 same models, roughly two hundred times slower) and says so on the way past.
+`--no-cpu-fallback` makes that an error instead.
 
 ### AOT targets
 

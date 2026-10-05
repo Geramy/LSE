@@ -228,6 +228,10 @@ target_link_libraries(test_probe PRIVATE lse_place)
 target_link_libraries(test_probe PRIVATE lse_backends)
 target_link_libraries(test_probe PRIVATE Threads::Threads)
 
+# --no-cpu-fallback outside a request: the device set refuses a member with no
+# code generator and a scheduler with none refuses its steps. CPU backend only.
+lse_add_test(test_cpu_fallback lse_place lse_graph lse_backends)
+
 # The trace module: the writer, the collector and the pftrace bytes need no
 # device, and the suite asserts on the encoded bytes rather than on a viewer.
 # lse_backends is linked so the same seam can be exercised against a live
