@@ -1539,12 +1539,17 @@ class Renderer {
     }
     if (f.function == "strftime_now") {
       const Value* fmt = args.get(0, "format");
-      const std::string& format = text_of(fmt != nullptr ? *fmt : Value::undefined(), line, "strftime_now");
+      if (fmt == nullptr) fail(line, "strftime_now() needs a format");
+      const std::string format = text_of(*fmt, line, "strftime_now");
       const std::time_t t = std::time(nullptr);
       std::tm tm{};
       localtime_r(&t, &tm);
       char buf[256];
+      // The format is the template's, by design.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
       const std::size_t n = std::strftime(buf, sizeof buf, format.c_str(), &tm);
+#pragma GCC diagnostic pop
       return Value::of(std::string(buf, n));
     }
     fail(line, "unsupported function '" + f.function + "'");

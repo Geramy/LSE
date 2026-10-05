@@ -1,6 +1,8 @@
 #include "lse/models/sampling_defaults.hpp"
 
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -89,6 +91,16 @@ Result<std::string> read_file(const std::filesystem::path& path) {
 }
 }  // namespace
 
+namespace {
+// A float as the shortest decimal that reads back as it, so 0.95f reports as
+// 0.95 rather than 0.949999988079071.
+double shortest(float v) {
+  char buf[32];
+  const auto end = std::to_chars(buf, buf + sizeof buf, v).ptr;
+  return std::strtod(std::string(buf, end).c_str(), nullptr);
+}
+}  // namespace
+
 std::string SamplingDefaults::source(std::string_view field) const {
   const auto it = sources.find(std::string(field));
   return it == sources.end() ? std::string(kFromLseDefault) : it->second;
@@ -99,12 +111,12 @@ nlohmann::json SamplingDefaults::to_json() const {
   for (const char* key : {"temperature", "top_k", "top_p", "min_p", "repetition_penalty",
                           "presence_penalty", "max_new_tokens", "max_length"})
     src[key] = source(key);
-  return json{{"temperature", temperature},
+  return json{{"temperature", shortest(temperature)},
               {"top_k", top_k},
-              {"top_p", top_p},
-              {"min_p", min_p},
-              {"repetition_penalty", repetition_penalty},
-              {"presence_penalty", presence_penalty},
+              {"top_p", shortest(top_p)},
+              {"min_p", shortest(min_p)},
+              {"repetition_penalty", shortest(repetition_penalty)},
+              {"presence_penalty", shortest(presence_penalty)},
               {"max_new_tokens", max_new_tokens ? json(*max_new_tokens) : json(nullptr)},
               {"max_length", max_length ? json(*max_length) : json(nullptr)},
               {"sources", std::move(src)}};

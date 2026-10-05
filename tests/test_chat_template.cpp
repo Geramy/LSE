@@ -67,6 +67,7 @@ LSE_TEST(jinja_renders_expressions_filters_and_tests) {
   LSE_EXPECT_STR(render("{% for k, v in d|items %}{{ k }}={{ v }};{% endfor %}", {{"d", {{"a", 1}, {"b", "x"}}}}),
                  "a=1;b=x;");
   LSE_EXPECT_STR(render("{{ none }}{{ true }}{{ 1.0 }}"), "NoneTrue1.0");
+  LSE_EXPECT_STR(render("{{ strftime_now('%Y')|length }}"), "4");
   // Truthiness: empty strings, lists and mappings, zero, none and undefined are false.
   LSE_EXPECT_STR(render("{% if '' or [] or {} or 0 or none or nothing %}T{% elif 'x' %}x{% endif %}"), "x");
 }

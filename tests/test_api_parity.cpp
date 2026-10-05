@@ -142,8 +142,8 @@ struct Fixture {
     };
     add("embed.weight", {vocab_size, 8}, true);
     if (eos_after_t) {
-      const std::size_t eos = vocab.size() + 2, t = static_cast<std::size_t>('t' - 'a');
-      for (std::size_t k = 0; k < 8; ++k) data[eos * 8 + k] = 3.0f * data[t * 8 + k];
+      const std::size_t eos = vocab.size() + 2, t_row = static_cast<std::size_t>('t' - 'a');
+      for (std::size_t k = 0; k < 8; ++k) data[eos * 8 + k] = 3.0f * data[t_row * 8 + k];
     }
     add("final_norm.weight", {8}, false);
     add("blocks.0.norm1.weight", {8}, false);

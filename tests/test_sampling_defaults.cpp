@@ -102,6 +102,8 @@ LSE_TEST(real_qwen38_generation_config_supplies_the_defaults) {
   LSE_EXPECT_NEAR(d->top_p, 0.95, 1e-6);
   LSE_EXPECT(d->to_json()["sources"]["top_k"] == "generation_config.json");
   LSE_EXPECT(d->to_json()["sources"]["min_p"] == "lse_default");
+  // Reported as the file wrote it, not as float32 widened to double.
+  LSE_EXPECT(d->to_json()["top_p"].get<double>() == 0.95);
   LSE_EXPECT(!d->max_new_tokens);  // it sets no output limit
 }
 
