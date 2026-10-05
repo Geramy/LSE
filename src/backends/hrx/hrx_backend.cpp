@@ -132,6 +132,15 @@ bool hrx_owns_residency(DeviceIndex d) {
   return g_hrx_residencies.count(d.value) != 0;
 }
 
+// No other live hrx backend holds memory: nothing outside this backend's own
+// streams can read a buffer it is about to write.
+bool hrx_sole_residency(DeviceIndex d) {
+  const std::lock_guard lock(g_hrx_residency_mu);
+  for (const std::uint16_t other : g_hrx_residencies)
+    if (!d.bound() || other != d.value) return false;
+  return true;
+}
+
 // LSE_TRACE_SYNC=1: one unbuffered stderr line before and after every call
 // that can block the host on the device, so a hang's last line names the
 // blocking call. Diagnostic only; costs a getenv once.
@@ -1934,6 +1943,55 @@ Status HrxBackend::dma_host_transfer(void* host, const DeviceBuffer& device,
 #endif
 }
 
+Status HrxBackend::write_ordered_impl(DeviceBuffer& dst, const void* src,
+                                      std::size_t bytes, std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)dst; (void)src; (void)bytes; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (src == nullptr || dst.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer in write_ordered");
+  }
+  if (dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "write_ordered runs past the end of the buffer");
+  }
+  if (bytes == 0) return OkStatus();
+  // iree_hal_command_buffer_update_buffer's limit
+  // (IREE_HAL_COMMAND_BUFFER_MAX_UPDATE_SIZE).
+  constexpr std::size_t kUpdateLimit = 64u << 10;
+  // Ordered on stream 0 alone. With work on other streams, on a spanning
+  // device whose members each own streams, or with another GPU's backend
+  // live (its peer copies read this memory from its own queues), "after
+  // every launch already issued" is a join across queues, which this
+  // backend makes on the host (wait_event_impl).
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  // A buffer with a host mapping can be read through it without a copy, and
+  // that read would not see a write still queued here.
+  if (bytes > kUpdateLimit || other_streams || dst.ptr != nullptr) {
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    return copy_h2d_impl(src, dst, bytes, dst_offset);
+  }
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  LSE_SYNC_TRACE("write_ordered %zu bytes", bytes);
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_update_buffer(static_cast<hrx_stream_t>(*stream), src, bytes,
+                               reinterpret_cast<hrx_buffer_t>(dst.handle),
+                               dst.offset + dst_offset),
+      "hrx_stream_update_buffer"));
+  ordered_writes_pending_ = true;
+  return OkStatus();
+#endif
+}
+
+Status HrxBackend::join_ordered_writes() {
+  if (!ordered_writes_pending_) return OkStatus();
+  return synchronize_stream_impl(Stream{0});
+}
+
 Status HrxBackend::copy_h2d_imported(const void* src, DeviceBuffer& dst,
                                      std::size_t bytes,
                                      std::size_t dst_offset) {
@@ -2063,6 +2121,7 @@ Status HrxBackend::copy_peer_ordered_impl(const DeviceBuffer& src,
     return LSE_ERROR(kInvalidArgument, "null buffer in ordered peer copy");
   }
   if (bytes == 0) return OkStatus();
+  LSE_RETURN_IF_ERROR(join_ordered_writes());
   if (producer.index >= streams_.size() || consumer.index >= streams_.size()) {
     return LSE_ERROR(kOutOfRange, "ordered peer copy names a stream the device "
                                   "does not have");
@@ -2130,6 +2189,7 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
     return LSE_ERROR(kOutOfRange, "copy_peer runs past the end of a buffer");
   }
   if (bytes == 0) return OkStatus();
+  LSE_RETURN_IF_ERROR(join_ordered_writes());
 
   // Straight to the copy engine, around the HAL rather than through it.
   //
@@ -2453,6 +2513,7 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
                      "hrx dispatch covers a whole grid; work ranges arrive "
                      "with work-item kernels");
   }
+  if (target.stream.index != 0) LSE_RETURN_IF_ERROR(join_ordered_writes());
   auto stream = stream_at(target.stream.index);
   if (!stream.ok()) return stream.status();
 
@@ -2718,6 +2779,7 @@ Status HrxBackend::synchronize_stream_impl(Stream stream) {
       hrx_stream_synchronize(static_cast<hrx_stream_t>(streams_[stream.index])),
       "hrx_stream_synchronize");
   LSE_SYNC_TRACE("stream_synchronize(%u) leave", stream.index);
+  if (synced.ok() && stream.index == 0) ordered_writes_pending_ = false;
   return synced;
 #endif
 }

@@ -84,6 +84,13 @@ class HrxBackend : public Backend<HrxBackend> {
 
   Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
                        std::size_t dst_offset);
+  // Queued on stream 0 as an update the command buffer carries (the bytes are
+  // copied when recorded), so the host waits for nothing. Up to the HAL's
+  // 64 KiB update limit, while stream 0 is the only stream in use and into
+  // memory with no host mapping; otherwise the drain and copy the seam
+  // describes.
+  Status write_ordered_impl(DeviceBuffer& dst, const void* src, std::size_t bytes,
+                            std::size_t dst_offset);
   // Peer to this device, no host bounce. Declines when the runtime refuses the
   // copy, which is what it does when the source's memory was never granted to
   // this agent.
@@ -249,6 +256,12 @@ class HrxBackend : public Backend<HrxBackend> {
   // waits on the stream (synchronize_stream_impl).
   static constexpr std::uint32_t kFlushGrowthLimit = 8;
   std::vector<std::uint32_t> flush_threshold_;
+  // An ordered write is queued on stream 0 and has not been waited for. Work
+  // issued anywhere but stream 0 is not ordered behind it, so such work joins
+  // stream 0 on the host first (join_ordered_writes); synchronizing stream 0
+  // clears it.
+  bool ordered_writes_pending_ = false;
+  Status join_ordered_writes();
 
   Result<void*> stream_at(std::uint32_t index);
   Status flush_stream(std::uint32_t index);

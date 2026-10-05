@@ -1253,8 +1253,12 @@ Status sync_to_device(Node& node, backend::IBackend& backend) {
   const std::size_t bytes =
       dtype_storage_bytes(node.dtype, node.element_count());
   if (node.host_mirror.size() < bytes) return OkStatus();
+  // In issue order rather than behind a drain: the bytes land after every
+  // launch already issued (which may still read the old ones) and before the
+  // launches that read them, with the host waiting on neither. Token ids,
+  // positions and descriptors are uploaded this way on every decode step.
   LSE_RETURN_IF_ERROR(
-      backend.copy({node.buffer}, node.host_mirror.data(), bytes));
+      backend.write_ordered(node.buffer, node.host_mirror.data(), bytes, 0));
   node.host_dirty = false;
   return OkStatus();
 }
