@@ -3,6 +3,13 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.2: model-defined limits, thinking levels and sampling defaults
+
+1. **No default output limit:** a reply runs to an end-of-turn token, a stop sequence, the request's `max_tokens`, a `generation_config` limit or a full context. The 256 and 4096 defaults are gone.
+2. **Full context:** `finish_reason: "length"`, `stop_reason: "context_full"` and `lse_context` on every response. A prompt with no room left gets HTTP 400 with `code: "context_full"`.
+3. **Thinking levels** are read from the model's chat template and listed in `/v1/models`; an undefined level is refused, not aliased.
+4. **Sampling defaults** come from `generation_config.json`, are reported with their sources, and use neutral defaults otherwise. `top_k`, `min_p` and `presence_penalty` are accepted on every request surface.
+
 ## v0.5.1: iPad prefill fixes
 
 1. **loomc:** four passes doubled arrays on every append; a prefill kernel asked for 16 GiB and iPadOS refused it. Fixed; compiles peak around 150 MiB.
