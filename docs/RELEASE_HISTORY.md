@@ -3,11 +3,15 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
-## v0.5.3: refusable CPU fallback and the current mac_linuxgpu runtime
+## v0.5.3: faster load and decode, refusable CPU fallback and the current mac_linuxgpu runtime
+
+Requires mac_linuxgpu v0.1.151 (build 255) or later.
 
 1. **`--no-cpu-fallback`** on `lse` and `lse-server`: startup fails when no device backend comes up or `--pool` names a CPU device, and a request fails when an operation has no device kernel. Each error names the cause. Without it, CPU fallback is logged, counted and reported in `lse_warnings`.
 2. **No CPU-only run with the option:** without `--pool`, a GPU backend that fails to start no longer leaves the model on the CPU interpreter. `LSE_REQUIRE_DEVICE_KERNELS=1` has the same effect as the option.
 3. **iOS build** against mac_linuxgpu build 247 and later (owner and selector calls; tested on 246 and 247). The HSA runtime is built under `build/ios/hsa`, so the mac_linuxgpu checkout is only read. `SKIP_HRX=1` links the newly built runtime.
+4. **Faster model load:** the pinned Qwen3.8-27B Q4 + DFlash2 configuration loads in **3.9 s** on driver build 255 (16 GT/s link), down from 16–28 s: streamed weight uploads through a mapped staging ring with `pread`, RoPE tables on all cores, the tokenizer loaded concurrently and mapped load buffers.
+5. **Faster decode:** +6.4% on a 640-token decode (row-at-a-time verify logits, a growing flush interval, small host writes queued behind the stream). Measured on driver 255: 2K prompt **593** tok/s prefill, **28.9** tok/s decode; 4K prompt **630** tok/s prefill, **39.2** tok/s decode.
 
 ## v0.5.2: model-defined limits, thinking levels and sampling defaults
 
