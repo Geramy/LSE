@@ -9,6 +9,7 @@
 
 // host_bytes: Array has no host-write path, and the tables are built on the
 // host from cos/sin rather than by any graph op.
+#include "lse/core/file_read.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 
@@ -16,14 +17,16 @@ namespace lse::ops {
 
 namespace {
 
-// Fills rows [first, last) of the pair-interleaved tables.
+// Fills rows [first, last) of the pair-interleaved tables; `cos` and `sin`
+// hold row `base` at their first element.
 void fill_rope_rows(float* cos, float* sin, std::int32_t rope_dim,
-                    const std::vector<double>& freq, std::int32_t first,
-                    std::int32_t last) {
+                    const std::vector<double>& freq, std::int32_t base,
+                    std::int32_t first, std::int32_t last) {
   const std::int32_t half = rope_dim / 2;
   for (std::int32_t p = first; p < last; ++p) {
-    float* c_row = cos + static_cast<std::size_t>(p) * static_cast<std::size_t>(rope_dim);
-    float* s_row = sin + static_cast<std::size_t>(p) * static_cast<std::size_t>(rope_dim);
+    const std::size_t at = static_cast<std::size_t>(p - base) * static_cast<std::size_t>(rope_dim);
+    float* c_row = cos + at;
+    float* s_row = sin + at;
     for (std::int32_t i = 0; i < half; ++i) {
       const double angle = static_cast<double>(p) * freq[static_cast<std::size_t>(i)];
       const auto c = static_cast<float>(std::cos(angle));
@@ -37,11 +40,12 @@ void fill_rope_rows(float* cos, float* sin, std::int32_t rope_dim,
   }
 }
 
-// The table's values, computed across the host's cores. A draft model sized
-// for a 262K context has 2 x 134 MB of them, which one thread took over a
-// second to produce element by element.
+// Rows [first, last) of the tables, computed across the host's cores, into
+// `cos` and `sin` starting at their first element. A draft model sized for a
+// 262K context has 2 x 134 MB of them, which one thread took over a second to
+// produce element by element.
 void fill_rope(float* cos, float* sin, std::int32_t rope_dim,
-               std::int32_t max_seq, float theta) {
+               std::int32_t first, std::int32_t last, float theta) {
   const std::int32_t half = rope_dim / 2;
   std::vector<double> freq(static_cast<std::size_t>(half));
   for (std::int32_t i = 0; i < half; ++i) {
@@ -49,43 +53,53 @@ void fill_rope(float* cos, float* sin, std::int32_t rope_dim,
         1.0 / std::pow(static_cast<double>(theta),
                        static_cast<double>(i) / static_cast<double>(half));
   }
+  const std::int32_t rows = last - first;
   constexpr std::int32_t kRowsPerThread = 4096;
   const std::int32_t hw = static_cast<std::int32_t>(
       std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
   const std::int32_t threads =
-      std::max(1, std::min(hw, (max_seq + kRowsPerThread - 1) / kRowsPerThread));
+      std::max(1, std::min(hw, (rows + kRowsPerThread - 1) / kRowsPerThread));
   if (threads == 1) {
-    fill_rope_rows(cos, sin, rope_dim, freq, 0, max_seq);
+    fill_rope_rows(cos, sin, rope_dim, freq, first, first, last);
     return;
   }
   std::vector<std::thread> pool;
   pool.reserve(static_cast<std::size_t>(threads));
-  const std::int32_t step = (max_seq + threads - 1) / threads;
+  const std::int32_t step = (rows + threads - 1) / threads;
   for (std::int32_t t = 0; t < threads; ++t) {
-    const std::int32_t first = t * step;
-    const std::int32_t last = std::min(max_seq, first + step);
-    if (first >= last) break;
-    pool.emplace_back(fill_rope_rows, cos, sin, rope_dim, std::cref(freq), first,
-                      last);
+    const std::int32_t a = first + t * step;
+    const std::int32_t b = std::min(last, a + step);
+    if (a >= b) break;
+    pool.emplace_back(fill_rope_rows, cos, sin, rope_dim, std::cref(freq), first, a, b);
   }
   for (std::thread& t : pool) t.join();
 }
 
-// A table as a device-resident constant: the buffer comes from the device the
-// current placement names (as weight loading picks it), the values are
-// uploaded, and no host copy is kept. Without a scheduler there is no device
-// and the table lives on the host, as every value does then.
-Result<Array> rope_table(Shape shape, const std::vector<float>& values) {
-  Array a = Array::zeros(shape, DType::kF32);
-  graph::Node& n = *a.node();
-  const std::size_t bytes = values.size() * sizeof(float);
+// The pair of tables as device-resident constants: the buffers come from the
+// device the current placement names (as weight loading picks it) and the
+// values are computed a block of rows at a time into scratch memory and
+// uploaded, so no host copy of the tables is ever whole -- 268 MB of them for
+// a 262K-context draft model. Without a scheduler there is no device and the
+// tables are host values, as every value is then.
+Status place_rope(RopeTables& t, float theta) {
+  const Shape shape{t.max_seq, t.dim};
+  t.cos = Array::zeros(shape, DType::kF32);
+  t.sin = Array::zeros(shape, DType::kF32);
+  graph::Node& cn = *t.cos.node();
+  graph::Node& sn = *t.sin.node();
+  const std::size_t row_floats = static_cast<std::size_t>(t.dim);
+  const std::size_t bytes = static_cast<std::size_t>(t.max_seq) * row_floats * sizeof(float);
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
-    std::memcpy(graph::interpreter::host_bytes(n), values.data(), bytes);
-    n.materialized = true;
-    n.host_dirty = true;
-    n.device_dirty = false;
-    return a;
+    fill_rope(static_cast<float*>(graph::interpreter::host_bytes(cn)),
+              static_cast<float*>(graph::interpreter::host_bytes(sn)), t.dim, 0,
+              t.max_seq, theta);
+    for (graph::Node* n : {&cn, &sn}) {
+      n->materialized = true;
+      n->host_dirty = true;
+      n->device_dirty = false;
+    }
+    return OkStatus();
   }
   backend::IDeviceSet& set = sched->devices();
   const std::size_t member = graph::preferred_member();
@@ -95,12 +109,28 @@ Result<Array> rope_table(Shape shape, const std::vector<float>& values) {
       member < set.size()
           ? set.stream_for(member).value_or(backend::kDefaultStream)
           : backend::kDefaultStream;
-  LSE_ASSIGN_OR(n.buffer, be.allocate(bytes, backend::MemoryClass::kDevice, at));
-  LSE_RETURN_IF_ERROR(be.upload(values.data(), n.buffer, bytes, 0));
-  n.materialized = true;
-  n.host_dirty = false;
-  n.device_dirty = n.buffer.ptr == nullptr;
-  return a;
+  LSE_ASSIGN_OR(cn.buffer, be.allocate(bytes, backend::MemoryClass::kDevice, at));
+  LSE_ASSIGN_OR(sn.buffer, be.allocate(bytes, backend::MemoryClass::kDevice, at));
+  constexpr std::int32_t kBlockRows = 32768;
+  const std::int32_t block = std::min(kBlockRows, t.max_seq);
+  const std::size_t block_bytes = static_cast<std::size_t>(block) * row_floats * sizeof(float);
+  LSE_ASSIGN_OR(HostScratch cos, HostScratch::allocate(block_bytes, "RoPE cos rows"));
+  LSE_ASSIGN_OR(HostScratch sin, HostScratch::allocate(block_bytes, "RoPE sin rows"));
+  for (std::int32_t first = 0; first < t.max_seq; first += block) {
+    const std::int32_t last = std::min(t.max_seq, first + block);
+    fill_rope(reinterpret_cast<float*>(cos.data()), reinterpret_cast<float*>(sin.data()),
+              t.dim, first, last, theta);
+    const std::size_t offset = static_cast<std::size_t>(first) * row_floats * sizeof(float);
+    const std::size_t n = static_cast<std::size_t>(last - first) * row_floats * sizeof(float);
+    LSE_RETURN_IF_ERROR(be.upload(cos.data(), cn.buffer, n, offset));
+    LSE_RETURN_IF_ERROR(be.upload(sin.data(), sn.buffer, n, offset));
+  }
+  for (graph::Node* n : {&cn, &sn}) {
+    n->materialized = true;
+    n->host_dirty = false;
+    n->device_dirty = n->buffer.ptr == nullptr;
+  }
+  return OkStatus();
 }
 
 }  // namespace
@@ -119,13 +149,7 @@ Result<RopeTables> build_rope(std::int32_t rope_dim, std::int32_t max_seq,
     t.sin = Array::zeros(Shape{max_seq, rope_dim}, DType::kF32);
     return t;
   }
-  const std::size_t count =
-      static_cast<std::size_t>(max_seq) * static_cast<std::size_t>(rope_dim);
-  std::vector<float> cos(count), sin(count);
-  fill_rope(cos.data(), sin.data(), rope_dim, max_seq, theta);
-  const Shape shape{max_seq, rope_dim};
-  LSE_ASSIGN_OR(t.cos, rope_table(shape, cos));
-  LSE_ASSIGN_OR(t.sin, rope_table(shape, sin));
+  LSE_RETURN_IF_ERROR(place_rope(t, theta));
   return t;
 }
 

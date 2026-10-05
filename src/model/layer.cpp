@@ -13,6 +13,7 @@
 
 // host_bytes / sync_to_device: a checkpoint tensor is host data and Array has
 // no host-write path, so the buffer is filled behind the graph.
+#include "lse/core/file_read.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/ops/norm.hpp"
@@ -323,13 +324,52 @@ Result<Array> upload(const TensorView& v, Shape shape,
       n.host_dirty = false;
       return a;
     }
-    if (native) {
-      LSE_RETURN_IF_ERROR(
-          v.read_native(graph::interpreter::host_bytes(n), want));
+  }
+
+  // Everything below produces the tensor on the host first -- widened, or
+  // gathered by rows or by a window of every row -- and then sends it. A
+  // device buffer with a host address (the CPU backend) takes the result in
+  // place; otherwise it is built in scratch memory that is unmapped as soon
+  // as the backend has taken the bytes, rather than in the node's host
+  // mirror, which would be freed into the allocator's cache of large blocks
+  // and stay resident.
+  const std::size_t out_bytes = dtype_storage_bytes(dt, n.element_count());
+  HostScratch built;
+  std::byte* out = nullptr;
+  if (n.buffer.ptr != nullptr) {
+    out = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
+  } else {
+    LSE_ASSIGN_OR(built, HostScratch::allocate(out_bytes, "'" + v.name + "'"));
+    out = built.data();
+  }
+  // The whole stored tensor, for the gathers: one positioned read of the
+  // file (the mapping would fault in page by page; see the direct path), or
+  // the widened copy when the dtype changes.
+  HostScratch staged;
+  const auto stage_whole = [&](std::size_t whole) -> Result<const std::byte*> {
+    if (native && v.data.size() >= whole && v.fd < 0) return v.data.data();
+    Phase al{&g_load_alloc_ms};
+    LSE_ASSIGN_OR(staged, HostScratch::allocate(whole, "'" + v.name + "'"));
+    Phase rd{&g_load_read_ms};
+    if (native && v.data.size() >= whole) {
+      LSE_RETURN_IF_ERROR(v.read_file(staged.data(), whole));
+      g_load_staged_bytes += whole;
+    } else if (native) {
+      LSE_RETURN_IF_ERROR(v.read_native(staged.data(), whole));
     } else {
-      LSE_RETURN_IF_ERROR(v.read_f32(
-          static_cast<float*>(graph::interpreter::host_bytes(n)),
-          n.element_count()));
+      LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
+                                     v.element_count()));
+    }
+    return static_cast<const std::byte*>(staged.data());
+  };
+
+  if (order == nullptr && win_count <= 0) {
+    Phase d{&g_load_direct_ms};
+    if (native) {
+      LSE_RETURN_IF_ERROR(v.read_native(out, out_bytes));
+    } else {
+      LSE_RETURN_IF_ERROR(
+          v.read_f32(reinterpret_cast<float*>(out), n.element_count()));
     }
   } else if (order == nullptr) {
     const std::size_t rank = v.shape.rank();
@@ -337,113 +377,52 @@ Result<Array> upload(const TensorView& v, Shape shape,
         static_cast<std::size_t>(rank >= 2 ? v.shape.dim(rank - 1) : 1);
     const std::size_t elem = dtype_storage_bytes(dt, 1);
     const std::size_t rows = width > 0 ? v.element_count() / width : 0;
-    // The mapping IS the bytes when no conversion is needed, so the span this
-    // gathers from is the file itself and nothing is staged. Only a checkpoint
-    // whose dtype has to be widened needs a buffer of its own.
-    const std::size_t whole = dtype_storage_bytes(dt, v.element_count());
-    std::vector<std::byte> staged;
-    const std::byte* from = nullptr;
-    if (native && v.data.size() >= whole && v.fd < 0) {
-      from = v.data.data();
-    } else if (native && v.data.size() >= whole) {
-      // One positioned read of the whole tensor, then the gather from
-      // memory: the mapping would fault in page by page (see the direct
-      // path above).
-      Phase al{&g_load_alloc_ms};
-      staged.resize(whole);
-      from = staged.data();
-      Phase rd{&g_load_read_ms};
-      LSE_RETURN_IF_ERROR(v.read_file(staged.data(), whole));
-      g_load_staged_bytes += whole;
-    } else {
-      Phase al{&g_load_alloc_ms};
-      staged.resize(whole);
-      from = staged.data();
-      Phase rd{&g_load_read_ms};
-      if (native) {
-        LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
-      } else {
-        LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
-                                       v.element_count()));
-      }
-    }
-    auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
+    LSE_ASSIGN_OR(const std::byte* from,
+                  stage_whole(dtype_storage_bytes(dt, v.element_count())));
     const auto first = static_cast<std::size_t>(win_first);
     const auto count = static_cast<std::size_t>(win_count);
     Phase gv{&g_load_gather_ms};
     for (std::size_t r = 0; r < rows; ++r) {
-      std::memcpy(dst + r * count * elem,
+      std::memcpy(out + r * count * elem,
                   from + (r * width + first) * elem, count * elem);
     }
   } else {
-    // Staged whole rather than read row by row: TensorView reads the mapping,
-    // and one sequential pass over it beats `order->size()` scattered ones.
+    // Staged whole rather than read row by row: one sequential read beats
+    // `order->size()` scattered ones.
     const std::size_t rank = v.shape.rank();
     const auto width =
         static_cast<std::size_t>(rank >= 2 ? v.shape.dim(rank - 1) : 1);
     const std::size_t elem = dtype_storage_bytes(dt, 1);
-    const std::size_t whole = dtype_storage_bytes(dt, v.element_count());
-    std::vector<std::byte> staged;
-    const std::byte* from = nullptr;
-    if (native && v.data.size() >= whole && v.fd < 0) {
-      from = v.data.data();
-    } else if (native && v.data.size() >= whole) {
-      // One positioned read of the whole tensor, then the gather from
-      // memory: the mapping would fault in page by page (see the direct
-      // path above).
-      Phase al{&g_load_alloc_ms};
-      staged.resize(whole);
-      from = staged.data();
-      Phase rd{&g_load_read_ms};
-      LSE_RETURN_IF_ERROR(v.read_file(staged.data(), whole));
-      g_load_staged_bytes += whole;
-    } else {
-      Phase al{&g_load_alloc_ms};
-      staged.resize(whole);
-      from = staged.data();
-      Phase rd{&g_load_read_ms};
-      if (native) {
-        LSE_RETURN_IF_ERROR(v.read_native(staged.data(), staged.size()));
-      } else {
-        LSE_RETURN_IF_ERROR(v.read_f32(reinterpret_cast<float*>(staged.data()),
-                                       v.element_count()));
-      }
-    }
-    auto* dst = static_cast<std::byte*>(graph::interpreter::host_bytes(n));
+    LSE_ASSIGN_OR(const std::byte* from,
+                  stage_whole(dtype_storage_bytes(dt, v.element_count())));
     const std::size_t row_bytes = width * elem;
     Phase gr{&g_load_gather_ms};
     for (std::size_t i = 0; i < order->size(); ++i) {
       std::memcpy(
-          dst + i * row_bytes,
+          out + i * row_bytes,
           from + static_cast<std::size_t>((*order)[i]) * row_bytes,
           row_bytes);
     }
   }
 
-  // The mirror now holds the only copy; it is the authority until it is pushed.
-  n.host_dirty = true;
-  n.device_dirty = false;
   n.materialized = true;
+  if (n.buffer.ptr != nullptr) {
+    // Written in place: the host copy is the device's memory.
+    n.host_dirty = true;
+    n.device_dirty = false;
+    return a;
+  }
   {
-    // What sync_to_device would do for this node, as an upload: the backend
-    // takes the bytes into its staging before returning, so the mirror can
-    // be dropped below while the transfer is still queued.
+    // The backend takes the bytes into its staging before returning, so the
+    // scratch can go while the transfer is still queued. The device holds
+    // the weight from here; anything that wants the bytes on the host pulls
+    // them back.
     Phase up{&g_load_dev_ms};
-    if (n.buffer.ptr == nullptr && n.buffer.valid()) {
-      const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
-      LSE_RETURN_IF_ERROR(be.upload(n.host_mirror.data(), n.buffer, bytes, 0));
-      g_load_pushed_bytes += bytes;
-      n.host_dirty = false;
-    }
+    LSE_RETURN_IF_ERROR(be.upload(out, n.buffer, out_bytes, 0));
+    g_load_pushed_bytes += out_bytes;
   }
-  // The device holds the weight now. A mirror kept beside opaque device
-  // memory is a second, host copy of the tensor that nothing reads: on
-  // Qwen3.8-27B the reordered and windowed tensors left 3 GiB of them. Drop
-  // it; anything that wants the bytes on the host pulls them back.
-  if (n.buffer.ptr == nullptr && !n.kv_fragments && !n.host_dirty) {
-    std::vector<std::byte>().swap(n.host_mirror);
-    n.device_dirty = true;
-  }
+  n.host_dirty = false;
+  n.device_dirty = true;
   return a;
 }
 
@@ -725,7 +704,7 @@ Result<Array> WeightBinder::bind_quantized(
                 remaining, weight_slab_bytes(be), allocation_bytes)) {
           const auto upload_matrix =
               [&]() -> Result<std::shared_ptr<graph::PackedQuantMatrix>> {
-            std::array<std::vector<std::byte>, 3> staged;
+            std::array<HostScratch, 3> staged;
             const std::array<const TensorView *, 3> views{&packed, &scales,
                                                           &biases};
             std::array<std::span<const std::byte>, 3> bytes;
@@ -736,12 +715,13 @@ Result<Array> WeightBinder::bind_quantized(
                 bytes[i] = views[i]->data.first(want);
               } else {
                 // From the file, not the mapping (see upload()).
-                staged[i].resize(want);
+                LSE_ASSIGN_OR(staged[i],
+                              HostScratch::allocate(want, "'" + views[i]->name + "'"));
                 LSE_RETURN_IF_ERROR(views[i]->fd >= 0
                     ? views[i]->read_file(staged[i].data(), want)
                     : views[i]->read_native(staged[i].data(), want));
                 g_load_staged_bytes += want;
-                bytes[i] = staged[i];
+                bytes[i] = std::span<const std::byte>(staged[i].data(), want);
               }
             }
             const auto packing = std::chrono::steady_clock::now();

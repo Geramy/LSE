@@ -25,3 +25,34 @@ Status read_file_range(int fd, std::uint64_t offset, void* dst,
 Result<int> open_for_streaming(const std::string& path);
 
 }  // namespace lse
+
+namespace lse {
+
+// Host memory for one transient load buffer (a tensor read whole, a gather's
+// result), mapped from the VM system and unmapped when it goes out of scope.
+// Not std::vector: the allocator keeps freed large blocks resident for reuse,
+// and a load that freed a few hundred of them held 730 MB of dirty, empty
+// MALLOC_LARGE regions afterwards.
+class HostScratch {
+ public:
+  HostScratch() = default;
+  ~HostScratch();
+  HostScratch(HostScratch&& other) noexcept;
+  HostScratch& operator=(HostScratch&& other) noexcept;
+  HostScratch(const HostScratch&) = delete;
+  HostScratch& operator=(const HostScratch&) = delete;
+
+  // `bytes` of zero-filled memory, or an error naming `what`.
+  static Result<HostScratch> allocate(std::size_t bytes, const std::string& what);
+
+  [[nodiscard]] std::byte* data() noexcept { return data_; }
+  [[nodiscard]] const std::byte* data() const noexcept { return data_; }
+  [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+ private:
+  std::byte* data_ = nullptr;
+  std::size_t size_ = 0;
+  std::size_t mapped_ = 0;
+};
+
+}  // namespace lse
