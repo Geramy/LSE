@@ -17,7 +17,8 @@
 #
 # Environment:
 #   MAC_LINUXGPU_DIR       mac_linuxgpu checkout providing the HSA runtime
-#                          (default ../mac_linuxgpu next to this checkout)
+#                          (default ../mac_linuxgpu next to this checkout).
+#                          Read only: the runtime is built under LSE_IOS_WORK.
 #   HRX_SOURCE, HSA_HEADERS_SOURCE, ...  passed through to build-hrx-ios.sh
 #   SKIP_HRX=1             reuse an existing build/ios/hrx-build
 #   IOS_DEPLOYMENT_TARGET  minimum iOS version (default 26.0)
@@ -45,8 +46,17 @@ sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
 mkdir -p "$work"
 
 echo "== 1/5 HSA runtime (iOS static) from $mac_linuxgpu"
-make -C "$mac_linuxgpu" hsa-ios HSA_IOS_DEPLOYMENT_TARGET="$deployment"
-hsa_library="$mac_linuxgpu/build/hsa-ios/libhsa-runtime64.a"
+# Built out of tree (the Makefile's BUILD), so the checkout is only read. A
+# build directory configured from another checkout is started over: CMake
+# refuses to reuse it for a different source tree.
+hsa_build="$work/hsa"
+hsa_cache="$hsa_build/hsa-ios/CMakeCache.txt"
+if [[ -f "$hsa_cache" ]] &&
+   ! grep -qxF "CMAKE_HOME_DIRECTORY:INTERNAL=$(cd "$mac_linuxgpu/hsa" && pwd -P)" "$hsa_cache"; then
+  rm -rf "$hsa_build/hsa-ios"
+fi
+make -C "$mac_linuxgpu" hsa-ios BUILD="$hsa_build" HSA_IOS_DEPLOYMENT_TARGET="$deployment"
+hsa_library="$hsa_build/hsa-ios/libhsa-runtime64.a"
 [[ -f "$hsa_library" ]] || die "make hsa-ios produced no $hsa_library"
 
 echo "== 2/5 HRX and loomc (iOS static)"
@@ -56,8 +66,14 @@ if [[ "${SKIP_HRX:-0}" != 1 || ! -f "$hrx_build/hrx-ios-libs.txt" ]]; then
     LSE_IOS_WORK="$work" LSE_BUILD_JOBS="$jobs" \
     bash "$root/scripts/ios/build-hrx-ios.sh"
 fi
+# HRX and loomc in link order, then the HSA runtime from step 1. The list
+# ends with the HSA archive HRX was built against; with SKIP_HRX=1 that one
+# can come from another checkout, so it is replaced, never linked.
 hrx_libs=()
 while IFS= read -r line; do [[ -n "$line" ]] && hrx_libs+=("$line"); done < "$hrx_build/hrx-ios-libs.txt"
+[[ "${hrx_libs[${#hrx_libs[@]}-1]}" == *libhsa-runtime64.a ]] ||
+  die "$hrx_build/hrx-ios-libs.txt does not end with the HSA runtime"
+hrx_libs[${#hrx_libs[@]}-1]="$hsa_library"
 includes=()
 while IFS= read -r line; do [[ -n "$line" ]] && includes+=("$line"); done < "$hrx_build/hrx-ios-includes.txt"
 hrx_include="${includes[0]}"

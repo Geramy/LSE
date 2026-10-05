@@ -330,12 +330,23 @@ class Program;
 // logged (the first time and at powers of two), and requests report the ones
 // they caused. With fallback disallowed (--no-cpu-fallback) the request fails
 // instead, naming the cause.
+//
+// Disallowed also covers the whole-run case. The device set refuses a member
+// with no code generator (the cpu backend), so a run that asked for no CPU
+// fallback never starts on the host interpreter because the GPU backend did not
+// come up, and a scheduler whose primary device has no code generator refuses
+// every step rather than interpreting it.
 struct CpuFallbackEvent {
   std::string cause;
   std::uint64_t count = 0;
 };
 void set_cpu_fallback_allowed(bool allowed) noexcept;
 [[nodiscard]] bool cpu_fallback_allowed() noexcept;
+// LSE_REQUIRE_DEVICE_KERNELS=1, the qualification switch that predates
+// --no-cpu-fallback and means the same thing. The process starts with fallback
+// disallowed when it is set, and an option that leaves fallback allowed does
+// not override it.
+[[nodiscard]] bool device_kernels_required_by_environment() noexcept;
 void record_cpu_fallback(const std::string& cause);
 // Events so far, process-wide; a request takes it before and asks for the
 // events after.

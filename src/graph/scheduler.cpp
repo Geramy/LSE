@@ -408,14 +408,16 @@ Status Scheduler::check_residency(std::span<const backend::BufferRef> bindings,
   return OkStatus();
 }
 
+bool device_kernels_required_by_environment() noexcept {
+  const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
+  return strict != nullptr && std::string_view(strict) == "1";
+}
+
 namespace {
 struct CpuFallbacks {
   std::mutex mu;
-  bool allowed = [] {
-    // The old qualification switch still refuses CPU fallback.
-    const char* strict = std::getenv("LSE_REQUIRE_DEVICE_KERNELS");
-    return !(strict != nullptr && std::string_view(strict) == "1");
-  }();
+  // The old qualification switch still refuses CPU fallback.
+  bool allowed = !device_kernels_required_by_environment();
   std::uint64_t sequence = 0;
   struct Event { std::uint64_t sequence; std::string cause; };
   std::vector<Event> recent;                    // the last kRecent events
@@ -1236,6 +1238,16 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   const IKernelEmitter* const emitter =
       primary_tc != nullptr ? primary_tc->emitter : nullptr;
   const bool device_first = mode_ == Mode::kDeviceFirst && emitter != nullptr;
+  // No code generator at all: every group of this step would run on the host
+  // interpreter, which is the whole-run CPU fallback. Asked only on this
+  // branch, so a device step pays nothing for it.
+  if (primary_tc == nullptr && !cpu_fallback_allowed()) {
+    const Status refused(StatusCode::kUnimplemented, ::lse::detail::concat(
+        "CPU fallback disabled: ", std::string(backend().name()),
+        " has no device code generator, so every op would run on the host interpreter"));
+    std::fprintf(stderr, "lse: %s\n", refused.to_string().c_str());
+    return refused;
+  }
   // Opened here rather than in eval() so that the trace reset and the step
   // bookkeeping around it land in the remainder instead of in a span.
   SpanTimer setup_span(trace_.spans.schedule);

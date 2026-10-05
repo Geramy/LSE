@@ -3,6 +3,12 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.3: refusable CPU fallback and the current mac_linuxgpu runtime
+
+1. **`--no-cpu-fallback`** on `lse` and `lse-server`: startup fails when no device backend comes up or `--pool` names a CPU device, and a request fails when an operation has no device kernel. Each error names the cause. Without it, CPU fallback is logged, counted and reported in `lse_warnings`.
+2. **No CPU-only run with the option:** without `--pool`, a GPU backend that fails to start no longer leaves the model on the CPU interpreter. `LSE_REQUIRE_DEVICE_KERNELS=1` has the same effect as the option.
+3. **iOS build** against mac_linuxgpu build 247 and later (owner and selector calls; tested on 246 and 247). The HSA runtime is built under `build/ios/hsa`, so the mac_linuxgpu checkout is only read. `SKIP_HRX=1` links the newly built runtime.
+
 ## v0.5.2: model-defined limits, thinking levels and sampling defaults
 
 1. **No default output limit:** a reply runs to an end-of-turn token, a stop sequence, the request's `max_tokens`, a `generation_config` limit or a full context. The 256 and 4096 defaults are gone.
