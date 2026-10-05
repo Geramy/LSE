@@ -87,6 +87,20 @@ Sampler::PreparedWeights Sampler::prepare_weights(
     }
   }
 
+  if (params_.presence_penalty != 0.0f && !history.empty()) {
+    const std::size_t window =
+        params_.repetition_window > 0
+            ? std::min(history.size(),
+                       static_cast<std::size_t>(params_.repetition_window))
+            : history.size();
+    std::unordered_set<std::uint32_t> seen;
+    for (std::size_t i = history.size() - window; i < history.size(); ++i) {
+      const std::uint32_t id = history[i];
+      if (id >= logits.size() || !seen.insert(id).second) continue;
+      logits[id] -= params_.presence_penalty;
+    }
+  }
+
   if (params_.temperature <= 0.0f) {
     return {1, 1, false, true, argmax(logits)};
   }
@@ -94,7 +108,7 @@ Sampler::PreparedWeights Sampler::prepare_weights(
   const bool unfiltered =
       (params_.top_k <= 0 ||
        static_cast<std::size_t>(params_.top_k) >= logits.size()) &&
-      !(params_.top_p > 0.0f && params_.top_p < 1.0f);
+      !(params_.top_p > 0.0f && params_.top_p < 1.0f) && !(params_.min_p > 0.0f);
   if (unfiltered && std::isfinite(params_.temperature)) {
     const std::uint32_t best = argmax(logits);
     const float max_logit = logits[best];
@@ -164,6 +178,18 @@ Sampler::PreparedWeights Sampler::prepare_weights(
     }
   }
 
+  if (params_.min_p > 0.0f) {
+    // probs_ is in descending order; the first entry is the most likely token.
+    const double floor = static_cast<double>(params_.min_p) * static_cast<double>(probs_[0]);
+    std::size_t cut = 1;
+    while (cut < keep && static_cast<double>(probs_[cut]) >= floor) ++cut;
+    if (cut < keep) {
+      keep = cut;
+      total = 0.0;
+      for (std::size_t i = 0; i < keep; ++i) total += static_cast<double>(probs_[i]);
+    }
+  }
+
   return {keep, total, true, false, order_[0]};
 }
 
@@ -190,7 +216,8 @@ Result<DiscreteDistribution> Sampler::distribution(
   const SamplingProfile profile(logits.size());
   if (logits.empty() || logits.size() > UINT32_MAX ||
       !std::isfinite(params_.temperature) || !std::isfinite(params_.top_p) ||
-      !std::isfinite(params_.repetition_penalty) || params_.repetition_penalty <= 0)
+      !std::isfinite(params_.repetition_penalty) || params_.repetition_penalty <= 0 ||
+      !std::isfinite(params_.min_p) || !std::isfinite(params_.presence_penalty))
     return LSE_ERROR(kInvalidArgument, "invalid target sampling inputs");
   bool positive_mass = false;
   for (const float logit : logits) {

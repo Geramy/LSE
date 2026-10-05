@@ -298,10 +298,18 @@ Result<Config> Config::from_json_file(const std::string& path) {
 
 std::string Config::to_json() const {
   nlohmann::json j;
+  // Every generation default travels with the config, so a converted or
+  // repacked model keeps what its checkpoint declared.
   j["generation_config"] = {{"temperature", sampling_defaults.temperature},
                             {"top_k", sampling_defaults.top_k},
                             {"top_p", sampling_defaults.top_p},
-                            {"repetition_penalty", sampling_defaults.repetition_penalty}};
+                            {"min_p", sampling_defaults.min_p},
+                            {"repetition_penalty", sampling_defaults.repetition_penalty},
+                            {"presence_penalty", sampling_defaults.presence_penalty}};
+  if (sampling_defaults.max_new_tokens)
+    j["generation_config"]["max_new_tokens"] = *sampling_defaults.max_new_tokens;
+  if (sampling_defaults.max_length)
+    j["generation_config"]["max_length"] = *sampling_defaults.max_length;
   j["vocab_size"] = vocab_size;
   j["hidden_size"] = hidden_size;
   j["num_layers"] = num_layers;

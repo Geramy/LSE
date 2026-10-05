@@ -22,11 +22,22 @@ struct SamplingParams {
   std::int32_t top_k = 0;
   // 1.0 disables. Keeps the smallest prefix whose mass reaches p.
   float top_p = 1.0f;
+  // 0 disables. After top-k and top-p, drops tokens whose probability (at the
+  // sampling temperature) is below min_p times the most likely token's.
+  float min_p = 0.0f;
   // 1.0 disables. Divides the logit of any token already seen (>1 discourages).
   float repetition_penalty = 1.0f;
-  // How far back the penalty looks. 0 means the whole context.
+  // 0 disables. Subtracted once from the logit of every distinct token in the
+  // penalty window (>0 discourages), as OpenAI's presence_penalty.
+  float presence_penalty = 0.0f;
+  // How far back the penalties look. 0 means the whole context.
   std::int32_t repetition_window = 64;
   std::uint64_t seed = 0;
+
+  // Every setting leaves the argmax as the answer: the device can pick it.
+  [[nodiscard]] bool greedy_argmax() const noexcept {
+    return temperature <= 0.0f && repetition_penalty == 1.0f && presence_penalty == 0.0f;
+  }
 };
 
 struct DiscreteDistribution {

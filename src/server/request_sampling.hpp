@@ -17,15 +17,19 @@ inline Result<runtime::SamplingParams> request_sampling(
   out.temperature = defaults.temperature;
   out.top_k = defaults.top_k;
   out.top_p = defaults.top_p;
+  out.min_p = defaults.min_p;
   out.repetition_penalty = defaults.repetition_penalty;
-  for (const char* key : {"temperature", "top_p", "frequency_penalty", "repetition_penalty"}) {
+  out.presence_penalty = defaults.presence_penalty;
+  for (const char* key : {"temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty",
+                          "repetition_penalty"}) {
     const auto at = body.find(key);
     if (at == body.end() || at->is_null()) continue;
     if (!at->is_number())
       return LSE_ERROR(kInvalidArgument, "request sampling field '", key, "' must be numeric");
     const double value = at->get<double>();
     if (!std::isfinite(value) || std::fabs(value) > static_cast<double>(std::numeric_limits<float>::max()) ||
-        (std::string_view(key) == "top_p" && (value < 0.0 || value > 1.0)) ||
+        ((std::string_view(key) == "top_p" || std::string_view(key) == "min_p") &&
+         (value < 0.0 || value > 1.0)) ||
         (std::string_view(key) == "repetition_penalty" && value <= 0.0))
       return LSE_ERROR(kInvalidArgument, "invalid request sampling field '", key, "'");
     const float converted = static_cast<float>(value);
@@ -33,6 +37,8 @@ inline Result<runtime::SamplingParams> request_sampling(
       return LSE_ERROR(kInvalidArgument, "request sampling field '", key, "' underflows float32");
     if (std::string_view(key) == "temperature") out.temperature = converted;
     else if (std::string_view(key) == "top_p") out.top_p = converted;
+    else if (std::string_view(key) == "min_p") out.min_p = converted;
+    else if (std::string_view(key) == "presence_penalty") out.presence_penalty = converted;
     else if (std::string_view(key) == "repetition_penalty") out.repetition_penalty = converted;
     else out.repetition_penalty = converted > 0.0f ? 1.0f + converted : 1.0f;
   }
@@ -40,11 +46,12 @@ inline Result<runtime::SamplingParams> request_sampling(
     if (!at->is_number_integer() ||
         (at->is_number_unsigned() && at->get<std::uint64_t>() >
              static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())))
-      return LSE_ERROR(kInvalidArgument, "request top_k must be a nonnegative int32");
+      return LSE_ERROR(kInvalidArgument, "request top_k must be -1, 0 or a positive int32");
     const auto value = at->get<std::int64_t>();
-    if (value < 0 || value > std::numeric_limits<std::int32_t>::max())
-      return LSE_ERROR(kInvalidArgument, "request top_k must be a nonnegative int32");
-    out.top_k = static_cast<std::int32_t>(value);
+    // 0 and -1 (the vLLM spelling) both switch top-k off.
+    if (value < -1 || value > std::numeric_limits<std::int32_t>::max())
+      return LSE_ERROR(kInvalidArgument, "request top_k must be -1, 0 or a positive int32");
+    out.top_k = value < 0 ? 0 : static_cast<std::int32_t>(value);
   }
   if (const auto at = body.find("seed"); at != body.end() && !at->is_null()) {
     if (!at->is_number_integer() ||
