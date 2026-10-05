@@ -20,6 +20,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "lse/core/file_read.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/registry.hpp"
 
@@ -102,6 +103,20 @@ Status TensorView::read_native(void* dst, std::size_t bytes) const {
   return OkStatus();
 }
 
+Status TensorView::read_file(void* dst, std::size_t bytes,
+                             std::size_t offset) const {
+  if (offset > data.size() || bytes > data.size() - offset) {
+    return LSE_ERROR(kOutOfRange, "read_file asked for ", std::to_string(bytes),
+                     " bytes at ", std::to_string(offset), " of ",
+                     std::to_string(data.size()), " in '", name, "'");
+  }
+  if (fd < 0) {
+    return LSE_ERROR(kInternal, "'", name,
+                     "' is not backed by an open checkpoint file");
+  }
+  return read_file_range(fd, file_offset + offset, dst, bytes, "'" + name + "'");
+}
+
 Status TensorView::read_f32(float* dst, std::size_t count) const {
   if (count > element_count()) {
     return LSE_ERROR(kOutOfRange, "read_f32 asked for ", std::to_string(count),
@@ -159,6 +174,7 @@ Status TensorView::read_f32(float* dst, std::size_t count) const {
 void SafeTensors::unmap_all() noexcept {
   for (const Mapping& m : mappings_) {
     if (m.ptr != nullptr) ::munmap(m.ptr, m.size);
+    if (m.fd >= 0) ::close(m.fd);
   }
   mappings_.clear();
 }
@@ -211,16 +227,25 @@ Status SafeTensors::map_file(const std::string& path) {
   void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
   ::close(fd);
   if (map == MAP_FAILED) return LSE_ERROR(kIoError, "mmap failed for '", path, "'");
+  // A second descriptor for the loader's positioned reads, opened so that
+  // streaming a checkpoint through it does not fill the page cache.
+  auto streaming = open_for_streaming(path);
+  if (!streaming.ok()) {
+    ::munmap(map, file_size);
+    return streaming.status();
+  }
+  const int read_fd = *streaming;
 
   const auto* base = static_cast<const std::byte*>(map);
   std::uint64_t header_len = 0;
   std::memcpy(&header_len, base, sizeof(header_len));
   if (header_len == 0 || header_len + 8 > file_size) {
     ::munmap(map, file_size);
+    ::close(read_fd);
     return LSE_ERROR(kIoError, "safetensors header length is out of range");
   }
 
-  mappings_.push_back(Mapping{map, file_size});
+  mappings_.push_back(Mapping{map, file_size, read_fd});
 
   const std::byte* payload = base + 8 + header_len;
   const std::size_t payload_size = file_size - 8 - header_len;
@@ -261,6 +286,8 @@ Status SafeTensors::map_file(const std::string& path) {
                        std::to_string(expected));
     }
     v.data = std::span<const std::byte>(payload + begin, end - begin);
+    v.fd = read_fd;
+    v.file_offset = 8 + header_len + begin;
     // A name repeated across shards would silently shadow; the index is
     // supposed to make that impossible, so treat it as a corrupt checkpoint.
     if (!tensors_.emplace(name, std::move(v)).second) {

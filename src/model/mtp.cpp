@@ -219,6 +219,7 @@ Result<std::unique_ptr<MtpModule>> MtpModule::open(const std::string& path,
                     : SafeTensors::open(paths.weights));
   WeightBinder binder(weights, &mtp->config_.quantization);
   LSE_RETURN_IF_ERROR(mtp->build(binder));
+  LSE_RETURN_IF_ERROR(binder.finish("MTP"));
 
   const std::vector<std::string> unclaimed = binder.unclaimed();
   if (!unclaimed.empty()) {

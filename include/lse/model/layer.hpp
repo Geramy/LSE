@@ -158,6 +158,13 @@ class WeightBinder {
   // [channels, kernel]. Nothing moves — only the reported shape differs.
   Result<Array> require_as(std::string_view name, Shape shape);
 
+  // A backend may still be moving the bytes of the tensors bound so far
+  // (IBackend::upload). This waits until every device has them, and is the
+  // point a load is done: an upload that failed on the device fails here.
+  // Under LSE_TIME_LOAD=1 it also reports where the load's time went, as
+  // `what`, and starts the accounting afresh for the next load.
+  Status finish(std::string_view what);
+
   [[nodiscard]] const SafeTensors& weights() const noexcept { return *weights_; }
   [[nodiscard]] std::vector<std::string> unclaimed() const;
   [[nodiscard]] std::size_t claimed_count() const noexcept { return claimed_.size(); }

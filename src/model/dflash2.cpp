@@ -456,6 +456,7 @@ Result<std::unique_ptr<DFlash2Module>> DFlash2Module::open(const std::string& pa
   WeightBinder binder(weights, &impl->config.quantization);
   const graph::ScopedSplitScheme unsplit(graph::SplitScheme::kNone);
   LSE_RETURN_IF_ERROR(impl->load(binder));
+  LSE_RETURN_IF_ERROR(binder.finish("DFlash2"));
   return std::unique_ptr<DFlash2Module>(new DFlash2Module(std::move(impl)));
 }
 std::span<const std::int32_t> DFlash2Module::target_layers() const noexcept { return impl_->config.target_layers; }

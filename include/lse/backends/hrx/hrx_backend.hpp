@@ -11,6 +11,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -84,6 +85,14 @@ class HrxBackend : public Backend<HrxBackend> {
 
   Status copy_h2d_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
                        std::size_t dst_offset);
+  // Weight uploads (IBackend::upload): staged through a ring of mapped host
+  // buffers and queued on stream 0, so the copy engine moves one slot while
+  // the caller fills the next. See the notes at upload_impl.
+  Status upload_impl(const void* src, DeviceBuffer& dst, std::size_t bytes,
+                     std::size_t dst_offset);
+  Status upload_file_impl(int fd, std::uint64_t file_offset, DeviceBuffer& dst,
+                          std::size_t bytes, std::size_t dst_offset);
+  Status finish_uploads_impl();
   // Peer to this device, no host bounce. Declines when the runtime refuses the
   // copy, which is what it does when the source's memory was never granted to
   // this agent.
@@ -169,6 +178,34 @@ class HrxBackend : public Backend<HrxBackend> {
   void* staging_host_ = nullptr;    // mapped host address of the above
   std::size_t staging_bytes_ = 0;
   Status ensure_staging(std::size_t bytes);
+  // The upload ring. Each slot is a host-visible buffer mapped for the life of
+  // a load; `point` is the stream-0 timeline value whose completion frees it
+  // (zero when nothing queued from it is outstanding).
+  struct UploadSlot {
+    void* buffer = nullptr;       // hrx_buffer_t
+    std::byte* host = nullptr;    // its mapping
+    void* semaphore = nullptr;    // hrx_semaphore_t of stream 0, borrowed
+    std::uint64_t point = 0;
+  };
+  std::vector<UploadSlot> upload_slots_;
+  std::size_t upload_at_ = 0;    // the slot being filled
+  std::size_t upload_fill_ = 0;  // bytes of it handed out so far
+  // Copies from the ring are queued on stream 0 and not yet waited for.
+  // Anything that could read their destinations other than stream 0's own
+  // later work drains them first (drain_uploads).
+  bool uploads_pending_ = false;
+  struct UploadStats {
+    std::size_t bytes = 0, copies = 0, slots = 0;
+    double fill_ms = 0, wait_ms = 0, drain_ms = 0;
+    std::chrono::steady_clock::time_point first{};
+  } upload_stats_;
+  Status open_upload_slots();
+  Status close_upload_slot();
+  Status drain_uploads();
+  void release_upload_slots() noexcept;
+  template <typename Fill>
+  Status stream_upload(DeviceBuffer& dst, std::size_t bytes,
+                       std::size_t dst_offset, Fill&& fill);
   Status dma_host_transfer(void* host, const DeviceBuffer& device,
                            std::size_t bytes, std::size_t device_offset,
                            bool to_device);

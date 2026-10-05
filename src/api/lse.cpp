@@ -604,6 +604,9 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   if (const Status s = e.lm->load(*e.binder); !s.ok()) {
     return fail(s, "binding the weights");
   }
+  if (const Status s = e.binder->finish("model"); !s.ok()) {
+    return fail(s, "uploading the weights");
+  }
 
   progress::begin("loading_tokenizer");
   const std::string tok_dir = paths->weights.substr(0, paths->weights.find_last_of('/'));

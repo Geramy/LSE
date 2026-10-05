@@ -21,7 +21,10 @@
 
 namespace lse::model {
 
-// Weight-load accounting, reported at exit under LSE_TIME_LOAD=1.
+// Weight-load accounting, reported by WeightBinder::finish() under
+// LSE_TIME_LOAD=1. Times are wall time on the loading thread; an upload's
+// time is what it took to hand the bytes to the backend, which for a backend
+// that queues uploads is its wait for staging room -- the copy engine's pace.
 double g_load_total_ms = 0.0;
 double g_load_host_ms = 0.0;
 double g_load_dev_ms = 0.0;
@@ -31,22 +34,13 @@ double g_load_alloc_ms = 0.0;
 double g_load_zeros_ms = 0.0;
 double g_load_buf_ms = 0.0;
 double g_load_direct_ms = 0.0;
+double g_load_pack_ms = 0.0;
+double g_load_finish_ms = 0.0;
 std::size_t g_load_tensors = 0;
+std::size_t g_load_direct_bytes = 0;   // file -> device, no host pass
+std::size_t g_load_staged_bytes = 0;   // read whole, then gathered/widened
+std::size_t g_load_pushed_bytes = 0;   // host results pushed (gathers, packs)
 namespace {
-struct LoadReport {
-  ~LoadReport() {
-    if (std::getenv("LSE_TIME_LOAD") == nullptr) return;
-    std::fprintf(stderr,
-                 "[load] %zu tensors, total %.0f ms = zeros %.0f + devbuf %.0f"
-                 " + direct-read %.0f + stage-alloc %.0f + stage-read %.0f"
-                 " + gather %.0f + upload %.0f\n",
-                 g_load_tensors, g_load_total_ms, g_load_zeros_ms,
-                 g_load_buf_ms, g_load_direct_ms, g_load_alloc_ms,
-                 g_load_read_ms, g_load_gather_ms, g_load_dev_ms);
-  }
-};
-const LoadReport g_load_report{};
-
 // Weights get windows of a few big allocations, not one allocation each.
 //
 // Every device allocation is a driver round trip, and the cost is per CALL,
@@ -169,6 +163,53 @@ std::size_t release_weight_slabs() {
   return bytes;
 }
 
+Status WeightBinder::finish(std::string_view what) {
+  const auto t0 = std::chrono::steady_clock::now();
+  Status first = OkStatus();
+  if (graph::Scheduler* sched = graph::default_scheduler()) {
+    backend::IDeviceSet& set = sched->devices();
+    const auto finish_one = [&first](backend::IBackend& be) {
+      const Status s = be.finish_uploads();
+      if (!s.ok() && first.ok()) first = s;
+    };
+    if (set.size() == 0) {
+      finish_one(sched->backend());
+    } else {
+      for (std::size_t i = 0; i < set.size(); ++i) finish_one(set.device(i));
+    }
+  }
+  g_load_finish_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+  if (std::getenv("LSE_TIME_LOAD") != nullptr) {
+    const double mib = 1048576.0;
+    const std::size_t moved =
+        g_load_direct_bytes + g_load_pushed_bytes;
+    const double ms = g_load_total_ms + g_load_finish_ms;
+    std::fprintf(stderr,
+                 "[load] %.*s: %zu tensors, %.0f ms (%.2f GB/s to the device): "
+                 "file->device %.0f MiB, read whole %.0f MiB, pushed from host "
+                 "%.0f MiB | zeros %.0f + devbuf %.0f + direct %.0f + "
+                 "stage-alloc %.0f + stage-read %.0f + gather %.0f + pack %.0f "
+                 "+ push %.0f + finish %.0f ms\n",
+                 static_cast<int>(what.size()), what.data(), g_load_tensors, ms,
+                 ms > 0 ? double(moved) / (ms * 1e6) : 0.0,
+                 double(g_load_direct_bytes) / mib,
+                 double(g_load_staged_bytes) / mib,
+                 double(g_load_pushed_bytes) / mib, g_load_zeros_ms,
+                 g_load_buf_ms, g_load_direct_ms, g_load_alloc_ms,
+                 g_load_read_ms, g_load_gather_ms, g_load_pack_ms,
+                 g_load_dev_ms, g_load_finish_ms);
+    std::fflush(stderr);
+  }
+  g_load_total_ms = g_load_host_ms = g_load_dev_ms = g_load_read_ms = 0.0;
+  g_load_gather_ms = g_load_alloc_ms = g_load_zeros_ms = g_load_buf_ms = 0.0;
+  g_load_direct_ms = g_load_pack_ms = g_load_finish_ms = 0.0;
+  g_load_tensors = g_load_direct_bytes = g_load_staged_bytes = 0;
+  g_load_pushed_bytes = 0;
+  return first;
+}
+
 Result<Array> WeightBinder::require(std::string_view name) {
   auto got = optional(name);
   if (got.ok()) return got;
@@ -262,13 +303,21 @@ Result<Array> upload(const TensorView& v, Shape shape,
     Phase d{&g_load_direct_ms};
     const std::size_t want = dtype_storage_bytes(dt, n.element_count());
     if (native && v.data.size() >= want) {
-      // Straight from the mapping to the card. The checkpoint is already
-      // mapped, so a host copy would only be this same read plus a write into
-      // a mirror nobody reads: 16 GB of first-touch page faults, at 3 GB/s
-      // where the mapping itself reads at thirty-odd. The device holds the
-      // truth from here; anything that wants these bytes on the host pulls
-      // them back the way it would for any other device-resident value.
-      LSE_RETURN_IF_ERROR(be.copy({n.buffer}, v.data.data(), want));
+      // Straight from the checkpoint file to the card, with no host copy of
+      // the tensor: the backend reads the file into its own staging and
+      // queues the transfer, so the next tensor is being read while this one
+      // crosses the link. Read through the file rather than the mapping: the
+      // mapping faults one page at a time (1.4 GB/s cold, measured) where a
+      // positioned read runs at the drive's rate. The device holds the truth
+      // from here; anything that wants these bytes on the host pulls them
+      // back the way it would for any other device-resident value.
+      if (v.fd >= 0) {
+        LSE_RETURN_IF_ERROR(
+            be.upload_file(v.fd, v.file_offset, n.buffer, want, 0));
+      } else {
+        LSE_RETURN_IF_ERROR(be.upload(v.data.data(), n.buffer, want, 0));
+      }
+      g_load_direct_bytes += want;
       n.materialized = true;
       n.device_dirty = true;
       n.host_dirty = false;
@@ -294,8 +343,18 @@ Result<Array> upload(const TensorView& v, Shape shape,
     const std::size_t whole = dtype_storage_bytes(dt, v.element_count());
     std::vector<std::byte> staged;
     const std::byte* from = nullptr;
-    if (native && v.data.size() >= whole) {
+    if (native && v.data.size() >= whole && v.fd < 0) {
       from = v.data.data();
+    } else if (native && v.data.size() >= whole) {
+      // One positioned read of the whole tensor, then the gather from
+      // memory: the mapping would fault in page by page (see the direct
+      // path above).
+      Phase al{&g_load_alloc_ms};
+      staged.resize(whole);
+      from = staged.data();
+      Phase rd{&g_load_read_ms};
+      LSE_RETURN_IF_ERROR(v.read_file(staged.data(), whole));
+      g_load_staged_bytes += whole;
     } else {
       Phase al{&g_load_alloc_ms};
       staged.resize(whole);
@@ -326,8 +385,18 @@ Result<Array> upload(const TensorView& v, Shape shape,
     const std::size_t whole = dtype_storage_bytes(dt, v.element_count());
     std::vector<std::byte> staged;
     const std::byte* from = nullptr;
-    if (native && v.data.size() >= whole) {
+    if (native && v.data.size() >= whole && v.fd < 0) {
       from = v.data.data();
+    } else if (native && v.data.size() >= whole) {
+      // One positioned read of the whole tensor, then the gather from
+      // memory: the mapping would fault in page by page (see the direct
+      // path above).
+      Phase al{&g_load_alloc_ms};
+      staged.resize(whole);
+      from = staged.data();
+      Phase rd{&g_load_read_ms};
+      LSE_RETURN_IF_ERROR(v.read_file(staged.data(), whole));
+      g_load_staged_bytes += whole;
     } else {
       Phase al{&g_load_alloc_ms};
       staged.resize(whole);
@@ -356,8 +425,16 @@ Result<Array> upload(const TensorView& v, Shape shape,
   n.device_dirty = false;
   n.materialized = true;
   {
+    // What sync_to_device would do for this node, as an upload: the backend
+    // takes the bytes into its staging before returning, so the mirror can
+    // be dropped below while the transfer is still queued.
     Phase up{&g_load_dev_ms};
-    LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, be));
+    if (n.buffer.ptr == nullptr && n.buffer.valid()) {
+      const std::size_t bytes = dtype_storage_bytes(n.dtype, n.element_count());
+      LSE_RETURN_IF_ERROR(be.upload(n.host_mirror.data(), n.buffer, bytes, 0));
+      g_load_pushed_bytes += bytes;
+      n.host_dirty = false;
+    }
   }
   // The device holds the weight now. A mirror kept beside opaque device
   // memory is a second, host copy of the tensor that nothing reads: on
@@ -655,18 +732,25 @@ Result<Array> WeightBinder::bind_quantized(
             for (std::size_t i = 0; i < views.size(); ++i) {
               const auto want = dtype_storage_bytes(views[i]->dtype,
                                                     views[i]->element_count());
-              if (views[i]->data.size() >= want) {
+              if (views[i]->data.size() >= want && views[i]->fd < 0) {
                 bytes[i] = views[i]->data.first(want);
               } else {
+                // From the file, not the mapping (see upload()).
                 staged[i].resize(want);
-                LSE_RETURN_IF_ERROR(
-                    views[i]->read_native(staged[i].data(), want));
+                LSE_RETURN_IF_ERROR(views[i]->fd >= 0
+                    ? views[i]->read_file(staged[i].data(), want)
+                    : views[i]->read_native(staged[i].data(), want));
+                g_load_staged_bytes += want;
                 bytes[i] = staged[i];
               }
             }
+            const auto packing = std::chrono::steady_clock::now();
             LSE_ASSIGN_OR(auto matrix,
                           quant::pack_q8_matrix(columns, features, bytes[0],
                                                 bytes[1], bytes[2]));
+            g_load_pack_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - packing)
+                                  .count();
             const std::array<const void *, 3> data{matrix.words.data(),
                                                    matrix.scales.data(),
                                                    matrix.biases.data()};
@@ -685,7 +769,8 @@ Result<Array> WeightBinder::bind_quantized(
               auto view = base;
               view.offset += offsets[i];
               view.size_bytes = sizes[i];
-              LSE_RETURN_IF_ERROR(be.copy({view}, data[i], sizes[i]));
+              LSE_RETURN_IF_ERROR(be.upload(data[i], view, sizes[i], 0));
+              g_load_pushed_bytes += sizes[i];
               storage->packed[i] =
                   Array::from_buffer(std::move(view), shapes[i], dtypes[i])
                       .node();
