@@ -1442,6 +1442,7 @@ Status HrxBackend::init_impl(int device_ordinal) {
   }
   streams_.assign(stream_caps_.stream_count, nullptr);
   unflushed_launches_.assign(stream_caps_.stream_count, 0);
+  flush_threshold_.assign(stream_caps_.stream_count, 0);
   stream_affinity_.resize(stream_caps_.stream_count);
   // The logical device's queues are flattened over its physical devices in
   // order, so slot s owns [s*per, (s+1)*per). Outside a spanning device there
@@ -1569,6 +1570,7 @@ void HrxBackend::shutdown_impl() noexcept {
   }
   streams_.clear();
   unflushed_launches_.clear();
+  flush_threshold_.clear();
 #if defined(__APPLE__)
   stop_sq_profiler();  // must run before the device is released
 #endif
@@ -2517,9 +2519,14 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
     // the token's launches. Do not reach for hrx_stream_begin_capture or
     // hrx_graph_exec_update to go further: both are UNIMPLEMENTED stubs in
     // libhrx (graph.c) as of this writing.
-    if (flush_interval_ != 0 &&
-        ++unflushed_launches_[index] >= flush_interval_) {
-      return flush_stream(index);
+    if (flush_interval_ != 0) {
+      std::uint32_t& next = flush_threshold_[index];
+      const std::uint32_t limit = flush_interval_ * kFlushGrowthLimit;
+      if (next < flush_interval_ || next > limit) next = flush_interval_;
+      if (++unflushed_launches_[index] >= next) {
+        next = std::min(next * 2, limit);
+        return flush_stream(index);
+      }
     }
     return OkStatus();
   }
@@ -2704,6 +2711,8 @@ Status HrxBackend::synchronize_stream_impl(Stream stream) {
   }
   if (streams_[stream.index] == nullptr) return OkStatus();
   unflushed_launches_[stream.index] = 0;
+  // The host is about to wait: the next launch on this stream starts a burst.
+  flush_threshold_[stream.index] = flush_interval_;
   LSE_SYNC_TRACE("stream_synchronize(%u) enter", stream.index);
   const Status synced = from_hrx(
       hrx_stream_synchronize(static_cast<hrx_stream_t>(streams_[stream.index])),
