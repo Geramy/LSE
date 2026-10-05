@@ -1546,6 +1546,9 @@ void HrxBackend::release_buffer(std::uint64_t handle) noexcept {
 void HrxBackend::shutdown_impl() noexcept {
 #if LSE_HRX_LINKED
   unregister_hrx_residency(device_index());
+  // A load that failed part way leaves copies queued from the ring.
+  if (initialized_) (void)drain_uploads();
+  release_upload_slots();
   {
     // Whatever retired before now is freed here; whatever is still held by a
     // live StreamEvent frees itself when its last copy drops (backend_alive
@@ -2046,6 +2049,245 @@ Status HrxBackend::copy_h2d_impl(const void* src, DeviceBuffer& dst,
 #endif
 }
 
+// --- weight uploads -------------------------------------------------------
+//
+// A model load is some 17 GB moved host to device, one tensor at a time, and
+// copy_h2d serves each one alone: wait for every stream, copy it through one
+// staging buffer 32 MiB at a time, wait for that chunk, copy the next. The
+// host's half (reading the checkpoint into staging) and the device's half
+// (the copy engine reading staging across the link) never overlapped, and
+// every tensor paid two full-device waits however small it was.
+//
+// Uploads instead go through a ring of mapped host buffers. A caller's bytes
+// are written into the current slot -- read from the checkpoint file or
+// copied from memory -- and the copy out of it is queued on stream 0 at once.
+// Small tensors share a slot; a large one spans several. When a slot is full
+// the stream is flushed, the slot remembers the timeline point that frees it,
+// and filling moves to the next, waiting only if the copy engine has not yet
+// drained that one. So the host fills slot n+1 while the device moves slot n,
+// and the load runs at the slower of the two instead of their sum.
+//
+// Ordering. Every copy is on stream 0, so stream 0's later work runs after
+// it. Anything else that could touch the destinations -- a launch on another
+// stream, a peer copy, a cross-stream event, a host read -- drains the queued
+// uploads first (drain_uploads), and finish_uploads() drains them for the
+// loader, which is where an asynchronous copy failure is reported.
+namespace {
+constexpr std::size_t kUploadSlots = 4;
+constexpr std::size_t kUploadSlotBytes = std::size_t{32} << 20;
+// Copies start on this boundary within a slot so the copy kernel takes its
+// 16-byte vector path whenever the destination and length allow it.
+constexpr std::size_t kUploadAlign = 256;
+
+bool time_load() {
+  static const bool on = std::getenv("LSE_TIME_LOAD") != nullptr;
+  return on;
+}
+double ms_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+}  // namespace
+
+Status HrxBackend::open_upload_slots() {
+#if !LSE_HRX_LINKED
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (!upload_slots_.empty()) return OkStatus();
+  if (!initialized_) return LSE_ERROR(kInternal, "hrx backend not initialized");
+  hrx_buffer_params_t params = {};
+  params.type = HRX_MEMORY_TYPE_HOST_VISIBLE | HRX_MEMORY_TYPE_HOST_COHERENT |
+                HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+  params.access = HRX_MEMORY_ACCESS_ALL;
+  params.usage = HRX_BUFFER_USAGE_TRANSFER | HRX_BUFFER_USAGE_MAPPING_SCOPED |
+                 HRX_BUFFER_USAGE_MAPPING_PERSISTENT;
+  params.queue_affinity = 0;
+  std::vector<UploadSlot> slots;
+  slots.reserve(kUploadSlots);
+  const auto undo = [&slots] {
+    for (UploadSlot& slot : slots) {
+      auto* buffer = static_cast<hrx_buffer_t>(slot.buffer);
+      hrx_status_ignore(hrx_buffer_unmap(buffer));
+      hrx_buffer_release(buffer);
+    }
+  };
+  for (std::size_t i = 0; i < kUploadSlots; ++i) {
+    hrx_buffer_t buffer = nullptr;
+    const Status made = from_hrx(
+        hrx_allocator_allocate_buffer(static_cast<hrx_allocator_t>(allocator_),
+                                      params, kUploadSlotBytes, &buffer),
+        "hrx_allocator_allocate_buffer (upload ring)");
+    if (!made.ok()) {
+      undo();
+      return made;
+    }
+    void* mapped = nullptr;
+    const Status map = from_hrx(
+        hrx_buffer_map(buffer, HRX_MAP_READ | HRX_MAP_WRITE, 0,
+                       kUploadSlotBytes, &mapped),
+        "hrx_buffer_map (upload ring)");
+    if (!map.ok() || mapped == nullptr) {
+      hrx_buffer_release(buffer);
+      undo();
+      return map.ok() ? LSE_ERROR(kInternal, "upload ring buffer did not map")
+                      : map;
+    }
+    UploadSlot slot;
+    slot.buffer = buffer;
+    slot.host = static_cast<std::byte*>(mapped);
+    slots.push_back(slot);
+  }
+  upload_slots_ = std::move(slots);
+  upload_at_ = 0;
+  upload_fill_ = 0;
+  upload_stats_ = UploadStats{};
+  upload_stats_.first = std::chrono::steady_clock::now();
+  return OkStatus();
+#endif
+}
+
+void HrxBackend::release_upload_slots() noexcept {
+#if LSE_HRX_LINKED
+  // A queued copy retains its source buffer until it retires, so dropping
+  // the ring here never frees memory a copy is still reading.
+  for (UploadSlot& slot : upload_slots_) {
+    auto* buffer = static_cast<hrx_buffer_t>(slot.buffer);
+    hrx_status_ignore(hrx_buffer_unmap(buffer));
+    hrx_buffer_release(buffer);
+  }
+#endif
+  upload_slots_.clear();
+  upload_at_ = 0;
+  upload_fill_ = 0;
+}
+
+// Submits what the current slot holds and moves to the next slot, waiting
+// for the copy engine to finish with it if it has not.
+Status HrxBackend::close_upload_slot() {
+#if !LSE_HRX_LINKED
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  UploadSlot& slot = upload_slots_[upload_at_];
+  if (upload_fill_ != 0) {
+    LSE_RETURN_IF_ERROR(flush_stream(0));
+    hrx_timeline_point_t at{};
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_get_timeline_position(static_cast<hrx_stream_t>(streams_[0]),
+                                         &at),
+        "hrx_stream_get_timeline_position (upload ring)"));
+    slot.semaphore = at.semaphore;
+    slot.point = at.value;
+    ++upload_stats_.slots;
+  }
+  upload_at_ = (upload_at_ + 1) % upload_slots_.size();
+  upload_fill_ = 0;
+  UploadSlot& next = upload_slots_[upload_at_];
+  if (next.point != 0) {
+    const auto t0 = std::chrono::steady_clock::now();
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_semaphore_wait(static_cast<hrx_semaphore_t>(next.semaphore),
+                           next.point, UINT64_MAX),
+        "waiting for a weight upload to leave the staging ring"));
+    upload_stats_.wait_ms += ms_since(t0);
+    next.point = 0;
+  }
+  return OkStatus();
+#endif
+}
+
+template <typename Fill>
+Status HrxBackend::stream_upload(DeviceBuffer& dst, std::size_t bytes,
+                                 std::size_t dst_offset, Fill&& fill) {
+#if !LSE_HRX_LINKED
+  (void)dst; (void)bytes; (void)dst_offset; (void)fill;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (dst.handle == 0) return LSE_ERROR(kInvalidArgument, "null buffer in upload");
+  if (dst_offset > dst.size_bytes || bytes > dst.size_bytes - dst_offset) {
+    return LSE_ERROR(kOutOfRange, "upload writes past the end of the buffer");
+  }
+  if (bytes == 0) return OkStatus();
+  LSE_RETURN_IF_ERROR(open_upload_slots());
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  for (std::size_t done = 0; done < bytes;) {
+    if (upload_fill_ >= kUploadSlotBytes) LSE_RETURN_IF_ERROR(close_upload_slot());
+    UploadSlot& slot = upload_slots_[upload_at_];
+    const std::size_t n = std::min(bytes - done, kUploadSlotBytes - upload_fill_);
+    const auto t0 = std::chrono::steady_clock::now();
+    LSE_RETURN_IF_ERROR(fill(slot.host + upload_fill_, done, n));
+    upload_stats_.fill_ms += ms_since(t0);
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                               static_cast<hrx_buffer_t>(slot.buffer),
+                               upload_fill_,
+                               reinterpret_cast<hrx_buffer_t>(dst.handle),
+                               dst.offset + dst_offset + done, n),
+        "hrx_stream_copy_buffer (upload)"));
+    uploads_pending_ = true;
+    upload_fill_ += (n + kUploadAlign - 1) & ~(kUploadAlign - 1);
+    upload_stats_.bytes += n;
+    ++upload_stats_.copies;
+    done += n;
+  }
+  return OkStatus();
+#endif
+}
+
+Status HrxBackend::upload_impl(const void* src, DeviceBuffer& dst,
+                               std::size_t bytes, std::size_t dst_offset) {
+  if (src == nullptr) return LSE_ERROR(kInvalidArgument, "null source in upload");
+  const auto* in = static_cast<const std::byte*>(src);
+  return stream_upload(dst, bytes, dst_offset,
+                       [in](std::byte* to, std::size_t at, std::size_t n) {
+                         std::memcpy(to, in + at, n);
+                         return OkStatus();
+                       });
+}
+
+Status HrxBackend::upload_file_impl(int fd, std::uint64_t file_offset,
+                                    DeviceBuffer& dst, std::size_t bytes,
+                                    std::size_t dst_offset) {
+  return stream_upload(
+      dst, bytes, dst_offset,
+      [fd, file_offset](std::byte* to, std::size_t at, std::size_t n) {
+        return read_file_range(fd, file_offset + at, to, n, "a weight upload");
+      });
+}
+
+Status HrxBackend::drain_uploads() {
+  if (!uploads_pending_) return OkStatus();
+  // synchronize_stream_impl(0) clears uploads_pending_ once it has waited.
+  return synchronize_stream_impl(Stream{0});
+}
+
+Status HrxBackend::finish_uploads_impl() {
+  if (upload_slots_.empty()) return OkStatus();
+  const auto t0 = std::chrono::steady_clock::now();
+  const Status drained = drain_uploads();
+  upload_stats_.drain_ms += ms_since(t0);
+  if (time_load()) {
+    const UploadStats& u = upload_stats_;
+    const double wall = ms_since(u.first);
+    std::fprintf(stderr,
+                 "[upload] hrx: %.1f MiB in %zu copies over %zu ring slots of "
+                 "%zu MiB, %.0f ms: filling slots %.0f ms, waiting for the "
+                 "copy engine %.0f ms, final drain %.0f ms; %.2f GB/s\n",
+                 double(u.bytes) / 1048576.0, u.copies, u.slots,
+                 kUploadSlotBytes >> 20, wall, u.fill_ms, u.wait_ms,
+                 u.drain_ms, wall > 0 ? double(u.bytes) / (wall * 1e6) : 0.0);
+  }
+  // The ring is 128 MiB of mapped host memory; a loaded engine has no use
+  // for it, and the next load maps it again.
+  release_upload_slots();
+  if (!drained.ok()) {
+    return Status(drained.code(),
+                  "a weight upload failed on the device: " + drained.message());
+  }
+  return OkStatus();
+}
+
 Status HrxBackend::copy_peer_ordered_impl(const DeviceBuffer& src,
                                           DeviceBuffer& dst,
                                           std::size_t bytes,
@@ -2060,6 +2302,7 @@ Status HrxBackend::copy_peer_ordered_impl(const DeviceBuffer& src,
   if (src.handle == 0 || dst.handle == 0) {
     return LSE_ERROR(kInvalidArgument, "null buffer in ordered peer copy");
   }
+  LSE_RETURN_IF_ERROR(drain_uploads());
   if (bytes == 0) return OkStatus();
   if (producer.index >= streams_.size() || consumer.index >= streams_.size()) {
     return LSE_ERROR(kOutOfRange, "ordered peer copy names a stream the device "
@@ -2123,6 +2366,7 @@ Status HrxBackend::copy_peer_impl(const DeviceBuffer& src, DeviceBuffer& dst,
   if (src.handle == 0 || dst.handle == 0) {
     return LSE_ERROR(kInvalidArgument, "null buffer in copy_peer");
   }
+  LSE_RETURN_IF_ERROR(drain_uploads());
   if (src_offset + bytes > src.size_bytes ||
       dst_offset + bytes > dst.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_peer runs past the end of a buffer");
@@ -2443,6 +2687,9 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
   if (!kernel.valid()) return LSE_ERROR(kInvalidArgument, "invalid kernel handle");
+  // Stream 0's own work is ordered after the uploads queued on it; another
+  // stream's is not.
+  if (target.stream.index != 0) LSE_RETURN_IF_ERROR(drain_uploads());
   if (!target.work.whole()) {
     // A dispatch is still a grid here, and a grid has no subrange. When a
     // kernel declares work items the range lands in the dispatch config and
@@ -2579,6 +2826,7 @@ Result<StreamEvent> HrxBackend::record_event_impl(Stream stream) {
     none.device = device_index();
     return none;
   }
+  if (stream.index != 0) LSE_RETURN_IF_ERROR(drain_uploads());
 
   // The runtime's own synchronization point, not one assembled out of queue
   // barriers and timeline arithmetic here. hrx_event_record carries its own
@@ -2645,6 +2893,7 @@ Status HrxBackend::wait_event_impl(Stream stream, const StreamEvent& event) {
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
   if (!event.valid() || event.handle == nullptr) return OkStatus();
+  if (stream.index != 0) LSE_RETURN_IF_ERROR(drain_uploads());
   LSE_SYNC_TRACE("wait_event(on=%u, from=%u)", stream.index,
                  event.stream.index);
   // A cross-GPU edge on a spanning device joins on the HOST, not on the
@@ -2709,6 +2958,8 @@ Status HrxBackend::synchronize_stream_impl(Stream stream) {
       hrx_stream_synchronize(static_cast<hrx_stream_t>(streams_[stream.index])),
       "hrx_stream_synchronize");
   LSE_SYNC_TRACE("stream_synchronize(%u) leave", stream.index);
+  // Everything queued on stream 0 has retired, the ring's copies included.
+  if (synced.ok() && stream.index == 0) uploads_pending_ = false;
   return synced;
 #endif
 }

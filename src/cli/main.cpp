@@ -695,6 +695,9 @@ int main(int argc, char** argv) {
   model::WeightBinder binder(*weights, &cfg->quantization);
   const Status loaded = lm->load(binder);
   if (!loaded.ok()) return fail(loaded, "binding the weights");
+  if (const Status uploaded = binder.finish("model"); !uploaded.ok()) {
+    return fail(uploaded, "uploading the weights");
+  }
 
   tok_load.join();
   if (!tok_slot->ok()) return fail(tok_slot->status(), "loading the tokenizer");

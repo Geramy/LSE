@@ -24,6 +24,7 @@
 
 #include "lse/backend/resources.hpp"
 #include "lse/core/enum_names.hpp"
+#include "lse/core/file_read.hpp"
 #include "lse/core/status.hpp"
 #include "lse/graph/toolchain.hpp"
 
@@ -1136,6 +1137,45 @@ class IBackend {
     (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
     return LSE_ERROR(kUnimplemented, "this backend has no peer copy");
   }
+  // Weight loading: bytes bound for device memory that nothing reads until
+  // the load is finished. Unlike copy_h2d these may return before the bytes
+  // have arrived -- the source is free to reuse the moment they return -- so
+  // a backend can keep its copy engine busy while the caller reads the next
+  // tensor. finish_uploads() is the point every upload has landed or failed;
+  // a backend that queues them also completes them before any other
+  // operation could observe the destination.
+  //
+  // The generic versions here are synchronous: a backend that has nothing
+  // better gets exactly copy_h2d.
+  virtual Status upload(const void* src, DeviceBuffer& dst, std::size_t bytes,
+                        std::size_t dst_offset) {
+    return copy_h2d(src, dst, bytes, dst_offset);
+  }
+  // The same, with the bytes read from `bytes` at `file_offset` of `fd`
+  // (a checkpoint: see model::TensorView::read_file) rather than from memory.
+  virtual Status upload_file(int fd, std::uint64_t file_offset,
+                             DeviceBuffer& dst, std::size_t bytes,
+                             std::size_t dst_offset) {
+    if (dst.ptr != nullptr) {
+      // Host-addressable memory: read straight into it.
+      return read_file_range(fd, file_offset,
+                             static_cast<std::byte*>(dst.ptr) + dst.offset +
+                                 dst_offset,
+                             bytes, "a weight upload");
+    }
+    constexpr std::size_t kChunk = std::size_t{32} << 20;
+    std::vector<std::byte> chunk(bytes < kChunk ? bytes : kChunk);
+    for (std::size_t done = 0; done < bytes;) {
+      const std::size_t n = bytes - done < kChunk ? bytes - done : kChunk;
+      LSE_RETURN_IF_ERROR(read_file_range(fd, file_offset + done, chunk.data(),
+                                          n, "a weight upload"));
+      LSE_RETURN_IF_ERROR(copy_h2d(chunk.data(), dst, n, dst_offset + done));
+      done += n;
+    }
+    return OkStatus();
+  }
+  virtual Status finish_uploads() { return OkStatus(); }
+
   virtual Result<KernelHandle> load_executable(
       std::string_view name, std::span<const std::byte> code_object) = 0;
   virtual Status launch(const KernelHandle& kernel, const LaunchDims& dims,
@@ -1269,6 +1309,26 @@ class BackendAdapter final : public IBackend {
   Status copy_peer(const DeviceBuffer& s, DeviceBuffer& d, std::size_t n,
                    std::size_t soff, std::size_t doff) override {
     return impl_.copy_peer(s, d, n, soff, doff);
+  }
+  Status upload(const void* s, DeviceBuffer& d, std::size_t n,
+                std::size_t off) override {
+    if constexpr (requires(Derived& i) { i.upload_impl(s, d, n, off); }) {
+      return impl_.upload_impl(s, d, n, off);
+    }
+    return IBackend::upload(s, d, n, off);
+  }
+  Status upload_file(int fd, std::uint64_t at, DeviceBuffer& d, std::size_t n,
+                     std::size_t off) override {
+    if constexpr (requires(Derived& i) { i.upload_file_impl(fd, at, d, n, off); }) {
+      return impl_.upload_file_impl(fd, at, d, n, off);
+    }
+    return IBackend::upload_file(fd, at, d, n, off);
+  }
+  Status finish_uploads() override {
+    if constexpr (requires(Derived& i) { i.finish_uploads_impl(); }) {
+      return impl_.finish_uploads_impl();
+    }
+    return OkStatus();
   }
   Result<KernelHandle> load_executable(
       std::string_view n, std::span<const std::byte> code) override {

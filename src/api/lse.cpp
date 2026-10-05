@@ -599,6 +599,15 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     std::fputs("lse-server: FlashPrefillV2=off; prefill=dense\n", stderr);
   }
 
+  // The tokenizer is read and parsed on its own thread while the weights
+  // load: it needs nothing from the device and nothing from the weights, and
+  // on the main thread it added most of a second after the last upload.
+  const std::string tok_dir = paths->weights.substr(0, paths->weights.find_last_of('/'));
+  std::optional<Result<tokenizer::Tokenizer>> tok_slot;
+  std::jthread tok_load([&tok_slot, &tok_dir, &tokenizer_repo] {
+    tok_slot.emplace(tokenizer::Tokenizer::for_model_dir(tok_dir, tokenizer_repo));
+  });
+
   progress::begin("building_model");
   auto built = model::build_model(config, *e.weights, "");
   if (!built.ok()) return fail(built.status(), "building the model");
@@ -609,12 +618,14 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   if (const Status s = e.lm->load(*e.binder); !s.ok()) {
     return fail(s, "binding the weights");
   }
+  if (const Status s = e.binder->finish("model"); !s.ok()) {
+    return fail(s, "uploading the weights");
+  }
 
   progress::begin("loading_tokenizer");
-  const std::string tok_dir = paths->weights.substr(0, paths->weights.find_last_of('/'));
-  auto tok = tokenizer::Tokenizer::for_model_dir(tok_dir, tokenizer_repo);
-  if (!tok.ok()) return fail(tok.status(), "loading the tokenizer");
-  e.tok.emplace(tok.release());
+  tok_load.join();
+  if (!tok_slot->ok()) return fail(tok_slot->status(), "loading the tokenizer");
+  e.tok.emplace(tok_slot->release());
 
   // Speculative decoding when the checkpoint ships a module, exactly as the
   // CLI resolves it.

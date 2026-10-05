@@ -38,6 +38,7 @@ include(LSERust)
 # ---------------------------------------------------------------------------
 add_library(lse_core
   src/core/debug.cpp
+  src/core/file_read.cpp
   src/core/progress.cpp
   src/core/dtype.cpp
   src/core/shape.cpp
