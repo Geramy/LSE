@@ -231,7 +231,8 @@ ditto -c -k --keepParent build/ios/LSE.xcframework lse-v0.5.0-ios-arm64.xcframew
 and `LSE_BUILD_JOBS` adjust the build. In Xcode, add `LSE.xcframework` to the
 app target (Do Not Embed: it is a static library) and `import LSE` from Swift.
 
-The script builds the HSA runtime (`make hsa-ios` in mac_linuxgpu), HRX and
+The script builds the HSA runtime (`make hsa-ios` in mac_linuxgpu, with its
+output in `build/ios/hsa`, so the checkout is only read), HRX and
 loomc as static archives (`scripts/ios/build-hrx-ios.sh`, which applies
 `patches/hrx/ios-static-runtime.patch` to a copy of the HRX source), the
 engine with `CMAKE_SYSTEM_NAME=iOS`, then prelinks them into one object that
