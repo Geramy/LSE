@@ -270,8 +270,12 @@ class Generator {
   // Preserve recorded heads and token slots when the verifier width changes.
   std::unordered_map<std::size_t, SpecHead> spec_by_m_;
   std::unordered_map<std::size_t, graph::Array> spec_ids_by_m_;
-  // Logits reach the host only when the sampler needs more than an argmax.
+  // Logits reach the host only when the sampler needs more than an argmax,
+  // and then a row at a time as the acceptance walk asks (spec_logit_rows):
+  // rows [0, spec_rows_ready_) of spec_logits_ hold the last pass's values.
   std::vector<float> spec_logits_;
+  std::size_t spec_rows_ready_ = 0;
+  Status spec_logit_rows(std::size_t rows);
   // The decoder's hidden state for the last prompt position, which is the
   // module's input for the first proposal of the generation.
   graph::Array prefill_tail_;
