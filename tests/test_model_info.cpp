@@ -583,7 +583,31 @@ LSE_TEST(c_api_answers_and_refuses) {
   LSE_EXPECT_EQ(lse_model_info(dir.path.c_str(), &out, &err), LSE_OK);
   LSE_EXPECT(out != nullptr && err == nullptr);
   if (out != nullptr) {
-    LSE_EXPECT_STR(json::parse(out)["architecture"].get<std::string>(), std::string("qwen3.5"));
+    const json info = json::parse(out);
+    LSE_EXPECT_STR(info["architecture"].get<std::string>(), std::string("qwen3.5"));
+    // No generation_config.json and no chat template: LSE's neutral defaults,
+    // said to be so, and no thinking controls.
+    LSE_EXPECT(info["generation_defaults"]["sources"]["temperature"] == "lse_default");
+    LSE_EXPECT(info["generation_defaults"]["max_new_tokens"].is_null());
+    LSE_EXPECT(!info["thinking"]["supported"].get<bool>());
+    LSE_EXPECT(info["thinking"]["source"].is_null());
+  }
+  lse_free(out);
+
+  // The checkpoint's own files, copied in: its generation_config and its
+  // chat template's thinking levels are what model info reports.
+  for (const char* file : {"chat_template.jinja", "generation_config.json"})
+    std::filesystem::copy_file(std::filesystem::path("tests/fixtures/chat_templates/qwen3.8") / file,
+                               dir.path / file, std::filesystem::copy_options::overwrite_existing);
+  out = nullptr;
+  LSE_EXPECT_EQ(lse_model_info(dir.path.c_str(), &out, &err), LSE_OK);
+  if (out != nullptr) {
+    const json info = json::parse(out);
+    LSE_EXPECT_EQ(info["generation_defaults"]["top_k"].get<int>(), 20);
+    LSE_EXPECT(info["generation_defaults"]["sources"]["top_k"] == "generation_config.json");
+    LSE_EXPECT(info["thinking"]["supported"].get<bool>());
+    LSE_EXPECT_STR(info["thinking"]["default_level"].get<std::string>(), std::string("xhigh"));
+    LSE_EXPECT_EQ(info["thinking"]["levels"].size(), std::size_t{4});
   }
   lse_free(out);
 

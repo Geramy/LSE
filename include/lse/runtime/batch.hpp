@@ -30,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <deque>
 #include <functional>
 #include <string>
@@ -57,8 +58,9 @@ struct BatchLimits {
   // (task #47 is the tiled form that lifts it). Raise it past 8 on a dense model
   // and the head gets 4.5x better; on an MoE model the body gets much worse.
   std::int32_t max_batch = 8;
-  // Tokens each sequence may generate.
-  std::int32_t max_tokens = 256;
+  // Tokens each sequence may generate. The default imposes no limit: a
+  // sequence ends at a stop token or when its context fills the KV length.
+  std::int32_t max_tokens = std::numeric_limits<std::int32_t>::max();
   std::vector<std::uint32_t> stop_tokens;
   // Blocks one attention layer's pool may hold. 0 derives it from the engine KV
   // length times the row count, which is the pool that never has to preempt.

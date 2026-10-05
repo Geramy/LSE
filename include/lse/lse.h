@@ -33,7 +33,7 @@ extern "C" {
  * meaning. lse_config carries the value it was initialized with. */
 #define LSE_ABI_VERSION 1u
 
-/* Engine version string, e.g. "0.5.1". */
+/* Engine version string, e.g. "0.5.2". */
 LSE_API const char *lse_version(void);
 /* LSE_ABI_VERSION of the library actually linked. */
 LSE_API uint32_t lse_abi_version(void);
@@ -81,7 +81,9 @@ typedef struct lse_config {
   /* Sampling and limits. */
   int32_t has_temperature;       /* nonzero: temperature overrides the model's */
   float temperature;             /* --temperature, 0..2 */
-  int32_t max_tokens;            /* --max-tokens cap per request (default 4096) */
+  int32_t max_tokens;            /* --max-tokens: operator cap on generated tokens per
+                                  * request; 0 (default) is no cap. LSE sets no
+                                  * output limit of its own (see docs/API.md). */
 
   /* Devices and kernels. */
   const char *pool;              /* --pool, e.g. "hrx:0" */
@@ -225,7 +227,11 @@ LSE_API lse_result lse_status(const lse_engine *engine, char **json_out);
  * weights' estimated VRAM, MTP and DFlash2 facts (including whether it is
  * itself a DFlash2 draft and the fields a draft must match), and, for every
  * KV cache format LSE supports (fp32, fp16, bf16, fp8, bf8), the KV bytes per
- * token and per 16-token block as the paged allocator sizes them. */
+ * token and per 16-token block as the paged allocator sizes them. It also
+ * reports "generation_defaults" (the sampling defaults and any output limit
+ * the checkpoint's generation_config.json/config.json declare, each with its
+ * source) and "thinking" (the levels the checkpoint's chat template defines),
+ * in the shapes /v1/models uses; see docs/API.md. */
 LSE_API lse_result lse_model_info(const char *model, char **json_out, char **err);
 
 /* What lse_open with `cfg` would allocate on the device, by component:

@@ -24,6 +24,7 @@
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/dflash2.hpp"
+#include "lse/models/thinking_controls.hpp"
 #include "lse/tokenizer/tokenizer.hpp"
 
 namespace lse::server {
@@ -37,8 +38,14 @@ struct ServerOptions {
   std::string model_id;
   // When set, every HTTP request must carry `Authorization: Bearer <key>`.
   std::string api_key;
-  // Refused above this, so one request cannot take the whole KV pool.
-  std::int32_t max_tokens_cap = 4096;
+  // An operator's cap on generated tokens per request: a request asking for
+  // more is refused, one asking for none is held to it. 0 (the default): no
+  // cap. LSE imposes no output limit of its own; generation ends at a stop
+  // token, a stop sequence, the request's max_tokens, a limit the model's own
+  // generation_config sets, or a full context.
+  std::int32_t max_tokens_cap = 0;
+  // The thinking levels the model's chat template defines.
+  models::ThinkingControls thinking;
   std::uint32_t mtp_depth = 3;
   runtime::PrefillBatch prefill;
   // Where the served model and its draft came from, and what they run on, for

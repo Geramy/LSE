@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -54,16 +55,48 @@ inline constexpr std::uint32_t kMaxMtpDepth = 7;
   return static_cast<std::uint32_t>(rows);
 }
 
+// No limit on generated tokens: generation runs until a stop token, the
+// token callback, or a full context.
+inline constexpr std::int32_t kNoTokenLimit = std::numeric_limits<std::int32_t>::max();
+
 struct GenerationLimits {
-  std::int32_t max_tokens = 256;
-  // Generation stops on any of these. Empty means run to max_tokens.
+  // At most this many generated tokens. kNoTokenLimit (the default) imposes
+  // none; 0 runs the prompt and generates nothing. Whatever the limit, the
+  // prompt plus the generated tokens never exceed the engine's KV length
+  // (model.config().kv_capacity()): there generation stops, as kContextFull.
+  std::int32_t max_tokens = kNoTokenLimit;
+  // Generation stops on any of these. Empty means run to a limit.
   std::vector<std::uint32_t> stop_tokens;
   std::uint32_t mtp_depth = kDefaultMtpDepth;
 };
 
+// Why a generation ended.
+enum class StopReason : std::uint8_t {
+  kNone,         // not run, or prefill only
+  kStopToken,    // the model produced a stop token
+  kMaxTokens,    // limits.max_tokens generated
+  kContextFull,  // the prompt and the generated tokens fill the KV length
+  kCallback,     // the token callback asked to stop (stop string, cancel)
+};
+[[nodiscard]] constexpr const char* to_string(StopReason r) noexcept {
+  switch (r) {
+    case StopReason::kNone: return "none";
+    case StopReason::kStopToken: return "stop_token";
+    case StopReason::kMaxTokens: return "max_tokens";
+    case StopReason::kContextFull: return "context_full";
+    case StopReason::kCallback: return "callback";
+  }
+  return "none";
+}
+
 struct GenerationStats {
   std::int32_t prompt_tokens = 0;
   std::int32_t generated_tokens = 0;
+  StopReason stop_reason = StopReason::kNone;
+  // Tokens the session's context holds at the end (the whole prompt plus the
+  // generated tokens) and the most it can hold.
+  std::int32_t context_tokens = 0;
+  std::int32_t context_length = 0;
   std::uint64_t prefill_ns = 0;
   // Wall time after the first token callback, including later model steps,
   // sampling and callbacks. Zero when no post-prefill step was attempted.

@@ -27,10 +27,14 @@ pi --provider lse --model qwen38-q4 --thinking low
 ```
 
 `--thinking off` works too. `thinkingFormat: "qwen"` makes pi send the
-`enable_thinking` switch. The server also accepts `reasoning_effort` (`none`,
-`minimal`, `low`, `medium`, `high`, `xhigh`), `thinking`, and
-`chat_template_kwargs.enable_thinking`. Effort controls the prompt instruction;
-it does not impose a separate reasoning-token budget.
+`enable_thinking` switch. The server also accepts `reasoning_effort`, `thinking`
+and `chat_template_kwargs.enable_thinking`. The accepted `reasoning_effort`
+values are the levels the model's own chat template defines, as listed in
+`/v1/models` `thinking.levels`. Qwen3.8's template defines `none`, `xhigh`,
+`medium` and `low`; a level it doesn't define (`high`, `minimal`) gets HTTP 400
+with `code: "unsupported_reasoning_effort"`, not an alias. Effort controls the
+prompt instruction; it does not impose a separate reasoning-token budget. See
+[API](API.md#thinking-levels).
 
 Use `api: "openai-completions"`. The Responses API (`/v1/responses`) is not
 implemented. `supportsStrictMode: false` is required because LSE does not perform
@@ -55,10 +59,17 @@ still guide conversion of XML parameter values into JSON. Strings such as
   `delta.reasoning_content`; final answer text arrives in `delta.content`.
   Function calls emit indexed deltas after a complete call has been parsed.
   Partial calls at a token limit never become executable tool-call objects.
+- There is no default output limit. A reply ends at an end-of-turn token, a stop
+  sequence, the request's `max_tokens`, or a full context. Each choice says which
+  in `stop_reason`, and every response reports `lse_context` (`tokens_used`,
+  `context_length`, `tokens_remaining`). A prompt that fills the context gets
+  HTTP 400 with `code: "context_full"`. See [API](API.md#context-full).
 - `stream_options.include_usage: true` adds a final usage chunk with empty
   `choices`, followed by `[DONE]`. Usage counts reasoning and output tokens.
-- The prompt already opens `<think>`, so an unfinished reasoning passage remains
-  reasoning even when generation never emits an opening or closing tag.
+- The assistant turn opens with the generation prompt the model's chat template
+  defines for the level. For Qwen3.x thinking levels it already opens `<think>`,
+  so an unfinished reasoning passage remains reasoning even when generation never
+  emits an opening or closing tag.
 
 ## Standard OpenAI client
 

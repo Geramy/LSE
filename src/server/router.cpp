@@ -2,10 +2,14 @@
 #include "jit_timings.hpp"
 #include "chat_protocol.hpp"
 #include "request_sampling.hpp"
+#include "thinking_request.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <vector>
@@ -93,13 +97,18 @@ struct Request {
   std::vector<std::uint32_t> prompt;
   runtime::SamplingParams sampling;
   runtime::GenerationLimits limits;
+  // The client's max_tokens / max_completion_tokens, when it sent one.
+  std::optional<std::int32_t> max_tokens;
   std::vector<std::string> stop_strings;
   bool stream = false;
   std::string model;
   detail::ChatRequest chat;
   bool include_usage = false;
+  // The thinking fields as sent, and (chat only) the level they resolve to.
+  detail::ThinkingRequest thinking;
+  detail::ChatFraming framing;
+  // Raw completions: whether reasoning markers in the output are split out.
   bool thinking_enabled = true;
-  std::string thinking_level;   // "" | low | medium | high | xhigh
   // The session whose KV this request continues; empty for a one-shot
   // request, whose state is released when it finishes.
   std::string session_id;
@@ -107,6 +116,37 @@ struct Request {
 
 // Where a completion stopped, in OpenAI's vocabulary.
 const char* finish_reason(bool hit_limit) { return hit_limit ? "length" : "stop"; }
+
+// Why it stopped, in LSE's: the choice's "stop_reason".
+//   stop_token    the model ended its turn (an end-of-turn token)
+//   stop_sequence one of the request's stop strings
+//   max_tokens    the request's max_tokens, the server's cap, or the model's
+//                 generation_config limit
+//   context_full  the prompt and the completion fill the context; see
+//                 "lse_context"
+//   cancelled     the client went away
+const char* stop_reason_name(runtime::StopReason r, bool by_string) {
+  if (by_string) return "stop_sequence";
+  switch (r) {
+    case runtime::StopReason::kStopToken: return "stop_token";
+    case runtime::StopReason::kMaxTokens: return "max_tokens";
+    case runtime::StopReason::kContextFull: return "context_full";
+    case runtime::StopReason::kCallback: return "cancelled";
+    case runtime::StopReason::kNone: return "max_tokens";
+  }
+  return "stop_token";
+}
+
+// A 400 whose error carries a machine-readable code (and extra fields).
+void send_coded_error(RouteReply& res, const std::string& message, const std::string& code,
+                      const std::string& param, json extra = json::object()) {
+  json e = error_json(message, "invalid_request_error", param);
+  e["error"]["code"] = code;
+  for (auto& [k, v] : extra.items()) e["error"][k] = v;
+  res.status = 400;
+  res.body = e.dump();
+  res.stream = nullptr;
+}
 
 }  // namespace
 
@@ -127,6 +167,11 @@ struct Outcome {
   int prefill_tokens = 0;
   int decode_tokens = 0;
   bool hit_limit = false;
+  bool stopped_by_string = false;
+  runtime::StopReason stop = runtime::StopReason::kNone;
+  // The context at the end: whole prompt plus completion, and its capacity.
+  int context_tokens = 0;
+  int context_length = 0;
   // Prefill and decode are different rates and a single figure hides which one
   // is the problem, so both are reported. Speculation moves the decode rate
   // without moving the pass count, which is why acceptance rides along.
@@ -336,7 +381,9 @@ struct Router::Impl {
                 {"max_position_embeddings", c.train_seq_len},
                 {"kv_len", c.kv_capacity()},
                 {"kv_cache_dtype", std::string(kv::to_string(c.kv_cache_dtype))},
-                {"max_tokens", opt.max_tokens_cap},
+                {"max_tokens", opt.max_tokens_cap > 0 ? json(opt.max_tokens_cap) : json(nullptr)},
+                {"generation_defaults", c.sampling_defaults.to_json()},
+                {"thinking", opt.thinking.to_json()},
                 {"draft", std::move(draft)}};
   }
 
@@ -488,60 +535,34 @@ struct Router::Impl {
     }
     r.sampling = *sampling;
 
-    // Thinking control. Accepts the OpenAI-style `reasoning_effort` ("none",
-    // "low", "medium", "high", "xhigh") and a direct `thinking` (bool or
-    // {type}); a client that sends neither keeps the model's default
-    // (reasoning on at its own level). The level steers how hard the model
-    // thinks via a system prompt (see reasoning_effort_instructions).
-    r.thinking_enabled = true;
-    for (const char* field : {"enable_thinking", "thinking"}) {
-      if (body.contains(field) && body[field].is_boolean())
-        r.thinking_enabled = body[field].get<bool>();
+    // Thinking fields. They are resolved against the model's chat template on
+    // the chat route (see thinking_request.hpp); a raw completion only uses
+    // them to decide whether to split reasoning out of the output.
+    if (auto bad = detail::read_thinking_request(body, r.thinking)) {
+      send_coded_error(res, bad->message, bad->code, bad->param);
+      return LSE_ERROR(kInvalidArgument, bad->code);
     }
-    if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
-      r.thinking_enabled = get_or<bool>(body["chat_template_kwargs"], "enable_thinking", r.thinking_enabled);
-    if (body.contains("thinking")) {
-      const json& t = body.at("thinking");
-      if (t.is_boolean()) {
-        r.thinking_enabled = t.get<bool>();
-      } else if (t.is_object()) {
-        r.thinking_enabled = get_or<std::string>(t, "type", "enabled") != "disabled";
-      }
-    }
-    if (body.contains("reasoning_effort")) {
-      const std::string effort = get_or<std::string>(body, "reasoning_effort", "");
-      if (effort == "none") {
-        r.thinking_enabled = false;
-      } else if (!effort.empty()) {
-        if (effort != "minimal" && effort != "low" && effort != "medium" &&
-            effort != "high" && effort != "xhigh") {
-          send_error(res, 400, "unsupported reasoning_effort", "invalid_request_error", "reasoning_effort");
-          return LSE_ERROR(kInvalidArgument, "reasoning_effort");
-        }
-        r.thinking_enabled = true;
-        r.thinking_level = effort == "minimal" ? "low" : effort;
-      }
-    }
-    if (body.contains("thinking_level")) {
-      const std::string lvl = get_or<std::string>(body, "thinking_level", "");
-      if (lvl != "none" && !lvl.empty()) r.thinking_level = lvl;
-    }
+    r.thinking_enabled = r.thinking.enable.value_or(true) && r.thinking.level != "none";
 
-    std::int32_t want = get_or<std::int32_t>(body, "max_tokens", 0);
-    if (want == 0) want = get_or<std::int32_t>(body, "max_completion_tokens", 256);
-    if (want <= 0) {
-      send_error(res, 400, "max_tokens must be positive", "invalid_request_error",
-                 "max_tokens");
-      return LSE_ERROR(kInvalidArgument, "max_tokens");
+    // No output limit unless the client asks for one: generation runs to a
+    // stop token, a stop sequence or a full context. See output_limit().
+    for (const char* key : {"max_completion_tokens", "max_tokens"}) {
+      const auto at = body.find(key);
+      if (at == body.end() || at->is_null()) continue;
+      if (!at->is_number_integer() || at->get<std::int64_t>() <= 0 ||
+          at->get<std::int64_t>() > std::numeric_limits<std::int32_t>::max()) {
+        send_error(res, 400, std::string(key) + " must be a positive integer", "invalid_request_error", key);
+        return LSE_ERROR(kInvalidArgument, key);
+      }
+      r.max_tokens = static_cast<std::int32_t>(at->get<std::int64_t>());  // max_tokens wins
     }
-    if (want > opt.max_tokens_cap) {
+    if (r.max_tokens && opt.max_tokens_cap > 0 && *r.max_tokens > opt.max_tokens_cap) {
       send_error(res, 400,
-                 "max_tokens " + std::to_string(want) + " exceeds this server's cap of " +
+                 "max_tokens " + std::to_string(*r.max_tokens) + " exceeds this server's cap of " +
                      std::to_string(opt.max_tokens_cap),
                  "invalid_request_error", "max_tokens");
       return LSE_ERROR(kInvalidArgument, "max_tokens cap");
     }
-    r.limits.max_tokens = want;
     r.limits.stop_tokens = stop_ids;
     r.limits.mtp_depth = opt.mtp_depth;
     if (body.contains("mtp_depth")) {
@@ -565,6 +586,24 @@ struct Router::Impl {
       return LSE_ERROR(kInvalidArgument, "n");
     }
     return r;
+  }
+
+  // Generated tokens a request may produce, from the first of: the client's
+  // max_tokens; the operator's --max-tokens cap; the model's
+  // generation_config max_new_tokens; else no limit. The model's
+  // generation_config max_length (prompt plus completion) bounds the last
+  // three. The context bounds all of them, in the generator.
+  std::int32_t output_limit(const Request& r) const {
+    if (r.max_tokens) return *r.max_tokens;
+    const models::SamplingDefaults& d = model.config().sampling_defaults;
+    std::int32_t limit = runtime::kNoTokenLimit;
+    if (opt.max_tokens_cap > 0) limit = opt.max_tokens_cap;
+    else if (d.max_new_tokens) limit = *d.max_new_tokens;
+    if (d.max_length) {
+      const auto room = static_cast<std::int64_t>(*d.max_length) - static_cast<std::int64_t>(r.prompt.size());
+      limit = static_cast<std::int32_t>(std::clamp<std::int64_t>(room, 1, limit));
+    }
+    return limit;
   }
 
   void completion(bool chat, std::string_view req_body, const std::atomic<bool>& stopping,
@@ -700,10 +739,14 @@ Result<Outcome> Router::Impl::generate(
   }
   if (!ids.ok()) return ids.status();
   out.completion_tokens = static_cast<int>(ids->size());
-  out.hit_limit = !stopped_by_string &&
-                  out.completion_tokens >= r.limits.max_tokens;
-
   const runtime::GenerationStats& st = gen.stats();
+  out.stopped_by_string = stopped_by_string;
+  out.stop = st.stop_reason;
+  out.hit_limit = !stopped_by_string && (st.stop_reason == runtime::StopReason::kMaxTokens ||
+                                         st.stop_reason == runtime::StopReason::kContextFull);
+  out.context_tokens = out.prompt_tokens + out.completion_tokens;
+  out.context_length = st.context_length;
+
   out.jit = detail::JitTotals::from(st);
   out.device_groups = st.device_groups;
   out.host_groups = st.host_groups;
@@ -761,6 +804,15 @@ Result<Outcome> Router::Impl::generate(
 namespace {
 
 
+// Not part of the OpenAI schema: how full the context is, so a client can
+// offer to compact before (or once) it fills. tokens_used is the prompt plus
+// the completion; context_length the most the engine holds (kv_len).
+json context_of(int tokens_used, int context_length) {
+  return json{{"tokens_used", tokens_used},
+              {"context_length", context_length},
+              {"tokens_remaining", std::max(0, context_length - tokens_used)}};
+}
+
 json usage_of(const Outcome& o) {
   return json{{"prompt_tokens", o.prompt_tokens},
               {"prompt_tokens_details", {{"cached_tokens", o.prompt_tokens - o.prefill_tokens}}},
@@ -808,16 +860,18 @@ json timings_of(const Outcome& o) {
 }
 
 // text_completion and chat.completion differ only in the shape of a choice.
-json chat_choice(const std::string& text, bool hit_limit, const Request& r,
-                 const std::string& id) {
-  detail::ChatResponseParser parser(r.thinking_enabled, r.chat, id);
-  parser.push(text);
-  parser.finish(hit_limit);
+json chat_choice(const Outcome& o, const Request& r, const std::string& id) {
+  detail::ChatResponseParser parser(r.framing.reasoning, r.chat, id);
+  parser.push(o.text);
+  parser.finish(o.hit_limit);
   return json{{"index", 0}, {"message", parser.message()}, {"logprobs", nullptr},
-              {"finish_reason", parser.finish_reason(hit_limit)}};
+              {"finish_reason", parser.finish_reason(o.hit_limit)},
+              {"stop_reason", stop_reason_name(o.stop, o.stopped_by_string)}};
 }
 
-json text_choice(const std::string& text, bool hit_limit, bool expose_thinking) {
+json text_choice(const Outcome& o, bool expose_thinking) {
+  const std::string& text = o.text;
+  const bool hit_limit = o.hit_limit;
   std::string reasoning;
   std::string out = text;
   if (expose_thinking) {
@@ -828,7 +882,8 @@ json text_choice(const std::string& text, bool hit_limit, bool expose_thinking) 
   json choice{{"index", 0},
               {"text", std::move(out)},
               {"logprobs", nullptr},
-              {"finish_reason", finish_reason(hit_limit)}};
+              {"finish_reason", finish_reason(hit_limit)},
+              {"stop_reason", stop_reason_name(o.stop, o.stopped_by_string)}};
   if (!reasoning.empty()) choice["reasoning"] = std::move(reasoning);
   return choice;
 }
@@ -858,8 +913,17 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
 
   std::string prompt_text;
   if (chat) {
+    const detail::ThinkingChoice thinking = detail::choose_thinking(impl.opt.thinking, r.thinking);
+    if (thinking.error) {
+      json extra{{"levels", json::array()}};
+      for (const auto& l : impl.opt.thinking.levels) extra["levels"].push_back(l.id);
+      send_coded_error(res, thinking.error->message, thinking.error->code, thinking.error->param,
+                       std::move(extra));
+      return;
+    }
+    r.framing = thinking.framing;
     try {
-      r.chat = detail::prepare_chat(body, r.thinking_enabled, r.thinking_level);
+      r.chat = detail::prepare_chat(body, r.framing);
       prompt_text = r.chat.prompt;
     } catch (const std::exception& e) {
       send_error(res, 400, e.what(), "invalid_request_error", "messages/tools");
@@ -900,6 +964,19 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
   }
   r.prompt = *encoded;
 
+  // The prompt must leave room for at least one generated token.
+  const int context_length = impl.model.config().kv_capacity();
+  const int prompt_tokens = static_cast<int>(r.prompt.size());
+  if (prompt_tokens >= context_length) {
+    send_coded_error(res,
+                     "the prompt is " + std::to_string(prompt_tokens) + " tokens and the context holds " +
+                         std::to_string(context_length) + "; compact or shorten the conversation",
+                     "context_full", chat ? "messages" : "prompt",
+                     json{{"lse_context", context_of(prompt_tokens, context_length)}});
+    return;
+  }
+  r.limits.max_tokens = impl.output_limit(r);
+
   const std::string id = make_id(chat ? "chatcmpl" : "cmpl");
   const std::int64_t created = now_seconds();
   const char* object = chat ? "chat.completion" : "text_completion";
@@ -916,9 +993,10 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
                 {"object", object},
                 {"created", created},
                 {"model", impl.opt.model_id},
-                {"choices", json::array({chat ? chat_choice(out->text, out->hit_limit, r, id)
-                                              : text_choice(out->text, out->hit_limit, r.thinking_enabled)})},
+                {"choices", json::array({chat ? chat_choice(*out, r, id)
+                                              : text_choice(*out, r.thinking_enabled)})},
                 {"usage", usage_of(*out)},
+                {"lse_context", context_of(out->context_tokens, out->context_length)},
                 {"timings", timings_of(*out)}};
       if (!out->cpu_fallbacks.empty()) resp["lse_warnings"] = warnings_of(*out);
       set_content(res, resp);
@@ -955,7 +1033,7 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
                                               {"finish_reason", nullptr}}})}});
         }
 
-        detail::ChatResponseParser parser(r.thinking_enabled, r.chat, id);
+        detail::ChatResponseParser parser(r.framing.reasoning, r.chat, id);
         std::string parser_error;
         auto send_chat_deltas = [&](const std::vector<json>& deltas) {
           for (const auto& delta : deltas) {
@@ -1002,14 +1080,18 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
           return false;
         }
 
+        const char* why = stop_reason_name(out->stop, out->stopped_by_string);
         json last = chat
-            ? json{{"index", 0}, {"delta", json::object()}, {"finish_reason", parser.finish_reason(out->hit_limit)}}
-            : json{{"index", 0}, {"text", ""}, {"finish_reason", finish_reason(out->hit_limit)}};
+            ? json{{"index", 0}, {"delta", json::object()}, {"finish_reason", parser.finish_reason(out->hit_limit)},
+                   {"stop_reason", why}}
+            : json{{"index", 0}, {"text", ""}, {"finish_reason", finish_reason(out->hit_limit)},
+                   {"stop_reason", why}};
         json final{{"id", id},
                    {"object", chunk_object},
                    {"created", created},
                    {"model", impl.opt.model_id},
                    {"choices", json::array({last})},
+                   {"lse_context", context_of(out->context_tokens, out->context_length)},
                    {"timings", timings_of(*out)}};
         if (!out->cpu_fallbacks.empty()) final["lse_warnings"] = warnings_of(*out);
         send(final);

@@ -76,7 +76,7 @@ std::size_t held_suffix(const std::string& s, std::string_view marker) {
 }
 }  // namespace
 
-ChatRequest prepare_chat(const ChatJson& body, bool thinking, const std::string& effort) {
+ChatRequest prepare_chat(const ChatJson& body, const ChatFraming& framing) {
   ChatRequest result;
   if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty())
     bad("messages must be a non-empty array");
@@ -164,7 +164,7 @@ ChatRequest prepare_chat(const ChatJson& body, bool thinking, const std::string&
     } else bad("unsupported message role: " + role);
   }
   if (!pending.empty()) bad("missing tool results at end of conversation");
-  std::string prefix = thinking ? reasoning_effort_instructions(effort.empty() ? "xhigh" : effort) : "";
+  std::string prefix = framing.instruction;
   if (!result.tools.empty()) {
     if (!prefix.empty()) prefix += "\n\n";
     prefix += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
@@ -182,7 +182,7 @@ ChatRequest prepare_chat(const ChatJson& body, bool thinking, const std::string&
   }
   if (!system.empty()) { if (!prefix.empty()) prefix += "\n\n"; prefix += system; }
   if (!prefix.empty()) messages.insert(messages.begin(), {"system", prefix});
-  result.prompt = render_chatml(messages, true, thinking);
+  result.prompt = render_chatml(messages, false) + framing.generation_prompt;
   return result;
 }
 

@@ -666,6 +666,43 @@ LSE_TEST(dflash2_sampled_generator_retains_only_verified_prefix_and_replays) {
   }
 }
 
+LSE_TEST(dflash2_generation_without_a_cap_stops_cleanly_at_a_full_context) {
+  // kv_length 32: with no max_tokens the drafted run ends exactly when the
+  // prompt and the output fill the context, never past it and never with an
+  // error, whether the drafts are accepted or rejected.
+  for (const auto mode : {FixtureWeights::kConstantTokens, FixtureWeights::kRejectedTokens}) {
+    for (const std::uint32_t block : {3u, 8u}) {
+      Fixture fixture;
+      const auto opened = fixture.open(mode, block);
+      LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+      runtime::Session session("full", 1);
+      runtime::Generator request(*fixture.target, greedy_sampling());
+      request.use_dflash2(*fixture.draft);
+      const std::vector<std::uint32_t> prompt{1, 2, 3};
+      auto output = request.generate(session, prompt, runtime::GenerationLimits{});
+      LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+      LSE_EXPECT_EQ(output->size(), 32u - prompt.size());
+      LSE_EXPECT(request.stats().stop_reason == runtime::StopReason::kContextFull);
+      LSE_EXPECT_EQ(request.stats().context_tokens, 32);
+      LSE_EXPECT_EQ(request.stats().context_length, 32);
+      LSE_EXPECT_EQ(session.history().size(), 32u);
+      // The same answer as a plain decode.
+      Fixture plain_fixture;
+      LSE_EXPECT_OK(plain_fixture.open(mode, block));
+      runtime::Generator plain(*plain_fixture.target, greedy_sampling());
+      auto reference = plain.generate(prompt, runtime::GenerationLimits{});
+      LSE_EXPECT(reference.ok() && *reference == *output);
+      LSE_EXPECT(plain.stats().stop_reason == runtime::StopReason::kContextFull);
+      // A prompt longer than the context is refused before any work.
+      std::vector<std::uint32_t> over(33, 1);
+      auto refused = plain.generate(over, runtime::GenerationLimits{});
+      LSE_EXPECT(!refused.ok());
+      LSE_EXPECT(!refused.ok() && refused.status().code() == StatusCode::kOutOfRange);
+      LSE_EXPECT(!refused.ok() && refused.status().message().find("context_full") != std::string::npos);
+    }
+  }
+}
+
 void terminal_and_next_turn(FixtureWeights mode, std::int32_t max_tokens,
                             std::size_t cancel_after,
                             const std::vector<std::uint32_t>& stops,

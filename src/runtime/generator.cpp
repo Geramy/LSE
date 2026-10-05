@@ -353,7 +353,7 @@ Status Generator::verify(Session& session,
   spec_features_ = std::move(capture.features);
 
   const SamplingParams& sp = sampler_.params();
-  const bool greedy = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+  const bool greedy = sp.greedy_argmax();
   const bool reuse = spec_.hidden.valid() && spec_.logits.valid() &&
                      spec_.hidden.node().get() == hidden.node().get() &&
                      spec_.greedy == greedy && (!greedy || spec_.pick.valid());
@@ -413,8 +413,8 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     Session& session, std::vector<float>& prefill_logits,
     const GenerationLimits& limits, const TokenCallback& on_token) {
   std::vector<std::uint32_t> generated;
-  generated.reserve(static_cast<std::size_t>(std::max(limits.max_tokens, 0)));
   if (limits.max_tokens <= 0) return generated;
+  const auto capacity = static_cast<std::size_t>(model_.config().kv_capacity());
 
   const std::uint32_t depth = dflash2_ != nullptr
                                   ? dflash2_verify_depth(dflash2_->block_size())
@@ -459,12 +459,25 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
            limits.stop_tokens.end();
   };
   const auto give = [&](std::uint32_t id) {
-    if (is_stop(id)) return false;
+    if (is_stop(id)) { stats_.stop_reason = StopReason::kStopToken; return false; }
+    // The prompt and the generated tokens never exceed the KV length.
+    if (session.history().size() >= capacity) {
+      stats_.stop_reason = StopReason::kContextFull;
+      return false;
+    }
     generated.push_back(id);
     session.history().push_back(id);
     ++stats_.generated_tokens;
-    if (on_token && !on_token(id)) return false;
-    return static_cast<std::int32_t>(generated.size()) < limits.max_tokens;
+    if (on_token && !on_token(id)) { stats_.stop_reason = StopReason::kCallback; return false; }
+    if (static_cast<std::int32_t>(generated.size()) >= limits.max_tokens) {
+      stats_.stop_reason = StopReason::kMaxTokens;
+      return false;
+    }
+    return true;
+  };
+  // No verifier row fits: the KV length is used up.
+  const auto out_of_positions = [&] {
+    if (stats_.stop_reason == StopReason::kNone) stats_.stop_reason = StopReason::kContextFull;
   };
   // The decoder's answer for row i of the pass just verified.
   const auto answer = [&](std::size_t i) -> Result<std::uint32_t> {
@@ -491,6 +504,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   if (running) {
     const std::uint32_t width = next_width();
     if (width == 0) {
+      out_of_positions();
       running = false;
     } else {
       decode_start = now_ns();
@@ -576,6 +590,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       std::vector<std::uint32_t> caught(answers.begin(), answers.end());
       const std::uint32_t width = next_width();
       if (width == 0) {
+        out_of_positions();
         running = false;
         break;
       }
@@ -596,6 +611,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     pending = answers[good - 1];
     const std::uint32_t width = next_width();
     if (width == 0) {
+      out_of_positions();
       running = false;
       break;
     }
@@ -664,7 +680,19 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   if (prompt.empty()) {
     return LSE_ERROR(kInvalidArgument, "cannot generate from an empty prompt");
   }
+  const std::int32_t capacity = model_.config().kv_capacity();
+  if (prompt.size() > static_cast<std::size_t>(capacity)) {
+    return LSE_ERROR(kOutOfRange, "context_full: the prompt is ", std::to_string(prompt.size()),
+                     " tokens and the context holds ", std::to_string(capacity));
+  }
   stats_ = GenerationStats{};
+  stats_.context_length = capacity;
+  // Set on every return path below that produced tokens.
+  struct ContextTally {
+    GenerationStats& stats;
+    const Session& session;
+    ~ContextTally() { stats.context_tokens = static_cast<std::int32_t>(session.history().size()); }
+  } tally{stats_, session};
   stats_.mtp_depth = mtp_ != nullptr ? limits.mtp_depth : 0;
   stats_.dflash2_depth = dflash2_ != nullptr ? dflash2_verify_depth(dflash2_->block_size()) : 0;
   host_reasons_.clear();
@@ -710,7 +738,6 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   stats_.prefill_ns = now_ns() - prefill_start;
 
   std::vector<std::uint32_t> generated;
-  generated.reserve(static_cast<std::size_t>(std::max(limits.max_tokens, 0)));
 
   const auto is_stop = [&limits](std::uint32_t id) {
     return std::find(limits.stop_tokens.begin(), limits.stop_tokens.end(), id) !=
@@ -723,8 +750,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   // keeps the host path. (The penalty's condition in Sampler::sample is
   // `repetition_penalty != 1.0f`.)
   const SamplingParams& sp = sampler_.params();
-  const bool device_greedy =
-      sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+  const bool device_greedy = sp.greedy_argmax();
 
   std::uint64_t decode_start = 0;
   if (mtp_ != nullptr || dflash2_ != nullptr) {
@@ -734,15 +760,20 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   }
   std::uint32_t next = 0;
   if (limits.max_tokens > 0) next = sampler_.sample(logits, session.history());
+  const auto full = static_cast<std::size_t>(capacity);
   for (std::int32_t n = 0; n < limits.max_tokens; ++n) {
-    if (is_stop(next)) break;
+    if (is_stop(next)) { stats_.stop_reason = StopReason::kStopToken; break; }
+    // The prompt and the generated tokens never exceed the KV length.
+    if (session.history().size() >= full) { stats_.stop_reason = StopReason::kContextFull; break; }
 
     generated.push_back(next);
     session.history().push_back(next);
     ++stats_.generated_tokens;
 
-    if (on_token && !on_token(next)) break;
-    if (n + 1 == limits.max_tokens) break;
+    if (on_token && !on_token(next)) { stats_.stop_reason = StopReason::kCallback; break; }
+    if (n + 1 == limits.max_tokens) { stats_.stop_reason = StopReason::kMaxTokens; break; }
+    // A token the context cannot hold is not worth a decode step.
+    if (session.history().size() >= full) { stats_.stop_reason = StopReason::kContextFull; break; }
 
     // The first token came from prefill. Start timing only when its successor
     // needs a model step, after the first token has been delivered.

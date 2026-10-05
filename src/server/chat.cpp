@@ -37,28 +37,6 @@ std::vector<std::uint32_t> chat_stop_tokens(const tokenizer::Tokenizer& tok) {
 }
 
 
-// Qwen3.x reasoners steer thinking depth with a system prompt, not a token.
-// These instructions are verbatim from the checkpoint chat_template, which
-// ships exactly two of them: the default (xhigh) and low. `medium` is a valid
-// effort level that carries no instruction (the model's middle default), and
-// an empty/unknown level is likewise uninstructed. "" = no instruction.
-std::string reasoning_effort_instructions(const std::string& level) {
-  if (level == "low") {
-    return "Reasoning effort is set to low. Keep your thinking brief and focused, "
-           "moving directly to the conclusion without unnecessary elaboration.";
-  }
-  if (level == "xhigh" || level == "high") {
-    // "high" is accepted as an alias for the template's top level "xhigh"; the
-    // instruction text is the template's xhigh string, which is all the model
-    // was trained with at this depth.
-    return "Reasoning effort is set to xhigh. Please think carefully through the "
-           "task, validate key assumptions, consider plausible alternatives, and "
-           "prioritize correctness, consistency, and clarity in the final answer.";
-  }
-  // "medium" and anything else: no instruction (the template injects nothing).
-  return "";
-}
-
 namespace detail {
 namespace {
 constexpr std::string_view kThinkOpen = "<think>";

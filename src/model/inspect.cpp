@@ -5,6 +5,7 @@
 // the comment beside it names which. When one of those rules changes, the
 // change belongs here as well; tests/test_model_info.cpp compares the two.
 #include "lse/model/inspect.hpp"
+#include "lse/models/thinking_controls.hpp"
 
 #include <algorithm>
 #include <array>
@@ -956,6 +957,15 @@ Result<nlohmann::json> model_info(const std::string& name_or_path) {
   out["kv_cache_dtypes"] = kv_formats_json(kv_layers, config.attn_kv_heads,
                                            config.attn_head_dim, config.mtp_layers > 0);
   out["kv_allocation"] = kv_allocation_json();
+  // What the checkpoint's own files say about generating: sampling defaults
+  // and any output limit (generation_config.json, config.json), and the
+  // thinking levels its chat template defines.
+  out["generation_defaults"] = config.sampling_defaults.to_json();
+  {
+    auto thinking = models::load_thinking_controls(fs::path(ck.paths.config).parent_path().string());
+    out["thinking"] = thinking.ok() ? thinking->to_json()
+                                    : json{{"supported", false}, {"error", std::string(thinking.status().message())}};
+  }
   return out;
 }
 

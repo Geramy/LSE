@@ -41,7 +41,8 @@ struct Options {
   std::string prompt = "Hello";
   runtime::SamplingParams sampling;
   bool temperature_set = false, top_k_set = false, top_p_set = false;
-  bool repetition_penalty_set = false;
+  bool repetition_penalty_set = false, min_p_set = false, presence_penalty_set = false;
+  bool max_tokens_set = false;
   runtime::GenerationLimits limits;
   std::string tokenizer_repo{tokenizer::kQwen36TokenizerRepo};
   // Empty means detect from the checkpoint.
@@ -87,11 +88,15 @@ void usage() {
       "                         repo id such as mlx-community/Qwen3.5-4B-4bit;\n"
       "                         a bare model name resolves when it is unique\n"
       "                         (default: $LSE_MODEL)\n"
-      "  -n, --max-tokens N     tokens to generate (default 256)\n"
+      "  -n, --max-tokens N     tokens to generate at most (default: the model's\n"
+      "                         generation_config limit if it sets one, else no\n"
+      "                         limit: a stop token or a full context ends it)\n"
       "  -t, --temperature F    0 or less is greedy (default: model)\n"
       "      --top-k N          keep the N most likely tokens (default: model)\n"
       "      --top-p F          nucleus threshold (default: model)\n"
       "      --repeat-penalty F penalize repeats, >1 discourages (default: model)\n"
+      "      --min-p F          drop tokens below F x the top probability (default: model)\n"
+      "      --presence-penalty F  subtract F from seen tokens' logits (default: model)\n"
       "  -s, --seed N           sampler seed (default 0)\n"
       "      --tokenizer REPO   HF repo for tokenizer.json, used only when the\n"
       "                         model directory has none (default Qwen/Qwen3.6-27B)\n"
@@ -201,6 +206,7 @@ bool parse(int argc, char** argv, Options* opt) {
     } else if (a == "-n" || a == "--max-tokens") {
       if (!take_value(argc, argv, i, "--max-tokens", &v)) return false;
       opt->limits.max_tokens = std::atoi(v.c_str());
+      opt->max_tokens_set = true;
     } else if (a == "-t" || a == "--temperature") {
       if (!take_value(argc, argv, i, "--temperature", &v)) return false;
       opt->sampling.temperature = std::strtof(v.c_str(), nullptr);
@@ -217,6 +223,14 @@ bool parse(int argc, char** argv, Options* opt) {
       if (!take_value(argc, argv, i, "--repeat-penalty", &v)) return false;
       opt->sampling.repetition_penalty = std::strtof(v.c_str(), nullptr);
       opt->repetition_penalty_set = true;
+    } else if (a == "--min-p") {
+      if (!take_value(argc, argv, i, "--min-p", &v)) return false;
+      opt->sampling.min_p = std::strtof(v.c_str(), nullptr);
+      opt->min_p_set = true;
+    } else if (a == "--presence-penalty") {
+      if (!take_value(argc, argv, i, "--presence-penalty", &v)) return false;
+      opt->sampling.presence_penalty = std::strtof(v.c_str(), nullptr);
+      opt->presence_penalty_set = true;
     } else if (a == "--mtp") {
       if (!take_value(argc, argv, i, "--mtp", &opt->mtp)) return false;
     } else if (a == "--mtp-depth") {
@@ -624,6 +638,8 @@ int main(int argc, char** argv) {
   if (!opt.top_p_set) opt.sampling.top_p = defaults.top_p;
   if (!opt.repetition_penalty_set)
     opt.sampling.repetition_penalty = defaults.repetition_penalty;
+  if (!opt.min_p_set) opt.sampling.min_p = defaults.min_p;
+  if (!opt.presence_penalty_set) opt.sampling.presence_penalty = defaults.presence_penalty;
   if (opt.kv_len > 0) cfg->kv_length = opt.kv_len;
   if (!opt.kv_cache_dtype.empty())
     cfg->kv_cache_dtype = kv::cache_dtype_from_string(opt.kv_cache_dtype).release();
@@ -680,6 +696,17 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // An output limit only when asked for, or when the model's own
+  // generation_config sets one.
+  if (!opt.max_tokens_set) {
+    if (defaults.max_new_tokens) opt.limits.max_tokens = *defaults.max_new_tokens;
+    if (defaults.max_length) {
+      const auto room = std::max<std::int64_t>(
+          0, static_cast<std::int64_t>(*defaults.max_length) - static_cast<std::int64_t>(prompt->size()));
+      opt.limits.max_tokens = static_cast<std::int32_t>(
+          std::min<std::int64_t>(opt.limits.max_tokens, room));
+    }
+  }
   if (opt.limits.stop_tokens.empty()) {
     opt.limits.stop_tokens.push_back(tokenizer::kQwen36Eos);
   }

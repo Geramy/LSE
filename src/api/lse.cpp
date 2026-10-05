@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -47,6 +48,7 @@
 #include "lse/model/mtp.hpp"
 #include "lse/model/registry.hpp"
 #include "lse/model/weights.hpp"
+#include "lse/models/thinking_controls.hpp"
 #include "lse/place/devices.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/server/http_server.hpp"
@@ -308,6 +310,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   };
 
   server::ServerOptions opt;
+  if (c.max_tokens < 0) return invalid("--max-tokens must be 0 (no cap) or positive");
   opt.max_tokens_cap = c.max_tokens;
   opt.max_sessions = c.max_sessions;
   if (c.disable_cpu_fallback) graph::set_cpu_fallback_allowed(false);
@@ -497,11 +500,42 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   cfg->sparse_attention = sparse_attention;
   if (sparse_requested && cfg->attn_head_dim != 256)
     return invalid("experimental sparse attention requires head dimension 256");
-  if (temperature_override) cfg->sampling_defaults.temperature = *temperature_override;
-  std::fprintf(stderr, "sampling defaults: temperature=%.3g top_k=%d top_p=%.3g\n",
-               static_cast<double>(cfg->sampling_defaults.temperature),
-               cfg->sampling_defaults.top_k,
-               static_cast<double>(cfg->sampling_defaults.top_p));
+  if (temperature_override) {
+    cfg->sampling_defaults.temperature = *temperature_override;
+    cfg->sampling_defaults.sources["temperature"] = std::string(models::kFromServerOption);
+  }
+  {
+    // What a request that names no sampling settings gets, and from where.
+    const models::SamplingDefaults& d = cfg->sampling_defaults;
+    std::fprintf(stderr,
+                 "sampling defaults: temperature=%.3g (%s) top_k=%d (%s) top_p=%.3g (%s) min_p=%.3g (%s) "
+                 "repetition_penalty=%.3g (%s) presence_penalty=%.3g (%s)\n",
+                 static_cast<double>(d.temperature), d.source("temperature").c_str(), d.top_k,
+                 d.source("top_k").c_str(), static_cast<double>(d.top_p), d.source("top_p").c_str(),
+                 static_cast<double>(d.min_p), d.source("min_p").c_str(),
+                 static_cast<double>(d.repetition_penalty), d.source("repetition_penalty").c_str(),
+                 static_cast<double>(d.presence_penalty), d.source("presence_penalty").c_str());
+    std::fprintf(stderr, "output limit: %s\n",
+                 c.max_tokens > 0 ? ("server cap " + std::to_string(c.max_tokens) + " tokens").c_str()
+                 : d.max_new_tokens ? ("generation_config max_new_tokens " + std::to_string(*d.max_new_tokens)).c_str()
+                 : d.max_length ? ("generation_config max_length " + std::to_string(*d.max_length)).c_str()
+                 : "none (a stop token, a stop sequence, max_tokens or a full context ends a reply)");
+  }
+  {
+    // The thinking levels come from the model's own chat template.
+    const std::string model_dir = std::filesystem::path(paths->config).parent_path().string();
+    auto thinking = models::load_thinking_controls(model_dir);
+    if (!thinking.ok()) return fail(thinking.status(), "reading the chat template");
+    opt.thinking = thinking.release();
+    std::string levels;
+    for (const auto& l : opt.thinking.levels) levels += (levels.empty() ? "" : ", ") + l.id;
+    std::fprintf(stderr, "thinking: %s\n",
+                 opt.thinking.supported()
+                     ? (levels + " (default " + opt.thinking.default_level + ") from " + opt.thinking.template_path).c_str()
+                     : opt.thinking.template_path.empty()
+                         ? "no chat template; the model is served without thinking controls"
+                         : ("none defined by " + opt.thinking.template_path).c_str());
+  }
   if (c.kv_len > 0) cfg->kv_length = c.kv_len;
   if (!kv_cache_dtype.empty())
     cfg->kv_cache_dtype = kv::cache_dtype_from_string(kv_cache_dtype).release();
@@ -728,7 +762,7 @@ void lse_config_init(lse_config* cfg) {
   cfg->flashprefill_v2 = -1;
   cfg->batch_size = 1024;
   cfg->ubatch_size = 1024;
-  cfg->max_tokens = 4096;
+  cfg->max_tokens = 0;
   cfg->port = 8080;
   cfg->shutdown_grace_seconds = 30;
   cfg->max_sessions = 8;

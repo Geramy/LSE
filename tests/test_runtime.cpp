@@ -4533,6 +4533,43 @@ void mtp_terminal_next_request(bool rejected, std::int32_t max_tokens,
 }
 }
 
+LSE_TEST(mtp_generation_without_a_cap_stops_cleanly_at_a_full_context) {
+  // The transitions fixture counts upward forever and never emits a stop
+  // token; with kv_length 32 and no max_tokens only the context ends it.
+  for (const bool rejected : {false, true}) {
+    auto fixture = build_mtp_fixture(rejected, 16, false, 32, true, true);
+    LSE_EXPECT(fixture.ok); if (!fixture.ok) return;
+    Session session("mtp-full", fixture.lm->state_slots());
+    Generator gen(*fixture.lm, greedy_params());
+    gen.use_mtp(*fixture.mtp);
+    auto out = gen.generate(session, {2, 3}, GenerationLimits{});
+    LSE_EXPECT(out.ok()); if (!out.ok()) { LSE_EXPECT_OK(out.status()); return; }
+    LSE_EXPECT_EQ(out->size(), 30u);
+    LSE_EXPECT(gen.stats().stop_reason == StopReason::kContextFull);
+    LSE_EXPECT_EQ(gen.stats().context_tokens, 32);
+    LSE_EXPECT_EQ(session.history().size(), 32u);
+    auto plain_fixture = build_mtp_fixture(rejected, 16, false, 32, true, true);
+    LSE_EXPECT(plain_fixture.ok); if (!plain_fixture.ok) return;
+    Generator plain(*plain_fixture.lm, greedy_params());
+    auto reference = plain.generate({2, 3}, GenerationLimits{});
+    LSE_EXPECT(reference.ok() && *reference == *out);
+    LSE_EXPECT(plain.stats().stop_reason == StopReason::kContextFull);
+    // A stop token still ends it first, and an explicit limit is honoured.
+    GenerationLimits stop;
+    stop.stop_tokens = {10};
+    Generator stopped(*plain_fixture.lm, greedy_params());
+    auto until = stopped.generate({2, 3}, stop);
+    LSE_EXPECT(until.ok() && until->size() == 6u);
+    LSE_EXPECT(stopped.stats().stop_reason == StopReason::kStopToken);
+    GenerationLimits five;
+    five.max_tokens = 5;
+    Generator capped(*plain_fixture.lm, greedy_params());
+    auto limited = capped.generate({2, 3}, five);
+    LSE_EXPECT(limited.ok() && limited->size() == 5u);
+    LSE_EXPECT(capped.stats().stop_reason == StopReason::kMaxTokens);
+  }
+}
+
 LSE_TEST(mtp_next_request_reuses_full_acceptance_prefix) {
   mtp_terminal_next_request(false, 7, 0, std::numeric_limits<std::uint32_t>::max());
 }

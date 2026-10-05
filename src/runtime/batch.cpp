@@ -1,6 +1,7 @@
 #include "lse/runtime/batch.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 
 #include "lse/graph/interpreter.hpp"
@@ -74,7 +75,7 @@ BatchScheduler::BatchScheduler(HybridLM& model, SamplingParams params,
   // sampler never reads more than the argmax, so B indices come back from the
   // device instead of B whole logit rows. Same condition Generator uses.
   const SamplingParams& sp = sampler_.params();
-  device_greedy_ = sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f;
+  device_greedy_ = sp.greedy_argmax();
 }
 
 BatchScheduler::~BatchScheduler() = default;
@@ -363,8 +364,10 @@ Status BatchScheduler::admit_waiting() {
     s.prompt_tokens = taken.prompt_tokens > 0
                           ? taken.prompt_tokens
                           : static_cast<std::int32_t>(taken.request.prompt.size());
-    s.max_tokens = taken.request.max_tokens +
-                   static_cast<std::int32_t>(taken.generated.size());
+    const auto already = static_cast<std::int64_t>(taken.generated.size());
+    s.max_tokens = static_cast<std::int32_t>(std::min<std::int64_t>(
+        static_cast<std::int64_t>(taken.request.max_tokens) + already,
+        std::numeric_limits<std::int32_t>::max()));
     s.position = 0;
     s.submitted_ns = taken.submitted_ns;
     s.admitted_ns = now_ns();
@@ -554,8 +557,10 @@ Result<std::vector<SequenceResult>> BatchScheduler::run(
       // The prompt is in. This pass's last row is this sequence's next token.
       const std::uint32_t next = picks[r];
       const std::uint64_t at = now_ns();
+      // The prompt and the generated tokens never exceed the KV length.
       if (is_stop(next) ||
-          static_cast<std::int32_t>(s.generated.size()) >= s.max_tokens) {
+          static_cast<std::int32_t>(s.generated.size()) >= s.max_tokens ||
+          s.history.size() >= static_cast<std::size_t>(model_.config().kv_capacity())) {
         s.done = true;
         continue;
       }
@@ -568,7 +573,8 @@ Result<std::vector<SequenceResult>> BatchScheduler::run(
         s.done = true;
         continue;
       }
-      if (static_cast<std::int32_t>(s.generated.size()) >= s.max_tokens) {
+      if (static_cast<std::int32_t>(s.generated.size()) >= s.max_tokens ||
+          s.history.size() >= static_cast<std::size_t>(model_.config().kv_capacity())) {
         s.done = true;
         continue;
       }

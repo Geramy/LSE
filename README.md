@@ -332,7 +332,7 @@ Streaming responses use server-sent events. Set `"stream": true` to request them
 | Endpoint | Support |
 |---|---|
 | `GET /health` | Server and speculation status |
-| `GET /v1/models`, `GET /v1/models/{id}` | Loaded model, with `context_length`, `kv_len`, `kv_cache_dtype` and the draft |
+| `GET /v1/models`, `GET /v1/models/{id}` | Loaded model, with `context_length`, `kv_len`, `kv_cache_dtype`, the draft, `generation_defaults` and `thinking` levels |
 | `GET /v1/lse/model_info` | What the loaded model is; see [model info](#model-info-and-memory-estimates) |
 | `GET`, `POST /v1/lse/estimate` | Device memory for the loaded model at other settings |
 | `POST /v1/chat/completions` | Text chat, reasoning, tools, and streaming |
@@ -344,6 +344,13 @@ A request that carries `"session_id"` continues that session's KV when its promp
 A request without one runs in a session of its own that is released when the request ends.
 Idle sessions beyond `--max-sessions` (default 8) or `--session-memory-budget` are evicted, least recently used first, and so are idle sessions when the device runs out of memory; an evicted session's next request prefills again.
 With a draft module (MTP or DFlash2), switching to another session starts it cold, because the draft's context belongs to the session before it.
+
+LSE sets no output limit of its own. A reply runs until the model ends its turn,
+a stop sequence, the request's `max_tokens`, or a full context. A full context
+ends with `finish_reason: "length"` and `stop_reason: "context_full"`, and every
+response reports `lse_context`. Thinking levels come from the model's chat
+template, and sampling defaults come from its `generation_config.json`. See the
+[API reference](docs/API.md).
 
 Current API limits:
 
@@ -601,6 +608,7 @@ Multi-device model partitioning and continuous HTTP batching remain development 
 | Topic | Document |
 |---|---|
 | Build and runtime setup | [Build instructions](BUILD_INSTRUCTIONS.md) |
+| Output limits, context full, thinking levels, sampling defaults | [API reference](docs/API.md) |
 | Thinking, tools, pi, and API limits | [Client compatibility](docs/CHAT-COMPATIBILITY.md) |
 | DFlash2 model and Q8 conversion | [DFlash2](docs/DFLASH2.md) |
 | In-process C API | [`include/lse/lse.h`](include/lse/lse.h) |

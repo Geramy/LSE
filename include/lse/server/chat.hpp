@@ -23,13 +23,12 @@ struct ChatMessage {
 // its own renderer rather than a different template string.
 //
 // The generation prefix opens a thinking block or supplies an empty block.
+// The chat route instead appends the generation prompt the checkpoint's own
+// template defines for the requested thinking level (thinking_controls.hpp),
+// rendering the turns with add_generation_prompt false.
 [[nodiscard]] std::string render_chatml(const std::vector<ChatMessage>& messages,
                                         bool add_generation_prompt = true,
                                         bool enable_thinking = true);
-
-// System-prompt text a Qwen3.x reasoner uses to steer how hard it
-// thinks, verbatim from the checkpoint chat_template. "" = default.
-[[nodiscard]] std::string reasoning_effort_instructions(const std::string& level);
 
 // Ids that end a turn: the tokenizer's own end-of-sequence plus ChatML's
 // <|im_end|>. Missing ones are skipped, so a tokenizer without them simply

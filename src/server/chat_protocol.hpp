@@ -12,8 +12,18 @@ struct ChatRequest {
   bool require_tool = false;
   bool parallel = true;
 };
+// How the prompt is framed for the requested thinking level, as the model's
+// chat template defines it.
+struct ChatFraming {
+  // Template instruction placed first in the system prompt ("" for none).
+  std::string instruction;
+  // Appended after the conversation to open the assistant turn.
+  std::string generation_prompt = "<|im_start|>assistant\n";
+  // The generation prompt leaves a <think> block open.
+  bool reasoning = false;
+};
 // Throws invalid_argument for unsupported or malformed wire fields.
-ChatRequest prepare_chat(const ChatJson&, bool thinking, const std::string& effort);
+ChatRequest prepare_chat(const ChatJson&, const ChatFraming& framing);
 
 class ChatResponseParser {
  public:
