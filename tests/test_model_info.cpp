@@ -500,6 +500,11 @@ LSE_TEST(estimate_matches_a_real_load_on_the_host_backend) {
   const std::uint64_t before = device_live();
   model::WeightBinder binder(*weights, &config->quantization);
   LSE_EXPECT_OK((*lm)->load(binder));
+  // The scheduler keeps the last program it ran, with that program's
+  // outputs, until the next one replaces it. That is not load memory, and
+  // whether a load ends with one depends on what it evaluated last (the RoPE
+  // tables are no longer evaluated as a graph), so drop it before measuring.
+  LSE_EXPECT_OK(sched->release_program());
   const std::uint64_t target_bytes = device_live() - before;
   // Slabs, the GDN rates prepared at load, and the RoPE tables.
   LSE_EXPECT_EQ(target_bytes, plan["weights_bytes"].get<std::uint64_t>() +
