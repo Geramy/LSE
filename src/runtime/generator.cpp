@@ -380,18 +380,71 @@ Status Generator::verify(Session& session,
     if (n) n->materialized = false;
   }
   const graph::NodePtr roots[] = {root.node()};
-  LSE_RETURN_IF_ERROR(sched->eval(roots, true, &spec_.program));
+  // Greedy pulls its m picks back here. Sampling leaves the logits on the
+  // device: the acceptance walk reads rows as it reaches them
+  // (spec_logit_rows), and it stops at the first rejected proposal.
+  LSE_RETURN_IF_ERROR(sched->eval(roots, greedy, &spec_.program));
 
   if (!greedy) {
-    LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(
-        *spec_.logits.node(), sched->backend()));
+    if (spec_.logits.dtype() != DType::kF32 || spec_.logits.shape().rank() != 3 ||
+        spec_.logits.shape().dim(1) != m) {
+      return LSE_ERROR(kInternal, "verifier logits are not [1, m, vocab] f32");
+    }
     spec_logits_.resize(spec_.logits.shape().elem_count());
-    LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
-        *spec_.logits.node(), spec_logits_.data(),
-        spec_logits_.size() * sizeof(float)));
+    spec_rows_ready_ = 0;
   }
   stats_.spec_verify_ns += now_ns() - started;
   ++stats_.spec_verify_passes;
+  return OkStatus();
+}
+
+// Rows [0, rows) of the last verify pass's logits, on the host.
+//
+// The walk over a pass's rows ends at the first proposal it rejects, so most
+// rows are never looked at: at the 68% acceptance measured on the pinned
+// Qwen 27B + DFlash2 run a step reads about 3 of its 8 rows, and a row is
+// vocab x 4 bytes (0.95 MiB at 248320), copied over the link at ~1.75 GB/s.
+// Reading all eight cost 4.6 ms of every ~94 ms step with the GPU idle.
+// Transfers double -- one row, one more, then two, then four -- so a walk
+// that accepts everything pays four transfers instead of one, and a walk
+// that stops early pays for little more than the rows it read.
+Status Generator::spec_logit_rows(std::size_t rows) {
+  if (rows <= spec_rows_ready_) return OkStatus();
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no usable backend for the verify logits");
+  }
+  const auto m = static_cast<std::size_t>(spec_.logits.shape().dim(1));
+  if (rows > m || spec_logits_.size() != spec_.logits.shape().elem_count()) {
+    return LSE_ERROR(kInternal, "verify logit row ", std::to_string(rows),
+                     " past the pass's ", std::to_string(m));
+  }
+  const std::uint64_t started = now_ns();
+  graph::Node& node = *spec_.logits.node();
+  if (spec_rows_ready_ == 0) {
+    // The pass was submitted, not awaited.
+    LSE_RETURN_IF_ERROR(sched->drain());
+  }
+  const std::size_t v = spec_logits_.size() / m;
+  const std::size_t row_bytes = v * sizeof(float);
+  if (node.kv_fragments || node.buffer.ptr != nullptr || !node.buffer.valid() ||
+      !node.device_dirty) {
+    // Not a plain device buffer: the whole tensor through the interpreter,
+    // which knows every other residency.
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(node, sched->backend()));
+    LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
+        node, spec_logits_.data(), spec_logits_.size() * sizeof(float)));
+    spec_rows_ready_ = m;
+  } else {
+    const std::size_t want = std::min(
+        m, std::max(rows, spec_rows_ready_ == 0 ? std::size_t{1} : 2 * spec_rows_ready_));
+    LSE_RETURN_IF_ERROR(sched->backend().copy(
+        spec_logits_.data() + spec_rows_ready_ * v,
+        backend::MemRef(node.buffer, spec_rows_ready_ * row_bytes),
+        (want - spec_rows_ready_) * row_bytes));
+    spec_rows_ready_ = want;
+  }
+  stats_.spec_verify_ns += now_ns() - started;
   return OkStatus();
 }
 
@@ -528,6 +581,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     bool mismatch = false;
     std::vector<std::uint32_t> answers(m, 0);
     for (std::size_t i = 0; i < m; ++i) {
+      if (!spec_.greedy) LSE_RETURN_IF_ERROR(spec_logit_rows(i + 1));
       bool accepted = false;
       double overlap = 0, candidate_mass = 0, deterministic_mass = 0;
       if (sampled_dflash && i + 1 < m) {

@@ -1117,6 +1117,17 @@ class IBackend {
                           std::size_t dst_offset) = 0;
   virtual Status copy_d2h(const DeviceBuffer& src, void* dst, std::size_t bytes,
                           std::size_t src_offset) = 0;
+  // A host write the device sees in issue order: after every launch already
+  // issued here, before every launch issued after this returns. `src` may be
+  // reused on return. This is the ordering a drain followed by copy_h2d
+  // gives; a backend that can queue the write behind its launches gives it
+  // without the host waiting for the device, and one that cannot does
+  // exactly that drain and copy.
+  virtual Status write_ordered(DeviceBuffer& dst, const void* src,
+                               std::size_t bytes, std::size_t dst_offset) {
+    LSE_RETURN_IF_ERROR(synchronize());
+    return copy_h2d(src, dst, bytes, dst_offset);
+  }
   // A peer copy the two streams order between themselves: it runs after what
   // the producer has queued and the consumer's next work runs after it, with
   // the host in neither edge. A backend that cannot say that falls back to the
@@ -1292,6 +1303,13 @@ class BackendAdapter final : public IBackend {
   Status copy_d2h(const DeviceBuffer& s, void* d, std::size_t n,
                   std::size_t off) override {
     return impl_.copy_d2h(s, d, n, off);
+  }
+  Status write_ordered(DeviceBuffer& d, const void* s, std::size_t n,
+                       std::size_t off) override {
+    if constexpr (requires(Derived& i) { i.write_ordered_impl(d, s, n, off); }) {
+      return impl_.write_ordered_impl(d, s, n, off);
+    }
+    return IBackend::write_ordered(d, s, n, off);
   }
   Status copy_peer_ordered(const DeviceBuffer& s, DeviceBuffer& d,
                            std::size_t n, std::size_t soff, std::size_t doff,

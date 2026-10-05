@@ -68,8 +68,9 @@ Status poke(Array& array, std::span<const float> data) {
   auto* scheduler = graph::default_scheduler();
   if (!scheduler || !array.valid() || data.size() != array.shape().elem_count())
     return LSE_ERROR(kInvalidArgument, "invalid DFlash2 input slot");
-  LSE_RETURN_IF_ERROR(scheduler->drain());
-  LSE_RETURN_IF_ERROR(scheduler->backend().copy(array.node()->buffer, data.data(), data.size_bytes()));
+  // Ordered behind the work that may still read the slot, not behind a drain.
+  LSE_RETURN_IF_ERROR(scheduler->backend().write_ordered(array.node()->buffer, data.data(),
+                                                         data.size_bytes(), 0));
   array.node()->materialized = true;
   array.node()->host_dirty = false;
   array.node()->device_dirty = true;
