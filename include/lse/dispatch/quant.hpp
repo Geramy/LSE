@@ -50,6 +50,15 @@ struct Q4GemmTile {
   // of them, not two of 128.
   const std::uint64_t tall = (m + 127) / 128, short_tiles = (m + 63) / 64;
   if (short_tiles * 56 < tall * 100) return {64, 128, 2, 4};
+  // Wide passes take 64x64 wave tiles, which read each operand fragment
+  // from scratch for four matrix instructions instead of two: 256 rows on
+  // eight waves from 768 rows up, 128 rows on four waves above 256
+  // (gfx1201, M 1024: gate 1.91 -> 1.66 ms, down 2.01 -> 1.64 ms; M 544
+  // 1.38 -> 1.31 ms). They need sixteen accumulators per wave, which the
+  // compiler takes only with its arrays growing per overflow, not per
+  // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
+  if (m >= 768) return {256, 128, 4, 2};
+  if (m > 256) return {128, 128, 2, 2};
   return {128, 128, 2, 4};
 }
 // How many slices of K one contraction is cut into. A workgroup walks its K

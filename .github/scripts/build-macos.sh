@@ -91,6 +91,11 @@ git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/loop-
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/loop-invariant-motion.patch"
 git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/rdna4-prefetch-address-span.patch"
 git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/rdna4-prefetch-address-span.patch"
+# loomc's arrays grow per overflow, not per append. Without it a kernel with
+# more than about 30 matrix operands in one function asks for gigabytes and
+# fails to compile, which rules out the prefill GEMM's 64x64 wave tiles.
+git -C "$work/hrx-source" apply --check "$root/patches/hrx/loom-grow-arrays-only-when-full.patch"
+git -C "$work/hrx-source" apply "$root/patches/hrx/loom-grow-arrays-only-when-full.patch"
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
