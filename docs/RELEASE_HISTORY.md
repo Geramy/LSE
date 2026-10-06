@@ -11,7 +11,7 @@ Requires mac_linuxgpu v0.1.151 (build 255) or later.
 2. **No CPU-only run with the option:** without `--pool`, a GPU backend that fails to start no longer leaves the model on the CPU interpreter. `LSE_REQUIRE_DEVICE_KERNELS=1` has the same effect as the option.
 3. **iOS build** against mac_linuxgpu build 247 and later (owner and selector calls; tested on 246 and 247). The HSA runtime is built under `build/ios/hsa`, so the mac_linuxgpu checkout is only read. `SKIP_HRX=1` links the newly built runtime.
 4. **Faster model load:** the pinned Qwen3.8-27B Q4 + DFlash2 configuration loads in **3.9 s** on driver build 255 (16 GT/s link), down from 16–28 s: streamed weight uploads through a mapped staging ring with `pread`, RoPE tables on all cores, the tokenizer loaded concurrently and mapped load buffers.
-5. **Faster decode:** +6.4% on a 640-token decode (row-at-a-time verify logits, a growing flush interval, small host writes queued behind the stream). Measured on driver 255: 2K prompt **593** tok/s prefill, **28.9** tok/s decode; 4K prompt **630** tok/s prefill, **39.2** tok/s decode.
+5. **Faster decode:** about +4% on a 640-token decode (row-at-a-time verify logits, small host writes queued behind the stream). Measured on driver 255: 2K prompt **592** tok/s prefill, **28.5** tok/s decode; 4K prompt **628** tok/s prefill, **38.4** tok/s decode.
 
 ## v0.5.2: model-defined limits, thinking levels and sampling defaults
 
