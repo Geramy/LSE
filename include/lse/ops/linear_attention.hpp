@@ -101,6 +101,12 @@ struct GatedDeltaNetState {
   Array recurrent;  // [B, value_heads, value_head_dim, value_head_dim]
   Array conv_q, conv_k, conv_v;
   Array conv_qkv;
+  // A pass padded past its last real token. step_mask is 1 at a real step and
+  // 0 at a padded one, step_unmask its complement, both [B, T, value_heads]:
+  // a padded step gets decay 1 and beta 0, which leaves the state as the last
+  // real step left it. tail_rows names the conv-input rows the conv tail
+  // takes (the last kernel-1 real ones) instead of the pass's last rows.
+  Array step_mask, step_unmask, tail_rows;
 };
 
 Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,

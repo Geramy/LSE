@@ -59,7 +59,9 @@ namespace lse::dispatch {
       auto mix = [&](std::uint64_t value) { key ^= value; key *= 1099511628211ull; };
       mix(static_cast<std::uint64_t>(plan.implementation));
       mix(plan.int8_activations);
-      if (inputs.size() == 5 && primitive->name() == "quant_linear.q4_matrix_panel.v1") {
+      if (inputs.size() == 5 && primitive->name() == "quant_linear.q4_gemm_f16.v1") {
+        mix(implementation_id("quant.q4.gemm-f16.v1"));
+      } else if (inputs.size() == 5 && primitive->name() == "quant_linear.q4_matrix_panel.v1") {
         const auto* row = q4_matrix_panel_row(quant_probe);
         mix(implementation_id("quant.q4.matrix-panel.v1"));
         mix(row ? implementation_id(row->key) : 0);

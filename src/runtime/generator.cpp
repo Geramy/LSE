@@ -63,17 +63,50 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 }
 
 // Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
-// two below it}, so the whole engine only ever compiles that many prefill
-// shapes. 0 is one pass, whatever the length.
+// two from kRaggedRun below it} u {1 .. kRaggedRun - 1}, so the engine only
+// ever compiles that many prefill shapes. 0 is one pass, whatever the length.
+//
+// Every pass streams the whole model's weights once, so a pass costs about
+// the same at one row as at sixteen. The remainder below kRaggedRun is
+// therefore one pass of its own width rather than one pass per set bit:
+// 137 tokens run as 9 + 128, not 1 + 8 + 128.
 //
 // Ascending, which puts the ragged remainder first: the last pass is then the
 // widest one, and it is the pass whose final row feeds the LM head. That keeps
 // the logits row on the same linear kernel a single pass would have used,
 // which is the closest a split can get to the unsplit answer.
+constexpr std::size_t kRaggedRun = 16;
+
+// The passes for n tokens: full chunks, and a remainder of at least
+// kRaggedRun tokens as ONE pass padded up to a multiple of kRaggedRun, its
+// padding past the last real token (HybridLM::hidden makes padded steps
+// inert). A remainder below kRaggedRun runs at its own width. Every pass
+// streams all the weights, so one padded pass costs what its width costs,
+// where the power-of-two split paid a whole weight pass per set bit. The
+// widths stay on a ladder of kRaggedRun, so the engine compiles at most
+// chunk / kRaggedRun prefill shapes.
+struct PassPlan { std::size_t width, valid; };
+std::vector<PassPlan> padded_plan(std::size_t n, std::size_t chunk) {
+  std::vector<PassPlan> plan;
+  if (chunk == 0) return {{n, n}};
+  const std::size_t rest = n % chunk;
+  if (rest != 0) {
+    const std::size_t width = rest < kRaggedRun ? rest
+        : std::min(chunk, (rest + kRaggedRun - 1) / kRaggedRun * kRaggedRun);
+    plan.push_back({width, rest});
+  }
+  for (std::size_t i = 0; i < n / chunk; ++i) plan.push_back({chunk, chunk});
+  return plan;
+}
+
 std::vector<std::size_t> prefill_plan(std::size_t n, std::size_t chunk) {
   if (chunk == 0) return {n};
   std::vector<std::size_t> plan;
   std::size_t rest = n % chunk;
+  if (const std::size_t ragged = rest % std::min(kRaggedRun, chunk); ragged != 0) {
+    plan.push_back(ragged);
+    rest -= ragged;
+  }
   for (std::size_t step = 1; rest != 0; step <<= 1) {
     if ((rest & step) != 0) {
       plan.push_back(step);
@@ -116,7 +149,7 @@ void snapshot_trace(GenerationStats* stats, std::vector<std::string>* reasons) {
 
 }  // namespace
 
-Result<Array> Generator::last_hidden(const Array& hidden) {
+Result<Array> Generator::last_hidden(const Array& hidden, std::int64_t valid) {
   if (!hidden.valid()) {
     return LSE_ERROR(kInvalidArgument, "last_hidden on an empty Array");
   }
@@ -129,7 +162,8 @@ Result<Array> Generator::last_hidden(const Array& hidden) {
   if (t <= 0) {
     return LSE_ERROR(kInvalidArgument, "hidden has no sequence axis");
   }
-  Array row = graph::slice(hidden, static_cast<int>(s.rank()) - 2, t - 1, t);
+  const std::int64_t last = valid > 0 && valid <= t ? valid : t;
+  Array row = graph::slice(hidden, static_cast<int>(s.rank()) - 2, last - 1, last);
   Shape flat;
   for (std::size_t i = 0; i < s.rank(); ++i) {
     if (i + 2 == s.rank()) continue;
@@ -236,6 +270,8 @@ Status Generator::mtp_prefill_chunk(const Array& hidden,
 
 Result<std::vector<float>> Generator::step(
     Session& session, const std::vector<std::uint32_t>& tokens) {
+  // A context still held from an earlier prompt lands before this one.
+  LSE_RETURN_IF_ERROR(flush_draft_context());
   // A one-token prompt still goes the long way when the module is in play: the
   // decode head skips the hidden state the module needs for its first row.
   if (tokens.size() == 1 && mtp_ == nullptr && dflash2_ == nullptr) {
@@ -262,32 +298,48 @@ Result<std::vector<float>> Generator::step(
   std::size_t at = 0;
   if (!prefill_batch_.valid())
     return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
-  std::vector<std::size_t> passes;
-  for (const auto batch : prefill_plan(tokens.size(), prefill_batch_.batch_size)) {
-    const auto chunks = prefill_plan(batch, prefill_batch_.ubatch_size);
-    passes.insert(passes.end(), chunks.begin(), chunks.end());
+  std::vector<PassPlan> passes;
+  if (mtp_ == nullptr && prefill_batch_.batch_size % prefill_batch_.ubatch_size == 0) {
+    passes = padded_plan(tokens.size(), prefill_batch_.ubatch_size);
+  } else {
+    for (const auto batch : prefill_plan(tokens.size(), prefill_batch_.batch_size)) {
+      for (const auto c : prefill_plan(batch, prefill_batch_.ubatch_size))
+        passes.push_back({c, c});
+    }
   }
   std::size_t previous_width = 0;
-  for (std::size_t take : passes) {
+  std::size_t last_valid = 0;
+  for (const PassPlan& pass : passes) {
+    const std::size_t take = pass.valid;
     if (previous_width != 0) {
       hidden = {};
-      if (take != previous_width) {
+      if (pass.width != previous_width) {
         LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
       }
     }
-    previous_width = take;
+    previous_width = pass.width;
+    last_valid = take;
     const auto first = tokens.begin() + static_cast<std::ptrdiff_t>(at);
-    LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(
-                                 first, first + static_cast<std::ptrdiff_t>(take))));
+    std::vector<std::uint32_t> pass_ids(first, first + static_cast<std::ptrdiff_t>(take));
+    pass_ids.resize(pass.width, 0u);  // padding past the last real token
+    LSE_ASSIGN_OR(Array ids, token_array(pass_ids));
     model::FeatureCapture capture;
     if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
     LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr,
                                        nullptr, nullptr, false,
                                        dflash2_ != nullptr ? &capture : nullptr, false,
-                                       ops::AttentionExecutionPhase::kPrefill));
+                                       ops::AttentionExecutionPhase::kPrefill,
+                                       static_cast<std::int32_t>(take)));
+    if (dflash2_ != nullptr && take < pass.width)
+      capture.features = graph::slice(capture.features, 1, 0, static_cast<std::int64_t>(take));
     if (dflash2_ != nullptr) {
-      LSE_RETURN_IF_ERROR(dflash2_->append_context(
-          capture.features, base + static_cast<std::int32_t>(at)));
+      if (&pass == &passes.back()) {
+        pending_context_ = capture.features;
+        pending_context_first_ = base + static_cast<std::int32_t>(at);
+      } else {
+        LSE_RETURN_IF_ERROR(dflash2_->append_context(
+            capture.features, base + static_cast<std::int32_t>(at)));
+      }
     }
     if (mtp_ != nullptr) {
       LSE_RETURN_IF_ERROR(mtp_prefill_chunk(
@@ -301,15 +353,25 @@ Result<std::vector<float>> Generator::step(
         carry, base + static_cast<std::int32_t>(tokens.size()), *mtp_));
     prefill_tail_ = session.mtp_tail();
   }
-  LSE_ASSIGN_OR(Array last, last_hidden(hidden));
+  LSE_ASSIGN_OR(Array last, last_hidden(hidden, static_cast<std::int64_t>(last_valid)));
   LSE_ASSIGN_OR(Array logits, model_.lm_head(last));
 
   std::vector<float> out(logits.shape().elem_count());
   LSE_RETURN_IF_ERROR(
       logits.to_host(out.data(), out.size() * sizeof(float)));
   LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
-  if (dflash2_ != nullptr) LSE_RETURN_IF_ERROR(dflash2_->retire_prefill());
+  if (dflash2_ != nullptr && !pending_context_.valid())
+    LSE_RETURN_IF_ERROR(dflash2_->retire_prefill());
   return out;
+}
+
+Status Generator::flush_draft_context() {
+  if (!pending_context_.valid()) return OkStatus();
+  Array features = std::move(pending_context_);
+  pending_context_ = {};
+  if (dflash2_ == nullptr) return OkStatus();
+  LSE_RETURN_IF_ERROR(dflash2_->append_context(features, pending_context_first_));
+  return dflash2_->retire_prefill();
 }
 
 Status Generator::verify(Session& session,
@@ -652,6 +714,9 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
 
   std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
   bool running = give(pending);
+  // The first token is out; the draft's context for the prompt's last pass
+  // goes in now, before anything drafts from it.
+  LSE_RETURN_IF_ERROR(flush_draft_context());
   std::uint64_t decode_start = 0;
 
   std::size_t retained_rows = 0;
@@ -846,6 +911,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     return LSE_ERROR(kOutOfRange, "context_full: the prompt is ", std::to_string(prompt.size()),
                      " tokens and the context holds ", std::to_string(capacity));
   }
+  LSE_RETURN_IF_ERROR(flush_draft_context());
   stats_ = GenerationStats{};
   stats_.context_length = capacity;
   // Set on every return path below that produced tokens.

@@ -1149,7 +1149,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         "host_groups=%u views=%u total_ms=%.3f partition_ms=%.3f "
         "schedule_ms=%.3f emit_ms=%.3f jit_lookup_ms=%.3f "
         "jit_compile_ms=%.3f bind_ms=%.3f submit_ms=%.3f "
-        "host_wait_ms=%.3f readback_ms=%.3f\n",
+        "host_wait_ms=%.3f readback_ms=%.3f slots_allocated=%u slots_reused=%u\n",
         static_cast<unsigned long long>(step_sequence.fetch_add(1)),
         static_cast<int>(ran.ok()), static_cast<int>(trace_.replayed),
         trace_.device_groups, trace_.host_groups, trace_.views_aliased,
@@ -1162,7 +1162,9 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         static_cast<double>(s.bind.ns) / 1e6,
         static_cast<double>(s.submit.ns) / 1e6,
         static_cast<double>(s.host_wait.ns) / 1e6,
-        static_cast<double>(s.readback.ns) / 1e6);
+        static_cast<double>(s.readback.ns) / 1e6,
+        static_cast<unsigned>(trace_.slots_allocated),
+        static_cast<unsigned>(trace_.slots_reused));
   }
 
   const Status accumulated = accumulate(acc_, trace_);

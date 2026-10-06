@@ -298,11 +298,17 @@ struct Wave32L2NormKernel final : KernelPrimitive<Wave32L2NormKernel> {
     const auto lane = e.let(local % kL2Wave);
     const auto head = e.let(math::workgroup_id_x() * (kL2Block / kL2Wave) +
                            local / kL2Wave);
+    const auto rows = static_cast<std::uint32_t>(s.inputs[0].elem_count() / kL2Head);
     const auto row = e.let(head * kL2Head);
+    // A grid that overruns the rows parks the surplus waves on the last row:
+    // they compute and store the same values, so no guard splits the body.
+    const auto safe_row = rows % (kL2Block / kL2Wave) == 0
+                              ? row
+                              : e.let(select(head < rows, row, e.u32((rows - 1u) * kL2Head)));
     std::array<kir::Val<kir::f32>, kL2Head / kL2Wave> values;
     auto partial = e.var(0.0f);
     for (std::uint32_t j = 0; j < values.size(); ++j) {
-      values[j] = e.let(a.x[row + lane + j * kL2Wave]);
+      values[j] = e.let(a.x[safe_row + lane + j * kL2Wave]);
       partial = math::fma(values[j], values[j], partial.read());
     }
     auto sum = e.let(partial.read());
@@ -312,7 +318,7 @@ struct Wave32L2NormKernel final : KernelPrimitive<Wave32L2NormKernel> {
     const auto inv = e.let(
         e.f32(1.0f) / math::max(math::sqrt(sum), e.f32(s.attrs[0])));
     for (std::uint32_t j = 0; j < values.size(); ++j) {
-      e.store(e.let(row + lane + j * kL2Wave), values[j] * inv);
+      e.store(e.let(safe_row + lane + j * kL2Wave), values[j] * inv);
     }
     return k.str();
   }
@@ -323,10 +329,14 @@ struct Wave32L2NormKernel final : KernelPrimitive<Wave32L2NormKernel> {
   DType infer_dtype(std::span<const DType> in) const override {
     return in.empty() ? DType::kF32 : in[0];
   }
-  static ThreadPlan plan_impl(const KernelShapes&) {
+  static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
+    const auto rows = s.inputs.empty()
+                          ? kL2Rows
+                          : static_cast<std::uint32_t>(s.inputs[0].elem_count() / kL2Head);
+    constexpr std::uint32_t per_block = kL2Block / kL2Wave;
     tp.workgroup_size[0] = kL2Block;
-    tp.workgroup_count[0] = kL2Rows / (kL2Block / kL2Wave);
+    tp.workgroup_count[0] = (rows + per_block - 1u) / per_block;
     return tp;
   }
 };

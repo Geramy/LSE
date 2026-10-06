@@ -39,9 +39,14 @@ inline constexpr std::array kFlashCacheRules{
   return false;
 }
 
-[[nodiscard]] constexpr std::uint64_t flash_wmma_lds_bytes(std::uint32_t head_dim) {
+// Query tile, scores and softmax state, plus the smallest value-staging block
+// (16 keys of value_dim + 8 halves) when value_dim is given.
+[[nodiscard]] constexpr std::uint64_t flash_wmma_lds_bytes(std::uint32_t head_dim,
+                                                           std::uint32_t value_dim) {
   const auto padded = (static_cast<std::uint64_t>(head_dim) + 15u) / 16u * 16u;
-  return kFlashQueryTile * (padded * 2u + kFlashKeyWindow * 4u + 3u * 4u);
+  const std::uint64_t staging =
+      value_dim == 0 ? 0 : 16u * (static_cast<std::uint64_t>(value_dim) + 8u) * 2u;
+  return kFlashQueryTile * (padded * 2u + kFlashKeyWindow * 4u + 3u * 4u) + staging;
 }
 
 struct DecodeRule {

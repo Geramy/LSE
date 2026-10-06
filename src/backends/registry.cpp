@@ -109,8 +109,10 @@ struct Trimmers {
   std::map<std::uint64_t, MemoryTrimmer> all;
 };
 Trimmers& trimmers() {
-  static Trimmers t;
-  return t;
+  // Never destroyed: a backend torn down by a static destructor at exit
+  // still unregisters its trimmer, and must find the registry alive.
+  static Trimmers* t = new Trimmers;
+  return *t;
 }
 
 std::string gib(std::uint64_t bytes) {

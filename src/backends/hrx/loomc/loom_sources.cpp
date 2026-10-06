@@ -10,7 +10,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 52> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 55> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -51,7 +51,7 @@ constexpr std::array<graph::PrimitiveSource, 52> kLoomSources{{
      "$t1 = scalar.expf<afn> $t0 : f32\n"
      "$t2 = scalar.constant 1.0 : f32\n"
      "$t3 = scalar.addf $t2, $t1 : f32\n"
-     "$r = scalar.divf $0, $t3 : f32"},
+     "$r = scalar.divf<arcp> $0, $t3 : f32"},
     {"tanh", "$r = scalar.tanhf<afn> $0 : f32"},
     // maxnumf is IEEE-754 maxNum, which is what fmaxf is. maximumf propagates
     // NaN and would disagree with the HIP row on exactly the inputs a softmax
@@ -298,6 +298,90 @@ constexpr std::array<graph::PrimitiveSource, 52> kLoomSources{{
      "$r, $t3 = kernel.subgroup.shuffle<xor> $0, $t0, $t2 : f32, i32, i32"},
 
     {"barrier", "kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}"},
+
+    // Eight consecutive f32 activations as an f16 matrix operand, lanes
+    // ordered k0,k4,k1,k5,k2,k6,k3,k7: the order "q4x8.f16" produces for the
+    // weight codes it meets, so the two agree on which K each lane carries.
+    {"cvt8i.f16.f32",
+     "$t0 = vector.interleave<0> $0, $1 : vector<4xf32>, vector<4xf32> -> vector<8xf32>\n"
+     "$r = vector.fptrunc $t0 : vector<8xf32> to vector<8xf16>"},
+    // One word of eight 4-bit codes as eight f16 weights scale*code + bias.
+    // Each half of a 32-bit lane takes code j and j+4 with exponent bits
+    // 0x6400 above it, which is 1024 + code exactly; adding -1024 is
+    // exact; the scale and the bias each round once. Lane order as above.
+    // Two words of four 8-bit codes (K positions 0-3 and 4-7 of one aligned
+    // run) as eight f16 weights scale*code + bias, in the same lane order as
+    // "q4x8.f16": each 32-bit lane pairs byte j of the first word with byte j
+    // of the second under exponent bits 0x6400, which is 1024 + code exactly.
+    {"q8x8.f16",
+     "$t0 = scalar.fptrunc $2 : f32 to f16\n"
+     "$t1 = scalar.fptrunc $3 : f32 to f16\n"
+     "$t2 = scalar.constant 255 : i32\n"
+     "$t3 = scalar.constant 1677747200 : i32\n"
+     "$t4 = scalar.constant 16 : i32\n"
+     "$t5 = scalar.constant 8 : i32\n"
+     "$t6 = scalar.andi $0, $t2 : i32\n"
+     "$t7 = scalar.andi $1, $t2 : i32\n"
+     "$t8 = scalar.shli $t7, $t4 : i32\n"
+     "$t9 = scalar.ori $t6, $t8 : i32\n"
+     "$t10 = scalar.ori $t9, $t3 : i32\n"
+     "$t11 = scalar.shrui $0, $t5 : i32\n"
+     "$t12 = scalar.shrui $1, $t5 : i32\n"
+     "$t13 = scalar.andi $t11, $t2 : i32\n"
+     "$t14 = scalar.andi $t12, $t2 : i32\n"
+     "$t15 = scalar.shli $t14, $t4 : i32\n"
+     "$t16 = scalar.ori $t13, $t15 : i32\n"
+     "$t17 = scalar.ori $t16, $t3 : i32\n"
+     "$t18 = scalar.shrui $0, $t4 : i32\n"
+     "$t19 = scalar.shrui $1, $t4 : i32\n"
+     "$t20 = scalar.andi $t18, $t2 : i32\n"
+     "$t21 = scalar.andi $t19, $t2 : i32\n"
+     "$t22 = scalar.shli $t21, $t4 : i32\n"
+     "$t23 = scalar.ori $t20, $t22 : i32\n"
+     "$t24 = scalar.ori $t23, $t3 : i32\n"
+     "$t25 = scalar.constant 24 : i32\n"
+     "$t26 = scalar.shrui $0, $t25 : i32\n"
+     "$t27 = scalar.shrui $1, $t25 : i32\n"
+     "$t28 = scalar.shli $t27, $t4 : i32\n"
+     "$t29 = scalar.ori $t26, $t28 : i32\n"
+     "$t30 = scalar.ori $t29, $t3 : i32\n"
+     "$t31 = vector.from_elements $t10, $t17, $t24, $t30 : vector<4xi32>\n"
+     "$t32 = vector.bitcast $t31 : vector<4xi32> to vector<8xf16>\n"
+     "$t33 = scalar.constant -1024.0 : f16\n"
+     "$t34 = vector.splat $t33 : vector<8xf16>\n"
+     "$t35 = vector.addf $t32, $t34 : vector<8xf16>\n"
+     "$t36 = vector.splat $t0 : vector<8xf16>\n"
+     "$t37 = vector.splat $t1 : vector<8xf16>\n"
+     "$t38 = vector.mulf $t35, $t36 : vector<8xf16>\n"
+     "$r = vector.addf $t38, $t37 : vector<8xf16>"},
+    {"q4x8.f16",
+     "$t0 = scalar.fptrunc $1 : f32 to f16\n"
+     "$t1 = scalar.fptrunc $2 : f32 to f16\n"
+     "$t2 = scalar.constant 983055 : i32\n"
+     "$t3 = scalar.constant 1677747200 : i32\n"
+     "$t4 = scalar.andi $0, $t2 : i32\n"
+     "$t5 = scalar.ori $t4, $t3 : i32\n"
+     "$t6 = scalar.constant 4 : i32\n"
+     "$t7 = scalar.shrui $0, $t6 : i32\n"
+     "$t8 = scalar.andi $t7, $t2 : i32\n"
+     "$t9 = scalar.ori $t8, $t3 : i32\n"
+     "$t10 = scalar.constant 8 : i32\n"
+     "$t11 = scalar.shrui $0, $t10 : i32\n"
+     "$t12 = scalar.andi $t11, $t2 : i32\n"
+     "$t13 = scalar.ori $t12, $t3 : i32\n"
+     "$t14 = scalar.constant 12 : i32\n"
+     "$t15 = scalar.shrui $0, $t14 : i32\n"
+     "$t16 = scalar.andi $t15, $t2 : i32\n"
+     "$t17 = scalar.ori $t16, $t3 : i32\n"
+     "$t18 = vector.from_elements $t5, $t9, $t13, $t17 : vector<4xi32>\n"
+     "$t19 = vector.bitcast $t18 : vector<4xi32> to vector<8xf16>\n"
+     "$t20 = scalar.constant -1024.0 : f16\n"
+     "$t21 = vector.splat $t20 : vector<8xf16>\n"
+     "$t22 = vector.addf $t19, $t21 : vector<8xf16>\n"
+     "$t23 = vector.splat $t0 : vector<8xf16>\n"
+     "$t24 = vector.splat $t1 : vector<8xf16>\n"
+     "$t25 = vector.mulf $t22, $t23 : vector<8xf16>\n"
+     "$r = vector.addf $t25, $t24 : vector<8xf16>"},
 }};
 
 struct ResultType {
@@ -306,7 +390,7 @@ struct ResultType {
 };
 
 // Everything not listed produces f32, which is what every arithmetic row does.
-constexpr std::array<ResultType, 13> kNonFloatResults{{
+constexpr std::array<ResultType, 16> kNonFloatResults{{
     {"and.u32", "i32"},
     {"bits.f32", "i32"},
     {"bits.f16", "i32"},
@@ -320,6 +404,9 @@ constexpr std::array<ResultType, 13> kNonFloatResults{{
     {"thread.workgroup_id.y", "index"},
     {"thread.workgroup_size", "index"},
     {"thread.grid_dim.x", "index"},
+    {"cvt8i.f16.f32", "vector<8xf16>"},
+    {"q4x8.f16", "vector<8xf16>"},
+    {"q8x8.f16", "vector<8xf16>"},
 }};
 
 // Only these shared measured layouts match Loom's RDNA4 single-tile catalog.

@@ -1,5 +1,6 @@
 // Typed paged KV; FP32 matrix accumulators and online softmax state.
 #include <cmath>
+#include <cstdlib>
 #include <string_view>
 #include <string>
 #include <vector>
@@ -105,6 +106,22 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
     const auto mrow = e.lds<kir::f32>(QTile);
     const auto drow = e.lds<kir::f32>(QTile);
     const auto arow = e.lds<kir::f32>(QTile);
+    // Value staging: a block of keys' whole value rows, read coalesced from
+    // the cache once and then gathered by every wave from scratch. The block
+    // is 32 keys, or 16 when scratch cannot hold 32 (64 measured no faster on
+    // gfx1201 and halves the workgroups scratch admits).
+    constexpr bool kWideKv =
+        Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16;
+    const bool stage_values = kWideKv && d.dv % 8u == 0u;
+    const std::uint32_t vrow = d.dv + 8u;
+    std::uint32_t vsub = 0;
+    if (stage_values) {
+      const std::uint64_t used = dispatch::attention_shapes::flash_wmma_lds_bytes(d.dh, 0u) + 512u;
+      const std::uint64_t budget = workgroup_lds_bytes(s.device);
+      for (std::uint32_t keys : {32u, 16u})
+        if (vsub == 0 && used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
+    }
+    const auto vs = e.lds<Narrow>(stage_values && vsub ? vsub * vrow : 8u);
     // Reuse alpha scratch for the uniform block-retention vote before softmax.
     const bool sparse = s.attrs[3] == 1.0f;
 
@@ -227,6 +244,27 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
           const auto key = e.let(wbase + (wave + column_tile * 8u) * 16u + lane_lo);
           auto acc = e.local<kir::f32, 8>();
           for (auto f : e.unroll(8u)) acc[f] = e.f32(0.0f);
+          if (kWideKv && d.dh % 16u == 0) {
+            // A key past the row reads the window's first key instead (a live
+            // window starts inside the row): its score is replaced by -inf
+            // below, so only finiteness matters, and the
+            // loads stay unconditional -- all of them issue before the first
+            // matrix instruction waits on one.
+            const auto safe_key = e.let(select(key < row_len, key, wbase));
+            const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+            const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+            const auto kbase = e.let(vector * d.dh + lane_hi * 8u);
+            std::vector<kir::Pack<KvElement<Storage>>> keys;
+            for (std::uint32_t depth = 0; depth < padded_depth; depth += 16u)
+              keys.push_back(e.load(a.k, e.let(kbase + depth), 16u));
+            using Frag = lse::vec<Narrow, 8>;
+            for (std::uint32_t step = 0; step < keys.size(); ++step) {
+              const auto qa = qs.load(e.let(lane_lo * padded_depth + step * 16u + lane_hi * 8u), 16u);
+              acc = math::mma<Mma>(kir::Val<Frag>(&k.types(), &k.ir(), qa.id()),
+                                   kir::Val<Frag>(&k.types(), &k.ir(), keys[step].id()),
+                                   acc.value());
+            }
+          } else {
           for (auto depth : e.range(0u, padded_depth, 16u)) {
             auto af = e.local<Narrow, 8>();
             auto bf = e.local<Narrow, 8>();
@@ -258,6 +296,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
               }
             }
             acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
+          }
           }
           for (auto f : e.unroll(8u))
             write_score(e.let(f + lane_hi * 8u), key, e.let(acc[f].read() * d.scale));
@@ -328,6 +367,55 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
         e.barrier();
 
         if (auto retained_values = e.when(retain.read() != 0.0f)) {
+        if (stage_values && vsub != 0) {
+          for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+            for (auto f : e.unroll(8u)) {
+              const auto row = e.let(f + lane_hi * 8u);
+              o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
+            }
+          }
+          const std::uint32_t pieces_per_key = d.dv / 8u;
+          const std::uint32_t pieces = vsub * pieces_per_key;
+          for (auto sub : e.range(0u, kKWin, vsub)) {
+            // Every value row this block needs, 16 bytes per thread per
+            // piece. A key past the row reads the window's first key: its
+            // probability is exactly zero, so only finiteness matters.
+            std::vector<kir::Pack<KvElement<Storage>>> rows;
+            std::vector<kir::Val<kir::u32>> slots;
+            for (std::uint32_t c = 0; c * kThreads < pieces; ++c) {
+              const auto piece = e.let(select(lid + c * kThreads < pieces,
+                                              lid + c * kThreads, e.u32(pieces - 1u)));
+              const auto slot_key = e.let(piece / pieces_per_key);
+              const auto part = e.let(piece % pieces_per_key);
+              const auto key = e.let(wbase + sub + slot_key);
+              const auto safe_key = e.let(select(key < row_len, key, wbase));
+              const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+              const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+              rows.push_back(e.load(a.v, e.let(vector * d.dv + part * 8u), 16u));
+              slots.push_back(e.let(slot_key * vrow + part * 8u));
+            }
+            if constexpr (kWideKv)
+              for (std::size_t c = 0; c < rows.size(); ++c)
+                k.store_pack<Narrow>(vs.id(), slots[c], rows[c], 16u);
+            e.barrier();
+            for (std::uint32_t tile = 0; tile < vsub; tile += 16u) {
+              const auto key_half = e.let(lane_hi * 8u);
+              auto af = e.local<Narrow, 8>();
+              for (auto f : e.unroll(8u))
+                af[f] = math::narrow<Narrow>(
+                    sc[e.let(lane_lo * kKWin + sub + tile + key_half + f)].read());
+              for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+                const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
+                const auto safe_dim = e.let(select(dimension < d.dv, dimension, e.u32(d.dv - 1u)));
+                auto bf = e.local<Narrow, 8>();
+                for (auto f : e.unroll(8u))
+                  bf[f] = vs[e.let((tile + key_half + f) * vrow + safe_dim)].read();
+                o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
+              }
+            }
+            e.barrier();
+          }
+        } else {
         // A wave owns one D16 tile per 128-channel slice; C remains FP32.
         for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
           const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
@@ -369,6 +457,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
             o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
           }
         }
+        }  // staged values
         }  // retained block
         e.barrier();
         }  // exact block

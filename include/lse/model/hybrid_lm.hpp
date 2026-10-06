@@ -165,7 +165,8 @@ class HybridLM {
                        FeatureCapture* capture = nullptr,
                        bool retain_prefix_state = false,
                        ops::AttentionExecutionPhase attention_phase =
-                           ops::AttentionExecutionPhase::kDecode);
+                           ops::AttentionExecutionPhase::kDecode,
+                       std::int32_t valid_tokens = 0);
 
   // Puts every mixer's sequence cursor back to `position`. The paged
   // pool is overwritten in place by the pass that follows, so this plus a
@@ -241,6 +242,10 @@ class HybridLM {
     Array meta;
     const void* states = nullptr;
     std::int64_t seq = -1;
+    // Real tokens of the pass the program was built for; below seq when the
+    // pass was padded. Its padding masks are leaves of the program, so it
+    // replays only for the same count.
+    std::int64_t valid = -1;
     std::vector<graph::Node*> kv_leaves;
     // The pass shape this slot serves: the token count of its retained
     // program. -1 is an empty slot.

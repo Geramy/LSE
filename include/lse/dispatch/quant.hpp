@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
@@ -20,6 +21,93 @@ struct QuantPlan {
 };
 
 // Shape eligibility is shared by graph construction and device dispatch.
+//
+// The tiled prefill GEMM: 4- or 8-bit codes, groups a whole number of K steps, f32
+// activations and output, float affine planes, and at least kQ4GemmMinRows
+// rows. Whether the device can run it is asked again at dispatch.
+// Whether a device can run the tiled 4-bit GEMM at all: 32-lane waves, a
+// 256-thread workgroup and the RDNA f16 matrix instructions. Asked when the
+// graph is built, because slicing K changes the graph; the kernel asks the
+// precise question (row, load width, scratch) again at dispatch.
+[[nodiscard]] inline bool q4_gemm_device(const backend::DeviceInfo& d) noexcept {
+  const auto f = backend::arch_family(d.arch);
+  return d.wavefront_size == 32 && d.max_threads_per_workgroup >= 256 &&
+         (f == backend::ArchFamily::kRdna3 || f == backend::ArchFamily::kRdna35 ||
+          f == backend::ArchFamily::kRdna4);
+}
+
+struct Q4GemmTile {
+  std::uint32_t bm = 0, bn = 0, wm = 0, wn = 0;
+};
+// The workgroup tile for an M x N contraction. Tall when M fills it; short
+// otherwise, so a short prompt still spreads over the device.
+[[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(std::uint64_t m) noexcept {
+  if (m <= 32) return {32, 128, 1, 8};
+  if (m <= 64) return {64, 128, 2, 4};
+  // A row tile costs about the same whether it is full or not, and a 64-row
+  // tile about 0.56 of a 128-row one (gfx1201, N 5120-17408). A width just
+  // past a multiple of 128 therefore runs on 64-row tiles: 144 rows as three
+  // of them, not two of 128.
+  const std::uint64_t tall = (m + 127) / 128, short_tiles = (m + 63) / 64;
+  if (short_tiles * 56 < tall * 100) return {64, 128, 2, 4};
+  // Wide passes take 64x64 wave tiles, which read each operand fragment
+  // from scratch for four matrix instructions instead of two: 256 rows on
+  // eight waves from 768 rows up, 128 rows on four waves above 256
+  // (gfx1201, M 1024: gate 1.91 -> 1.66 ms, down 2.01 -> 1.64 ms; M 544
+  // 1.38 -> 1.31 ms). They need sixteen accumulators per wave, which the
+  // compiler takes only with its arrays growing per overflow, not per
+  // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
+  if (m >= 768) return {256, 128, 4, 2};
+  if (m > 256) return {128, 128, 2, 2};
+  return {128, 128, 2, 4};
+}
+// How many slices of K one contraction is cut into. A workgroup walks its K
+// range serially, so a grid with fewer workgroups than the device can seat
+// is bound by that walk, not by math or memory; slicing K multiplies the
+// grid until it fills `compute_units` twice over. Each slice keeps at least
+// kQ4GemmMinSliceSteps steps, and slices divide the steps evenly.
+inline constexpr std::uint32_t kQ4GemmMinSliceSteps = 16;
+inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
+[[nodiscard]] constexpr std::uint32_t q4_gemm_slices(
+    std::uint64_t m, std::uint64_t n, std::uint64_t k,
+    std::uint32_t compute_units) noexcept {
+  if (compute_units == 0 || k % kQ4GemmStepK != 0) return 1;
+  const auto t = q4_gemm_tile(m);
+  const std::uint64_t tiles = ((m + t.bm - 1) / t.bm) * ((n + t.bn - 1) / t.bn);
+  const std::uint64_t steps = k / kQ4GemmStepK;
+  std::uint32_t s = 1;
+  while (s < kQ4GemmMaxSlices && tiles * s < 2ull * compute_units &&
+         steps % (2ull * s) == 0 && steps / (2ull * s) >= kQ4GemmMinSliceSteps)
+    s *= 2;
+  return s;
+}
+
+[[nodiscard]] inline bool q4_gemm_shape(const graph::KernelShapes& s) {
+  if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
+      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
+      (s.input_dtypes[2] != DType::kBF16 && s.input_dtypes[2] != DType::kF16) ||
+      s.input_dtypes[3] != s.input_dtypes[2] || s.output_dtype != DType::kF32 ||
+      (s.iattrs[0] != 4 && s.iattrs[0] != 8) || s.iattrs[1] <= 0 ||
+      s.iattrs[1] % static_cast<std::int32_t>(kQ4GemmStepK) != 0 ||
+      !s.inputs[0].rank() || s.inputs[1].rank() != 2)
+    return false;
+  const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
+  const auto n = s.inputs[1].dim(0);
+  const auto lanes = k * s.iattrs[0] / 32;
+  if (k <= 0 || n <= 0 || k % s.iattrs[1] != 0 ||
+      s.inputs[1] != Shape{n, lanes} ||
+      s.inputs[2] != Shape{n, k / s.iattrs[1]} || s.inputs[3] != s.inputs[2])
+    return false;
+  Shape output;
+  for (std::size_t i = 0; i + 1 < s.inputs[0].rank(); ++i)
+    output.push_back(s.inputs[0].dim(i));
+  output.push_back(n);
+  if (s.output != output) return false;
+  const auto m = s.inputs[0].elem_count() / static_cast<std::uint64_t>(k);
+  return m >= kQ4GemmMinRows && m * static_cast<std::uint64_t>(k) <= UINT32_MAX &&
+         m * static_cast<std::uint64_t>(n) <= UINT32_MAX &&
+         static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(lanes) <= UINT32_MAX;
+}
 [[nodiscard]] inline const Q4PanelShape* q4_shared_panel_rule(
     const graph::KernelShapes& s) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||

@@ -7,6 +7,13 @@
 namespace lse::dispatch {
 
 enum class QuantMatrix : std::uint8_t { kNone, kInt8, kInt8Lds, kBF16 };
+
+// Prefill GEMM over 4-bit group-affine weights (q4_gemm.cpp): the K step it
+// stages, and the fewest rows it takes. Up to eight rows the decode-shaped
+// panel forms are the better schedule; a ragged prefill pass of nine to
+// fifteen rows has no panel form and takes the GEMM.
+inline constexpr std::uint32_t kQ4GemmStepK = 64;
+inline constexpr std::uint64_t kQ4GemmMinRows = 9;
 inline constexpr std::uint32_t kQ4MatrixLdsBytes = 6656;
 
 struct QuantMatrixShape {

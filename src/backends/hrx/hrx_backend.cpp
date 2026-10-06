@@ -18,6 +18,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <optional>
 #include <utility>
@@ -1322,6 +1323,60 @@ std::optional<int> HrxBackend::resolve_stable_ref(std::string_view pci,
 }
 #endif  // LSE_HRX_LINKED
 
+// A stream-ordered allocation flushes stream 0 and then waits for the queue
+// to reach it, so every fresh buffer a pass asks for waits on the work
+// already queued -- the host cannot build the next pass while the device
+// runs this one. A buffer whose last reference has dropped is kept here
+// instead and handed to the next allocation of the same size: with stream 0
+// the only stream, every launch that could still touch it runs before any
+// launch issued after the reuse, which is the same ordering the scheduler's
+// own slot reuse within a pass relies on. The memory trimmers empty it (a
+// one-shot request's end, and any allocation that runs out of memory), and
+// it holds at most an eighth of the device.
+struct HrxBackend::Recycler {
+  std::mutex mu;
+  std::unordered_map<std::size_t, std::vector<std::uint64_t>> bins;
+  std::size_t bytes = 0;
+  std::size_t cap = 0;
+  bool alive = true;
+  bool enabled = false;
+
+  std::size_t release_all() {
+    std::unordered_map<std::size_t, std::vector<std::uint64_t>> taken;
+    std::size_t released = 0;
+    {
+      std::lock_guard lock(mu);
+      taken.swap(bins);
+      released = bytes;
+      bytes = 0;
+    }
+#if LSE_HRX_LINKED
+    for (auto& [size, handles] : taken) {
+      (void)size;
+      for (std::uint64_t h : handles) hrx_buffer_release(reinterpret_cast<hrx_buffer_t>(h));
+    }
+#endif
+    return released;
+  }
+  // True when `handle` was kept; the caller releases it otherwise.
+  bool keep(std::uint64_t handle, std::size_t size) {
+    std::lock_guard lock(mu);
+    if (!alive || !enabled || bytes + size > cap) return false;
+    bins[size].push_back(handle);
+    bytes += size;
+    return true;
+  }
+  std::uint64_t take(std::size_t size) {
+    std::lock_guard lock(mu);
+    auto it = bins.find(size);
+    if (it == bins.end() || it->second.empty()) return 0;
+    const std::uint64_t h = it->second.back();
+    it->second.pop_back();
+    bytes -= size;
+    return h;
+  }
+};
+
 Status HrxBackend::init_impl(int device_ordinal) {
 #if !LSE_HRX_LINKED
   (void)device_ordinal;
@@ -1473,6 +1528,11 @@ Status HrxBackend::init_impl(int device_ordinal) {
 #endif
 
   initialized_ = true;
+  recycler_ = std::make_shared<Recycler>();
+  recycler_->enabled = true;
+  recycler_->cap = static_cast<std::size_t>(info_.total_memory / 8u);
+  recycle_trimmer_ = backend::register_memory_trimmer(
+      [recycler = recycler_] { return recycler->release_all(); });
   // Once per process: the runtime is shared by every instance.
   static std::once_flag reporter;
   std::call_once(reporter, [] {
@@ -1528,13 +1588,23 @@ Status HrxBackend::flush_stream(std::uint32_t) {
 }
 #endif
 
+bool HrxBackend::single_stream() const {
+  if (physical_count_ > 1 || !hrx_sole_residency(device_index())) return false;
+  for (std::size_t i = 1; i < streams_.size(); ++i)
+    if (streams_[i] != nullptr) return false;
+  return true;
+}
+
 void HrxBackend::adopt(DeviceBuffer& buf, std::uint64_t handle,
                        std::size_t bytes) {
   buf.handle = handle;
   buf.size_bytes = bytes;
   buf.storage = std::shared_ptr<void>(
-      reinterpret_cast<void*>(handle), [this](void* p) {
-        release_buffer(reinterpret_cast<std::uint64_t>(p));
+      reinterpret_cast<void*>(handle),
+      [this, recycler = recycler_, bytes](void* p) {
+        const auto h = reinterpret_cast<std::uint64_t>(p);
+        if (recycler && recycler->keep(h, bytes)) return;
+        release_buffer(h);
       });
 }
 
@@ -1568,6 +1638,14 @@ void HrxBackend::shutdown_impl() noexcept {
       hrx_event_release(static_cast<hrx_event_t>(e));
     }
     graveyard_->retired.clear();
+  }
+  if (recycler_) {
+    backend::unregister_memory_trimmer(recycle_trimmer_);
+    {
+      std::lock_guard lock(recycler_->mu);
+      recycler_->alive = false;
+    }
+    (void)recycler_->release_all();
   }
   // Before the device: each executable retains it.
   for (void* e : loaded_executables_) {
@@ -1648,6 +1726,24 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
     // buffer inserts every buffer it dispatches against into its own resource
     // set at *record* time, so memory another stream still references cannot
     // be handed back to the pool here, flushed or not.
+    if (recycler_ && recycler_->enabled) {
+      if (single_stream()) {
+        if (const std::uint64_t h = recycler_->take(bytes); h != 0) {
+          DeviceBuffer out;
+          out.size_bytes = bytes;
+          adopt(out, h, bytes);
+          return out;
+        }
+      } else {
+        // Another stream is in use now: what was kept may still be read
+        // there, so none of it is handed out again.
+        {
+          std::lock_guard lock(recycler_->mu);
+          recycler_->enabled = false;
+        }
+        (void)recycler_->release_all();
+      }
+    }
     auto stream = stream_at(0);
     if (!stream.ok()) return stream.status();
     hrx_status_t allocated = hrx_buffer_allocate(
@@ -2021,6 +2117,47 @@ Status HrxBackend::copy_ordered_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                              reinterpret_cast<hrx_buffer_t>(dst.handle),
                              dst.offset + dst_offset, bytes),
       "hrx_stream_copy_buffer (ordered)");
+#endif
+}
+
+Status HrxBackend::zero_ordered_impl(DeviceBuffer& dst, std::size_t bytes,
+                                     std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)dst; (void)bytes; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (dst.handle == 0) return LSE_ERROR(kInvalidArgument, "null buffer in zero_ordered");
+  if (dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "zero_ordered runs past the end of the buffer");
+  }
+  if (bytes == 0) return OkStatus();
+  // The same ordering write_ordered gives, with no size limit: a fill carries
+  // its pattern, not the bytes. Fresh recurrent state used to be a vector of
+  // zeros copied with copy_h2d, which waits for every stream first -- one
+  // full device wait per state, ninety-six per one-shot request on a 64-layer
+  // hybrid.
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  if (other_streams || dst.ptr != nullptr) {
+    const std::vector<std::byte> zeros(bytes, std::byte{0});
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    return copy_h2d_impl(zeros.data(), dst, bytes, dst_offset);
+  }
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  LSE_SYNC_TRACE("zero_ordered %zu bytes", bytes);
+  const std::size_t at = dst.offset + dst_offset;
+  const std::uint32_t pattern = 0;
+  const std::size_t width = (at % 4 == 0 && bytes % 4 == 0) ? 4 : 1;
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_fill_buffer(static_cast<hrx_stream_t>(*stream),
+                             reinterpret_cast<hrx_buffer_t>(dst.handle), at,
+                             bytes, &pattern, width),
+      "hrx_stream_fill_buffer"));
+  ordered_writes_pending_ = true;
+  return OkStatus();
 #endif
 }
 

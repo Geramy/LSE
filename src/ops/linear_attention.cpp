@@ -32,7 +32,7 @@ Status validate_rate_shape(const Array& rate, const GatedDeltaNetSpec& spec) {
 // no concat of tail ++ x and no slices, which is what keeps the decode-path
 // copy count down. A null or empty tail is the stateless full-sequence path.
 Array conv_stream(const Array& x, const Array& weight, const Array& bias,
-                  bool has_bias, Array* tail) {
+                  bool has_bias, Array* tail, const Array& tail_rows = {}) {
   // weight.dtype(), not x's: the conv kernel reads filter and bias through one
   // element type, so a bias in the activation's dtype fails its argument bind.
   // On HRX that surfaces as a kernel with an empty body and an output of exactly
@@ -43,7 +43,15 @@ Array conv_stream(const Array& x, const Array& weight, const Array& bias,
                       : Array::zeros(Shape{weight.shape().dim(0)}, weight.dtype());
   if (tail == nullptr || !tail->valid()) return graph::causal_conv1d(x, weight, b);
   const Array prev = *tail;
-  *tail = graph::conv_tail(prev, x);
+  if (tail_rows.valid()) {
+    // A padded pass: the tail is the last kernel-1 real rows, wherever the
+    // pass's last real token falls.
+    const Shape& sx = x.shape();
+    const Array flat = graph::reshape(x, Shape{sx.dim(0) * sx.dim(1), sx.dim(2)});
+    *tail = graph::reshape(graph::gather_rows(flat, tail_rows), prev.shape());
+  } else {
+    *tail = graph::conv_tail(prev, x);
+  }
   return graph::causal_conv1d(x, weight, b, prev);
 }
 
@@ -109,20 +117,24 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   if (spec.layout == ProjLayout::kFusedQKV) {
     qkv = conv_stream(graph::linear(x, w.in_proj_qkv), w.conv_w, w.conv_b,
                       spec.conv_bias,
-                      state != nullptr ? &state->conv_qkv : nullptr);
+                      state != nullptr ? &state->conv_qkv : nullptr,
+                      state != nullptr ? state->tail_rows : Array{});
     q_raw = graph::slice(qkv, -1, 0, key_width);
     k_raw = graph::slice(qkv, -1, key_width, 2 * key_width);
     v_raw = graph::slice(qkv, -1, 2 * key_width, 2 * key_width + value_width);
   } else {
     q_raw = conv_stream(graph::linear(x, w.in_proj_q), w.conv_q_w, w.conv_q_b,
                         spec.conv_bias,
-                        state != nullptr ? &state->conv_q : nullptr);
+                        state != nullptr ? &state->conv_q : nullptr,
+                        state != nullptr ? state->tail_rows : Array{});
     k_raw = conv_stream(graph::linear(x, w.in_proj_k), w.conv_k_w, w.conv_k_b,
                         spec.conv_bias,
-                        state != nullptr ? &state->conv_k : nullptr);
+                        state != nullptr ? &state->conv_k : nullptr,
+                        state != nullptr ? state->tail_rows : Array{});
     v_raw = conv_stream(graph::linear(x, w.in_proj_v), w.conv_v_w, w.conv_v_b,
                         spec.conv_bias,
-                        state != nullptr ? &state->conv_v : nullptr);
+                        state != nullptr ? &state->conv_v : nullptr,
+                        state != nullptr ? state->tail_rows : Array{});
   }
 
   // A speculative verify's few rows take SiLU and the head norm of q and k
@@ -180,6 +192,11 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
       alpha = graph::repeat(alpha, ratio, -1);
       beta = graph::repeat(beta, ratio, -1);
     }
+  }
+
+  if (state != nullptr && state->step_mask.valid()) {
+    alpha = alpha * state->step_mask + state->step_unmask;
+    beta = beta * state->step_mask;
   }
 
   Array s_in = state != nullptr && state->recurrent.valid()

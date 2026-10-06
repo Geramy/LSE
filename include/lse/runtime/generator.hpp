@@ -214,7 +214,9 @@ class Generator {
   }
 
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
-  static Result<graph::Array> last_hidden(const graph::Array& hidden);
+  // `valid` rows of the sequence axis are real (0: all of them).
+  static Result<graph::Array> last_hidden(const graph::Array& hidden,
+                                          std::int64_t valid = 0);
 
  private:
   // Runs `tokens` from the session's current position and returns the logits
@@ -304,6 +306,12 @@ class Generator {
   model::DFlash2Module* dflash2_ = nullptr;
   graph::Array spec_features_;
   Status append_draft_context(std::size_t rows, std::int32_t first);
+  // The prompt's last pass's target features, for the DFlash2 context. The
+  // first token needs only the target's logits, so this pass is appended
+  // after that token is out (flush_draft_context), not before it.
+  graph::Array pending_context_;
+  std::int32_t pending_context_first_ = 0;
+  Status flush_draft_context();
 
   // Runs row tokens at the session cursor and leaves the
   // per-row answers readable: the greedy picks in spec_, the raw logits in

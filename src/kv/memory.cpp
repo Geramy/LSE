@@ -86,7 +86,9 @@ Status FragmentStorage::reserve(std::size_t bytes) {
   }
   LSE_ASSIGN_OR(auto table, backend_.allocate(addresses.size() * sizeof(std::uint64_t),
       backend::MemoryClass::kDevice, stream_));
-  LSE_RETURN_IF_ERROR(backend_.copy_h2d(addresses.data(), table, table.size_bytes, 0));
+  // Ordered behind the launches already issued rather than after a wait for
+  // them: nothing has read this table yet, and every reader is queued later.
+  LSE_RETURN_IF_ERROR(backend_.write_ordered(table, addresses.data(), table.size_bytes, 0));
   table_ = std::move(table);
   return OkStatus();
 }
@@ -111,8 +113,7 @@ Status FragmentStorage::grow(std::size_t bytes) {
            fragments[i].offset == span.offset + span.size_bytes) {
       span.size_bytes += fragments[i++].size_bytes;
     }
-    const std::vector<std::byte> zeros(span.size_bytes, std::byte{0});
-    LSE_RETURN_IF_ERROR(backend_.copy_h2d(zeros.data(), span, zeros.size(), 0));
+    LSE_RETURN_IF_ERROR(backend_.zero_ordered(span, span.size_bytes, 0));
   }
   std::vector<std::uint64_t> addresses;
   addresses.reserve(count - fragments_.size());
@@ -120,7 +121,7 @@ Status FragmentStorage::grow(std::size_t bytes) {
     LSE_ASSIGN_OR(auto pointer, backend_.device_pointer(fragments[i]));
     addresses.push_back(reinterpret_cast<std::uintptr_t>(pointer));
   }
-  LSE_RETURN_IF_ERROR(backend_.copy_h2d(addresses.data(), table_,
+  LSE_RETURN_IF_ERROR(backend_.write_ordered(table_, addresses.data(),
       addresses.size() * sizeof(std::uint64_t), fragments_.size() * sizeof(std::uint64_t)));
   fragments_ = std::move(fragments);
   size_bytes_ = bytes;

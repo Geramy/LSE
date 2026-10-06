@@ -47,6 +47,10 @@ struct MixerState {
   // Sequence cursor for every mixer, including GDN-only models. Zero marks
   // a fresh sequence when choosing whether retained carry-ins must be cleared.
   std::int32_t position = 0;
+  // A prefill pass padded past its last real token: per-step mask for the
+  // recurrence (1 real, 0 padded, and its complement) and the rows of the
+  // conv input that become the conv tail. Unset on an unpadded pass.
+  Array pad_mask, pad_unmask, pad_tail_rows;
 
   [[nodiscard]] bool empty() const noexcept {
     return !gdn_state.valid() && !key_cache.valid();
