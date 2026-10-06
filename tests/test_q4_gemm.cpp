@@ -5,6 +5,9 @@
 // compares a sample of outputs against the oracle and reports the mean time
 // of `reps` replays.
 #include "harness.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
+#include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 #include "lse/dispatch/quant.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
@@ -92,6 +95,79 @@ LSE_TEST(q4_gemm_shape_routes_prefill_rows_to_the_tiled_gemm) {
                           leaf({6144, 80}, DType::kBF16), 4, 64);
     NodePtr zg = z.node()->inputs.size() == 1 ? z.node()->inputs[0] : z.node();
     LSE_EXPECT(zg->inputs.size() == 5u && zg->inputs[4].get() == panel.get());
+  }
+}
+
+LSE_TEST(q4_gemm_emits_for_every_tile_and_width_on_a_described_device) {
+  // No device: the kernel is emitted for a gfx1201 description, for each tile
+  // the policy picks and both code widths, plain and K-sliced.
+  backend::DeviceInfo device;
+  backend::AmdDeviceInfo amd;
+  device.arch = "gfx1201";
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
+  for (const unsigned bits : {4u, 8u}) {
+    for (const std::int64_t m : {16, 64, 137, 1024}) {
+      const std::int64_t n = 5120, k = 6144;
+      auto x = leaf({1, m, k}, DType::kF32);
+      auto panel_node = std::make_shared<Node>();
+      panel_node->shape = Shape{m, k};
+      panel_node->dtype = DType::kF16;
+      panel_node->materialized = true;
+      for (const std::int32_t slices : {1, 2}) {
+        auto gemm = std::make_shared<Node>();
+        gemm->set_kind(OpKind::kCustom);
+        gemm->dtype = DType::kF32;
+        gemm->inputs = {x.node(), leaf({n, k * bits / 32}, DType::kU32).node(),
+                        leaf({n, k / 64}, DType::kBF16).node(),
+                        leaf({n, k / 64}, DType::kBF16).node(), panel_node};
+        gemm->iattrs[0] = static_cast<std::int32_t>(bits);
+        gemm->iattrs[1] = 64;
+        gemm->shape = Shape{1, m, n};
+        gemm->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+        if (slices > 1) {
+          gemm->prim = find_primitive("quant_linear.q4_gemm_f16.slices.v1");
+          gemm->shape = Shape{slices, 1, m, n};
+          gemm->iattrs[2] = slices;
+        }
+        LSE_EXPECT(gemm->prim != nullptr);
+        if (!gemm->prim) continue;
+        gemm->fclass = gemm->prim->fusion_class();
+        const NodePtr roots[]{gemm};
+        const auto groups = Partitioner::partition(roots, &device);
+        LSE_EXPECT_EQ(groups.size(), 1u);
+        if (groups.size() != 1) continue;
+        auto emitted = backend::LoomEmitter{}.emit(groups[0], device);
+        if (!emitted.ok())
+          std::fprintf(stderr, "q4 gemm emission M%lld bits %u slices %d: %s\n",
+                       static_cast<long long>(m), bits, slices,
+                       std::string(emitted.status().message()).c_str());
+        LSE_EXPECT(emitted.ok());
+        if (emitted.ok())
+          LSE_EXPECT(emitted->source.find("vector.mma") != std::string::npos);
+        // Q4G_TEST_COMPILE: also compile each kernel for the description and
+        // print what the allocator gave it -- no device involved.
+        if (emitted.ok() && std::getenv("Q4G_TEST_COMPILE")) {
+          const backend::LoomcCompiler compiler;
+          auto compiled = compiler.compile(emitted->source, device.arch);
+          if (!compiled.ok()) {
+            std::fprintf(stderr, "q4 gemm compile M%lld bits %u slices %d: %s\n",
+                         static_cast<long long>(m), bits, slices,
+                         std::string(compiled.status().message()).c_str());
+          } else {
+            for (const auto& r : compiled->resources)
+              std::printf("q4 gemm M%lld bits %u slices %d: vgpr %u sgpr %u lds %u "
+                          "vspill %u sspill %u\n",
+                          static_cast<long long>(m), bits, slices,
+                          r.vector_registers.value_or(0), r.scalar_registers.value_or(0),
+                          r.workgroup_segment_bytes.value_or(0),
+                          r.vector_spills.value_or(0), r.scalar_spills.value_or(0));
+          }
+          LSE_EXPECT(compiled.ok());
+        }
+      }
+    }
   }
 }
 
