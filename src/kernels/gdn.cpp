@@ -156,19 +156,26 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     // of steps can read all its inputs before the first dependent update:
     // the loads do not depend on the state, and issuing them together pays
     // their latency once per block instead of once per step.
-    const std::uint32_t blocks = seq / kStepBlock;
-    for (auto tb : e.range(0u, blocks, 1u)) {
-      const auto t0 = e.let(tb * kStepBlock);
+    const auto block = [&](const kir::Val<kir::u32>& t0, std::uint32_t steps) {
       std::vector<StepIn> ins;
-      ins.reserve(kStepBlock);
-      for (std::uint32_t u = 0; u < kStepBlock; ++u)
+      ins.reserve(steps);
+      for (std::uint32_t u = 0; u < steps; ++u)
         ins.push_back(load_step(e.let(t0 + u)));
-      for (std::uint32_t u = 0; u < kStepBlock; ++u)
+      for (std::uint32_t u = 0; u < steps; ++u)
         run_step(e.let(t0 + u), ins[u]);
+    };
+    // Whole blocks in a loop; the remainder, shorter than a block, in
+    // straight-line code. A loop is emitted only when it repeats: a
+    // one-trip loop and a short tail loop beside it are a control shape the
+    // target's branch lowering refuses.
+    const std::uint32_t blocks = seq / kStepBlock;
+    if (blocks > 1) {
+      for (auto tb : e.range(0u, blocks, 1u)) block(e.let(tb * kStepBlock), kStepBlock);
+    } else if (blocks == 1) {
+      block(e.u32(0), kStepBlock);
     }
-    for (auto t : e.range(blocks * kStepBlock, seq, 1u)) {
-      run_step(t, load_step(t));
-    }
+    if (const std::uint32_t tail = seq - blocks * kStepBlock; tail != 0)
+      block(e.u32(blocks * kStepBlock), tail);
   } else {
   for (auto t : e.range(seq)) {
     const auto sc = (b * seq + t) * heads + h;

@@ -60,17 +60,27 @@ Result<Array> token_array(const std::vector<std::uint32_t>& ids) {
 }
 
 // Splits `n` tokens into consecutive passes sized from {chunk} u {powers of
-// two below it}, so the whole engine only ever compiles that many prefill
-// shapes. 0 is one pass, whatever the length.
+// two from kRaggedRun below it} u {1 .. kRaggedRun - 1}, so the engine only
+// ever compiles that many prefill shapes. 0 is one pass, whatever the length.
+//
+// Every pass streams the whole model's weights once, so a pass costs about
+// the same at one row as at sixteen. The remainder below kRaggedRun is
+// therefore one pass of its own width rather than one pass per set bit:
+// 137 tokens run as 9 + 128, not 1 + 8 + 128.
 //
 // Ascending, which puts the ragged remainder first: the last pass is then the
 // widest one, and it is the pass whose final row feeds the LM head. That keeps
 // the logits row on the same linear kernel a single pass would have used,
 // which is the closest a split can get to the unsplit answer.
+constexpr std::size_t kRaggedRun = 16;
 std::vector<std::size_t> prefill_plan(std::size_t n, std::size_t chunk) {
   if (chunk == 0) return {n};
   std::vector<std::size_t> plan;
   std::size_t rest = n % chunk;
+  if (const std::size_t ragged = rest % std::min(kRaggedRun, chunk); ragged != 0) {
+    plan.push_back(ragged);
+    rest -= ragged;
+  }
   for (std::size_t step = 1; rest != 0; step <<= 1) {
     if ((rest & step) != 0) {
       plan.push_back(step);
