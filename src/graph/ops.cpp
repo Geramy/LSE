@@ -456,10 +456,14 @@ Array scatter_add_rows(const Array& base, const Array& rows,
   return Array(n);
 }
 
+bool topk_pairs_fits(std::int64_t width, int k) noexcept {
+  return width >= 4096 && width < 16777215 && k >= 1 && k <= 32;
+}
+
 Array topk_pairs(const Array& x, int k) {
   if (!x.valid() || !x.shape().rank() || x.dtype() != DType::kF32) return {};
   const auto width = x.shape().dim(x.shape().rank() - 1);
-  if (width < 4096 || width >= 16777215 || k < 1 || k > 32) return {};
+  if (!topk_pairs_fits(width, k)) return {};
   // Scan stages of 256 threads x `per` registers each: a wide first stage
   // leaves a few chunks' k candidates, which the next stage (or two) reduce
   // to one chunk.

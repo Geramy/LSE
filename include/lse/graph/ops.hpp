@@ -118,6 +118,8 @@ Array topk(const Array& x, int k, int axis = -1, Array* indices = nullptr,
 // copy. Rows of at least 4096; an invalid Array when the row is narrower or
 // k is outside [1, 32].
 Array topk_pairs(const Array& x, int k);
+// Whether topk_pairs takes a row of `width` with this k.
+bool topk_pairs_fits(std::int64_t width, int k) noexcept;
 
 // Index of the row maximum over the last axis, as f32 (the engine's index
 // convention — see topk). Ties take the smallest index, matching the host

@@ -421,8 +421,12 @@ Status Generator::verify(Session& session,
   const SamplingParams& sp = sampler_.params();
   const bool greedy = sp.greedy_argmax();
   const auto vocab = static_cast<std::size_t>(model_.config().vocab_size);
-  const std::uint32_t top_k = !greedy && sampler_.decided_by_top(kSpecTopLimit, vocab)
-                                  ? static_cast<std::uint32_t>(sp.top_k) : 0u;
+  // A vocabulary narrower than the device top-k's rows keeps the row
+  // readback, as every sampling setting the top-k does not decide does.
+  const std::uint32_t top_k =
+      !greedy && sampler_.decided_by_top(kSpecTopLimit, vocab) &&
+              graph::topk_pairs_fits(static_cast<std::int64_t>(vocab), sp.top_k)
+          ? static_cast<std::uint32_t>(sp.top_k) : 0u;
   const bool reuse = spec_.hidden.valid() && spec_.logits.valid() &&
                      spec_.hidden.node().get() == hidden.node().get() &&
                      spec_.greedy == greedy && (!greedy || spec_.pick.valid()) &&
