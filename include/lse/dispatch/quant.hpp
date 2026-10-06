@@ -44,6 +44,12 @@ struct Q4GemmTile {
 [[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(std::uint64_t m) noexcept {
   if (m <= 32) return {32, 128, 1, 8};
   if (m <= 64) return {64, 128, 2, 4};
+  // A row tile costs about the same whether it is full or not, and a 64-row
+  // tile about 0.56 of a 128-row one (gfx1201, N 5120-17408). A width just
+  // past a multiple of 128 therefore runs on 64-row tiles: 144 rows as three
+  // of them, not two of 128.
+  const std::uint64_t tall = (m + 127) / 128, short_tiles = (m + 63) / 64;
+  if (short_tiles * 56 < tall * 100) return {64, 128, 2, 4};
   return {128, 128, 2, 4};
 }
 // How many slices of K one contraction is cut into. A workgroup walks its K
