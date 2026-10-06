@@ -150,8 +150,8 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // Key heads are shared across value heads, GQA-style.
   const auto ratio = static_cast<int>(vh / kh);
   if (ratio > 1) {
-    q = graph::repeat(q, ratio, 2);
-    k = graph::repeat(k, ratio, 2);
+    // q and k stay at the key heads: the scan maps each value head to its
+    // key head, which saves materializing two repeated copies per layer.
     if (!spec.decay_per_value_head) {
       alpha = graph::repeat(alpha, ratio, -1);
       beta = graph::repeat(beta, ratio, -1);

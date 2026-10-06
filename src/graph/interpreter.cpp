@@ -378,8 +378,14 @@ Status eval_gated_delta(Node& n) {
 
   const auto batch = static_cast<std::size_t>(q.shape.dim(0));
   const auto seq = static_cast<std::size_t>(q.shape.dim(1));
-  const auto heads = static_cast<std::size_t>(q.shape.dim(2));
+  // Value heads; q and k may carry fewer heads, each shared by a run of
+  // value heads (GQA-style).
+  const auto heads = static_cast<std::size_t>(v.shape.dim(2));
+  const auto key_heads = static_cast<std::size_t>(q.shape.dim(2));
   const auto dim = static_cast<std::size_t>(q.shape.dim(3));
+  if (key_heads == 0 || heads % key_heads != 0 ||
+      static_cast<std::size_t>(k.shape.dim(2)) != key_heads)
+    return LSE_ERROR(kInvalidArgument, "gated delta key heads do not divide value heads");
 
   std::vector<double> state(batch * heads * dim * dim);
   for (std::size_t i = 0; i < state.size(); ++i) state[i] = static_cast<double>(load_element(s_in, i));
@@ -390,6 +396,7 @@ Status eval_gated_delta(Node& n) {
       for (std::size_t h = 0; h < heads; ++h) {
         double* S = state.data() + ((bi * heads) + h) * dim * dim;
         const std::size_t vec = (((bi * seq) + t) * heads + h) * dim;
+        const std::size_t kvec = (((bi * seq) + t) * key_heads + h / (heads / key_heads)) * dim;
         const std::size_t sc = ((bi * seq) + t) * heads + h;
 
         const double a = static_cast<double>(load_element(alpha, sc));
@@ -398,7 +405,7 @@ Status eval_gated_delta(Node& n) {
         for (std::size_t i = 0; i < dim; ++i) {
           double acc = 0.0;
           for (std::size_t j = 0; j < dim; ++j) {
-            acc += S[i * dim + j] * static_cast<double>(load_element(k, vec + j));
+            acc += S[i * dim + j] * static_cast<double>(load_element(k, kvec + j));
           }
           sk[i] = acc;
         }
@@ -408,14 +415,14 @@ Status eval_gated_delta(Node& n) {
           const double delta =
               (static_cast<double>(load_element(v, vec + i)) - sk[i]) * bt;
           for (std::size_t j = 0; j < dim; ++j) {
-            S[i * dim + j] += delta * static_cast<double>(load_element(k, vec + j));
+            S[i * dim + j] += delta * static_cast<double>(load_element(k, kvec + j));
           }
         }
 
         for (std::size_t i = 0; i < dim; ++i) {
           double acc = 0.0;
           for (std::size_t j = 0; j < dim; ++j) {
-            acc += S[i * dim + j] * static_cast<double>(load_element(q, vec + j));
+            acc += S[i * dim + j] * static_cast<double>(load_element(q, kvec + j));
           }
           if (!write_state) {
             store_element(n, vec + i, static_cast<float>(acc));

@@ -765,7 +765,8 @@ Array gated_delta_step(const Array& q, const Array& k, const Array& v,
     n->prim = find_primitive("gdn_chunk_scan");
     return Array(n);
   };
-  Array o = make_gdn(q.shape(), 0);
+  // The output has the value heads; q and k may share theirs across them.
+  Array o = make_gdn(v.shape(), 0);
   if (state_out != nullptr) *state_out = make_gdn(state_in.shape(), 1);
   return o;
 }

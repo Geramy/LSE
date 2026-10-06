@@ -14,9 +14,9 @@ Array input(Shape shape) {
   n->materialized = true;
   return Array(n);
 }
-void check(int dim, int seq, int wave, int outputs) {
-  auto q = input(Shape{1, seq, 48, dim});
-  auto k = input(q.shape()), v = input(q.shape());
+void check(int dim, int seq, int wave, int outputs, int key_heads = 48) {
+  auto q = input(Shape{1, seq, key_heads, dim});
+  auto k = input(q.shape()), v = input(Shape{1, seq, 48, dim});
   auto alpha = input(Shape{1, seq, 48}), beta = input(alpha.shape());
   auto state = input(Shape{1, 48, dim, dim});
   Array next;
@@ -36,9 +36,14 @@ void check(int dim, int seq, int wave, int outputs) {
       continue;
     }
     ++emitted_count;
-    LSE_EXPECT(result->source.find("scf.for") != std::string::npos);
-    LSE_EXPECT(result->source.find("= scf.for") != std::string::npos);
-    LSE_EXPECT(result->source.find("scf.yield") != std::string::npos);
+    // A scan of up to eight steps loads every step's inputs first and runs
+    // unrolled; a longer one carries its state through a loop.
+    const bool looped = seq > 8;
+    LSE_EXPECT((result->source.find("scf.for") != std::string::npos) == looped);
+    LSE_EXPECT((result->source.find("= scf.for") != std::string::npos) == looped);
+    if (looped) LSE_EXPECT(result->source.find("scf.yield") != std::string::npos);
+    LSE_EXPECT(result->dims.workgroup_count[0] * result->dims.workgroup_size[0] ==
+               static_cast<std::uint32_t>(48 * dim * wave));
     LSE_EXPECT(result->source.find("kernel.subgroup.shuffle<xor>") != std::string::npos);
     LSE_EXPECT(result->source.find("buffer.alloca") == std::string::npos);
     LSE_EXPECT(result->source.find("float s[") == std::string::npos);
@@ -50,9 +55,11 @@ void check(int dim, int seq, int wave, int outputs) {
 
 LSE_TEST(gdn_register_state_is_typed_for_decode_prefill_and_all_outputs) {
   for (int dim : {16, 32, 64, 128}) {
-    for (int seq : {1, 6}) {
+    for (int seq : {1, 6, 9, 32}) {
       for (int wave : {32, 64}) {
         for (int outputs : {0, 1, 2}) check(dim, seq, wave, outputs);
+        // Sixteen key heads shared by the 48 value heads.
+        check(dim, seq, wave, 2, 16);
       }
     }
   }

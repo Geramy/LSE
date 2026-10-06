@@ -338,8 +338,12 @@ Status PrefixStateCommit::retain(std::span<const MixerState> states,
         return LSE_ERROR(kUnimplemented, "prefix recurrence is not a pure GDN state");
       const Shape vector{1, sequence_rows, out->shape.dim(1), out->shape.dim(2)};
       const Shape scalar{1, sequence_rows, out->shape.dim(1)};
+      // k may carry fewer (shared) heads than the state's value heads.
+      const auto& key = out->inputs[1]->shape;
+      const bool key_ok = key.rank() == 4 && key.dim(0) == 1 && key.dim(1) == sequence_rows &&
+          key.dim(2) > 0 && out->shape.dim(1) % key.dim(2) == 0 && key.dim(3) == out->shape.dim(2);
       if (out->shape.dim(2) != out->shape.dim(3) ||
-          out->inputs[1]->shape != vector || out->inputs[2]->shape != vector ||
+          !key_ok || out->inputs[2]->shape != vector ||
           out->inputs[3]->shape != scalar || out->inputs[4]->shape != scalar ||
           out->inputs[5]->shape != out->shape)
         return LSE_ERROR(kInvalidArgument, "prefix recurrence geometry differs");
