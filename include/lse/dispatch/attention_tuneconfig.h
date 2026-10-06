@@ -77,10 +77,10 @@ inline constexpr std::array kSplitShortRules{
 };
 
 struct ShortTileRule {
-  std::uint32_t min_rows, max_rows, min_capacity, query_tile;
+  std::uint32_t min_rows, max_rows, query_tile;
 };
 inline constexpr std::array kShortTileRules{
-    ShortTileRule{4, 8, 8192, 4},
+    ShortTileRule{4, 8, 4},
 };
 
 [[nodiscard]] constexpr std::uint64_t split_partitions(std::uint64_t capacity) noexcept {
@@ -91,14 +91,6 @@ inline constexpr std::array kShortTileRules{
   return (parts * sizeof(float) + 15u) / 16u * 16u;
 }
 
-[[nodiscard]] constexpr std::uint32_t short_query_tile(std::uint32_t rows,
-                                                      std::uint32_t capacity) noexcept {
-  for (const auto& rule : kShortTileRules)
-    if (rows >= rule.min_rows && rows <= rule.max_rows && capacity >= rule.min_capacity)
-      return rule.query_tile;
-  return 1;
-}
-
 struct ShortHeadRule {
   std::uint32_t queries_per_kv, query_tile, head_tile;
 };
@@ -106,19 +98,48 @@ inline constexpr std::array kShortHeadRules{
     ShortHeadRule{6, 4, 2},
 };
 
-[[nodiscard]] constexpr std::uint32_t short_head_tile(std::uint32_t rows,
-    std::uint32_t heads, std::uint32_t kvheads, std::uint32_t capacity) noexcept {
-  if (kvheads == 0 || heads % kvheads != 0) return 1;
-  const auto tile = short_query_tile(rows, capacity);
+[[nodiscard]] constexpr std::uint32_t short_rule_query_tile(std::uint32_t rows) noexcept {
+  for (const auto& rule : kShortTileRules)
+    if (rows >= rule.min_rows && rows <= rule.max_rows) return rule.query_tile;
+  return 1;
+}
+
+[[nodiscard]] constexpr std::uint32_t short_rule_head_tile(std::uint32_t heads,
+    std::uint32_t kvheads, std::uint32_t query_tile) noexcept {
+  if (kvheads == 0 || heads % kvheads != 0 || query_tile == 1) return 1;
   for (const auto& rule : kShortHeadRules)
-    if (heads / kvheads == rule.queries_per_kv && tile == rule.query_tile)
+    if (heads / kvheads == rule.queries_per_kv && query_tile == rule.query_tile)
       return rule.head_tile;
   return 1;
 }
 
+// A tile of query rows and heads reads each key window once instead of once
+// per row, which is most of the untiled kernel's memory traffic, but leaves
+// query_tile * head_tile times fewer workgroups. Tile while the workgroups that
+// are certain to have keys still cover every compute unit: a KV rung doubles
+// as it grows, so a pass at `capacity` holds more than half of it.
+[[nodiscard]] constexpr std::uint32_t short_query_tile(std::uint32_t rows,
+    std::uint32_t heads, std::uint32_t kvheads, std::uint32_t capacity,
+    std::uint32_t compute_units) noexcept {
+  const auto tile = short_rule_query_tile(rows);
+  if (tile == 1 || compute_units == 0 || heads == 0) return 1;
+  const auto head_tile = short_rule_head_tile(heads, kvheads, tile);
+  const auto live_parts = static_cast<std::uint64_t>(capacity / 2u) / kShortKeyWindow;
+  const auto tiled = live_parts * (heads / head_tile) * ((rows + tile - 1u) / tile);
+  return tiled >= compute_units ? tile : 1u;
+}
+
+[[nodiscard]] constexpr std::uint32_t short_head_tile(std::uint32_t rows,
+    std::uint32_t heads, std::uint32_t kvheads, std::uint32_t capacity,
+    std::uint32_t compute_units) noexcept {
+  return short_rule_head_tile(heads, kvheads,
+      short_query_tile(rows, heads, kvheads, capacity, compute_units));
+}
+
 [[nodiscard]] constexpr bool short_skips_empty_partitions(std::uint32_t rows,
-                                                         std::uint32_t capacity) noexcept {
-  return short_query_tile(rows, capacity) > 1;
+    std::uint32_t heads, std::uint32_t kvheads, std::uint32_t capacity,
+    std::uint32_t compute_units) noexcept {
+  return short_query_tile(rows, heads, kvheads, capacity, compute_units) > 1;
 }
 
 struct ShortDefaultRule {

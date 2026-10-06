@@ -15,9 +15,9 @@ Array leaf(Shape shape) {
 struct Fixture {
   std::array<Array,6> inputs;
   Array output,state;
-  Fixture(int dim=128,int seq=1) {
-    const Shape q{1,seq,48,dim},scalar{1,seq,48},s{1,48,dim,dim};
-    inputs={leaf(q),leaf(q),leaf(q),leaf(scalar),leaf(scalar),leaf(s)};
+  Fixture(int dim=128,int seq=1,int key_heads=48) {
+    const Shape q{1,seq,key_heads,dim},v{1,seq,48,dim},scalar{1,seq,48},s{1,48,dim,dim};
+    inputs={leaf(q),leaf(q),leaf(v),leaf(scalar),leaf(scalar),leaf(s)};
     output=gated_delta_step(inputs[0],inputs[1],inputs[2],inputs[3],inputs[4],inputs[5],&state);
   }
   std::vector<FusionGroup> groups(bool reverse=false) {
@@ -45,6 +45,20 @@ LSE_TEST(exact_pair_coalesces_both_root_orders_and_binds_separate_writes) {
     LSE_EXPECT(emitted->source.find("buffer.alloca")==std::string::npos);
     auto hip=backend::HipEmitter{}.emit(groups[0],dev);LSE_EXPECT(hip.ok());
     if(hip.ok())LSE_EXPECT_EQ(hip->dims.workgroup_count[0],emitted->dims.workgroup_count[0]);
+  }
+}
+LSE_TEST(shared_key_heads_still_pair_into_one_launch) {
+  for (int seq:{1,6}) {
+    Fixture f(128,seq,16);auto groups=f.groups();LSE_EXPECT_EQ(groups.size(),1u);
+    if(groups.size()!=1)continue;
+    LSE_EXPECT_EQ(groups[0].launches,1u);LSE_EXPECT_EQ(groups[0].outputs.size(),2u);
+    auto emitted=backend::LoomEmitter{}.emit(groups[0],device());
+    LSE_EXPECT(emitted.ok());
+    if(emitted.ok())LSE_EXPECT_EQ(emitted->binding_order.size(),8u);
+    // Key heads must divide the value heads.
+    Fixture bad(128,seq,16);bad.inputs[0].node()->shape=Shape{1,seq,20,128};
+    bad.inputs[1].node()->shape=Shape{1,seq,20,128};
+    LSE_EXPECT(!exact_gdn_pair(bad.output.node(),bad.state.node()));
   }
 }
 LSE_TEST(single_roots_and_materialized_siblings_remain_standalone) {

@@ -1128,6 +1128,16 @@ class IBackend {
     LSE_RETURN_IF_ERROR(synchronize());
     return copy_h2d(src, dst, bytes, dst_offset);
   }
+  // A device-to-device copy within this device that runs where it is issued
+  // in the default stream's order (after every launch already issued there,
+  // before every one issued after), with no host wait. Both buffers must stay
+  // live until the device reaches it. The generic version drains and copies.
+  virtual Status copy_ordered(const DeviceBuffer& src, DeviceBuffer& dst,
+                              std::size_t bytes, std::size_t src_offset,
+                              std::size_t dst_offset) {
+    LSE_RETURN_IF_ERROR(synchronize());
+    return copy_peer(src, dst, bytes, src_offset, dst_offset);
+  }
   // A peer copy the two streams order between themselves: it runs after what
   // the producer has queued and the consumer's next work runs after it, with
   // the host in neither edge. A backend that cannot say that falls back to the
@@ -1203,6 +1213,12 @@ class IBackend {
   virtual Status begin_decode_sample(std::uint64_t) { return OkStatus(); }
   virtual Status end_decode_sample(std::uint64_t, bool) { return OkStatus(); }
   virtual void cancel_decode_sample() noexcept {}
+  // A long burst of launches (a speculative verify pass) starts at a point
+  // where the device has drained, and ends at the next drain (its answers'
+  // readback). Between the two the backend may batch more launches per
+  // submission; the policy changes only at those drained points.
+  virtual Status begin_launch_burst() { return OkStatus(); }
+  virtual void end_launch_burst() noexcept {}
   virtual Status synchronize() = 0;
 
   // What this device's streams can do, and how to order two of them. A caller
@@ -1304,6 +1320,13 @@ class BackendAdapter final : public IBackend {
                   std::size_t off) override {
     return impl_.copy_d2h(s, d, n, off);
   }
+  Status copy_ordered(const DeviceBuffer& s, DeviceBuffer& d, std::size_t n,
+                      std::size_t so, std::size_t dof) override {
+    if constexpr (requires(Derived& i) { i.copy_ordered_impl(s, d, n, so, dof); }) {
+      return impl_.copy_ordered_impl(s, d, n, so, dof);
+    }
+    return IBackend::copy_ordered(s, d, n, so, dof);
+  }
   Status write_ordered(DeviceBuffer& d, const void* s, std::size_t n,
                        std::size_t off) override {
     if constexpr (requires(Derived& i) { i.write_ordered_impl(d, s, n, off); }) {
@@ -1366,6 +1389,15 @@ class BackendAdapter final : public IBackend {
     if constexpr (requires { impl_.end_decode_sample_impl(elapsed, eligible); })
       return impl_.end_decode_sample_impl(elapsed, eligible);
     return OkStatus();
+  }
+  Status begin_launch_burst() override {
+    if constexpr (requires { impl_.begin_launch_burst_impl(); })
+      return impl_.begin_launch_burst_impl();
+    return OkStatus();
+  }
+  void end_launch_burst() noexcept override {
+    if constexpr (requires { impl_.end_launch_burst_impl(); })
+      impl_.end_launch_burst_impl();
   }
   void cancel_decode_sample() noexcept override {
     if constexpr (requires { impl_.cancel_decode_sample_impl(); })

@@ -1,3 +1,4 @@
+#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -189,11 +190,38 @@ struct DFlash2RingPartial final : KernelPrimitive<DFlash2RingPartial> {
           scores.reserve(QTile);
           for (std::uint32_t r = 0; r < QTile; ++r)
             scores.push_back(e.var(0.0f));
-          for (auto dd : e.range(d.dh)) {
-            const auto key = e.let(load_key(j, dd));
-            for (std::uint32_t r = 0; r < QTile; ++r)
-              scores[r] = math::fma(qs[e.let(r * d.dh + dd)].read(), key,
-                                    scores[r].read());
+          if (d.dh % 4u == 0u) {
+            // Four dimensions per 16-byte load of the key and of each query
+            // row; the products still accumulate one dimension at a time.
+            const auto context = e.let(j < d.capacity);
+            const auto kbase = e.let(select(context,
+                ((kh * d.capacity + (ring_end + j) % d.capacity) * d.dh),
+                ((kh * d.tq + j % d.capacity) * d.dh)));
+            for (auto quad : e.range(d.dh / 4u)) {
+              const auto dd = e.let(quad * 4u);
+              std::array<kir::LValue<kir::f32>, 4> key{e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+              if (auto c = e.when(context)) {
+                const auto pack = e.load(a.k, e.let(kbase + dd), 16u);
+                for (int u = 0; u < 4; ++u) key[static_cast<std::size_t>(u)] = pack[u];
+              }
+              if (auto pr = e.when(j >= d.capacity)) {
+                const auto pack = e.load(a.proposal_k, e.let(kbase + dd), 16u);
+                for (int u = 0; u < 4; ++u) key[static_cast<std::size_t>(u)] = pack[u];
+              }
+              for (std::uint32_t r = 0; r < QTile; ++r) {
+                const auto qv = qs.load(e.let(r * d.dh + dd), 16u);
+                for (int u = 0; u < 4; ++u)
+                  scores[r] = math::fma(qv[u], key[static_cast<std::size_t>(u)].read(),
+                                        scores[r].read());
+              }
+            }
+          } else {
+            for (auto dd : e.range(d.dh)) {
+              const auto key = e.let(load_key(j, dd));
+              for (std::uint32_t r = 0; r < QTile; ++r)
+                scores[r] = math::fma(qs[e.let(r * d.dh + dd)].read(), key,
+                                      scores[r].read());
+            }
           }
           for (std::uint32_t r = 0; r < QTile; ++r) {
             const auto abs_i = e.let(e.u32(d.capacity) + q0 + r);
@@ -263,17 +291,24 @@ struct DFlash2RingPartial final : KernelPrimitive<DFlash2RingPartial> {
           }
         }
 
-        for (auto slot : e.range(kKWin)) {
-          const auto jv = e.let(wbase + slot);
-          if (auto held = e.when(jv < row_len &&
-                                 kir::cast<std::int64_t>(jv) >= begin)) {
-            for (std::uint32_t p = 0; p < dpt; ++p) {
-              const auto dd = e.let(lid + p * kThreads);
-              if (auto g = e.when(dd < d.dv)) {
-                const auto vv = e.let(load_value(jv, dd));
-                for (std::uint32_t r = 0; r < QTile; ++r) {
-                  o[r * dpt + p] = math::fma(sc[e.let(r * kKWin + slot)].read(),
-                                             vv, o[r * dpt + p].read());
+        // Each row's weights for four slots in one 16-byte LDS read; the slots
+        // still accumulate one at a time, in order.
+        for (auto quad : e.range(kKWin / 4u)) {
+          std::vector<kir::Pack<kir::f32>> weights;
+          for (std::uint32_t r = 0; r < QTile; ++r)
+            weights.push_back(sc.load(e.let(r * kKWin + quad * 4u), 16u));
+          for (std::uint32_t u = 0; u < 4u; ++u) {
+            const auto jv = e.let(wbase + quad * 4u + u);
+            if (auto held = e.when(jv < row_len &&
+                                   kir::cast<std::int64_t>(jv) >= begin)) {
+              for (std::uint32_t p = 0; p < dpt; ++p) {
+                const auto dd = e.let(lid + p * kThreads);
+                if (auto g = e.when(dd < d.dv)) {
+                  const auto vv = e.let(load_value(jv, dd));
+                  for (std::uint32_t r = 0; r < QTile; ++r) {
+                    o[r * dpt + p] = math::fma(weights[r][static_cast<int>(u)],
+                                               vv, o[r * dpt + p].read());
+                  }
                 }
               }
             }

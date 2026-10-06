@@ -1988,6 +1988,42 @@ Status HrxBackend::write_ordered_impl(DeviceBuffer& dst, const void* src,
 #endif
 }
 
+Status HrxBackend::copy_ordered_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                                     std::size_t bytes, std::size_t src_offset,
+                                     std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (src.handle == 0 || dst.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer in ordered copy");
+  }
+  if (src_offset + bytes > src.size_bytes || dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "ordered copy runs past a buffer");
+  }
+  if (bytes == 0) return OkStatus();
+  // Ordered on stream 0 alone; with other streams or another backend on
+  // this memory the ordering is a join across queues, made on the host.
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  if (other_streams || src.residency != dst.residency || src.member != dst.member) {
+    return copy_peer_ordered_impl(src, dst, bytes, src_offset, dst_offset, Stream{0}, Stream{0});
+  }
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  LSE_SYNC_TRACE("copy_ordered %zu bytes", bytes);
+  return from_hrx(
+      hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                             reinterpret_cast<hrx_buffer_t>(src.handle),
+                             src.offset + src_offset,
+                             reinterpret_cast<hrx_buffer_t>(dst.handle),
+                             dst.offset + dst_offset, bytes),
+      "hrx_stream_copy_buffer (ordered)");
+#endif
+}
+
 Status HrxBackend::join_ordered_writes() {
   if (!ordered_writes_pending_) return OkStatus();
   return synchronize_stream_impl(Stream{0});
@@ -2540,6 +2576,31 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   if (src_offset + bytes > src.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_d2h reads past the end of the buffer");
   }
+  // A small read on a device whose work is all on stream 0 rides that
+  // stream: the copy into staging is queued behind every launch and ordered
+  // write already issued, so one wait covers the producers and the copy.
+  // Everything else waits for the device first, as below.
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  constexpr std::size_t kOrderedReadLimit = 1u << 20;
+  if (!other_streams && bytes <= kOrderedReadLimit) {
+    LSE_SYNC_TRACE("copy_d2h ordered %zu bytes", bytes);
+    auto stream = stream_at(0);
+    if (!stream.ok()) return stream.status();
+    LSE_RETURN_IF_ERROR(ensure_staging(bytes));
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                               reinterpret_cast<hrx_buffer_t>(src.handle),
+                               src.offset + src_offset,
+                               static_cast<hrx_buffer_t>(staging_buffer_), 0, bytes),
+        "hrx_stream_copy_buffer (ordered d2h)"));
+    unflushed_launches_[0] = 0;
+    LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{0}));
+    std::memcpy(dst, staging_host_, bytes);
+    return OkStatus();
+  }
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
   LSE_SYNC_TRACE("copy_d2h %zu bytes", bytes);
@@ -2675,6 +2736,26 @@ Status HrxBackend::begin_decode_sample_impl(std::uint64_t key) {
   submission_signature_ = kHashSeed;
   submission_dispatches_ = 0;
   return OkStatus();
+}
+
+Status HrxBackend::begin_launch_burst_impl() {
+  // Same rules as a tuner sample: only under the automatic policy, never over
+  // an explicit interval, never during a sample, and the interval changes
+  // only once the device has drained.
+  if (!automatic_submission_ || submission_sample_ != nullptr ||
+      baseline_flush_interval_ == 0 || kBurstFlushInterval <= baseline_flush_interval_)
+    return OkStatus();
+  if (flush_interval_ != kBurstFlushInterval) {
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    flush_interval_ = kBurstFlushInterval;
+  }
+  return OkStatus();
+}
+
+void HrxBackend::end_launch_burst_impl() noexcept {
+  // Called after the burst's readback: the device has drained, and the next
+  // launch starts a submission at the baseline interval.
+  if (submission_sample_ == nullptr) flush_interval_ = baseline_flush_interval_;
 }
 
 Status HrxBackend::end_decode_sample_impl(std::uint64_t elapsed, bool eligible) {

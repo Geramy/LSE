@@ -248,8 +248,12 @@ class Generator {
     graph::Array hidden;
     graph::Array logits;
     graph::Array pick;
+    // Sampling decided by a top-k with no history penalty reads each row's
+    // best logits from the device instead of whole rows.
+    graph::Array top;
     std::vector<graph::NodePtr> compute;
     bool greedy = false;
+    std::uint32_t top_k = 0;
   };
   DecodeHead head_;
   // Persistent [1,1] token slot for decode; poked on the host and uploaded by
@@ -262,8 +266,12 @@ class Generator {
     graph::Array hidden;
     graph::Array logits;
     graph::Array pick;
+    // Sampling decided by a top-k with no history penalty reads each row's
+    // best logits from the device instead of whole rows.
+    graph::Array top;
     std::vector<graph::NodePtr> compute;
     bool greedy = false;
+    std::uint32_t top_k = 0;
   };
   SpecHead spec_;
   graph::Array spec_ids_;
@@ -276,6 +284,18 @@ class Generator {
   std::vector<float> spec_logits_;
   std::size_t spec_rows_ready_ = 0;
   Status spec_logit_rows(std::size_t rows);
+  // With spec_.top: every row's (value, index) candidates of the last pass,
+  // read in one copy, and row i's split into spec_top_values_/spec_top_ids_.
+  std::vector<float> spec_top_;
+  bool spec_top_ready_ = false;
+  std::vector<float> spec_top_values_;
+  std::vector<std::uint32_t> spec_top_ids_;
+  Status spec_top_row(std::size_t row);
+  // The verify pass is a launch burst from its drained start to the drained
+  // readback of its answers (backend::IBackend::begin_launch_burst).
+  backend::IBackend* burst_ = nullptr;
+  Status begin_verify_burst();
+  void end_verify_burst() noexcept;
   // The decoder's hidden state for the last prompt position, which is the
   // module's input for the first proposal of the generation.
   graph::Array prefill_tail_;

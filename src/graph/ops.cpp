@@ -414,6 +414,34 @@ Array scatter_add_rows(const Array& base, const Array& rows,
   return Array(n);
 }
 
+Array topk_pairs(const Array& x, int k) {
+  if (!x.valid() || !x.shape().rank() || x.dtype() != DType::kF32) return {};
+  const auto width = x.shape().dim(x.shape().rank() - 1);
+  if (width < 4096 || width >= 16777215 || k < 1 || k > 32) return {};
+  // Scan stages of 256 threads x `per` registers each: a wide first stage
+  // leaves a few chunks' k candidates, which the next stage (or two) reduce
+  // to one chunk.
+  constexpr std::int64_t kThreads = 256, kWidePer = 32;
+  Array candidates = x;
+  auto count = width;
+  bool pairs = false;
+  while (true) {
+    const std::int64_t need = (count + kThreads - 1) / kThreads;
+    const auto per = std::min<std::int64_t>(need, kWidePer);
+    const auto chunks = (count + kThreads * per - 1) / (kThreads * per);
+    Shape stage_shape{static_cast<std::int64_t>(x.shape().elem_count()) / width, chunks, k, 2};
+    auto stage = make(OpKind::kCustom, stage_shape, DType::kF32, {candidates.node()});
+    stage->attrs = {static_cast<float>(k), static_cast<float>(count), pairs ? 1.0f : 0.0f,
+                    static_cast<float>(per)};
+    stage->prim = find_primitive("topk.scan.v1");
+    candidates = Array(stage);
+    if (chunks == 1) break;
+    count = chunks * k;
+    pairs = true;
+  }
+  return candidates;
+}
+
 Array topk(const Array& x, int k, int axis, Array* indices, float score_band) {
   const std::size_t a = normalize_axis(axis, x.shape().rank());
   Shape out;
@@ -423,20 +451,7 @@ Array topk(const Array& x, int k, int axis, Array* indices, float score_band) {
   const auto width = x.shape().dim(a);
   if (a + 1 == x.shape().rank() && x.dtype() == DType::kF32 &&
       width >= 4096 && width < 16777215 && k >= 1 && k <= 16) {
-    Array candidates = x;
-    auto count = width;
-    bool pairs = false;
-    while (true) {
-      const auto chunks = (count + 511) / 512;
-      Shape stage_shape{static_cast<std::int64_t>(x.shape().elem_count()) / width, chunks, k, 2};
-      auto stage = make(OpKind::kCustom, stage_shape, DType::kF32, {candidates.node()});
-      stage->attrs = {static_cast<float>(k), static_cast<float>(count), pairs ? 1.0f : 0.0f, 0.0f};
-      stage->prim = find_primitive("topk.chunk.v2");
-      candidates = Array(stage);
-      if (chunks == 1) break;
-      count = chunks * k;
-      pairs = true;
-    }
+    Array candidates = topk_pairs(x, k);
     auto extract = [&](bool write_index) {
       auto node = make(OpKind::kCustom, out, DType::kF32, {candidates.node()});
       node->attrs = {static_cast<float>(k), write_index ? 1.0f : 0.0f, score_band, 0.0f};
@@ -750,7 +765,8 @@ Array gated_delta_step(const Array& q, const Array& k, const Array& v,
     n->prim = find_primitive("gdn_chunk_scan");
     return Array(n);
   };
-  Array o = make_gdn(q.shape(), 0);
+  // The output has the value heads; q and k may share theirs across them.
+  Array o = make_gdn(v.shape(), 0);
   if (state_out != nullptr) *state_out = make_gdn(state_in.shape(), 1);
   return o;
 }

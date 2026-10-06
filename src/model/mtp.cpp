@@ -39,9 +39,18 @@ Status poke(Array& slot, std::span<const float> values) {
   for (std::size_t i = 0; i < values.size(); ++i) {
     graph::interpreter::store_element(dst, i, values[i]);
   }
+  dst.materialized = true;
+  if (dst.dtype == DType::kF32 && !dst.kv_fragments && dst.buffer.ptr == nullptr) {
+    // A pass's tokens and step descriptor: queued behind the work that may
+    // still read the slot instead of waiting for the device first.
+    LSE_RETURN_IF_ERROR(sched->backend().write_ordered(dst.buffer, values.data(),
+                                                       values.size_bytes(), 0));
+    dst.host_dirty = false;
+    dst.device_dirty = false;
+    return OkStatus();
+  }
   dst.host_dirty = true;
   dst.device_dirty = false;
-  dst.materialized = true;
   return graph::interpreter::sync_to_device(dst, sched->backend());
 }
 
@@ -81,9 +90,7 @@ Status poke(Array& slot, const Array& hidden) {
   if (src.buffer.residency == be.device_index()) {
     if (sched->devices().size() == 1 && src.buffer.member == 0 &&
         dst.buffer.member == 0 && !be.stream_capabilities().may_spread()) {
-      copied = be.copy_peer_ordered(src.buffer, dst.buffer, bytes, 0, 0,
-                                     backend::kDefaultStream,
-                                     backend::kDefaultStream);
+      copied = be.copy_ordered(src.buffer, dst.buffer, bytes, 0, 0);
     } else {
       copied = be.copy({dst.buffer}, {src.buffer}, bytes);
     }
@@ -103,6 +110,25 @@ Status poke(Array& slot, const Array& hidden) {
   std::vector<float> values(src.element_count());
   LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(src, values.data(), bytes));
   return poke(slot, std::span<const float>(values));
+}
+
+// A pass's tokens: uploaded into its own slot, or (a chained one-row pass)
+// read where the previous pass left its pick. The pick is written after this
+// pass's embedding has read the token, in stream order.
+template <class PassT>
+Status feed_tokens(PassT& pass, std::span<const float> ids, const Array* device_token) {
+  graph::Node& slot = *pass.tokens.node();
+  if (device_token == nullptr) {
+    if (pass.token_slot.valid()) slot.buffer = pass.token_slot;
+    return poke(pass.tokens, ids);
+  }
+  const graph::Node& from = *device_token->node();
+  slot.buffer = from.buffer;
+  slot.member = from.member;
+  slot.materialized = true;
+  slot.host_dirty = false;
+  slot.device_dirty = true;
+  return OkStatus();
 }
 
 Result<Array> device_slot(Shape shape) {
@@ -324,6 +350,23 @@ Result<Array> MtpModule::record(std::int64_t rows) {
 Result<std::uint32_t> MtpModule::draft_pass(
     std::span<const float> hidden, std::span<const std::uint32_t> tokens,
     std::int32_t first, const Array* device_hidden) {
+  LSE_RETURN_IF_ERROR(submit_pass(hidden, tokens, first, device_hidden, nullptr));
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend to run the MTP module");
+  LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(
+      *pass_.pick.node(), sched->backend()));
+  return static_cast<std::uint32_t>(
+      graph::interpreter::load_element(*pass_.pick.node(), 0));
+}
+
+Status MtpModule::submit_pass(
+    std::span<const float> hidden, std::span<const std::uint32_t> tokens,
+    std::int32_t first, const Array* device_hidden, const Array* device_token) {
+  if (device_token != nullptr &&
+      (tokens.size() != 1 || !device_token->valid() ||
+       device_token->dtype() != DType::kF32 || device_token->shape().elem_count() != 1 ||
+       !device_token->node()->buffer.valid()))
+    return LSE_ERROR(kInvalidArgument, "a chained MTP pass takes one device token");
   if (tokens.empty()) {
     return LSE_ERROR(kInvalidArgument, "an MTP pass needs at least one row");
   }
@@ -401,7 +444,7 @@ Result<std::uint32_t> MtpModule::draft_pass(
     pass_.program.reset_compute();
     LSE_RETURN_IF_ERROR(held.valid() ? poke(pass_.hidden, held)
                                       : poke(pass_.hidden, hidden));
-    LSE_RETURN_IF_ERROR(poke(pass_.tokens, ids));
+    LSE_RETURN_IF_ERROR(feed_tokens(pass_, ids, device_token));
     LSE_RETURN_IF_ERROR(poke(pass_.meta, meta));
     LSE_RETURN_IF_ERROR(
         sched->eval(pass_.program.roots(), false, &pass_.program));
@@ -415,7 +458,8 @@ Result<std::uint32_t> MtpModule::draft_pass(
     LSE_ASSIGN_OR(pass_.pick, record(rows));
     LSE_RETURN_IF_ERROR(held.valid() ? poke(pass_.hidden, held)
                                       : poke(pass_.hidden, hidden));
-    LSE_RETURN_IF_ERROR(poke(pass_.tokens, ids));
+    pass_.token_slot = pass_.tokens.node()->buffer;
+    LSE_RETURN_IF_ERROR(feed_tokens(pass_, ids, device_token));
 
     std::vector<graph::NodePtr> roots{pass_.pick.node()};
     if (pass_.last.valid()) roots.push_back(pass_.last.node());
@@ -431,12 +475,9 @@ Result<std::uint32_t> MtpModule::draft_pass(
         state_.value_cache.valid() ? state_.value_cache.node().get() : nullptr;
   }
 
-  LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(
-      *pass_.pick.node(), sched->backend()));
   state_.position = after;
   position_ = after;
-  return static_cast<std::uint32_t>(
-      graph::interpreter::load_element(*pass_.pick.node(), 0));
+  return OkStatus();
 }
 
 Result<std::uint32_t> MtpModule::draft(std::span<const float> hidden,
@@ -469,18 +510,41 @@ Result<std::vector<std::uint32_t>> MtpModule::draft_chain_impl(
     std::uint32_t depth) {
   std::vector<std::uint32_t> out;
   if (depth == 0) return out;
-  out.reserve(depth);
-  LSE_ASSIGN_OR(std::uint32_t got,
-                draft_pass(hidden, tokens, first, device_hidden));
-  out.push_back(got);
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend to run the MTP module");
+  auto& be = sched->backend();
+  // Every pass feeds the next its proposal and hidden on the device; their
+  // picks are copied, in stream order, into one buffer read back once.
+  if (!chain_picks_.valid() ||
+      chain_picks_.shape().elem_count() < static_cast<std::size_t>(depth)) {
+    LSE_ASSIGN_OR(chain_picks_, device_slot(Shape{static_cast<std::int64_t>(std::max(depth, 8u))}));
+  }
+  auto gather = [&](std::uint32_t i) -> Status {
+    const auto& pick = pass_.pick.node()->buffer;
+    return be.copy_ordered(pick, chain_picks_.node()->buffer, sizeof(float), 0,
+                           i * sizeof(float));
+  };
+  LSE_RETURN_IF_ERROR(submit_pass(hidden, tokens, first, device_hidden, nullptr));
+  LSE_RETURN_IF_ERROR(gather(0));
   for (std::uint32_t i = 1; i < depth; ++i) {
     if (!pass_.last.valid()) {
       return LSE_ERROR(kInternal, "the draft pass kept no hidden to chain on");
     }
     const Array own = pass_.last;
-    const std::uint32_t tok = out.back();
-    LSE_ASSIGN_OR(got, draft_pass({}, std::span(&tok, 1), position_, &own));
-    out.push_back(got);
+    const Array previous = pass_.pick;
+    const std::uint32_t row = 0;
+    LSE_RETURN_IF_ERROR(submit_pass({}, std::span(&row, 1), position_, &own, &previous));
+    LSE_RETURN_IF_ERROR(gather(i));
+  }
+  std::vector<float> picks(depth);
+  LSE_RETURN_IF_ERROR(be.copy(picks.data(), backend::MemRef(chain_picks_.node()->buffer, 0),
+                              picks.size() * sizeof(float)));
+  out.reserve(depth);
+  const auto vocab = static_cast<float>(config_.vocab_size);
+  for (const float pick : picks) {
+    if (!(pick >= 0.0f && pick < vocab) || pick != static_cast<float>(static_cast<std::uint32_t>(pick)))
+      return LSE_ERROR(kInternal, "MTP proposal ", std::to_string(pick), " is not a token");
+    out.push_back(static_cast<std::uint32_t>(pick));
   }
   return out;
 }

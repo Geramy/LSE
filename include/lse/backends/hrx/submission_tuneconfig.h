@@ -101,6 +101,11 @@ class SubmissionTuner {
   std::array<State, 16> states_{};
 };
 
+// Launches per submission inside a speculative verify pass (about 1700
+// launches, begun and ended at a drain): the tuner's smallest candidate
+// above the default, which measured best for that burst on the R9700.
+inline constexpr std::uint32_t kBurstFlushInterval = 64;
+
 inline bool automatic_submission_policy(const char* explicit_interval,
                                          const char* automatic_setting) {
   // Even an invalid explicit spelling opts out: the backend retains its

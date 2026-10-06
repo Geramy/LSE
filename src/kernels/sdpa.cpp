@@ -10,6 +10,7 @@
 #include "lse/backends/hrx/device_info.hpp"
 
 #include <cmath>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -391,10 +392,13 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
+    const auto units = static_cast<std::uint32_t>(s.device->compute_units);
     const auto head_tile = ShortQuery
-        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, capacity)
+        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, capacity, units)
         : dispatch::attention_shapes::decode_head_tile(heads, kvheads);
-    const auto token_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : 1u;
+    const auto token_tile = ShortQuery
+        ? dispatch::attention_shapes::short_query_tile(queries, heads, kvheads, capacity, units)
+        : 1u;
     const auto row_tile = token_tile * head_tile;
     if (row_tile > 1u) {
       const auto scores = e.lds<kir::f32>(row_tile * kSplitKeys);
@@ -423,7 +427,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
           return e.let((((b * heads + h + r / token_tile) * queries + q0 + r % token_tile) * parts + part) * kSplitRecord);
         else return e.let(((b * heads + h + r) * parts + part) * kSplitRecord);
       };
-      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity)) {
+      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, heads, kvheads, capacity, units)) {
         const auto no_keys = e.let(begin >= kv_len);
         if (auto empty = e.when(no_keys)) {
           for (std::uint32_t r = 0; r < row_tile; ++r) {
@@ -498,11 +502,22 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
             scores[r * kSplitKeys + key_lane] = select(valid[r], row_scores[r].read() * s.attrs[0], math::neg_inf());
       }
       e.barrier();
+      // Row maxima by a wave butterfly and a pass over the four wave
+      // results: max is exact, so this is the serial scan's answer.
+      const auto wave_max = e.lds<kir::f32>(4u * row_tile);
       std::vector<kir::LValue<kir::f32>> maximum;
-      for (std::uint32_t r = 0; r < row_tile; ++r) maximum.push_back(e.var(math::neg_inf()));
-      for (auto jj : e.range(kSplitKeys))
-        for (std::uint32_t r = 0; r < row_tile; ++r)
-          maximum[r] = math::max(maximum[r].read(), scores[r * kSplitKeys + jj].read());
+      for (std::uint32_t r = 0; r < row_tile; ++r) {
+        auto m = e.var(scores[e.let(e.u32(r * kSplitKeys) + lane)].read());
+        for (std::uint32_t shift = 16u; shift; shift >>= 1u)
+          m = math::max(m.read(), math::shfl_xor(m.read(), e.u32(shift)));
+        if (auto first = e.when(wl == 0u)) wave_max[e.let(wi * row_tile + r)] = m.read();
+      }
+      e.barrier();
+      for (std::uint32_t r = 0; r < row_tile; ++r) {
+        maximum.push_back(e.var(wave_max[e.u32(r)].read()));
+        for (std::uint32_t w = 1; w < 4u; ++w)
+          maximum[r] = math::max(maximum[r].read(), wave_max[e.u32(w * row_tile + r)].read());
+      }
       e.barrier();
       if (auto owns = e.when(lane < kSplitKeys)) {
         const auto j = e.let(begin + lane);
@@ -515,22 +530,38 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
         }
       }
       e.barrier();
+      std::vector<kir::Pack<kir::f32>> quad_weights;
+      std::optional<kir::Val<kir::u32>> quad_blk;
       std::vector<kir::LValue<kir::f32>> denom, acc0, acc1;
       for (std::uint32_t r = 0; r < row_tile; ++r) {
         denom.push_back(e.var(0.0f));
         acc0.push_back(e.var(0.0f));
         acc1.push_back(e.var(0.0f));
       }
-      for (auto jj : e.range(kSplitKeys)) {
+      // Each row's weights for four keys come out of LDS in one 16-byte read;
+      // the keys still accumulate one at a time, in order.
+      for (auto quad : e.range(kSplitKeys / 4u))
+      for (std::uint32_t q = 0; q < 4u; ++q) {
+        const auto jj = e.let(quad * 4u + q);
+        std::vector<kir::Pack<kir::f32>> weights;
+        if (q == 0u) {
+          quad_weights.clear();
+          for (std::uint32_t r = 0; r < row_tile; ++r)
+            quad_weights.push_back(scores.load(e.let(e.u32(r * kSplitKeys) + quad * 4u), 16u));
+          // Four aligned keys share a block of four or more: one table read.
+          if (block % 4u == 0u)
+            quad_blk = e.let(kv_block_index<Storage>(a.table[tb + (begin + quad * 4u) / block]));
+        }
         const auto j = e.let(begin + jj);
         const auto valid = valid_rows(j);
         if (auto live = e.when(any_valid(valid))) {
-          const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
+          const auto blk = block % 4u == 0u ? *quad_blk
+              : e.let(kv_block_index<Storage>(a.table[tb + j / block]));
           const auto vb = e.let(((blk * kvheads + kh) * block + j % block) * 256u + lane * 2u);
           const auto values = kv_load_pair<Storage>(e, a.v, vb, 256u);
           for (std::uint32_t r = 0; r < row_tile; ++r) {
             if (auto row_live = e.when(valid[r])) {
-              const auto weight = e.let(scores[r * kSplitKeys + jj].read());
+              const auto weight = e.let(quad_weights[r][static_cast<int>(q)]);
               denom[r] = denom[r].read() + weight;
               acc0[r] = math::fma(weight, values[0], acc0[r].read());
               acc1[r] = math::fma(values[1], weight, acc1[r].read());
@@ -671,17 +702,21 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     tp.workgroup_size[0] = 128;
     auto query_tile = 1u;
     if (s.inputs[0].dim(2) > 1) {
-      query_tile = dispatch::attention_shapes::short_query_tile(
-          static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-          static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
-      const auto head_tile = dispatch::attention_shapes::short_head_tile(
-          static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-          static_cast<std::uint32_t>(s.inputs[0].dim(1)),
-          static_cast<std::uint32_t>(s.inputs[1].dim(1)),
-          static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
+      const auto rows = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+      const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+      const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+      const auto capacity = static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2));
+      const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
+      query_tile = dispatch::attention_shapes::short_query_tile(rows, heads, kvheads, capacity, units);
+      const auto head_tile = dispatch::attention_shapes::short_head_tile(rows, heads, kvheads, capacity, units);
       tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * (s.output.dim(1) / head_tile) *
           ((s.output.dim(2) + query_tile - 1) / query_tile) * s.output.dim(3));
       query_tile *= head_tile;
+      if (query_tile > 1u) {
+        // The tiled kernel's row maxima pass four wave results per row.
+        tp.lds_bytes = query_tile * kSplitKeys * sizeof(float) + 4u * query_tile * sizeof(float);
+        return tp;
+      }
     } else {
       query_tile = dispatch::attention_shapes::decode_head_tile(
           static_cast<std::uint32_t>(s.inputs[0].dim(1)),

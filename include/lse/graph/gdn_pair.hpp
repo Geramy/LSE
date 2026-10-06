@@ -21,16 +21,20 @@ inline GdnPair exact_gdn_pair(const NodePtr& a, const NodePtr& b) {
         (a->iattrs[0] == 1 && b->iattrs[0] == 0))) return {};
   for (std::size_t i = 0; i < 6; ++i)
     if (!a->inputs[i] || a->inputs[i] != b->inputs[i] || a->inputs[i]->dtype != DType::kF32) return {};
+  // q and k may carry fewer heads than v, each shared by a run of value
+  // heads; the output, alpha, beta and the state have the value heads.
   const auto& q = a->inputs[0]->shape;
+  const auto& v = a->inputs[2]->shape;
   if (q.rank() != 4 || q.dim(0) <= 0 || q.dim(1) <= 0 || q.dim(2) <= 0 ||
       (q.dim(3) != 16 && q.dim(3) != 32 && q.dim(3) != 64 && q.dim(3) != 128) ||
-      a->inputs[1]->shape != q || a->inputs[2]->shape != q) return {};
-  const Shape scalar{q.dim(0), q.dim(1), q.dim(2)};
-  const Shape state_shape{q.dim(0), q.dim(2), q.dim(3), q.dim(3)};
+      a->inputs[1]->shape != q || v.rank() != 4 || v.dim(0) != q.dim(0) ||
+      v.dim(1) != q.dim(1) || v.dim(3) != q.dim(3) || v.dim(2) % q.dim(2) != 0) return {};
+  const Shape scalar{v.dim(0), v.dim(1), v.dim(2)};
+  const Shape state_shape{v.dim(0), v.dim(2), v.dim(3), v.dim(3)};
   if (a->inputs[3]->shape != scalar || a->inputs[4]->shape != scalar ||
       a->inputs[5]->shape != state_shape) return {};
   GdnPair pair{a->iattrs[0] == 0 ? a : b, a->iattrs[0] == 1 ? a : b};
-  if (pair.output->shape != q || pair.state->shape != state_shape) return {};
+  if (pair.output->shape != v || pair.state->shape != state_shape) return {};
   return pair;
 }
 } // namespace lse::graph

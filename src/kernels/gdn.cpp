@@ -20,6 +20,9 @@ namespace math = lse::math;
 namespace {
 
 constexpr std::uint32_t kBlock = 256;
+// Scans this short (a speculative verify, a commit of its accepted prefix)
+// load every timestep's inputs before the recurrence starts.
+constexpr std::uint32_t kGdnPreloadSteps = 8;
 
 std::uint32_t wave_of(const DeviceInfo* device) {
   if (device == nullptr) return 32;
@@ -51,8 +54,13 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
   const Shape& q = s.inputs[0];
   const auto batch = static_cast<std::uint32_t>(q.dim(0));
   const auto seq = static_cast<std::uint32_t>(q.dim(1));
-  const auto heads = static_cast<std::uint32_t>(q.dim(2));
+  // Value heads index the state, v, alpha and beta; q and k carry
+  // key_heads, each shared by heads / key_heads value heads.
+  const auto heads = static_cast<std::uint32_t>(s.inputs[2].dim(2));
+  const auto key_heads = static_cast<std::uint32_t>(q.dim(2));
   const auto D = static_cast<std::uint32_t>(q.dim(3));
+  if (key_heads == 0 || heads % key_heads != 0 || s.inputs[1].dim(2) != q.dim(2)) return {};
+  const auto share = heads / key_heads;
   const bool write_state = mode != GdnWrite::kOut;
   const bool write_out = mode != GdnWrite::kState;
   if (seq == 0 || heads == 0 || D == 0) return {};
@@ -106,16 +114,71 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     return acc;
   };
 
-  for (auto t : e.range(seq)) {
+  // A verify-width scan has every timestep's inputs ready before the first
+  // state update: issue all of their loads up front (the recurrence itself,
+  // and its arithmetic order, is the loop below).
+  const bool preload = seq <= kGdnPreloadSteps && tile <= 4;
+  std::vector<kir::LValue<kir::f32>> pre_al, pre_bt, pre_v;
+  std::vector<std::vector<kir::LValue<kir::f32>>> pre_k, pre_q;
+  if (preload) {
+    for (std::uint32_t t = 0; t < seq; ++t) {
+      const auto sc = e.let((b * seq + t) * heads + h);
+      const auto vec = e.let(sc * D);
+      const auto kvec = e.let(((b * seq + t) * key_heads + h / share) * D);
+      pre_al.push_back(e.var(a.alpha[sc]));
+      pre_bt.push_back(e.var(a.beta[sc]));
+      pre_v.push_back(e.var(a.v[vec + row]));
+      pre_k.emplace_back(); pre_q.emplace_back();
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        const auto j = e.let(lane + ei * wave);
+        pre_k.back().push_back(e.var(0.0f));
+        pre_q.back().push_back(e.var(0.0f));
+        if (auto in = e.when(j < D)) {
+          pre_k.back()[ei] = a.k[kvec + j];
+          pre_q.back()[ei] = a.q[kvec + j];
+        }
+      }
+    }
+    for (std::uint32_t t = 0; t < seq; ++t) {
+      const auto al = e.let(pre_al[t].read());
+      auto skp = e.var(0.0f);
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        const auto j = lane + ei * wave;
+        srow[ei] = srow[ei].read() * al;
+        if (auto in = e.when(j < D)) {
+          skp = math::fma(srow[ei].read(), pre_k[t][ei].read(), skp);
+        }
+      }
+      const auto sk = reduce(skp);
+      const auto bt = e.let(pre_bt[t].read());
+      const auto delta = e.let((pre_v[t].read() - sk) * bt);
+      auto accp = e.var(0.0f);
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        const auto j = lane + ei * wave;
+        if (auto in = e.when(j < D)) {
+          srow[ei] = math::fma(delta, pre_k[t][ei].read(), srow[ei].read());
+          accp = math::fma(srow[ei].read(), pre_q[t][ei].read(), accp);
+        }
+      }
+      if (write_out) {
+        const auto acc = reduce(accp);
+        if (auto in = e.when(lane == 0)) {
+          e.store(((b * seq + t) * heads + h) * D + row, acc);
+        }
+      }
+    }
+  }
+  if (!preload) for (auto t : e.range(seq)) {
     const auto sc = (b * seq + t) * heads + h;
     const auto vec = sc * D;
+    const auto kvec = e.let(((b * seq + t) * key_heads + h / share) * D);
     const auto al = e.let(a.alpha[sc]);
     auto skp = e.var(0.0f);
     for (std::uint32_t ei = 0; ei < tile; ++ei) {
       const auto j = lane + ei * wave;
       srow[ei] = srow[ei].read() * al;
       if (auto in = e.when(j < D)) {
-        skp = math::fma(srow[ei].read(), a.k[vec + j], skp);
+        skp = math::fma(srow[ei].read(), a.k[kvec + j], skp);
       }
     }
     const auto sk = reduce(skp);
@@ -125,8 +188,8 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     for (std::uint32_t ei = 0; ei < tile; ++ei) {
       const auto j = lane + ei * wave;
       if (auto in = e.when(j < D)) {
-        srow[ei] = math::fma(delta, a.k[vec + j], srow[ei].read());
-        accp = math::fma(srow[ei].read(), a.q[vec + j], accp);
+        srow[ei] = math::fma(delta, a.k[kvec + j], srow[ei].read());
+        accp = math::fma(srow[ei].read(), a.q[kvec + j], accp);
       }
     }
     if (write_out) {
@@ -162,7 +225,8 @@ ThreadPlan gdn_plan(const KernelShapes& s, bool write_state) {
   const Shape& q = s.inputs[0];
   const auto batch = static_cast<std::uint32_t>(q.dim(0));
   const auto seq = static_cast<std::uint32_t>(q.dim(1));
-  const auto heads = static_cast<std::uint32_t>(q.dim(2));
+  const auto heads = static_cast<std::uint32_t>(
+      s.inputs.size() > 2 && s.inputs[2].rank() == 4 ? s.inputs[2].dim(2) : q.dim(2));
   const auto D = static_cast<std::uint32_t>(q.dim(3));
   const std::uint32_t wave = wave_of(s.device);
   (void)write_state;
@@ -196,7 +260,7 @@ struct GdnKernel final : KernelPrimitive<GdnKernel> {
     if (in.size() < 6) {
       return LSE_ERROR(kInvalidArgument, "gdn_chunk_scan needs 6 inputs");
     }
-    return in[0];
+    return in[2];
   }
   DType infer_dtype(std::span<const DType> in) const override {
     return in.empty() ? DType::kF32 : in[0];
@@ -226,8 +290,8 @@ struct GdnPairKernel final : KernelPrimitive<GdnPairKernel> {
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
-    if (in.empty()) return LSE_ERROR(kInvalidArgument, "gdn pair needs q");
-    return in[0];
+    if (in.size() < 3) return LSE_ERROR(kInvalidArgument, "gdn pair needs q, k and v");
+    return in[2];
   }
   DType infer_dtype(std::span<const DType> in) const override {
     return in.empty() ? DType::kF32 : in[0];

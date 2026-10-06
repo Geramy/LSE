@@ -16,6 +16,9 @@
 namespace lse::runtime {
 
 namespace {
+// Widest top-k the verify pass reads from the device instead of whole rows
+// (topk_pairs bound).
+constexpr std::size_t kSpecTopLimit = 32;
 
 using graph::Array;
 using lse::DType;
@@ -343,6 +346,7 @@ Status Generator::verify(Session& session,
   }
 
   const std::uint64_t started = now_ns();
+  LSE_RETURN_IF_ERROR(begin_verify_burst());
   model::FeatureCapture capture;
   if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
   LSE_ASSIGN_OR(Array hidden,
@@ -354,9 +358,13 @@ Status Generator::verify(Session& session,
 
   const SamplingParams& sp = sampler_.params();
   const bool greedy = sp.greedy_argmax();
+  const auto vocab = static_cast<std::size_t>(model_.config().vocab_size);
+  const std::uint32_t top_k = !greedy && sampler_.decided_by_top(kSpecTopLimit, vocab)
+                                  ? static_cast<std::uint32_t>(sp.top_k) : 0u;
   const bool reuse = spec_.hidden.valid() && spec_.logits.valid() &&
                      spec_.hidden.node().get() == hidden.node().get() &&
-                     spec_.greedy == greedy && (!greedy || spec_.pick.valid());
+                     spec_.greedy == greedy && (!greedy || spec_.pick.valid()) &&
+                     spec_.top_k == top_k;
   if (!reuse) {
     spec_ = SpecHead{};
     spec_.hidden = hidden;
@@ -372,10 +380,23 @@ Status Generator::verify(Session& session,
       }
       spec_.compute.push_back(spec_.pick.node()->inputs[0]);
       spec_.compute.push_back(spec_.pick.node());
+    } else if (top_k != 0) {
+      spec_.top = graph::topk_pairs(spec_.logits, static_cast<int>(top_k));
+      if (!spec_.top.valid()) {
+        return LSE_ERROR(kInternal, "no device top-", std::to_string(top_k),
+                         " over the verify logits");
+      }
+      spec_.top_k = top_k;
+      std::vector<graph::NodePtr> stages;
+      for (graph::NodePtr n = spec_.top.node(); n && n != spec_.logits.node();
+           n = n->inputs.empty() ? nullptr : n->inputs[0]) {
+        stages.push_back(n);
+      }
+      spec_.compute.insert(spec_.compute.end(), stages.rbegin(), stages.rend());
     }
   }
 
-  Array root = greedy ? spec_.pick : spec_.logits;
+  Array root = greedy ? spec_.pick : spec_.top_k != 0 ? spec_.top : spec_.logits;
   for (const graph::NodePtr& n : spec_.compute) {
     if (n) n->materialized = false;
   }
@@ -384,14 +405,21 @@ Status Generator::verify(Session& session,
   // device: the acceptance walk reads rows as it reaches them
   // (spec_logit_rows), and it stops at the first rejected proposal.
   LSE_RETURN_IF_ERROR(sched->eval(roots, greedy, &spec_.program));
+  // Greedy picks came back with the pass.
+  if (greedy) end_verify_burst();
 
   if (!greedy) {
     if (spec_.logits.dtype() != DType::kF32 || spec_.logits.shape().rank() != 3 ||
         spec_.logits.shape().dim(1) != m) {
       return LSE_ERROR(kInternal, "verifier logits are not [1, m, vocab] f32");
     }
-    spec_logits_.resize(spec_.logits.shape().elem_count());
-    spec_rows_ready_ = 0;
+    if (spec_.top_k != 0) {
+      spec_top_.resize(spec_.top.shape().elem_count());
+      spec_top_ready_ = false;
+    } else {
+      spec_logits_.resize(spec_.logits.shape().elem_count());
+      spec_rows_ready_ = 0;
+    }
   }
   stats_.spec_verify_ns += now_ns() - started;
   ++stats_.spec_verify_passes;
@@ -445,6 +473,70 @@ Status Generator::spec_logit_rows(std::size_t rows) {
     spec_rows_ready_ = want;
   }
   stats_.spec_verify_ns += now_ns() - started;
+  end_verify_burst();
+  return OkStatus();
+}
+
+Status Generator::begin_verify_burst() {
+  end_verify_burst();
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr || sched->devices().size() != 1) return OkStatus();
+  burst_ = &sched->backend();
+  return burst_->begin_launch_burst();
+}
+
+void Generator::end_verify_burst() noexcept {
+  if (burst_ != nullptr) burst_->end_launch_burst();
+  burst_ = nullptr;
+}
+
+// Row `row` of the last verify pass's device top-k. All m rows' candidates
+// are a few KiB, so the first row read brings every row in one copy.
+Status Generator::spec_top_row(std::size_t row) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) {
+    return LSE_ERROR(kInternal, "no usable backend for the verify candidates");
+  }
+  const auto m = static_cast<std::size_t>(spec_.logits.shape().dim(1));
+  const std::size_t k = spec_.top_k;
+  if (row >= m || k == 0 || spec_top_.size() != m * k * 2) {
+    return LSE_ERROR(kInternal, "verify candidate row ", std::to_string(row),
+                     " past the pass's ", std::to_string(m));
+  }
+  if (!spec_top_ready_) {
+    const std::uint64_t started = now_ns();
+    graph::Node& node = *spec_.top.node();
+    // The pass was submitted, not awaited. A device-to-host copy waits for
+    // the work it reads (or rides the stream behind it), so the plain-buffer
+    // read below needs no drain of its own.
+    if (node.kv_fragments || node.buffer.ptr != nullptr || !node.buffer.valid() ||
+        !node.device_dirty) {
+      LSE_RETURN_IF_ERROR(sched->drain());
+      LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(node, sched->backend()));
+      LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
+          node, spec_top_.data(), spec_top_.size() * sizeof(float)));
+    } else {
+      LSE_RETURN_IF_ERROR(sched->backend().copy(
+          spec_top_.data(), backend::MemRef(node.buffer, 0),
+          spec_top_.size() * sizeof(float)));
+    }
+    spec_top_ready_ = true;
+    stats_.spec_verify_ns += now_ns() - started;
+    end_verify_burst();
+  }
+  const auto vocab = static_cast<float>(model_.config().vocab_size);
+  spec_top_values_.resize(k);
+  spec_top_ids_.resize(k);
+  for (std::size_t j = 0; j < k; ++j) {
+    const float value = spec_top_[(row * k + j) * 2];
+    const float index = spec_top_[(row * k + j) * 2 + 1];
+    if (!(index >= 0.0f && index < vocab) || std::floor(index) != index) {
+      return LSE_ERROR(kInternal, "verify candidate index ", std::to_string(index),
+                       " is not a token");
+    }
+    spec_top_values_[j] = value;
+    spec_top_ids_[j] = static_cast<std::uint32_t>(index);
+  }
   return OkStatus();
 }
 
@@ -467,6 +559,10 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     const GenerationLimits& limits, const TokenCallback& on_token) {
   std::vector<std::uint32_t> generated;
   if (limits.max_tokens <= 0) return generated;
+  struct BurstScope {
+    Generator* g;
+    ~BurstScope() { g->end_verify_burst(); }
+  } burst_scope{this};
   const auto capacity = static_cast<std::size_t>(model_.config().kv_capacity());
 
   const std::uint32_t depth = dflash2_ != nullptr
@@ -538,6 +634,13 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       return static_cast<std::uint32_t>(
           graph::interpreter::load_element(*spec_.pick.node(), i));
     }
+    if (spec_.top_k != 0) {
+      if (sampled_dflash) {
+        LSE_ASSIGN_OR(auto target, sampler_.distribution_top(spec_top_values_, spec_top_ids_));
+        return speculative_sampler.sample_target(target);
+      }
+      return sampler_.sample_top(spec_top_values_, spec_top_ids_);
+    }
     const std::size_t v = spec_logits_.size() / m;
     auto logits = std::span<float>(spec_logits_.data() + i * v, v);
     if (sampled_dflash) {
@@ -581,13 +684,17 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     bool mismatch = false;
     std::vector<std::uint32_t> answers(m, 0);
     for (std::size_t i = 0; i < m; ++i) {
-      if (!spec_.greedy) LSE_RETURN_IF_ERROR(spec_logit_rows(i + 1));
+      if (!spec_.greedy) {
+        LSE_RETURN_IF_ERROR(spec_.top_k != 0 ? spec_top_row(i) : spec_logit_rows(i + 1));
+      }
       bool accepted = false;
       double overlap = 0, candidate_mass = 0, deterministic_mass = 0;
       if (sampled_dflash && i + 1 < m) {
-        const auto v = spec_logits_.size() / m;
-        LSE_ASSIGN_OR(auto target, sampler_.distribution(
-            std::span<float>(spec_logits_.data() + i * v, v), session.history()));
+        const auto v = spec_.top_k != 0 ? 0 : spec_logits_.size() / m;
+        LSE_ASSIGN_OR(auto target, spec_.top_k != 0
+            ? sampler_.distribution_top(spec_top_values_, spec_top_ids_)
+            : sampler_.distribution(std::span<float>(spec_logits_.data() + i * v, v),
+                                    session.history()));
         const auto& proposal = proposal_distributions[i];
         const auto best = static_cast<std::size_t>(std::max_element(
             proposal.probabilities.begin(), proposal.probabilities.end()) - proposal.probabilities.begin());

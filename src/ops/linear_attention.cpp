@@ -8,6 +8,9 @@ namespace lse::ops {
 
 namespace {
 
+// Widest row count (a speculative verify pass) that fuses q/k preparation.
+constexpr std::int64_t kFusedPrepRows = 8;
+
 // beta off the 0/1 rails: a saturated beta drives the delta-rule gain up until
 // the recurrent state overflows to inf, then NaN.
 constexpr float kBetaFloor = 1e-4f;
@@ -102,11 +105,11 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   const std::int64_t key_width = kh * kd;
   const std::int64_t value_width = vh * vd;
 
-  Array q_raw, k_raw, v_raw;
+  Array q_raw, k_raw, v_raw, qkv;
   if (spec.layout == ProjLayout::kFusedQKV) {
-    Array qkv = conv_stream(graph::linear(x, w.in_proj_qkv), w.conv_w, w.conv_b,
-                            spec.conv_bias,
-                            state != nullptr ? &state->conv_qkv : nullptr);
+    qkv = conv_stream(graph::linear(x, w.in_proj_qkv), w.conv_w, w.conv_b,
+                      spec.conv_bias,
+                      state != nullptr ? &state->conv_qkv : nullptr);
     q_raw = graph::slice(qkv, -1, 0, key_width);
     k_raw = graph::slice(qkv, -1, key_width, 2 * key_width);
     v_raw = graph::slice(qkv, -1, 2 * key_width, 2 * key_width + value_width);
@@ -122,19 +125,40 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
                         state != nullptr ? &state->conv_v : nullptr);
   }
 
+  // A speculative verify's few rows take SiLU and the head norm of q and k
+  // straight from the conv output in one dispatch each (gdn.silu_l2norm.v1),
+  // computing what the separate slice/silu and l2_normalize kernels did. One
+  // row (wave-level norm) and long prefill chunks keep the separate ops.
+  const bool fused_prep = qkv.valid() && spec.conv_activation && batch == 1 &&
+                          seq > 1 && seq <= kFusedPrepRows;
+  auto silu_l2norm = [&](std::int64_t offset, float scale) -> Result<Array> {
+    LSE_ASSIGN_OR(Array out, graph::custom("gdn.silu_l2norm.v1", {qkv},
+        {static_cast<float>(offset), spec.eps, scale, 0.0f}));
+    out.node()->shape = Shape{batch, seq, kh, kd};
+    return out;
+  };
+  Array q, k;
+  if (fused_prep) {
+    LSE_ASSIGN_OR(q, silu_l2norm(0, spec.query_scale));
+    LSE_ASSIGN_OR(k, silu_l2norm(key_width, 1.0f));
+  }
   if (spec.conv_activation) {
-    q_raw = graph::silu(q_raw);
-    k_raw = graph::silu(k_raw);
+    if (!fused_prep) {
+      q_raw = graph::silu(q_raw);
+      k_raw = graph::silu(k_raw);
+    }
     v_raw = graph::silu(v_raw);
   }
 
   const Shape key_shape{batch, seq, kh, kd};
-  Array q = graph::l2_normalize(graph::reshape(q_raw, key_shape), spec.eps);
-  Array k = graph::l2_normalize(graph::reshape(k_raw, key_shape), spec.eps);
-  Array v = graph::reshape(v_raw, Shape{batch, seq, vh, vd});
-  if (spec.query_scale != 1.0f) {
-    q = q * Array::full(Shape{1}, DType::kF32, spec.query_scale);
+  if (!fused_prep) {
+    q = graph::l2_normalize(graph::reshape(q_raw, key_shape), spec.eps);
+    k = graph::l2_normalize(graph::reshape(k_raw, key_shape), spec.eps);
+    if (spec.query_scale != 1.0f) {
+      q = q * Array::full(Shape{1}, DType::kF32, spec.query_scale);
+    }
   }
+  Array v = graph::reshape(v_raw, Shape{batch, seq, vh, vd});
 
   // alpha = exp(-rate * softplus(a + dt_bias)) — the decay applied to the
   // recurrent state each step. The rate is where the two models part company.
@@ -150,8 +174,8 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // Key heads are shared across value heads, GQA-style.
   const auto ratio = static_cast<int>(vh / kh);
   if (ratio > 1) {
-    q = graph::repeat(q, ratio, 2);
-    k = graph::repeat(k, ratio, 2);
+    // q and k stay at the key heads: the scan maps each value head to its
+    // key head, which saves materializing two repeated copies per layer.
     if (!spec.decay_per_value_head) {
       alpha = graph::repeat(alpha, ratio, -1);
       beta = graph::repeat(beta, ratio, -1);

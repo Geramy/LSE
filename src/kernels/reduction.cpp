@@ -48,6 +48,15 @@ struct RmsNormArgs {
 namespace {
 constexpr std::uint32_t kRmsBlock = 256;
 constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
+// Register-held rows: up to 32 values per lane, for up to 8 rows (a verify).
+constexpr std::uint32_t kRmsCachedPerLane = 32, kRmsCachedRows = 8;
+// Rows no wider than four wave32 lanes' worth (a head's 128) take a wave
+// each, eight to a workgroup, instead of a 256-lane workgroup each.
+constexpr std::uint32_t kNarrowRows = kRmsBlock / 32u;
+bool narrow_rows(const KernelShapes& s, std::uint32_t d) {
+  return s.device && s.device->wavefront_size == 32 && d <= 4u * 32u &&
+         s.intrinsics && !s.intrinsics->find("wave.shfl_xor").empty();
+}
 
 }  // namespace
 
@@ -68,11 +77,57 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       RmsNormArgs<env::Emit, G> a;
       if (!env::bind(k, a, s)) return {};
       env::Emit e{&k};
+      if (narrow_rows(s, d)) {
+        // A wave per row. Lane l holds the squares of columns l, l+32, l+64
+        // and l+96, which are exactly the four 256-lane partials the wide
+        // tree adds for it (every other partial of a row this narrow is
+        // zero), added in the same order; the xor butterfly then leaves
+        // every lane with lane 0's total.
+        const auto lid = e.let(math::local_id());
+        const auto lane = e.let(lid % 32u);
+        const auto row_index = e.let(math::workgroup_id_x() * kNarrowRows + lid / 32u);
+        const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / d);
+        if (auto live = e.when(row_index < rows)) {
+          const auto row = e.let(row_index * d);
+          std::array<kir::Val<kir::f32>, 4> squares;
+          std::array<kir::LValue<kir::f32>, 4> values{e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+          for (std::uint32_t c = 0; c < 4u; ++c) {
+            auto square = e.var(0.0f);
+            if (auto in = e.when(lane + c * 32u < d)) {
+              values[c] = a.x[row + lane + c * 32u];
+              square = math::fma(values[c].read(), values[c].read(), e.f32(0.0f));
+            }
+            squares[c] = e.let(square.read());
+          }
+          const auto zero = e.f32(0.0f);
+          const auto a0 = e.let(squares[0] + zero);
+          const auto a1 = e.let(squares[2] + zero);
+          const auto a2 = e.let(squares[1] + zero);
+          const auto a3 = e.let(squares[3] + zero);
+          auto total = e.let((a0 + a1) + (a2 + a3));
+          for (std::uint32_t offset = 16; offset > 0; offset >>= 1)
+            total = e.let(total + math::shfl_xor(total, e.u32(offset)));
+          const auto scale = e.let(math::rsqrt(total / static_cast<float>(d) + s.attrs[0]));
+          for (std::uint32_t c = 0; c < 4u; ++c) {
+            const auto col = e.let(lane + c * 32u);
+            if (auto in = e.when(col < d)) {
+              const auto gain = math::widen(a.g[col]);
+              const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+              e.store(row + col, values[c].read() * scale * weight);
+            }
+          }
+        }
+        return k.str();
+      }
       const auto lane = e.let(math::local_id());
       const auto row = e.let(math::workgroup_id_x() * d);
       auto partial = e.var(0.0f);
-      const bool cache_row = d == 5120 && s.output.elem_count() == d &&
-          s.device && s.device->arch == "gfx1201" && s.device->wavefront_size == 32;
+      // Rows of a decode or verify step keep their values in registers, the
+      // loads issued together, instead of a dependent load loop; the sums and
+      // their order are unchanged. Long prefill chunks keep the loop.
+      const bool cache_row = d % kRmsBlock == 0 && d / kRmsBlock <= kRmsCachedPerLane &&
+          s.output.elem_count() <= static_cast<std::size_t>(kRmsCachedRows) * d &&
+          s.device && s.device->wavefront_size == 32;
       std::vector<kir::Val<kir::f32>> row_values;
       if (cache_row) {
         // Retain decode inputs across the reduction without changing its order.
@@ -135,8 +190,14 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     tp.workgroup_size[0] = kRmsBlock;
-    tp.workgroup_count[0] = static_cast<std::uint32_t>(
-        s.output.elem_count() / static_cast<std::size_t>(last_dim(s.inputs[0])));
+    const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
+    const auto rows = static_cast<std::uint32_t>(
+        s.output.elem_count() / static_cast<std::size_t>(d));
+    if (narrow_rows(s, d)) {
+      tp.workgroup_count[0] = (rows + kNarrowRows - 1u) / kNarrowRows;
+      return tp;
+    }
+    tp.workgroup_count[0] = rows;
     tp.lds_bytes = kRmsScratch;
     return tp;
   }
@@ -273,6 +334,92 @@ LSE_REGISTER_PRIMITIVE(Wave32L2NormKernel);
 
 // out = x / max(||x||, eps). eps floors the norm, it does not sit under the
 // sqrt — see the note in the host implementation.
+// SiLU over a column window of a row-major [.., C] tensor, then the L2 norm of
+// each D-wide head of it: what slice -> silu -> reshape -> l2_normalize (and
+// an optional constant scale) compute, in one dispatch instead of two. The
+// SiLU is the elementwise "silu" spelling (x / (1 + exp(-x))) and the norm is
+// the per-thread row scan of l2_normalize, so the values are those of the
+// unfused graph. attrs: column offset, eps, scale (1 = none).
+template <class E>
+struct SiluL2Args {
+  env::In<kir::f32, E> x;
+  env::Out<kir::f32, E> out;
+};
+constexpr std::uint32_t kSiluL2Threads = 256;
+struct SiluL2NormKernel final : KernelPrimitive<SiluL2NormKernel> {
+  static constexpr std::string_view kName = "gdn.silu_l2norm.v1";
+  static constexpr std::string_view kEntry = "lse_gdn_silu_l2norm_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 1 || s.inputs[0].rank() < 2 || s.output.rank() != s.inputs[0].rank() + 1 ||
+        !s.device || !s.store || !s.types.scalar || !s.intrinsics ||
+        s.input_dtypes[0] != DType::kF32 || s.output_dtype != DType::kF32) return {};
+    for (const auto symbol : {"neg", "exp", "sqrt", "max", "fma", "barrier"})
+      if (s.intrinsics->find(symbol).empty()) return {};
+    const auto c = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
+    const auto d = static_cast<std::uint32_t>(last_dim(s.output));
+    const auto heads = static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 2));
+    const auto offset = static_cast<std::uint32_t>(s.attrs[0]);
+    if (d == 0 || kSiluL2Threads % d != 0 || offset + heads * d > c) return {};
+    kir::KernelBody k(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    SiluL2Args<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    // One head row per d threads: each thread computes its element's SiLU
+    // once into workgroup memory, then scans the row's values in order.
+    const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / d);
+    const auto per_group = kSiluL2Threads / d;
+    const auto lid = e.let(math::local_id());
+    const auto row = e.let(math::workgroup_id_x() * per_group + lid / d);
+    const auto col = e.let(lid % d);
+    const auto values = e.lds<kir::f32>(per_group * d);
+    const auto slot = e.let((lid / d) * d);
+    auto mine = e.var(0.0f);
+    if (auto live = e.when(row < rows)) {
+      const auto base = e.let((row / heads) * c + offset + (row % heads) * d);
+      const auto x = e.let(a.x[base + col]);
+      mine = x / (e.f32(1.0f) + math::exp(math::neg(x)));
+      values[e.let(slot + col)] = mine.read();
+    }
+    e.barrier();
+    if (auto live = e.when(row < rows)) {
+      auto acc = e.var(0.0f);
+      for (auto t : e.range(d)) {
+        const auto v = e.let(values[e.let(slot + t)].read());
+        acc = math::fma(v, v, acc.read());
+      }
+      const auto inv = e.let(
+          e.f32(1.0f) / math::max(math::sqrt(acc.read()), e.f32(s.attrs[1])));
+      auto value = e.let(mine.read() * inv);
+      if (s.attrs[2] != 1.0f) value = e.let(value * e.f32(s.attrs[2]));
+      e.store(e.let(row * d + col), value);
+    }
+    return k.str();
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    // The head geometry is the caller's: gdn_silu_l2norm sets the shape.
+    if (in.size() != 1) return LSE_ERROR(kInvalidArgument, "silu_l2norm takes 1 input");
+    return in[0];
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    const auto d = static_cast<std::uint32_t>(last_dim(s.output));
+    const auto per_group = d ? kSiluL2Threads / d : 1u;
+    const auto rows = static_cast<std::uint32_t>(d ? s.output.elem_count() / d : 0);
+    tp.workgroup_size[0] = kSiluL2Threads;
+    tp.workgroup_count[0] = (rows + per_group - 1) / per_group;
+    tp.lds_bytes = kSiluL2Threads * static_cast<std::uint32_t>(sizeof(float));
+    return tp;
+  }
+};
+LSE_REGISTER_PRIMITIVE(SiluL2NormKernel);
+
 struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
   static constexpr std::string_view kName = "l2_normalize";
   static constexpr std::string_view kEntry = "lse_l2_normalize";
