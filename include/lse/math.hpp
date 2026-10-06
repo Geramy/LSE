@@ -69,6 +69,10 @@ struct Exp {
   static constexpr std::string_view key = "exp";
   using result = lse::f32;
 };
+struct Neg {
+  static constexpr std::string_view key = "neg";
+  using result = lse::f32;
+};
 struct Sqrt {
   static constexpr std::string_view key = "sqrt";
   using result = lse::f32;
@@ -176,6 +180,7 @@ template <class Op, typename... A>
 }
 
 inline Val<lse::f32> exp(const Val<lse::f32>& x) { return emit<op::Exp>(x); }
+inline Val<lse::f32> neg(const Val<lse::f32>& x) { return emit<op::Neg>(x); }
 inline Val<lse::f32> sqrt(const Val<lse::f32>& x) { return emit<op::Sqrt>(x); }
 inline Val<lse::f32> rsqrt(const Val<lse::f32>& x) { return emit<op::Rsqrt>(x); }
 inline Val<lse::f32> fma(const Val<lse::f32>& a, const Val<lse::f32>& b,
