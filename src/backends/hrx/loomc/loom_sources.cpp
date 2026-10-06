@@ -51,7 +51,7 @@ constexpr std::array<graph::PrimitiveSource, 54> kLoomSources{{
      "$t1 = scalar.expf<afn> $t0 : f32\n"
      "$t2 = scalar.constant 1.0 : f32\n"
      "$t3 = scalar.addf $t2, $t1 : f32\n"
-     "$r = scalar.divf $0, $t3 : f32"},
+     "$r = scalar.divf<arcp> $0, $t3 : f32"},
     {"tanh", "$r = scalar.tanhf<afn> $0 : f32"},
     // maxnumf is IEEE-754 maxNum, which is what fmaxf is. maximumf propagates
     // NaN and would disagree with the HIP row on exactly the inputs a softmax

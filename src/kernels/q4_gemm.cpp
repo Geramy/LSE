@@ -480,10 +480,6 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
 
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
-  // A fused epilogue runs once per accumulator element, 64 per lane here;
-  // Loom's scheduler interleaves them and exhausts scalar registers on an
-  // exact divide (silu). Trailing elementwise work runs in its own launch.
-  bool supports_epilogue() const noexcept override { return false; }
   bool has_typed_host_impl() const noexcept override { return true; }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {

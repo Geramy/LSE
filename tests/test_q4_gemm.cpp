@@ -90,6 +90,9 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
   }
   std::vector<std::uint32_t> w(n * k / 8);
   for (auto& v : w) v = static_cast<std::uint32_t>(rng());
+  if (const char* fill = std::getenv("Q4G_TEST_W")) {
+    for (auto& v : w) v = static_cast<std::uint32_t>(std::strtoul(fill, nullptr, 16));
+  }
   std::vector<bfloat16_t> s(n * groups), b(n * groups);
   for (std::size_t i = 0; i < s.size(); ++i) {
     s[i] = bfloat16_t(0.002f + 0.01f * std::abs(uni(rng)));
