@@ -259,7 +259,7 @@ struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
     const auto count = static_cast<std::uint32_t>(s.attrs[1]);
     const bool pairs = s.attrs[2] != 0.0f;
     const auto chunks = static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 3));
-    if (!top || top > 16 || !count || chunks != (count + kChunkElements - 1) / kChunkElements ||
+    if (!top || top > 32 || !count || chunks != (count + kChunkElements - 1) / kChunkElements ||
         s.output.dim(s.output.rank() - 2) != static_cast<std::int64_t>(top) || s.output.dim(s.output.rank() - 1) != 2 ||
         2ull * kChunkThreads * top * sizeof(float) > backend::workgroup_lds_bytes(s.device)) return {};
     kir::KernelBody body(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
@@ -378,6 +378,158 @@ struct TopKChunkKernel final : KernelPrimitive<TopKChunkKernel> {
   }
 };
 LSE_REGISTER_PRIMITIVE(TopKChunkKernel);
+
+// The k best of a chunk of 256 * E elements by k rounds of a workgroup
+// argmax, each element in a register: a round is one wave shuffle reduce, one
+// pass over eight wave winners, and a rescan by the one thread that owned the
+// winner. Same order as topk.chunk.v2 (NaN first, ties to the smaller index,
+// missing entries -inf at kMissingIndex), at a cost linear in k instead of a
+// k-wide merge per tree level.
+struct TopKScanKernel final : KernelPrimitive<TopKScanKernel> {
+  static constexpr std::string_view kName = "topk.scan.v1";
+  static constexpr std::string_view kEntry = "lse_topk_scan_v1";
+  static constexpr std::string_view kSource = {};
+  static constexpr std::uint32_t kThreads = 256, kWave = 32;
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  bool has_host_impl() const noexcept override { return true; }
+
+  // attrs: k, count, pairs, elements per thread.
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 1 || s.output.rank() < 3 || !s.device || !s.store ||
+        !s.types.scalar || !s.intrinsics || s.input_dtypes[0] != DType::kF32 ||
+        s.output_dtype != DType::kF32 || s.device->wavefront_size != kWave ||
+        s.device->max_threads_per_workgroup < kThreads) return {};
+    const auto top = static_cast<std::uint32_t>(s.attrs[0]);
+    const auto count = static_cast<std::uint32_t>(s.attrs[1]);
+    const bool pairs = s.attrs[2] != 0.0f;
+    const auto per = static_cast<std::uint32_t>(s.attrs[3]);
+    const auto span = kThreads * per;
+    const auto chunks = static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 3));
+    if (!top || top > 32 || !count || !per || per > 64 || chunks != (count + span - 1) / span ||
+        s.output.dim(s.output.rank() - 2) != static_cast<std::int64_t>(top) ||
+        s.output.dim(s.output.rank() - 1) != 2) return {};
+    constexpr std::uint32_t waves = kThreads / kWave;
+    kir::KernelBody body(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+    body.set_store(s.store);
+    TopKArgs<env::Emit> a;
+    if (!env::bind(body, a, s)) return {};
+    env::Emit e{&body};
+    const auto lid = e.let(math::local_id());
+    const auto lane = e.let(lid % kWave), wave = e.let(lid / kWave);
+    const auto chunk = e.let(math::workgroup_id_x());
+    const auto row = e.let(math::workgroup_id_y());
+    std::vector<kir::LValue<kir::f32>> v, ix;
+    for (std::uint32_t j = 0; j < per; ++j) {
+      v.push_back(e.var(math::neg_inf()));
+      ix.push_back(e.var(kMissingIndex));
+      const auto at = e.let(chunk * span + j * kThreads + lid);
+      if (auto valid = e.when(at < count)) {
+        const auto offset = e.let((row * count + at) * (pairs ? 2u : 1u));
+        v[j] = a.x[offset];
+        if (pairs) ix[j] = a.x[offset + 1u];
+        else ix[j] = kir::cast<kir::f32>(at);
+      }
+    }
+    auto bv = e.var(math::neg_inf()), bi = e.var(kMissingIndex);
+    auto rescan = [&] {
+      bv = math::neg_inf(); bi = kMissingIndex;
+      for (std::uint32_t j = 0; j < per; ++j) {
+        if (auto better = e.when(pair_better(e, v[j].read(), ix[j].read(), bv.read(), bi.read()))) {
+          bv = v[j].read(); bi = ix[j].read();
+        }
+      }
+    };
+    rescan();
+    // Two banks so a round's winners never overwrite the ones still being read.
+    const auto wv = e.lds<kir::f32>(2u * waves);
+    const auto wi = e.lds<kir::f32>(2u * waves);
+    // Rounds stay a loop: unrolled, k rescans of `per` registers outgrow a
+    // branch's reach.
+    for (auto p : e.range(top)) {
+      auto rv = e.var(bv.read()), ri = e.var(bi.read());
+      for (std::uint32_t bit = 1; bit < kWave; bit <<= 1) {
+        const auto ov = e.let(math::shfl_xor(rv.read(), e.u32(bit)));
+        const auto oi = e.let(math::shfl_xor(ri.read(), e.u32(bit)));
+        if (auto take = e.when(pair_better(e, ov, oi, rv.read(), ri.read()))) {
+          rv = ov; ri = oi;
+        }
+      }
+      const auto bank = e.let((p % 2u) * waves);
+      if (auto leader = e.when(lane == 0u)) {
+        wv[e.let(wave + bank)] = rv.read();
+        wi[e.let(wave + bank)] = ri.read();
+      }
+      e.barrier();
+      auto gv = e.var(wv[bank].read()), gi = e.var(wi[bank].read());
+      for (std::uint32_t w = 1; w < waves; ++w) {
+        const auto ov = e.let(wv[e.let(bank + w)].read());
+        const auto oi = e.let(wi[e.let(bank + w)].read());
+        if (auto take = e.when(pair_better(e, ov, oi, gv.read(), gi.read()))) {
+          gv = ov; gi = oi;
+        }
+      }
+      if (auto leader = e.when(lid == 0u)) {
+        const auto output = e.let(((row * chunks + chunk) * top + p) * 2u);
+        e.store(output, gv.read());
+        e.store(output + 1u, gi.read());
+      }
+      if (auto owner = e.when(gi.read() != e.f32(kMissingIndex) && bi.read() == gi.read())) {
+        for (std::uint32_t j = 0; j < per; ++j) {
+          if (auto hit = e.when(ix[j].read() == gi.read())) {
+            v[j] = math::neg_inf(); ix[j] = kMissingIndex;
+          }
+        }
+        rescan();
+      }
+    }
+    return body.lds().ok() ? body.str() : std::string{};
+  }
+  void eval_cpu(std::span<const float* const> in, float* out, std::size_t elements,
+                const std::array<float, 4>& attrs) const override {
+    const auto top = static_cast<std::size_t>(attrs[0]);
+    const auto count = static_cast<std::size_t>(attrs[1]);
+    const bool pairs = attrs[2] != 0.0f;
+    const auto span = static_cast<std::size_t>(kThreads) * static_cast<std::size_t>(attrs[3]);
+    const auto chunks = (count + span - 1) / span;
+    const auto rows = elements / (chunks * top * 2);
+    std::vector<TopKPair> candidates;
+    for (std::size_t row = 0; row < rows; ++row) {
+      for (std::size_t chunk = 0; chunk < chunks; ++chunk) {
+        candidates.clear();
+        const auto begin = chunk * span;
+        const auto end = std::min(count, begin + span);
+        for (auto at = begin; at < end; ++at) {
+          const auto offset = (row * count + at) * (pairs ? 2u : 1u);
+          candidates.push_back({in[0][offset], pairs ? in[0][offset + 1] : static_cast<float>(at)});
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const TopKPair& a, const TopKPair& b) { return pair_better(a, b); });
+        const auto base = (row * chunks + chunk) * top * 2;
+        for (std::size_t p = 0; p < top; ++p) {
+          const auto candidate = p < candidates.size() ? candidates[p]
+              : TopKPair{-std::numeric_limits<float>::infinity(), kMissingIndex};
+          out[base + 2 * p] = candidate.value;
+          out[base + 2 * p + 1] = candidate.index;
+        }
+      }
+    }
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override { return in[0]; }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan plan;
+    const auto chunks = static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 3));
+    const auto top = static_cast<std::uint32_t>(s.attrs[0]);
+    plan.workgroup_size[0] = kThreads;
+    plan.workgroup_count[0] = chunks;
+    plan.workgroup_count[1] = static_cast<std::uint32_t>(s.output.elem_count() / (chunks * top * 2));
+    plan.lds_bytes = 4u * (kThreads / kWave) * static_cast<std::uint32_t>(sizeof(float));
+    return plan;
+  }
+};
+LSE_REGISTER_PRIMITIVE(TopKScanKernel);
 
 struct TopKExtractKernel final : KernelPrimitive<TopKExtractKernel> {
   static constexpr std::string_view kName = "topk.extract";

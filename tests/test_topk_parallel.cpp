@@ -131,17 +131,19 @@ LSE_TEST(parallel_topk_loom_emits_ragged_three_stage_vocabulary) {
     LSE_EXPECT(emitted.ok());
     if (!emitted.ok()) { std::fprintf(stderr, "%s\n", emitted.status().to_string().c_str()); continue; }
     const auto name = group.outputs[0]->prim->name();
-    if (name == "topk.chunk.v2") {
-      const unsigned expected_chunks[] = {485, 16, 1};
-      LSE_EXPECT(chunks < 3);
-      if (chunks < 3) LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], expected_chunks[chunks]);
+    if (name == "topk.scan.v1") {
+      // 248320 over 256 x 32 registers is 31 chunks; their 31 x 16
+      // candidates fit one chunk of 256 x 2.
+      const unsigned expected_chunks[] = {31, 1};
+      LSE_EXPECT(chunks < 2);
+      if (chunks < 2) LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], expected_chunks[chunks]);
       LSE_EXPECT_EQ(emitted->dims.workgroup_count[1], 7u);
-      LSE_EXPECT_EQ(emitted->lds_bytes, 32768u);
+      LSE_EXPECT_EQ(emitted->lds_bytes, 128u);
       LSE_EXPECT(emitted->source.find("kernel.barrier") != std::string::npos);
       ++chunks;
     } else if (name == "topk.extract") ++extracts;
   }
-  LSE_EXPECT_EQ(chunks, 3u); LSE_EXPECT_EQ(extracts, 2u);
+  LSE_EXPECT_EQ(chunks, 2u); LSE_EXPECT_EQ(extracts, 2u);
 }
 
 int gpu_topk() {
@@ -219,6 +221,31 @@ int gpu_topk_edges() {
   verify(read(values),read(ids),expected);
   std::printf("topk edges shape=4x4097 k=16 device_groups=%u host_groups=%u host_fallbacks=%u\n",
       trace.device_groups,trace.host_groups,trace.host_fallbacks);
+  // Interleaved pairs past the extract kernel's k, on the edge rows and on a
+  // vocabulary-wide row that takes two scan stages.
+  std::vector<float> wide(2 * 248320);
+  for (std::size_t i = 0; i < wide.size(); ++i)
+    wide[i] = std::sin(static_cast<float>(i) * .00317f) * 11;
+  for (std::size_t i : {3u, 8191u, 8192u, 200000u, 248319u}) wide[i] = 20;
+  wide[248320 + 77] = nan;
+  for (const auto* data : {&input, &wide}) {
+    const std::size_t w = data == &input ? width : 248320;
+    for (int pk : {16, 20, 32}) {
+      const auto want = reference(*data, w, static_cast<std::size_t>(pk));
+      auto pairs = topk_pairs(filled({static_cast<std::int64_t>(data->size() / w), static_cast<std::int64_t>(w)}, *data), pk);
+      LSE_EXPECT(pairs.valid());
+      if (!pairs.valid()) continue;
+      const NodePtr pair_roots[] = {pairs.node()};
+      LSE_EXPECT_OK(scheduler->eval(pair_roots, false));
+      LSE_EXPECT_OK(scheduler->drain());
+      const auto got = read(pairs);
+      std::vector<float> got_values, got_ids;
+      for (std::size_t i = 0; i + 1 < got.size(); i += 2) {
+        got_values.push_back(got[i]); got_ids.push_back(got[i + 1]);
+      }
+      verify(got_values, got_ids, want);
+    }
+  }
   return test::Registry::get().failures ? 1 : 0;
 }
 int main(int argc, char** argv) {

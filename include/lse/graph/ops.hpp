@@ -112,6 +112,13 @@ Array overwrite_slice(const Array& dst, const Array& src, int axis,
 Array topk(const Array& x, int k, int axis = -1, Array* indices = nullptr,
            float score_band = 1.0f);
 
+// The last axis's k best as interleaved (value, index) pairs, [rows, 1, k, 2],
+// best first with NaN ahead of everything and ties to the smaller index: what
+// topk reads its values and indices from, in one buffer a host can read in one
+// copy. Rows of at least 4096; an invalid Array when the row is narrower or
+// k is outside [1, 32].
+Array topk_pairs(const Array& x, int k);
+
 // Index of the row maximum over the last axis, as f32 (the engine's index
 // convention — see topk). Ties take the smallest index, matching the host
 // sampler's argmax exactly. Two nodes: a per-chunk partial reduce to
