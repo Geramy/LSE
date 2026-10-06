@@ -1988,6 +1988,42 @@ Status HrxBackend::write_ordered_impl(DeviceBuffer& dst, const void* src,
 #endif
 }
 
+Status HrxBackend::copy_ordered_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                                     std::size_t bytes, std::size_t src_offset,
+                                     std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)src; (void)dst; (void)bytes; (void)src_offset; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (src.handle == 0 || dst.handle == 0) {
+    return LSE_ERROR(kInvalidArgument, "null buffer in ordered copy");
+  }
+  if (src_offset + bytes > src.size_bytes || dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "ordered copy runs past a buffer");
+  }
+  if (bytes == 0) return OkStatus();
+  // Ordered on stream 0 alone; with other streams or another backend on
+  // this memory the ordering is a join across queues, made on the host.
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  if (other_streams || src.residency != dst.residency || src.member != dst.member) {
+    return copy_peer_ordered_impl(src, dst, bytes, src_offset, dst_offset, Stream{0}, Stream{0});
+  }
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  LSE_SYNC_TRACE("copy_ordered %zu bytes", bytes);
+  return from_hrx(
+      hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                             reinterpret_cast<hrx_buffer_t>(src.handle),
+                             src.offset + src_offset,
+                             reinterpret_cast<hrx_buffer_t>(dst.handle),
+                             dst.offset + dst_offset, bytes),
+      "hrx_stream_copy_buffer (ordered)");
+#endif
+}
+
 Status HrxBackend::join_ordered_writes() {
   if (!ordered_writes_pending_) return OkStatus();
   return synchronize_stream_impl(Stream{0});

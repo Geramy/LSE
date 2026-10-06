@@ -98,6 +98,9 @@ class HrxBackend : public Backend<HrxBackend> {
   // 64 KiB update limit, while stream 0 is the only stream in use and into
   // memory with no host mapping; otherwise the drain and copy the seam
   // describes.
+  Status copy_ordered_impl(const DeviceBuffer& src, DeviceBuffer& dst,
+                           std::size_t bytes, std::size_t src_offset,
+                           std::size_t dst_offset);
   Status write_ordered_impl(DeviceBuffer& dst, const void* src, std::size_t bytes,
                             std::size_t dst_offset);
   // Peer to this device, no host bounce. Declines when the runtime refuses the

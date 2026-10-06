@@ -1128,6 +1128,16 @@ class IBackend {
     LSE_RETURN_IF_ERROR(synchronize());
     return copy_h2d(src, dst, bytes, dst_offset);
   }
+  // A device-to-device copy within this device that runs where it is issued
+  // in the default stream's order (after every launch already issued there,
+  // before every one issued after), with no host wait. Both buffers must stay
+  // live until the device reaches it. The generic version drains and copies.
+  virtual Status copy_ordered(const DeviceBuffer& src, DeviceBuffer& dst,
+                              std::size_t bytes, std::size_t src_offset,
+                              std::size_t dst_offset) {
+    LSE_RETURN_IF_ERROR(synchronize());
+    return copy_peer(src, dst, bytes, src_offset, dst_offset);
+  }
   // A peer copy the two streams order between themselves: it runs after what
   // the producer has queued and the consumer's next work runs after it, with
   // the host in neither edge. A backend that cannot say that falls back to the
@@ -1303,6 +1313,13 @@ class BackendAdapter final : public IBackend {
   Status copy_d2h(const DeviceBuffer& s, void* d, std::size_t n,
                   std::size_t off) override {
     return impl_.copy_d2h(s, d, n, off);
+  }
+  Status copy_ordered(const DeviceBuffer& s, DeviceBuffer& d, std::size_t n,
+                      std::size_t so, std::size_t dof) override {
+    if constexpr (requires(Derived& i) { i.copy_ordered_impl(s, d, n, so, dof); }) {
+      return impl_.copy_ordered_impl(s, d, n, so, dof);
+    }
+    return IBackend::copy_ordered(s, d, n, so, dof);
   }
   Status write_ordered(DeviceBuffer& d, const void* s, std::size_t n,
                        std::size_t off) override {
