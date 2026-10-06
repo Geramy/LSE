@@ -489,10 +489,12 @@ Status Generator::spec_top_row(std::size_t row) {
   if (!spec_top_ready_) {
     const std::uint64_t started = now_ns();
     graph::Node& node = *spec_.top.node();
-    // The pass was submitted, not awaited.
-    LSE_RETURN_IF_ERROR(sched->drain());
+    // The pass was submitted, not awaited. A device-to-host copy waits for
+    // the work it reads (or rides the stream behind it), so the plain-buffer
+    // read below needs no drain of its own.
     if (node.kv_fragments || node.buffer.ptr != nullptr || !node.buffer.valid() ||
         !node.device_dirty) {
+      LSE_RETURN_IF_ERROR(sched->drain());
       LSE_RETURN_IF_ERROR(graph::interpreter::sync_from_device(node, sched->backend()));
       LSE_RETURN_IF_ERROR(graph::interpreter::read_raw(
           node, spec_top_.data(), spec_top_.size() * sizeof(float)));

@@ -2540,6 +2540,31 @@ Status HrxBackend::copy_d2h_impl(const DeviceBuffer& src, void* dst,
   if (src_offset + bytes > src.size_bytes) {
     return LSE_ERROR(kOutOfRange, "copy_d2h reads past the end of the buffer");
   }
+  // A small read on a device whose work is all on stream 0 rides that
+  // stream: the copy into staging is queued behind every launch and ordered
+  // write already issued, so one wait covers the producers and the copy.
+  // Everything else waits for the device first, as below.
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  constexpr std::size_t kOrderedReadLimit = 1u << 20;
+  if (!other_streams && bytes <= kOrderedReadLimit) {
+    LSE_SYNC_TRACE("copy_d2h ordered %zu bytes", bytes);
+    auto stream = stream_at(0);
+    if (!stream.ok()) return stream.status();
+    LSE_RETURN_IF_ERROR(ensure_staging(bytes));
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_stream_copy_buffer(static_cast<hrx_stream_t>(*stream),
+                               reinterpret_cast<hrx_buffer_t>(src.handle),
+                               src.offset + src_offset,
+                               static_cast<hrx_buffer_t>(staging_buffer_), 0, bytes),
+        "hrx_stream_copy_buffer (ordered d2h)"));
+    unflushed_launches_[0] = 0;
+    LSE_RETURN_IF_ERROR(synchronize_stream_impl(Stream{0}));
+    std::memcpy(dst, staging_host_, bytes);
+    return OkStatus();
+  }
   // Same hazard as copy_h2d: the transfer is not ordered against any stream
   // by anything but this wait.
   LSE_SYNC_TRACE("copy_d2h %zu bytes", bytes);
