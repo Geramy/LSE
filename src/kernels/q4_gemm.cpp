@@ -51,7 +51,6 @@ using graph::ThreadPlan;
 namespace {
 
 constexpr std::uint32_t kThreads = 256;
-constexpr std::uint32_t kWaves = 8;
 // One K step. A whole number of them must make one quantization group so a
 // column's scale and bias are constant across the step.
 constexpr std::uint32_t kBK = dispatch::kQ4GemmStepK;
@@ -232,6 +231,7 @@ Dims dims_of(const KernelShapes& s, bool sliced) {
   return d;
 }
 
+std::uint32_t burst_steps(const Dims& d, const struct Tile& t);
 Tile tile_for(const Dims& d) {
   const auto t = dispatch::q4_gemm_tile(d.m);
   return {t.bm, t.bn, t.wm, t.wn};
@@ -263,14 +263,30 @@ const math::MatrixCoreRow* f16_row(const KernelShapes& s) {
   return nullptr;
 }
 
+// Steps per K-loop iteration. A short tile does little matrix work per
+// step, so the loop is bound by memory latency and wants several steps'
+// reads in flight; a tall tile's step bodies are large enough that the
+// target cannot compile more than one per iteration. gfx1201, N 17408 x
+// K 5120: M 9 300 -> 179 us at four steps, M 64 324 -> 263 us at two.
+std::uint32_t burst_steps(const Dims& d, const Tile& t) {
+  // The target's matrix-operand staging fails past about 32 matrix
+  // instructions in one block, which caps the burst by the wave's tile.
+  const std::uint32_t per_step = (t.bm / t.wm / 16u) * (t.bn / t.wn / 16u) * (kBK / 16u);
+  const std::uint32_t steps = d.k / kBK / d.slices;
+  for (std::uint32_t b = 4u; b > 1u; b /= 2u)
+    if (b * per_step <= 32u && steps % b == 0u) return b;
+  return 1u;
+}
+
 std::uint32_t lds_bytes(const Tile& t) {
   return (t.bm + t.bn) * kRowHalves * 2u;
 }
 
 bool device_fits(const KernelShapes& s, const Dims& d) {
   if (!d.valid || !s.device || !s.intrinsics) return false;
-  if (s.device->wavefront_size * kWaves != kThreads ||
-      s.device->max_threads_per_workgroup < kThreads)
+  const Tile t = tile_for(d);
+  if (s.device->wavefront_size != 32u ||
+      s.device->max_threads_per_workgroup < t.wm * t.wn * 32u)
     return false;
   if (device_load_bytes(s.device) < 16u) return false;
   for (const auto symbol : {"barrier", d.bits == 8 ? "q8x8.f16" : "q4x8.f16"})
@@ -334,10 +350,11 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // row, row-major over the tile so consecutive threads read one contiguous
   // row segment of the panel.
   constexpr std::uint32_t kAPerRow = kBK / kRun;
-  const std::uint32_t a_pieces = t.bm * kAPerRow / kThreads;
+  const std::uint32_t threads = t.wm * t.wn * 32u;
+  const std::uint32_t a_pieces = t.bm * kAPerRow / threads;
   std::vector<kir::Val<kir::u32>> a_src, a_dst;
   for (std::uint32_t c = 0; c < a_pieces; ++c) {
-    const auto f = e.let(lid + c * kThreads);
+    const auto f = e.let(lid + c * threads);
     const auto r = e.let(f / kAPerRow);
     const auto run = e.let(f % kAPerRow);
     const auto grow = e.let(m0 + r);
@@ -353,12 +370,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // A tile with fewer weight pieces than threads lets the surplus threads
   // repeat a piece: they write the same values to the same place.
   const std::uint32_t b_total = t.bn * kBPerCol;
-  const std::uint32_t b_pieces = (b_total + kThreads - 1u) / kThreads;
+  const std::uint32_t b_pieces = (b_total + threads - 1u) / threads;
   std::vector<kir::Val<kir::u32>> b_src, b_dst, b_aff;
   for (std::uint32_t c = 0; c < b_pieces; ++c) {
-    const auto f = b_total % kThreads == 0u
-                       ? e.let(lid + c * kThreads)
-                       : e.let((lid + c * kThreads) % b_total);
+    const auto f = b_total % threads == 0u
+                       ? e.let(lid + c * threads)
+                       : e.let((lid + c * threads) % b_total);
     const auto col = e.let(f / kBPerCol);
     const auto part = e.let(f % kBPerCol);
     const auto gcol = e.let(n0 + col);
@@ -372,7 +389,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   struct Staged {
     std::vector<kir::Pack<lse::f16>> av;
     std::vector<kir::Pack<std::uint32_t>> bv;
-    std::vector<kir::Val<kir::f32>> scale, bias;
+    std::vector<kir::Val<S>> scale, bias;  // widened in commit
   };
   const auto issue = [&](const kir::Val<kir::u32>& kt) {
     Staged st;
@@ -384,8 +401,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     for (std::uint32_t c = 0; c < b_pieces; ++c) {
       st.bv.push_back(e.load(a.packed, e.let(b_src[c] + woff), 16u));
       const auto at = e.let(b_aff[c] + g);
-      st.scale.push_back(e.let(math::widen(a.scales[at])));
-      st.bias.push_back(e.let(math::widen(a.biases[at])));
+      st.scale.push_back(e.let(a.scales[at]));
+      st.bias.push_back(e.let(a.biases[at]));
     }
     return st;
   };
@@ -397,12 +414,14 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto commit = [&](const Staged& st) {
     for (std::uint32_t c = 0; c < a_pieces; ++c) store8(As, a_dst[c], st.av[c]);
     for (std::uint32_t c = 0; c < b_pieces; ++c) {
+      const auto scale = e.let(math::widen(st.scale[c]));
+      const auto bias = e.let(math::widen(st.bias[c]));
       if (d.bits == 8) {
         // Two aligned runs of eight, each from a pair of words.
         for (std::uint32_t r = 0; r < 2u; ++r) {
           const auto lo = e.let(st.bv[c][static_cast<int>(2u * r)]);
           const auto hi = e.let(st.bv[c][static_cast<int>(2u * r + 1u)]);
-          const auto v = kb.call<F16x8>("q8x8.f16", lo, hi, st.scale[c], st.bias[c]);
+          const auto v = kb.call<F16x8>("q8x8.f16", lo, hi, scale, bias);
           store8(Bs, e.let(b_dst[c] + r * kRun),
                  kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8));
         }
@@ -411,7 +430,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       for (std::uint32_t w = 0; w < 4u; ++w) {
         const auto word = e.let(st.bv[c][static_cast<int>(w)]);
         const auto v =
-            kb.call<F16x8>("q4x8.f16", word, st.scale[c], st.bias[c]);
+            kb.call<F16x8>("q4x8.f16", word, scale, bias);
         store8(Bs, e.let(b_dst[c] + w * kCodesPerWord),
                kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8));
       }
@@ -467,15 +486,34 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         }
     }
   };
-  commit(issue(k_begin));
-  e.barrier();
-  for (auto kt : e.range(k_begin, k_end, 1u)) {
-    const auto next = e.let(select(kt + 1u < k_end, kt + 1u, kt));
-    const Staged st = issue(next);
-    compute();
+  const std::uint32_t burst = burst_steps(d, t);
+  if (burst <= 1u) {
+    commit(issue(k_begin));
     e.barrier();
-    commit(st);
-    e.barrier();
+    for (auto kt : e.range(k_begin, k_end, 1u)) {
+      const auto next = e.let(select(kt + 1u < k_end, kt + 1u, kt));
+      const Staged st = issue(next);
+      compute();
+      e.barrier();
+      commit(st);
+      e.barrier();
+    }
+  } else {
+    // A burst of steps per iteration, every step's global reads issued at
+    // its top: the target waits for outstanding reads at each loop header,
+    // so reads cannot be carried across iterations, and one step ahead hides
+    // only one step's matrix work -- next to nothing at a few rows, where
+    // the loop then waits a full memory latency per step.
+    for (auto kt : e.range(k_begin, k_end, burst)) {
+      std::vector<Staged> sts;
+      for (std::uint32_t u = 0; u < burst; ++u) sts.push_back(issue(e.let(kt + u)));
+      for (std::uint32_t u = 0; u < burst; ++u) {
+        commit(sts[u]);
+        e.barrier();
+        compute();
+        e.barrier();
+      }
+    }
   }
 
   for (std::uint32_t fm = 0; fm < FM; ++fm) {
@@ -644,7 +682,7 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
       return kernel ? kernel->plan(original) : tp;
     }
     const Tile t = tile_for(d);
-    tp.workgroup_size[0] = kThreads;
+    tp.workgroup_size[0] = t.wm * t.wn * 32u;
     tp.workgroup_count[0] =
         ((d.m + t.bm - 1u) / t.bm) * ((d.n + t.bn - 1u) / t.bn) * d.slices;
     tp.lds_bytes = lds_bytes(t);
