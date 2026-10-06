@@ -135,7 +135,7 @@ bool flash_wmma_supported(const KernelShapes& s) {
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.device->max_threads_per_workgroup >= rule.threads && d.tq >= rule.min_rows &&
         d.dh <= rule.max_head_dim && d.dv <= rule.max_head_dim &&
-        backend::workgroup_lds_bytes(s.device) >= shapes::flash_wmma_lds_bytes(d.dh))
+        backend::workgroup_lds_bytes(s.device) >= shapes::flash_wmma_lds_bytes(d.dh, d.dv))
       geometry = true;
   if (!geometry) return false;
   const auto target = kernels::matrix_target(*s.device);

@@ -495,6 +495,7 @@ lse_add_test(test_q4_activation_panel lse_graph lse_kernels lse_backends lse_ir)
 lse_add_test(test_q4_matrix_panel lse_graph lse_kernels lse_backends lse_ir)
 lse_add_test(test_q4_gemm lse_graph lse_kernels lse_backends lse_ir)
 lse_add_test(test_gdn_rows lse_graph lse_kernels lse_backends lse_ir)
+lse_add_test(test_flash_prefill lse_graph lse_kernels lse_backends lse_ir)
 lse_add_test(test_q8_matrix_pack lse_graph lse_kernels lse_backends lse_ir)
 set_tests_properties(test_quant_swiglu test_typed_kernel test_q4_activation_panel test_q4_matrix_panel test_q8_matrix_pack PROPERTIES
   ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")

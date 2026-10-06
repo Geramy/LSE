@@ -213,9 +213,10 @@ LSE_TEST(flash_wmma_policy_covers_kv_formats_ragged_tiles_and_matrix_resources) 
       LSE_EXPECT(dispatch::flash_wmma_supported(s));
     }
   }
-  device.lds_bytes_per_workgroup = 24767;
+  // Query tile, scores, softmax state and the smallest value-staging block.
+  device.lds_bytes_per_workgroup = 33215;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
-  device.lds_bytes_per_workgroup = 24768;
+  device.lds_bytes_per_workgroup = 33216;
   LSE_EXPECT(dispatch::flash_wmma_supported(s));
   device.extension = nullptr;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
@@ -249,7 +250,9 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()) {
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],768u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    LSE_EXPECT_EQ(emitted->lds_bytes,24768u);
+    // 24768 for the query tile, scores and softmax state; 16896 to stage
+    // 32 keys of 256 f16 values in rows of 264.
+    LSE_EXPECT_EQ(emitted->lds_bytes,41664u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf16>")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
