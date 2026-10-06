@@ -283,16 +283,6 @@ class HrxBackend : public Backend<HrxBackend> {
   std::uint64_t submission_signature_ = 0;
   std::uint32_t submission_dispatches_ = 0;
   std::vector<std::uint32_t> unflushed_launches_;
-  // The launch count at which each stream next flushes. A burst of work after
-  // the host waited starts at flush_interval_, so the GPU starts as soon as
-  // before, and doubles at every flush up to kFlushGrowthLimit times that:
-  // every submission costs the queue a barrier packet and a doorbell (~20 us
-  // of idle GPU between submissions and ~45 us of host time each on the
-  // pinned R9700 run), and once the GPU has work queued the host records the
-  // next chunk far faster than the GPU drains the last. Reset when the host
-  // waits on the stream (synchronize_stream_impl).
-  static constexpr std::uint32_t kFlushGrowthLimit = 8;
-  std::vector<std::uint32_t> flush_threshold_;
   // An ordered write is queued on stream 0 and has not been waited for. Work
   // issued anywhere but stream 0 is not ordered behind it, so such work joins
   // stream 0 on the host first (join_ordered_writes); synchronizing stream 0
