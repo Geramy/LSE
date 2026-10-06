@@ -299,6 +299,15 @@ bool wave32_l2_supported(const KernelShapes& s) {
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.inputs[0] == Shape{rule.batch, rule.heads, rule.rows, rule.width}) return true;
+  // Any row count at the rules' row width and wave: one wave per row. The
+  // per-element form re-reads its whole row for every element, which at a
+  // prefill's thousands of rows is the row width times the work.
+  for (const auto& rule : shapes::kWaveL2Rules)
+    if (s.device->wavefront_size == rule.wave &&
+        s.device->max_threads_per_workgroup >= rule.threads &&
+        s.inputs[0].rank() >= 1 &&
+        s.inputs[0].dim(s.inputs[0].rank() - 1) == rule.width &&
+        rule.width % rule.wave == 0) return true;
   return false;
 }
 
