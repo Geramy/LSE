@@ -96,6 +96,14 @@ class MtpModule {
                                    std::span<const std::uint32_t> tokens,
                                    std::int32_t first,
                                    const graph::Array* device_hidden = nullptr);
+  // The pass without its readback: the proposal stays in pass_.pick on the
+  // device. `device_token`, when set, is the one row's token there (the
+  // previous pass's pick), read in place instead of uploaded; `tokens` then
+  // only gives the row count.
+  Status submit_pass(std::span<const float> hidden,
+                     std::span<const std::uint32_t> tokens, std::int32_t first,
+                     const graph::Array* device_hidden,
+                     const graph::Array* device_token);
   Result<std::vector<std::uint32_t>> draft_chain_impl(
       std::span<const float> hidden, const graph::Array* device_hidden,
       std::span<const std::uint32_t> tokens, std::int32_t first,
@@ -112,6 +120,8 @@ class MtpModule {
   graph::Array fc_, pre_norm_hidden_, pre_norm_embedding_, final_norm_;
 
   MixerState state_;
+  // A chain's proposals, gathered on the device and read back once.
+  graph::Array chain_picks_;
   std::int32_t position_ = 0;
   std::uint64_t revision_ = 0;
 
@@ -119,6 +129,7 @@ class MtpModule {
     graph::Program program;
     graph::Array hidden;   // [1, T, D] stable input slot
     graph::Array tokens;   // [1, T] leaf, poked
+    backend::DeviceBuffer token_slot;  // tokens' own storage, when aliased
     graph::Array meta;     // kv::step_meta_elems(1) leaf, poked
     graph::Array pick;
     graph::Array last;     // [1, D]: the block's hidden for the drafted row
