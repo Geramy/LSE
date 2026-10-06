@@ -302,6 +302,7 @@ void MtpModule::reset() {
   state_ = MixerState{};
   pass_ = Pass{};
   passes_.clear();
+  chain_picks_ = Array{};
   position_ = 0;
   ++revision_;
 }
