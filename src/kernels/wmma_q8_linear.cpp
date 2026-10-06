@@ -18,7 +18,30 @@ using graph::KernelShapes;
 using graph::ThreadPlan;
 namespace {
 constexpr int kTileM = 16, kTileN = 16, kTileK = 16;
-constexpr std::uint32_t kBlock = 256, kColBlocks = 1;
+constexpr std::uint32_t kMaxBlock = 256, kColBlocks = 1;
+// One 16-column tile per wave. A grid of full-width workgroups that leaves
+// compute units idle (a small M over a narrow N, as in a draft model's down
+// projection) halves its workgroups until every unit holds one.
+struct Q8Grid {
+  std::uint32_t block = kMaxBlock;
+  // The grid had to narrow: few waves per unit, so each wave issues a whole
+  // group's weight loads at once instead of one K16 slice at a time.
+  bool latency_bound = false;
+};
+Q8Grid q8_grid(const KernelShapes& s, std::uint32_t m, std::uint32_t rows,
+               std::uint32_t n, std::uint32_t wave) {
+  Q8Grid grid;
+  const auto tiles = (n + 15u) / 16u;
+  const auto row_blocks = (m + rows - 1u) / rows;
+  const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
+  auto waves = kMaxBlock / wave;
+  while (waves > 1u && row_blocks * ((tiles + waves - 1u) / waves) < units) {
+    waves /= 2u;
+    grid.latency_bound = true;
+  }
+  grid.block = waves * wave;
+  return grid;
+}
 constexpr float kAmaxFloor = 1e-30f;
 template <math::MatrixTarget G>
 using MmaFor = math::op::Mma<G, math::MatrixElem::kI32, math::MatrixElem::kSU8,
@@ -93,6 +116,8 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
   const std::uint32_t round_groups = d.round_groups;
   const std::uint32_t round_slices = slices * round_groups;
   const std::uint32_t words = gsize * round_groups / 4u;
+  const Q8Grid grid = q8_grid(s, m, kRowsPerGroup, n, kWave);
+  const std::uint32_t kBlock = grid.block;
   const std::uint32_t waves = kBlock / kWave;
   const std::uint32_t tiles_n = (n + kTileN - 1u) / kTileN;
   const std::uint32_t wg_tiles = waves * kColBlocks;
@@ -273,6 +298,28 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
         for (auto z : e.unroll(kSlots)) acc[i][z] = kir::cast<kir::i32>(e.u32(0));
       }
 
+      // A group's K16 products sum exactly in i32, so K order inside the
+      // group is free while weights and activations agree: lane half `hi`
+      // reads the group's words hi*8..hi*8+7 in two 16-byte loads and slice
+      // t takes words hi*8+2t, +1 -- codes K[32hi+8t, +8) -- from both sides.
+      constexpr bool kGroupShape = !Packed && kFrag == 2 && kGeo.split_k &&
+                                   kGeo.lane_k == 8 && kTileK == 16;
+      const bool group_load = kGroupShape && grid.latency_bound;
+      std::vector<kir::Local<kir::u32, 8>> group_words;
+      if (group_load) {
+        for (std::uint32_t j = 0; j < kColBlocks; ++j) {
+          group_words.push_back(e.local<kir::u32, 8>());
+          for (int w = 0; w < 8; ++w) group_words[j][w] = e.u32(0);
+          if (auto gd = e.when(live[j] && bcol[j] < n)) {
+            const auto base = e.let(bcol[j] * lanes + g * (gsize / 4u) + lane_hi * 8u);
+            for (std::uint32_t h = 0; h < 2u; ++h) {
+              const auto pack = e.load(a.packed, e.let(base + h * 4u), 16u);
+              for (std::uint32_t q = 0; q < 4u; ++q)
+                group_words[j][static_cast<int>(h * 4u + q)] = pack[static_cast<int>(q)];
+            }
+          }
+        }
+      }
       for (std::uint32_t t = 0; t < slices; ++t) {
         const auto k0 =
             e.let(g * gsize + t * static_cast<std::uint32_t>(kTileK));
@@ -280,6 +327,11 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
         bf.reserve(kColBlocks);
         for (std::uint32_t j = 0; j < kColBlocks; ++j) {
           bf.push_back(e.local<kir::u32, kFragI>());
+          if (group_load) {
+            for (std::uint32_t c = 0; c < kFrag; ++c)
+              bf[j][static_cast<int>(c)] = group_words[j][static_cast<int>(t * 2u + c)].read();
+            continue;
+          }
           for (std::uint32_t c = 0; c < kFrag; ++c) bf[j][static_cast<int>(c)] = e.u32(0);
           if (auto gd = e.when(live[j] && bcol[j] < n)) {
             fill_weights<Packed>(e, a, bcol[j], k0, lane_k, lanes, bf[j]);
@@ -291,8 +343,12 @@ std::string emit_body(const KernelShapes& s, const dispatch::AffineMatrixPlan& d
         for (std::uint32_t i = 0; i < kRowBlocks; ++i) {
           const auto af = e.local<kir::u32, kFragI>();
           for (std::uint32_t c = 0; c < kFrag; ++c) {
-            af[static_cast<int>(c)] = xq[e.let(lane_words[i] + lane_word + slot *
-                (static_cast<std::uint32_t>(kRow.k) / 4u) + c)].read();
+            if (group_load)
+              af[static_cast<int>(c)] = xq[e.let(lane_words[i] + gi * (gsize / 4u) +
+                  lane_hi * 8u + t * 2u + c)].read();
+            else
+              af[static_cast<int>(c)] = xq[e.let(lane_words[i] + lane_word + slot *
+                  (static_cast<std::uint32_t>(kRow.k) / 4u) + c)].read();
           }
           for (std::uint32_t j = 0; j < kColBlocks; ++j) {
             const std::uint32_t ij = i * kColBlocks + j;
@@ -401,8 +457,11 @@ struct AffineWmmaKernel final : graph::KernelPrimitive<AffineWmmaKernel<RowBlock
       }
       return tp;
     }
-    tp.workgroup_size[0] = kBlock;
-    tp.workgroup_count[0] = ((d.m + kRows - 1u) / kRows) * ((d.n + 127u) / 128u);
+    const auto block = q8_grid(s, d.m, kRows, d.n, d.matrix->wave).block;
+    const auto waves = block / d.matrix->wave;
+    tp.workgroup_size[0] = block;
+    tp.workgroup_count[0] = ((d.m + kRows - 1u) / kRows) *
+                            (((d.n + 15u) / 16u + waves - 1u) / waves);
     tp.lds_bytes = d.lds_bytes;
     return tp;
   }
