@@ -85,6 +85,19 @@ class Sampler {
   [[nodiscard]] Result<DiscreteDistribution> distribution(
       std::span<float> logits, std::span<const std::uint32_t> history);
 
+  // A row's `candidates` best logits decide the draw exactly when top-k keeps
+  // no more than that and no history penalty rewrites a logit: the softmax,
+  // top-p and min-p only ever look at the kept head of the sorted row.
+  [[nodiscard]] bool decided_by_top(std::size_t candidates, std::size_t vocab) const noexcept;
+  // sample() and distribution() over a row's best logits, best first (ties
+  // by lower id), as a device top-k returns them. `values[0]` is a NaN or
+  // +inf whenever the full row holds one, which is what makes the checks
+  // distribution() runs over the row decidable here.
+  [[nodiscard]] Result<std::uint32_t> sample_top(std::span<const float> values,
+                                                 std::span<const std::uint32_t> ids);
+  [[nodiscard]] Result<DiscreteDistribution> distribution_top(
+      std::span<const float> values, std::span<const std::uint32_t> ids);
+
   [[nodiscard]] const SamplingParams& params() const noexcept { return params_; }
   void reseed(std::uint64_t seed) noexcept { state_ = mix_seed(seed); }
 
@@ -97,6 +110,13 @@ class Sampler {
   };
   [[nodiscard]] PreparedWeights prepare_weights(
       std::span<float> logits, std::span<const std::uint32_t> history);
+  // Softmax, top-p and min-p over sorted_[0, keep), the kept logits in
+  // descending order with their ids in order_.
+  [[nodiscard]] PreparedWeights weigh_sorted(std::size_t keep);
+  [[nodiscard]] Result<PreparedWeights> prepare_top(std::span<const float> values,
+                                                    std::span<const std::uint32_t> ids);
+  [[nodiscard]] std::uint32_t draw_prepared(const PreparedWeights& weights);
+  [[nodiscard]] Result<DiscreteDistribution> distribution_of(const PreparedWeights& weights);
   [[nodiscard]] static std::uint64_t mix_seed(std::uint64_t seed) noexcept;
   [[nodiscard]] float next_uniform() noexcept;
 
@@ -105,6 +125,7 @@ class Sampler {
   // Reused across calls so a decode step does not allocate.
   std::vector<std::uint32_t> order_;
   std::vector<float> probs_;
+  std::vector<float> sorted_;
 };
 
 // Highest logit, ties going to the lowest index.

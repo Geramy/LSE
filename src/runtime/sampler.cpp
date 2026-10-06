@@ -148,13 +148,19 @@ Sampler::PreparedWeights Sampler::prepare_weights(
               });
   }
 
+  sorted_.resize(keep);
+  for (std::size_t i = 0; i < keep; ++i) sorted_[i] = logits[order_[i]];
+  return weigh_sorted(keep);
+}
+
+Sampler::PreparedWeights Sampler::weigh_sorted(std::size_t keep) {
   // Softmax over the survivors only, shifted by the max for stability.
-  const float max_logit = logits[order_[0]];
+  const float max_logit = sorted_[0];
   const float inv_t = 1.0f / params_.temperature;
   probs_.resize(keep);
   double total = 0.0;
   for (std::size_t i = 0; i < keep; ++i) {
-    const float p = std::exp((logits[order_[i]] - max_logit) * inv_t);
+    const float p = std::exp((sorted_[i] - max_logit) * inv_t);
     probs_[i] = p;
     total += static_cast<double>(p);
   }
@@ -193,10 +199,31 @@ Sampler::PreparedWeights Sampler::prepare_weights(
   return {keep, total, true, false, order_[0]};
 }
 
-std::uint32_t Sampler::sample(std::span<float> logits,
-                              std::span<const std::uint32_t> history) {
-  const SamplingProfile profile(logits.size());
-  const auto weights = prepare_weights(logits, history);
+bool Sampler::decided_by_top(std::size_t candidates, std::size_t vocab) const noexcept {
+  return params_.temperature > 0.0f && std::isfinite(params_.temperature) &&
+         params_.top_k > 0 && static_cast<std::size_t>(params_.top_k) < vocab &&
+         static_cast<std::size_t>(params_.top_k) <= candidates &&
+         params_.repetition_penalty == 1.0f && params_.presence_penalty == 0.0f &&
+         std::isfinite(params_.top_p) && std::isfinite(params_.min_p);
+}
+
+Result<Sampler::PreparedWeights> Sampler::prepare_top(std::span<const float> values,
+                                                      std::span<const std::uint32_t> ids) {
+  const auto keep = static_cast<std::size_t>(params_.top_k);
+  if (params_.top_k <= 0 || values.size() < keep || ids.size() != values.size())
+    return LSE_ERROR(kInvalidArgument, "top candidates do not cover top-k");
+  // Device order puts a NaN first; an all -inf row has no finite candidate.
+  for (const float value : values)
+    if (std::isnan(value) || value == std::numeric_limits<float>::infinity())
+      return LSE_ERROR(kInvalidArgument, "nonfinite target logit");
+  if (!std::isfinite(values[0]))
+    return LSE_ERROR(kInvalidArgument, "target has no probability mass");
+  order_.assign(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(keep));
+  sorted_.assign(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(keep));
+  return weigh_sorted(keep);
+}
+
+std::uint32_t Sampler::draw_prepared(const PreparedWeights& weights) {
   if (weights.point_mass) return weights.token;
   const double target = static_cast<double>(next_uniform()) * weights.total;
   double running = 0;
@@ -209,6 +236,47 @@ std::uint32_t Sampler::sample(std::span<float> logits,
     if (running >= target) return last;
   }
   return last;
+}
+
+Result<DiscreteDistribution> Sampler::distribution_of(const PreparedWeights& weights) {
+  DiscreteDistribution out;
+  if (weights.point_mass) {
+    out.ids = {weights.token}; out.probabilities = {1.0};
+    return out;
+  }
+  if (!std::isfinite(weights.total) || weights.total <= 0)
+    return LSE_ERROR(kInvalidArgument, "invalid target probability mass");
+  out.ids.reserve(weights.keep); out.probabilities.reserve(weights.keep);
+  for (std::size_t i = 0; i < weights.keep; ++i) {
+    const double p = static_cast<double>(probs_[i]);
+    if (!std::isfinite(p) || p < 0)
+      return LSE_ERROR(kInvalidArgument, "invalid target probability");
+    out.ids.push_back(weights.indexed ? order_[i] : static_cast<std::uint32_t>(i));
+    out.probabilities.push_back(p / weights.total);
+  }
+  return out;
+}
+
+Result<std::uint32_t> Sampler::sample_top(std::span<const float> values,
+                                          std::span<const std::uint32_t> ids) {
+  LSE_ASSIGN_OR(const auto weights, prepare_top(values, ids));
+  return draw_prepared(weights);
+}
+
+Result<DiscreteDistribution> Sampler::distribution_top(std::span<const float> values,
+                                                       std::span<const std::uint32_t> ids) {
+  if (!std::isfinite(params_.temperature) || !std::isfinite(params_.top_p) ||
+      !std::isfinite(params_.min_p))
+    return LSE_ERROR(kInvalidArgument, "invalid target sampling inputs");
+  LSE_ASSIGN_OR(const auto weights, prepare_top(values, ids));
+  return distribution_of(weights);
+}
+
+std::uint32_t Sampler::sample(std::span<float> logits,
+                              std::span<const std::uint32_t> history) {
+  const SamplingProfile profile(logits.size());
+  const auto weights = prepare_weights(logits, history);
+  return draw_prepared(weights);
 }
 
 Result<DiscreteDistribution> Sampler::distribution(
@@ -230,22 +298,7 @@ Result<DiscreteDistribution> Sampler::distribution(
   for (const float logit : logits)
     if (std::isnan(logit) || logit == std::numeric_limits<float>::infinity())
       return LSE_ERROR(kInvalidArgument, "nonfinite transformed target logit");
-  DiscreteDistribution out;
-  if (weights.point_mass) {
-    out.ids = {weights.token}; out.probabilities = {1.0};
-    return out;
-  }
-  if (!std::isfinite(weights.total) || weights.total <= 0)
-    return LSE_ERROR(kInvalidArgument, "invalid target probability mass");
-  out.ids.reserve(weights.keep); out.probabilities.reserve(weights.keep);
-  for (std::size_t i = 0; i < weights.keep; ++i) {
-    const double p = static_cast<double>(probs_[i]);
-    if (!std::isfinite(p) || p < 0)
-      return LSE_ERROR(kInvalidArgument, "invalid target probability");
-    out.ids.push_back(weights.indexed ? order_[i] : static_cast<std::uint32_t>(i));
-    out.probabilities.push_back(p / weights.total);
-  }
-  return out;
+  return distribution_of(weights);
 }
 
 double DiscreteDistribution::probability(std::uint32_t token) const noexcept {
