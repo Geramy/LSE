@@ -391,10 +391,13 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
+    const auto units = static_cast<std::uint32_t>(s.device->compute_units);
     const auto head_tile = ShortQuery
-        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, capacity)
+        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, capacity, units)
         : dispatch::attention_shapes::decode_head_tile(heads, kvheads);
-    const auto token_tile = ShortQuery ? dispatch::attention_shapes::short_query_tile(queries, capacity) : 1u;
+    const auto token_tile = ShortQuery
+        ? dispatch::attention_shapes::short_query_tile(queries, heads, kvheads, capacity, units)
+        : 1u;
     const auto row_tile = token_tile * head_tile;
     if (row_tile > 1u) {
       const auto scores = e.lds<kir::f32>(row_tile * kSplitKeys);
@@ -423,7 +426,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
           return e.let((((b * heads + h + r / token_tile) * queries + q0 + r % token_tile) * parts + part) * kSplitRecord);
         else return e.let(((b * heads + h + r) * parts + part) * kSplitRecord);
       };
-      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity)) {
+      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, heads, kvheads, capacity, units)) {
         const auto no_keys = e.let(begin >= kv_len);
         if (auto empty = e.when(no_keys)) {
           for (std::uint32_t r = 0; r < row_tile; ++r) {
@@ -671,14 +674,13 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     tp.workgroup_size[0] = 128;
     auto query_tile = 1u;
     if (s.inputs[0].dim(2) > 1) {
-      query_tile = dispatch::attention_shapes::short_query_tile(
-          static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-          static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
-      const auto head_tile = dispatch::attention_shapes::short_head_tile(
-          static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-          static_cast<std::uint32_t>(s.inputs[0].dim(1)),
-          static_cast<std::uint32_t>(s.inputs[1].dim(1)),
-          static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2)));
+      const auto rows = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+      const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+      const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+      const auto capacity = static_cast<std::uint32_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2));
+      const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
+      query_tile = dispatch::attention_shapes::short_query_tile(rows, heads, kvheads, capacity, units);
+      const auto head_tile = dispatch::attention_shapes::short_head_tile(rows, heads, kvheads, capacity, units);
       tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * (s.output.dim(1) / head_tile) *
           ((s.output.dim(2) + query_tile - 1) / query_tile) * s.output.dim(3));
       query_tile *= head_tile;

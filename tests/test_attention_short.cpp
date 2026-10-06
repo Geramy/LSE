@@ -24,6 +24,7 @@ struct Fixture {
     gpu.wavefront_size = 32;
     gpu.max_threads_per_workgroup = 256;
     gpu.lds_bytes_per_workgroup = 65536;
+    gpu.compute_units = 64;
     q = leaf({1, 24, queries, 256});
     k = leaf({capacity / 16 + 1, 4, 16, 256});
     v = leaf(k.shape());
@@ -60,9 +61,11 @@ LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
         const bool partial = i == 0;
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
         const auto tile = dispatch::attention_shapes::short_query_tile(
-            static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
+            static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity),
+            fx.gpu.compute_units);
         const auto head_tile = dispatch::attention_shapes::short_head_tile(
-            static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity));
+            static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity),
+            fx.gpu.compute_units);
         LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], partial
                       ? (24u / head_tile) * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
                       : 24u * static_cast<unsigned>(queries));
@@ -209,15 +212,31 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
         LSE_EXPECT(sliding == (causal && signed_distance < 7));
       }
 }
+// Tiled workgroups over the keys a rung certainly holds (half of it) must
+// cover the compute units; head tiles pair with four-row query tiles.
+std::uint32_t expected_short_tile(std::uint32_t queries, std::uint32_t capacity,
+                                  std::uint32_t units) {
+  if (queries < 4 || queries > 8 || units == 0) return 1;
+  const std::uint64_t tiled = std::uint64_t{capacity / 2u / 128u} * (24u / 2u) * ((queries + 3u) / 4u);
+  return tiled >= units ? 4u : 1u;
+}
 LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
-  for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
-    for (int capacity : {1024, 2048, 4096, 8192, 8208, 16384, 32768, 65536, 69632, 262144}) {
-      const auto tile = dispatch::attention_shapes::short_query_tile(
-          static_cast<std::uint32_t>(queries), static_cast<std::uint32_t>(capacity));
-      const bool measured = queries >= 4 && queries <= 8 &&
-                            capacity >= 8192;
-      LSE_EXPECT_EQ(tile, measured ? 4u : 1u);
-    }
+  for (std::uint32_t units : {0u, 16u, 64u, 96u, 256u})
+    for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
+      for (int capacity : {512, 1024, 2048, 4096, 8192, 8208, 16384, 32768, 65536, 69632, 262144}) {
+        const auto tile = dispatch::attention_shapes::short_query_tile(
+            static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity), units);
+        LSE_EXPECT_EQ(tile, expected_short_tile(static_cast<std::uint32_t>(queries),
+                                                static_cast<std::uint32_t>(capacity), units));
+        LSE_EXPECT_EQ(dispatch::attention_shapes::short_head_tile(
+                          static_cast<std::uint32_t>(queries), 24u, 4u,
+                          static_cast<std::uint32_t>(capacity), units),
+                      tile == 4u ? 2u : 1u);
+      }
+  // Sixty-four units: a rung of 1024 keys tiles an eight-row pass (96
+  // workgroups) and a rung of 512 does not (48).
+  LSE_EXPECT_EQ(dispatch::attention_shapes::short_query_tile(8u, 24u, 4u, 1024u, 64u), 4u);
+  LSE_EXPECT_EQ(dispatch::attention_shapes::short_query_tile(8u, 24u, 4u, 512u, 64u), 1u);
   for (int capacity : {8192, 16384})
     for (unsigned lds : {512u, 2048u, 4095u, 4096u}) {
       Fixture fx(4, capacity);
@@ -228,11 +247,11 @@ LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
     }
 }
 LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
-  for (std::uint32_t queries : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u})
-    for (std::uint32_t capacity : {1024u, 2048u, 4096u, 8192u, 8208u, 16384u, 32768u, 65536u, 69632u, 262144u})
-      LSE_EXPECT(dispatch::attention_shapes::short_skips_empty_partitions(queries, capacity) ==
-                 (queries >= 4u && queries <= 8u &&
-                  capacity >= 8192u));
+  for (std::uint32_t units : {0u, 64u, 256u})
+    for (std::uint32_t queries : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u})
+      for (std::uint32_t capacity : {1024u, 2048u, 4096u, 8192u, 8208u, 16384u, 32768u, 65536u, 69632u, 262144u})
+        LSE_EXPECT(dispatch::attention_shapes::short_skips_empty_partitions(queries, 24u, 4u, capacity, units) ==
+                   (expected_short_tile(queries, capacity, units) > 1u));
 }
 
 LSE_TEST(short_split_checks_merge_lds_before_selecting_both_stages) {

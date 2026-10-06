@@ -218,6 +218,11 @@ bool split_short_supported(const KernelShapes& s) {
       !has_ops(s, {"wave.shfl_xor"}) || s.inputs[1] != s.inputs[2] ||
       !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return false;
   const auto capacity = s.inputs[4].dim(1) * s.inputs[1].dim(2);
+  const auto rows = static_cast<std::uint32_t>(s.inputs[0].dim(2));
+  const auto heads = static_cast<std::uint32_t>(s.inputs[0].dim(1));
+  const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
+  const auto tile_capacity = static_cast<std::uint32_t>(capacity);
+  const auto units = static_cast<std::uint32_t>(s.device->compute_units);
   for (const auto& rule : shapes::kSplitShortRules)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
@@ -226,12 +231,8 @@ bool split_short_supported(const KernelShapes& s) {
         shapes::split_merge_lds_bytes(shapes::split_partitions(capacity)) <=
             backend::workgroup_lds_bytes(s.device) &&
         backend::workgroup_lds_bytes(s.device) >= rule.threads * sizeof(float) *
-            shapes::short_query_tile(static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-                                     static_cast<std::uint32_t>(capacity)) *
-            shapes::short_head_tile(static_cast<std::uint32_t>(s.inputs[0].dim(2)),
-                                    static_cast<std::uint32_t>(s.inputs[0].dim(1)),
-                                    static_cast<std::uint32_t>(s.inputs[1].dim(1)),
-                                    static_cast<std::uint32_t>(capacity))) {
+            shapes::short_query_tile(rows, heads, kvheads, tile_capacity, units) *
+            shapes::short_head_tile(rows, heads, kvheads, tile_capacity, units)) {
       const Shape partial{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2),
                           static_cast<std::int64_t>(shapes::split_partitions(capacity)),
