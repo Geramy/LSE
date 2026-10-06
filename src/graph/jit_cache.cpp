@@ -1,6 +1,7 @@
 #include "lse/graph/jit.hpp"
 #include "lse/opt/measurements.hpp"
 #include "dispatch_profile.hpp"
+#include "lse/core/debug.hpp"
 #include "resource_profile.hpp"
 
 #include <unistd.h>
@@ -638,15 +639,18 @@ void dump_hip_source(const EmittedKernel& emitted, std::uint64_t key) {
              emitted.source);
 }
 
+// Generated source is written for review only when asked: LSE_HIP_DUMP names
+// the directory, and debug mode (LSE_DEBUG, --debug) uses the build tree's.
+// A server writing every new kernel's text on its first dispatch spent most
+// of a cold prefill's kernel lookup on file writes.
 std::string hip_dump_directory() {
   if (const char* env = std::getenv("LSE_HIP_DUMP"); env != nullptr && env[0] != '\0') {
     return env;
   }
 #ifdef LSE_BUILD_DIR
-  return std::string(LSE_BUILD_DIR) + "/hip";
-#else
-  return {};
+  if (::lse::debug()) return std::string(LSE_BUILD_DIR) + "/hip";
 #endif
+  return {};
 }
 
 std::string_view kernel_cache_version() noexcept { return LSE_ENGINE_VERSION; }
