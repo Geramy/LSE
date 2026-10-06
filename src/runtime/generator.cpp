@@ -346,6 +346,7 @@ Status Generator::verify(Session& session,
   }
 
   const std::uint64_t started = now_ns();
+  LSE_RETURN_IF_ERROR(begin_verify_burst());
   model::FeatureCapture capture;
   if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
   LSE_ASSIGN_OR(Array hidden,
@@ -404,6 +405,8 @@ Status Generator::verify(Session& session,
   // device: the acceptance walk reads rows as it reaches them
   // (spec_logit_rows), and it stops at the first rejected proposal.
   LSE_RETURN_IF_ERROR(sched->eval(roots, greedy, &spec_.program));
+  // Greedy picks came back with the pass.
+  if (greedy) end_verify_burst();
 
   if (!greedy) {
     if (spec_.logits.dtype() != DType::kF32 || spec_.logits.shape().rank() != 3 ||
@@ -470,7 +473,21 @@ Status Generator::spec_logit_rows(std::size_t rows) {
     spec_rows_ready_ = want;
   }
   stats_.spec_verify_ns += now_ns() - started;
+  end_verify_burst();
   return OkStatus();
+}
+
+Status Generator::begin_verify_burst() {
+  end_verify_burst();
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr || sched->devices().size() != 1) return OkStatus();
+  burst_ = &sched->backend();
+  return burst_->begin_launch_burst();
+}
+
+void Generator::end_verify_burst() noexcept {
+  if (burst_ != nullptr) burst_->end_launch_burst();
+  burst_ = nullptr;
 }
 
 // Row `row` of the last verify pass's device top-k. All m rows' candidates
@@ -505,6 +522,7 @@ Status Generator::spec_top_row(std::size_t row) {
     }
     spec_top_ready_ = true;
     stats_.spec_verify_ns += now_ns() - started;
+    end_verify_burst();
   }
   const auto vocab = static_cast<float>(model_.config().vocab_size);
   spec_top_values_.resize(k);
@@ -541,6 +559,10 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     const GenerationLimits& limits, const TokenCallback& on_token) {
   std::vector<std::uint32_t> generated;
   if (limits.max_tokens <= 0) return generated;
+  struct BurstScope {
+    Generator* g;
+    ~BurstScope() { g->end_verify_burst(); }
+  } burst_scope{this};
   const auto capacity = static_cast<std::size_t>(model_.config().kv_capacity());
 
   const std::uint32_t depth = dflash2_ != nullptr

@@ -291,6 +291,11 @@ class Generator {
   std::vector<float> spec_top_values_;
   std::vector<std::uint32_t> spec_top_ids_;
   Status spec_top_row(std::size_t row);
+  // The verify pass is a launch burst from its drained start to the drained
+  // readback of its answers (backend::IBackend::begin_launch_burst).
+  backend::IBackend* burst_ = nullptr;
+  Status begin_verify_burst();
+  void end_verify_burst() noexcept;
   // The decoder's hidden state for the last prompt position, which is the
   // module's input for the first proposal of the generation.
   graph::Array prefill_tail_;

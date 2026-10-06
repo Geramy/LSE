@@ -1213,6 +1213,12 @@ class IBackend {
   virtual Status begin_decode_sample(std::uint64_t) { return OkStatus(); }
   virtual Status end_decode_sample(std::uint64_t, bool) { return OkStatus(); }
   virtual void cancel_decode_sample() noexcept {}
+  // A long burst of launches (a speculative verify pass) starts at a point
+  // where the device has drained, and ends at the next drain (its answers'
+  // readback). Between the two the backend may batch more launches per
+  // submission; the policy changes only at those drained points.
+  virtual Status begin_launch_burst() { return OkStatus(); }
+  virtual void end_launch_burst() noexcept {}
   virtual Status synchronize() = 0;
 
   // What this device's streams can do, and how to order two of them. A caller
@@ -1383,6 +1389,15 @@ class BackendAdapter final : public IBackend {
     if constexpr (requires { impl_.end_decode_sample_impl(elapsed, eligible); })
       return impl_.end_decode_sample_impl(elapsed, eligible);
     return OkStatus();
+  }
+  Status begin_launch_burst() override {
+    if constexpr (requires { impl_.begin_launch_burst_impl(); })
+      return impl_.begin_launch_burst_impl();
+    return OkStatus();
+  }
+  void end_launch_burst() noexcept override {
+    if constexpr (requires { impl_.end_launch_burst_impl(); })
+      impl_.end_launch_burst_impl();
   }
   void cancel_decode_sample() noexcept override {
     if constexpr (requires { impl_.cancel_decode_sample_impl(); })

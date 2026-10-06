@@ -2738,6 +2738,26 @@ Status HrxBackend::begin_decode_sample_impl(std::uint64_t key) {
   return OkStatus();
 }
 
+Status HrxBackend::begin_launch_burst_impl() {
+  // Same rules as a tuner sample: only under the automatic policy, never over
+  // an explicit interval, never during a sample, and the interval changes
+  // only once the device has drained.
+  if (!automatic_submission_ || submission_sample_ != nullptr ||
+      baseline_flush_interval_ == 0 || kBurstFlushInterval <= baseline_flush_interval_)
+    return OkStatus();
+  if (flush_interval_ != kBurstFlushInterval) {
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    flush_interval_ = kBurstFlushInterval;
+  }
+  return OkStatus();
+}
+
+void HrxBackend::end_launch_burst_impl() noexcept {
+  // Called after the burst's readback: the device has drained, and the next
+  // launch starts a submission at the baseline interval.
+  if (submission_sample_ == nullptr) flush_interval_ = baseline_flush_interval_;
+}
+
 Status HrxBackend::end_decode_sample_impl(std::uint64_t elapsed, bool eligible) {
   if (submission_sample_ == nullptr) return OkStatus();
   const auto boundary_start = std::chrono::steady_clock::now();

@@ -98,6 +98,8 @@ class HrxBackend : public Backend<HrxBackend> {
   // 64 KiB update limit, while stream 0 is the only stream in use and into
   // memory with no host mapping; otherwise the drain and copy the seam
   // describes.
+  Status begin_launch_burst_impl();
+  void end_launch_burst_impl() noexcept;
   Status copy_ordered_impl(const DeviceBuffer& src, DeviceBuffer& dst,
                            std::size_t bytes, std::size_t src_offset,
                            std::size_t dst_offset);
