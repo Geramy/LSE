@@ -69,7 +69,9 @@ LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
         LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], partial
                       ? (24u / head_tile) * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
                       : 24u * static_cast<unsigned>(queries));
-        LSE_EXPECT_EQ(emitted->lds_bytes, partial ? tile * head_tile * 512u : static_cast<unsigned>(capacity / 32));
+        LSE_EXPECT_EQ(emitted->lds_bytes, partial
+            ? (tile * head_tile > 1u ? tile * head_tile * 528u : 512u)
+            : static_cast<unsigned>(capacity / 32));
         LSE_EXPECT_EQ(emitted->binding_order.size(), partial ? 6u : 2u);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       }
@@ -238,12 +240,12 @@ LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
   LSE_EXPECT_EQ(dispatch::attention_shapes::short_query_tile(8u, 24u, 4u, 1024u, 64u), 4u);
   LSE_EXPECT_EQ(dispatch::attention_shapes::short_query_tile(8u, 24u, 4u, 512u, 64u), 1u);
   for (int capacity : {8192, 16384})
-    for (unsigned lds : {512u, 2048u, 4095u, 4096u}) {
+    for (unsigned lds : {512u, 2048u, 4223u, 4224u}) {
       Fixture fx(4, capacity);
       fx.gpu.lds_bytes_per_workgroup = lds;
       auto out = fx.split();
       LSE_EXPECT(out.node()->prim->name() ==
-          (lds >= 4096u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+          (lds >= 4224u ? "attention.split_merge128.wg128c2.v1" : "attention"));
     }
 }
 LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
@@ -255,12 +257,13 @@ LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
 }
 
 LSE_TEST(short_split_checks_merge_lds_before_selecting_both_stages) {
-  for (unsigned lds : {2048u, 2175u, 2176u, 4095u, 4096u, 8192u}) {
+  // An eight-row tile needs 8 x 128 scores and 4 x 8 wave maxima.
+  for (unsigned lds : {2048u, 2175u, 2176u, 4223u, 4224u, 8192u}) {
     Fixture fx(8, 69632);
     fx.gpu.lds_bytes_per_workgroup = lds;
     const auto output = fx.split();
     LSE_EXPECT(output.node()->prim->name() ==
-        (lds >= 4096u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+        (lds >= 4224u ? "attention.split_merge128.wg128c2.v1" : "attention"));
   }
   Fixture fx(8, 262144);
   fx.gpu.lds_bytes_per_workgroup = 8191;

@@ -230,7 +230,7 @@ bool split_short_supported(const KernelShapes& s) {
         s.inputs[0].dim(3) == rule.head_dim &&
         shapes::split_merge_lds_bytes(shapes::split_partitions(capacity)) <=
             backend::workgroup_lds_bytes(s.device) &&
-        backend::workgroup_lds_bytes(s.device) >= rule.threads * sizeof(float) *
+        backend::workgroup_lds_bytes(s.device) >= (rule.threads + 4u) * sizeof(float) *
             shapes::short_query_tile(rows, heads, kvheads, tile_capacity, units) *
             shapes::short_head_tile(rows, heads, kvheads, tile_capacity, units)) {
       const Shape partial{s.inputs[0].dim(0), s.inputs[0].dim(1),
