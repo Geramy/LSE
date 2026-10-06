@@ -22,6 +22,9 @@ constexpr std::uint32_t kMaxBlock = 256, kColBlocks = 1;
 // One 16-column tile per wave. A grid of full-width workgroups that leaves
 // compute units idle (a small M over a narrow N, as in a draft model's down
 // projection) halves its workgroups until every unit holds one.
+// Narrowing stops at four waves per workgroup: below that each wave's
+// staging rounds dominate and a tiny grid gets slower, not faster.
+constexpr std::uint32_t kMinNarrowWaves = 4;
 struct Q8Grid {
   std::uint32_t block = kMaxBlock;
   // The grid had to narrow: few waves per unit, so each wave issues a whole
@@ -35,7 +38,7 @@ Q8Grid q8_grid(const KernelShapes& s, std::uint32_t m, std::uint32_t rows,
   const auto row_blocks = (m + rows - 1u) / rows;
   const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
   auto waves = kMaxBlock / wave;
-  while (waves > 1u && row_blocks * ((tiles + waves - 1u) / waves) < units) {
+  while (waves > kMinNarrowWaves && row_blocks * ((tiles + waves - 1u) / waves) < units) {
     waves /= 2u;
     grid.latency_bound = true;
   }
