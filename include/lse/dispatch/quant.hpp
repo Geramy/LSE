@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
@@ -24,6 +25,48 @@ struct QuantPlan {
 // The tiled prefill GEMM: 4-bit codes, groups a whole number of K steps, f32
 // activations and output, float affine planes, and at least kQ4GemmMinRows
 // rows. Whether the device can run it is asked again at dispatch.
+// Whether a device can run the tiled 4-bit GEMM at all: 32-lane waves, a
+// 256-thread workgroup and the RDNA f16 matrix instructions. Asked when the
+// graph is built, because slicing K changes the graph; the kernel asks the
+// precise question (row, load width, scratch) again at dispatch.
+[[nodiscard]] inline bool q4_gemm_device(const backend::DeviceInfo& d) noexcept {
+  const auto f = backend::arch_family(d.arch);
+  return d.wavefront_size == 32 && d.max_threads_per_workgroup >= 256 &&
+         (f == backend::ArchFamily::kRdna3 || f == backend::ArchFamily::kRdna35 ||
+          f == backend::ArchFamily::kRdna4);
+}
+
+struct Q4GemmTile {
+  std::uint32_t bm = 0, bn = 0, wm = 0, wn = 0;
+};
+// The workgroup tile for an M x N contraction. Tall when M fills it; short
+// otherwise, so a short prompt still spreads over the device.
+[[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(std::uint64_t m) noexcept {
+  if (m <= 32) return {32, 128, 1, 8};
+  if (m <= 64) return {64, 128, 2, 4};
+  return {128, 128, 2, 4};
+}
+// How many slices of K one contraction is cut into. A workgroup walks its K
+// range serially, so a grid with fewer workgroups than the device can seat
+// is bound by that walk, not by math or memory; slicing K multiplies the
+// grid until it fills `compute_units` twice over. Each slice keeps at least
+// kQ4GemmMinSliceSteps steps, and slices divide the steps evenly.
+inline constexpr std::uint32_t kQ4GemmMinSliceSteps = 16;
+inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
+[[nodiscard]] constexpr std::uint32_t q4_gemm_slices(
+    std::uint64_t m, std::uint64_t n, std::uint64_t k,
+    std::uint32_t compute_units) noexcept {
+  if (compute_units == 0 || k % kQ4GemmStepK != 0) return 1;
+  const auto t = q4_gemm_tile(m);
+  const std::uint64_t tiles = ((m + t.bm - 1) / t.bm) * ((n + t.bn - 1) / t.bn);
+  const std::uint64_t steps = k / kQ4GemmStepK;
+  std::uint32_t s = 1;
+  while (s < kQ4GemmMaxSlices && tiles * s < 2ull * compute_units &&
+         steps % (2ull * s) == 0 && steps / (2ull * s) >= kQ4GemmMinSliceSteps)
+    s *= 2;
+  return s;
+}
+
 [[nodiscard]] inline bool q4_gemm_shape(const graph::KernelShapes& s) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
       s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||

@@ -53,26 +53,61 @@ std::vector<T> read(Array value) {
 }
 
 LSE_TEST(q4_gemm_shape_routes_prefill_rows_to_the_tiled_gemm) {
+  // The graph takes the tiled GEMM only on a device that can run it (or with
+  // no device at all), and slices K only when a device says how many
+  // compute units it has. A host-only build keeps the original contraction.
+  const backend::DeviceInfo* device = nullptr;
+  if (Scheduler* scheduler = default_scheduler())
+    device = &scheduler->backend().device_info();
+  const bool tiled = device == nullptr || dispatch::q4_gemm_device(*device);
   for (const std::int64_t m : {16, 137, 1024}) {
-    // Two contractions over one activation share its panel.
     auto x = leaf({1, m, 5120}, DType::kF32);
     auto y = quant_linear(x, leaf({17408, 640}, DType::kU32),
                           leaf({17408, 80}, DType::kBF16),
                           leaf({17408, 80}, DType::kBF16), 4, 64);
-    LSE_EXPECT(y.node()->prim != nullptr &&
-               y.node()->prim->name() == "quant_linear.q4_gemm_f16.v1");
-    LSE_EXPECT_EQ(y.node()->inputs.size(), 5u);
-    const auto& panel = y.node()->inputs[4];
+    LSE_EXPECT((y.shape() == Shape{1, m, 17408}));
+    if (!tiled) {
+      LSE_EXPECT(y.node()->prim != nullptr &&
+                 !y.node()->prim->name().starts_with("quant_linear.q4_gemm_f16"));
+      continue;
+    }
+    NodePtr gemm = y.node();
+    if (gemm->prim && gemm->prim->name() == "quant_linear.q4_gemm_f16.slice_sum.v1") {
+      gemm = gemm->inputs[0];
+      LSE_EXPECT(gemm->prim->name() == "quant_linear.q4_gemm_f16.slices.v1");
+      LSE_EXPECT(gemm->shape.dim(0) == gemm->iattrs[2] && gemm->iattrs[2] > 1);
+    } else {
+      LSE_EXPECT(gemm->prim != nullptr &&
+                 gemm->prim->name() == "quant_linear.q4_gemm_f16.v1");
+    }
+    LSE_EXPECT_EQ(gemm->inputs.size(), 5u);
+    const auto& panel = gemm->inputs[4];
     LSE_EXPECT(panel->prim != nullptr &&
                panel->prim->name() == "quant_activation.f16_panel.v1");
     LSE_EXPECT(panel->dtype == DType::kF16);
     LSE_EXPECT((panel->shape == Shape{m, 5120}));
+    // Two contractions over one activation share its panel.
     auto z = quant_linear(x, leaf({6144, 640}, DType::kU32),
                           leaf({6144, 80}, DType::kBF16),
                           leaf({6144, 80}, DType::kBF16), 4, 64);
-    LSE_EXPECT(z.node()->inputs.size() == 5u &&
-               z.node()->inputs[4].get() == panel.get());
+    NodePtr zg = z.node()->inputs.size() == 1 ? z.node()->inputs[0] : z.node();
+    LSE_EXPECT(zg->inputs.size() == 5u && zg->inputs[4].get() == panel.get());
   }
+}
+
+LSE_TEST(q4_gemm_slices_fill_the_device_without_starving_a_slice) {
+  // 64 compute units: a narrow M=32 projection over K=17408 is sliced, a
+  // full M=1024 one is not, and every slice keeps at least the minimum steps.
+  LSE_EXPECT_EQ(dispatch::q4_gemm_slices(1024, 17408, 5120, 64), 1u);
+  LSE_EXPECT(dispatch::q4_gemm_slices(32, 5120, 17408, 64) > 1u);
+  for (const auto k : {5120ull, 6144ull, 17408ull})
+    for (const auto m : {16ull, 32ull, 128ull, 1024ull}) {
+      const auto s = dispatch::q4_gemm_slices(m, 5120, k, 64);
+      LSE_EXPECT((k / dispatch::kQ4GemmStepK) % s == 0);
+      LSE_EXPECT(s == 1 || k / dispatch::kQ4GemmStepK / s >=
+                               dispatch::kQ4GemmMinSliceSteps);
+    }
+  LSE_EXPECT_EQ(dispatch::q4_gemm_slices(32, 5120, 17408, 0), 1u);
 }
 
 int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {

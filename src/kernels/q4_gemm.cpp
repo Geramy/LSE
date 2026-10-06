@@ -66,6 +66,8 @@ constexpr std::uint32_t kRun = 8;
 
 constexpr std::string_view kPanelName = "quant_activation.f16_panel.v1";
 constexpr std::string_view kGemmName = "quant_linear.q4_gemm_f16.v1";
+constexpr std::string_view kGemmSlicesName = "quant_linear.q4_gemm_f16.slices.v1";
+constexpr std::string_view kSliceSumName = "quant_linear.q4_gemm_f16.slice_sum.v1";
 
 // The panel's position for element k of a row: within each aligned run of
 // eight, k0,k4,k1,k5,k2,k6,k3,k7.
@@ -185,6 +187,8 @@ struct Tile {
 
 struct Dims {
   std::uint32_t m = 0, n = 0, k = 0, groups = 0, gsize = 0, lanes = 0;
+  // Slices of K, each written to its own plane of a [slices, ...] output.
+  std::uint32_t slices = 1;
   bool valid = false;
 };
 
@@ -196,31 +200,40 @@ KernelShapes original_shapes(const KernelShapes& s) {
   return original;
 }
 
-Dims dims_of(const KernelShapes& s) {
+Dims dims_of(const KernelShapes& s, bool sliced) {
   Dims d;
   if (s.inputs.size() != 5 || s.input_dtypes.size() != 5 ||
       s.input_dtypes[4] != DType::kF16)
     return d;
-  const KernelShapes original = original_shapes(s);
+  KernelShapes original = original_shapes(s);
+  if (sliced) {
+    // [slices, ...output] -> output, for the shape contract.
+    if (s.output.rank() < 2 || s.iattrs[2] < 2 ||
+        s.output.dim(0) != s.iattrs[2])
+      return d;
+    Shape plane;
+    for (std::size_t i = 1; i < s.output.rank(); ++i) plane.push_back(s.output.dim(i));
+    original.output = plane;
+    d.slices = static_cast<std::uint32_t>(s.iattrs[2]);
+  }
   if (!dispatch::q4_gemm_shape(original)) return d;
   d.k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
   d.n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   d.lanes = static_cast<std::uint32_t>(s.inputs[1].dim(1));
   d.gsize = static_cast<std::uint32_t>(s.iattrs[1]);
   d.groups = d.k / d.gsize;
-  d.m = static_cast<std::uint32_t>(s.output.elem_count() / d.n);
-  if (s.inputs[4] != Shape{static_cast<std::int64_t>(d.m),
+  d.m = static_cast<std::uint32_t>(original.output.elem_count() / d.n);
+  if ((d.k / kBK) % d.slices != 0 ||
+      s.inputs[4] != Shape{static_cast<std::int64_t>(d.m),
                            static_cast<std::int64_t>(d.k)})
     return d;
   d.valid = true;
   return d;
 }
 
-// The tile follows the grid: a tall tile when M fills it, a short one when it
-// does not, so a short prompt still puts a workgroup on most compute units.
 Tile tile_for(const Dims& d) {
-  if (d.m <= 64) return {64, 128, 2, 4};
-  return {128, 128, 2, 4};
+  const auto t = dispatch::q4_gemm_tile(d.m);
+  return {t.bm, t.bn, t.wm, t.wn};
 }
 
 template <class S>
@@ -302,8 +315,15 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto wg = e.let(math::workgroup_id_x());
   // Column tiles fastest: the workgroups resident together share one
   // activation tile, which then stays in cache while the weights stream.
+  const std::uint32_t tiles_m = (M + t.bm - 1u) / t.bm;
   const auto tn = e.let(wg % tiles_n);
-  const auto tm = e.let(wg / tiles_n);
+  const auto tm = e.let((wg / tiles_n) % tiles_m);
+  // This workgroup's slice of K, and the output plane it writes.
+  const std::uint32_t slice_steps = KT / d.slices;
+  const auto ks = e.let(wg / (tiles_n * tiles_m));
+  const auto k_begin = e.let(ks * slice_steps);
+  const auto k_end = e.let(k_begin + slice_steps);
+  const auto plane = e.let(ks * (M * N));
   const auto m0 = e.let(tm * t.bm);
   const auto n0 = e.let(tn * t.bn);
   const auto wave_m = e.let(wave / t.wn);
@@ -328,10 +348,15 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // piece.
   constexpr std::uint32_t kWordsPerStep = kBK / kCodesPerWord;
   constexpr std::uint32_t kBPerCol = kWordsPerStep / 4u;
-  const std::uint32_t b_pieces = t.bn * kBPerCol / kThreads;
+  // A tile with fewer weight pieces than threads lets the surplus threads
+  // repeat a piece: they write the same values to the same place.
+  const std::uint32_t b_total = t.bn * kBPerCol;
+  const std::uint32_t b_pieces = (b_total + kThreads - 1u) / kThreads;
   std::vector<kir::Val<kir::u32>> b_src, b_dst, b_aff;
   for (std::uint32_t c = 0; c < b_pieces; ++c) {
-    const auto f = e.let(lid + c * kThreads);
+    const auto f = b_total % kThreads == 0u
+                       ? e.let(lid + c * kThreads)
+                       : e.let((lid + c * kThreads) % b_total);
     const auto col = e.let(f / kBPerCol);
     const auto part = e.let(f % kBPerCol);
     const auto gcol = e.let(n0 + col);
@@ -429,10 +454,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         }
     }
   };
-  commit(issue(e.u32(0)));
+  commit(issue(k_begin));
   e.barrier();
-  for (auto kt : e.range(0u, KT, 1u)) {
-    const auto next = e.let(select(kt + 1u < KT, kt + 1u, kt));
+  for (auto kt : e.range(k_begin, k_end, 1u)) {
+    const auto next = e.let(select(kt + 1u < k_end, kt + 1u, kt));
     const Staged st = issue(next);
     compute();
     e.barrier();
@@ -451,12 +476,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         // wait: emit one only for the extents a tile can overrun.
         const auto value = acc[fm * FN + fn][z].read();
         if (M % t.bm == 0 && N % t.bn == 0) {
-          e.store(row * N + col, value);
+          e.store(plane + row * N + col, value);
         } else if (N % t.bn == 0) {
-          if (auto in = e.when(row < M)) e.store(row * N + col, value);
+          if (auto in = e.when(row < M)) e.store(plane + row * N + col, value);
         } else {
           if (auto in = e.when(row < M && col < N))
-            e.store(row * N + col, value);
+            e.store(plane + row * N + col, value);
         }
       }
     }
@@ -473,16 +498,29 @@ const graph::KernelPrimitiveBase* legacy(const KernelShapes& original) {
   return base ? base->specialize(original) : nullptr;
 }
 
-struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
-  static constexpr std::string_view kName = kGemmName;
-  static constexpr std::string_view kEntry = "lse_quant_linear_q4_gemm_f16_v1";
+// The plain form writes the product; the sliced form writes one partial
+// product per slice of K into a leading [slices] axis, which
+// Q4SliceSumKernel then sums.
+template <bool Sliced>
+struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
+  static constexpr std::string_view kName =
+      Sliced ? kGemmSlicesName : kGemmName;
+  static constexpr std::string_view kEntry =
+      Sliced ? "lse_quant_linear_q4_gemm_f16_slices_v1"
+             : "lse_quant_linear_q4_gemm_f16_v1";
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
+  // Partial products take no epilogue; the sum does.
+  bool supports_epilogue() const noexcept override { return !Sliced; }
   bool has_typed_host_impl() const noexcept override { return true; }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (Sliced)
+      return LSE_ERROR(kInvalidArgument,
+                       "a sliced q4 gemm's shape carries its slice count; it "
+                       "is set when the node is built");
     if (in.size() != 5 || !in[0].rank() || in[1].rank() != 2)
       return LSE_ERROR(kInvalidArgument,
                        "q4 gemm takes x, packed[N, lanes], scales, biases, "
@@ -497,7 +535,9 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
   }
 
   // The same function as quant_linear on the first four operands, computed
-  // from the f32 activation; the panel is a device staging artifact.
+  // from the f32 activation; the panel is a device staging artifact. A
+  // sliced output carries the whole product in slice 0 and zeros elsewhere,
+  // which sums to the same thing.
   Status eval_cpu_typed(std::span<const graph::HostTensorView> in,
                         graph::HostOutputView out,
                         const std::array<float, 4>&,
@@ -511,9 +551,12 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
     const auto n = static_cast<std::size_t>(in[1].shape.dim(0));
     const auto gs = static_cast<std::size_t>(iattrs[1]);
     const auto m = in[0].shape.elem_count() / k;
-    if (k % gs != 0 || in[1].bytes.size() != n * k / 2 ||
-        in[2].bytes.size() != n * (k / gs) * 2 || out.bytes.size() != m * n * 4)
+    const std::size_t slices = Sliced ? static_cast<std::size_t>(iattrs[2]) : 1;
+    if (k % gs != 0 || slices == 0 || in[1].bytes.size() != n * k / 2 ||
+        in[2].bytes.size() != n * (k / gs) * 2 ||
+        out.bytes.size() != slices * m * n * 4)
       return LSE_ERROR(kInvalidArgument, "invalid q4 gemm byte extent");
+    std::memset(out.bytes.data(), 0, out.bytes.size());
     const auto affine = [&](const graph::HostTensorView& v, std::size_t at) {
       if (v.dtype == DType::kBF16) {
         bfloat16_t h;
@@ -543,9 +586,11 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
-    const Dims d = dims_of(s);
+    const Dims d = dims_of(s, Sliced);
     if (!d.valid) return {};
     if (!device_fits(s, d)) {
+      // The graph slices K only for a device that runs the GEMM.
+      if (Sliced) return {};
       const KernelShapes original = original_shapes(s);
       const auto* kernel = legacy(original);
       return kernel ? kernel->emit_kernel(original) : std::string{};
@@ -573,9 +618,10 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
-    const Dims d = dims_of(s);
+    const Dims d = dims_of(s, Sliced);
     if (!d.valid) return tp;
     if (!device_fits(s, d)) {
+      if (Sliced) return tp;
       const KernelShapes original = original_shapes(s);
       const auto* kernel = legacy(original);
       return kernel ? kernel->plan(original) : tp;
@@ -583,8 +629,102 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
     const Tile t = tile_for(d);
     tp.workgroup_size[0] = kThreads;
     tp.workgroup_count[0] =
-        ((d.m + t.bm - 1u) / t.bm) * ((d.n + t.bn - 1u) / t.bn);
+        ((d.m + t.bm - 1u) / t.bm) * ((d.n + t.bn - 1u) / t.bn) * d.slices;
     tp.lds_bytes = lds_bytes(t);
+    return tp;
+  }
+};
+using Q4GemmPlain = Q4GemmKernel<false>;
+using Q4GemmSlices = Q4GemmKernel<true>;
+
+// Sums a [slices, ...] partial product over its leading axis. Four outputs
+// per thread, read as one 16-byte load per slice; trailing elementwise work
+// fuses into its stores.
+struct SliceSumArgs {
+  env::In<kir::f32, env::Emit> partial;
+  env::Out<kir::f32, env::Emit> out;
+};
+struct Q4SliceSumKernel final : graph::KernelPrimitive<Q4SliceSumKernel> {
+  static constexpr std::string_view kName = kSliceSumName;
+  static constexpr std::string_view kEntry = "lse_quant_linear_q4_gemm_f16_slice_sum_v1";
+  static constexpr std::string_view kSource = {};
+  static constexpr std::uint32_t kLanes = 4;
+
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool has_typed_host_impl() const noexcept override { return true; }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 1 || in[0].rank() < 2)
+      return LSE_ERROR(kInvalidArgument, "slice sum takes [slices, ...]");
+    Shape out;
+    for (std::size_t i = 1; i < in[0].rank(); ++i) out.push_back(in[0].dim(i));
+    return out;
+  }
+  static bool supported(const KernelShapes& s) {
+    if (s.inputs.size() != 1 || s.input_dtypes.size() != 1 ||
+        s.input_dtypes[0] != DType::kF32 || s.output_dtype != DType::kF32 ||
+        s.inputs[0].rank() < 2 || !s.device || !s.intrinsics ||
+        device_load_bytes(s.device) < 16u)
+      return false;
+    const auto count = s.output.elem_count();
+    return count != 0 && count % kLanes == 0 &&
+           s.inputs[0].elem_count() ==
+               static_cast<std::uint64_t>(s.inputs[0].dim(0)) * count &&
+           s.inputs[0].elem_count() <= UINT32_MAX;
+  }
+  Status eval_cpu_typed(std::span<const graph::HostTensorView> in,
+                        graph::HostOutputView out,
+                        const std::array<float, 4>&,
+                        const std::array<std::int32_t, 4>&) const override {
+    if (in.size() != 1 || in[0].dtype != DType::kF32 || out.dtype != DType::kF32 ||
+        in[0].shape.rank() < 2)
+      return LSE_ERROR(kInvalidArgument, "invalid slice sum storage");
+    const std::size_t slices = static_cast<std::size_t>(in[0].shape.dim(0));
+    const std::size_t count = out.bytes.size() / 4;
+    if (in[0].bytes.size() != slices * count * 4)
+      return LSE_ERROR(kInvalidArgument, "invalid slice sum byte extent");
+    for (std::size_t i = 0; i < count; ++i) {
+      float acc = 0.0f;
+      for (std::size_t sl = 0; sl < slices; ++sl) {
+        float v;
+        std::memcpy(&v, in[0].bytes.data() + (sl * count + i) * 4, 4);
+        acc += v;
+      }
+      std::memcpy(out.bytes.data() + i * 4, &acc, 4);
+    }
+    return OkStatus();
+  }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!supported(s) || !s.store || s.types.scalar == nullptr) return {};
+    const auto count = static_cast<std::uint32_t>(s.output.elem_count());
+    const auto slices = static_cast<std::uint32_t>(s.inputs[0].dim(0));
+    kir::KernelBody kb(s.types, *s.intrinsics, 0);
+    kb.set_store(s.store);
+    SliceSumArgs a;
+    if (!env::bind(kb, a, s)) return {};
+    env::Emit e{&kb};
+    const auto piece = e.let(math::workgroup_id_x() * kThreads + math::local_id());
+    if (auto live = e.when(piece < count / kLanes)) {
+      const auto at = e.let(piece * kLanes);
+      std::vector<kir::Pack<kir::f32>> parts;
+      for (std::uint32_t sl = 0; sl < slices; ++sl)
+        parts.push_back(e.load(a.partial, e.let(at + sl * count), 16u));
+      for (std::uint32_t j = 0; j < kLanes; ++j) {
+        auto sum = e.let(parts[0][static_cast<int>(j)]);
+        for (std::uint32_t sl = 1; sl < slices; ++sl)
+          sum = e.let(sum + parts[sl][static_cast<int>(j)]);
+        e.store(e.let(at + j), sum);
+      }
+    }
+    return kb.str();
+  }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    if (!supported(s)) return tp;
+    const auto pieces = static_cast<std::uint32_t>(s.output.elem_count()) / kLanes;
+    tp.workgroup_size[0] = kThreads;
+    tp.workgroup_count[0] = (pieces + kThreads - 1u) / kThreads;
     return tp;
   }
 };
@@ -592,6 +732,8 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel> {
 }  // namespace
 
 LSE_REGISTER_PRIMITIVE(F16PanelKernel);
-LSE_REGISTER_PRIMITIVE(Q4GemmKernel);
+LSE_REGISTER_PRIMITIVE(Q4GemmPlain);
+LSE_REGISTER_PRIMITIVE(Q4GemmSlices);
+LSE_REGISTER_PRIMITIVE(Q4SliceSumKernel);
 
 }  // namespace lse::kernels

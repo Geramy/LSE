@@ -287,7 +287,11 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   const auto matrix_storage = packed.node()->quant
       ? packed.node()->quant->matrix_storage : nullptr;
   const std::array<NodePtr, 3> sources{packed.node(), scales.node(), biases.node()};
-  if (dispatch::q4_gemm_shape(geometry)) {
+  const backend::DeviceInfo* device = nullptr;
+  if (Scheduler* scheduler = default_scheduler())
+    device = &scheduler->backend().device_info();
+  if (dispatch::q4_gemm_shape(geometry) &&
+      (device == nullptr || dispatch::q4_gemm_device(*device))) {
     // The tiled GEMM reads an f16 copy of the activation, made once and
     // shared by every contraction over the same activation.
     const Shape panel_shape{
@@ -305,6 +309,26 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
     n->inputs.push_back(panel);
     ++panel->consumer_count;
     n->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+    const std::uint32_t compute_units = device ? device->compute_units : 0u;
+    const auto k = static_cast<std::uint64_t>(sx.dim(sx.rank() - 1));
+    const auto m = sx.elem_count() / k;
+    const std::uint32_t slices = dispatch::q4_gemm_slices(
+        m, static_cast<std::uint64_t>(packed.shape().dim(0)), k, compute_units);
+    if (slices > 1) {
+      // K cut into slices: one launch writes a partial product per slice,
+      // a second sums them, and trailing elementwise work fuses into the sum.
+      n->prim = find_primitive("quant_linear.q4_gemm_f16.slices.v1");
+      Shape partial_shape{static_cast<std::int64_t>(slices)};
+      for (std::size_t i = 0; i < out.rank(); ++i) partial_shape.push_back(out.dim(i));
+      n->shape = partial_shape;
+      n->set_kind(OpKind::kCustom);
+      n->iattrs[2] = static_cast<std::int32_t>(slices);
+      n->fclass = n->prim ? n->prim->fusion_class() : n->fclass;
+      auto sum = make(OpKind::kCustom, out, DType::kF32, {n});
+      sum->prim = find_primitive("quant_linear.q4_gemm_f16.slice_sum.v1");
+      if (sum->prim) sum->fclass = sum->prim->fusion_class();
+      return Array(sum);
+    }
   } else if (dispatch::q8_packed_matrix_shape(geometry) && matrix_storage &&
       matrix_storage->matches(sources)) {
     for (const auto& leaf : matrix_storage->packed) {
