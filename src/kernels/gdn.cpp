@@ -20,6 +20,8 @@ namespace math = lse::math;
 namespace {
 
 constexpr std::uint32_t kBlock = 256;
+// Timesteps whose inputs one scan wave reads together before it updates.
+constexpr std::uint32_t kStepBlock = 8;
 
 std::uint32_t wave_of(const DeviceInfo* device) {
   if (device == nullptr) return 32;
@@ -106,6 +108,68 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     return acc;
   };
 
+  // One timestep of the recurrence, given that step's inputs already in
+  // registers.
+  struct StepIn {
+    kir::Val<kir::f32> al, bt, v;
+    std::vector<kir::Val<kir::f32>> k, q;
+  };
+  const auto load_step = [&](const kir::Val<kir::u32>& t) {
+    StepIn in;
+    const auto sc = e.let((b * seq + t) * heads + h);
+    const auto vec = e.let(sc * D);
+    in.al = e.let(a.alpha[sc]);
+    in.bt = e.let(a.beta[sc]);
+    in.v = e.let(a.v[vec + row]);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      const auto j = e.let(lane + ei * wave);
+      in.k.push_back(e.let(a.k[vec + j]));
+      in.q.push_back(e.let(a.q[vec + j]));
+    }
+    return in;
+  };
+  const auto run_step = [&](const kir::Val<kir::u32>& t, const StepIn& in) {
+    auto skp = e.var(0.0f);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      srow[ei] = srow[ei].read() * in.al;
+      skp = math::fma(srow[ei].read(), in.k[ei], skp);
+    }
+    const auto sk = reduce(skp);
+    const auto delta = e.let((in.v - sk) * in.bt);
+    auto accp = e.var(0.0f);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      srow[ei] = math::fma(delta, in.k[ei], srow[ei].read());
+      accp = math::fma(srow[ei].read(), in.q[ei], accp);
+    }
+    if (write_out) {
+      // The scan passes every timestep on its way to the end, so it publishes
+      // each one as it goes rather than being restarted to reach it.
+      const auto acc = reduce(accp);
+      if (auto in_lane = e.when(lane == 0)) {
+        e.store(((b * seq + t) * heads + h) * D + row, acc);
+      }
+    }
+  };
+
+  if (D % wave == 0) {
+    // Every lane owns whole elements, so no step needs a guard and a block
+    // of steps can read all its inputs before the first dependent update:
+    // the loads do not depend on the state, and issuing them together pays
+    // their latency once per block instead of once per step.
+    const std::uint32_t blocks = seq / kStepBlock;
+    for (auto tb : e.range(0u, blocks, 1u)) {
+      const auto t0 = e.let(tb * kStepBlock);
+      std::vector<StepIn> ins;
+      ins.reserve(kStepBlock);
+      for (std::uint32_t u = 0; u < kStepBlock; ++u)
+        ins.push_back(load_step(e.let(t0 + u)));
+      for (std::uint32_t u = 0; u < kStepBlock; ++u)
+        run_step(e.let(t0 + u), ins[u]);
+    }
+    for (auto t : e.range(blocks * kStepBlock, seq, 1u)) {
+      run_step(t, load_step(t));
+    }
+  } else {
   for (auto t : e.range(seq)) {
     const auto sc = (b * seq + t) * heads + h;
     const auto vec = sc * D;
@@ -130,13 +194,12 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
       }
     }
     if (write_out) {
-      // The scan passes every timestep on its way to the end, so it publishes
-      // each one as it goes rather than being restarted to reach it.
       const auto acc = reduce(accp);
       if (auto in = e.when(lane == 0)) {
         e.store(((b * seq + t) * heads + h) * D + row, acc);
       }
     }
+  }
   }
 
   if (write_state) {
