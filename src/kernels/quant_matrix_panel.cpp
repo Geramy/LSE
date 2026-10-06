@@ -249,6 +249,25 @@ struct MatrixArgs {
   env::In<kir::u32, env::Emit> panel;
   env::Out<kir::f32, env::Emit> out;
 };
+// A decode workgroup owns one 16-column tile per wave over the whole K. Halve
+// the waves per workgroup until the tiles cover every compute unit.
+std::uint32_t matrix_waves(const KernelShapes &s, std::uint32_t n) {
+  const auto tiles = (n + 15u) / 16u;
+  const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
+  auto waves = kBlock / 32u;
+  while (waves > 1u && (tiles + waves - 1u) / waves < units)
+    waves /= 2u;
+  return waves;
+}
+// Groups whose loads issue together before their products accumulate in
+// order. Four is the most the emitter's register budget takes.
+constexpr std::uint32_t kMatrixUnroll = 4;
+std::uint32_t matrix_unroll(std::uint32_t groups) {
+  std::uint32_t unroll = kMatrixUnroll;
+  while (unroll > 1u && groups % unroll != 0u)
+    unroll /= 2u;
+  return unroll;
+}
 std::string emit_matrix(const KernelShapes &s) {
   using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
                             math::MatrixElem::kSU8, 16, 16, 16>;
@@ -261,7 +280,8 @@ std::string emit_matrix(const KernelShapes &s) {
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
   const auto groups = k / 64u;
   const auto lanes = k / 8u;
-  constexpr std::uint32_t waves = kBlock / 32u;
+  const auto waves = matrix_waves(s, n);
+  const auto unroll = matrix_unroll(groups);
   const auto tiles_n = (n + 15u) / 16u;
   const auto nblocks = (tiles_n + waves - 1u) / waves;
   kir::KernelBody kb(s.types, *s.intrinsics, 0);
@@ -283,53 +303,70 @@ std::string emit_matrix(const KernelShapes &s) {
   std::vector<kir::LValue<kir::f32>> out;
   for (int z = 0; z < kSlots; ++z)
     out.push_back(e.var(0.0f));
-  for (auto g : e.range(0u, groups, 1u)) {
-    const auto sa = e.let(safe_col * groups + g);
-    const auto raw_scale = e.let(a.scales[sa]);
-    const auto raw_bias = e.let(a.biases[sa]);
-    std::array<kir::Val<kir::u32>, 4> weight;
-    for (std::uint32_t t = 0; t < 4u; ++t)
-      weight[t] =
-          e.let(a.packed[e.let(safe_col * lanes + g * 8u + t * 2u + hi)]);
+  // A group's four K16 products sum exactly in i32, so the K order inside a
+  // group is free as long as weights and activations agree. Lane half `hi`
+  // takes the group's words hi*4..hi*4+3 (one 16-byte load) and product t
+  // pairs word hi*4+t, codes K[32hi+8t, +8), with the activation half that
+  // holds the same codes: slice 2hi+t/2, half t%2.
+  struct Loaded {
+    kir::Val<lse::bf16> raw_scale, raw_bias;
+    kir::Pack<kir::u32> weight;
     std::vector<kir::Pack<kir::u32>> acts, metadata;
-    for (std::uint32_t t = 0; t < 4u; ++t)
-      acts.push_back(e.load(
-          a.panel, e.let(g * kGroupWords + t * 64u + hi * 32u + lo * 2u), 8u));
-    for (std::uint32_t z = 0; z < 8u; z += 2u)
-      metadata.push_back(e.load(
-          a.panel, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u), 16u));
-    const auto scale = e.let(math::widen(raw_scale));
-    const auto bias = e.let(math::widen(raw_bias));
-    const auto acc = e.local<kir::i32, kSlots>();
-    for (int z = 0; z < kSlots; ++z)
-      acc[z] = kir::cast<kir::i32>(e.u32(0));
-    for (std::uint32_t t = 0; t < 4u; ++t) {
-      const auto bf = e.local<kir::u32, kFrag>();
-      const auto af = e.local<kir::u32, kFrag>();
-      for (int f = 0; f < kFrag; ++f) {
-        auto expanded = e.let(e.u32(0));
-        for (std::uint32_t b = 0; b < 4u; ++b) {
-          const auto code =
-              e.let((weight[t] /
-                     (1u << (4u * (static_cast<std::uint32_t>(f) * 4u + b)))) %
-                    16u);
-          expanded = e.let(expanded + code * (1u << (8u * b)));
-        }
-        bf[f] = expanded;
-        af[f] = acts[t][f];
-      }
-      acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
+  };
+  const auto act_lane = e.let(hi * 128u + lo * 2u);
+  for (auto g0 : e.range(0u, groups, unroll)) {
+    std::vector<Loaded> loaded;
+    loaded.reserve(unroll);
+    for (std::uint32_t u = 0; u < unroll; ++u) {
+      const auto g = e.let(g0 + u);
+      const auto sa = e.let(safe_col * groups + g);
+      Loaded l{e.let(a.scales[sa]), e.let(a.biases[sa]),
+               e.load(a.packed, e.let(safe_col * lanes + g * 8u + hi * 4u), 16u),
+               {}, {}};
+      for (std::uint32_t t = 0; t < 4u; ++t)
+        l.acts.push_back(e.load(
+            a.panel, e.let(g * kGroupWords + act_lane + (t / 2u) * 64u + (t % 2u) * 32u), 8u));
+      for (std::uint32_t z = 0; z < 8u; z += 2u)
+        l.metadata.push_back(e.load(
+            a.panel, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u), 16u));
+      loaded.push_back(std::move(l));
     }
-    for (int z = 0; z < kSlots; ++z) {
-      const auto step = e.let(math::from_bits<lse::f32>(
-          metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
-      const auto sum = e.let(math::from_bits<lse::f32>(
-          metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2 + 1]));
-      const auto term = e.let(scale * step);
-      out[static_cast<std::size_t>(z)] =
-          math::fma(term, kir::cast<kir::f32>(acc[z].read()),
-                    out[static_cast<std::size_t>(z)].read()) +
-          bias * sum;
+    for (std::uint32_t u = 0; u < unroll; ++u) {
+      const auto &l = loaded[u];
+      const auto scale = e.let(math::widen(l.raw_scale));
+      const auto bias = e.let(math::widen(l.raw_bias));
+      const auto acc = e.local<kir::i32, kSlots>();
+      for (int z = 0; z < kSlots; ++z)
+        acc[z] = kir::cast<kir::i32>(e.u32(0));
+      for (std::uint32_t t = 0; t < 4u; ++t) {
+        const auto bf = e.local<kir::u32, kFrag>();
+        const auto af = e.local<kir::u32, kFrag>();
+        for (int f = 0; f < kFrag; ++f) {
+          auto expanded = e.let(e.u32(0));
+          const auto word = e.let(l.weight[static_cast<int>(t)]);
+          for (std::uint32_t b = 0; b < 4u; ++b) {
+            const auto code =
+                e.let((word /
+                       (1u << (4u * (static_cast<std::uint32_t>(f) * 4u + b)))) %
+                      16u);
+            expanded = e.let(expanded + code * (1u << (8u * b)));
+          }
+          bf[f] = expanded;
+          af[f] = l.acts[t][f];
+        }
+        acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
+      }
+      for (int z = 0; z < kSlots; ++z) {
+        const auto step = e.let(math::from_bits<lse::f32>(
+            l.metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
+        const auto sum = e.let(math::from_bits<lse::f32>(
+            l.metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2 + 1]));
+        const auto term = e.let(scale * step);
+        out[static_cast<std::size_t>(z)] =
+            math::fma(term, kir::cast<kir::f32>(acc[z].read()),
+                      out[static_cast<std::size_t>(z)].read()) +
+            bias * sum;
+      }
     }
   }
   for (int z = 0; z < kSlots; ++z) {
@@ -525,6 +562,13 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     tp.lds_bytes = rule->shared_words * sizeof(std::uint32_t);
     tp.workgroup_count[0] =
         ((m + rule->rows - 1u) / rule->rows) * ((n + 127u) / 128u);
+    if (rule->rows == kRows) {
+      const auto waves = matrix_waves(s, n);
+      const auto tiles = (n + 15u) / 16u;
+      tp.workgroup_size[0] = waves * 32u;
+      tp.workgroup_count[0] =
+          ((m + rule->rows - 1u) / rule->rows) * ((tiles + waves - 1u) / waves);
+    }
     return tp;
   }
 };
