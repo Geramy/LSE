@@ -29,8 +29,12 @@ struct Fixture {
   if(!h.ok())std::fprintf(stderr,"HIP: %s\n",h.status().to_string().c_str());
   if(!l.ok())std::fprintf(stderr,"Loom: %s\n",l.status().to_string().c_str());
   if(!h.ok()||!l.ok())return;
-  LSE_EXPECT((l->source.find("kernel.barrier<workgroup>")!=std::string::npos)==cooperative);
-  LSE_EXPECT((h->source.find("__syncthreads")!=std::string::npos)==cooperative);
+  // Rows of at most 128 take a wave each (eight per workgroup), with no
+  // workgroup scratch or barrier; wider rows keep the 256-lane tree.
+  const auto& in_shape=g.nodes[0]->shape;
+  const bool narrow=cooperative&&in_shape.dim(in_shape.rank()-1)<=128;
+  LSE_EXPECT((l->source.find("kernel.barrier<workgroup>")!=std::string::npos)==(cooperative&&!narrow));
+  LSE_EXPECT((h->source.find("__syncthreads")!=std::string::npos)==(cooperative&&!narrow));
   if(g.outputs.size()>1) {
    LSE_EXPECT(h->source.find("__device__ float lse_rms_norm_")!=std::string::npos);
    for(const auto& output:g.outputs) {
@@ -41,7 +45,12 @@ struct Fixture {
     LSE_EXPECT(stored);
    }
   }
-  if(cooperative){
+  if(narrow){
+   const auto& shape=g.nodes[0]->shape;auto rows=shape.elem_count()/static_cast<size_t>(shape.dim(shape.rank()-1));
+   LSE_EXPECT_EQ(l->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(l->dims.workgroup_count[0],(rows+7)/8);
+   LSE_EXPECT_EQ(h->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(h->dims.workgroup_count[0],(rows+7)/8);
+   LSE_EXPECT_EQ(l->lds_bytes,0u);
+  } else if(cooperative){
    const auto& shape=g.nodes[0]->shape;auto rows=shape.elem_count()/static_cast<size_t>(shape.dim(shape.rank()-1));
    LSE_EXPECT_EQ(l->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(l->dims.workgroup_count[0],rows);
    LSE_EXPECT_EQ(h->dims.workgroup_size[0],256u);LSE_EXPECT_EQ(h->dims.workgroup_count[0],rows);

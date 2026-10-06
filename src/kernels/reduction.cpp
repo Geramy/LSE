@@ -48,6 +48,13 @@ struct RmsNormArgs {
 namespace {
 constexpr std::uint32_t kRmsBlock = 256;
 constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
+// Rows no wider than four wave32 lanes' worth (a head's 128) take a wave
+// each, eight to a workgroup, instead of a 256-lane workgroup each.
+constexpr std::uint32_t kNarrowRows = kRmsBlock / 32u;
+bool narrow_rows(const KernelShapes& s, std::uint32_t d) {
+  return s.device && s.device->wavefront_size == 32 && d <= 4u * 32u &&
+         s.intrinsics && !s.intrinsics->find("wave.shfl_xor").empty();
+}
 
 }  // namespace
 
@@ -68,6 +75,48 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       RmsNormArgs<env::Emit, G> a;
       if (!env::bind(k, a, s)) return {};
       env::Emit e{&k};
+      if (narrow_rows(s, d)) {
+        // A wave per row. Lane l holds the squares of columns l, l+32, l+64
+        // and l+96, which are exactly the four 256-lane partials the wide
+        // tree adds for it (every other partial of a row this narrow is
+        // zero), added in the same order; the xor butterfly then leaves
+        // every lane with lane 0's total.
+        const auto lid = e.let(math::local_id());
+        const auto lane = e.let(lid % 32u);
+        const auto row_index = e.let(math::workgroup_id_x() * kNarrowRows + lid / 32u);
+        const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / d);
+        if (auto live = e.when(row_index < rows)) {
+          const auto row = e.let(row_index * d);
+          std::array<kir::Val<kir::f32>, 4> squares;
+          std::array<kir::LValue<kir::f32>, 4> values{e.var(0.0f), e.var(0.0f), e.var(0.0f), e.var(0.0f)};
+          for (std::uint32_t c = 0; c < 4u; ++c) {
+            auto square = e.var(0.0f);
+            if (auto in = e.when(lane + c * 32u < d)) {
+              values[c] = a.x[row + lane + c * 32u];
+              square = math::fma(values[c].read(), values[c].read(), e.f32(0.0f));
+            }
+            squares[c] = e.let(square.read());
+          }
+          const auto zero = e.f32(0.0f);
+          const auto a0 = e.let(squares[0] + zero);
+          const auto a1 = e.let(squares[2] + zero);
+          const auto a2 = e.let(squares[1] + zero);
+          const auto a3 = e.let(squares[3] + zero);
+          auto total = e.let((a0 + a1) + (a2 + a3));
+          for (std::uint32_t offset = 16; offset > 0; offset >>= 1)
+            total = e.let(total + math::shfl_xor(total, e.u32(offset)));
+          const auto scale = e.let(math::rsqrt(total / static_cast<float>(d) + s.attrs[0]));
+          for (std::uint32_t c = 0; c < 4u; ++c) {
+            const auto col = e.let(lane + c * 32u);
+            if (auto in = e.when(col < d)) {
+              const auto gain = math::widen(a.g[col]);
+              const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+              e.store(row + col, values[c].read() * scale * weight);
+            }
+          }
+        }
+        return k.str();
+      }
       const auto lane = e.let(math::local_id());
       const auto row = e.let(math::workgroup_id_x() * d);
       auto partial = e.var(0.0f);
@@ -135,8 +184,14 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     tp.workgroup_size[0] = kRmsBlock;
-    tp.workgroup_count[0] = static_cast<std::uint32_t>(
-        s.output.elem_count() / static_cast<std::size_t>(last_dim(s.inputs[0])));
+    const auto d = static_cast<std::uint32_t>(last_dim(s.inputs[0]));
+    const auto rows = static_cast<std::uint32_t>(
+        s.output.elem_count() / static_cast<std::size_t>(d));
+    if (narrow_rows(s, d)) {
+      tp.workgroup_count[0] = (rows + kNarrowRows - 1u) / kNarrowRows;
+      return tp;
+    }
+    tp.workgroup_count[0] = rows;
     tp.lds_bytes = kRmsScratch;
     return tp;
   }
