@@ -116,6 +116,8 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
   scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
   scheduler->set_dialect(Dialect::kLoom);
   const std::size_t groups = k / 64;
+  const int bits = std::getenv("Q4G_TEST_BITS") ? std::atoi(std::getenv("Q4G_TEST_BITS")) : 4;
+  const std::size_t per_word = 32 / static_cast<std::size_t>(bits);
   std::mt19937 rng(1234);
   std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
   std::vector<float> x(m * k);
@@ -123,25 +125,27 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
   if (const char* fill = std::getenv("Q4G_TEST_X")) {
     for (auto& v : x) v = static_cast<float>(std::atof(fill));
   }
-  std::vector<std::uint32_t> w(n * k / 8);
+  std::vector<std::uint32_t> w(n * k / per_word);
   for (auto& v : w) v = static_cast<std::uint32_t>(rng());
   if (const char* fill = std::getenv("Q4G_TEST_W")) {
     for (auto& v : w) v = static_cast<std::uint32_t>(std::strtoul(fill, nullptr, 16));
   }
   std::vector<bfloat16_t> s(n * groups), b(n * groups);
   for (std::size_t i = 0; i < s.size(); ++i) {
-    s[i] = bfloat16_t(0.002f + 0.01f * std::abs(uni(rng)));
-    b[i] = bfloat16_t(-8.0f * static_cast<float>(s[i]) + 0.01f * uni(rng));
+    const float span = bits == 8 ? 0.0001f : 0.01f;
+    s[i] = bfloat16_t(span * 0.2f + span * std::abs(uni(rng)));
+    b[i] = bfloat16_t(-static_cast<float>(1 << (bits - 1)) * static_cast<float>(s[i]) +
+                      0.01f * uni(rng));
   }
   auto ax = filled(Shape{1, static_cast<std::int64_t>(m), static_cast<std::int64_t>(k)},
                    DType::kF32, x);
-  auto aw = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(k / 8)},
+  auto aw = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(k / per_word)},
                    DType::kU32, w);
   auto as = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(groups)},
                    DType::kBF16, s);
   auto ab = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(groups)},
                    DType::kBF16, b);
-  auto y = quant_linear(ax, aw, as, ab, 4, 64);
+  auto y = quant_linear(ax, aw, as, ab, bits, 64);
   const NodePtr roots[]{y.node()};
   Program program;
   scheduler->reset_accumulated_trace();
@@ -162,8 +166,9 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
     const std::size_t col = t < 64 ? (t * 997) % n : pick_n(rng);
     double acc = 0, mag = 0;
     for (std::size_t kk = 0; kk < k; ++kk) {
-      const std::uint32_t word = w[col * (k / 8) + kk / 8];
-      const double code = static_cast<double>((word >> (4 * (kk % 8))) & 15u);
+      const std::uint32_t word = w[col * (k / per_word) + kk / per_word];
+      const double code = static_cast<double>(
+          (word >> (bits * (kk % per_word))) & ((1u << bits) - 1u));
       const double weight =
           static_cast<double>(static_cast<float>(s[col * groups + kk / 64])) * code +
           static_cast<double>(static_cast<float>(b[col * groups + kk / 64]));
@@ -188,8 +193,8 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
     // The model's MLP: silu(gate) * up fused into the gate GEMM's stores.
     // Fresh nodes, so nothing is materialized and the partitioner fuses
     // silu and the product into the gate GEMM's stores.
-    auto gate = quant_linear(ax, aw, as, ab, 4, 64);
-    auto up = quant_linear(ax, aw, as, ab, 4, 64);
+    auto gate = quant_linear(ax, aw, as, ab, bits, 64);
+    auto up = quant_linear(ax, aw, as, ab, bits, 64);
     auto act = silu(gate) * up;
     const NodePtr act_roots[]{act.node()};
     scheduler->reset_accumulated_trace();

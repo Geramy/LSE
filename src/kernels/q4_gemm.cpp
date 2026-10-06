@@ -60,7 +60,6 @@ constexpr std::uint32_t kBK = dispatch::kQ4GemmStepK;
 // groups.
 constexpr std::uint32_t kPad = 8;
 constexpr std::uint32_t kRowHalves = kBK + kPad;
-constexpr std::uint32_t kCodesPerWord = 8;
 // Panel lanes per piece: one 16-byte move, and one aligned run of K.
 constexpr std::uint32_t kRun = 8;
 
@@ -187,6 +186,7 @@ struct Tile {
 
 struct Dims {
   std::uint32_t m = 0, n = 0, k = 0, groups = 0, gsize = 0, lanes = 0;
+  std::uint32_t bits = 4;
   // Slices of K, each written to its own plane of a [slices, ...] output.
   std::uint32_t slices = 1;
   bool valid = false;
@@ -221,6 +221,7 @@ Dims dims_of(const KernelShapes& s, bool sliced) {
   d.n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   d.lanes = static_cast<std::uint32_t>(s.inputs[1].dim(1));
   d.gsize = static_cast<std::uint32_t>(s.iattrs[1]);
+  d.bits = static_cast<std::uint32_t>(s.iattrs[0]);
   d.groups = d.k / d.gsize;
   d.m = static_cast<std::uint32_t>(original.output.elem_count() / d.n);
   if ((d.k / kBK) % d.slices != 0 ||
@@ -272,7 +273,7 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
       s.device->max_threads_per_workgroup < kThreads)
     return false;
   if (device_load_bytes(s.device) < 16u) return false;
-  for (const auto symbol : {"barrier", "q4x8.f16"})
+  for (const auto symbol : {"barrier", d.bits == 8 ? "q8x8.f16" : "q4x8.f16"})
     if (s.intrinsics->find(symbol).empty()) return false;
   return backend::workgroup_lds_bytes(s.device) >= lds_bytes(tile_for(d)) &&
          f16_row(s) != nullptr;
@@ -344,10 +345,11 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     a_src.push_back(e.let(safe * K + run * kRun));
     a_dst.push_back(e.let(r * kRowHalves + run * kRun));
   }
-  // Weight staging: four packed words (32 codes, one 16-byte load) per
-  // piece.
-  constexpr std::uint32_t kWordsPerStep = kBK / kCodesPerWord;
-  constexpr std::uint32_t kBPerCol = kWordsPerStep / 4u;
+  // Weight staging: four packed words (one 16-byte load) per piece: 32
+  // 4-bit codes or 16 8-bit ones.
+  const std::uint32_t kCodesPerWord = 32u / d.bits;
+  const std::uint32_t kWordsPerStep = kBK / kCodesPerWord;
+  const std::uint32_t kBPerCol = kWordsPerStep / 4u;
   // A tile with fewer weight pieces than threads lets the surplus threads
   // repeat a piece: they write the same values to the same place.
   const std::uint32_t b_total = t.bn * kBPerCol;
@@ -395,6 +397,17 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto commit = [&](const Staged& st) {
     for (std::uint32_t c = 0; c < a_pieces; ++c) store8(As, a_dst[c], st.av[c]);
     for (std::uint32_t c = 0; c < b_pieces; ++c) {
+      if (d.bits == 8) {
+        // Two aligned runs of eight, each from a pair of words.
+        for (std::uint32_t r = 0; r < 2u; ++r) {
+          const auto lo = e.let(st.bv[c][static_cast<int>(2u * r)]);
+          const auto hi = e.let(st.bv[c][static_cast<int>(2u * r + 1u)]);
+          const auto v = kb.call<F16x8>("q8x8.f16", lo, hi, st.scale[c], st.bias[c]);
+          store8(Bs, e.let(b_dst[c] + r * kRun),
+                 kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8));
+        }
+        continue;
+      }
       for (std::uint32_t w = 0; w < 4u; ++w) {
         const auto word = e.let(st.bv[c][static_cast<int>(w)]);
         const auto v =
@@ -545,14 +558,17 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
     if (in.size() != 5 || in[0].dtype != DType::kF32 ||
         in[1].dtype != DType::kU32 || out.dtype != DType::kF32 ||
         (in[2].dtype != DType::kBF16 && in[2].dtype != DType::kF16) ||
-        in[3].dtype != in[2].dtype || iattrs[0] != 4 || iattrs[1] <= 0)
+        in[3].dtype != in[2].dtype || (iattrs[0] != 4 && iattrs[0] != 8) ||
+        iattrs[1] <= 0)
       return LSE_ERROR(kInvalidArgument, "invalid q4 gemm storage");
     const auto k = static_cast<std::size_t>(in[0].shape.dim(in[0].shape.rank() - 1));
     const auto n = static_cast<std::size_t>(in[1].shape.dim(0));
     const auto gs = static_cast<std::size_t>(iattrs[1]);
     const auto m = in[0].shape.elem_count() / k;
     const std::size_t slices = Sliced ? static_cast<std::size_t>(iattrs[2]) : 1;
-    if (k % gs != 0 || slices == 0 || in[1].bytes.size() != n * k / 2 ||
+    const auto bits = static_cast<std::size_t>(iattrs[0]);
+    const auto per_word = 32 / bits;
+    if (k % gs != 0 || slices == 0 || in[1].bytes.size() != n * k * bits / 8 ||
         in[2].bytes.size() != n * (k / gs) * 2 ||
         out.bytes.size() != slices * m * n * 4)
       return LSE_ERROR(kInvalidArgument, "invalid q4 gemm byte extent");
@@ -572,8 +588,9 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
         float acc = 0.0f;
         for (std::size_t kk = 0; kk < k; ++kk) {
           std::uint32_t word;
-          std::memcpy(&word, in[1].bytes.data() + (col * (k / 8) + kk / 8) * 4, 4);
-          const float code = static_cast<float>((word >> (4 * (kk % 8))) & 15u);
+          std::memcpy(&word, in[1].bytes.data() + (col * (k / per_word) + kk / per_word) * 4, 4);
+          const float code = static_cast<float>(
+              (word >> (bits * (kk % per_word))) & ((1u << bits) - 1u));
           const auto g = col * (k / gs) + kk / gs;
           float x;
           std::memcpy(&x, in[0].bytes.data() + (row * k + kk) * 4, 4);
