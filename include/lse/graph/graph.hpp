@@ -433,8 +433,6 @@ class Scheduler {
   // path and a step that returned an error still reports where its time went.
   Status eval_step(std::span<const NodePtr> roots, bool pull_host,
                    Program* plan);
-  void prewarm_kernels(std::size_t member, backend::IBackend& be,
-                       const IKernelEmitter& emitter);
   Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
                             std::size_t member, Program* replay = nullptr,
                             std::size_t group_index = 0);
