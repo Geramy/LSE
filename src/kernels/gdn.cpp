@@ -6,6 +6,8 @@
 #include "lse/math.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 
+#include <cstdlib>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -222,6 +224,182 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
   return k.str();
 }
 
+// The prefill form: one thread per state row, the whole row in registers.
+//
+// Every row of S evolves independently -- decay, the row's own dot with k,
+// its own delta, its own dot with q -- so a thread that owns a row needs no
+// cross-lane reduction at all, where the wave-per-row form spends two
+// five-step shuffle trees per timestep on each row. A workgroup owns one
+// head's rows; the head's k and q for a block of timesteps are staged in
+// workgroup scratch once and read there by every row as broadcasts.
+// Selected for prompts of at least kRowScanMinSeq timesteps (decode keeps
+// the wave form) and a row that fits the register budget.
+constexpr std::uint32_t kRowScanMinSeq = 16;
+constexpr std::uint32_t kRowScanMaxDim = 128;
+constexpr std::uint32_t kRowScanBlock = 16;
+// Lanes sharing one row: each holds D / kRowScanLanes of it, and the two
+// dots per step finish with one shuffle per halving. Two lanes put eight
+// waves on a 128-row head, which hides the per-step dependence chain that a
+// single wave per SIMD leaves exposed.
+constexpr std::uint32_t kRowScanLanes = 2;
+// Rows per workgroup. Rows are independent, so a head's rows are spread over
+// several workgroups, each staging the head's k and q for itself: more,
+// smaller workgroups put more waves in flight than one per head does
+// (measured on gfx1201 at 1024 steps and 48 heads: 64 rows 1.57 ms, 32 rows
+// 1.68, a whole head of 128 rows 1.90, the wave-per-row scan 1.80).
+constexpr std::uint32_t kRowScanRows = 64;
+std::uint32_t row_scan_rows(std::uint32_t D) {
+  return D % kRowScanRows == 0 && kRowScanRows * kRowScanLanes >= kRowScanBlock
+             ? kRowScanRows : D;
+}
+
+bool row_scan_fits(const KernelShapes& s) {
+  if (s.inputs.size() < 6 || s.inputs[0].rank() != 4 || !s.device) return false;
+  const auto seq = s.inputs[0].dim(1);
+  const auto D = s.inputs[0].dim(3);
+  const std::uint32_t wave = wave_of(s.device);
+  return seq >= kRowScanMinSeq && D > 0 && D <= kRowScanMaxDim &&
+         D % wave == 0 && D % (4 * kRowScanLanes) == 0 &&
+         static_cast<std::uint32_t>(D) * kRowScanLanes <= s.device->max_threads_per_workgroup &&
+         !s.intrinsics->find("wave.shfl_xor").empty() &&
+         backend::workgroup_lds_bytes(s.device) >=
+             (2u * kRowScanBlock * static_cast<std::uint32_t>(D) + 2u * kRowScanBlock) * 4u &&
+         s.intrinsics != nullptr && !s.intrinsics->find("barrier").empty();
+}
+
+std::string emit_gdn_rows(const KernelShapes& s, GdnWrite mode) {
+  const Shape& q = s.inputs[0];
+  const auto batch = static_cast<std::uint32_t>(q.dim(0));
+  const auto seq = static_cast<std::uint32_t>(q.dim(1));
+  const auto heads = static_cast<std::uint32_t>(q.dim(2));
+  const auto D = static_cast<std::uint32_t>(q.dim(3));
+  const bool write_state = mode != GdnWrite::kOut;
+  const bool write_out = mode != GdnWrite::kState;
+  if (write_out && !s.store) return {};
+  if (mode == GdnWrite::kBoth && s.inputs.size() < 7) return {};
+  (void)batch;
+
+  kir::KernelBody k(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+  k.set_store(s.store);
+  GdnArgs<env::Emit> a;
+  if (!env::bind(k, a, s)) return {};
+  env::Emit e{&k};
+  const auto ks = e.lds<kir::f32>(kRowScanBlock * D);
+  const auto qs = e.lds<kir::f32>(kRowScanBlock * D);
+  const auto als = e.lds<kir::f32>(kRowScanBlock);
+  const auto bts = e.lds<kir::f32>(kRowScanBlock);
+  if (!ks || !qs || !als || !bts) return {};
+
+  constexpr std::uint32_t L = kRowScanLanes;
+  const std::uint32_t E = D / L;  // elements of the row this lane holds
+  const std::uint32_t R = row_scan_rows(D);
+  const std::uint32_t groups_per_head = D / R;
+  const std::uint32_t threads = R * L;
+  const auto lid = e.let(math::local_id());
+  const auto wg = e.let(math::workgroup_id_x());
+  const auto row = e.let((wg % groups_per_head) * R + lid / L);
+  const auto part_of_row = e.let(lid % L);
+  const auto col0 = e.let(part_of_row * E);
+  const auto h = e.let((wg / groups_per_head) % heads);
+  const auto b = e.let(wg / (groups_per_head * heads));
+  const auto state_row = e.let(((b * heads + h) * D + row) * D + col0);
+
+  std::vector<kir::LValue<kir::f32>> srow;
+  srow.reserve(E);
+  for (std::uint32_t j = 0; j < E; j += 4) {
+    const auto p = e.load(a.s, e.let(state_row + j), 16u);
+    for (int u = 0; u < 4; ++u) srow.emplace_back(e.var(p[u]));
+  }
+  // The row's dot from its lanes' partial sums; every lane gets the total.
+  const auto row_sum = [&](kir::Val<kir::f32> x) {
+    for (std::uint32_t m = 1; m < L; m <<= 1) x = e.let(x + math::shfl_xor(x, e.u32(m)));
+    return x;
+  };
+
+  // Stage kRowScanBlock timesteps from t0: thread `row` moves element `row`
+  // of each step's k and q, and the first threads each step's decay and
+  // beta. A step past the end reads a real step's vectors (its index wraps)
+  // and gets decay 1 and beta 0, which leaves every row exactly as it was.
+  const auto stage = [&](const kir::Val<kir::u32>& t0) {
+    e.barrier();
+    // The workgroup's threads move the block's k and q, element idx % D of
+    // step idx / D, a workgroup's worth of elements per pass.
+    for (std::uint32_t i0 = 0; i0 < kRowScanBlock * D; i0 += threads) {
+      const auto idx = e.let(lid + i0);
+      const auto u = e.let(idx / D);
+      const auto j = e.let(idx % D);
+      const auto tt = e.let((t0 + u) % seq);
+      const auto vec = e.let(((b * seq + tt) * heads + h) * D);
+      ks[e.let(j + u * D)] = a.k[e.let(vec + j)];
+      qs[e.let(j + u * D)] = a.q[e.let(vec + j)];
+    }
+    if (auto lead = e.when(lid < kRowScanBlock)) {
+      const auto live = e.let(t0 + lid < seq);
+      const auto sc = e.let((b * seq + (t0 + lid) % seq) * heads + h);
+      als[lid] = select(live, a.alpha[sc], e.f32(1.0f));
+      bts[lid] = select(live, a.beta[sc], e.f32(0.0f));
+    }
+    e.barrier();
+  };
+  const auto step = [&](const kir::Val<kir::u32>& t, const kir::Val<kir::u32>& u) {
+    const auto sc = e.let((b * seq + t % seq) * heads + h);
+    const auto al = e.let(als[u].read());
+    const auto bt = e.let(bts[u].read());
+    const auto vt = e.let(a.v[e.let(sc * D + row)]);
+    const auto base = e.let(u * D + col0);
+    // Four partial sums keep the dot's dependence chain a quarter as long.
+    std::array<kir::LValue<kir::f32>, 4> part{e.var(0.0f), e.var(0.0f),
+                                              e.var(0.0f), e.var(0.0f)};
+    std::vector<kir::Val<kir::f32>> kj;
+    kj.reserve(E);
+    for (std::uint32_t j = 0; j < E; j += 4) {
+      const auto kp = ks.load(e.let(base + j), 16u);
+      for (int x = 0; x < 4; ++x) {
+        kj.push_back(e.let(kp[x]));
+        srow[j + x] = srow[j + x].read() * al;
+        part[x] = math::fma(srow[j + x].read(), kj.back(), part[x].read());
+      }
+    }
+    const auto sk = row_sum(e.let((part[0].read() + part[1].read()) +
+                                  (part[2].read() + part[3].read())));
+    const auto delta = e.let((vt - sk) * bt);
+    for (int x = 0; x < 4; ++x) part[x] = 0.0f;
+    for (std::uint32_t j = 0; j < E; j += 4) {
+      const auto qp = qs.load(e.let(base + j), 16u);
+      for (int x = 0; x < 4; ++x) {
+        srow[j + x] = math::fma(delta, kj[j + x], srow[j + x].read());
+        part[x] = math::fma(srow[j + x].read(), qp[x], part[x].read());
+      }
+    }
+    if (write_out) {
+      const auto o = row_sum(e.let((part[0].read() + part[1].read()) +
+                                   (part[2].read() + part[3].read())));
+      // One compare for both conditions: lane 0 of the row (part 0) at a
+      // live step. part * seq + t < seq exactly when part is 0 and t < seq.
+      if (auto in = e.when(part_of_row * seq + t < seq)) e.store(e.let(sc * D + row), o);
+    }
+  };
+
+  // One loop over whole blocks; the last block's surplus steps are inert.
+  // A second loop for a remainder doubles the live state the target has to
+  // allocate across loops, and it spills.
+  const std::uint32_t blocks = (seq + kRowScanBlock - 1u) / kRowScanBlock;
+  for (auto tb : e.range(0u, blocks, 1u)) {
+    const auto t0 = e.let(tb * kRowScanBlock);
+    stage(t0);
+    for (auto u : e.range(0u, kRowScanBlock, 1u)) step(e.let(t0 + u), u);
+  }
+
+  if (write_state) {
+    for (std::uint32_t j = 0; j < E; ++j) {
+      const auto idx = e.let(state_row + j);
+      if (mode == GdnWrite::kBoth) a.sout[idx] = srow[j].read();
+      else e.store(idx, srow[j].read());
+    }
+  }
+  return k.str();
+}
+
 ThreadPlan gdn_plan(const KernelShapes& s, bool write_state) {
   ThreadPlan tp;
   tp.workgroup_size[0] = kBlock;
@@ -231,11 +409,16 @@ ThreadPlan gdn_plan(const KernelShapes& s, bool write_state) {
   }
   const Shape& q = s.inputs[0];
   const auto batch = static_cast<std::uint32_t>(q.dim(0));
-  const auto seq = static_cast<std::uint32_t>(q.dim(1));
   const auto heads = static_cast<std::uint32_t>(q.dim(2));
   const auto D = static_cast<std::uint32_t>(q.dim(3));
   const std::uint32_t wave = wave_of(s.device);
   (void)write_state;
+  if (row_scan_fits(s)) {
+    tp.workgroup_size[0] = row_scan_rows(D) * kRowScanLanes;
+    tp.workgroup_count[0] = batch * heads * (D / row_scan_rows(D));
+    tp.lds_bytes = (2u * kRowScanBlock * D + 2u * kRowScanBlock) * 4u;
+    return tp;
+  }
   const std::uint32_t rows = batch * heads * D;
   const std::uint32_t threads = rows * wave;
   tp.workgroup_count[0] = threads == 0 ? 1u : (threads + kBlock - 1) / kBlock;
@@ -259,7 +442,8 @@ struct GdnKernel final : KernelPrimitive<GdnKernel> {
     }
     const auto dim = s.inputs[0].dim(3);
     if (dim != 16 && dim != 32 && dim != 64 && dim != 128) return {};
-    return emit_gdn(s, s.iattrs[0] != 0 ? GdnWrite::kState : GdnWrite::kOut);
+    const GdnWrite mode = s.iattrs[0] != 0 ? GdnWrite::kState : GdnWrite::kOut;
+    return row_scan_fits(s) ? emit_gdn_rows(s, mode) : emit_gdn(s, mode);
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -292,7 +476,8 @@ struct GdnPairKernel final : KernelPrimitive<GdnPairKernel> {
     }
     const auto dim = s.inputs[0].dim(3);
     if (dim != 16 && dim != 32 && dim != 64 && dim != 128) return {};
-    return emit_gdn(s, GdnWrite::kBoth);
+    return row_scan_fits(s) ? emit_gdn_rows(s, GdnWrite::kBoth)
+                            : emit_gdn(s, GdnWrite::kBoth);
   }
 
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
