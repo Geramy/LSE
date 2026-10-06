@@ -3,6 +3,15 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.4: twice the prefill, faster speculative decode and HRX patches in-tree
+
+Requires mac_linuxgpu v0.1.151 (build 255) or later; measured on v0.1.156 (build 260).
+
+1. **Prefill:** a tiled f16 matrix-core GEMM for 4- and 8-bit projections of 16 rows or more (64x64 wave tiles on wide passes, K slices when the grid underfills), a GDN prefill scan with a thread pair per state row, flash prefill attention staged through workgroup memory, a wave per row for `l2_normalize` and one padded pass for a prompt's remainder. Warm 4K prompt (4230 tokens) **1,455** tok/s, up from 678 in 0.5.3 on the same driver; warm 1060 tokens **1,307** tok/s.
+2. **Time to first token:** issue-ordered clears of fresh state and KV, reuse of freed device buffers, kernels loaded together at a step's first cache miss and the last DFlash2 context pass after the first token. Warm 137-token TTFT **0.18 s** (0.5.3: 0.68 s); the first request after start 0.37 s.
+3. **Decode:** occupancy-tiled short-query attention, four-chunk lm_head and query loads, the decode down projection over every compute unit, preloaded GDN scans that read shared key heads in place, fused verify q/k preparation, batched verify launches, a device top-k for sampled verification and MTP drafts chained on the device. 640-token decode: DFlash2 **49.9** tok/s, MTP=3 **50.8** tok/s, plain **28.5** tok/s (0.5.3: 40.9, 44.9, 27.5).
+4. **HRX patches in LSE:** the macOS, iOS and Linux builds apply `patches/hrx` instead of fetching the archived mac-amdgpu repository; loomc grows its arrays only when full, so the 64x64-tile kernels compile.
+
 ## v0.5.3: faster load and decode, refusable CPU fallback and the current mac_linuxgpu runtime
 
 Requires mac_linuxgpu v0.1.151 (build 255) or later.

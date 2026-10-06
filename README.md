@@ -21,14 +21,48 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
 [Install](#install-a-release) · [Start the server](#start-the-http-server) ·
 [MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
 [Memory estimates](#model-info-and-memory-estimates) · [libLSE](#use-lse-as-a-library) ·
-[iPadOS](#ios-and-ipados) · [Benchmarks](#humaneval-through-32k) ·
+[iPadOS](#ios-and-ipados) · [Performance](#performance-on-macos-r9700) · [Benchmarks](#humaneval-through-32k) ·
 [Build](#build-from-source) · [Troubleshooting](#troubleshooting)
+
+## Performance on macOS (R9700)
+
+Qwen3.8-27B Q4 (MLX group-affine) on a Radeon AI PRO R9700 over Thunderbolt 5,
+Apple M5 Max, mac_linuxgpu v0.1.156 (build 260), LSE 0.5.4, measured 2026-10-06. Server flags:
+`--pool hrx:0 --dialect loom --batch-size 1024 --ubatch-size 1024 --kv-cache-dtype bf16
+--kv-len 262100 --temperature 0.6`, with `LSE_REQUIRE_DEVICE_KERNELS=1` (no CPU fallback).
+DFlash2 uses the Q8 draft (`--dflash2=on --dflash2-model qwen38-27b-dflash2-q8`).
+
+Time to first token over the HTTP API, 128 tokens out. Cold is the first request
+of that size after the server starts, with the kernel cache already on disk;
+warm is the median of the next three.
+
+| Prompt tokens | Warm TTFT | Warm prefill | Cold TTFT | 0.5.3 warm TTFT |
+| ---: | ---: | ---: | ---: | ---: |
+| 137 | 0.183 s | 749 tok/s | 0.370 s | 0.675 s |
+| 271 | 0.287 s | 944 tok/s | 0.455 s | 0.988 s |
+| 532 | 0.478 s | 1,113 tok/s | 0.660 s | 1.449 s |
+| 646 | 0.565 s | 1,143 tok/s | 0.812 s | 1.434 s |
+| 1060 | 0.811 s | 1,307 tok/s | 1.119 s | 1.893 s |
+| 2118 | 1.479 s | 1,432 tok/s | 1.611 s | 3.312 s |
+| 4230 | 2.907 s | 1,455 tok/s | 2.928 s | 6.237 s |
+
+Decode, sampled at temperature 0.6:
+
+| Mode | 640-token decode | Draft acceptance | 2K prompt (2406 tokens) | 4K prompt (4786 tokens) | 0.5.3, 640-token decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DFlash2 | 49.9 tok/s | 65.5% | 48.5 tok/s, TTFT 1.57 s | 54.7 tok/s, TTFT 3.16 s | 40.9 tok/s |
+| MTP=3 (`--mtp qwen38-27b-mtp-q8 --mtp-depth 3`) | 50.8 tok/s | 68.9% | 49.1 tok/s | — | 44.9 tok/s |
+| Plain (`--dflash2=off`) | 28.5 tok/s | — | 28.5 tok/s, TTFT 1.55 s | — | 27.5 tok/s |
+
+Model load, launch to ready with the checkpoint in the file cache: 3.8 s with DFlash2, 3.2 s plain, 3.4 s with MTP. The first request after start (137 tokens) answers in 0.37 s.
 
 ## HumanEval+ through 32K
 
 **51–55% faster prefill at 32K** with FlashPrefill alpha 0.1 across Baseline,
 MTP3 and DFlash2. The completed comparison covers **1,368 generations**;
 correctness matches Off at Standard and 32K, with one additional failure per mode at 16K.
+These results were measured with LSE 0.4.24; see [Performance on macOS](#performance-on-macos-r9700)
+for the current release.
 
 [![HumanEval+ correctness, prompt speed and decode speed for all six configurations at Standard, 16K and 32K context](docs/benchmarks/flashprefill-humaneval-32k.png)](docs/benchmarks/flashprefill-humaneval-32k.png)
 
@@ -42,7 +76,9 @@ Use **`--FlashPrefillV2=off`** for dense prefill. MTP and DFlash2 prompt prefill
 their draft and verification passes stay dense.
 Unsupported configurations use dense attention automatically.
 
-At 16K, the merged build reached **632.1 prompt tok/s** versus 492.9 dense.
+These FlashPrefill figures were measured with LSE 0.4.23, before the 0.5.4 prefill
+work; they compare sparse and dense prefill on that build. At 16K, the merged build
+reached **632.1 prompt tok/s** versus 492.9 dense.
 At 32K, the earlier matched pair reached **604.9 prompt tok/s** versus 378.1 dense. The 64-token greedy output matched; perplexity
 has not been measured. [Configuration and measurements](docs/experimental/sparse-attention.md).
 
@@ -504,12 +540,15 @@ app's `Library/Caches/lse/kernels`.
 Measured on an iPad Pro (M4) with a Radeon AI PRO R9700 over Thunderbolt,
 Qwen3.8-27B Q4 with the Q8 DFlash2 draft, warm:
 
-| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.4.24 |
+| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.5.4 |
 | --- | ---: | ---: |
-| Decode | 40.5 tok/s at 73% draft acceptance | 43.3 tok/s at 74% |
+| Decode | 40.5 tok/s at 73% draft acceptance | 49.9 tok/s at 66% |
 | Decode at 85–93% acceptance | 57–70 tok/s | — |
-| Model load | about 34 s | — |
+| Model load | about 34 s | 3.8 s |
 | Operations that fell back to the CPU | 0 | 0 |
+
+The MacBook Pro column is the 640-token decode from
+[Performance on macOS](#performance-on-macos-r9700); the iPad figures are from v0.5.0.
 
 Build the XCFramework with
 [`scripts/ios/build-ios.sh`](BUILD_INSTRUCTIONS.md#ios--ipados-in-process-library),
