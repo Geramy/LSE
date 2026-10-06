@@ -48,6 +48,8 @@ struct RmsNormArgs {
 namespace {
 constexpr std::uint32_t kRmsBlock = 256;
 constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
+// Register-held rows: up to 32 values per lane, for up to 8 rows (a verify).
+constexpr std::uint32_t kRmsCachedPerLane = 32, kRmsCachedRows = 8;
 // Rows no wider than four wave32 lanes' worth (a head's 128) take a wave
 // each, eight to a workgroup, instead of a 256-lane workgroup each.
 constexpr std::uint32_t kNarrowRows = kRmsBlock / 32u;
@@ -120,8 +122,12 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       const auto lane = e.let(math::local_id());
       const auto row = e.let(math::workgroup_id_x() * d);
       auto partial = e.var(0.0f);
-      const bool cache_row = d == 5120 && s.output.elem_count() == d &&
-          s.device && s.device->arch == "gfx1201" && s.device->wavefront_size == 32;
+      // Rows of a decode or verify step keep their values in registers, the
+      // loads issued together, instead of a dependent load loop; the sums and
+      // their order are unchanged. Long prefill chunks keep the loop.
+      const bool cache_row = d % kRmsBlock == 0 && d / kRmsBlock <= kRmsCachedPerLane &&
+          s.output.elem_count() <= static_cast<std::size_t>(kRmsCachedRows) * d &&
+          s.device && s.device->wavefront_size == 32;
       std::vector<kir::Val<kir::f32>> row_values;
       if (cache_row) {
         // Retain decode inputs across the reduction without changing its order.
