@@ -106,9 +106,7 @@ Result<Array> alloc_pool(const Shape& shape, DType dtype,
   // transfer and a pool-sized host allocation at every context rung.
   const std::size_t tail_bytes = bytes - initialized_prefix_bytes;
   if (tail_bytes != 0) {
-    const std::vector<std::byte> zeros(tail_bytes, std::byte{0});
-    LSE_RETURN_IF_ERROR(be.copy_h2d(
-        zeros.data(), owned, tail_bytes, initialized_prefix_bytes));
+    LSE_RETURN_IF_ERROR(be.zero_ordered(owned, tail_bytes, initialized_prefix_bytes));
   }
   return Array::from_buffer(std::move(owned), shape, dtype);
 }

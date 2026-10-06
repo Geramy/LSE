@@ -100,6 +100,8 @@ class HrxBackend : public Backend<HrxBackend> {
   // describes.
   Status write_ordered_impl(DeviceBuffer& dst, const void* src, std::size_t bytes,
                             std::size_t dst_offset);
+  Status zero_ordered_impl(DeviceBuffer& dst, std::size_t bytes,
+                           std::size_t dst_offset);
   // Peer to this device, no host bounce. Declines when the runtime refuses the
   // copy, which is what it does when the source's memory was never granted to
   // this agent.

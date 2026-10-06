@@ -1988,6 +1988,47 @@ Status HrxBackend::write_ordered_impl(DeviceBuffer& dst, const void* src,
 #endif
 }
 
+Status HrxBackend::zero_ordered_impl(DeviceBuffer& dst, std::size_t bytes,
+                                     std::size_t dst_offset) {
+#if !LSE_HRX_LINKED
+  (void)dst; (void)bytes; (void)dst_offset;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (dst.handle == 0) return LSE_ERROR(kInvalidArgument, "null buffer in zero_ordered");
+  if (dst_offset + bytes > dst.size_bytes) {
+    return LSE_ERROR(kOutOfRange, "zero_ordered runs past the end of the buffer");
+  }
+  if (bytes == 0) return OkStatus();
+  // The same ordering write_ordered gives, with no size limit: a fill carries
+  // its pattern, not the bytes. Fresh recurrent state used to be a vector of
+  // zeros copied with copy_h2d, which waits for every stream first -- one
+  // full device wait per state, ninety-six per one-shot request on a 64-layer
+  // hybrid.
+  bool other_streams = physical_count_ > 1 || !hrx_sole_residency(device_index());
+  for (std::size_t i = 1; i < streams_.size() && !other_streams; ++i) {
+    other_streams = streams_[i] != nullptr;
+  }
+  if (other_streams || dst.ptr != nullptr) {
+    const std::vector<std::byte> zeros(bytes, std::byte{0});
+    LSE_RETURN_IF_ERROR(synchronize_impl());
+    return copy_h2d_impl(zeros.data(), dst, bytes, dst_offset);
+  }
+  auto stream = stream_at(0);
+  if (!stream.ok()) return stream.status();
+  LSE_SYNC_TRACE("zero_ordered %zu bytes", bytes);
+  const std::size_t at = dst.offset + dst_offset;
+  const std::uint32_t pattern = 0;
+  const std::size_t width = (at % 4 == 0 && bytes % 4 == 0) ? 4 : 1;
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_stream_fill_buffer(static_cast<hrx_stream_t>(*stream),
+                             reinterpret_cast<hrx_buffer_t>(dst.handle), at,
+                             bytes, &pattern, width),
+      "hrx_stream_fill_buffer"));
+  ordered_writes_pending_ = true;
+  return OkStatus();
+#endif
+}
+
 Status HrxBackend::join_ordered_writes() {
   if (!ordered_writes_pending_) return OkStatus();
   return synchronize_stream_impl(Stream{0});

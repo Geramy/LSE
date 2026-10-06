@@ -210,8 +210,9 @@ Result<Array> mutable_zeros(const Shape& shape) {
   const backend::ScopedAllocationSite site(backend::AllocationSite::kState);
   LSE_ASSIGN_OR(backend::DeviceBuffer owned,
                 be.allocate(bytes, backend::MemoryClass::kDevice, at));
-  const std::vector<std::byte> zeros(bytes, std::byte{0});
-  LSE_RETURN_IF_ERROR(be.copy_h2d(zeros.data(), owned, bytes, 0));
+  // Queued behind the launches already issued, so the host does not wait
+  // for the device to clear a buffer nothing has touched yet.
+  LSE_RETURN_IF_ERROR(be.zero_ordered(owned, bytes, 0));
   Array out = Array::from_buffer(std::move(owned), shape, DType::kF32);
   out.node()->device_dirty = true;
   return out;

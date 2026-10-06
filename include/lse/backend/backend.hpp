@@ -1128,6 +1128,14 @@ class IBackend {
     LSE_RETURN_IF_ERROR(synchronize());
     return copy_h2d(src, dst, bytes, dst_offset);
   }
+  // Zeros written in the same issue order as write_ordered. A backend with a
+  // device-side fill queues it and the host does not wait; one without writes
+  // a host buffer of zeros through write_ordered.
+  virtual Status zero_ordered(DeviceBuffer& dst, std::size_t bytes,
+                              std::size_t dst_offset) {
+    const std::vector<std::byte> zeros(bytes, std::byte{0});
+    return write_ordered(dst, zeros.data(), bytes, dst_offset);
+  }
   // A peer copy the two streams order between themselves: it runs after what
   // the producer has queued and the consumer's next work runs after it, with
   // the host in neither edge. A backend that cannot say that falls back to the
@@ -1310,6 +1318,12 @@ class BackendAdapter final : public IBackend {
       return impl_.write_ordered_impl(d, s, n, off);
     }
     return IBackend::write_ordered(d, s, n, off);
+  }
+  Status zero_ordered(DeviceBuffer& d, std::size_t n, std::size_t off) override {
+    if constexpr (requires(Derived& i) { i.zero_ordered_impl(d, n, off); }) {
+      return impl_.zero_ordered_impl(d, n, off);
+    }
+    return IBackend::zero_ordered(d, n, off);
   }
   Status copy_peer_ordered(const DeviceBuffer& s, DeviceBuffer& d,
                            std::size_t n, std::size_t soff, std::size_t doff,
