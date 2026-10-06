@@ -157,6 +157,12 @@ struct Scheduler::Impl {
   // device kernel (the CPU fallback's case); a failure after emission is a
   // compile or device error.
   DispatchStage dispatch_stage = DispatchStage::kEmit;
+  // The groups the dispatch loop is walking and where it has got to, so the
+  // first kernel this step has to load can load every later one first; see
+  // Scheduler::prewarm_kernels. Reset at the top of each loop.
+  std::span<const FusionGroup> walking;
+  std::size_t walked = 0;
+  bool prewarmed = false;
   // The constants are a cache: under memory pressure they are let go and the
   // next pass that needs one binds and fills a fresh buffer.
   std::mutex constants_mu;
@@ -493,6 +499,28 @@ std::string describe_group(const FusionGroup& g, std::size_t index) {
 }
 }  // namespace
 
+// Loading an executable on this runtime ends in an instruction-cache flush
+// that is itself a device job, queued behind everything this step has already
+// submitted. Loading a pass's kernels one by one as their groups come up
+// therefore waits, kernel after kernel, for the pass's own earlier work: a
+// first pass at a new width spent ~470 ms of host time there against ~100 ms
+// of device time. The first miss of a step loads every kernel the rest of the
+// step will need before submitting any more work, so only that first load
+// waits on the queue. A group that cannot be emitted or compiled here is left
+// for its own dispatch to report.
+void Scheduler::prewarm_kernels(std::size_t member, backend::IBackend& be,
+                                const IKernelEmitter& emitter) {
+  for (std::size_t i = impl_->walked; i < impl_->walking.size(); ++i) {
+    const FusionGroup& g = impl_->walking[i];
+    if (views_only(g)) continue;
+    const std::uint64_t ident = emitter.cache_key(g, be.device_info());
+    if (impl_->jit->try_get(member, ident, emitter.dialect()) != nullptr) continue;
+    auto generated = emitter.emit(g, be.device_info());
+    if (!generated.ok()) continue;
+    (void)impl_->jit->get_or_compile(member, ident, *generated);
+  }
+}
+
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
                                      std::size_t member, Program* replay,
@@ -559,6 +587,12 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
           impl_->jit->try_get(member, ident, emitted->dialect)) {
     launched = *cached;
   } else {
+    // One device: on a set, which member a later group runs on is the
+    // plan's to say, and a load on the wrong one is wasted.
+    if (!impl_->prewarmed && devices_.size() == 1) {
+      impl_->prewarmed = true;
+      prewarm_kernels(member, be, *emitter);
+    }
     auto kernel = impl_->jit->get_or_compile(member, ident, *emitted);
     if (kernel.ok()) {
       launched = kernel.release();
@@ -1149,7 +1183,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         "host_groups=%u views=%u total_ms=%.3f partition_ms=%.3f "
         "schedule_ms=%.3f emit_ms=%.3f jit_lookup_ms=%.3f "
         "jit_compile_ms=%.3f bind_ms=%.3f submit_ms=%.3f "
-        "host_wait_ms=%.3f readback_ms=%.3f\n",
+        "host_wait_ms=%.3f readback_ms=%.3f slots_allocated=%u slots_reused=%u\n",
         static_cast<unsigned long long>(step_sequence.fetch_add(1)),
         static_cast<int>(ran.ok()), static_cast<int>(trace_.replayed),
         trace_.device_groups, trace_.host_groups, trace_.views_aliased,
@@ -1162,7 +1196,9 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
         static_cast<double>(s.bind.ns) / 1e6,
         static_cast<double>(s.submit.ns) / 1e6,
         static_cast<double>(s.host_wait.ns) / 1e6,
-        static_cast<double>(s.readback.ns) / 1e6);
+        static_cast<double>(s.readback.ns) / 1e6,
+        static_cast<unsigned>(trace_.slots_allocated),
+        static_cast<unsigned>(trace_.slots_reused));
   }
 
   const Status accumulated = accumulate(acc_, trace_);
@@ -1230,6 +1266,14 @@ Status Scheduler::run_group_on_host(const FusionGroup& g) {
 
 Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
                             Program* plan) {
+  // Only a dispatch loop below names the groups a prewarm may walk; any
+  // dispatch outside one, and anything after this step, prewarms nothing.
+  struct WalkReset {
+    Impl& impl;
+    explicit WalkReset(Impl& i) : impl(i) { clear(); }
+    ~WalkReset() { clear(); }
+    void clear() { impl.walking = {}; impl.walked = 0; impl.prewarmed = true; }
+  } walk_reset(*impl_);
   Program& rec = plan != nullptr ? *plan : impl_->program;
   // Asked once. Four sites below need it and it is a virtual call on a
   // device-first step, and a compiler that cannot see through the repeat cannot
@@ -1735,8 +1779,11 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       place_span.close();
 
       std::size_t done = 0;
+      impl_->walking = staged_groups;
+      impl_->prewarmed = false;
       for (const FusionGroup& g : staged_groups) {
         const std::uint32_t gi = static_cast<std::uint32_t>(done);
+        impl_->walked = done;
         if (views_only(g)) {
           LSE_RETURN_IF_ERROR(try_alias_group(g));
           ++trace_.views_aliased;
@@ -1915,6 +1962,9 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // Where each member had got to when we last issued work on it. Taken right
   // after the dispatch, so it names that work and nothing queued behind it.
   std::vector<backend::StreamEvent> last_issue(devices_.size());
+  impl_->walking = groups;
+  impl_->prewarmed = false;
+  impl_->walked = 0;
   for (const FusionGroup& g : groups) {
     std::string desc(to_string(g.anchor));
     desc += " [";
