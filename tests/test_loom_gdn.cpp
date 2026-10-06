@@ -36,9 +36,11 @@ void check(int dim, int seq, int wave, int outputs, int key_heads = 48) {
       continue;
     }
     ++emitted_count;
-    // A scan of up to eight steps loads every step's inputs first and runs
-    // unrolled; a longer one carries its state through a loop.
-    const bool looped = seq > 8;
+    // When every lane owns whole elements the scan reads blocks of eight
+    // steps ahead and loops only over two or more whole blocks (the rest is
+    // straight-line); otherwise a scan of up to eight steps loads every
+    // step's inputs first and runs unrolled, and a longer one loops.
+    const bool looped = dim % wave == 0 ? seq >= 16 : seq > 8;
     LSE_EXPECT((result->source.find("scf.for") != std::string::npos) == looped);
     LSE_EXPECT((result->source.find("= scf.for") != std::string::npos) == looped);
     if (looped) LSE_EXPECT(result->source.find("scf.yield") != std::string::npos);

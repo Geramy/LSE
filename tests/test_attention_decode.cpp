@@ -1,4 +1,5 @@
 #include "harness.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
@@ -82,7 +83,8 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
       if (!emitted.ok()) return;
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], i == 0 ? 8u * parts : 48u);
-      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u : (parts * 4u + 15u) / 16u * 16u);
+      // The partial's scores for six rows, then four wave maxima per row.
+      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u + 4u * 6u * 4u : (parts * 4u + 15u) / 16u * 16u);
     }
   }
   LSE_EXPECT(find_primitive("attention.decode_shared") == nullptr);
@@ -205,10 +207,14 @@ LSE_TEST(attention_dispatch_matrix_tiles_follow_device_and_lds_limits) {
   request.types = backend::loom_types();
   request.intrinsics = &intrinsics;
   using dispatch::AttentionPlan;
+  // The query tile, scores and softmax state, plus one 16-key block of
+  // staged values.
+  const auto flash_lds = static_cast<unsigned>(
+      dispatch::attention_shapes::flash_wmma_lds_bytes(256, 256));
   for (const auto [bytes, expected] : {
        std::pair{65536u, AttentionPlan::kFlashWmma},
-       std::pair{24768u, AttentionPlan::kFlashWmma},
-       std::pair{24767u, AttentionPlan::kScalar}}) {
+       std::pair{flash_lds, AttentionPlan::kFlashWmma},
+       std::pair{flash_lds - 1u, AttentionPlan::kScalar}}) {
     fx.gpu.lds_bytes_per_workgroup = bytes;
     LSE_EXPECT(dispatch::attention_plan(request) == expected);
   }
@@ -283,7 +289,7 @@ LSE_TEST(decode_attention_narrow_storage_uses_wave_qk_and_preserves_partial_abi)
       if (!partial.ok() || !merge.ok()) return;
       LSE_EXPECT_EQ(partial->dims.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 4u * parts);
-      LSE_EXPECT_EQ(partial->lds_bytes, 3072u);
+      LSE_EXPECT_EQ(partial->lds_bytes, 3072u + 4u * 6u * 4u);
       LSE_EXPECT_EQ(partial->binding_order.size(), 6u);
       LSE_EXPECT(partial->source.find("kernel.subgroup.shuffle<xor>") != std::string::npos);
       LSE_EXPECT(partial->source.find("scalar.fmaf") != std::string::npos);

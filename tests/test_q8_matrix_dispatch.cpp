@@ -83,9 +83,14 @@ LSE_TEST(q8_matrix_dispatch_selects_measured_small_shapes_and_prefill_boundary) 
     LSE_EXPECT(primitive != nullptr);
     if (!primitive) continue;
     const auto plan = primitive->plan(f.shapes);
-    LSE_EXPECT_EQ(plan.workgroup_size[0], 256u);
-    LSE_EXPECT_EQ(plan.workgroup_count[0],
-        static_cast<std::uint32_t>((c.m + c.rows - 1) / c.rows * ((c.n + 127) / 128)));
+    // Eight-wave workgroups, one 16-column tile per wave; a grid that leaves
+    // compute units idle narrows to four waves (and no further).
+    const auto row_blocks = static_cast<std::uint32_t>((c.m + c.rows - 1) / c.rows);
+    const auto tiles = static_cast<std::uint32_t>((c.n + 15) / 16);
+    const std::uint32_t waves =
+        row_blocks * ((tiles + 7u) / 8u) < static_cast<std::uint32_t>(f.device.compute_units) ? 4u : 8u;
+    LSE_EXPECT_EQ(plan.workgroup_size[0], waves * 32u);
+    LSE_EXPECT_EQ(plan.workgroup_count[0], row_blocks * ((tiles + waves - 1u) / waves));
     LSE_EXPECT_EQ(plan.lds_bytes, 6656u);
     const auto matrix = dispatch::q8_matrix_plan(f.shapes, c.rows);
     LSE_EXPECT(matrix.matrix != nullptr);

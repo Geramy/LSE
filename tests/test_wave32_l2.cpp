@@ -44,7 +44,7 @@ struct Fixture {
     d.extension_id = backend::AmdDeviceInfo::kExtensionId;
     d.extension = &amd;
   }
-  void check(const FusionGroup& g, bool wave) {
+  void check(const FusionGroup& g, bool wave, std::uint32_t rows = 16) {
     auto h = hip.emit(g, d), l = loom.emit(g, d);
     LSE_EXPECT(h.ok());
     LSE_EXPECT(l.ok());
@@ -66,7 +66,7 @@ struct Fixture {
     if (wave) {
       for (const auto* e : {&*h, &*l}) {
         LSE_EXPECT_EQ(e->dims.workgroup_size[0], 128u);
-        LSE_EXPECT_EQ(e->dims.workgroup_count[0], 4u);
+        LSE_EXPECT_EQ(e->dims.workgroup_count[0], (rows + 3u) / 4u);
         LSE_EXPECT_EQ(e->dims.subgroup_size, 32u);
         LSE_EXPECT_EQ(e->lds_bytes, 0u);
       }
@@ -82,9 +82,14 @@ LSE_TEST(wave32_l2_exact_selection_and_fallback_contract) {
   auto generic = l2_normalize(leaf({1, 1, 16, 128}));
   LSE_EXPECT(generic.node()->attrs[0] == 1e-12f);
   f.check(solo(generic), true);
-  for (auto sh : {Shape{1, 1, 16, 127}, Shape{1, 1, 16, 129}, Shape{1, 1, 15, 128},
-                  Shape{1, 2, 16, 128}, Shape{16, 128}})
+  // A row width other than the rules' keeps the per-element form; any row
+  // count at their width takes a wave per row, four rows per workgroup.
+  for (auto sh : {Shape{1, 1, 16, 127}, Shape{1, 1, 16, 129}})
     f.check(solo(l2_normalize(leaf(sh))), false);
+  f.check(solo(l2_normalize(leaf({1, 1, 15, 128}))), true, 15);
+  f.check(solo(l2_normalize(leaf({1, 2, 16, 128}))), true, 32);
+  f.check(solo(l2_normalize(leaf({16, 128}))), true, 16);
+  f.check(solo(l2_normalize(leaf({1, 1024, 16, 128}))), true, 16384);
   for (auto dt : {DType::kBF16, DType::kF16}) {
     auto n = l2_normalize(leaf({1, 1, 16, 128}, dt));
     auto* p = dynamic_cast<const KernelPrimitiveBase*>(n.node()->prim);
@@ -109,8 +114,10 @@ LSE_TEST(wave32_l2_exact_selection_and_fallback_contract) {
   auto zero = f.loom.emit(empty, f.d);
   LSE_EXPECT(!zero.ok());
   if (!zero.ok()) LSE_EXPECT(zero.status().code() == StatusCode::kUnimplemented);
+  // The any-row rule asks for the wave and width, not the arch: another
+  // wave32 RDNA part takes the same form.
   f.d.arch = "gfx1151";
-  f.check(g, false);
+  f.check(g, true);
   f.d.arch = "gfx1201";
   f.d.wavefront_size = 64;
   f.check(g, false);

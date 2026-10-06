@@ -449,8 +449,10 @@ LSE_TEST(
       if (!admitted.ok())
         continue;
       LSE_EXPECT_EQ(admitted->lds_bytes, columns == 17408 ? 9216u : 0u);
-      LSE_EXPECT_EQ(admitted->dims.workgroup_size[0], 256u);
-      LSE_EXPECT_EQ(admitted->dims.workgroup_count[0], rows == 8 ? 40u
+      // The 8-row decode panel halves its waves until its 320 tiles cover
+      // the 64 compute units: four waves, 80 workgroups.
+      LSE_EXPECT_EQ(admitted->dims.workgroup_size[0], rows == 8 ? 128u : 256u);
+      LSE_EXPECT_EQ(admitted->dims.workgroup_count[0], rows == 8 ? 80u
                                                        : columns == 17408
                                                            ? 2176u
                                                            : 640u);

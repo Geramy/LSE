@@ -3,6 +3,7 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
+#include "lse/dispatch/quant.hpp"
 #include "lse/graph/ops.hpp"
 #include <cstdio>
 #include <utility>
@@ -61,6 +62,11 @@ int main() {
           throw std::runtime_error(h.status().to_string());
         if (!l.ok())
           throw std::runtime_error(l.status().to_string());
+        // Loom runs a prefill-width 4- or 8-bit projection as the tiled f16
+        // matrix-core GEMM over an f16 copy of the activation; the legacy
+        // HIP dialect keeps its INT8 matrix route.
+        const bool loom_gemm = rows >= static_cast<int>(dispatch::kQ4GemmMinRows) &&
+                               (bits == 4 || bits == 8);
         const bool expected = bits == 4 && (rows <= 8 || rows >= 16);
         const bool hip_dot =
             h->source.find("__builtin_amdgcn_sudot4") != std::string::npos;
@@ -74,18 +80,26 @@ int main() {
             l->source.find("element_format=u8") != std::string::npos;
         require((hip_dot || hip_matrix) == expected,
                 "HIP activation-conversion selection mismatch");
-        require((loom_dot || loom_matrix) == expected,
+        const bool loom_f16_matrix =
+            l->source.find("vector.mma") != std::string::npos &&
+            l->source.find("vector<8xf16>") != std::string::npos &&
+            l->source.find("element_format=f16") != std::string::npos;
+        require((loom_dot || loom_matrix) == (expected && !loom_gemm),
                 "Loom activation-conversion selection mismatch");
+        require(loom_f16_matrix == loom_gemm, "Loom wrong prefill GEMM route");
         if (expected) {
           require(rows < 16 ? hip_dot : hip_matrix, "HIP wrong INT8 route");
-          require(rows < 16 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
+          if (!loom_gemm)
+            require(rows < 16 ? loom_dot : loom_matrix, "Loom wrong INT8 route");
         }
-        for (unsigned axis = 0; axis < 3; ++axis) {
-          require(h->dims.workgroup_size[axis] == l->dims.workgroup_size[axis] &&
-                      h->dims.workgroup_count[axis] == l->dims.workgroup_count[axis],
-                  "HIP/Loom launch plans differ");
+        if (!loom_gemm) {
+          for (unsigned axis = 0; axis < 3; ++axis) {
+            require(h->dims.workgroup_size[axis] == l->dims.workgroup_size[axis] &&
+                        h->dims.workgroup_count[axis] == l->dims.workgroup_count[axis],
+                    "HIP/Loom launch plans differ");
+          }
+          require(h->lds_bytes == l->lds_bytes, "HIP/Loom LDS plans differ");
         }
-        require(h->lds_bytes == l->lds_bytes, "HIP/Loom LDS plans differ");
         auto declared = backend::HipEmitter::shared_bytes(h->source);
         require(declared.ok() && *declared == h->lds_bytes &&
                     h->lds_bytes <= device.lds_bytes_per_workgroup,

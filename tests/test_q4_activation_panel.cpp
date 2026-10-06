@@ -458,10 +458,13 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
            (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144)) ||
           (dimensions[1] == 5120 &&
            (dimensions[2] == 17408 || dimensions[2] == 6144))));
+    const bool four_chunks =
+        dimensions[2] == 5120 &&
+        ((dimensions[0] == 8 && (dimensions[1] == 17408 || dimensions[1] == 10240 ||
+                                 dimensions[1] == 12288 || dimensions[1] == 248320)) ||
+         (dimensions[0] == 7 && dimensions[1] == 248320));
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
-                  dimensions[0] == 8 && dimensions[2] == 5120 &&
-                          (dimensions[1] == 17408 || dimensions[1] == 10240)
-                      ? 4u : adjacent ? 2u : 1u);
+                  four_chunks ? 4u : adjacent ? 2u : 1u);
     const auto *consumer =
         dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);
     LSE_EXPECT(consumer != nullptr);
@@ -495,7 +498,10 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
           continue;
         }
         LSE_EXPECT_EQ(emitted->lds_bytes, 0u);
-        LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
+        // The 8-row matrix panel narrows to four waves to cover every unit.
+        LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],
+                      group.outputs[0]->prim->name() == "quant_linear.q4_matrix_panel.v1"
+                          ? 128u : 256u);
         if (group.outputs[0]->prim->name() == kConsumer) {
           LSE_EXPECT_EQ(emitted->dims.workgroup_count[1], 1u);
           LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],

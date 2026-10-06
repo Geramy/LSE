@@ -371,15 +371,17 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
       }
     }
     for (auto [n, k] : {std::pair{17408, 5120}, {5120, 17408},
-                        {10240, 5120}, {6144, 5120}, {5120, 6144}}) {
+                        {10240, 5120}, {6144, 5120}, {5120, 6144},
+                        {12288, 5120}, {248320, 5120}}) {
       Fixture measured(8, n, k, 4, loom);
       LSE_EXPECT(measured.plan().shared_activation_panel);
       LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(measured.shapes),
-                    k == 5120 && (n == 17408 || n == 10240) ? 4u : 2u);
+                    k == 5120 && (n == 17408 || n == 10240 || n == 12288 || n == 248320)
+                        ? 4u : 2u);
     }
     for (auto [m, n, k] : {std::array{4, 5120, 17408}, {4, 12288, 5120},
                            {4, 5120, 6144}, {4, 248320, 5120},
-                           {6, 17408, 5120}, {8, 12288, 5120},
+                           {6, 17408, 5120},
                            {3, 17408, 5120}, {4, 17, 5120}}) {
       Fixture unchanged(m, n, k, 4, loom);
       LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(unchanged.shapes), 1u);
