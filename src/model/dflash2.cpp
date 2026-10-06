@@ -91,6 +91,21 @@ Status copy_slot(Array& destination, Array source) {
   destination.node()->host_dirty = false;
   return OkStatus();
 }
+bool alias_slot(Array& destination, const Array& source) {
+  if (!source.valid() || source.dtype() != DType::kF32 ||
+      source.shape() != destination.shape()) return false;
+  const auto& from = *source.node();
+  if (!from.materialized || !from.buffer.valid() || !from.buffer.storage ||
+      from.host_dirty || from.kv_fragments ||
+      from.buffer.size_bytes < source.shape().elem_count() * sizeof(float)) return false;
+  auto& to = *destination.node();
+  to.buffer = from.buffer;
+  to.member = from.member;
+  to.materialized = true;
+  to.device_dirty = true;
+  to.host_dirty = false;
+  return true;
+}
 void accept_cache_write(Array& cache, const Array& written) {
   auto& destination = *cache.node();
   const auto& source = *written.node();
@@ -527,7 +542,10 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
   auto& pass = it->second;
   {
     DraftProfile profile("context-copy");
-    LSE_RETURN_IF_ERROR(copy_slot(pass.features, input));
+    // Verified features already sit in an owned device buffer: the pass reads
+    // them there, ordered behind the verify pass that wrote them, with no copy
+    // and no wait. Anything else (a slice of a wide prefill) is copied in.
+    if (!alias_slot(pass.features, input)) LSE_RETURN_IF_ERROR(copy_slot(pass.features, input));
   }
   {
     DraftProfile profile("context-offset-upload");
