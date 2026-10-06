@@ -298,7 +298,7 @@ struct DFlash2Module::Impl {
     std::vector<graph::NodePtr> roots;
   };
   struct DraftPass {
-    Array inputs, tokens, anchor, offset, meta, indices, scores, path;
+    Array inputs, tokens, anchor, offset, meta, indices, scores, path, lattice;
     std::vector<float> input_image;
     graph::Program program;
     std::vector<graph::NodePtr> roots;
@@ -447,7 +447,12 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
   LSE_ASSIGN_OR(p.scores, graph::custom("dflash2.selector", {pred, gate, succ, unary},
       {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(top), static_cast<float>(rank)}));
   if (sampled) {
-    p.roots = {p.scores.node(), p.indices.node()};
+    // Scores and candidate ids reach the host in one buffer, one read.
+    p.lattice = graph::concat(
+        {graph::reshape(p.scores, Shape{static_cast<std::int64_t>(p.scores.shape().elem_count())}),
+         graph::reshape(p.indices, Shape{static_cast<std::int64_t>(p.indices.shape().elem_count())})}, 0);
+    if (!p.lattice.valid()) return LSE_ERROR(kInternal, "DFlash2 lattice concat failed");
+    p.roots = {p.lattice.node()};
   } else {
     LSE_ASSIGN_OR(p.path, graph::custom("dflash2.selector_walk.v1", {p.scores, p.indices},
         {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(config.vocab_size), 0.0f}));
@@ -624,13 +629,21 @@ Result<DFlash2Proposal> DFlash2Module::draft_sampled(
   LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, proposals, true));
   const auto positions = impl_->config.block_size - 1;
   const auto top = static_cast<std::uint32_t>(impl_->config.selector_top_k);
-  std::vector<float> scores(static_cast<std::size_t>(positions) * top * top);
-  std::vector<float> raw_ids(static_cast<std::size_t>(positions) * top);
+  const auto score_count = ready->scores.shape().elem_count();
+  const auto id_count = ready->indices.shape().elem_count();
+  if (score_count < static_cast<std::size_t>(positions) * top * top ||
+      id_count < static_cast<std::size_t>(positions) * top ||
+      ready->lattice.shape().elem_count() != score_count + id_count)
+    return LSE_ERROR(kInternal, "DFlash2 lattice does not hold every candidate");
+  std::vector<float> lattice(score_count + id_count);
   {
     DraftProfile profile("lattice-readback");
-    LSE_RETURN_IF_ERROR(ready->scores.to_host(scores.data(), scores.size() * sizeof(float)));
-    LSE_RETURN_IF_ERROR(ready->indices.to_host(raw_ids.data(), raw_ids.size() * sizeof(float)));
+    LSE_RETURN_IF_ERROR(ready->lattice.to_host(lattice.data(), lattice.size() * sizeof(float)));
   }
+  std::vector<float> scores(lattice.begin(),
+      lattice.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(positions) * top * top));
+  std::vector<float> raw_ids(lattice.begin() + static_cast<std::ptrdiff_t>(score_count),
+      lattice.begin() + static_cast<std::ptrdiff_t>(score_count + static_cast<std::size_t>(positions) * top));
   std::vector<std::uint32_t> ids(raw_ids.size());
   for (std::size_t i = 0; i < ids.size(); ++i) {
     if (!std::isfinite(raw_ids[i]) || raw_ids[i] < 0 ||
