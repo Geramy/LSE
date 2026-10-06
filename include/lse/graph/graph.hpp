@@ -159,6 +159,9 @@ class Node {
   std::shared_ptr<const QuantPlanes> quant;
 
   std::weak_ptr<Node> quant_activation_panel;
+  // The f16 copy of this activation the tiled 4-bit GEMM reads, shared by
+  // every such contraction over it.
+  std::weak_ptr<Node> f16_activation_panel;
 
   // Host copy of `buffer`, for nodes the host has to read or write. Device
   // memory has no host address, so this is the only way the interpreter can

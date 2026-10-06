@@ -20,6 +20,35 @@ struct QuantPlan {
 };
 
 // Shape eligibility is shared by graph construction and device dispatch.
+//
+// The tiled prefill GEMM: 4-bit codes, groups a whole number of K steps, f32
+// activations and output, float affine planes, and at least kQ4GemmMinRows
+// rows. Whether the device can run it is asked again at dispatch.
+[[nodiscard]] inline bool q4_gemm_shape(const graph::KernelShapes& s) {
+  if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
+      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
+      (s.input_dtypes[2] != DType::kBF16 && s.input_dtypes[2] != DType::kF16) ||
+      s.input_dtypes[3] != s.input_dtypes[2] || s.output_dtype != DType::kF32 ||
+      s.iattrs[0] != 4 || s.iattrs[1] <= 0 ||
+      s.iattrs[1] % static_cast<std::int32_t>(kQ4GemmStepK) != 0 ||
+      !s.inputs[0].rank() || s.inputs[1].rank() != 2)
+    return false;
+  const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
+  const auto n = s.inputs[1].dim(0);
+  if (k <= 0 || n <= 0 || k % s.iattrs[1] != 0 ||
+      s.inputs[1] != Shape{n, k / 8} ||
+      s.inputs[2] != Shape{n, k / s.iattrs[1]} || s.inputs[3] != s.inputs[2])
+    return false;
+  Shape output;
+  for (std::size_t i = 0; i + 1 < s.inputs[0].rank(); ++i)
+    output.push_back(s.inputs[0].dim(i));
+  output.push_back(n);
+  if (s.output != output) return false;
+  const auto m = s.inputs[0].elem_count() / static_cast<std::uint64_t>(k);
+  return m >= kQ4GemmMinRows && m * static_cast<std::uint64_t>(k) <= UINT32_MAX &&
+         m * static_cast<std::uint64_t>(n) <= UINT32_MAX &&
+         static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k / 8) <= UINT32_MAX;
+}
 [[nodiscard]] inline const Q4PanelShape* q4_shared_panel_rule(
     const graph::KernelShapes& s) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||

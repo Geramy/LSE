@@ -287,7 +287,25 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   const auto matrix_storage = packed.node()->quant
       ? packed.node()->quant->matrix_storage : nullptr;
   const std::array<NodePtr, 3> sources{packed.node(), scales.node(), biases.node()};
-  if (dispatch::q8_packed_matrix_shape(geometry) && matrix_storage &&
+  if (dispatch::q4_gemm_shape(geometry)) {
+    // The tiled GEMM reads an f16 copy of the activation, made once and
+    // shared by every contraction over the same activation.
+    const Shape panel_shape{
+        static_cast<std::int64_t>(sx.elem_count() /
+                                  static_cast<std::uint64_t>(sx.dim(sx.rank() - 1))),
+        sx.dim(sx.rank() - 1)};
+    auto panel = x.node()->f16_activation_panel.lock();
+    if (!panel || panel->inputs.size() != 1 || panel->inputs[0] != x.node() ||
+        panel->shape != panel_shape || panel->dtype != DType::kF16) {
+      panel = make(OpKind::kCustom, panel_shape, DType::kF16, {x.node()});
+      panel->prim = find_primitive("quant_activation.f16_panel.v1");
+      if (panel->prim) panel->fclass = panel->prim->fusion_class();
+      x.node()->f16_activation_panel = panel;
+    }
+    n->inputs.push_back(panel);
+    ++panel->consumer_count;
+    n->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+  } else if (dispatch::q8_packed_matrix_shape(geometry) && matrix_storage &&
       matrix_storage->matches(sources)) {
     for (const auto& leaf : matrix_storage->packed) {
       n->inputs.push_back(leaf);

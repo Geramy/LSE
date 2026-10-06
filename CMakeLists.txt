@@ -252,6 +252,7 @@ add_library(lse_kernels
   src/kernels/transpose.cpp
   src/kernels/wmma_linear.cpp
   src/kernels/wmma_quant_linear.cpp
+  src/kernels/q4_gemm.cpp
   src/kernels/wmma_q8_linear.cpp
   src/kernels/dflash2_sdpa.cpp
   src/kernels/dflash2_ring_sdpa.cpp
