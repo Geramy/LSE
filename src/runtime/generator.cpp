@@ -243,6 +243,8 @@ Status Generator::mtp_prefill_chunk(const Array& hidden,
 
 Result<std::vector<float>> Generator::step(
     Session& session, const std::vector<std::uint32_t>& tokens) {
+  // A context still held from an earlier prompt lands before this one.
+  LSE_RETURN_IF_ERROR(flush_draft_context());
   // A one-token prompt still goes the long way when the module is in play: the
   // decode head skips the hidden state the module needs for its first row.
   if (tokens.size() == 1 && mtp_ == nullptr && dflash2_ == nullptr) {
@@ -275,7 +277,7 @@ Result<std::vector<float>> Generator::step(
     passes.insert(passes.end(), chunks.begin(), chunks.end());
   }
   std::size_t previous_width = 0;
-  for (std::size_t take : passes) {
+  for (const std::size_t& take : passes) {
     if (previous_width != 0) {
       hidden = {};
       if (take != previous_width) {
@@ -293,8 +295,13 @@ Result<std::vector<float>> Generator::step(
                                        dflash2_ != nullptr ? &capture : nullptr, false,
                                        ops::AttentionExecutionPhase::kPrefill));
     if (dflash2_ != nullptr) {
-      LSE_RETURN_IF_ERROR(dflash2_->append_context(
-          capture.features, base + static_cast<std::int32_t>(at)));
+      if (&take == &passes.back()) {
+        pending_context_ = capture.features;
+        pending_context_first_ = base + static_cast<std::int32_t>(at);
+      } else {
+        LSE_RETURN_IF_ERROR(dflash2_->append_context(
+            capture.features, base + static_cast<std::int32_t>(at)));
+      }
     }
     if (mtp_ != nullptr) {
       LSE_RETURN_IF_ERROR(mtp_prefill_chunk(
@@ -315,8 +322,18 @@ Result<std::vector<float>> Generator::step(
   LSE_RETURN_IF_ERROR(
       logits.to_host(out.data(), out.size() * sizeof(float)));
   LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
-  if (dflash2_ != nullptr) LSE_RETURN_IF_ERROR(dflash2_->retire_prefill());
+  if (dflash2_ != nullptr && !pending_context_.valid())
+    LSE_RETURN_IF_ERROR(dflash2_->retire_prefill());
   return out;
+}
+
+Status Generator::flush_draft_context() {
+  if (!pending_context_.valid()) return OkStatus();
+  Array features = std::move(pending_context_);
+  pending_context_ = {};
+  if (dflash2_ == nullptr) return OkStatus();
+  LSE_RETURN_IF_ERROR(dflash2_->append_context(features, pending_context_first_));
+  return dflash2_->retire_prefill();
 }
 
 Status Generator::verify(Session& session,
@@ -559,6 +576,9 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
 
   std::uint32_t pending = sampler_.sample(prefill_logits, session.history());
   bool running = give(pending);
+  // The first token is out; the draft's context for the prompt's last pass
+  // goes in now, before anything drafts from it.
+  LSE_RETURN_IF_ERROR(flush_draft_context());
   std::uint64_t decode_start = 0;
 
   std::size_t retained_rows = 0;
@@ -749,6 +769,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     return LSE_ERROR(kOutOfRange, "context_full: the prompt is ", std::to_string(prompt.size()),
                      " tokens and the context holds ", std::to_string(capacity));
   }
+  LSE_RETURN_IF_ERROR(flush_draft_context());
   stats_ = GenerationStats{};
   stats_.context_length = capacity;
   // Set on every return path below that produced tokens.
