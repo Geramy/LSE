@@ -295,6 +295,12 @@ class HrxBackend : public Backend<HrxBackend> {
   Result<void*> stream_at(std::uint32_t index);
   Status flush_stream(std::uint32_t index);
   void adopt(DeviceBuffer& buf, std::uint64_t handle, std::size_t bytes);
+  // Device-local buffers whose last reference has dropped, kept by size for
+  // the next allocation of that size. See allocate_impl.
+  struct Recycler;
+  std::shared_ptr<Recycler> recycler_;
+  std::uint64_t recycle_trimmer_ = 0;
+  bool single_stream() const;
   void release_buffer(std::uint64_t handle) noexcept;
 };
 
