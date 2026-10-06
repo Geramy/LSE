@@ -214,7 +214,9 @@ class Generator {
   }
 
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
-  static Result<graph::Array> last_hidden(const graph::Array& hidden);
+  // `valid` rows of the sequence axis are real (0: all of them).
+  static Result<graph::Array> last_hidden(const graph::Array& hidden,
+                                          std::int64_t valid = 0);
 
  private:
   // Runs `tokens` from the session's current position and returns the logits

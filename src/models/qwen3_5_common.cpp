@@ -442,6 +442,9 @@ class Qwen35GatedDeltaNet final : public IMixer {
       if (st != nullptr) {
         carried.recurrent = st->gdn_state;
         carried.conv_qkv = st->gdn_conv_qkv;
+        carried.step_mask = st->pad_mask;
+        carried.step_unmask = st->pad_unmask;
+        carried.tail_rows = st->pad_tail_rows;
       }
       LSE_ASSIGN_OR(Array part,
                     ops::gated_delta_net(x, w_[m], spec_[m],

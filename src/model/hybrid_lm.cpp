@@ -218,6 +218,20 @@ Result<Array> mutable_zeros(const Shape& shape) {
   return out;
 }
 
+// Host values as a device array, written in issue order.
+Result<Array> device_values(const Shape& shape, const std::vector<float>& values) {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for pass values");
+  Array a = Array::zeros(shape, DType::kF32);
+  graph::Node& n = *a.node();
+  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(n, sched->backend()));
+  for (std::size_t i = 0; i < values.size(); ++i)
+    graph::interpreter::store_element(n, i, values[i]);
+  n.materialized = true;
+  LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(n, sched->backend()));
+  return a;
+}
+
 // Keep the allocation and its current contents, but sever the previous
 // request's computation DAG. Session::restart has already zeroed these bytes.
 void detach_state(Array& a) {
@@ -556,7 +570,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                                bool replaces_previous,
                                FeatureCapture* capture,
                                bool retain_prefix_state,
-                               ops::AttentionExecutionPhase attention_phase) {
+                               ops::AttentionExecutionPhase attention_phase,
+                               std::int32_t valid_tokens) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -589,6 +604,15 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   };
   const std::int64_t t_now =
       tokens.valid() ? tokens.shape().dim(tokens.shape().rank() - 1) : 0;
+  // Tokens of the pass that are real; the rest of the pass is padding past
+  // the last real one (see the padding masks below).
+  const std::int64_t t_live = valid_tokens > 0 ? valid_tokens : t_now;
+  if (t_live > t_now || (t_live < t_now && (rows != nullptr || replaces_previous ||
+                                            retain_prefix_state || state_shards() != 1 ||
+                                            (tokens.valid() && tokens.shape().dim(0) != 1))))
+    return LSE_ERROR(kInvalidArgument, "a padded pass of ", std::to_string(t_now),
+                     " rows with ", std::to_string(t_live),
+                     " real tokens needs one unsharded prefill sequence");
   if (retain_prefix_state && (states == nullptr || !tokens.valid() ||
                               tokens.shape().dim(0) != 1 || t_now <= 1 || rows != nullptr)) {
     return LSE_ERROR(kInvalidArgument, "prefix retention needs one multi-token sequence");
@@ -752,7 +776,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     const std::size_t at = static_cast<std::size_t>(kv::kStepMetaHeader) +
                            r * static_cast<std::size_t>(kv::kStepMetaPerRow);
     if (first[r] < 0) continue;  // holds no sequence: position 0, length 0
-    const std::int32_t after = first[r] + static_cast<std::int32_t>(t_now);
+    const std::int32_t after = first[r] + static_cast<std::int32_t>(t_live);
     row_tokens[r] = after;
     meta[at] = static_cast<float>(first[r]);
     meta[at + 1] = static_cast<float>(after);
@@ -867,7 +891,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
       cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
-      cache_.states == states && !cache_.program.empty() &&
+      cache_.states == states && !cache_.program.empty() && cache_.valid == t_live &&
       !cache_.program.groups().empty() && kv_leaves_match();
   if (replaces_previous && last_pass_host_groups_ != 0) {
     return LSE_ERROR(kUnimplemented, "the pass being replaced put ",
@@ -987,6 +1011,35 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   if (states != nullptr) {
     before.reserve(states->size());
     for (const MixerState& s : *states) before.push_back(snap_state(s));
+  }
+
+  if (states != nullptr) {
+    Array mask, unmask, tail_rows;
+    if (t_live < t_now) {
+      const auto heads = static_cast<std::int64_t>(config_.gdn_v_heads);
+      const auto tail = static_cast<std::int64_t>(config_.gdn_conv_kernel) - 1;
+      if (heads <= 0 || tail <= 0 || t_live < tail)
+        return LSE_ERROR(kInvalidArgument, "a padded pass needs at least ",
+                         std::to_string(tail), " real tokens and GDN value heads");
+      std::vector<float> m(static_cast<std::size_t>(t_now * heads), 0.0f);
+      std::vector<float> u(m.size(), 1.0f);
+      for (std::int64_t t = 0; t < t_live; ++t)
+        for (std::int64_t h = 0; h < heads; ++h) {
+          m[static_cast<std::size_t>(t * heads + h)] = 1.0f;
+          u[static_cast<std::size_t>(t * heads + h)] = 0.0f;
+        }
+      std::vector<float> rows_of_tail(static_cast<std::size_t>(tail));
+      for (std::int64_t i = 0; i < tail; ++i)
+        rows_of_tail[static_cast<std::size_t>(i)] = static_cast<float>(t_live - tail + i);
+      LSE_ASSIGN_OR(mask, device_values(Shape{1, t_now, heads}, m));
+      LSE_ASSIGN_OR(unmask, device_values(Shape{1, t_now, heads}, u));
+      LSE_ASSIGN_OR(tail_rows, device_values(Shape{tail}, rows_of_tail));
+    }
+    for (MixerState& st : *states) {
+      st.pad_mask = mask;
+      st.pad_unmask = unmask;
+      st.pad_tail_rows = tail_rows;
+    }
   }
 
   LSE_ASSIGN_OR(Array x, embed(tokens));
@@ -1154,6 +1207,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.feature_layers.assign(feature_layers.begin(), feature_layers.end());
   cache_.states = states;
   cache_.seq = t_now;
+  cache_.valid = t_live;
   cache_.prefix_end = kv_len;
   cache_.pass_id = ++pass_counter_;
   cache_.prev_pass = prev_pass_run;
