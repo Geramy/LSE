@@ -104,14 +104,13 @@ def main():
     # Record immutable build inputs; runtime cache keys identify the loaded compiler.
     build_inputs = {
         'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
-        'hrx_adapter_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch').read_bytes()).hexdigest(),
-        'loom_symbolic_memo_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch').read_bytes()).hexdigest(),
-        'kv_fragment_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch').read_bytes()).hexdigest(),
-        'loom_matrix_staging_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/cooperative-matrix-operands.patch').read_bytes()).hexdigest(),
-        'loom_prefetch_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/rdna4-prefetch-address-span.patch').read_bytes()).hexdigest(),
-        'loom_vopd_patch': hashlib.sha256((work / 'deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch').read_bytes()).hexdigest(),
+        # LSE's HRX patch series, in the order build-macos.sh applies it.
+        'hrx_patches': {name: hashlib.sha256((root / 'patches/hrx' / f'{name}.patch').read_bytes()).hexdigest()
+                        for name in ('macos-coarse-host-adapter', 'symbolic-memo-touched-reset',
+                                     'gfx12-vopd-identical-source', 'kv-fragment-addressing',
+                                     'cooperative-matrix-operands', 'loop-invariant-motion',
+                                     'rdna4-prefetch-address-span', 'loom-grow-arrays-only-when-full')},
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
-        'mac_amdgpu': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
     }
     cache_identity = hashlib.sha256(json.dumps(build_inputs, sort_keys=True).encode()).hexdigest()[:24]
@@ -123,7 +122,7 @@ def main():
             f'exec "$package_root/libexec/{binary}" "$@"\n')
         wrapper.chmod(0o755)
     for src, dst in ((root / 'LICENSE.md', 'LSE.md'),
-                     (work / 'deps/mac-amdgpu/LICENSE', 'MacAMDGPU'),
+                     (root / 'patches/hrx/LICENSE.MacAMDGPU', 'MacAMDGPU'),
                      (work / 'hrx-source/LICENSE', 'HRX.txt'),
                      (llvm / 'LICENSE.TXT', 'LLVM.txt')):
         if not src.is_file():
@@ -185,7 +184,6 @@ def main():
                  package / 'docs/benchmarks/weight-slab-memory-2026-09-29.md')
     manifest = {
         'lse_revision': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
-        'mac_amdgpu_revision': run('git', '-C', str(work / 'deps/mac-amdgpu'), 'rev-parse', 'HEAD').strip(),
         'hrx_revision': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
         'cargo': run('cargo', '--version').strip(),
@@ -196,10 +194,11 @@ def main():
         'gpu_execution_tested_in_ci': False,
         'jit_cache_identity': cache_identity,
         'jit_cache_build_inputs': build_inputs,
-        'hrx_adapter_patch_sha256': build_inputs['hrx_adapter_patch'],
-        'loom_symbolic_memo_patch_sha256': build_inputs['loom_symbolic_memo_patch'],
-        'kv_fragment_patch_sha256': build_inputs['kv_fragment_patch'],
-        'loom_vopd_patch_sha256': build_inputs['loom_vopd_patch'],
+        'hrx_patch_directory': 'patches/hrx',
+        'hrx_adapter_patch_sha256': build_inputs['hrx_patches']['macos-coarse-host-adapter'],
+        'loom_symbolic_memo_patch_sha256': build_inputs['hrx_patches']['symbolic-memo-touched-reset'],
+        'kv_fragment_patch_sha256': build_inputs['hrx_patches']['kv-fragment-addressing'],
+        'loom_vopd_patch_sha256': build_inputs['hrx_patches']['gfx12-vopd-identical-source'],
     }
     (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (package / 'QUICKSTART.txt').write_text(

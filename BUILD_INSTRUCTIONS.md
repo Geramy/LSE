@@ -109,8 +109,8 @@ $(brew --prefix lld@21)/bin/ld.lld --version | grep 'LLD 21.1.8'
 ### Build
 
 The CI script [`build-macos.sh`](.github/scripts/build-macos.sh) is the
-reference — it fetches the pinned HRX/mac-amdgpu deps, applies the macOS
-portability patches, configures with the Darwin archive tools, and builds both
+reference — it fetches the pinned HRX dependencies, applies LSE's HRX patch
+series from `patches/hrx/`, configures with the Darwin archive tools, and builds both
 HRX/Loom and LSE. To run it by hand:
 
 ```bash
@@ -233,8 +233,9 @@ app target (Do Not Embed: it is a static library) and `import LSE` from Swift.
 
 The script builds the HSA runtime (`make hsa-ios` in mac_linuxgpu, with its
 output in `build/ios/hsa`, so the checkout is only read), HRX and
-loomc as static archives (`scripts/ios/build-hrx-ios.sh`, which applies
-`patches/hrx/ios-static-runtime.patch` to a copy of the HRX source), the
+loomc as static archives (`scripts/ios/build-hrx-ios.sh`, which fetches
+hrx-system at the same pin as the macOS build and applies the same
+`patches/hrx/` series plus `ios-static-runtime.patch` to a copy of it), the
 engine with `CMAKE_SYSTEM_NAME=iOS`, then prelinks them into one object that
 exports only the `lse_*` API. Kernels are generated on the device by loomc as
 GPU code objects (data); nothing is compiled for the CPU at run time. The

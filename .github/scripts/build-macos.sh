@@ -43,10 +43,8 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-mac_rev=99f17badeb85d1596ed0487993d09d05fa812fa5
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
-fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$work/deps/mac-amdgpu"
 fetch https://github.com/ROCm/hrx-system.git "$hrx_rev" "$work/deps/hrx"
 fetch https://github.com/iree-org/hsa-runtime-headers.git "$hsa_headers_rev" "$work/deps/hsa-headers"
 fetch https://github.com/crusoecloud/fastokens.git 7973014e4f3a6028ac48f305704eacd64d0b4ef6 "$work/deps/fastokens"
@@ -75,27 +73,26 @@ git -C "$work/source" init -q
 git -C "$work/hrx-source" init -q
 # The LSE source is already macOS-portable (kqueue poller, __APPLE__ socket
 # handling, LSE_POLLER_SOURCE selection all in-tree since 79f39c0), so no
-# portability patch is applied to it. Only the fetched hrx dependency still
-# needs its coarse-host-adapter patch.
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/macos-coarse-host-adapter.patch"
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/symbolic-memo-touched-reset.patch"
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/gfx12-vopd-identical-source.patch"
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/kv-fragment-addressing.patch"
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/cooperative-matrix-operands.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/cooperative-matrix-operands.patch"
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/loop-invariant-motion.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/loop-invariant-motion.patch"
-git -C "$work/hrx-source" apply --check "$work/deps/mac-amdgpu/patches/hrx/rdna4-prefetch-address-span.patch"
-git -C "$work/hrx-source" apply "$work/deps/mac-amdgpu/patches/hrx/rdna4-prefetch-address-span.patch"
-# loomc's arrays grow per overflow, not per append. Without it a kernel with
-# more than about 30 matrix operands in one function asks for gigabytes and
-# fails to compile, which rules out the prefill GEMM's 64x64 wave tiles.
-git -C "$work/hrx-source" apply --check "$root/patches/hrx/loom-grow-arrays-only-when-full.patch"
-git -C "$work/hrx-source" apply "$root/patches/hrx/loom-grow-arrays-only-when-full.patch"
+# portability patch is applied to it. The fetched hrx dependency takes LSE's
+# own HRX patch series (patches/hrx), in this order:
+# - macos-coarse-host-adapter: the AMDGPU HAL over the macOS driver transport.
+# - symbolic-memo-touched-reset, gfx12-vopd-identical-source,
+#   loop-invariant-motion, rdna4-prefetch-address-span: Loom code generation
+#   fixes for gfx12.
+# - kv-fragment-addressing: the native K/V address API.
+# - cooperative-matrix-operands: matrix operand staging; its operand list
+#   grows only when full.
+# - loom-grow-arrays-only-when-full: the remaining loomc arrays that grew per
+#   append. Without it a kernel with more than about 30 matrix operands in one
+#   function asks for gigabytes and fails to compile, which rules out the
+#   prefill GEMM's 64x64 wave tiles.
+hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
+  gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
+  loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full)
+for patch in "${hrx_patches[@]}"; do
+  git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
+  git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"
+done
 jobs="${LSE_BUILD_JOBS:-3}"
 cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \

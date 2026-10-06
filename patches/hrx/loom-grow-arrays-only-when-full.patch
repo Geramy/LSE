@@ -1,24 +1,3 @@
-diff --git a/loom/src/loom/transforms/kernel/stage_matrix_operands.c b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
-index 5d1a6cc..ba07ac9 100644
---- a/loom/src/loom/transforms/kernel/stage_matrix_operands.c
-+++ b/loom/src/loom/transforms/kernel/stage_matrix_operands.c
-@@ -1061,9 +1061,13 @@ static iree_status_t collect(void* user, loom_op_t* op,
-   if (!loom_vector_fragment_isa(op) ||
-       loom_vector_fragment_role(op) != LOOM_VECTOR_ROLE_RHS)
-     return iree_ok_status();
--  IREE_RETURN_IF_ERROR(iree_arena_grow_array(
--      c->pass->arena, c->count, c->count + 1, sizeof(*c->candidates),
--      &c->capacity, (void**)&c->candidates));
-+  // Grow only when full: growing on every append doubles the capacity per
-+  // candidate, so 31 fragments asked the arena for 2^31 entries.
-+  if (c->count == c->capacity) {
-+    IREE_RETURN_IF_ERROR(iree_arena_grow_array(
-+        c->pass->arena, c->count, c->count + 1, sizeof(*c->candidates),
-+        &c->capacity, (void**)&c->candidates));
-+  }
-   c->candidates[c->count++] = op;
-   return iree_ok_status();
- }
 diff --git a/loom/src/loom/transforms/symbol/symbol_equivalence.c b/loom/src/loom/transforms/symbol/symbol_equivalence.c
 index 44dae30..af95d1b 100644
 --- a/loom/src/loom/transforms/symbol/symbol_equivalence.c

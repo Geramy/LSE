@@ -12,8 +12,11 @@
 # buffers but cannot load executables.
 #
 # Environment:
-#   HRX_SOURCE           hrx-system tree to build. Copied, never modified.
+#   HRX_SOURCE           unpatched hrx-system tree at the pinned revision.
+#                        Copied, never modified. Default: fetched into
+#                        $LSE_IOS_WORK/deps/hrx.
 #   HSA_HEADERS_SOURCE   hsa-runtime-headers checkout (hsa/ and aqlprofile-sdk/).
+#                        Default: fetched into $LSE_IOS_WORK/deps/hsa-headers.
 #   HSA_IOS_LIBRARY      static libhsa-runtime64.a built for iOS arm64.
 #   FLATCC_SOURCE        flatcc source tree; fetched by CMake when missing.
 #   LOOM_AMDGPU_ISA_XML  directory holding amdgpu_isa_*.xml; fetched when
@@ -33,18 +36,26 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 dev="$HOME/Documents/Development"
 work="${LSE_IOS_WORK:-$root/build/ios}"
-hrx_source="${HRX_SOURCE:-$dev/mac_amdgpu/build/hrx-macos-source}"
-hsa_headers="${HSA_HEADERS_SOURCE:-$dev/mac_amdgpu/upstream/hsa-runtime-headers}"
+# The same hrx-system and hsa-runtime-headers pins as .github/scripts/build-macos.sh.
+hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
+hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
+hrx_source="${HRX_SOURCE:-$work/deps/hrx}"
+hsa_headers="${HSA_HEADERS_SOURCE:-$work/deps/hsa-headers}"
 hsa_library="${HSA_IOS_LIBRARY:-$dev/mac_linuxgpu-worktrees/hsa-ios/build/hsa-ios/libhsa-runtime64.a}"
-flatcc_source="${FLATCC_SOURCE:-$dev/mac_amdgpu/build/hrx-macos/_deps/flatcc-src}"
-isa_xml="${LOOM_AMDGPU_ISA_XML:-$dev/mac_amdgpu/build/hrx-macos-adapter/_deps/amdgpu_isa_xml-src}"
+flatcc_source="${FLATCC_SOURCE:-}"
+isa_xml="${LOOM_AMDGPU_ISA_XML:-}"
 deployment="${IOS_DEPLOYMENT_TARGET:-26.0}"
 jobs="${LSE_BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
-patch="$root/patches/hrx/ios-static-runtime.patch"
-# loomc grew four arrays on every append, doubling their capacity each time:
-# a 1024-token prefill kernel asked for 16 GiB in stage-matrix-operands, which
-# macOS maps lazily and iOS refuses. Applied until the fix is upstream.
-loom_patch="$root/patches/hrx/loom-grow-arrays-only-when-full.patch"
+# LSE's HRX patch series, in the order build-macos.sh applies it, with the
+# iOS static runtime ahead of the last loomc fix. The macOS coarse host
+# adapter stays on: the iPad reaches the GPU through the same transport.
+# loom-grow-arrays-only-when-full matters most here: loomc arrays that grew
+# on every append asked for 16 GiB on a 1024-token prefill kernel, which
+# macOS maps lazily and iOS refuses.
+hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
+  gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
+  loop-invariant-motion rdna4-prefetch-address-span ios-static-runtime
+  loom-grow-arrays-only-when-full)
 
 die() { echo "$*" >&2; exit 1; }
 
@@ -53,6 +64,22 @@ die() { echo "$*" >&2; exit 1; }
 for tool in cmake ninja python3 rsync git; do
   command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
+fetch() {
+  local url="$1" rev="$2" path="$3"
+  if [[ ! -d "$path/.git" ]]; then
+    git init -q "$path"
+    git -C "$path" remote add origin "$url"
+    git -C "$path" fetch --depth 1 origin "$rev"
+    git -C "$path" checkout -q --detach FETCH_HEAD
+  fi
+  [[ "$(git -C "$path" rev-parse HEAD)" == "$rev" &&
+     -z "$(git -C "$path" status --porcelain)" ]] ||
+    die "dependency revision or contents differ: $path"
+}
+[[ -n "${HRX_SOURCE:-}" ]] ||
+  fetch https://github.com/ROCm/hrx-system.git "$hrx_rev" "$hrx_source"
+[[ -n "${HSA_HEADERS_SOURCE:-}" ]] ||
+  fetch https://github.com/iree-org/hsa-runtime-headers.git "$hsa_headers_rev" "$hsa_headers"
 [[ -f "$hrx_source/libhrx/include/hrx_runtime.h" ]] ||
   die "HRX_SOURCE is not an hrx-system tree: $hrx_source"
 [[ -f "$hsa_headers/include/hsa/hsa.h" ]] ||
@@ -60,8 +87,9 @@ done
 [[ -f "$hsa_library" ]] || die "HSA_IOS_LIBRARY not found: $hsa_library"
 lipo -info "$hsa_library" 2>/dev/null | grep -q arm64 ||
   die "HSA_IOS_LIBRARY is not an arm64 archive: $hsa_library"
-[[ -f "$patch" ]] || die "missing $patch"
-[[ -f "$loom_patch" ]] || die "missing $loom_patch"
+for patch in "${hrx_patches[@]}"; do
+  [[ -f "$root/patches/hrx/$patch.patch" ]] || die "missing patches/hrx/$patch.patch"
+done
 
 # The host compiler is Xcode's Apple clang so the archives link into an Xcode
 # app against the SDK libc++. The AMDGPU HAL configure step still insists on
@@ -99,7 +127,7 @@ build="$work/hrx-build"
 probe="$build/ios-probe"
 libs="$build/ios-libs"
 
-# 1. A fresh copy of the source with the iOS patch on top. The copy gets its
+# 1. A fresh copy of the source with LSE's patch series on top. The copy gets its
 # own git repository: inside this checkout, git apply would otherwise resolve
 # paths against the enclosing repository and silently skip them.
 echo "== copying $hrx_source"
@@ -109,10 +137,10 @@ mkdir -p "$src"
 rsync -a --exclude=/.git --exclude=/build/ --exclude=__pycache__ \
   "$hrx_source/" "$src/"
 git -C "$src" init -q
-git -C "$src" apply --check "$patch"
-git -C "$src" apply "$patch"
-git -C "$src" apply --check "$loom_patch"
-git -C "$src" apply "$loom_patch"
+for patch in "${hrx_patches[@]}"; do
+  git -C "$src" apply --check "$root/patches/hrx/$patch.patch"
+  git -C "$src" apply "$root/patches/hrx/$patch.patch"
+done
 
 # 2. Generators that run during the build (embed_data, flatcc) must run on the
 # Mac, not on the device. Build them for macOS and point the iOS build at them.

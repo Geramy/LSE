@@ -7,7 +7,6 @@ deps="$root/build/deps/linux-loom"
   echo 'This compiler build requires Linux.' >&2; exit 1;
 }
 hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
-mac_rev=99f17badeb85d1596ed0487993d09d05fa812fa5
 fetch() {
   local url="$1" rev="$2" path="$3"
   if [[ ! -d "$path/.git" ]]; then
@@ -23,7 +22,6 @@ fetch() {
 }
 mkdir -p "$work" "$deps"
 fetch https://github.com/ROCm/hrx-system.git "$hrx_rev" "$deps/hrx-$hrx_rev"
-fetch https://github.com/lemonade-sdk/mac-amdgpu.git "$mac_rev" "$deps/mac-amdgpu-$mac_rev"
 python3 - "$work/source" <<'PY'
 from pathlib import Path
 import shutil, sys
@@ -36,9 +34,12 @@ source.mkdir()
 PY
 git -C "$deps/hrx-$hrx_rev" archive HEAD | tar -x -C "$work/source"
 git -C "$work/source" init -q
-patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch)
+# LSE's Loom patches (patches/hrx), then its HRX runtime patches (patches/).
+# loom-grow-arrays-only-when-full keeps loomc from asking for gigabytes on a
+# kernel with many matrix operands, such as the prefill GEMM's 64x64 tiles.
+patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch)
 for patch in "${patches[@]}"; do
-  path="$deps/mac-amdgpu-$mac_rev/patches/hrx/$patch"
+  path="$root/patches/hrx/$patch"
   git -C "$work/source" apply --check "$path"
   git -C "$work/source" apply "$path"
 done
@@ -76,11 +77,11 @@ cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DLOOM_TARGET_IREE_VM=ON -DLOOM_EXECUTE_IREE_VM=ON -DLOOM_TARGET_LLVMIR=ON \
   -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON
 cmake --build "$work/build" --target hrx loomc_shared --parallel "${LSE_BUILD_JOBS:-3}"
-python3 - "$work" "$deps" "$hrx_rev" "$mac_rev" <<'PY'
+python3 - "$work" "$deps" "$hrx_rev" <<'PY'
 from pathlib import Path
 import hashlib, json, os, re, subprocess, sys
 work, deps = map(Path, sys.argv[1:3])
-hrx_rev, mac_rev = sys.argv[3:5]
+hrx_rev = sys.argv[3]
 library = (work / 'build/loom/binding/c/libloomc.so').resolve(strict=True)
 include = work / 'source/loom/binding/c/include'
 version = work / 'build/loom/binding/c/cmake/loomc/loomc-config-version.cmake'
@@ -88,8 +89,8 @@ if not version.is_file() or not (include / 'loomc/loomc.h').is_file():
     raise SystemExit('Missing built Loom C API headers or version metadata')
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 patches = []
-for name in ('symbolic-memo-touched-reset.patch', 'gfx12-vopd-identical-source.patch', 'cooperative-matrix-operands.patch', 'loop-invariant-motion.patch', 'rdna4-prefetch-address-span.patch'):
-    path = deps / f'mac-amdgpu-{mac_rev}' / 'patches/hrx' / name
+for name in ('symbolic-memo-touched-reset.patch', 'gfx12-vopd-identical-source.patch', 'cooperative-matrix-operands.patch', 'loop-invariant-motion.patch', 'rdna4-prefetch-address-span.patch', 'loom-grow-arrays-only-when-full.patch'):
+    path = work.parents[1] / 'patches/hrx' / name
     patches.append({'path': f'patches/hrx/{name}', 'sha256': digest(path)})
 for path in sorted((work.parents[1] / 'patches').glob('*.patch')):
     patches.append({'path': 'patches/' + path.name, 'sha256': digest(path)})
@@ -104,8 +105,6 @@ configuration = {key: value for key, value in cache.items()
                  or key in ('CMAKE_BUILD_TYPE', 'LIBHRX_BUILD', 'IREE_BUILD_TESTS', 'IREE_BUILD_BENCHMARKS')}
 manifest = {
     'hrx_revision': hrx_rev,
-    'patch_repository': 'https://github.com/lemonade-sdk/mac-amdgpu.git',
-    'patch_revision': mac_rev,
     'patches': patches,
     'library': str(library), 'library_sha256': digest(library),
     'include_directory': str(include), 'version_file': str(version),
