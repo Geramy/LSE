@@ -1,4 +1,6 @@
 // Row-wise normalization with cooperative and scalar implementations.
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <array>
 #include <vector>
@@ -410,6 +412,45 @@ struct SiluL2NormKernel final : KernelPrimitive<SiluL2NormKernel> {
       e.store(e.let(row * d + col), value);
     }
     return k.str();
+  }
+  // The host reference, in the device body's order: SiLU per element, then
+  // the head's sum of squares accumulated left to right with fma.
+  bool has_typed_host_impl() const noexcept override { return true; }
+  Status eval_cpu_typed(std::span<const HostTensorView> in, HostOutputView out,
+                        const std::array<float, 4>& attrs,
+                        const std::array<std::int32_t, 4>&) const override {
+    if (in.size() != 1 || in[0].dtype != DType::kF32 || out.dtype != DType::kF32 ||
+        in[0].shape.rank() < 2 || out.shape.rank() != in[0].shape.rank() + 1)
+      return LSE_ERROR(kInvalidArgument, "gdn.silu_l2norm.v1: invalid host storage");
+    const auto c = static_cast<std::size_t>(last_dim(in[0].shape));
+    const auto d = static_cast<std::size_t>(last_dim(out.shape));
+    const auto heads = static_cast<std::size_t>(out.shape.dim(out.shape.rank() - 2));
+    const auto offset = static_cast<std::size_t>(attrs[0]);
+    const std::size_t rows = d ? out.shape.elem_count() / d : 0;
+    if (d == 0 || heads == 0 || offset + heads * d > c ||
+        in[0].bytes.size() < in[0].shape.elem_count() * 4 ||
+        out.bytes.size() < out.shape.elem_count() * 4 ||
+        rows / heads * c > in[0].shape.elem_count())
+      return LSE_ERROR(kInvalidArgument, "gdn.silu_l2norm.v1: head window outside its input");
+    const auto* x = reinterpret_cast<const float*>(in[0].bytes.data());
+    auto* y = reinterpret_cast<float*>(out.bytes.data());
+    std::vector<float> values(d);
+    for (std::size_t row = 0; row < rows; ++row) {
+      const std::size_t base = (row / heads) * c + offset + (row % heads) * d;
+      float acc = 0.0f;
+      for (std::size_t t = 0; t < d; ++t) {
+        const float v = x[base + t];
+        values[t] = v / (1.0f + std::exp(-v));
+        acc = std::fma(values[t], values[t], acc);
+      }
+      const float inv = 1.0f / std::max(std::sqrt(acc), attrs[1]);
+      for (std::size_t t = 0; t < d; ++t) {
+        float value = values[t] * inv;
+        if (attrs[2] != 1.0f) value *= attrs[2];
+        y[row * d + t] = value;
+      }
+    }
+    return OkStatus();
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
     // The head geometry is the caller's: gdn_silu_l2norm sets the shape.
