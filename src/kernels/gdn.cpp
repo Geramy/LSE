@@ -20,6 +20,9 @@ namespace math = lse::math;
 namespace {
 
 constexpr std::uint32_t kBlock = 256;
+// Scans this short (a speculative verify, a commit of its accepted prefix)
+// load every timestep's inputs before the recurrence starts.
+constexpr std::uint32_t kGdnPreloadSteps = 8;
 
 std::uint32_t wave_of(const DeviceInfo* device) {
   if (device == nullptr) return 32;
@@ -106,7 +109,60 @@ std::string emit_gdn(const KernelShapes& s, GdnWrite mode) {
     return acc;
   };
 
-  for (auto t : e.range(seq)) {
+  // A verify-width scan has every timestep's inputs ready before the first
+  // state update: issue all of their loads up front (the recurrence itself,
+  // and its arithmetic order, is the loop below).
+  const bool preload = seq <= kGdnPreloadSteps && tile <= 4;
+  std::vector<kir::LValue<kir::f32>> pre_al, pre_bt, pre_v;
+  std::vector<std::vector<kir::LValue<kir::f32>>> pre_k, pre_q;
+  if (preload) {
+    for (std::uint32_t t = 0; t < seq; ++t) {
+      const auto sc = e.let((b * seq + t) * heads + h);
+      const auto vec = e.let(sc * D);
+      pre_al.push_back(e.var(a.alpha[sc]));
+      pre_bt.push_back(e.var(a.beta[sc]));
+      pre_v.push_back(e.var(a.v[vec + row]));
+      pre_k.emplace_back(); pre_q.emplace_back();
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        const auto j = e.let(lane + ei * wave);
+        pre_k.back().push_back(e.var(0.0f));
+        pre_q.back().push_back(e.var(0.0f));
+        if (auto in = e.when(j < D)) {
+          pre_k.back()[ei] = a.k[vec + j];
+          pre_q.back()[ei] = a.q[vec + j];
+        }
+      }
+    }
+    for (std::uint32_t t = 0; t < seq; ++t) {
+      const auto al = e.let(pre_al[t].read());
+      auto skp = e.var(0.0f);
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        const auto j = lane + ei * wave;
+        srow[ei] = srow[ei].read() * al;
+        if (auto in = e.when(j < D)) {
+          skp = math::fma(srow[ei].read(), pre_k[t][ei].read(), skp);
+        }
+      }
+      const auto sk = reduce(skp);
+      const auto bt = e.let(pre_bt[t].read());
+      const auto delta = e.let((pre_v[t].read() - sk) * bt);
+      auto accp = e.var(0.0f);
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        const auto j = lane + ei * wave;
+        if (auto in = e.when(j < D)) {
+          srow[ei] = math::fma(delta, pre_k[t][ei].read(), srow[ei].read());
+          accp = math::fma(srow[ei].read(), pre_q[t][ei].read(), accp);
+        }
+      }
+      if (write_out) {
+        const auto acc = reduce(accp);
+        if (auto in = e.when(lane == 0)) {
+          e.store(((b * seq + t) * heads + h) * D + row, acc);
+        }
+      }
+    }
+  }
+  if (!preload) for (auto t : e.range(seq)) {
     const auto sc = (b * seq + t) * heads + h;
     const auto vec = sc * D;
     const auto al = e.let(a.alpha[sc]);
