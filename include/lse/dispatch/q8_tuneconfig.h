@@ -10,10 +10,7 @@ struct MatrixRule {
   std::string_view arch;
   std::uint32_t wave, bits, rows, lds, threads, max_round_groups;
 };
-inline constexpr std::array kMatrixRules{
-    MatrixRule{"gfx1201", 32, 8, 16, 1664, 256, 4},
-    MatrixRule{"gfx1201", 32, 8, 64, 6656, 256, 1},
-};
+// Device rows: lse/dispatch/arch/<gfx>.hpp.
 
 struct ShapeRule { std::uint32_t min_m, max_m, n, k, rows; };
 inline constexpr std::array kShapes{

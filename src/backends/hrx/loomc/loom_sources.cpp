@@ -409,8 +409,16 @@ constexpr std::array<ResultType, 16> kNonFloatResults{{
     {"q8x8.f16", "vector<8xf16>"},
 }};
 
-// Only these shared measured layouts match Loom's RDNA4 single-tile catalog.
-// Chained/unmeasured rows are deliberately absent even when a key is shared.
+// The single-instruction wave32 rows whose lane mapping is measured, for every
+// generation Loom has a matrix catalog for: RDNA3/3.5 (wmma_gfx11, the
+// rdna3_wmmar3_* layouts -- 16 operand values per lane over the whole k step,
+// the two half-waves carrying the same rows) and RDNA4 (the single-tile
+// layouts -- 8 per lane, k split across the half-waves). The schema below is
+// the row's own per-lane payload, so the two generations print different
+// fragment widths for the same tile and loomc picks the instruction that
+// matches. A kernel chooses between them by the live device's target; the
+// table offering both is not a choice. Chained/unmeasured rows are
+// deliberately absent even when a key is shared.
 struct MatrixSpelling {
   const math::MatrixCoreRow* row = nullptr;
   std::string text;
@@ -420,7 +428,9 @@ const std::vector<MatrixSpelling>& matrix_spellings() {
   static const std::vector<MatrixSpelling> rows = [] {
     std::vector<MatrixSpelling> out;
     for (const auto& r : math::matrix_core_table()) {
-      if (r.target != math::MatrixTarget::kRdna4 || !r.emittable() ||
+      if ((r.target != math::MatrixTarget::kRdna3 &&
+           r.target != math::MatrixTarget::kRdna4) ||
+          !r.emittable() ||
           r.chained != 1 || r.m != 16 || r.n != 16 ||
           (r.k != 16 && r.k != 32) || r.wave != 32) continue;
       std::string a_format, b_format;

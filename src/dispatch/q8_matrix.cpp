@@ -1,4 +1,5 @@
 #include "lse/dispatch/q8_matrix.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/q8_tuneconfig.h"
 #include <algorithm>
 #include <limits>
@@ -36,7 +37,7 @@ AffineMatrixPlan matrix_plan(const graph::KernelShapes& s, std::uint32_t rows, s
   const auto groups = static_cast<std::uint32_t>(k / 64);
   const q8_shapes::MatrixRule* rule = nullptr;
   std::uint32_t round_groups = 0, lds_bytes = 0;
-  for (const auto& r : q8_shapes::kMatrixRules) {
+  for (const auto& r : arch::tuning(s.device->arch).q8_matrix_rules) {
     const auto rounds = std::min(groups, r.max_round_groups);
     const auto lds = r.lds * rounds;
     if (s.device->arch == r.arch && s.device->wavefront_size == r.wave && bits == r.bits && rows == r.rows &&
@@ -77,7 +78,7 @@ AffineMatrixPlan q8_matrix_plan(const graph::KernelShapes& s, std::uint32_t rows
 }
 bool q8_packed_weight_device(const backend::DeviceInfo& device) {
   bool admitted = false;
-  for (const auto& rule : q8_shapes::kMatrixRules) {
+  for (const auto& rule : arch::tuning(device.arch).q8_matrix_rules) {
     if (rule.bits == 8 && rule.rows == 16 && device.arch == rule.arch &&
         device.wavefront_size == rule.wave &&
         device.max_threads_per_workgroup >= rule.threads &&

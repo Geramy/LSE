@@ -233,8 +233,11 @@ Dims dims_of(const KernelShapes& s, bool sliced) {
 }
 
 std::uint32_t burst_steps(const Dims& d, const struct Tile& t);
-Tile tile_for(const Dims& d) {
-  const auto t = dispatch::q4_gemm_tile(d.m);
+// The part's tile (its tuning header picks the wide-pass one).
+Tile tile_for(const KernelShapes& s, const Dims& d) {
+  const auto t = dispatch::q4_gemm_tile(
+      d.m, dispatch::arch::tuning(s.device ? std::string_view(s.device->arch)
+                                           : std::string_view{}));
   return {t.bm, t.bn, t.wm, t.wn};
 }
 
@@ -290,7 +293,7 @@ std::uint32_t lds_bytes(const Tile& t) {
 
 bool device_fits(const KernelShapes& s, const Dims& d) {
   if (!d.valid || !s.device || !s.intrinsics) return false;
-  const Tile t = tile_for(d);
+  const Tile t = tile_for(s, d);
   // Every thread stages the same number of activation pieces.
   if (s.device->wavefront_size != 32u ||
       s.device->max_threads_per_workgroup < t.wm * t.wn * 32u ||
@@ -299,7 +302,7 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
   if (device_load_bytes(s.device) < 16u) return false;
   for (const auto symbol : {"barrier", d.bits == 8 ? "q8x8.f16" : "q4x8.f16"})
     if (s.intrinsics->find(symbol).empty()) return false;
-  return backend::workgroup_lds_bytes(s.device) >= lds_bytes(tile_for(d)) &&
+  return backend::workgroup_lds_bytes(s.device) >= lds_bytes(tile_for(s, d)) &&
          f16_row(s) != nullptr;
 }
 
@@ -315,7 +318,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   constexpr std::uint32_t kLaneK = kGeo.lane_k;
   static_assert(kLaneK % kRun == 0u, "fragments load in whole runs");
 
-  const Tile t = tile_for(d);
+  const Tile t = tile_for(s, d);
   const std::uint32_t M = d.m, N = d.n, K = d.k;
   const std::uint32_t KT = K / kBK;
   const std::uint32_t tiles_n = (N + t.bn - 1u) / t.bn;
@@ -689,7 +692,7 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
       const auto* kernel = legacy(original);
       return kernel ? kernel->plan(original) : tp;
     }
-    const Tile t = tile_for(d);
+    const Tile t = tile_for(s, d);
     tp.workgroup_size[0] = t.wm * t.wn * 32u;
     tp.workgroup_count[0] =
         ((d.m + t.bm - 1u) / t.bm) * ((d.n + t.bn - 1u) / t.bn) * d.slices;

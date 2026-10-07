@@ -280,31 +280,44 @@ std::uint32_t matrix_waves(const KernelShapes &s, std::uint32_t n) {
 }
 // Groups whose loads issue together before their products accumulate in
 // order. Four is the most the emitter's register budget takes.
+// A generation whose lanes carry the whole K step loads twice the operand
+// words per group, so it takes half the groups per round.
 constexpr std::uint32_t kMatrixUnroll = 4;
-std::uint32_t matrix_unroll(std::uint32_t groups) {
-  std::uint32_t unroll = kMatrixUnroll;
+std::uint32_t matrix_unroll(std::uint32_t groups,
+                            std::uint32_t most = kMatrixUnroll) {
+  std::uint32_t unroll = most;
   while (unroll > 1u && groups % unroll != 0u)
     unroll /= 2u;
   return unroll;
 }
 // `Bits` is the weight width: 4-bit words widen to matrix operands by nibble
 // plane, 8-bit words already are operands, four codes to a register.
-template <std::uint32_t Bits>
+//
+// `G` is the device's matrix generation. On RDNA4 a lane holds half of each
+// K16 product (the half-waves split it); on RDNA3/3.5 a lane holds all of it
+// and the half-waves repeat the same rows, so each product reads both halves'
+// weight words and activation words, and accumulator slot z is output row
+// 2z + half-wave instead of z + 8 * half-wave (lse/math/matrix_rdna3.hpp).
+template <std::uint32_t Bits, math::MatrixTarget G>
 std::string emit_matrix(const KernelShapes &s) {
   static_assert(Bits == 4 || Bits == 8);
-  using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
+  using Mma = math::op::Mma<G, math::MatrixElem::kI32,
                             math::MatrixElem::kSU8, 16, 16, 16>;
   constexpr auto row = Mma::kRow;
   constexpr auto geo = geometry_of(row);
   constexpr int kFrag = row.a_len / row.chained;
   constexpr int kSlots = row.c_len;
+  static_assert(row.wave == 32 && row.chained == 1 && kSlots == 8 &&
+                (geo.split_k ? kFrag == 2 : kFrag == 4),
+                "the decode panel is written for the wave32 iu8 rows");
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   const auto k =
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
   const auto groups = k / 64u;
   const auto lanes = k * Bits / 32u;
   const auto waves = matrix_waves(s, n);
-  const auto unroll = matrix_unroll(groups);
+  const auto unroll =
+      matrix_unroll(groups, geo.split_k ? kMatrixUnroll : kMatrixUnroll / 2u);
   const auto tiles_n = (n + 15u) / 16u;
   const auto nblocks = (tiles_n + waves - 1u) / waves;
   kir::KernelBody kb(s.types, *s.intrinsics, 0);
@@ -338,7 +351,9 @@ std::string emit_matrix(const KernelShapes &s) {
     std::vector<kir::Pack<kir::u32>> weight, acts, metadata;
   };
   constexpr std::uint32_t kGroupWeightWords = 64u * Bits / 32u;
-  const auto act_lane = e.let(hi * 128u + lo * 2u);
+  // The half-wave's activation words on a split layout; the row's alone on
+  // a contiguous one, which reads both halves.
+  const auto act_lane = geo.split_k ? e.let(hi * 128u + lo * 2u) : e.let(lo * 2u);
   for (auto g0 : e.range(0u, groups, unroll)) {
     std::vector<Loaded> loaded;
     loaded.reserve(unroll);
@@ -346,6 +361,7 @@ std::string emit_matrix(const KernelShapes &s) {
       const auto g = e.let(g0 + u);
       const auto sa = e.let(safe_col * groups + g);
       Loaded l{e.let(a.scales[sa]), e.let(a.biases[sa]), {}, {}, {}};
+      if constexpr (geo.split_k) {
       const auto wbase = e.let(safe_col * lanes + g * kGroupWeightWords +
                                hi * (kGroupWeightWords / 2u));
       for (std::uint32_t w = 0; w < kGroupWeightWords / 2u; w += 4u)
@@ -356,6 +372,22 @@ std::string emit_matrix(const KernelShapes &s) {
       for (std::uint32_t z = 0; z < 8u; z += 2u)
         l.metadata.push_back(e.load(
             a.panel, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u), 16u));
+      } else {
+        // The whole group's weight words; for product t the activation
+        // words of both halves (acts[2t + half]); and the step and sum of
+        // each row this lane's slots hold (rows 2z + hi), one pair a load.
+        const auto wbase = e.let(safe_col * lanes + g * kGroupWeightWords);
+        for (std::uint32_t w = 0; w < kGroupWeightWords; w += 4u)
+          l.weight.push_back(e.load(a.packed, e.let(wbase + w), 16u));
+        for (std::uint32_t t = 0; t < 4u; ++t)
+          for (std::uint32_t h = 0; h < 2u; ++h)
+            l.acts.push_back(e.load(
+                a.panel, e.let(g * kGroupWords + act_lane + h * 128u +
+                               (t / 2u) * 64u + (t % 2u) * 32u), 8u));
+        for (std::uint32_t z = 0; z < 8u; ++z)
+          l.metadata.push_back(e.load(
+              a.panel, e.let(g * kGroupWords + 256u + hi * 2u + z * 4u), 8u));
+      }
       loaded.push_back(std::move(l));
     }
     for (std::uint32_t u = 0; u < unroll; ++u) {
@@ -369,27 +401,36 @@ std::string emit_matrix(const KernelShapes &s) {
         const auto bf = e.local<kir::u32, kFrag>();
         const auto af = e.local<kir::u32, kFrag>();
         for (int f = 0; f < kFrag; ++f) {
+          // Which half of the product this register carries: the lane's own
+          // on a split layout, half f / 2 on a contiguous one, whose
+          // registers are the two halves' in turn.
+          const std::uint32_t half_words = geo.split_k ? 0u : kGroupWeightWords / 2u;
+          const std::uint32_t h = geo.split_k ? 0u : static_cast<std::uint32_t>(f) / 2u;
+          const int r = geo.split_k ? f : f % 2;
           if constexpr (Bits == 4) {
             // The panel pairs each weight word with its activations in
             // nibble plane order (code_slot): plane f is the word's nibbles
             // f, f+2, f+4 and f+6, one to a byte.
-            const auto word = e.let(l.weight[0][static_cast<int>(t)]);
+            const auto wi = h * half_words + t;
+            const auto word = e.let(l.weight[wi / 4u][static_cast<int>(wi % 4u)]);
             bf[f] = e.let(math::bit_and(
-                word / (1u << (4u * static_cast<std::uint32_t>(f))),
+                word / (1u << (4u * static_cast<std::uint32_t>(r))),
                 e.u32(0x0f0f0f0fu)));
           } else {
-            const auto at = t * 2u + static_cast<std::uint32_t>(f);
+            const auto at = h * half_words + t * 2u + static_cast<std::uint32_t>(r);
             bf[f] = e.let(l.weight[at / 4u][static_cast<int>(at % 4u)]);
           }
-          af[f] = l.acts[t][f];
+          af[f] = l.acts[geo.split_k ? t : t * 2u + h][r];
         }
         acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
       }
       for (int z = 0; z < kSlots; ++z) {
+        const auto pair = static_cast<std::size_t>(geo.split_k ? z / 2 : z);
+        const int lane_pair = geo.split_k ? (z % 2) * 2 : 0;
         const auto step = e.let(math::from_bits<lse::f32>(
-            l.metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2]));
+            l.metadata[pair][lane_pair]));
         const auto sum = e.let(math::from_bits<lse::f32>(
-            l.metadata[static_cast<std::size_t>(z / 2)][(z % 2) * 2 + 1]));
+            l.metadata[pair][lane_pair + 1]));
         const auto term = e.let(scale * step);
         out[static_cast<std::size_t>(z)] =
             math::fma(term, kir::cast<kir::f32>(acc[z].read()),
@@ -406,6 +447,27 @@ std::string emit_matrix(const KernelShapes &s) {
       e.store(output_row * n + col, out[static_cast<std::size_t>(z)].read());
   }
   return kb.str();
+}
+// The decode panel for the device's matrix generation; a generation without
+// the wave32 iu8 row emits nothing.
+template <std::uint32_t Bits>
+std::string emit_matrix_for(const KernelShapes &s) {
+  const auto target = s.device ? matrix_target(*s.device) : std::nullopt;
+  if (!target) return {};
+  return with_matrix_target<std::string>(
+      *target, [&]<math::MatrixTarget G>() -> std::string {
+        if constexpr (!math::has_matrix_core_row(G, math::MatrixElem::kI32,
+                                                 math::MatrixElem::kSU8, 16,
+                                                 16, 16)) {
+          return {};
+        } else if constexpr (math::matrix_core_row(G, math::MatrixElem::kI32,
+                                                   math::MatrixElem::kSU8, 16,
+                                                   16, 16).wave != 32) {
+          return {};
+        } else {
+          return emit_matrix<Bits, G>(s);
+        }
+      });
 }
 template <bool Cooperative, bool PairStage = false>
 std::string emit_prefill_matrix(const KernelShapes &s) {
@@ -566,7 +628,11 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     if (dispatch::q4_matrix_panel_row(original)) {
       const auto *rule = dispatch::q4_matrix_panel_rule(original);
       if (rule->rows == kRows)
-        return emit_matrix<4>(s);
+        return emit_matrix_for<4>(s);
+      // The 64-row prefill tiles are written for RDNA4's split-K fragment
+      // only; another generation has no rule for them, and says so here.
+      if (matrix_target(*s.device) != math::MatrixTarget::kRdna4)
+        return {};
       return rule->shared_words
                  ? (rule->n == 17408 ? emit_prefill_matrix<true, true>(s)
                                      : emit_prefill_matrix<true>(s))
@@ -642,7 +708,7 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
       return {};
     const auto original = original_shapes(s);
     if (dispatch::q8_matrix_panel_row(original))
-      return emit_matrix<8>(s);
+      return emit_matrix_for<8>(s);
     const auto *kernel = legacy(original);
     return kernel ? kernel->emit_kernel(original) : std::string{};
   }

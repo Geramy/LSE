@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/q8_tuneconfig.h"
 #include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
@@ -37,9 +38,6 @@ struct QuantPlan {
           f == backend::ArchFamily::kRdna4);
 }
 
-struct Q4GemmTile {
-  std::uint32_t bm = 0, bn = 0, wm = 0, wn = 0;
-};
 // The workgroup tile for an M x N contraction. Tall when M fills it; short
 // otherwise, so a short prompt still spreads over the device.
 //
@@ -52,7 +50,11 @@ struct Q4GemmTile {
 // 17408 x K 5120: M 80 0.43 -> 0.31 ms, M 144 0.58 -> 0.44 ms, M 272 1.00
 // -> 0.80 ms, M 656 1.84 -> 1.68 ms; N 5120 x K 17408: M 144 0.65 -> 0.43
 // ms, M 272 1.13 -> 0.84 ms).
-[[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(std::uint64_t m) noexcept {
+// The wide-pass tile is the part's (arch::Tuning::q4_gemm_wide): a
+// generation whose operand fragments are wider than RDNA4's spends its
+// registers differently, so the tile is measured per part.
+[[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(
+    std::uint64_t m, const arch::Tuning& tune = arch::generic::kTuning) noexcept {
   if (m <= 32) return {32, 128, 1, 8};
   if (m <= 64) return {64, 128, 2, 4};
   if (m <= 192) {
@@ -65,7 +67,7 @@ struct Q4GemmTile {
   // down 2.01 -> 1.64 ms). They need sixteen accumulators per wave, which
   // the compiler takes only with its arrays growing per overflow, not per
   // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
-  if (m >= 768) return {256, 128, 4, 2};
+  if (m >= 768) return tune.q4_gemm_wide.bm ? tune.q4_gemm_wide : kQ4GemmWideTile;
   const std::uint64_t rows96 = (m + 95) / 96 * 96, rows144 = (m + 143) / 144 * 144;
   return rows144 <= rows96 ? Q4GemmTile{144, 128, 3, 4} : Q4GemmTile{96, 128, 2, 4};
 }
@@ -84,9 +86,10 @@ inline constexpr std::uint32_t kQ4GemmMinSliceSteps = 16;
 inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
 [[nodiscard]] constexpr std::uint32_t q4_gemm_slices(
     std::uint64_t m, std::uint64_t n, std::uint64_t k,
-    std::uint32_t compute_units) noexcept {
+    std::uint32_t compute_units,
+    const arch::Tuning& tune = arch::generic::kTuning) noexcept {
   if (compute_units == 0 || k % kQ4GemmStepK != 0) return 1;
-  const auto t = q4_gemm_tile(m);
+  const auto t = q4_gemm_tile(m, tune);
   const std::uint64_t tiles = ((m + t.bm - 1) / t.bm) * ((n + t.bn - 1) / t.bn);
   const std::uint64_t steps = k / kQ4GemmStepK;
   const std::uint64_t fill = (q4_gemm_wave48(t) ? 3ull : 2ull) * compute_units;
@@ -170,22 +173,24 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
       return nullptr;
     count *= static_cast<std::uint64_t>(extent);
   }
-  for (const auto& rule : kQ4MatrixPanelShapes) {
-    if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
-        s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
-        s.inputs[0].dim(s.inputs[0].rank() - 1) != rule.k ||
-        s.inputs[0].elem_count() != static_cast<std::uint64_t>(rule.m * rule.k) ||
-        s.inputs[1] != Shape{rule.n, rule.k / 8} ||
-        s.inputs[2] != Shape{rule.n, rule.k / rule.group} ||
-        s.inputs[3] != s.inputs[2])
-      continue;
-    Shape expected;
-    for (std::size_t axis = 0; axis + 1 < s.inputs[0].rank(); ++axis)
-      expected.push_back(s.inputs[0].dim(axis));
-    expected.push_back(rule.n);
-    return s.output == expected ? &rule : nullptr;
-  }
-  return nullptr;
+  const Shape& x = s.inputs[0];
+  const auto* rule = arch::first_rule<&arch::Tuning::q4_matrix_panel_shapes>(
+      s.device ? std::string_view(s.device->arch) : std::string_view{},
+      [&](const Q4MatrixPanelShape& r) {
+        return s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
+               s.iattrs[1] == static_cast<std::int32_t>(r.group) &&
+               x.dim(x.rank() - 1) == r.k &&
+               x.elem_count() == static_cast<std::uint64_t>(r.m * r.k) &&
+               s.inputs[1] == Shape{r.n, r.k / 8} &&
+               s.inputs[2] == Shape{r.n, r.k / r.group} &&
+               s.inputs[3] == s.inputs[2];
+      });
+  if (rule == nullptr) return nullptr;
+  Shape expected;
+  for (std::size_t axis = 0; axis + 1 < x.rank(); ++axis)
+    expected.push_back(x.dim(axis));
+  expected.push_back(rule->n);
+  return s.output == expected ? rule : nullptr;
 }
 [[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s) {
   return q4_matrix_panel_rule(s) != nullptr;
@@ -285,22 +290,22 @@ q4_swiglu_shape(const graph::KernelShapes &s) {
   for (const auto slot : {2u, 3u, 5u, 6u})
     if (s.input_dtypes[slot] != DType::kBF16)
       return nullptr;
-  for (const auto &rule : kQ4SwiGluShapes) {
-    if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
-        s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
-        s.inputs[0] != Shape{1, rule.m, rule.k} ||
-        s.output != Shape{1, rule.m, rule.n} ||
-        s.inputs[1] != Shape{rule.n, rule.k / 8} ||
-        s.inputs[4] != s.inputs[1] ||
-        s.inputs[7] != Shape{rule.m, (rule.k / rule.group) * 25})
-      continue;
-    bool affines = true;
-    for (const auto slot : {2u, 3u, 5u, 6u})
-      affines &= s.inputs[slot] == Shape{rule.n, rule.k / rule.group};
-    if (affines)
-      return &rule;
-  }
-  return nullptr;
+  return arch::first_rule<&arch::Tuning::q4_swiglu_shapes>(
+      s.device ? std::string_view(s.device->arch) : std::string_view{},
+      [&](const Q4SwiGluShape &rule) {
+        if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
+            s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
+            s.inputs[0] != Shape{1, rule.m, rule.k} ||
+            s.output != Shape{1, rule.m, rule.n} ||
+            s.inputs[1] != Shape{rule.n, rule.k / 8} ||
+            s.inputs[4] != s.inputs[1] ||
+            s.inputs[7] != Shape{rule.m, (rule.k / rule.group) * 25})
+          return false;
+        bool affines = true;
+        for (const auto slot : {2u, 3u, 5u, 6u})
+          affines &= s.inputs[slot] == Shape{rule.n, rule.k / rule.group};
+        return affines;
+      });
 }
 [[nodiscard]] inline const Q4SwiGluShape *
 q4_swiglu_rule(const graph::KernelShapes &s) {

@@ -494,140 +494,40 @@ namespace detail {
 
 using ir::Scalar;
 
-// THE table. One place a row is added; one place a variant is looked up.
+// THE table, kept as one header per matrix generation (lse/math/matrix_*.hpp)
+// and joined below: a row is added in its generation's header, and every
+// variant is looked up in the joined table.
 //
 // Verified against this toolchain (clang for gfx1151 / gfx1201 / gfx942):
-// every key below names a builtin that exists with the widths stated. What is
-// NOT verified on hardware is the per-lane layout, and that is exactly what
-// `operands` / `acc_layout` record — the gfx11 rows were measured on gfx1151,
-// everything else says so and declines.
-inline constexpr std::array<MatrixCoreRow, 25> kMatrixCore{{
-    // -- RDNA3 / 3.5, wave32. A/B 16 elements per lane, whole K in each lane.
-    {"wmma.f32.16x16x16.f16", MatrixTarget::kRdna3, MatrixElem::kF32,
-     MatrixElem::kF16, Scalar::kF16, 16, Scalar::kF16, 16, Scalar::kF32, 8, 1,
-     16, 16, 16, 32, MatrixCap::kWmmaF16, 1, 16, 100,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
-    {"wmma.f32.16x16x16.bf16", MatrixTarget::kRdna3, MatrixElem::kF32,
-     MatrixElem::kBF16, Scalar::kBF16, 16, Scalar::kBF16, 16, Scalar::kF32, 8,
-     1, 16, 16, 16, 32, MatrixCap::kWmmaBf16, 1, 16, 100,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
-    // The narrow-accumulate forms take an opsel that selects which half of a
-    // 16-wide accumulator the 8 results land in, so their D mapping is not the
-    // f32 one and has never been measured here.
-    {"wmma.f16.16x16x16.f16", MatrixTarget::kRdna3, MatrixElem::kF16,
-     MatrixElem::kF16, Scalar::kF16, 16, Scalar::kF16, 16, Scalar::kF16, 16, 1,
-     16, 16, 16, 32, MatrixCap::kWmmaF16, 1, 16, 100,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kUnmeasured},
-    {"wmma.bf16.16x16x16.bf16", MatrixTarget::kRdna3, MatrixElem::kBF16,
-     MatrixElem::kBF16, Scalar::kBF16, 16, Scalar::kBF16, 16, Scalar::kBF16, 16,
-     1, 16, 16, 16, 32, MatrixCap::kWmmaBf16, 1, 16, 100,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kUnmeasured},
-    // Four int8 to an i32 lane, eight int4. Same D layout as the f32 form —
-    // measured, see tests/test_jit.cpp matrix_core_int8_*.
-    {"wmma.i32.16x16x16.iu8", MatrixTarget::kRdna3, MatrixElem::kI32,
-     MatrixElem::kI8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kI32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmmaInt8, 1, 16, 200,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
-    {"wmma.i32.16x16x16.su8", MatrixTarget::kRdna3, MatrixElem::kI32,
-     MatrixElem::kSU8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kI32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmmaInt8, 1, 16, 200,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
-    {"wmma.i32.16x16x16.iu4", MatrixTarget::kRdna3, MatrixElem::kI32,
-     MatrixElem::kI4, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 8, 16,
-     16, 16, 32, MatrixCap::kWmmaInt4, 1, 16, 400,
-     OperandLayout::kLaneRowContiguousK, AccLayout::kPairRowHalfWave},
+// every key names a builtin that exists with the widths stated. What is NOT
+// verified on hardware is the per-lane layout, and that is exactly what
+// `operands` / `acc_layout` record -- a row whose layout nobody has measured
+// says so and declines.
+}  // namespace detail
+}  // namespace lse::math
 
-    // -- RDNA4, wave32. Half the RDNA3 operand width: K splits across the
-    // half-waves, which is a different fill, not just a narrower one. gfx1201
-    // is offline here, so nothing below has a measured layout.
-    // Layouts hypothesized from the su8 row's ISA-calculator derivation and
-    // VERIFIED ON DEVICE (gfx1201): the split-K operand fill and block
-    // accumulator mapping are what the generalized tile emits, and the
-    // device-vs-oracle suite is the measurement.
-    {"wmma12.f32.16x16x16.f16", MatrixTarget::kRdna4, MatrixElem::kF32,
-     MatrixElem::kF16, Scalar::kF16, 8, Scalar::kF16, 8, Scalar::kF32, 8, 1, 16,
-     16, 16, 32, MatrixCap::kWmma12F16, 1, 16, 200,
-     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
-    {"wmma12.f32.16x16x16.bf16", MatrixTarget::kRdna4, MatrixElem::kF32,
-     MatrixElem::kBF16, Scalar::kBF16, 8, Scalar::kBF16, 8, Scalar::kF32, 8, 1,
-     16, 16, 16, 32, MatrixCap::kWmma12Bf16, 1, 16, 200,
-     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
-    {"wmma12.f16.16x16x16.f16", MatrixTarget::kRdna4, MatrixElem::kF16,
-     MatrixElem::kF16, Scalar::kF16, 8, Scalar::kF16, 8, Scalar::kF16, 8, 1, 16,
-     16, 16, 32, MatrixCap::kWmma12F16, 1, 16, 200, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
-    {"wmma12.bf16.16x16x16.bf16", MatrixTarget::kRdna4, MatrixElem::kBF16,
-     MatrixElem::kBF16, Scalar::kBF16, 8, Scalar::kBF16, 8, Scalar::kBF16, 8, 1,
-     16, 16, 16, 32, MatrixCap::kWmma12Bf16, 1, 16, 200,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
-    {"wmma12.i32.16x16x16.iu8", MatrixTarget::kRdna4, MatrixElem::kI32,
-     MatrixElem::kI8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Int8, 1, 16, 400,
-     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
-    // The double-K form of the same instruction: 8 int8 per lane is a 64-bit
-    // read on a 128-bit path, so two chained steps fill the load.
-    {"wmma12.i32.16x16x16.iu8", MatrixTarget::kRdna4, MatrixElem::kI32,
-     MatrixElem::kI8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kI32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Int8, 2, 32, 400,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
-    // The mixed form, as on RDNA3: a group-affine code is unsigned and the
-    // activation signed. gfx12 spells the same two signedness immediates, so
-    // this is one row, not a different instruction. Its lane mapping is not
-    // measured, so it does not emit -- see the note above.
-    {"wmma12.i32.16x16x16.su8", MatrixTarget::kRdna4, MatrixElem::kI32,
-     MatrixElem::kSU8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Int8, 1, 16, 400,
-     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
-    {"wmma12.i32.16x16x32.iu4", MatrixTarget::kRdna4, MatrixElem::kI32,
-     MatrixElem::kI4, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kI32, 8, 8, 16,
-     16, 32, 32, MatrixCap::kWmma12Int4, 1, 32, 400,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
-    {"wmma12.f32.16x16x16.fp8_fp8", MatrixTarget::kRdna4, MatrixElem::kF32,
-     MatrixElem::kFp8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kF32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Fp8, 1, 16, 400,
-     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
-    {"wmma12.f32.16x16x16.bf8_bf8", MatrixTarget::kRdna4, MatrixElem::kF32,
-     MatrixElem::kBf8, Scalar::kI32, 2, Scalar::kI32, 2, Scalar::kF32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Fp8, 1, 16, 400,
-     OperandLayout::kLaneRowSplitK, AccLayout::kRowBlockHalfWave},
-    {"wmma12.f32.16x16x16.fp8_fp8", MatrixTarget::kRdna4, MatrixElem::kF32,
-     MatrixElem::kFp8, Scalar::kI32, 4, Scalar::kI32, 4, Scalar::kF32, 8, 4, 16,
-     16, 16, 32, MatrixCap::kWmma12Fp8, 2, 32, 400, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
+// One header per generation; see each for its layouts and references.
+#include "lse/math/matrix_cdna3.hpp"
+#include "lse/math/matrix_rdna3.hpp"
+#include "lse/math/matrix_rdna4.hpp"
 
-    // -- CDNA3, wave64, MFMA. A different instruction family, not a wider
-    // WMMA: 64 lanes cooperate and a lane holds a slice of K, not all of it.
-    // No MI300X here.
-    {"mfma.f32.16x16x16.f16", MatrixTarget::kCdna3, MatrixElem::kF32,
-     MatrixElem::kF16, Scalar::kF16, 4, Scalar::kF16, 4, Scalar::kF32, 4, 1, 16,
-     16, 16, 64, MatrixCap::kMfmaF16, 1, 16, 400, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
-    {"mfma.f32.32x32x8.f16", MatrixTarget::kCdna3, MatrixElem::kF32,
-     MatrixElem::kF16, Scalar::kF16, 4, Scalar::kF16, 4, Scalar::kF32, 16, 1,
-     32, 32, 8, 64, MatrixCap::kMfmaF16, 1, 8, 400, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
-    {"mfma.f32.16x16x16.bf16", MatrixTarget::kCdna3, MatrixElem::kF32,
-     MatrixElem::kBF16, Scalar::kBF16, 4, Scalar::kBF16, 4, Scalar::kF32, 4, 1,
-     16, 16, 16, 64, MatrixCap::kMfmaBf16, 1, 16, 400,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
-    {"mfma.f32.32x32x8.bf16", MatrixTarget::kCdna3, MatrixElem::kF32,
-     MatrixElem::kBF16, Scalar::kBF16, 4, Scalar::kBF16, 4, Scalar::kF32, 16, 1,
-     32, 32, 8, 64, MatrixCap::kMfmaBf16, 1, 8, 400, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
-    // MFMA takes its packed operands as one i64 per lane, not a vector.
-    {"mfma.i32.16x16x32.i8", MatrixTarget::kCdna3, MatrixElem::kI32,
-     MatrixElem::kI8, Scalar::kI64, 1, Scalar::kI64, 1, Scalar::kI32, 4, 8, 16,
-     16, 32, 64, MatrixCap::kMfmaInt8, 1, 32, 800, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
-    {"mfma.f32.16x16x32.fp8_fp8", MatrixTarget::kCdna3, MatrixElem::kF32,
-     MatrixElem::kFp8, Scalar::kI64, 1, Scalar::kI64, 1, Scalar::kF32, 4, 8, 16,
-     16, 32, 64, MatrixCap::kMfmaFp8, 1, 32, 800, OperandLayout::kUnmeasured,
-     AccLayout::kUnmeasured},
-    {"mfma.f32.32x32x16.fp8_fp8", MatrixTarget::kCdna3, MatrixElem::kF32,
-     MatrixElem::kFp8, Scalar::kI64, 1, Scalar::kI64, 1, Scalar::kF32, 16, 8,
-     32, 32, 16, 64, MatrixCap::kMfmaFp8, 1, 16, 800,
-     OperandLayout::kUnmeasured, AccLayout::kUnmeasured},
-}};
+namespace lse::math {
+namespace detail {
+
+template <std::size_t A, std::size_t B, std::size_t C>
+[[nodiscard]] constexpr std::array<MatrixCoreRow, A + B + C> join_rows(
+    const std::array<MatrixCoreRow, A>& a, const std::array<MatrixCoreRow, B>& b,
+    const std::array<MatrixCoreRow, C>& c) noexcept {
+  std::array<MatrixCoreRow, A + B + C> out{};
+  std::size_t i = 0;
+  for (const auto& r : a) out[i++] = r;
+  for (const auto& r : b) out[i++] = r;
+  for (const auto& r : c) out[i++] = r;
+  return out;
+}
+
+inline constexpr auto kMatrixCore = join_rows(kRdna3Rows, kRdna4Rows, kCdna3Rows);
+static_assert(kMatrixCore.size() == 25);
 
 }  // namespace detail
 

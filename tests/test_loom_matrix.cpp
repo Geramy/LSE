@@ -6,6 +6,9 @@
 #include "lse/graph/kernel_env.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/math.hpp"
+#include <algorithm>
+#include <cmath>
+#include <vector>
 using namespace lse;
 namespace {
 template <math::MatrixElem T, math::MatrixElem C>
@@ -32,21 +35,176 @@ Result<backend::LoomBody> print_mma() {
 } // namespace
 LSE_TEST(loom_matrix_uses_shared_measured_rows_and_declines_other_layouts) {
   const auto table = backend::loom_sources();
-  size_t present = 0;
+  size_t rdna3 = 0, rdna4 = 0;
   for (const auto &row : math::matrix_core_table()) {
     const auto *supported = backend::loom_matrix_row(row.key);
     if (supported && row.chained == 1) {
-      ++present;
       LSE_EXPECT(supported->emittable());
-      LSE_EXPECT(supported->target == math::MatrixTarget::kRdna4);
+      LSE_EXPECT(supported->target == math::MatrixTarget::kRdna3 ||
+                 supported->target == math::MatrixTarget::kRdna4);
       LSE_EXPECT(supported->wave == 32 && supported->chained == 1);
       LSE_EXPECT(!table.find(row.key).empty());
+      ++(supported->target == math::MatrixTarget::kRdna3 ? rdna3 : rdna4);
     }
   }
-  LSE_EXPECT(present == 6);
+  // RDNA3/3.5: f32 <- f16/bf16, i32 <- iu8/su8/iu4. RDNA4: f32 <- f16/bf16,
+  // i32 <- iu8/su8, f32 <- fp8/bf8.
+  LSE_EXPECT(rdna3 == 5);
+  LSE_EXPECT(rdna4 == 6);
   LSE_EXPECT(table.find("wmma12.i32.16x16x32.iu4").empty());
-  LSE_EXPECT(table.find("wmma.f32.16x16x16.f16").empty());
+  // The narrow-accumulate forms have no measured D mapping on either part.
+  LSE_EXPECT(table.find("wmma.f16.16x16x16.f16").empty());
+  LSE_EXPECT(table.find("wmma12.f16.16x16x16.f16").empty());
+  LSE_EXPECT(!table.find("wmma.f32.16x16x16.f16").empty());
 }
+
+// The same tile is a different per-lane payload on each generation: RDNA3/3.5
+// gives each lane the whole k step (16 values, the half-waves repeating the
+// same rows), RDNA4 half of it. The schema is what tells loomc which
+// instruction it is, so it has to carry the row's own width.
+LSE_TEST(loom_matrix_spells_each_generation_at_its_own_fragment_width) {
+  const auto table = backend::loom_sources();
+  const auto gfx11 = table.find("wmma.f32.16x16x16.f16");
+  const auto gfx12 = table.find("wmma12.f32.16x16x16.f16");
+  LSE_EXPECT(gfx11.find("payload_elements=16, payload_registers=8") !=
+             std::string_view::npos);
+  LSE_EXPECT(gfx11.find("vector<16xf16>") != std::string_view::npos);
+  LSE_EXPECT(gfx12.find("payload_elements=8, payload_registers=4") !=
+             std::string_view::npos);
+  LSE_EXPECT(gfx12.find("vector<8xf16>") != std::string_view::npos);
+  const auto iu8 = table.find("wmma.i32.16x16x16.iu8");
+  LSE_EXPECT(iu8.find("payload_elements=16, payload_registers=4") !=
+             std::string_view::npos);
+  const auto iu4 = table.find("wmma.i32.16x16x16.iu4");
+  LSE_EXPECT(iu4.find("element_format=u4, payload_elements=16, "
+                      "payload_registers=2") != std::string_view::npos);
+  for (const auto key : {"wmma.f32.16x16x16.f16", "wmma.f32.16x16x16.bf16",
+                         "wmma12.f32.16x16x16.f16"})
+    LSE_EXPECT(backend::loom_result_type(key) == "vector<8xf32>");
+  LSE_EXPECT(backend::loom_result_type("wmma.i32.16x16x16.iu4") ==
+             "vector<8xi32>");
+}
+
+namespace {
+// Where the hardware reads operand value `v` of lane `lane` from, and where it
+// writes accumulator register `e` of lane `lane`, written from AMD's documents
+// and NOT from the row's layout fields, so the two can disagree.
+//
+//   RDNA3/3.5 wave32 (RDNA3 ISA guide, "Wave Matrix Multiply Accumulate";
+//   AMD matrix instruction calculator, --architecture rdna3; Loom
+//   rdna3_wmmar3_* layouts): A[i][k] sits in lane i AND lane i+16, value k
+//   -- the half-waves must hold the same data. B[k][j] likewise in lane j and
+//   j+16. D[i][j] is lane j + 16*(i%2), register i/2.
+//   RDNA4 wave32 (RDNA4 ISA guide; the calculator, --architecture rdna4;
+//   Loom rdna4_wmma_*): A[i][k] is lane i + 16*(k/(K/2)), value k%(K/2): the
+//   half-waves split K and nothing repeats. D[i][j] is lane j + 16*(i/8),
+//   register i%8.
+struct Coord {
+  int row, k;
+};
+Coord documented_operand(const math::MatrixCoreRow &r, int lane, int v) {
+  if (r.target == math::MatrixTarget::kRdna3) return {lane % 16, v};
+  return {lane % 16, (lane / 16) * (r.k / 2) + v};
+}
+Coord documented_acc(const math::MatrixCoreRow &r, int lane, int e) {
+  if (r.target == math::MatrixTarget::kRdna3)
+    return {2 * e + lane / 16, lane % 16};
+  return {e + 8 * (lane / 16), lane % 16};
+}
+
+// One instruction, executed as the documents describe, on fragments filled
+// and an accumulator read back the way every kernel does through
+// geometry_of. Returns the largest error against the plain product, or -1
+// when the fill breaks a hardware rule (an uncovered k, or half-waves that
+// disagree where RDNA3 requires them to repeat).
+double run_documented(const math::MatrixCoreRow &r) {
+  const int M = r.m, N = r.n, K = r.k, W = r.wave;
+  const int per_lane = r.a_len * r.pack;  // operand values in one lane
+  std::vector<double> A(M * K), B(K * N);
+  for (int i = 0; i < M * K; ++i) A[i] = (i * 7 % 13) - 6;
+  for (int i = 0; i < K * N; ++i) B[i] = (i * 5 % 11) - 5;
+  // What the kernel puts in each lane, by the row's geometry: lane L takes
+  // row L % n starting at k = (L / n) * lane_k on a split layout, 0 otherwise.
+  const kernels::TileGeometry g = kernels::geometry_of(r);
+  if (static_cast<int>(g.lane_k) != per_lane) return -1.0;
+  std::vector<double> af(W * per_lane), bf(W * per_lane);
+  for (int lane = 0; lane < W; ++lane) {
+    const int lo = lane % r.n, hi = lane / r.n;
+    const int k0 = g.split_k ? hi * static_cast<int>(g.lane_k) : 0;
+    for (int v = 0; v < per_lane; ++v) {
+      af[lane * per_lane + v] = A[lo * K + k0 + v];
+      bf[lane * per_lane + v] = B[(k0 + v) * N + lo];
+    }
+  }
+  // What the hardware assembles from them.
+  std::vector<double> a(M * K, NAN), b(K * N, NAN);
+  for (int lane = 0; lane < W; ++lane)
+    for (int v = 0; v < per_lane; ++v) {
+      const Coord c = documented_operand(r, lane, v);
+      double &ra = a[c.row * K + c.k], &rb = b[c.k * N + c.row];
+      if (!std::isnan(ra) && (ra != af[lane * per_lane + v] ||
+                              rb != bf[lane * per_lane + v]))
+        return -1.0;
+      ra = af[lane * per_lane + v];
+      rb = bf[lane * per_lane + v];
+    }
+  for (int i = 0; i < M * K; ++i)
+    if (std::isnan(a[i]) || std::isnan(b[i])) return -1.0;
+  // D = A * B, written back the documented way and read the kernel's way.
+  std::vector<double> out(M * N, NAN);
+  for (int lane = 0; lane < W; ++lane)
+    for (int e = 0; e < r.c_len; ++e) {
+      const Coord d = documented_acc(r, lane, e);
+      double acc = 0.0;
+      for (int k = 0; k < K; ++k) acc += a[d.row * K + k] * b[k * N + d.k];
+      const int row = e * static_cast<int>(g.slot_step) +
+                      (lane / r.n) * static_cast<int>(g.half_rows);
+      out[row * N + lane % r.n] = acc;
+    }
+  double worst = 0.0;
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      double want = 0.0;
+      for (int k = 0; k < K; ++k) want += A[i * K + k] * B[k * N + j];
+      const double got = out[i * N + j];
+      if (std::isnan(got)) return -1.0;
+      worst = std::max(worst, std::abs(got - want));
+    }
+  return worst;
+}
+}  // namespace
+
+// Every row Loom emits, on either generation, against a CPU reference of the
+// instruction as AMD documents it. The kernels never index a lane by hand;
+// they go through the row's layout, so this is the check that the layout each
+// generation's row carries is the hardware's.
+LSE_TEST(matrix_rows_match_the_documented_lane_layouts) {
+  size_t checked = 0;
+  for (const auto &row : math::matrix_core_table()) {
+    if (backend::loom_matrix_row(row.key) != &row) continue;
+    const double err = run_documented(row);
+    if (err != 0.0)
+      std::fprintf(stderr, "%.*s: %g\n", static_cast<int>(row.key.size()),
+                   row.key.data(), err);
+    LSE_EXPECT(err == 0.0);
+    ++checked;
+  }
+  LSE_EXPECT(checked == 11);
+  // And the geometry the tiles read agrees with the row: gfx11 holds the
+  // whole k step and interleaves the half-waves' rows, gfx12 splits k and
+  // blocks them.
+  constexpr auto g11 = kernels::geometry_of(math::matrix_core_row(
+      math::MatrixTarget::kRdna3, math::MatrixElem::kF32,
+      math::MatrixElem::kF16, 16, 16, 16));
+  static_assert(!g11.split_k && g11.lane_k == 16 && g11.frag == 16 &&
+                g11.slot_step == 2 && g11.half_rows == 1);
+  constexpr auto g12 = kernels::geometry_of(math::matrix_core_row(
+      math::MatrixTarget::kRdna4, math::MatrixElem::kF32,
+      math::MatrixElem::kF16, 16, 16, 16));
+  static_assert(g12.split_k && g12.lane_k == 8 && g12.frag == 8 &&
+                g12.slot_step == 1 && g12.half_rows == 8);
+}
+
 LSE_TEST(loom_matrix_mixed_signedness_is_a_schema_not_a_type_guess) {
   const auto t = backend::loom_sources().find("wmma12.i32.16x16x16.su8");
   LSE_EXPECT(t.find("element_format=i8") != std::string_view::npos);

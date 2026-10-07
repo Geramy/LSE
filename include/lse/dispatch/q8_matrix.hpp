@@ -1,5 +1,6 @@
 #pragma once
 #include "lse/graph/kernel_primitive.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/q8_tuneconfig.h"
 #include "lse/math.hpp"
 namespace lse::dispatch {
@@ -43,7 +44,7 @@ struct AffineMatrixPlan {
 // planning without a device; the device check also asks for the matrix-core
 // capabilities and LDS a real part reports.
 [[nodiscard]] inline bool q8_packed_weight_arch(std::string_view arch) noexcept {
-  for (const auto& rule : q8_shapes::kMatrixRules)
+  for (const auto& rule : arch::tuning(arch).q8_matrix_rules)
     if (rule.bits == 8 && rule.rows == 16 && rule.arch == arch) return true;
   return false;
 }

@@ -2,6 +2,7 @@
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/hipc/hip_sources.hpp"
 #include "lse/backends/hrx/loomc/loom_sources.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/quant.hpp"
 
 #include <array>
@@ -389,6 +390,76 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
       LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(unchanged.shapes), 1u);
     }
   }
+}
+
+// gfx1151's verify passes take int8 activations, the shared panel (4 and 8
+// rows) and the row ladder (3 and 7) from its own header, as gfx1201's do from its; a part with no
+// such rows (gfx1100) keeps the one-row-at-a-time contraction.
+LSE_TEST(verify_pass_panel_is_qualified_per_part) {
+  for (const int m : {3, 4, 7, 8}) {
+    Fixture f(m, 17408, 5120, 4, true);
+    f.inputs[0] = Shape{1, m, 5120};
+    f.shapes.output = Shape{1, m, 17408};
+    f.device = {};
+    f.amd = {};
+    f.device.arch = "gfx1151";
+    f.device.compute_units = 40;
+    f.device.wavefront_size = 32;
+    f.device.max_threads_per_workgroup = 1024;
+    f.device.lds_bytes_per_workgroup = 65536;
+    backend::apply_arch_defaults(f.device, f.amd);
+    f.device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    f.device.extension = &f.amd;
+    const auto halo = f.plan();
+    LSE_EXPECT(halo.int8_activations);
+    LSE_EXPECT_EQ(halo.shared_activation_panel, m == 4 || m == 8);
+    LSE_EXPECT_EQ(halo.row_ladder_ceiling, m == 3 ? 4u : m == 7 ? 8u : 0u);
+    f.device.arch = "gfx1100";
+    const auto other = f.plan();
+    LSE_EXPECT(!other.int8_activations && !other.shared_activation_panel);
+  }
+}
+
+// Each part's dispatch rows come from its own header and only from there:
+// a device gets its part's rows followed by the generic ones, an unknown part
+// the generic rows alone, and no part reads another's.
+LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
+  namespace arch = dispatch::arch;
+  const auto& r9700 = arch::tuning("gfx1201");
+  const auto& halo = arch::tuning("gfx1151");
+  const auto& other = arch::tuning("gfx1100");
+  LSE_EXPECT(r9700.arch == "gfx1201");
+  LSE_EXPECT(halo.arch == "gfx1151");
+  LSE_EXPECT(other.arch.empty());
+  const auto own = [](const arch::Tuning& t, const auto& rows) {
+    for (const auto& row : rows)
+      if (!row.arch.empty() && row.arch != t.arch) return false;
+    return true;
+  };
+  for (const arch::Tuning* t : {&r9700, &halo, &other}) {
+    LSE_EXPECT(own(*t, t->quant_matrix_shapes) && own(*t, t->quant_int8_rows) &&
+               own(*t, t->quant_matrix_ranges) && own(*t, t->quant_scalar_shapes) &&
+               own(*t, t->quant_row_ladders) && own(*t, t->quant_panel_devices) &&
+               own(*t, t->q4_swiglu_shapes) && own(*t, t->q4_matrix_panel_shapes) &&
+               own(*t, t->q8_matrix_rules) && own(*t, t->q8_panel_rules) &&
+               own(*t, t->flash_wmma) &&
+               own(*t, t->flash_cache) && own(*t, t->decode) &&
+               own(*t, t->split_short) && own(*t, t->wave_l2));
+    // The generic admissions follow every part's own rows.
+    LSE_EXPECT(!t->quant_int8_rows.empty() && t->quant_int8_rows.back().arch.empty());
+    LSE_EXPECT(!t->quant_matrix_ranges.empty() &&
+               t->quant_matrix_ranges.back().arch.empty());
+  }
+  // gfx1201's measured rows, unchanged by the move into its header.
+  LSE_EXPECT_EQ(r9700.quant_matrix_shapes.size(), 4u);
+  LSE_EXPECT_EQ(r9700.q4_matrix_panel_shapes.size(), 6u);
+  LSE_EXPECT_EQ(r9700.q8_matrix_rules.size(), 2u);
+  LSE_EXPECT_EQ(r9700.q8_panel_rules.size(), 2u);
+  // gfx1151 runs the 8-bit decode panel but not wmma_q8_linear's tiles.
+  LSE_EXPECT(halo.q8_matrix_rules.empty() && halo.q8_panel_rules.size() == 1u);
+  LSE_EXPECT_EQ(r9700.decode.size(), 1u);
+  LSE_EXPECT(r9700.flash_prefill && !halo.flash_prefill && !other.flash_prefill);
+  LSE_EXPECT(other.quant_matrix_shapes.empty() && other.flash_wmma.empty());
 }
 
 LSE_TEST_MAIN()

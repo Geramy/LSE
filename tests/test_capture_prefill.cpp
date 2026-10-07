@@ -140,11 +140,15 @@ struct CaptureHipEmitter final : IKernelEmitter {
 struct CaptureBackend : Backend<CaptureBackend> {
   static constexpr std::string_view kName = "capture";
   // Which target the next capture device stands in for: Loom on gfx1201
-  // (the iPad) by default, or HIP on gfx1151 (Linux CI).
-  static inline const bool hip_gfx1151 = [] {
+  // (the iPad) by default, HIP on gfx1151 (Linux CI) for
+  // LSE_CAPTURE_TARGET=gfx1151, or Loom on gfx1151 (Strix Halo, with its
+  // RDNA3.5 matrix rows and tuning) for LSE_CAPTURE_TARGET=gfx1151-loom.
+  static inline const std::string_view capture_target = [] {
     const char* t = std::getenv("LSE_CAPTURE_TARGET");
-    return t != nullptr && std::string_view(t) == "gfx1151";
+    return t != nullptr ? std::string_view(t) : std::string_view{};
   }();
+  static inline const bool hip_gfx1151 = capture_target == "gfx1151";
+  static inline const bool loom_gfx1151 = capture_target == "gfx1151-loom";
   mutable CaptureHipEmitter hip_emitter;
   mutable KernelToolchain hip_chain{Dialect::kHip, &hip_emitter, &compiler_for_hip};
   static inline NullCompiler compiler_for_hip;
@@ -165,11 +169,12 @@ struct CaptureBackend : Backend<CaptureBackend> {
   Status init_impl(int ordinal) {
     LSE_RETURN_IF_ERROR(cpu.init_impl(ordinal));
     info = cpu.device_info_impl();
-    info.arch = hip_gfx1151 ? "gfx1151" : "gfx1201";
-    info.compute_units = hip_gfx1151 ? 40 : 64; info.wavefront_size = 32;
+    const bool gfx1151 = hip_gfx1151 || loom_gfx1151;
+    info.arch = gfx1151 ? "gfx1151" : "gfx1201";
+    info.compute_units = gfx1151 ? 40 : 64; info.wavefront_size = 32;
     info.max_threads_per_workgroup = 1024; info.lds_bytes_per_workgroup = 65536;
     info.total_memory = 34208743424ull;
-    info.name = "capture gfx1201";
+    info.name = "capture " + info.arch;
     apply_arch_defaults(info, amd);
     info.arch_facts = arch_facts_for(info);
     info.extension_id = AmdDeviceInfo::kExtensionId;
@@ -652,6 +657,7 @@ std::uint64_t malloc_in_use() {
 // memory too). Gated: it loads a whole model. Point it at checkpoints:
 //   LSE_TEST_MODEL_TARGET=.../qwen38-27b-q4 [LSE_TEST_MODEL_DFLASH2=...]
 //   LSE_TEST_HOST_BUDGET_MB=256 (default: the host heap a loaded engine may keep)
+//   LSE_TEST_KV_LEN=262100, LSE_TEST_MODEL_MTP=.../qwen38-27b-mtp-q8 (optional)
 LSE_TEST(a_loaded_engine_keeps_little_host_memory) {
   const char* target = std::getenv("LSE_TEST_MODEL_TARGET");
   if (target == nullptr) {
@@ -668,7 +674,10 @@ LSE_TEST(a_loaded_engine_keeps_little_host_memory) {
   lse_config_init(&cfg);
   cfg.model = target;
   if (draft != nullptr) { cfg.dflash2 = 1; cfg.dflash2_model = draft; }
+  if (const char* mtp = std::getenv("LSE_TEST_MODEL_MTP")) cfg.mtp_path = mtp;
   cfg.kv_len = 32768;
+  // A server's own context length, for the kernels a long cache selects.
+  if (const char* kv = std::getenv("LSE_TEST_KV_LEN")) cfg.kv_len = std::atoi(kv);
   cfg.kv_cache_dtype = "bf16";
   cfg.pool = "capture:0";
   cfg.dialect = "loom";

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/kernels/wmma.hpp"
 #include "lse/quant/group_affine_codec.hpp"
 
@@ -75,8 +76,9 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
   const auto budget = backend::workgroup_lds_bytes(s.device);
   const bool staged = !s.staged.name.empty() || !s.staged_quant.codes.empty();
   const auto* amd = backend::device_extension<backend::AmdDeviceInfo>(*s.device);
+  const arch::Tuning& tune = arch::tuning(s.device->arch);
   bool int8_shape = false;
-  for (const auto& rule : kQuantInt8Rows)
+  for (const auto& rule : tune.quant_int8_rows)
     int8_shape |= quant_row_range(rule, s.device->arch, s.device->wavefront_size,
                                  static_cast<std::uint32_t>(s.iattrs[0]),
                                  static_cast<std::uint32_t>(s.iattrs[1]), m);
@@ -86,7 +88,7 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
       if (s.intrinsics->find(symbol).empty()) plan.int8_activations = false;
   }
   bool panel_device = false;
-  for (const auto& rule : kQuantPanelDevices)
+  for (const auto& rule : tune.quant_panel_devices)
     panel_device |= quant_shape_device(rule, s.device->arch, s.device->wavefront_size) &&
         static_cast<std::uint32_t>(s.iattrs[0]) == rule.bits &&
         static_cast<std::uint32_t>(s.iattrs[1]) == rule.group &&
@@ -95,7 +97,7 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
       q4_shared_panel_shape(s) && panel_device;
   if (!staged && plan.int8_activations && s.input_dtypes[2] == DType::kBF16 &&
       s.device->max_threads_per_workgroup >= 256) {
-    for (const auto& rule : kQuantRowLadderShapes) {
+    for (const auto& rule : tune.quant_row_ladders) {
       if (quant_shape_device(rule, s.device->arch, s.device->wavefront_size) &&
           m == rule.m && n == rule.n && k == rule.k && budget >= rule.lds) {
         plan.row_ladder_ceiling = rule.ceiling;
@@ -104,7 +106,7 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
     }
   }
   if (!staged) {
-    for (const auto& rule : kQuantMatrixShapes) {
+    for (const auto& rule : tune.quant_matrix_shapes) {
       if (!quant_shape_device(rule, s.device->arch, s.device->wavefront_size) ||
           static_cast<std::uint32_t>(s.iattrs[0]) != rule.bits || static_cast<std::uint32_t>(s.iattrs[1]) != rule.group ||
           m < rule.min_m || m > rule.max_m || n != rule.n || k != rule.k ||
@@ -120,7 +122,7 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
       return plan;
     }
     if (plan.int8_activations) {
-      for (const auto& rule : kQuantMatrixRanges) {
+      for (const auto& rule : tune.quant_matrix_ranges) {
         if (!quant_row_range(rule, s.device->arch, s.device->wavefront_size,
                              static_cast<std::uint32_t>(s.iattrs[0]),
                              static_cast<std::uint32_t>(s.iattrs[1]), m) ||
@@ -138,7 +140,7 @@ QuantPlan quant_plan(const KernelShapes& s, bool indexed) {
   }
   if (!staged && s.input_dtypes[2] == DType::kBF16 &&
       s.device->max_threads_per_workgroup >= 256) {
-    for (const auto& rule : kQuantScalarShapes) {
+    for (const auto& rule : tune.quant_scalar_shapes) {
       if (!quant_shape_device(rule, s.device->arch, s.device->wavefront_size) ||
           static_cast<std::uint32_t>(s.iattrs[0]) != rule.bits || static_cast<std::uint32_t>(s.iattrs[1]) != rule.group) continue;
       if (m == 1) {
@@ -186,7 +188,7 @@ const math::MatrixCoreRow* q8_matrix_panel_row(const KernelShapes& s) {
        {"bits.f32", "value.f32", "wave.shfl_xor", "rint", "max", "abs"})
     if (s.intrinsics->find(symbol).empty()) return nullptr;
   bool measured = false;
-  for (const auto& rule : q8_shapes::kMatrixRules)
+  for (const auto& rule : arch::tuning(s.device->arch).q8_panel_rules)
     measured |= rule.arch == s.device->arch && rule.wave == s.device->wavefront_size &&
                 rule.bits == 8 && rule.rows == kQ4MatrixPanelRows;
   if (!measured) return nullptr;

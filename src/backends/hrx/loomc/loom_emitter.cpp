@@ -3,6 +3,7 @@
 #include "lse/graph/epilogue_input.hpp"
 #include "lse/graph/terminal_store.hpp"
 #include "lse/dispatch/cache.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/kv/memory.hpp"
 
