@@ -6,7 +6,9 @@
 #include "lse/math.hpp"
 #include "lse/quant/group_affine_codec.hpp"
 
+#include <algorithm>
 #include <array>
+#include <type_traits>
 #include <vector>
 
 namespace lse::kernels {
@@ -185,6 +187,193 @@ void emit_bias(env::Emit &e, const Args &a,
   }
 }
 
+// Several columns per wave. emit_panel gives each wave one column, so every
+// wave reads every row's activation codes and steps for its column alone: at
+// eight rows a lane reads 24 activation words per weight word. Here a wave
+// owns `columns` adjacent columns and each lane reads a run's activations
+// once for all of them. It pays where the grid is large enough to keep the
+// device full with a quarter of the waves -- the vocabulary projection -- and
+// costs the narrower projections occupancy, so the shape table chooses it
+// (Q4PanelShape::columns).
+//
+// Every lane keeps emit_panel's chunks, accumulation order and bias pass for
+// each of its columns. The closing reduction halves the values a lane holds
+// at each xor step instead of reducing every value on every lane; each step
+// adds the same two partial sums the xor tree adds, so each output is the
+// value emit_panel's lane 0 stores, and the lanes store one output each.
+std::string emit_panel_columns(const KernelShapes &s,
+                               const Dot4Schedule &schedule,
+                               std::uint32_t columns) {
+  const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+  const auto k =
+      static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  const auto m = static_cast<std::uint32_t>(s.output.elem_count() / n);
+  const auto lanes = k / 8u, groups = k / 64u, nchunks = k / 8u;
+  const auto stride = groups * 25u;
+  const auto wave = schedule.wave;
+  const auto waves = kBlock / wave;
+  const auto cpl = schedule.chunks_per_lane;
+  const auto span = wave * cpl;
+  const auto per_group = waves * columns;
+  const auto ntiles = (n + per_group - 1) / per_group;
+  const auto rows = schedule.rows;
+  const auto ksplits = schedule.k_splits;
+  const auto values = rows * columns;
+  if (wave != 32 || (values & (values - 1)) != 0 || values > wave ||
+      (cpl != 1 && cpl != 2 && cpl != 4))
+    return {};
+  kir::KernelBody kb(s.types, *s.intrinsics, 0);
+  kb.set_store(s.store);
+  Args a;
+  if (!env::bind(kb, a, s))
+    return {};
+  env::Emit e{&kb};
+  const auto lid = e.let(math::local_id());
+  const auto wave_id = e.let(lid / wave);
+  const auto lane = e.let(lid % wave);
+  const auto tile = e.let(math::workgroup_id_x());
+  const auto col0 = e.let((tile * waves + wave_id) * columns);
+  const auto row = e.let(math::workgroup_id_y() * rows);
+  // acc[c * rows + r]: column c, row r.
+  std::vector<kir::LValue<kir::f32>> acc;
+  acc.reserve(values);
+  for (std::uint32_t v = 0; v < values; ++v)
+    acc.push_back(e.var(0.0f));
+  std::vector<kir::Val<kir::u32>> panel_base, row_base, scale_base;
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    const auto input_row = e.let(select(row + r < m, row + r, e.u32(0)));
+    panel_base.push_back(e.let(input_row * stride));
+  }
+  for (std::uint32_t c = 0; c < columns; ++c) {
+    // A column past the end reads the last column; it is never stored.
+    const auto col = e.let(col0 + c);
+    const auto safe = e.let(select(col < n, col, e.u32(n - 1u)));
+    row_base.push_back(e.let(safe * lanes));
+    scale_base.push_back(e.let(safe * groups));
+  }
+  // One run of `count` chunks at `chunk` for every column: the weight words
+  // and scales first, then each row's codes once for all columns.
+  const auto run = [&](const kir::Val<kir::u32> &chunk, std::uint32_t count) {
+    std::vector<std::vector<std::array<kir::Val<kir::u32>, 2>>> planes(columns);
+    std::vector<kir::Val<kir::f32>> wscale;
+    {
+      std::vector<kir::Pack<kir::u32>> words;
+      using Raw = std::remove_cvref_t<decltype(a.scales[e.u32(0)])>;
+      std::vector<Raw> raw;
+      const auto group = e.let(chunk / 8u);
+      for (std::uint32_t c = 0; c < columns; ++c) {
+        words.push_back(e.load(a.packed, e.let(row_base[c] + chunk), count * 4u));
+        raw.push_back(e.let(a.scales[scale_base[c] + group]));
+      }
+      for (std::uint32_t c = 0; c < columns; ++c) {
+        for (std::uint32_t j = 0; j < count; ++j) {
+          const auto word = e.let(words[c][static_cast<int>(j)]);
+          std::array<kir::Val<kir::u32>, 2> value;
+          for (std::size_t plane = 0; plane < 2; ++plane)
+            value[plane] =
+                quant::dot4_code_plane(e, word, static_cast<int>(plane));
+          planes[c].push_back(value);
+        }
+        wscale.push_back(e.let(math::widen(raw[c])));
+      }
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      std::vector<kir::Val<kir::u32>> codes;
+      for (std::uint32_t at = 0; at < count * 2u; at += 4u) {
+        const auto width = std::min(4u, count * 2u - at);
+        const auto pack = e.load(
+            a.panel, e.let(panel_base[r] + chunk * 2u + at), width * 4u);
+        for (std::uint32_t w = 0; w < width; ++w)
+          codes.push_back(e.let(pack[static_cast<int>(w)]));
+      }
+      const auto steps =
+          e.load(a.panel, e.let(panel_base[r] + k / 4u + chunk), count * 4u);
+      std::vector<kir::Val<kir::f32>> step;
+      for (std::uint32_t j = 0; j < count; ++j)
+        step.push_back(
+            e.let(math::from_bits<lse::f32>(steps[static_cast<int>(j)])));
+      for (std::uint32_t c = 0; c < columns; ++c) {
+        auto facc = e.var(e.f32(0.0f));
+        for (std::uint32_t j = 0; j < count; ++j) {
+          auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
+          for (std::size_t plane = 0; plane < 2; ++plane)
+            iacc = math::dot4_iu8(kir::cast<kir::i32>(codes[j * 2u + plane]),
+                                  kir::cast<kir::i32>(planes[c][j][plane]),
+                                  iacc.read());
+          facc = math::fma(step[j], kir::cast<kir::f32>(iacc.read()),
+                           facc.read());
+        }
+        auto &target = acc[c * rows + r];
+        target = math::fma(wscale[c], facc.read(), target.read());
+      }
+    }
+  };
+  if (auto in_grid = e.when(tile < ntiles && row < m)) {
+    for (std::uint32_t ks = 0; ks < ksplits; ++ks) {
+      const auto cb = ks * (nchunks / ksplits);
+      const auto ce = cb + nchunks / ksplits;
+      const auto ntile = ce - cb;
+      const auto aligned = (ntile / span) * span;
+      for (auto c0 : e.range(cb, cb + aligned, span))
+        run(e.let(c0 + lane * cpl), cpl);
+      if (aligned < ntile)
+        for (auto chunk : e.range(e.u32(cb + aligned) + lane, e.u32(ce), wave))
+          run(chunk, 1);
+      for (auto g : e.range(e.u32(cb / 8u) + lane, e.u32(ce / 8u), wave)) {
+        std::vector<kir::Val<kir::f32>> bias;
+        for (std::uint32_t c = 0; c < columns; ++c)
+          bias.push_back(e.let(math::widen(a.biases[scale_base[c] + g])));
+        for (std::uint32_t r = 0; r < rows; ++r) {
+          const auto sum = e.let(math::from_bits<lse::f32>(
+              a.panel[panel_base[r] + 3u * k / 8u + g]));
+          for (std::uint32_t c = 0; c < columns; ++c) {
+            auto &target = acc[c * rows + r];
+            target = math::fma(bias[c], sum, target.read());
+          }
+        }
+      }
+    }
+  }
+  // Outside every guard: the shuffles are wave-cooperative. At the step for
+  // bit b a lane keeps the half of its values its bit b selects and receives
+  // its partner's copy of that half.
+  std::vector<kir::Val<kir::f32>> held;
+  for (std::uint32_t v = 0; v < values; ++v)
+    held.push_back(acc[v].read());
+  for (std::uint32_t bit = 1; bit < wave; bit <<= 1) {
+    if (held.size() == 1) {
+      held[0] = e.let(held[0] + math::shfl_xor(held[0], e.u32(bit)));
+      continue;
+    }
+    const auto upper = e.let(lane / bit % 2u == 1u);
+    const auto half = held.size() / 2;
+    std::vector<kir::Val<kir::f32>> next;
+    for (std::size_t i = 0; i < half; ++i) {
+      const auto keep = e.let(select(upper, held[half + i], held[i]));
+      const auto send = e.let(select(upper, held[i], held[half + i]));
+      next.push_back(e.let(keep + math::shfl_xor(send, e.u32(bit))));
+    }
+    held = std::move(next);
+  }
+  // A lane's value index is its low bits reversed: bit 1 chose the top half
+  // of all `values`, bit 2 the top half of what remained, and so on.
+  auto index = e.u32(0);
+  {
+    std::uint32_t weight = values / 2u;
+    for (std::uint32_t bit = 1; weight > 0; bit <<= 1, weight /= 2u)
+      index = e.let(index + (lane / bit % 2u) * weight);
+  }
+  const auto c = e.let(index / rows);
+  const auto r = e.let(index % rows);
+  const auto col = e.let(col0 + c);
+  const auto rr = e.let(row + r);
+  const auto owner = e.let(lane < values);
+  if (auto writer = e.when(owner && tile < ntiles && col < n && rr < m))
+    e.store(rr * n + col, held[0]);
+  return kb.str();
+}
+
+
 std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule,
                        std::uint32_t load_chunks) {
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
@@ -306,9 +495,13 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
       return kernel ? kernel->emit_kernel(original) : std::string{};
     }
     const auto schedule = schedule_for(original);
-    return schedule.valid()
-        ? emit_panel(s, schedule, dispatch::q4_shared_panel_load_chunks(original))
-        : std::string{};
+    if (!schedule.valid())
+      return {};
+    if (const auto columns = dispatch::q4_shared_panel_columns(original);
+        columns > 1)
+      return emit_panel_columns(s, schedule, columns);
+    return emit_panel(s, schedule,
+                      dispatch::q4_shared_panel_load_chunks(original));
   }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     if (!valid_panel(s))
@@ -322,7 +515,8 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
     if (!schedule.valid())
       return {};
     ThreadPlan plan;
-    const auto columns = kBlock / schedule.wave;
+    const auto columns =
+        kBlock / schedule.wave * dispatch::q4_shared_panel_columns(original);
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
     plan.workgroup_size[0] = kBlock;
     plan.workgroup_count[0] = (n + columns - 1) / columns;

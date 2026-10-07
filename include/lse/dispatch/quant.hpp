@@ -234,6 +234,12 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   return rule && quant_plan(s).shared_activation_panel ? rule->load_chunks : 1;
 }
 
+[[nodiscard]] inline std::uint32_t q4_shared_panel_columns(
+    const graph::KernelShapes& s) {
+  const auto* rule = q4_shared_panel_rule(s);
+  return rule && quant_plan(s).shared_activation_panel ? rule->columns : 1;
+}
+
 [[nodiscard]] inline const Q4SwiGluShape *
 q4_swiglu_shape(const graph::KernelShapes &s) {
   if (s.inputs.size() != 8 || s.input_dtypes.size() != 8 ||

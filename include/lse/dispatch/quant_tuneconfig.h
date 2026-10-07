@@ -90,6 +90,8 @@ struct Q4PanelShape {
   std::int64_t m, n, k;
   std::uint32_t rows = 0;
   std::uint32_t load_chunks = 1;
+  // Adjacent columns one wave owns; rows * columns is at most a wave.
+  std::uint32_t columns = 1;
 };
 inline constexpr std::array kQ4PanelShapes{
     Q4PanelShape{1, 17408, 5120, 0, 4},
@@ -97,15 +99,15 @@ inline constexpr std::array kQ4PanelShapes{
     Q4PanelShape{4, 17408, 5120, 0, 2},  Q4PanelShape{4, 5120, 17408},
     Q4PanelShape{4, 10240, 5120, 0, 2},  Q4PanelShape{4, 6144, 5120, 0, 2},
     Q4PanelShape{4, 12288, 5120},  Q4PanelShape{4, 5120, 6144},
-    Q4PanelShape{4, 248320, 5120}, Q4PanelShape{7, 248320, 5120, 8, 4},
+    Q4PanelShape{4, 248320, 5120}, Q4PanelShape{7, 248320, 5120, 8, 4, 4},
     Q4PanelShape{6, 17408, 5120, 8}, Q4PanelShape{6, 5120, 17408, 8},
     Q4PanelShape{6, 10240, 5120, 8}, Q4PanelShape{6, 6144, 5120, 8},
     Q4PanelShape{6, 12288, 5120, 8}, Q4PanelShape{6, 5120, 6144, 8},
-    Q4PanelShape{6, 248320, 5120, 8},
+    Q4PanelShape{6, 248320, 5120, 8, 1, 4},
     Q4PanelShape{8, 17408, 5120, 8, 4}, Q4PanelShape{8, 5120, 17408, 8, 2},
     Q4PanelShape{8, 10240, 5120, 8, 4}, Q4PanelShape{8, 6144, 5120, 8, 2},
     Q4PanelShape{8, 12288, 5120, 8, 4}, Q4PanelShape{8, 5120, 6144, 8, 2},
-    Q4PanelShape{8, 248320, 5120, 8, 4}, Q4PanelShape{8, 48, 5120, 8},
+    Q4PanelShape{8, 248320, 5120, 8, 4, 4}, Q4PanelShape{8, 48, 5120, 8},
 };
 
 
