@@ -563,4 +563,9 @@ if(LSE_ENABLE_HRX)
   add_test(NAME test_capture_prefill_hip_gfx1151 COMMAND test_capture_prefill
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(test_capture_prefill_hip_gfx1151 PROPERTIES ENVIRONMENT "LSE_CAPTURE_TARGET=gfx1151")
+  # And on one standing in for Loom on gfx1151 (Strix Halo), whose matrix
+  # kernels take the RDNA3.5 rows and the gfx1151 tuning header.
+  add_test(NAME test_capture_prefill_loom_gfx1151 COMMAND test_capture_prefill
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(test_capture_prefill_loom_gfx1151 PROPERTIES ENVIRONMENT "LSE_CAPTURE_TARGET=gfx1151-loom")
 endif()
