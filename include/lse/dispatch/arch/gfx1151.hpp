@@ -50,6 +50,32 @@ inline constexpr std::array kQ4MatrixPanelShapes{
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 8, 5120, 17408},
 };
 
+// Single-row decode contractions over the shared int8 activation panel. The
+// panel is quantized once per activation (quant_activation_panel.cpp) and
+// every contraction over it reads it, where without a row each workgroup
+// requantizes the whole activation in its own scratch. kQ4PanelShapes gives
+// every part the MLP's two; these are the attention projections that share
+// the layer's normed input. Measured on the 8060S in the pinned model (GPU
+// kernel time per call, rocprofv3, 1024-token prompt, 64 decoded tokens):
+//   GDN in_proj_qkv 10240 x 5120   136.0 -> 127.5 us
+//   GDN in_proj_z    6144 x 5120    86.2 ->  78.6 us
+//   attn q+gate     12288 x 5120   164.3 -> 152.6 us
+//   attn k, v        1024 x 5120    18.9 ->  14.8 us
+//   GDN in_proj_a, b   48 x 5120   9.2, 7.9 -> 6.0, 5.0 us
+// and a decode step 75.4 -> 73.6 ms (13.17 -> 13.48 tok/s) with the panel
+// launches they add. Two-chunk activation loads; one chunk for the 48-row
+// projections, whose single wave column per row has no second to pair. Not
+// here: the 5120 x 6144 output projection, which reads the panel slower
+// (85.5 -> 108.4 us), and two columns per wave, slower on every shape (down
+// projection 222 -> 251 us, vocabulary projection 3066 -> 3225 us).
+inline constexpr std::array kQ4DecodePanelShapes{
+    Q4PanelShape{1, 10240, 5120, 0, 2, 1, kArch},
+    Q4PanelShape{1, 6144, 5120, 0, 2, 1, kArch},
+    Q4PanelShape{1, 12288, 5120, 0, 2, 1, kArch},
+    Q4PanelShape{1, 1024, 5120, 0, 2, 1, kArch},
+    Q4PanelShape{1, 48, 5120, 0, 1, 1, kArch},
+};
+
 // The prefill GEMM's wide-pass tile (M >= 768): 256 x 128 outputs on 4 x 4
 // waves of 64 x 32. gfx1201's 64 x 64 wave tile holds 16 accumulators and
 // 8 operand fragments, and a gfx11 fragment is twice as wide, so on gfx1151
@@ -118,6 +144,7 @@ inline constexpr Tuning kTuning{
     .quant_panel_devices = kQuantPanelDevices,
     .q4_swiglu_shapes = kQ4SwiGluShapes,
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
+    .q4_panel_shapes = kQ4DecodePanelShapes,
     .q8_panel_rules = kQ8PanelRules,
     .flash_wmma = kFlashWmmaRules,
     .decode = kDecodeRules,
@@ -132,6 +159,7 @@ static_assert(rows_name(kQuantInt8Rows, kArch) &&
               rows_name(kQ4SwiGluShapes, kArch) &&
               rows_name(kQuantMatrixRanges, kArch) &&
               rows_name(kQ4MatrixPanelShapes, kArch) &&
+              rows_name(kQ4DecodePanelShapes, kArch) &&
               rows_name(kQ8PanelRules, kArch) &&
               rows_name(kFlashWmmaRules, kArch) &&
               rows_name(kDecodeRules, kArch) &&

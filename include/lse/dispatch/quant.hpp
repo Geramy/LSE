@@ -126,8 +126,11 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
          m * static_cast<std::uint64_t>(n) <= UINT32_MAX &&
          static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(lanes) <= UINT32_MAX;
 }
+// `arch` adds that part's own rows (arch::Tuning::q4_panel_shapes) after the
+// shared table; the graph names the device it builds for, a kernel reads it
+// from its shapes.
 [[nodiscard]] inline const Q4PanelShape* q4_shared_panel_rule(
-    const graph::KernelShapes& s) {
+    const graph::KernelShapes& s, std::string_view arch) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
       s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
       s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
@@ -141,6 +144,11 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     if (n == shape.n && k == shape.k &&
         s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
       measured = &shape;
+  if (!measured && !arch.empty())
+    for (const auto& shape : arch::tuning(arch).q4_panel_shapes)
+      if (shape.arch == arch && n == shape.n && k == shape.k &&
+          s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
+        measured = &shape;
   if (!measured || s.inputs[1] != Shape{n, k / 8} ||
       s.inputs[2] != Shape{n, k / 64} || s.inputs[3] != s.inputs[2])
     return nullptr;
@@ -149,6 +157,15 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     output.push_back(s.inputs[0].dim(i));
   output.push_back(n);
   return s.output == output ? measured : nullptr;
+}
+[[nodiscard]] inline const Q4PanelShape* q4_shared_panel_rule(
+    const graph::KernelShapes& s) {
+  return q4_shared_panel_rule(
+      s, s.device ? std::string_view(s.device->arch) : std::string_view{});
+}
+[[nodiscard]] inline bool q4_shared_panel_shape(const graph::KernelShapes& s,
+                                                std::string_view arch) {
+  return q4_shared_panel_rule(s, arch) != nullptr;
 }
 [[nodiscard]] inline bool q4_shared_panel_shape(const graph::KernelShapes& s) {
   return q4_shared_panel_rule(s) != nullptr;
