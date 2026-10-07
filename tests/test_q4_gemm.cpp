@@ -171,19 +171,58 @@ LSE_TEST(q4_gemm_emits_for_every_tile_and_width_on_a_described_device) {
   }
 }
 
+namespace {
+// Operand registers per f16 fragment on each generation, from its own row.
+std::uint32_t fragment_registers(math::MatrixTarget target) {
+  for (const auto& row : math::matrix_core_table())
+    if (row.target == target && row.acc == math::MatrixElem::kF32 &&
+        row.operand == math::MatrixElem::kF16 && row.m == 16 && row.n == 16 &&
+        row.k_step == 16 && row.chained == 1 && row.emittable())
+      return dispatch::q4_gemm_fragment_registers(&row);
+  return 0;
+}
+}  // namespace
+
 LSE_TEST(q4_gemm_slices_fill_the_device_without_starving_a_slice) {
   // 64 compute units: a narrow M=32 projection over K=17408 is sliced, a
   // full M=1024 one is not, and every slice keeps at least the minimum steps.
-  LSE_EXPECT_EQ(dispatch::q4_gemm_slices(1024, 17408, 5120, 64), 1u);
-  LSE_EXPECT(dispatch::q4_gemm_slices(32, 5120, 17408, 64) > 1u);
-  for (const auto k : {5120ull, 6144ull, 17408ull})
-    for (const auto m : {16ull, 32ull, 128ull, 1024ull}) {
-      const auto s = dispatch::q4_gemm_slices(m, 5120, k, 64);
-      LSE_EXPECT((k / dispatch::kQ4GemmStepK) % s == 0);
-      LSE_EXPECT(s == 1 || k / dispatch::kQ4GemmStepK / s >=
-                               dispatch::kQ4GemmMinSliceSteps);
-    }
-  LSE_EXPECT_EQ(dispatch::q4_gemm_slices(32, 5120, 17408, 0), 1u);
+  for (const auto target : {math::MatrixTarget::kRdna4, math::MatrixTarget::kRdna3}) {
+    const auto regs = fragment_registers(target);
+    LSE_EXPECT_EQ(dispatch::q4_gemm_slices(1024, 17408, 5120, 64, regs), 1u);
+    LSE_EXPECT(dispatch::q4_gemm_slices(32, 5120, 17408, 64, regs) > 1u);
+    for (const auto k : {5120ull, 6144ull, 17408ull})
+      for (const auto m : {16ull, 32ull, 128ull, 1024ull}) {
+        const auto s = dispatch::q4_gemm_slices(m, 5120, k, 64, regs);
+        LSE_EXPECT((k / dispatch::kQ4GemmStepK) % s == 0);
+        LSE_EXPECT(s == 1 || k / dispatch::kQ4GemmStepK / s >=
+                                 dispatch::kQ4GemmMinSliceSteps);
+      }
+    LSE_EXPECT_EQ(dispatch::q4_gemm_slices(32, 5120, 17408, 0, regs), 1u);
+  }
+}
+
+// The wave tile is sized to what the generation's fragments leave in a
+// lane's registers: RDNA4 takes the 64x64 wave tiles on wide passes, RDNA3/3.5,
+// whose f16 fragment is twice as wide, keeps the 48x32 ones. Below 768 rows
+// both generations take the same tiles.
+LSE_TEST(q4_gemm_tile_follows_the_generations_fragment_width) {
+  const auto rdna4 = fragment_registers(math::MatrixTarget::kRdna4);
+  const auto rdna3 = fragment_registers(math::MatrixTarget::kRdna3);
+  LSE_EXPECT_EQ(rdna4, 4u);
+  LSE_EXPECT_EQ(rdna3, 8u);
+  for (const std::uint64_t m : {768ull, 1024ull, 4096ull}) {
+    const auto t4 = dispatch::q4_gemm_tile(m, rdna4);
+    const auto t3 = dispatch::q4_gemm_tile(m, rdna3);
+    LSE_EXPECT((t4.bm == 256 && t4.wm == 4 && t4.wn == 2));
+    LSE_EXPECT(dispatch::q4_gemm_wave48(t3));
+    LSE_EXPECT(dispatch::q4_gemm_matrix_registers(t3, rdna3) <=
+               dispatch::kQ4GemmMatrixRegisters);
+  }
+  for (const std::uint64_t m : {9ull, 16ull, 33ull, 64ull, 137ull, 512ull, 767ull}) {
+    const auto t4 = dispatch::q4_gemm_tile(m, rdna4);
+    const auto t3 = dispatch::q4_gemm_tile(m, rdna3);
+    LSE_EXPECT((t4.bm == t3.bm && t4.bn == t3.bn && t4.wm == t3.wm && t4.wn == t3.wn));
+  }
 }
 
 int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
