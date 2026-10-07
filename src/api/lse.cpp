@@ -671,8 +671,12 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
 
   // Kernels are specialized to pass shapes; every shape a request can take is
   // made resident now, so no request emits or loads one between its launches.
-  progress::begin("preparing_kernels");
-  {
+  // The host interpreter (a CPU-only build, or cpu named in --pool) runs no
+  // generated kernels, so there is nothing to make resident for it.
+  const graph::KernelToolchain* const prepare_tc = sched->toolchain(devices->primary());
+  if (sched->mode() == graph::Scheduler::Mode::kDeviceFirst && prepare_tc != nullptr &&
+      prepare_tc->emitter != nullptr) {
+    progress::begin("preparing_kernels");
     const auto started = std::chrono::steady_clock::now();
     if (const Status s = e.router->prepare_kernels(); !s.ok())
       return fail(s, "preparing kernels");
