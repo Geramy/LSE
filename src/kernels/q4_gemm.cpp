@@ -233,12 +233,11 @@ Dims dims_of(const KernelShapes& s, bool sliced) {
 }
 
 std::uint32_t burst_steps(const Dims& d, const struct Tile& t);
-const math::MatrixCoreRow* f16_row(const KernelShapes& s);
-// The tile follows the row: a generation with wider operand fragments takes
-// the wave tiles its registers hold (dispatch::q4_gemm_tile).
+// The part's tile (its tuning header picks the wide-pass one).
 Tile tile_for(const KernelShapes& s, const Dims& d) {
   const auto t = dispatch::q4_gemm_tile(
-      d.m, dispatch::q4_gemm_fragment_registers(f16_row(s)));
+      d.m, dispatch::arch::tuning(s.device ? std::string_view(s.device->arch)
+                                           : std::string_view{}));
   return {t.bm, t.bn, t.wm, t.wn};
 }
 
@@ -293,8 +292,7 @@ std::uint32_t lds_bytes(const Tile& t) {
 }
 
 bool device_fits(const KernelShapes& s, const Dims& d) {
-  if (!d.valid || !s.device || !s.intrinsics || f16_row(s) == nullptr)
-    return false;
+  if (!d.valid || !s.device || !s.intrinsics) return false;
   const Tile t = tile_for(s, d);
   // Every thread stages the same number of activation pieces.
   if (s.device->wavefront_size != 32u ||
@@ -304,7 +302,8 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
   if (device_load_bytes(s.device) < 16u) return false;
   for (const auto symbol : {"barrier", d.bits == 8 ? "q8x8.f16" : "q4x8.f16"})
     if (s.intrinsics->find(symbol).empty()) return false;
-  return backend::workgroup_lds_bytes(s.device) >= lds_bytes(t);
+  return backend::workgroup_lds_bytes(s.device) >= lds_bytes(tile_for(s, d)) &&
+         f16_row(s) != nullptr;
 }
 
 template <class S, math::MatrixTarget G>

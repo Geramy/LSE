@@ -314,8 +314,8 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
     const auto m = sx.elem_count() / k;
     const std::uint32_t slices = dispatch::q4_gemm_slices(
         m, static_cast<std::uint64_t>(packed.shape().dim(0)), k, compute_units,
-        dispatch::q4_gemm_fragment_registers(
-            device ? dispatch::q4_gemm_row(*device) : nullptr));
+        dispatch::arch::tuning(device ? std::string_view(device->arch)
+                                      : std::string_view{}));
     if (slices > 1) {
       // K cut into slices: one launch writes a partial product per slice,
       // a second sums them, and trailing elementwise work fuses into the sum.

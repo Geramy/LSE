@@ -154,7 +154,7 @@ bool compile_q4_gemm(backend::DeviceInfo &info, backend::LoomcCompiler &compiler
   const std::uint32_t slices = dispatch::q4_gemm_slices(
       static_cast<std::uint64_t>(m), static_cast<std::uint64_t>(n),
       static_cast<std::uint64_t>(k), info.compute_units,
-      dispatch::q4_gemm_fragment_registers(dispatch::q4_gemm_row(info)));
+      dispatch::arch::tuning(info.arch));
   auto gemm = std::make_shared<graph::Node>();
   gemm->set_kind(graph::OpKind::kCustom);
   gemm->dtype = DType::kF32;

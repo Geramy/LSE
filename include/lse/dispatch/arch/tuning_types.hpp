@@ -51,6 +51,10 @@ struct Tuning {
   // FlashPrefill's block-sparse prefill attention (pool, selector and
   // mean-corrected matrix kernels) is qualified on this part.
   bool flash_prefill = false;
+
+  // The prefill GEMM's tile for wide passes (q4_gemm_tile, M >= 768); unset
+  // takes the generic 256 x 128 tile of 64x64 wave tiles.
+  Q4GemmTile q4_gemm_wide{};
 };
 
 // One part's rows followed by the generic ones, as one array.

@@ -15,6 +15,13 @@ enum class QuantMatrix : std::uint8_t { kNone, kInt8, kInt8Lds, kBF16 };
 inline constexpr std::uint32_t kQ4GemmStepK = 64;
 inline constexpr std::uint64_t kQ4GemmMinRows = 9;
 inline constexpr std::uint32_t kQ4MatrixLdsBytes = 6656;
+// A prefill GEMM workgroup tile: BM x BN outputs on WM x WN waves.
+struct Q4GemmTile {
+  std::uint32_t bm = 0, bn = 0, wm = 0, wn = 0;
+};
+// The wide-pass tile a part without its own (arch::Tuning::q4_gemm_wide)
+// takes: 256 x 128 outputs on 4 x 2 waves of 64 x 64.
+inline constexpr Q4GemmTile kQ4GemmWideTile{256, 128, 4, 2};
 
 struct QuantMatrixShape {
   std::string_view arch;

@@ -7,7 +7,6 @@
 #include "lse/dispatch/q8_tuneconfig.h"
 #include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
-#include "lse/kernels/wmma.hpp"
 #include "lse/math.hpp"
 
 namespace lse::dispatch {
@@ -39,34 +38,6 @@ struct QuantPlan {
           f == backend::ArchFamily::kRdna4);
 }
 
-struct Q4GemmTile {
-  std::uint32_t bm = 0, bn = 0, wm = 0, wn = 0;
-};
-// The f16 matrix row the tiled GEMM multiplies with on this device's
-// generation (f32 += f16 x f16, 16x16x16, one instruction), or null. Asked of
-// the device alone, so the graph can size the GEMM before any kernel exists;
-// the kernel asks again with the dialect's spellings.
-[[nodiscard]] inline const math::MatrixCoreRow* q4_gemm_row(
-    const backend::DeviceInfo& d) noexcept {
-  const auto target = kernels::matrix_target(d);
-  if (!target) return nullptr;
-  const auto caps = kernels::device_matrix_caps(d);
-  for (const auto& row : math::matrix_core_table())
-    if (row.target == *target && row.wave == d.wavefront_size &&
-        row.wave == 32 && row.acc == math::MatrixElem::kF32 &&
-        row.operand == math::MatrixElem::kF16 && row.m == 16 && row.n == 16 &&
-        row.k_step == 16 && row.chained == 1 && row.emittable() &&
-        math::has_cap(caps, row.cap))
-      return &row;
-  return nullptr;
-}
-// Registers one operand fragment of that row takes in a lane; 0 without one.
-[[nodiscard]] constexpr std::uint32_t q4_gemm_fragment_registers(
-    const math::MatrixCoreRow* row) noexcept {
-  return row ? static_cast<std::uint32_t>(row->a_len) *
-                   ir::scalar_bytes(row->a_elem) / 4u
-             : 0u;
-}
 // The workgroup tile for an M x N contraction. Tall when M fills it; short
 // otherwise, so a short prompt still spreads over the device.
 //
@@ -79,24 +50,11 @@ struct Q4GemmTile {
 // 17408 x K 5120: M 80 0.43 -> 0.31 ms, M 144 0.58 -> 0.44 ms, M 272 1.00
 // -> 0.80 ms, M 656 1.84 -> 1.68 ms; N 5120 x K 17408: M 144 0.65 -> 0.43
 // ms, M 272 1.13 -> 0.84 ms).
-//
-// What a lane holds for one wave tile is the matrix generation's business,
-// not the tile's: an f16 operand fragment is 4 registers on RDNA4, where the
-// half-waves split K, and 8 on RDNA3/3.5, where each lane carries the whole
-// K step. `fragment_registers` is that width, from the device's matrix row.
-[[nodiscard]] constexpr std::uint32_t q4_gemm_matrix_registers(
-    const Q4GemmTile& t, std::uint32_t fragment_registers) noexcept {
-  if (t.wm == 0 || t.wn == 0) return 0;
-  const std::uint32_t fm = t.bm / t.wm / 16u, fn = t.bn / t.wn / 16u;
-  return fm * fn * 8u + (fm + fn) * fragment_registers;
-}
-// Registers the wide tile may give its accumulators and operand fragments.
-// The rest of a 256-register wave goes to staging and addresses: the 64x64
-// wave tile compiles to 248 registers on gfx1201 with 160 here, and to all
-// 256 with a scratch spill on gfx1151 with 192 (loomc at the HRX pin).
-inline constexpr std::uint32_t kQ4GemmMatrixRegisters = 160;
+// The wide-pass tile is the part's (arch::Tuning::q4_gemm_wide): a
+// generation whose operand fragments are wider than RDNA4's spends its
+// registers differently, so the tile is measured per part.
 [[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(
-    std::uint64_t m, std::uint32_t fragment_registers) noexcept {
+    std::uint64_t m, const arch::Tuning& tune = arch::generic::kTuning) noexcept {
   if (m <= 32) return {32, 128, 1, 8};
   if (m <= 64) return {64, 128, 2, 4};
   if (m <= 192) {
@@ -109,14 +67,7 @@ inline constexpr std::uint32_t kQ4GemmMatrixRegisters = 160;
   // down 2.01 -> 1.64 ms). They need sixteen accumulators per wave, which
   // the compiler takes only with its arrays growing per overflow, not per
   // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
-  //
-  // A generation whose fragments are wider than that budget allows (RDNA3/3.5)
-  // keeps the 48 x 32 wave tiles below at every width.
-  constexpr Q4GemmTile kWide{256, 128, 4, 2};
-  if (m >= 768 && fragment_registers != 0 &&
-      q4_gemm_matrix_registers(kWide, fragment_registers) <=
-          kQ4GemmMatrixRegisters)
-    return kWide;
+  if (m >= 768) return tune.q4_gemm_wide.bm ? tune.q4_gemm_wide : kQ4GemmWideTile;
   const std::uint64_t rows96 = (m + 95) / 96 * 96, rows144 = (m + 143) / 144 * 144;
   return rows144 <= rows96 ? Q4GemmTile{144, 128, 3, 4} : Q4GemmTile{96, 128, 2, 4};
 }
@@ -135,9 +86,10 @@ inline constexpr std::uint32_t kQ4GemmMinSliceSteps = 16;
 inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
 [[nodiscard]] constexpr std::uint32_t q4_gemm_slices(
     std::uint64_t m, std::uint64_t n, std::uint64_t k,
-    std::uint32_t compute_units, std::uint32_t fragment_registers) noexcept {
+    std::uint32_t compute_units,
+    const arch::Tuning& tune = arch::generic::kTuning) noexcept {
   if (compute_units == 0 || k % kQ4GemmStepK != 0) return 1;
-  const auto t = q4_gemm_tile(m, fragment_registers);
+  const auto t = q4_gemm_tile(m, tune);
   const std::uint64_t tiles = ((m + t.bm - 1) / t.bm) * ((n + t.bn - 1) / t.bn);
   const std::uint64_t steps = k / kQ4GemmStepK;
   const std::uint64_t fill = (q4_gemm_wave48(t) ? 3ull : 2ull) * compute_units;

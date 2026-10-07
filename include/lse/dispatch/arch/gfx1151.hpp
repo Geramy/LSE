@@ -27,13 +27,27 @@ inline constexpr std::array kQ4MatrixPanelShapes{
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 8, 5120, 17408},
 };
 
+// The prefill GEMM's wide-pass tile (M >= 768): 256 x 128 outputs on 4 x 4
+// waves of 64 x 32. gfx1201's 64 x 64 wave tile holds 16 accumulators and
+// 8 operand fragments, and a gfx11 fragment is twice as wide, so on gfx1151
+// it compiles to 256 VGPRs with a spill and its fused-epilogue forms exceed
+// loomc's spill-materialization limit (the engine cannot start). 64 x 32 wave
+// tiles compile to 184 VGPRs with no scratch. Measured on the 8060S,
+// test_q4_gemm --gpu, ms per launch, N17408 K5120 / N5120 K17408:
+//   256x128 on 4x4 waves (this):  M1024 9.6 / 9.6,   M4096 37.8 / 39.0
+//   256x128 on 8x2 waves:         M1024 9.7 / 9.6,   M4096 37.6 / 38.9
+//   128x128 on 2x4 waves:         M1024 9.7 / 11.2,  M4096 38.6 / 44.8
+//   48x32 wave tiles (generic):   M1024 10.5 / 10.9, M4096 41.0 / 43.5
+//   256x128 on 4x2 waves (spills, plain GEMM only): M1024 8.6 / 8.8
+inline constexpr Q4GemmTile kQ4GemmWide{256, 128, 4, 4};
+
 // -- 8-bit matrix panels --------------------------------------------------
-// The 8-bit iu8 contractions (wmma_q8_linear.cpp, 16- and 64-row tiles, and
-// the decode form on the shared panel) at the scratch and threads they ask
-// for on every part; their K16 operands follow the gfx11 row's layout.
+// The 16-row tile of the 8-bit iu8 contractions: the decode form on the
+// shared panel (quant_matrix_panel.cpp) and wmma_q8_linear's 16-row form, at
+// the scratch and threads they ask for on every part. The 64-row tile has no
+// gfx1151 rule: 8-bit prefill takes the f16 GEMM.
 inline constexpr std::array kQ8MatrixRules{
     q8_shapes::MatrixRule{kArch, 32, 8, 16, 1664, 256, 4},
-    q8_shapes::MatrixRule{kArch, 32, 8, 64, 6656, 256, 1},
 };
 
 // -- Attention ------------------------------------------------------------
@@ -76,6 +90,7 @@ inline constexpr Tuning kTuning{
     .decode = kDecodeRules,
     .split_short = kSplitShortRules,
     .wave_l2 = kWaveL2Rules,
+    .q4_gemm_wide = kQ4GemmWide,
 };
 
 static_assert(rows_name(kQuantInt8Rows, kArch) &&
