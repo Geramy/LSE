@@ -441,7 +441,8 @@ LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
                own(*t, t->quant_matrix_ranges) && own(*t, t->quant_scalar_shapes) &&
                own(*t, t->quant_row_ladders) && own(*t, t->quant_panel_devices) &&
                own(*t, t->q4_swiglu_shapes) && own(*t, t->q4_matrix_panel_shapes) &&
-               own(*t, t->q8_matrix_rules) && own(*t, t->flash_wmma) &&
+               own(*t, t->q8_matrix_rules) && own(*t, t->q8_panel_rules) &&
+               own(*t, t->flash_wmma) &&
                own(*t, t->flash_cache) && own(*t, t->decode) &&
                own(*t, t->split_short) && own(*t, t->wave_l2));
     // The generic admissions follow every part's own rows.
@@ -453,6 +454,9 @@ LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
   LSE_EXPECT_EQ(r9700.quant_matrix_shapes.size(), 4u);
   LSE_EXPECT_EQ(r9700.q4_matrix_panel_shapes.size(), 6u);
   LSE_EXPECT_EQ(r9700.q8_matrix_rules.size(), 2u);
+  LSE_EXPECT_EQ(r9700.q8_panel_rules.size(), 2u);
+  // gfx1151 runs the 8-bit decode panel but not wmma_q8_linear's tiles.
+  LSE_EXPECT(halo.q8_matrix_rules.empty() && halo.q8_panel_rules.size() == 1u);
   LSE_EXPECT_EQ(r9700.decode.size(), 1u);
   LSE_EXPECT(r9700.flash_prefill && !halo.flash_prefill && !other.flash_prefill);
   LSE_EXPECT(other.quant_matrix_shapes.empty() && other.flash_wmma.empty());

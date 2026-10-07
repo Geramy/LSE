@@ -188,7 +188,7 @@ const math::MatrixCoreRow* q8_matrix_panel_row(const KernelShapes& s) {
        {"bits.f32", "value.f32", "wave.shfl_xor", "rint", "max", "abs"})
     if (s.intrinsics->find(symbol).empty()) return nullptr;
   bool measured = false;
-  for (const auto& rule : arch::tuning(s.device->arch).q8_matrix_rules)
+  for (const auto& rule : arch::tuning(s.device->arch).q8_panel_rules)
     measured |= rule.arch == s.device->arch && rule.wave == s.device->wavefront_size &&
                 rule.bits == 8 && rule.rows == kQ4MatrixPanelRows;
   if (!measured) return nullptr;

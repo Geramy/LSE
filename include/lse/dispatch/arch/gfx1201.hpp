@@ -96,6 +96,7 @@ inline constexpr Tuning kTuning{
     .q4_swiglu_shapes = kQ4SwiGluShapes,
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
     .q8_matrix_rules = kQ8MatrixRules,
+    .q8_panel_rules = kQ8MatrixRules,
     .flash_wmma = kFlashWmmaRules,
     .flash_cache = kFlashCacheRules,
     .decode = kDecodeRules,

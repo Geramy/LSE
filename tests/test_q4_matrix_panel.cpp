@@ -891,7 +891,11 @@ int gpu_q8_down(std::size_t rows, std::size_t columns, std::size_t width) {
   auto sc = upload({n, k / 64}, DType::kBF16, scales.data(), scales.size() * 2);
   auto bi = upload({n, k / 64}, DType::kBF16, biases.data(), biases.size() * 2);
   auto output = quant_linear(x, w, sc, bi, 8, 64);
-  LSE_EXPECT(output.node()->prim->name() == "quant_linear.q8_matrix_panel.v1");
+  // The shared panel has a layout for eight rows; other row counts take the
+  // 8-bit contraction the device's tuning selects (wmma_q8_linear's 16-row
+  // tile where the part has its rule), checked against the same oracle.
+  if (rows == 8)
+    LSE_EXPECT(output.node()->prim->name() == "quant_linear.q8_matrix_panel.v1");
   scheduler->reset_accumulated_trace();
   const NodePtr roots[]{output.node()};
   LSE_EXPECT_OK(scheduler->eval(roots, false));
@@ -919,9 +923,11 @@ int gpu_q8_down(std::size_t rows, std::size_t columns, std::size_t width) {
       maximum = std::max(maximum, difference);
       LSE_EXPECT(difference <= 2e-4 + 5e-6 * std::abs(static_cast<double>(want)));
     }
-  std::printf("M%zu N%zu K%zu 8-bit matrix panel maximum component error %.9g; "
+  std::printf("M%zu N%zu K%zu 8-bit %.*s maximum component error %.9g; "
               "device groups %u, host %u\n",
-              rows, columns, width, maximum, trace.device_groups,
+              rows, columns, width,
+              static_cast<int>(output.node()->prim->name().size()),
+              output.node()->prim->name().data(), maximum, trace.device_groups,
               trace.host_groups);
   return lse::test::Registry::get().failures ? 1 : 0;
 }

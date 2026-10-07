@@ -38,8 +38,12 @@ struct Tuning {
   std::span<const Q4SwiGluShape> q4_swiglu_shapes;
   std::span<const Q4MatrixPanelShape> q4_matrix_panel_shapes;
 
-  // 8-bit matrix panels (q8_matrix.cpp).
+  // 8-bit contractions: the WMMA tiles of wmma_q8_linear and the packed
+  // weights (q8_matrix.cpp), and separately the 8-row decode form on the
+  // shared activation panel (quant_matrix_panel.cpp), since a part may run
+  // one well and the other not.
   std::span<const q8_shapes::MatrixRule> q8_matrix_rules;
+  std::span<const q8_shapes::MatrixRule> q8_panel_rules;
 
   // Attention (attention.cpp).
   std::span<const attention_shapes::FlashWmmaRule> flash_wmma;

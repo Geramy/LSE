@@ -64,12 +64,19 @@ inline constexpr std::array kQ4MatrixPanelShapes{
 //   256x128 on 4x2 waves (spills, plain GEMM only): M1024 8.6 / 8.8
 inline constexpr Q4GemmTile kQ4GemmWide{256, 128, 4, 4};
 
-// -- 8-bit matrix panels --------------------------------------------------
-// The 16-row tile of the 8-bit iu8 contractions: the decode form on the
-// shared panel (quant_matrix_panel.cpp) and wmma_q8_linear's 16-row form, at
-// the scratch and threads they ask for on every part. The 64-row tile has no
-// gfx1151 rule: 8-bit prefill takes the f16 GEMM.
-inline constexpr std::array kQ8MatrixRules{
+// -- 8-bit contractions ---------------------------------------------------
+// The 8-row decode form on the shared panel (quant_matrix_panel.cpp, the
+// DFlash2 draft's 8-row passes) at the scratch and threads it takes on every
+// part. wmma_q8_linear's tiles get no rule here: on the 8060S the generic
+// contraction is faster for the rows they would take. Measured per call,
+// 17408 x 5120 8-bit, MTP=3 smoke:
+//   generic:             M1 0.76 ms, M2 1.55, M3 2.27, M4 2.95
+//   16-row WMMA tile:    11.2 ms at every M (2.4-2.6 ms with whole-group
+//                        16-byte weight loads)
+//   8-row shared panel:  1.38 ms at M8, against 5.78 ms generic
+// so MTP=3 decodes at 17.0 tok/s without the tile against 8.9 with it, and
+// DFlash2 at 16.0 with the panel against 14.1 without.
+inline constexpr std::array kQ8PanelRules{
     q8_shapes::MatrixRule{kArch, 32, 8, 16, 1664, 256, 4},
 };
 
@@ -111,7 +118,7 @@ inline constexpr Tuning kTuning{
     .quant_panel_devices = kQuantPanelDevices,
     .q4_swiglu_shapes = kQ4SwiGluShapes,
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
-    .q8_matrix_rules = kQ8MatrixRules,
+    .q8_panel_rules = kQ8PanelRules,
     .flash_wmma = kFlashWmmaRules,
     .decode = kDecodeRules,
     .split_short = kSplitShortRules,
@@ -125,7 +132,7 @@ static_assert(rows_name(kQuantInt8Rows, kArch) &&
               rows_name(kQ4SwiGluShapes, kArch) &&
               rows_name(kQuantMatrixRanges, kArch) &&
               rows_name(kQ4MatrixPanelShapes, kArch) &&
-              rows_name(kQ8MatrixRules, kArch) &&
+              rows_name(kQ8PanelRules, kArch) &&
               rows_name(kFlashWmmaRules, kArch) &&
               rows_name(kDecodeRules, kArch) &&
               rows_name(kSplitShortRules, kArch) &&
