@@ -108,7 +108,7 @@ LSE_TEST(q4_gemm_emits_for_every_tile_and_width_on_a_described_device) {
   device.extension_id = backend::AmdDeviceInfo::kExtensionId;
   device.extension = &amd;
   for (const unsigned bits : {4u, 8u}) {
-    for (const std::int64_t m : {16, 64, 137, 1024}) {
+    for (const std::int64_t m : {16, 48, 64, 137, 272, 656, 1024}) {
       const std::int64_t n = 5120, k = 6144;
       auto x = leaf({1, m, k}, DType::kF32);
       auto panel_node = std::make_shared<Node>();

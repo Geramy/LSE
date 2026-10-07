@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -269,12 +270,17 @@ const math::MatrixCoreRow* f16_row(const KernelShapes& s) {
 // target cannot compile more than one per iteration. gfx1201, N 17408 x
 // K 5120: M 9 300 -> 179 us at four steps, M 64 324 -> 263 us at two.
 std::uint32_t burst_steps(const Dims& d, const Tile& t) {
-  // The target's matrix-operand staging fails past about 32 matrix
-  // instructions in one block, which caps the burst by the wave's tile.
+  // The burst is capped by the matrix instructions it puts in one block:
+  // 32 for most tiles, which the target's operand staging once imposed, and
+  // 48 for tiles of 48-row waves, which then take two steps (M 144 gate:
+  // 0.48 -> 0.44 ms against one). Four steps of those (96 instructions)
+  // compile to wrong code at some widths.
   const std::uint32_t per_step = (t.bm / t.wm / 16u) * (t.bn / t.wn / 16u) * (kBK / 16u);
   const std::uint32_t steps = d.k / kBK / d.slices;
+  const std::uint32_t cap =
+      dispatch::q4_gemm_wave48({t.bm, t.bn, t.wm, t.wn}) ? 48u : 32u;
   for (std::uint32_t b = 4u; b > 1u; b /= 2u)
-    if (b * per_step <= 32u && steps % b == 0u) return b;
+    if (b * per_step <= cap && steps % b == 0u) return b;
   return 1u;
 }
 
@@ -285,8 +291,10 @@ std::uint32_t lds_bytes(const Tile& t) {
 bool device_fits(const KernelShapes& s, const Dims& d) {
   if (!d.valid || !s.device || !s.intrinsics) return false;
   const Tile t = tile_for(d);
+  // Every thread stages the same number of activation pieces.
   if (s.device->wavefront_size != 32u ||
-      s.device->max_threads_per_workgroup < t.wm * t.wn * 32u)
+      s.device->max_threads_per_workgroup < t.wm * t.wn * 32u ||
+      t.bm * (kBK / kRun) % (t.wm * t.wn * 32u) != 0u)
     return false;
   if (device_load_bytes(s.device) < 16u) return false;
   for (const auto symbol : {"barrier", d.bits == 8 ? "q8x8.f16" : "q4x8.f16"})

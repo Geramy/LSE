@@ -41,31 +41,44 @@ struct Q4GemmTile {
 };
 // The workgroup tile for an M x N contraction. Tall when M fills it; short
 // otherwise, so a short prompt still spreads over the device.
+//
+// From 65 to 767 rows the tile is built from 48 x 32 wave tiles, four wave
+// columns over 128 output columns and two to four wave rows. Each step's
+// fixed work (the weight decode, the scratch stores, two barriers) is then
+// shared by up to 192 rows instead of 64, and the waves of one workgroup
+// hide each other's latencies. Up to 192 rows one row tile holds the whole
+// pass; past that, 96- or 144-row tiles, whichever pads less (gfx1201, N
+// 17408 x K 5120: M 80 0.43 -> 0.31 ms, M 144 0.58 -> 0.44 ms, M 272 1.00
+// -> 0.80 ms, M 656 1.84 -> 1.68 ms; N 5120 x K 17408: M 144 0.65 -> 0.43
+// ms, M 272 1.13 -> 0.84 ms).
 [[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(std::uint64_t m) noexcept {
   if (m <= 32) return {32, 128, 1, 8};
   if (m <= 64) return {64, 128, 2, 4};
-  // A row tile costs about the same whether it is full or not, and a 64-row
-  // tile about 0.56 of a 128-row one (gfx1201, N 5120-17408). A width just
-  // past a multiple of 128 therefore runs on 64-row tiles: 144 rows as three
-  // of them, not two of 128.
-  const std::uint64_t tall = (m + 127) / 128, short_tiles = (m + 63) / 64;
-  if (short_tiles * 56 < tall * 100) return {64, 128, 2, 4};
+  if (m <= 192) {
+    const auto wm = static_cast<std::uint32_t>((m + 47) / 48);
+    return {48 * wm, 128, wm, 4};
+  }
   // Wide passes take 64x64 wave tiles, which read each operand fragment
   // from scratch for four matrix instructions instead of two: 256 rows on
-  // eight waves from 768 rows up, 128 rows on four waves above 256
-  // (gfx1201, M 1024: gate 1.91 -> 1.66 ms, down 2.01 -> 1.64 ms; M 544
-  // 1.38 -> 1.31 ms). They need sixteen accumulators per wave, which the
-  // compiler takes only with its arrays growing per overflow, not per
+  // eight waves from 768 rows up (gfx1201, M 1024: gate 1.91 -> 1.66 ms,
+  // down 2.01 -> 1.64 ms). They need sixteen accumulators per wave, which
+  // the compiler takes only with its arrays growing per overflow, not per
   // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
   if (m >= 768) return {256, 128, 4, 2};
-  if (m > 256) return {128, 128, 2, 2};
-  return {128, 128, 2, 4};
+  const std::uint64_t rows96 = (m + 95) / 96 * 96, rows144 = (m + 143) / 144 * 144;
+  return rows144 <= rows96 ? Q4GemmTile{144, 128, 3, 4} : Q4GemmTile{96, 128, 2, 4};
+}
+// Whether a tile is one of the 48-row-wave tiles above.
+[[nodiscard]] constexpr bool q4_gemm_wave48(const Q4GemmTile& t) noexcept {
+  return t.wm != 0 && t.bm == 48 * t.wm && t.wn == 4 && t.bn == 128;
 }
 // How many slices of K one contraction is cut into. A workgroup walks its K
 // range serially, so a grid with fewer workgroups than the device can seat
 // is bound by that walk, not by math or memory; slicing K multiplies the
-// grid until it fills `compute_units` twice over. Each slice keeps at least
-// kQ4GemmMinSliceSteps steps, and slices divide the steps evenly.
+// grid until it fills `compute_units` twice over (three times for the
+// 48-row-wave tiles, whose workgroups are larger: M 144 gate 0.48 -> 0.44 ms
+// at two slices). Each slice keeps at least kQ4GemmMinSliceSteps steps, and
+// slices divide the steps evenly.
 inline constexpr std::uint32_t kQ4GemmMinSliceSteps = 16;
 inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
 [[nodiscard]] constexpr std::uint32_t q4_gemm_slices(
@@ -75,8 +88,9 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   const auto t = q4_gemm_tile(m);
   const std::uint64_t tiles = ((m + t.bm - 1) / t.bm) * ((n + t.bn - 1) / t.bn);
   const std::uint64_t steps = k / kQ4GemmStepK;
+  const std::uint64_t fill = (q4_gemm_wave48(t) ? 3ull : 2ull) * compute_units;
   std::uint32_t s = 1;
-  while (s < kQ4GemmMaxSlices && tiles * s < 2ull * compute_units &&
+  while (s < kQ4GemmMaxSlices && tiles * s < fill &&
          steps % (2ull * s) == 0 && steps / (2ull * s) >= kQ4GemmMinSliceSteps)
     s *= 2;
   return s;
