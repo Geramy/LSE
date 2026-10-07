@@ -130,7 +130,9 @@ struct Pair final : KernelPrimitive<Pair> {
     if (!rule)
       return false;
     const auto schedule = dot4_schedule(original(s));
-    return schedule.valid() && schedule.wave == rule->wave &&
+    // The grid has no row axis: one workgroup row must cover every row.
+    return schedule.valid() && schedule.rows >= rule->m &&
+           schedule.wave == rule->wave &&
            schedule.chunks_per_lane == rule->chunks_per_lane &&
            schedule.k_splits == rule->k_splits;
   }

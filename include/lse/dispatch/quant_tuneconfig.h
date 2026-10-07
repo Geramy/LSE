@@ -118,6 +118,7 @@ struct Q4SwiGluShape {
 };
 inline constexpr std::array kQ4SwiGluShapes{
     Q4SwiGluShape{"gfx1201", 32, 4, 64, 256, 4, 1, 1, 17408, 5120},
+    Q4SwiGluShape{"gfx1201", 32, 4, 64, 256, 4, 1, 4, 17408, 5120},
     Q4SwiGluShape{"gfx1201", 32, 4, 64, 256, 4, 2, 8, 17408, 5120},
 };
 
