@@ -101,11 +101,13 @@ second (`src/runtime/draft_width.cpp`):
   is measured on the device for this model; the first steps of a process
   visit every width twice, and each width is measured again every 4,096
   steps. A shared level follows the context length, and a per-width offset
-  holds what the extra rows cost. Nothing is hard-coded, so each GPU tunes
-  itself. On the R9700 the curve is far from linear: the 1, 2, 4 and 8-row
-  passes take 31.4, 35.0, 34.2 and 38.7 ms, the 3, 5, 6 and 7-row passes
-  48.5, 75.5, 52.7 and 89.4 ms (640-token essay, warm), so the policy settles
-  on 1, 4 or 8 rows.
+  holds what the extra rows cost. A step that recorded a program (a width's
+  first pass in a request) or compiled a kernel is left out. Nothing is
+  hard-coded, so each GPU tunes itself: on the R9700 the step costs of 1 to 8
+  rows measured 33.7, 35.3, 36.2, 35.9, 36.1, 36.5, 38.1 and 38.7 ms (verify
+  pass, acceptance walk and context append; 640-token essay, warm), and
+  before the verify widths moved onto the four- and eight-row kernels the 3,
+  5, 6 and 7-row passes took 48 to 89 ms and the policy avoided them.
 - **Stopping rule.** Proposal j is verified when some prefix ending at or
   after j adds more expected tokens per added nanosecond than the long-run
   rate; positions after j enter at their mean acceptance, not their own
@@ -144,7 +146,23 @@ DSpark ([arXiv 2607.05147](https://huggingface.co/papers/2607.05147))
 schedules verify prefixes the same way, from a learned confidence head and a
 profiled width curve.
 
-ADAPTIVE_RESULTS
+Measured on the R9700 (macOS, driver build 266, master 1f1c3cd plus this
+change), the pinned DFlash2 configuration at temperature 0.6: three
+interleaved pairs of servers, `--adaptive-dflash2=off` then on, each pair
+running 12 seeds of every prompt (36 requests per prompt and arm). Fixed
+output is the same text on every run of a seed; adaptive output is a
+different sample of the same distribution, so the comparison is over 36
+texts each.
+
+| Prompt | Fixed (median) | Adaptive (median) | Change | Mean change (95% CI) | Acceptance fixed / adaptive | Rows per pass fixed / adaptive |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 640-token essay | 62.2 tok/s | 65.6 tok/s | +5.5% | +5.8% (+4.1 to +7.7) | 67.2% / 68.2% | 7.95 / 6.32 |
+| Code (HumanEval-style, 640 tokens) | 153.1 tok/s | 152.8 tok/s | -0.2% | +0.2% (-2.3 to +2.8) | 97.2% / 97.2% | 7.96 / 7.91 |
+| 2K prompt, 256 tokens | 70.8 tok/s | 70.6 tok/s | -0.4% | +1.4% (-2.5 to +5.4) | 75.0% / 75.2% | 7.93 / 6.78 |
+| 4K prompt, 256 tokens | 64.8 tok/s | 68.9 tok/s | +6.4% | +6.4% (+2.8 to +10.0) | 74.4% / 76.0% | 7.91 / 6.63 |
+
+Greedy requests produced byte-identical text to master with the policy on
+and off (essay, code, 2K and 4K prompts).
 
 ## Automatic Q8 conversion
 
