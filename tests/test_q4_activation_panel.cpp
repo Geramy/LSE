@@ -468,9 +468,11 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
                   four_chunks ? 4u : adjacent ? 2u : 1u);
     // The vocabulary projection at six to eight rows gives each wave four
-    // columns; every other shape keeps one.
+    // columns and the 4-row down projection two; every other shape keeps one.
     const std::uint32_t columns =
-        dimensions[1] == 248320 && dimensions[0] >= 6 ? 4u : 1u;
+        dimensions[1] == 248320 && dimensions[0] >= 6 ? 4u
+        : dimensions[0] == 4 && dimensions[1] == 5120 && dimensions[2] == 17408
+            ? 2u : 1u;
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_columns(original_shape), columns);
     const auto *consumer =
         dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);
