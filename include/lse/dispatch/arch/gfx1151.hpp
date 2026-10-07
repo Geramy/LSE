@@ -189,6 +189,13 @@ inline constexpr Tuning kTuning{
     .decode = kDecodeRules,
     .split_short = kSplitShortRules,
     .wave_l2 = kWaveL2Rules,
+    // FlashPrefill V2 (block-sparse prefill attention, alpha 0.1): its pool
+    // and selector kernels and the mean-corrected flash kernel on the gfx11
+    // fragments pass test_sparse_attention --gpu on the 8060S. Pinned model,
+    // prefill tok/s, dense -> FlashPrefill V2: 4096 tokens 488 -> 501,
+    // 8192 442 -> 485, 16384 378 -> 467, 32768 533 -> 696; 1024 and 2048
+    // unchanged (attention is a small share of a short prefill here).
+    .flash_prefill = true,
     .q4_gemm_wide = kQ4GemmWide,
 };
 

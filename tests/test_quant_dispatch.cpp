@@ -520,7 +520,7 @@ LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
   // gfx1151 runs the 8-bit decode panel but not wmma_q8_linear's tiles.
   LSE_EXPECT(halo.q8_matrix_rules.empty() && halo.q8_panel_rules.size() == 1u);
   LSE_EXPECT_EQ(r9700.decode.size(), 1u);
-  LSE_EXPECT(r9700.flash_prefill && !halo.flash_prefill && !other.flash_prefill);
+  LSE_EXPECT(r9700.flash_prefill && halo.flash_prefill && !other.flash_prefill);
   LSE_EXPECT(other.quant_matrix_shapes.empty() && other.flash_wmma.empty());
 }
 
