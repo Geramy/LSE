@@ -395,8 +395,9 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
   }
 }
 
-// gfx1151's verify passes take int8 activations, the shared panel (4 and 8
-// rows) and the row ladder (3 and 7) from its own header, as gfx1201's do from its; a part with no
+// gfx1151's verify passes take int8 activations, the shared panel (every
+// width on the 4- and 8-row kernels) and the row ladder (3 and 7) from its own
+// header, as gfx1201's do from its; a part with no
 // such rows (gfx1100) keeps the one-row-at-a-time contraction.
 LSE_TEST(verify_pass_panel_is_qualified_per_part) {
   for (const int m : {3, 4, 7, 8}) {
@@ -415,7 +416,9 @@ LSE_TEST(verify_pass_panel_is_qualified_per_part) {
     f.device.extension = &f.amd;
     const auto halo = f.plan();
     LSE_EXPECT(halo.int8_activations);
-    LSE_EXPECT_EQ(halo.shared_activation_panel, m == 4 || m == 8);
+    // Three and seven rows run on the four- and eight-row panels
+    // (dispatch::verify_rows).
+    LSE_EXPECT(halo.shared_activation_panel);
     LSE_EXPECT_EQ(halo.row_ladder_ceiling, m == 3 ? 4u : m == 7 ? 8u : 0u);
     f.device.arch = "gfx1100";
     const auto other = f.plan();
@@ -461,6 +464,21 @@ LSE_TEST(decode_panel_rows_are_qualified_per_part) {
     const auto* own = dispatch::q4_shared_panel_rule(f.shapes, "gfx1151");
     LSE_EXPECT(own != nullptr && own->rows == 4 && own->arch == "gfx1151");
   }
+}
+
+// Both parts run the odd verify widths on the four- and eight-row kernels;
+// a part without the rule runs each width as itself.
+LSE_TEST(verify_widths_take_the_measured_row_kernels_per_part) {
+  for (const auto* part : {"gfx1201", "gfx1151"}) {
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 1), 1);
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 2), 4);
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 3), 4);
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 4), 4);
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 5), 8);
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 7), 8);
+    LSE_EXPECT_EQ(dispatch::verify_rows(part, 8), 8);
+  }
+  LSE_EXPECT_EQ(dispatch::verify_rows("gfx1100", 3), 3);
 }
 
 // Each part's dispatch rows come from its own header and only from there:

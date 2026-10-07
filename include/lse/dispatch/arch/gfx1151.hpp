@@ -25,6 +25,17 @@ inline constexpr std::string_view kArch = "gfx1151";
 inline constexpr auto kQuantInt8Rows = concat(
     std::array{QuantRowRange{kArch, 32, 4, 64, 2, 8}},
     generic::kQuantInt8Rows);
+// Verify passes of two, three, five, six and seven rows run on the four- and
+// eight-row kernels with the extra rows masked (dispatch::verify_rows).
+// Without them each such width took the one-row-at-a-time contraction.
+// Verify ms per pass on the 8060S at fixed widths 1..8 (DFlash2, 256-token
+// prompt): 80 103 208 98 323 125 239 140 -> 80 89 93 98 119 120 133 140;
+// MTP=3 widths 1..4: 76 98 203 90 -> 75 84 87 91.
+inline constexpr std::array kQuantVerifyRows{
+    QuantVerifyRows{kArch, 2, 4}, QuantVerifyRows{kArch, 3, 4},
+    QuantVerifyRows{kArch, 5, 8}, QuantVerifyRows{kArch, 6, 8},
+    QuantVerifyRows{kArch, 7, 8},
+};
 inline constexpr std::array kQuantPanelDevices{
     QuantPanelDevice{kArch, 32, 4, 64, 256},
 };
@@ -159,6 +170,7 @@ inline constexpr Tuning kTuning{
     .quant_matrix_ranges = kQuantMatrixRanges,
     .quant_row_ladders = kQuantRowLadderShapes,
     .quant_panel_devices = kQuantPanelDevices,
+    .quant_verify_rows = kQuantVerifyRows,
     .q4_swiglu_shapes = kQ4SwiGluShapes,
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
     .q4_panel_shapes = kQ4DecodePanelShapes,
@@ -171,6 +183,7 @@ inline constexpr Tuning kTuning{
 };
 
 static_assert(rows_name(kQuantInt8Rows, kArch) &&
+              rows_name(kQuantVerifyRows, kArch) &&
               rows_name(kQuantPanelDevices, kArch) &&
               rows_name(kQuantRowLadderShapes, kArch) &&
               rows_name(kQ4SwiGluShapes, kArch) &&

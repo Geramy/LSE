@@ -38,8 +38,9 @@ struct Tuning {
   std::span<const QuantVerifyRows> quant_verify_rows;
   std::span<const Q4SwiGluShape> q4_swiglu_shapes;
   std::span<const Q4MatrixPanelShape> q4_matrix_panel_shapes;
-  // Contractions that read the shared int8 activation panel on this part,
-  // beyond the kQ4PanelShapes every part with the panel takes.
+  // Contractions that read the shared int8 activation panel on this part:
+  // shapes beyond the kQ4PanelShapes every part with the panel takes, and
+  // this part's own measurement of a shared shape, which takes precedence.
   std::span<const Q4PanelShape> q4_panel_shapes;
 
   // 8-bit contractions: the WMMA tiles of wmma_q8_linear and the packed
