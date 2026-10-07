@@ -340,6 +340,9 @@ if(LSE_ENABLE_HRX)
   add_executable(compile_loom_matrix compile_loom_matrix.cpp)
   lse_apply_common_flags(compile_loom_matrix)
   target_link_libraries(compile_loom_matrix PRIVATE lse_backend_hrx lse_graph lse_kernels)
+  add_executable(compile_q4_fused compile_q4_fused.cpp)
+  lse_apply_common_flags(compile_q4_fused)
+  target_link_libraries(compile_q4_fused PRIVATE lse_backend_hrx lse_graph lse_kernels)
   # What one cached kernel's loomc compile costs the host (peak RSS and the
   # largest allocation): the size of an on-device compile.
   add_executable(measure_loomc_compile measure_loomc_compile.cpp)

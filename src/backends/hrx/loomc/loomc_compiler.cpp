@@ -3,6 +3,8 @@
 #include "lse/backends/hrx/code_object.hpp"
 
 #include <cstdint>
+#include <functional>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -514,6 +516,13 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
     std::string_view source, std::string_view arch) const {
   if (source.empty()) return LSE_ERROR(kInvalidArgument, "empty source");
   if (arch.empty()) return LSE_ERROR(kInvalidArgument, "no target arch");
+  if (const char* dir = std::getenv("LSE_EXP_DUMP_COMPILE")) {  // EXPERIMENT
+    const auto h = std::hash<std::string_view>{}(source);
+    if (FILE* f = std::fopen((std::string(dir) + "/" + std::to_string(h) + ".loom").c_str(), "w")) {
+      std::fwrite(source.data(), 1, source.size(), f);
+      std::fclose(f);
+    }
+  }
 
 #if LSE_HAVE_LOOMC
   State& s = *state_;
