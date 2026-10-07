@@ -169,13 +169,13 @@ class HrxBackend : public Backend<HrxBackend> {
   // object, which is why the backend is constructed in place and never moved —
   // the same reason DeviceInfo::extension can point at amd_.
   //
-  // HIP is preferred when COMGR is available. The constructor moves Loom
-  // first when this build has no COMGR but does have loomc, so an unspecified
-  // dialect still selects an available compiler.
+  // Loom is the default dialect on every platform. The constructor moves HIP
+  // first only when this build has no loomc but does have COMGR, so an
+  // unspecified dialect still selects an available compiler.
   std::array<graph::KernelToolchain, 2> toolchains_{
-      graph::KernelToolchain{graph::Dialect::kHip, &emitter_, &compiler_},
       graph::KernelToolchain{graph::Dialect::kLoom, &loom_emitter_,
-                             &loom_compiler_}};
+                             &loom_compiler_},
+      graph::KernelToolchain{graph::Dialect::kHip, &emitter_, &compiler_}};
   void* device_ = nullptr;    // hrx_device_t
   void* allocator_ = nullptr; // hrx_allocator_t (borrowed)
   bool initialized_ = false;

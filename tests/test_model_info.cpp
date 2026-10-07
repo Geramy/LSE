@@ -637,6 +637,17 @@ LSE_TEST(c_api_answers_and_refuses) {
     LSE_EXPECT(e["total_bytes"].get<std::uint64_t>() > e["weights_bytes"].get<std::uint64_t>());
   }
   lse_free(out);
+  // No dialect named is Loom, on every platform, and Loom stores K/V in
+  // fragments.
+  out = nullptr;
+  cfg.dialect = nullptr;
+  LSE_EXPECT_EQ(lse_estimate(&cfg, R"({"device_arch":"cpu","sequences":2})", &out, &err), LSE_OK);
+  if (out != nullptr) {
+    const json e = json::parse(out);
+    LSE_EXPECT_STR(e["settings"]["kv_storage"].get<std::string>(), std::string("fragmented"));
+  }
+  lse_free(out);
+  cfg.dialect = "hip";
   out = nullptr;
   LSE_EXPECT_EQ(lse_estimate(&cfg, "[1, 2]", &out, &err), LSE_ERR_INVALID_ARGUMENT);
   lse_free(err);

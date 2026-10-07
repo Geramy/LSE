@@ -297,12 +297,17 @@ LSE_TEST(quant_linear_indexes_the_activation_by_its_row) {
   }
 }
 
-// Small prefill rows retain the FP32 codec.
+// Small prefill rows retain the FP32 codec on a part with no int8 rules for
+// them. gfx1151 has such rules for 2 to 8 rows (its verify passes take the
+// shared int8 panel), so this asks for gfx1100, an RDNA3 part with the same
+// dot instructions and no verify-pass rows.
 LSE_TEST(quant_linear_small_prefill_uses_the_float_codec) {
   constexpr std::int64_t kGroup = 64;
   constexpr std::int64_t kN = 16;
   constexpr std::int64_t kK = 1024;
   constexpr std::string_view kDot = "__builtin_amdgcn_sudot4";
+  backend::DeviceInfo rdna3 = gfx1151();
+  rdna3.arch = "gfx1100";
 
   const auto emit_at = [&](int bits) -> std::string {
     const std::int64_t lanes = kK * bits / 32;
@@ -312,7 +317,7 @@ LSE_TEST(quant_linear_small_prefill_uses_the_float_codec) {
     Array scales = Array::zeros(Shape{kN, groups}, DType::kBF16);
     Array biases = Array::zeros(Shape{kN, groups}, DType::kBF16);
     Array y = quant_linear(x, packed, scales, biases, bits, kGroup);
-    auto e = emit_anchor(y, OpKind::kQuantMatMul);
+    auto e = emit_anchor(y, OpKind::kQuantMatMul, rdna3);
     return e.ok() ? e->source : std::string{};
   };
 
@@ -344,7 +349,7 @@ LSE_TEST(quant_linear_small_prefill_uses_the_float_codec) {
   const backend::HipEmitter fresh;
   backend::AmdDeviceInfo no_dot = gfx1151_amd();
   no_dot.has_dot4_iu8 = false;
-  backend::DeviceInfo plain = gfx1151();
+  backend::DeviceInfo plain = rdna3;
   plain.extension = &no_dot;
   const std::int64_t lanes = kK * 4 / 32;
   const std::int64_t groups = kK / kGroup;
@@ -2326,17 +2331,22 @@ LSE_TEST(emitted_source_carries_the_dialect_of_its_emitter) {
   LSE_EXPECT(e->dialect == Dialect::kHip);
 }
 
-LSE_TEST(the_hrx_device_prefers_an_available_compiler) {
+// Loom is the default dialect on every platform: the HRX device declares it
+// first, and hands HIP the front only to a build that has COMGR and no loomc.
+LSE_TEST(the_hrx_device_prefers_loom) {
   backend::BackendAdapter<backend::HrxBackend> hrx;
   LSE_EXPECT_EQ(hrx.toolchains().size(), 2u);
   const KernelToolchain* hip = hrx.toolchain_for(Dialect::kHip);
   const KernelToolchain* loom = hrx.toolchain_for(Dialect::kLoom);
   LSE_EXPECT(hip != nullptr && loom != nullptr);
   if (hip == nullptr || loom == nullptr) return;
-  const Dialect preferred = !hip->compiler->available() &&
-                                    loom->compiler->available()
-                                ? Dialect::kLoom
-                                : Dialect::kHip;
+  const Dialect preferred = !loom->compiler->available() &&
+                                    hip->compiler->available()
+                                ? Dialect::kHip
+                                : Dialect::kLoom;
+#if defined(LSE_HAVE_LOOMC) && LSE_HAVE_LOOMC
+  LSE_EXPECT(preferred == Dialect::kLoom);
+#endif
   LSE_EXPECT(hrx.toolchains().front().dialect == preferred);
   LSE_EXPECT(hrx.emitter() != nullptr);
   LSE_EXPECT(hrx.compiler() != nullptr);

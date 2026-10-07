@@ -87,7 +87,7 @@ typedef struct lse_config {
 
   /* Devices and kernels. */
   const char *pool;              /* --pool, e.g. "hrx:0" */
-  const char *dialect;           /* --dialect: hip|loom */
+  const char *dialect;           /* --dialect: loom (default when NULL) or hip */
   const char *cache_dir;         /* --cache-dir (default: the platform cache) */
 
   /* HTTP adapter (lse_http_start only). */
@@ -242,8 +242,8 @@ LSE_API lse_result lse_model_info(const char *model, char **json_out, char **err
  * prefill activation peak, and the MTP or DFlash2 draft, with resident and
  * peak totals. Reads the fields lse_open reads: model, mtp_path/no_mtp/
  * mtp_depth, dflash2/dflash2_model, kv_cache_dtype, kv_len, batch_size,
- * ubatch_size and dialect (Loom stores K/V in fragments, HIP in contiguous
- * pools). `options_json` may be NULL or an object with any of:
+ * ubatch_size and dialect (Loom, the default, stores K/V in fragments; HIP
+ * stores it in contiguous pools). `options_json` may be NULL or an object with any of:
  *   "context_tokens":      tokens held when estimating (default: kv_len)
  *   "sequences":           sequences decoded together (default 1)
  *   "device_arch":         e.g. "gfx1201"; decides whether the packed Q8

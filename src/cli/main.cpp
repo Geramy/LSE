@@ -56,9 +56,8 @@ struct Options {
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
   // Which source dialect this run would rather its kernels were written in.
-  // Empty means the device's own first choice, which is what every run that
-  // does not say gets.
-  std::string dialect;
+  // Loom unless the run names another.
+  std::string dialect = "loom";
   std::string cache_dir;
   // --no-cpu-fallback: refuse the host interpreter instead of falling back to it.
   bool no_cpu_fallback = false;
@@ -145,10 +144,9 @@ void usage() {
       "                         when no device backend comes up, when the pool\n"
       "                         names a cpu device, or when an op has no device\n"
       "                         kernel (default: allowed, logged and counted)\n"
-      "      --dialect NAME     source dialect to generate kernels in: hip or\n"
-      "                         loom. A device that does not declare it is\n"
-      "                         given its own first choice instead (default:\n"
-      "                         every device's first choice)\n"
+      "      --dialect NAME     source dialect to generate kernels in: loom or\n"
+      "                         hip (default: loom). A device that does not\n"
+      "                         declare it is given its own first choice instead\n"
       "  -h, --help             this message");
 }
 

@@ -3,6 +3,15 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.6: Loom by default on every platform, RDNA3.5 (gfx1151) matrix cores, faster verify passes
+
+Requires mac_linuxgpu v0.1.151 (build 255) or later on macOS; kernel arguments in VRAM need v0.1.161 (build 265).
+
+1. **Loom is the default kernel dialect on every platform.** `lse`, `lse-server` and libLSE (a NULL `lse_config.dialect`) generate Loom kernels unless `--dialect hip` is named. In 0.5.5 Linux builds defaulted to HIP, and `lse-server` without `--dialect` failed at startup on Linux while preparing kernels. The legacy HIP dialect stays selectable. `lse_estimate` with no dialect reports fragmented K/V storage, and FlashPrefill V2 and BLASST no longer need `--dialect loom` named. A user primitive that spells only HIP source runs on the host interpreter unless `--dialect hip` is named, as on macOS.
+2. **RDNA3.5 (gfx1151) matrix cores on the Loom path.** Each architecture's tuning rules and matrix-instruction rows live in their own headers (`include/lse/dispatch/arch/{gfx1201,gfx1151,generic}.hpp`, `include/lse/math/matrix_{rdna3,rdna4,cdna3}.hpp`); gfx1201's rows moved there unchanged. The Loom dialect spells the RDNA3/3.5 WMMA rows, so gfx1151 runs the 4-bit prefill GEMM, the flash prefill attention and the 4- and 8-row int8 decode panels on its own WMMA instructions, splits decode attention across the part, and runs MTP and DFlash2 verify passes on the shared int8 panel. The 4-bit prefill GEMM's wide tile is chosen per part (gfx1151: 256x128 from 64x32 wave tiles). On an MS-S1 MAX (Radeon 8060S, ROCm 7.13, Ubuntu 24.04) with the pinned Qwen3.8-27B Q4 configuration: plain decode **13.3** tok/s (640 tokens), MTP=3 **15.1** tok/s (acceptance 65%), DFlash2 **18.4** tok/s (acceptance 67%), prefill 250 to 320 tok/s; 0.5.5 failed at startup on gfx1151. The Q6 staged-bf16 kernels, the 64-row prefill panel tiles and FP8 WMMA are RDNA4-only; gfx1151 uses the generic contraction there. The gfx1151 work leaves gfx1201's kernel sources and greedy output unchanged.
+3. **Faster verify passes.** An 8-row verify pass's k and v projections and a 4-row pass's k, v and gated-delta-net a and b projections read the shared activation panel; each 4-row down-projection wave computes two adjacent columns. 640-token decode on mac_linuxgpu build 265: DFlash2 55.6 -> **56.4** tok/s (+1.4%), MTP=3 55.1 -> **55.7** (+1.1%) from the shared panel, and MTP=3 55.8 -> **56.7** (+1.6%) from the two-column down projection; acceptance and greedy output unchanged.
+4. **Offline gfx1151 capture:** `LSE_CAPTURE_TARGET=gfx1151-loom` loads a whole model and emits, and with `LSE_TEST_REAL_COMPILE` compiles, every request shape's kernels for gfx1151 with no GPU.
+
 ## v0.5.5: faster decode and short prompts, HRX kernel arguments in VRAM
 
 Requires mac_linuxgpu v0.1.151 (build 255) or later; kernel arguments in VRAM need v0.1.161 (build 265). Measured on builds 264 and 265.

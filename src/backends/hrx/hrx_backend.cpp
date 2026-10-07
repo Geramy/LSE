@@ -983,10 +983,10 @@ bool HrxBackend::available() noexcept {
 }
 
 HrxBackend::HrxBackend() {
-  // The first declared toolchain is the default for an unqualified run.
-  // A build without COMGR must not route every model operation to the host
-  // interpreter when its Loom compiler is available.
-  if (!compiler_.available() && loom_compiler_.available()) {
+  // The first declared toolchain is the default for an unqualified run, and
+  // that is Loom. A build without loomc must not route every model operation
+  // to the host interpreter when its COMGR compiler is available.
+  if (!loom_compiler_.available() && compiler_.available()) {
     std::swap(toolchains_[0], toolchains_[1]);
   }
 }
