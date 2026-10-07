@@ -473,6 +473,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       const auto p = tile.load(at, 16u);
       return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
     } else {
+      if (std::getenv("LSE_EXP_FRAG32")) {
+        const auto p = tile.load_elems(at, static_cast<std::uint32_t>(kFrag));
+        return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
+      }
       const auto f = e.local<lse::f16, kFrag>();
       for (int piece = 0; piece < kFrag / 8; ++piece) {
         const auto p =
