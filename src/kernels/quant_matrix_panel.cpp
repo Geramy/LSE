@@ -272,6 +272,25 @@ struct MatrixArgs {
 };
 // A decode workgroup owns one 16-column tile per wave over the whole K. Halve
 // the waves per workgroup until the tiles cover every compute unit.
+const dispatch::MatrixPanelTune *matrix_tune(const KernelShapes &s, std::uint32_t bits,
+                                   std::uint32_t n, std::uint32_t k) {
+  if (!s.device) return nullptr;
+  for (const auto &tune : dispatch::arch::tuning(s.device->arch).matrix_panel_tunes)
+    if (tune.arch == s.device->arch && tune.bits == bits && tune.n == n && tune.k == k)
+      return &tune;
+  return nullptr;
+}
+std::uint32_t matrix_waves(const KernelShapes &s, std::uint32_t n);
+// K slices per tile: the part's tune, at most the workgroup's waves.
+std::uint32_t matrix_ksplits(const KernelShapes &s, std::uint32_t bits,
+                             std::uint32_t n, std::uint32_t k) {
+  const auto *tune = matrix_tune(s, bits, n, k);
+  const auto waves = matrix_waves(s, n);
+  if (!tune || tune->k_splits <= 1 || waves % tune->k_splits != 0 ||
+      (k / 64u) % tune->k_splits != 0)
+    return 1;
+  return tune->k_splits;
+}
 std::uint32_t matrix_waves(const KernelShapes &s, std::uint32_t n) {
   const auto tiles = (n + 15u) / 16u;
   const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
@@ -321,11 +340,19 @@ std::string emit_matrix(const KernelShapes &s) {
   const auto groups = k / 64u;
   const auto lanes = k * Bits / 32u;
   const auto waves = matrix_waves(s, n);
-  const auto unroll =
-      matrix_unroll(groups, geo.split_k ? kMatrixUnroll : kMatrixUnroll / 2u);
+  // A part's tune may cut K into slices walked by adjacent waves (summed in
+  // slice order at the end) and set the groups loaded together; without one
+  // the kernel is exactly the single-slice form.
+  const auto *tune = matrix_tune(s, Bits, n, k);
+  const auto ks = matrix_ksplits(s, Bits, n, k);
+  const auto unroll = matrix_unroll(
+      groups / ks, tune && tune->unroll ? tune->unroll
+                   : geo.split_k ? kMatrixUnroll : kMatrixUnroll / 2u);
   const auto tiles_n = (n + 15u) / 16u;
-  const auto nblocks = (tiles_n + waves - 1u) / waves;
-  kir::KernelBody kb(s.types, *s.intrinsics, 0);
+  const auto tile_waves = waves / ks;
+  const auto nblocks = (tiles_n + tile_waves - 1u) / tile_waves;
+  kir::KernelBody kb(s.types, *s.intrinsics,
+                     ks > 1 ? backend::workgroup_lds_bytes(s.device) : 0u);
   kb.set_store(s.store);
   MatrixArgs a;
   if (!env::bind(kb, a, s))
@@ -337,7 +364,15 @@ std::string emit_matrix(const KernelShapes &s) {
   const auto hi = e.let(lane / 16u);
   const auto wg = e.let(math::workgroup_id_x());
   const auto m0 = e.let((wg / nblocks) * 16u);
-  const auto ntile = e.let((wg % nblocks) * waves + lid / 32u);
+  // The single-slice form emits exactly what it always has; only a split
+  // names its waves' slices.
+  std::optional<kir::Val<kir::u32>> wave_index, kslice;
+  if (ks > 1) {
+    wave_index = e.let(lid / 32u);
+    kslice = e.let(*wave_index % ks);
+  }
+  const auto ntile = ks == 1 ? e.let((wg % nblocks) * waves + lid / 32u)
+                             : e.let((wg % nblocks) * tile_waves + *wave_index / ks);
   const auto col = e.let(ntile * 16u + lo);
   const auto live = e.let(ntile < tiles_n && col < n);
   const auto safe_col = e.let(select(col < n, col, e.u32(0)));
@@ -359,7 +394,7 @@ std::string emit_matrix(const KernelShapes &s) {
   // The half-wave's activation words on a split layout; the row's alone on
   // a contiguous one, which reads both halves.
   const auto act_lane = geo.split_k ? e.let(hi * 128u + lo * 2u) : e.let(lo * 2u);
-  for (auto g0 : e.range(0u, groups, unroll)) {
+  const auto groups_body = [&](const kir::Val<kir::u32>& g0) {
     std::vector<Loaded> loaded;
     loaded.reserve(unroll);
     for (std::uint32_t u = 0; u < unroll; ++u) {
@@ -443,15 +478,40 @@ std::string emit_matrix(const KernelShapes &s) {
             bias * sum;
       }
     }
+  };
+  if (ks == 1) {
+    for (auto g0 : e.range(0u, groups, unroll)) groups_body(g0);
+  } else {
+    const auto g_begin = e.let(*kslice * (groups / ks));
+    for (auto g0 : e.range(g_begin, e.let(g_begin + groups / ks), unroll))
+      groups_body(g0);
+  }
+  if (ks > 1) {
+    // Each tile's slices are adjacent waves; the first adds the others in
+    // slice order.
+    const auto partial = e.lds<kir::f32>(waves * kSlots * 32u);
+    for (int z = 0; z < kSlots; ++z)
+      partial[e.let((*wave_index * kSlots + static_cast<std::uint32_t>(z)) * 32u + lane)] =
+          out[static_cast<std::size_t>(z)].read();
+    e.barrier();
+    for (std::uint32_t j = 1; j < ks; ++j)
+      for (int z = 0; z < kSlots; ++z)
+        out[static_cast<std::size_t>(z)] =
+            out[static_cast<std::size_t>(z)].read() +
+            partial[e.let(((*wave_index + j) * kSlots + static_cast<std::uint32_t>(z)) * 32u + lane)].read();
   }
   for (int z = 0; z < kSlots; ++z) {
     const auto output_row =
         e.let(m0 + hi * geo.half_rows +
               static_cast<std::uint32_t>(z) * geo.slot_step);
-    if (auto valid = e.when(live && output_row < input_rows))
+    if (ks == 1) {
+      if (auto valid = e.when(live && output_row < input_rows))
+        e.store(output_row * n + col, out[static_cast<std::size_t>(z)].read());
+    } else if (auto valid = e.when(live && *kslice == 0u && output_row < input_rows)) {
       e.store(output_row * n + col, out[static_cast<std::size_t>(z)].read());
+    }
   }
-  return kb.str();
+  return kb.lds().ok() ? kb.str() : std::string{};
 }
 // The decode panel for the device's matrix generation; a generation without
 // the wave32 iu8 row emits nothing.
@@ -665,10 +725,13 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
         ((m + rule->rows - 1u) / rule->rows) * ((n + 127u) / 128u);
     if (rule->rows == kRows) {
       const auto waves = matrix_waves(s, n);
+      const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+      const auto ks = matrix_ksplits(s, 4, n, k);
       const auto tiles = (n + 15u) / 16u;
       tp.workgroup_size[0] = waves * 32u;
-      tp.workgroup_count[0] =
-          ((m + rule->rows - 1u) / rule->rows) * ((tiles + waves - 1u) / waves);
+      tp.workgroup_count[0] = ((m + rule->rows - 1u) / rule->rows) *
+                              ((tiles + waves / ks - 1u) / (waves / ks));
+      if (ks > 1) tp.lds_bytes = waves * 8u * 32u * 4u;
     }
     return tp;
   }
@@ -728,9 +791,12 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
       return kernel ? kernel->plan(original) : tp;
     }
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+    const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
     const auto waves = matrix_waves(s, n);
+    const auto ks = matrix_ksplits(s, 8, n, k);
     tp.workgroup_size[0] = waves * 32u;
-    tp.workgroup_count[0] = ((n + 15u) / 16u + waves - 1u) / waves;
+    tp.workgroup_count[0] = ((n + 15u) / 16u + waves / ks - 1u) / (waves / ks);
+    if (ks > 1) tp.lds_bytes = waves * 8u * 32u * 4u;
     return tp;
   }
 };

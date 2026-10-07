@@ -504,6 +504,7 @@ LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
                own(*t, t->q4_swiglu_shapes) && own(*t, t->q4_matrix_panel_shapes) &&
                own(*t, t->q4_panel_shapes) &&
                own(*t, t->q8_matrix_rules) && own(*t, t->q8_panel_rules) &&
+               own(*t, t->matrix_panel_tunes) &&
                own(*t, t->flash_wmma) &&
                own(*t, t->flash_cache) && own(*t, t->decode) &&
                own(*t, t->split_short) && own(*t, t->wave_l2));

@@ -106,6 +106,10 @@ struct Q4SwiGluShape {
   std::string_view arch;
   std::uint32_t wave, bits, group, threads, chunks_per_lane, k_splits;
   std::int64_t m, n, k;
+  // Each 128-chunk block of the activation panel is staged once in
+  // workgroup scratch for the workgroup's eight columns instead of every
+  // wave reading it from the cache.
+  bool stage_panel = false;
 };
 
 struct Q4MatrixPanelShape {
@@ -119,6 +123,16 @@ struct Q4MatrixPanelShape {
 // panel in `rows`-row tiles. The 16-row decode tile holds any pass of up to
 // eight rows, its padding rows zero; which passes read it is the consumers'
 // rules' choice.
+// The 16-row matrix panel kernel (quant_matrix_panel.cpp) on one part, for
+// one weight width and shape: K cut into `k_splits` slices that adjacent
+// waves of a workgroup walk in parallel and sum in slice order, and the
+// groups whose loads issue together (0: the kernel's own choice).
+struct MatrixPanelTune {
+  std::string_view arch;
+  std::uint32_t bits;
+  std::int64_t n, k;
+  std::uint32_t k_splits = 1, unroll = 0;
+};
 struct Q4MatrixPanelLayout {
   std::int64_t min_m, m, k;
   std::uint32_t rows;

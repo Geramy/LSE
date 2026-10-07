@@ -48,7 +48,8 @@ inline constexpr std::array kQuantRowLadderShapes{
 inline constexpr std::array kQ4SwiGluShapes{
     Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 1, 1, 17408, 5120},
     Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 1, 4, 17408, 5120},
-    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 2, 8, 17408, 5120},
+    // Eight rows: the panel staged in scratch per 128-chunk block.
+    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 2, 8, 17408, 5120, true},
 };
 inline constexpr auto kQuantMatrixRanges = generic::kQuantMatrixRanges;
 
@@ -140,6 +141,28 @@ inline constexpr Q4GemmTile kQ4GemmWide{256, 128, 4, 4};
 //   8-row shared panel:  1.38 ms at M8, against 5.78 ms generic
 // so MTP=3 decodes at 17.0 tok/s without the tile against 8.9 with it, and
 // DFlash2 at 16.0 with the panel against 14.1 without.
+// The 16-row matrix panel (quant_matrix_panel.cpp) with K cut into slices
+// that adjacent waves walk in parallel, and the groups loaded together. At
+// one 16-column tile per wave a 5120-column contraction has 320 waves on 40
+// CUs, each walking all of K; the 8-bit draft's widest shapes stream poorly
+// at two groups a round. Warm per-call us on the 8060S at 8 rows
+// (test_q4_matrix_panel, rocprofv3 median of 10), untuned -> tuned:
+//   4-bit 5120 x 17408 (target down)   392 -> 340 (in-model, K/4)
+//   8-bit 17408 x 5120                1289 -> 469 (K/4)
+//   8-bit 5120 x 17408                 643 -> 574 (K/4, four groups)
+//   8-bit 5120 x 10240                 537 -> 457 (K/4, four groups)
+//   8-bit 5120 x 4096                  188 ->  89 (K/4, four groups)
+//   8-bit 1024 x 5120                   77 ->  33 (K/4)
+//   8-bit 1280 x 5120                   34 ->  27 (K/2, four groups)
+inline constexpr std::array kMatrixPanelTunes{
+    MatrixPanelTune{kArch, 4, 5120, 17408, 4, 0},
+    MatrixPanelTune{kArch, 8, 17408, 5120, 4, 0},
+    MatrixPanelTune{kArch, 8, 5120, 17408, 4, 4},
+    MatrixPanelTune{kArch, 8, 5120, 10240, 4, 4},
+    MatrixPanelTune{kArch, 8, 5120, 4096, 4, 4},
+    MatrixPanelTune{kArch, 8, 1024, 5120, 4, 0},
+    MatrixPanelTune{kArch, 8, 1280, 5120, 2, 4},
+};
 inline constexpr std::array kQ8PanelRules{
     q8_shapes::MatrixRule{kArch, 32, 8, 16, 1664, 256, 4},
 };
@@ -185,6 +208,7 @@ inline constexpr Tuning kTuning{
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
     .q4_panel_shapes = kQ4DecodePanelShapes,
     .q8_panel_rules = kQ8PanelRules,
+    .matrix_panel_tunes = kMatrixPanelTunes,
     .flash_wmma = kFlashWmmaRules,
     .decode = kDecodeRules,
     .split_short = kSplitShortRules,
@@ -208,6 +232,7 @@ static_assert(rows_name(kQuantInt8Rows, kArch) &&
               rows_name(kQ4MatrixPanelShapes, kArch) &&
               rows_name(kQ4DecodePanelShapes, kArch) &&
               rows_name(kQ8PanelRules, kArch) &&
+              rows_name(kMatrixPanelTunes, kArch) &&
               rows_name(kFlashWmmaRules, kArch) &&
               rows_name(kDecodeRules, kArch) &&
               rows_name(kSplitShortRules, kArch) &&
