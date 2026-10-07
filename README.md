@@ -88,8 +88,13 @@ Unsupported configurations use dense attention automatically.
 These FlashPrefill figures were measured with LSE 0.4.23, before the 0.5.4 prefill
 work; they compare sparse and dense prefill on that build. At 16K, the merged build
 reached **632.1 prompt tok/s** versus 492.9 dense.
-At 32K, the earlier matched pair reached **604.9 prompt tok/s** versus 378.1 dense. The 64-token greedy output matched; perplexity
-has not been measured. [Configuration and measurements](docs/experimental/sparse-attention.md).
+At 32K, the earlier matched pair reached **604.9 prompt tok/s** versus 378.1 dense. The 64-token greedy output matched. [Configuration and measurements](docs/experimental/sparse-attention.md).
+Wikitext-2 perplexity with master `92cbdca`
+([qualification](docs/R9700_QUALIFICATION.md#output-quality-perplexity-2026-10-07)):
+
+- At ctx 512, dense and V2 both measure 7.1467.
+- In 1024-token windows, dense measures 7.6503 and V2 7.6512.
+- In 2048-token windows, dense measures 7.0368 and V2 7.0487.
 
 Credit to [shcherbakov22](https://github.com/shcherbakov22/) for providing research on FlashPrefill v2  
 [FlashPrefill v2 paper](https://arxiv.org/html/2608.19758v1)

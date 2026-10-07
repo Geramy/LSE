@@ -1,4 +1,91 @@
-# R9700 experimental optimization qualification
+# R9700 and gfx1151 qualification
+
+## Output quality: perplexity (2026-10-07)
+
+Measured with `lse-server --perplexity` ([Perplexity](PERPLEXITY.md)) from
+master `92cbdca`. The model is Qwen3.8-27B as MLX 4-bit affine, group 64
+(`qwen38-27b-q4-mlx`). The text is wikitext-2 raw test (`wiki.test.raw`
+from llama.cpp's `wikitext-2-raw-v1.zip`).
+
+The method is llama.cpp's default:
+
+- 512-token chunks with no overlap.
+- The second half of each chunk is scored.
+- No BOS token is inserted.
+
+This gives 297,193 tokens, 580 chunks and 147,900 scored tokens. Every run
+used the bf16 KV cache, batch and ubatch 1024, and
+`LSE_REQUIRE_DEVICE_KERNELS=1`. The token-id SHA-256 is
+`e0847dfdf2218cba0f786294f70732f1dc28e42723752e477cf640a298da9072`.
+llama.cpp's `llama-tokenize` produces the same ids.
+
+### LSE vs llama.cpp (R9700, ctx 512)
+
+| Engine | Weights | Host | PPL | Δ vs LSE | Scored tokens | Seconds |
+|---|---|---|---:|---:|---:|---:|
+| LSE `92cbdca`, dense prefill | MLX 4-bit, group 64 | macOS, mac_linuxgpu build 266 | 7.1467 ± 0.0464 | | 147,900 | 218.5 |
+| LSE `92cbdca`, dense prefill | MLX 4-bit, group 64 | Linux, ROCm 7.13 | 7.1467 ± 0.0464 | 0.0000 | 147,900 | 261.0 |
+| llama.cpp b11379 Vulkan, `llama-perplexity` defaults | GGUF Q4_0, `unsloth/Qwen3.8-27B-GGUF` @ `4ca7207` | Linux | 7.0759 ± 0.0461 | −0.0708 | 147,900 | 320 |
+
+The two engines use different 4-bit quantizations of the same model.
+The macOS and Linux LSE runs give the same value to every printed digit:
+7.146706077229698.
+
+### FlashPrefill V2 on vs off (macOS)
+
+KLD is FlashPrefill V2 measured against a dense base. It covers the top 32
+tokens per scored token plus one bucket for the rest of the vocabulary.
+
+| Method | Dense PPL | V2 PPL | Δ PPL | Mean KLD | Same top | RMS Δp | Scored tokens |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| chunks, ctx 512 | 7.1467 | 7.1467 | +0.0000 | 3.3e-13 | 100.000% | 0.000% | 147,900 |
+| sliding, window 1024 | 7.6503 | 7.6512 | +0.0009 | 0.00062 ± 0.00010 | 99.704% | 0.696% | 296,902 |
+| sliding, window 2048 | 7.0368 | 7.0487 | +0.0119 | 0.00475 ± 0.00024 | 98.550% | 2.038% | 297,047 |
+
+HumanEval prompts plus solutions at ctx 512 (16,065 scored tokens) give 1.5970
+both dense and with V2.
+
+### gfx1151: K-split before vs after (MS-S1, Radeon 8060S, ctx 512)
+
+- **A** = master `92cbdca`, which includes the eight-row K-split.
+- **B** = `1947c23` plus the perplexity commits (`6ebd99a`).
+
+KLD is against B dense.
+
+| Build | Prefill | PPL | Mean KLD | Same top | Seconds |
+|---|---|---:|---:|---:|---:|
+| B | dense | 7.146670 ± 0.046419 | base | base | 725.5 |
+| A | dense | 7.146670 ± 0.046419 | 2.9e-13 | 100.000% | 727.6 |
+| A | FlashPrefill V2 | 7.146670 ± 0.046419 | 2.9e-13 | 100.000% | 726.8 |
+| B | FlashPrefill V2 | 7.146670 ± 0.046419 | 2.9e-13 | 100.000% | 727.5 |
+
+Sliding windows of 2048 tokens (297,047 scored tokens). KLD is against A dense.
+
+| Build | Prefill | PPL | Mean KLD | Same top | Seconds |
+|---|---|---:|---:|---:|---:|
+| A | dense | 7.036797 ± 0.032460 | base | base | 642.9 |
+| B | dense | 7.036797 ± 0.032460 | 3.4e-13 | 100.000% | 652.9 |
+| A | FlashPrefill V2 | 7.048663 ± 0.032522 | 0.00477 ± 0.00025 | 98.551% | 654.5 |
+
+The K-split does not change prefill scoring at ctx 512 or at window 2048.
+FlashPrefill V2 changes PPL by +0.0119 at window 2048 on gfx1151, and by
++0.0119 on the R9700.
+
+### Speculative decoding
+
+The prompt was the first HumanEval prompt (122 tokens), with greedy decoding
+of 256 tokens using `lse -t 0 -n 256`.
+
+- DFlash2 (depth 7) accepted 190/237 proposals (80.2%).
+- MTP (depth 3) accepted 159/220 (72.3%).
+- Neither output is token-identical to plain decode: both first differ at
+  generated token 4.
+- DFlash2 and MTP first differ from each other at token 47.
+
+Full data, commands and checksums: `lse-pr/output-qualification.md` in the
+development workspace.
+
+## Earlier: experimental optimization qualification
 
 The allocation-owner lifetime fix passes correctness and performance checks.
 The two-pass Q6 prefill and two-iteration INT8 prefetch candidates remain on
