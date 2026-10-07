@@ -216,6 +216,7 @@ add_library(lse_graph
   src/graph/jit_cache.cpp
   src/graph/interpreter.cpp
   src/graph/scheduler.cpp
+  src/graph/variant_book.cpp
   src/graph/stream_plan.cpp
   src/graph/sharding.cpp
 )

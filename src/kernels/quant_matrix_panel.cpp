@@ -311,6 +311,28 @@ std::uint32_t matrix_unroll(std::uint32_t groups,
     unroll /= 2u;
   return unroll;
 }
+// The groups loaded together, as variants (they change when loads issue,
+// never the order products accumulate in): the part's tune or the
+// generation's default first, then every other count the slice divides by.
+std::vector<std::uint32_t> matrix_unroll_menu(const KernelShapes &s, std::uint32_t bits,
+                                              std::uint32_t n, std::uint32_t k) {
+  const auto groups = k / 64u / matrix_ksplits(s, bits, n, k);
+  const auto *tune = matrix_tune(s, bits, n, k);
+  const bool split_k = s.device && matrix_target(*s.device) == math::MatrixTarget::kRdna4;
+  std::vector<std::uint32_t> menu{matrix_unroll(
+      groups, tune && tune->unroll ? tune->unroll
+              : split_k ? kMatrixUnroll : kMatrixUnroll / 2u)};
+  for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u, 1u}) {
+    const auto u = matrix_unroll(groups, most);
+    if (std::find(menu.begin(), menu.end(), u) == menu.end()) menu.push_back(u);
+  }
+  return menu;
+}
+std::uint32_t matrix_variants(const KernelShapes &s, std::uint32_t bits) {
+  const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+  const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  return static_cast<std::uint32_t>(matrix_unroll_menu(s, bits, n, k).size());
+}
 // `Bits` is the weight width: 4-bit words widen to matrix operands by nibble
 // plane, 8-bit words already are operands, four codes to a register.
 //
@@ -343,11 +365,11 @@ std::string emit_matrix(const KernelShapes &s) {
   // A part's tune may cut K into slices walked by adjacent waves (summed in
   // slice order at the end) and set the groups loaded together; without one
   // the kernel is exactly the single-slice form.
-  const auto *tune = matrix_tune(s, Bits, n, k);
   const auto ks = matrix_ksplits(s, Bits, n, k);
-  const auto unroll = matrix_unroll(
-      groups / ks, tune && tune->unroll ? tune->unroll
-                   : geo.split_k ? kMatrixUnroll : kMatrixUnroll / 2u);
+  const auto unrolls = matrix_unroll_menu(s, Bits, n, k);
+  if (s.variant >= unrolls.size())
+    return {};
+  const auto unroll = unrolls[s.variant];
   const auto tiles_n = (n + 15u) / 16u;
   const auto tile_waves = waves / ks;
   const auto nblocks = (tiles_n + tile_waves - 1u) / tile_waves;
@@ -706,6 +728,15 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     const auto *kernel = legacy(original);
     return kernel ? kernel->emit_kernel(original) : std::string{};
   }
+  std::uint32_t variants(const KernelShapes &s) const override {
+    if (!valid_matrix_panel(s) || !s.device)
+      return 1;
+    const auto original = original_shapes(s);
+    if (!dispatch::q4_matrix_panel_row(original) ||
+        dispatch::q4_matrix_panel_rule(original)->rows != kRows)
+      return 1;
+    return matrix_variants(s, 4);
+  }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     ThreadPlan tp;
     if (!valid_matrix_panel(s))
@@ -780,6 +811,12 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
       return emit_matrix_for<8>(s);
     const auto *kernel = legacy(original);
     return kernel ? kernel->emit_kernel(original) : std::string{};
+  }
+  std::uint32_t variants(const KernelShapes &s) const override {
+    if (!valid_q8_matrix_panel(s) || !s.device ||
+        !dispatch::q8_matrix_panel_row(original_shapes(s)))
+      return 1;
+    return matrix_variants(s, 8);
   }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     ThreadPlan tp;

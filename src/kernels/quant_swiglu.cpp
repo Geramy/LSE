@@ -210,6 +210,18 @@ struct Pair final : KernelPrimitive<Pair> {
   // the weights, bound the pass. Same blocks, chunks, accumulation order
   // and bias pass as the unstaged body; the grid covers exactly 17408
   // columns, so every wave reaches every barrier.
+  // Staged or not is the same arithmetic, so it is a variant (variants()):
+  // variant 0 is what the part's row says, variant 1 the other body.
+  static bool staged(const KernelShapes &s, std::uint32_t rows) {
+    return rows > 1 && (dispatch::q4_swiglu_rule(s)->stage_panel != (s.variant == 1u));
+  }
+  std::uint32_t variants(const KernelShapes &s) const override {
+    if (!valid(s))
+      return 1;
+    const auto rows = std::min<std::uint32_t>(
+        dot4_schedule(original(s)).rows, static_cast<std::uint32_t>(s.inputs[0].dim(1)));
+    return rows > 1 ? 2u : 1u;
+  }
   static std::string emit_staged(const KernelShapes &s, const Dot4Schedule &sched,
                                  std::uint32_t rows) {
     kir::KernelBody kb(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
@@ -295,8 +307,7 @@ struct Pair final : KernelPrimitive<Pair> {
     // its own rows alone, each exactly as the rule's pass computes it.
     const auto rows = std::min<std::uint32_t>(
         sched.rows, static_cast<std::uint32_t>(s.inputs[0].dim(1)));
-    const auto *rule = dispatch::q4_swiglu_rule(s);
-    if (rule->stage_panel && rows > 1)
+    if (staged(s, rows))
       return emit_staged(s, sched, rows);
     kir::KernelBody kb(s.types, *s.intrinsics, 0);
     kb.set_store(s.store);
@@ -368,7 +379,7 @@ struct Pair final : KernelPrimitive<Pair> {
       p.workgroup_count[0] = 2176;
       const auto rows = std::min<std::uint32_t>(
           dot4_schedule(original(s)).rows, static_cast<std::uint32_t>(s.inputs[0].dim(1)));
-      if (dispatch::q4_swiglu_rule(s)->stage_panel && rows > 1)
+      if (staged(s, rows))
         p.lds_bytes = rows * kStageRow * 4u;
     }
     return p;

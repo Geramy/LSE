@@ -195,6 +195,12 @@ class IKernelEmitter {
   // JIT identity for this group on this device. Must change when generated
   // source would change without FusionGroup::signature() changing (a
   // specialized primitive). Arch is mixed in by the cache, not here.
+  // How many variants the group's self-indexed primitive offers for this
+  // device (KernelPrimitiveBase::variants); 1 when it has no such primitive.
+  [[nodiscard]] virtual std::uint32_t variants(const FusionGroup&,
+                                               const backend::DeviceInfo&) const {
+    return 1;
+  }
   [[nodiscard]] virtual std::uint64_t cache_key(
       const FusionGroup& group, const backend::DeviceInfo& device) const;
 

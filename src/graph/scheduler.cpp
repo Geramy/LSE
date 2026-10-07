@@ -31,6 +31,7 @@
 #include "lse/graph/pointwise_fusion.hpp"
 #include "lse/opt/fusion.hpp"
 #include "dispatch_profile.hpp"
+#include "variant_book.hpp"
 
 namespace lse::graph {
 namespace {
@@ -178,6 +179,37 @@ struct Scheduler::Impl {
   // is invisible to it. Cleared whenever the device is known idle.
   std::vector<std::uint8_t> outstanding;
   std::vector<backend::StreamEvent> entry_events;
+
+  // Which variant each kernel with a choice runs. See variant_book.hpp.
+  detail::VariantBook variants;
+  std::unordered_map<const IKernelCompiler*, std::string> compiler_ids;
+  struct VariantPick {
+    std::uint32_t variant = 0;
+    std::uint32_t offered = 1;
+    std::uint64_t key = 0;
+    // Not yet decided: measure every variant after this launch.
+    bool trial = false;
+  };
+  VariantPick pick_variant(const IKernelEmitter& emitter,
+                           const IKernelCompiler* compiler,
+                           const FusionGroup& group,
+                           const backend::DeviceInfo& info) {
+    VariantPick pick;
+    if (!variants.enabled() || compiler == nullptr) return pick;
+    pick.offered = emitter.variants(group, info);
+    if (pick.offered <= 1) return pick;
+    auto [it, fresh] = compiler_ids.try_emplace(compiler);
+    if (fresh) it->second = compiler->identity();
+    const EmissionVariantScope base(0);
+    pick.key = detail::VariantBook::key(emitter.cache_key(group, info),
+                                        pick.offered, it->second);
+    if (const auto chosen = variants.decided(pick.key)) {
+      if (*chosen < pick.offered) pick.variant = *chosen;
+    } else {
+      pick.trial = true;
+    }
+    return pick;
+  }
 
   Status ensure_jit(backend::IDeviceSet& devices, std::size_t member,
                     const KernelToolchain& tc) {
@@ -494,6 +526,110 @@ std::string describe_group(const FusionGroup& g, std::size_t index) {
 }
 }  // namespace
 
+namespace {
+
+// Every variant the group's primitive offers, launched on the operands the
+// step just ran with. A variant is a candidate only if its output equals
+// variant 0's in every byte; the fastest candidate is returned, and variant 0
+// unless another beats it by more than the noise of the measurement. The
+// output holds variant 0's bytes again when this returns.
+struct VariantTrial {
+  backend::IBackend& be;
+  JitCache& jit;
+  std::size_t member;
+  const IKernelEmitter& emitter;
+  const FusionGroup& group;
+  const EmittedKernel& base;
+  const backend::KernelHandle& base_handle;
+  const backend::DispatchArgs& args;
+  backend::DispatchTarget target;
+  backend::DeviceBuffer& output;
+  std::size_t output_bytes;
+  std::uint32_t offered;
+};
+
+Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note) {
+  struct Candidate {
+    std::uint32_t variant = 0;
+    backend::KernelHandle handle;
+    backend::LaunchDims dims;
+    double best_us = 0.0;
+  };
+  LSE_RETURN_IF_ERROR(t.be.synchronize());
+  std::vector<std::byte> reference(t.output_bytes);
+  std::vector<std::byte> got(t.output_bytes);
+  LSE_RETURN_IF_ERROR(t.be.copy_d2h(t.output, reference.data(), t.output_bytes, 0));
+  std::vector<Candidate> candidates{{0, t.base_handle, t.base.dims, 0.0}};
+  const backend::DeviceInfo& info = t.be.device_info();
+  for (std::uint32_t v = 1; v < t.offered; ++v) {
+    const EmissionVariantScope scope(v);
+    const std::uint64_t ident = t.emitter.cache_key(t.group, info);
+    auto written = t.emitter.emit(t.group, info);
+    if (!written.ok()) {
+      note += " " + std::to_string(v) + "=declined";
+      continue;
+    }
+    const EmittedKernel& k = *written;
+    if (k.binding_order != t.base.binding_order || k.pointer_table ||
+        k.persist_grid || k.constants.total_bytes != t.base.constants.total_bytes) {
+      return LSE_ERROR(kInternal, "variant ", v, " of ", t.base.entry_name,
+                       " binds its operands differently from variant 0");
+    }
+    auto built = t.jit.get_or_compile(t.member, ident, k);
+    if (!built.ok()) {
+      std::fprintf(stderr, "lse: variant %u of %s does not build: %s\n", v,
+                   t.base.entry_name.c_str(), built.status().to_string().c_str());
+      note += " " + std::to_string(v) + "=unbuilt";
+      continue;
+    }
+    LSE_RETURN_IF_ERROR(t.be.launch(*built, k.dims, t.args, t.target));
+    LSE_RETURN_IF_ERROR(t.be.synchronize());
+    LSE_RETURN_IF_ERROR(t.be.copy_d2h(t.output, got.data(), t.output_bytes, 0));
+    if (std::memcmp(got.data(), reference.data(), t.output_bytes) != 0) {
+      note += " " + std::to_string(v) + "=differs";
+      continue;
+    }
+    candidates.push_back({v, *built, k.dims, 0.0});
+  }
+  if (candidates.size() > 1) {
+    // Enough launches per sample that a sample is ~2 ms of device time, then
+    // the best of three interleaved rounds: what is kept is each variant's
+    // speed, not the moment it happened to run in.
+    auto sample = [&](Candidate& c, std::uint32_t reps) -> Result<double> {
+      LSE_RETURN_IF_ERROR(t.be.synchronize());
+      const auto t0 = SpanClock::now();
+      for (std::uint32_t r = 0; r < reps; ++r)
+        LSE_RETURN_IF_ERROR(t.be.launch(c.handle, c.dims, t.args, t.target));
+      LSE_RETURN_IF_ERROR(t.be.synchronize());
+      return static_cast<double>(elapsed_ns(t0, SpanClock::now())) / 1e3 / reps;
+    };
+    LSE_ASSIGN_OR(const double once, sample(candidates[0], 1));
+    const auto reps = static_cast<std::uint32_t>(
+        std::clamp(2000.0 / std::max(once, 1.0), 1.0, 64.0));
+    for (int round = 0; round < 3; ++round) {
+      for (Candidate& c : candidates) {
+        LSE_ASSIGN_OR(const double us, sample(c, reps));
+        c.best_us = round == 0 ? us : std::min(c.best_us, us);
+      }
+    }
+  }
+  const Candidate* best = &candidates[0];
+  for (const Candidate& c : candidates) {
+    char part[48];
+    std::snprintf(part, sizeof(part), " %u=%.1fus", c.variant, c.best_us);
+    note += part;
+    if (c.best_us < best->best_us) best = &c;
+  }
+  const std::uint32_t chosen =
+      best->best_us < candidates[0].best_us * 0.98 ? best->variant : 0u;
+  LSE_RETURN_IF_ERROR(t.be.synchronize());
+  LSE_RETURN_IF_ERROR(t.be.copy_h2d(reference.data(), t.output, t.output_bytes, 0));
+  LSE_RETURN_IF_ERROR(t.be.synchronize());
+  return chosen;
+}
+
+}  // namespace
+
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
                                      std::size_t member, Program* replay,
@@ -518,6 +654,16 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                 be.device_info().arch, &ident)
       : nullptr;
   std::optional<EmittedKernel> transient;
+  // The variant this group runs, which every emission below is made under.
+  // A retained emission was made under the same decision, so it needs the
+  // pick only if its text has to be written again.
+  Impl::VariantPick pick;
+  std::optional<EmissionVariantScope> variant_scope;
+  if (emitted == nullptr || emitted->source.empty()) {
+    pick = impl_->pick_variant(*emitter, tc->compiler, group, be.device_info());
+    variant_scope.emplace(pick.variant);
+  }
+  const bool fresh_emission = emitted == nullptr;
   if (emitted == nullptr) {
     ident = emitter->cache_key(group, be.device_info());
     impl_->dispatch_stage = DispatchStage::kEmit;
@@ -892,6 +1038,55 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
                               predrain_ns, completed.ok());
   }
   LSE_RETURN_IF_ERROR(completed);
+  if (pick.trial && fresh_emission && !serial && impl_->variants.has_budget()) {
+    // Measured only where a launch can be repeated on the same operands and
+    // its whole effect read back: one output, written in place of nothing,
+    // aliasing no input.
+    const NodePtr& out = group.outputs.size() == 1 ? group.outputs[0] : NodePtr{};
+    std::string why;
+    if (!out || emitted->pointer_table || emitted->persist_grid ||
+        group_bindings_may_alias(group) || foreign_to(out->buffer, member) ||
+        !std::ranges::count(emitted->binding_order, out)) {
+      why = "unmeasurable";
+    }
+    for (const NodePtr& n : emitted->binding_order) {
+      if (n && n->prim != nullptr && n->prim->inplace_input() >= 0) why = "unmeasurable";
+    }
+    const std::size_t out_bytes =
+        out ? dtype_storage_bytes(out->dtype, out->element_count()) : 0;
+    if (why.empty() && (out_bytes == 0 || out_bytes > out->buffer.size_bytes ||
+                        out_bytes > (std::size_t{512} << 20))) {
+      why = "unmeasurable";
+    }
+    std::uint32_t chosen = 0;
+    const auto t_trial = SpanClock::now();
+    if (why.empty()) {
+      const VariantTrial trial{be, *impl_->jit, member, *emitter, group, *emitted,
+                               launched, args,
+                               backend::DispatchTarget{stream, devices_.residency(member), {}},
+                               out->buffer, out_bytes, pick.offered};
+      LSE_ASSIGN_OR(chosen, run_variant_trial(trial, why));
+    }
+    const std::uint64_t trial_ns = elapsed_ns(t_trial, SpanClock::now());
+    impl_->variants.spend(trial_ns);
+    trace_.spans.host_wait.add(trial_ns);
+    if (why == "unmeasurable") impl_->variants.hold(pick.key, 0);
+    else impl_->variants.record(pick.key, chosen, why);
+    std::fprintf(stderr, "lse: variants of %s:%s -> %u (%.1f ms)\n",
+                 emitted->entry_name.c_str(), why.c_str(), chosen,
+                 static_cast<double>(trial_ns) / 1e6);
+    // The step's retained emission is the one later replays launch.
+    if (chosen != 0 && replay != nullptr) {
+      const EmissionVariantScope scope(chosen);
+      const std::uint64_t chosen_ident = emitter->cache_key(group, be.device_info());
+      auto kernel = emitter->emit_launch(group, be.device_info());
+      if (!kernel.ok()) return kernel.status();
+      if (replay->cache_emission(group_index, group, &be, emitter, chosen_ident,
+                                 be.device_info().arch, kernel.release()) == nullptr) {
+        return LSE_ERROR(kInternal, "replay emission index is outside its program");
+      }
+    }
+  }
   // Diagnostic: LSE_DUMP_BUFFERS=<entry substring> drains the device after
   // this dispatch and prints a checksum and the first values of every bound
   // buffer, so a kernel's inputs and outputs can be compared across builds.
@@ -1213,6 +1408,7 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
     const IKernelEmitter* emitter = nullptr;
     std::vector<const FusionGroup*> groups;
     std::vector<std::uint64_t> signatures;
+    std::vector<std::uint32_t> variants;
     std::unordered_set<std::uint64_t> seen;
   };
   std::vector<Missing> missing(devices_.size());
@@ -1229,6 +1425,12 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
                        "' has no kernel emitter");
     }
     LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member, *mtc));
+    // A decided variant is the kernel the step will launch, so it is the one
+    // prepared; an undecided one prepares variant 0 and is measured when it
+    // first runs.
+    const std::uint32_t variant =
+        impl_->pick_variant(*memitter, mtc->compiler, g, be.device_info()).variant;
+    const EmissionVariantScope scope(variant);
     const std::uint64_t ident = memitter->cache_key(g, be.device_info());
     if (impl_->jit->try_get(member, ident, memitter->dialect()) != nullptr) continue;
     Missing& m = missing[member];
@@ -1236,6 +1438,7 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
     m.emitter = memitter;
     m.groups.push_back(&g);
     m.signatures.push_back(ident);
+    m.variants.push_back(variant);
   }
   for (std::size_t member = 0; member < missing.size(); ++member) {
     const Missing& m = missing[member];
@@ -1250,7 +1453,9 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
     const backend::DeviceInfo& info = devices_.device(member).device_info();
     std::vector<EmittedKernel> kernels;
     kernels.reserve(m.groups.size());
-    for (const FusionGroup* g : m.groups) {
+    for (std::size_t i = 0; i < m.groups.size(); ++i) {
+      const FusionGroup* g = m.groups[i];
+      const EmissionVariantScope scope(m.variants[i]);
       auto emitted = m.emitter->emit(*g, info);
       if (!emitted.ok()) {
         return Status(emitted.status().code(), ::lse::detail::concat(

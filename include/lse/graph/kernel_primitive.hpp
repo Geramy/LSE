@@ -113,6 +113,26 @@ struct KernelShapes {
   // The quantized form of `staged`, when the run hoisted one. Same contract:
   // a named set is a completed fill, already behind its barrier.
   StagedQuantPanel staged_quant{};
+
+  // Which of the primitive's variants (KernelPrimitiveBase::variants) to
+  // emit. 0 is the primitive's own default; the optimizer sets another only
+  // after measuring it faster on this device and bit-identical in its output.
+  std::uint32_t variant = 0;
+};
+
+// The variant the current emission is for, set by the optimizer around an
+// emit (and the cache key that names it) and read by the emitter into
+// KernelShapes::variant. 0 outside any scope.
+[[nodiscard]] std::uint32_t emission_variant() noexcept;
+class EmissionVariantScope {
+ public:
+  explicit EmissionVariantScope(std::uint32_t variant) noexcept;
+  ~EmissionVariantScope();
+  EmissionVariantScope(const EmissionVariantScope&) = delete;
+  EmissionVariantScope& operator=(const EmissionVariantScope&) = delete;
+
+ private:
+  std::uint32_t previous_;
 };
 
 struct ThreadPlan {
@@ -135,6 +155,14 @@ class KernelPrimitiveBase : public Primitive {
   // True by default: the emitter owns the entry point, so it appends the
   // epilogue after the call rather than relying on the body to run it.
   virtual bool supports_epilogue() const noexcept { return true; }
+
+  // How many ways this primitive can lay out the same computation for these
+  // shapes: operand placement, buffering, tiling -- choices that change
+  // where data waits and how work is shared, never the arithmetic. Every
+  // variant must produce each output bit for bit as variant 0 does; the
+  // optimizer checks that on the device before it keeps one, and keeps the
+  // fastest it measures. 1 means there is nothing to choose.
+  virtual std::uint32_t variants(const KernelShapes&) const { return 1; }
 
   // Whether the primitive maps threads to work itself instead of computing one
   // output element per thread.

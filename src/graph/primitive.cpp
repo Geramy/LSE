@@ -1,3 +1,4 @@
+#include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/primitive.hpp"
 
 #include "lse/graph/codegen.hpp"
@@ -67,4 +68,16 @@ std::vector<std::string> registered_primitives() {
   return out;
 }
 
+}  // namespace lse::graph
+
+namespace lse::graph {
+namespace {
+thread_local std::uint32_t g_emission_variant = 0;
+}  // namespace
+std::uint32_t emission_variant() noexcept { return g_emission_variant; }
+EmissionVariantScope::EmissionVariantScope(std::uint32_t variant) noexcept
+    : previous_(g_emission_variant) {
+  g_emission_variant = variant;
+}
+EmissionVariantScope::~EmissionVariantScope() { g_emission_variant = previous_; }
 }  // namespace lse::graph
