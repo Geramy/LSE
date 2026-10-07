@@ -86,6 +86,17 @@ class Program {
   // node when it is itself a produced value, which is the only reason this has
   // to be called at all.
   void hold_carries() noexcept;
+  // Whether `previous`'s carried outputs can hand this program its carried
+  // inputs (adopt_carries): the same number of carries, each the same shape
+  // and type, and every one of `previous`'s outputs holding its value.
+  [[nodiscard]] bool can_adopt_carries(const Program& previous) const noexcept;
+  // The pass about to run follows `previous`, a different program over the
+  // same state: carry i's input takes carry i's output buffer from
+  // `previous` (an exchange, so no bytes move and no buffer is shared), the
+  // way fold_carries moves a program's own outputs in. `previous`'s outputs
+  // are left holding what this program's inputs held; they are rewritten the
+  // next time `previous` runs. The device must be idle on these buffers.
+  void adopt_carries(Program& previous) noexcept;
 
  private:
   std::vector<NodePtr> roots_;

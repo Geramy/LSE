@@ -49,6 +49,9 @@ struct ServerOptions {
   // The thinking levels the model's chat template defines.
   models::ThinkingControls thinking;
   std::uint32_t mtp_depth = 3;
+  // DFlash2 verifies the prefix of each draft block that DraftWidthPolicy
+  // picks (true), or the whole block every step (false).
+  bool adaptive_dflash2 = true;
   runtime::PrefillBatch prefill;
   // Where the served model and its draft came from, and what they run on, for
   // /v1/lse/model_info and /v1/lse/estimate. Those routes describe the loaded

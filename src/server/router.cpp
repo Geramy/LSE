@@ -184,6 +184,9 @@ struct Outcome {
   std::uint32_t mtp_depth = 0;
   std::uint32_t dflash2_depth = 0;
   std::uint32_t spec_steps = 0, spec_tested = 0, spec_accepted = 0;
+  std::uint32_t spec_proposed = 0, spec_plain_steps = 0;
+  double spec_mean_width = 0.0;
+  bool dflash2_adaptive = false;
   std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
   std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint64_t spec_draft_ns = 0, spec_verify_ns = 0;
@@ -211,6 +214,9 @@ struct Router::Impl {
   model::MtpModule* mtp = nullptr;
   model::DFlash2Module* dflash2 = nullptr;
   ServerOptions opt;
+  // DFlash2's verify-width policy: what each width costs on this device and
+  // how the draft's confidence maps to acceptance, kept across requests.
+  runtime::DraftWidthPolicy widths;
   // One model on one device. Two decodes at once would interleave on the same
   // KV pool, so requests queue here instead.
   std::mutex generate_lock;
@@ -376,7 +382,8 @@ struct Router::Impl {
     if (dflash2 != nullptr)
       draft = {{"kind", "dflash2"},
                {"block_size", dflash2->block_size()},
-               {"depth", runtime::dflash2_verify_depth(dflash2->block_size())}};
+               {"depth", runtime::dflash2_verify_depth(dflash2->block_size())},
+               {"adaptive", opt.adaptive_dflash2}};
     return json{{"context_length", c.kv_capacity()},
                 {"max_position_embeddings", c.train_seq_len},
                 {"kv_len", c.kv_capacity()},
@@ -629,7 +636,8 @@ Result<Outcome> Router::Impl::generate(
 
   runtime::Generator gen(impl.model, r.sampling, impl.opt.prefill);
   if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
-  if (impl.dflash2 != nullptr) gen.use_dflash2(*impl.dflash2);
+  if (impl.dflash2 != nullptr)
+    gen.use_dflash2(*impl.dflash2, impl.opt.adaptive_dflash2 ? &impl.widths : nullptr);
 
   // The request's session: a named one is found or created, and continues
   // its own prefix (the Generator checks the exact tokens before reusing
@@ -756,6 +764,10 @@ Result<Outcome> Router::Impl::generate(
   out.spec_steps = st.spec_steps;
   out.spec_tested = st.spec_tested;
   out.spec_accepted = st.spec_accepted;
+  out.spec_proposed = st.spec_proposed;
+  out.spec_plain_steps = st.spec_plain_steps;
+  out.spec_mean_width = st.mean_verify_width();
+  out.dflash2_adaptive = st.dflash2_adaptive;
   out.spec_tested_by_position = st.spec_tested_by_position;
   out.spec_accepted_by_position = st.spec_accepted_by_position;
   out.spec_overlap_sum = st.spec_overlap_sum;
@@ -796,7 +808,10 @@ Result<Outcome> Router::Impl::generate(
                out.decode_per_second,
                out.acceptance >= 0.0
                    ? (" | accepted " + std::to_string(
-                          static_cast<int>(out.acceptance * 100.0)) + "%").c_str()
+                          static_cast<int>(out.acceptance * 100.0)) + "% (" +
+                      std::to_string(out.spec_accepted) + "/" + std::to_string(out.spec_tested) +
+                      " tested, " + std::to_string(out.spec_proposed) + " proposed, mean width " +
+                      std::to_string(out.spec_mean_width).substr(0, 4) + ")").c_str()
                    : "");
   return out;
 }
@@ -837,6 +852,7 @@ json timings_of(const Outcome& o) {
          {"predicted_per_second", o.decode_per_second}};
   t["mtp_depth"] = o.mtp_depth;
   t["dflash2_depth"] = o.dflash2_depth;
+  if (o.dflash2_depth != 0) t["dflash2_adaptive"] = o.dflash2_adaptive;
   t["spec_method"] = o.dflash2_depth != 0 ? "dflash2"
                        : o.mtp_depth != 0 ? "mtp" : "none";
   o.jit.append_to(t);
@@ -847,6 +863,9 @@ json timings_of(const Outcome& o) {
     t["spec_steps"] = o.spec_steps;
     t["spec_tested"] = o.spec_tested;
     t["spec_accepted"] = o.spec_accepted;
+    t["spec_proposed"] = o.spec_proposed;
+    t["spec_plain_steps"] = o.spec_plain_steps;
+    t["spec_mean_width"] = o.spec_mean_width;
     t["spec_tested_by_position"] = o.spec_tested_by_position;
     t["spec_accepted_by_position"] = o.spec_accepted_by_position;
     t["spec_overlap_sum"] = o.spec_overlap_sum;
@@ -1124,7 +1143,8 @@ Status Router::prepare_kernels() {
                                          impl_->model.config().sampling_defaults));
   runtime::Generator gen(impl_->model, sampling, impl_->opt.prefill);
   if (impl_->mtp != nullptr) gen.use_mtp(*impl_->mtp);
-  if (impl_->dflash2 != nullptr) gen.use_dflash2(*impl_->dflash2);
+  if (impl_->dflash2 != nullptr)
+    gen.use_dflash2(*impl_->dflash2, impl_->opt.adaptive_dflash2 ? &impl_->widths : nullptr);
   return gen.prepare_kernels();
 }
 
@@ -1201,7 +1221,8 @@ RouteReply Router::handle(std::string_view method, std::string_view path,
                             {"mtp_depth", impl.mtp != nullptr ? impl.opt.mtp_depth : 0},
                             {"dflash2_enabled", impl.dflash2 != nullptr},
                             {"dflash2_depth", impl.dflash2 != nullptr
-                                                 ? runtime::dflash2_verify_depth(impl.dflash2->block_size()) : 0}});
+                                                 ? runtime::dflash2_verify_depth(impl.dflash2->block_size()) : 0},
+                            {"dflash2_adaptive", impl.dflash2 != nullptr && impl.opt.adaptive_dflash2}});
       return res;
     }
     if (method == "GET" && path == "/v1/models") {

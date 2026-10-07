@@ -23,6 +23,7 @@
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/dflash2.hpp"
+#include "lse/runtime/draft_width.hpp"
 #include "lse/runtime/perplexity.hpp"
 #include "lse/runtime/sampler.hpp"
 #include "lse/runtime/prefill_batch.hpp"
@@ -137,14 +138,21 @@ struct GenerationStats {
   std::uint64_t jit_disk_hits = 0;
   std::uint64_t jit_compiles = 0;
   std::uint64_t jit_compile_ns = 0;
-  // One verifier pass can compare several draft proposals.
+  // One verifier pass can compare several draft proposals. spec_proposed
+  // counts the proposals the passes carried, spec_tested those the target
+  // checked (a pass stops checking at its first rejection), spec_accepted
+  // those it kept. spec_plain_steps are passes that carried none.
   std::uint32_t spec_steps = 0;
   std::uint32_t spec_accepted = 0;
   std::uint32_t spec_tested = 0;
+  std::uint32_t spec_proposed = 0;
+  std::uint32_t spec_plain_steps = 0;
   std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
   std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint32_t mtp_depth = 0;
   std::uint32_t dflash2_depth = 0;
+  // The verify width followed DraftWidthPolicy rather than the full block.
+  bool dflash2_adaptive = false;
   // Where a speculative step's time goes: the decoder passes that verify a
   // proposal (two of them when it is rejected) against the module pass that
   // made it. The second is what speculation costs whether or not it pays.
@@ -155,6 +163,11 @@ struct GenerationStats {
   [[nodiscard]] double acceptance_rate() const noexcept {
     if (spec_tested == 0) return 0.0;
     return static_cast<double>(spec_accepted) / static_cast<double>(spec_tested);
+  }
+  // Rows per verify pass: the anchor plus the proposals it carried.
+  [[nodiscard]] double mean_verify_width() const noexcept {
+    if (spec_steps == 0) return 0.0;
+    return static_cast<double>(spec_proposed + spec_steps) / static_cast<double>(spec_steps);
   }
 
   // The first generated token is sampled from prefill logits. Only later
@@ -210,8 +223,10 @@ class Generator {
   // Proposals are checked by the decoder; limits.mtp_depth selects the chain
   // length. The module and session caches are reset together by generate().
   void use_mtp(model::MtpModule& mtp) noexcept { mtp_ = &mtp; dflash2_ = nullptr; }
-  void use_dflash2(model::DFlash2Module& draft) noexcept {
-    dflash2_ = &draft; mtp_ = nullptr;
+  // With `widths`, each step verifies the prefix of the draft's block that
+  // policy chooses (and may skip the draft); without, the whole block.
+  void use_dflash2(model::DFlash2Module& draft, DraftWidthPolicy* widths = nullptr) noexcept {
+    dflash2_ = &draft; mtp_ = nullptr; widths_ = widths;
   }
 
   // One forward pass of a prompt: `width` rows, the first `valid` of them
@@ -340,6 +355,7 @@ class Generator {
 
   model::MtpModule* mtp_ = nullptr;
   model::DFlash2Module* dflash2_ = nullptr;
+  DraftWidthPolicy* widths_ = nullptr;
   graph::Array spec_features_;
   Status append_draft_context(std::size_t rows, std::int32_t first);
   // The prompt's last pass's target features, for the DFlash2 context. The

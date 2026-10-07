@@ -341,6 +341,7 @@ lse_apply_common_flags(lse_sampling)
 
 add_library(lse_runtime
   src/runtime/batch.cpp
+  src/runtime/draft_width.cpp
   src/runtime/generator.cpp
   src/runtime/perplexity.cpp
   src/runtime/session.cpp

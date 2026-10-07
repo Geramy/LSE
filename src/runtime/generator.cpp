@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 
+#include "lse/core/debug.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/graph/interpreter.hpp"
@@ -906,6 +907,12 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   SpeculativeSampler speculative_sampler(sampler_.params().seed ^
       (static_cast<std::uint64_t>(session.position()) * 0x9e3779b97f4a7c15ull));
   std::vector<DiscreteDistribution> proposal_distributions;
+  // Adaptive DFlash2 width (DraftWidthPolicy): the draft's top probability at
+  // each proposal the next pass verifies, the policy's calibrated acceptance
+  // for each, and the wall time of the draft that made them (0: no draft).
+  DraftWidthPolicy* const widths = dflash2_ != nullptr ? widths_ : nullptr;
+  std::vector<double> confidence, estimates;
+  std::uint64_t last_draft_ns = 0;
   const auto next_width = [&] {
     return mtp_verify_rows(
         depth, static_cast<std::uint64_t>(limits.max_tokens) - generated.size(),
@@ -916,7 +923,44 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
                                     std::int32_t first, std::uint32_t proposals)
       -> Result<std::vector<std::uint32_t>> {
     if (dflash2_ != nullptr) {
+      confidence.clear();
+      estimates.clear();
+      last_draft_ns = 0;
       if (proposals == 0) return std::vector<std::uint32_t>{};
+      if (widths != nullptr) {
+        // A plain step: nothing to verify, so nothing to draft. The verify
+        // pass still appends its row to the draft's context.
+        if (!widths->draft_next()) return std::vector<std::uint32_t>{};
+        const std::uint64_t started = now_ns();
+        std::vector<std::uint32_t> tokens_out;
+        if (sampled_dflash) {
+          LSE_ASSIGN_OR(auto proposal, dflash2_->draft_sampled(tokens.back(),
+              first + static_cast<std::int32_t>(tokens.size()) - 1,
+              proposals, sampler_.params().temperature, speculative_sampler));
+          proposal_distributions = std::move(proposal.conditionals);
+          tokens_out = std::move(proposal.tokens);
+        } else {
+          LSE_ASSIGN_OR(tokens_out, dflash2_->draft(tokens.back(),
+              first + static_cast<std::int32_t>(tokens.size()) - 1, proposals,
+              &proposal_distributions));
+        }
+        last_draft_ns = now_ns() - started;
+        widths->observe_draft(last_draft_ns);
+        if (proposal_distributions.size() != tokens_out.size())
+          return LSE_ERROR(kInternal, "DFlash2 draft returned ", std::to_string(tokens_out.size()),
+                           " proposals with ", std::to_string(proposal_distributions.size()),
+                           " distributions");
+        for (const DiscreteDistribution& q : proposal_distributions)
+          confidence.push_back(q.probabilities.empty() ? 0.0
+              : *std::max_element(q.probabilities.begin(), q.probabilities.end()));
+        estimates.assign(confidence.size(), 0.0);
+        const std::uint32_t k = widths->proposals(confidence, sampled_dflash, estimates);
+        widths->observe_draft_value(estimates, k);
+        tokens_out.resize(k);
+        confidence.resize(k);
+        estimates.resize(k);
+        return tokens_out;
+      }
       if (sampled_dflash) {
         LSE_ASSIGN_OR(auto proposal, dflash2_->draft_sampled(tokens.back(),
             first + static_cast<std::int32_t>(tokens.size()) - 1,
@@ -1010,11 +1054,47 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     }
   }
 
+  // The step just finished, for the width policy: from one verify pass's
+  // submission to the next's, less the draft between them, is what the pass
+  // and its acceptance walk cost.
+  std::uint64_t step_top = 0;
+  std::size_t step_rows = 0, step_tokens = 0;
+  std::int32_t step_at = 0;
+  std::string step_trace;
   while (running) {
     m = row_in.size();
     const auto at = static_cast<std::int32_t>(session.position());
+    if (widths != nullptr) {
+      const std::uint64_t now = now_ns();
+      if (step_top != 0) {
+        const std::uint64_t period = now - step_top;
+        const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
+        widths->observe_verify(static_cast<std::uint32_t>(step_rows), verify_ns);
+        widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
+        if (lse::debug())
+          std::fprintf(stderr, "[dflash2-width] position=%d rows=%zu tokens=%zu verify_ms=%.3f "
+                       "draft_ms=%.3f next_rows=%zu rate_tps=%.2f estimates=%s\n",
+                       step_at, step_rows, step_tokens, static_cast<double>(verify_ns) / 1e6,
+                       static_cast<double>(last_draft_ns) / 1e6, m, widths->rate() * 1e9,
+                       step_trace.c_str());
+      }
+      step_top = now;
+      step_rows = m;
+      step_at = at;
+      if (lse::debug()) {
+        step_trace.clear();
+        for (std::size_t j = 0; j < estimates.size(); ++j) {
+          char item[48];
+          std::snprintf(item, sizeof item, "%s%.3f/%.3f", j == 0 ? "" : ",", confidence[j],
+                        estimates[j]);
+          step_trace += item;
+        }
+      }
+    }
     LSE_RETURN_IF_ERROR(verify(session, row_in, false));
     ++stats_.spec_steps;
+    stats_.spec_proposed += static_cast<std::uint32_t>(m - 1);
+    if (m == 1) ++stats_.spec_plain_steps;
 
     std::size_t emitted_to = 0;
     bool mismatch = false;
@@ -1056,6 +1136,9 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         stats_.spec_overlap_sum[i] += overlap;
         stats_.spec_candidate_mass_sum[i] += candidate_mass;
         stats_.spec_deterministic_mass_sum[i] += deterministic_mass;
+        if (widths != nullptr && i < confidence.size())
+          widths->observe_acceptance(confidence[i], static_cast<std::uint32_t>(i), accepted,
+                                     sampled_dflash);
         if (accepted) {
           ++stats_.spec_accepted;
           ++stats_.spec_accepted_by_position[i];
@@ -1067,6 +1150,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     }
     retained_rows = emitted_to;
     retained_first = at;
+    step_tokens = emitted_to;
     if (!running) {
       if (emitted_to < m) {
         const auto started = now_ns();
@@ -1193,6 +1277,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   } tally{stats_, session};
   stats_.mtp_depth = mtp_ != nullptr ? limits.mtp_depth : 0;
   stats_.dflash2_depth = dflash2_ != nullptr ? dflash2_verify_depth(dflash2_->block_size()) : 0;
+  stats_.dflash2_adaptive = dflash2_ != nullptr && widths_ != nullptr;
   host_reasons_.clear();
   if (graph::Scheduler* sched = graph::default_scheduler()) {
     sched->reset_accumulated_trace();
