@@ -185,7 +185,7 @@ struct TileGeometry {
   std::uint32_t half_rows = 0;
 };
 
-[[nodiscard]] consteval TileGeometry geometry_of(
+[[nodiscard]] constexpr TileGeometry geometry_of(
     const lse::math::MatrixCoreRow& r) {
   TileGeometry g;
   g.wave = static_cast<std::uint32_t>(r.wave);
