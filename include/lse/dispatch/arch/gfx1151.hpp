@@ -15,7 +15,30 @@ namespace lse::dispatch::arch::gfx1151 {
 
 inline constexpr std::string_view kArch = "gfx1151";
 
-inline constexpr auto kQuantInt8Rows = generic::kQuantInt8Rows;
+// -- Verify-pass contractions (2 to 8 rows) ------------------------------
+// MTP and DFlash2 verify passes run 4-bit contractions of 2 to 8 rows. Without
+// these rules gfx1151 ran them as one f32 row at a time (the weights read once
+// per row). With them it takes gfx1201's int8 path: the activation rows
+// quantized once to a shared panel, products by v_dot4_i32_iu8 (RDNA3.5 has
+// the dot8 instructions), and the row ladder and fused SwiGLU forms at the
+// shapes gfx1201 measured them on. 256 threads, scratch within 64 KiB.
+inline constexpr auto kQuantInt8Rows = concat(
+    std::array{QuantRowRange{kArch, 32, 4, 64, 2, 8}},
+    generic::kQuantInt8Rows);
+inline constexpr std::array kQuantPanelDevices{
+    QuantPanelDevice{kArch, 32, 4, 64, 256},
+};
+inline constexpr std::array kQuantRowLadderShapes{
+    QuantRowLadderShape{kArch, 32, 3, 4, 33088, 17408, 5120},
+    QuantRowLadderShape{kArch, 32, 3, 4, 56128, 5120, 17408},
+    QuantRowLadderShape{kArch, 32, 7, 8, 33152, 17408, 5120},
+    QuantRowLadderShape{kArch, 32, 7, 8, 56192, 5120, 17408},
+};
+inline constexpr std::array kQ4SwiGluShapes{
+    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 1, 1, 17408, 5120},
+    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 1, 4, 17408, 5120},
+    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 2, 8, 17408, 5120},
+};
 inline constexpr auto kQuantMatrixRanges = generic::kQuantMatrixRanges;
 
 // -- Group-affine contractions -------------------------------------------
@@ -84,6 +107,9 @@ inline constexpr Tuning kTuning{
     .arch = kArch,
     .quant_int8_rows = kQuantInt8Rows,
     .quant_matrix_ranges = kQuantMatrixRanges,
+    .quant_row_ladders = kQuantRowLadderShapes,
+    .quant_panel_devices = kQuantPanelDevices,
+    .q4_swiglu_shapes = kQ4SwiGluShapes,
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
     .q8_matrix_rules = kQ8MatrixRules,
     .flash_wmma = kFlashWmmaRules,
@@ -94,6 +120,9 @@ inline constexpr Tuning kTuning{
 };
 
 static_assert(rows_name(kQuantInt8Rows, kArch) &&
+              rows_name(kQuantPanelDevices, kArch) &&
+              rows_name(kQuantRowLadderShapes, kArch) &&
+              rows_name(kQ4SwiGluShapes, kArch) &&
               rows_name(kQuantMatrixRanges, kArch) &&
               rows_name(kQ4MatrixPanelShapes, kArch) &&
               rows_name(kQ8MatrixRules, kArch) &&
