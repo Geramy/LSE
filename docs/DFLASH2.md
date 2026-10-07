@@ -156,10 +156,26 @@ texts each.
 
 | Prompt | Fixed (median) | Adaptive (median) | Change | Mean change (95% CI) | Acceptance fixed / adaptive | Rows per pass fixed / adaptive |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 640-token essay | 62.2 tok/s | 65.6 tok/s | +5.5% | +5.8% (+4.1 to +7.7) | 67.2% / 68.2% | 7.95 / 6.32 |
-| Code (HumanEval-style, 640 tokens) | 153.1 tok/s | 152.8 tok/s | -0.2% | +0.2% (-2.3 to +2.8) | 97.2% / 97.2% | 7.96 / 7.91 |
-| 2K prompt, 256 tokens | 70.8 tok/s | 70.6 tok/s | -0.4% | +1.4% (-2.5 to +5.4) | 75.0% / 75.2% | 7.93 / 6.78 |
-| 4K prompt, 256 tokens | 64.8 tok/s | 68.9 tok/s | +6.4% | +6.4% (+2.8 to +10.0) | 74.4% / 76.0% | 7.91 / 6.63 |
+| 640-token essay | 62.0 tok/s | 67.4 tok/s | +8.8% | +8.4% (+6.8 to +10.0) | 67.2% / 69.5% | 7.95 / 5.79 |
+| Code (HumanEval-style, 640 tokens) | 152.8 tok/s | 152.2 tok/s | -0.3% | -1.0% (-3.7 to +1.7) | 97.2% / 97.1% | 7.96 / 7.79 |
+| 2K prompt, 256 tokens | 70.6 tok/s | 70.9 tok/s | +0.4% | +2.3% (-0.9 to +5.8) | 75.0% / 76.0% | 7.91 / 5.94 |
+| 4K prompt, 256 tokens | 64.9 tok/s | 66.7 tok/s | +2.7% | +2.5% (-1.0 to +6.3) | 74.4% / 75.8% | 7.91 / 5.87 |
+
+On a Radeon 8060S (gfx1151), where a 4-row verify pass costs 92 ms and an
+8-row one 116 ms, three interleaved pairs measured essay +5.8%, 2K +6.9%,
+code +0.6% and 4K -2.9% (means; essay and code 9 runs per arm, 2K and 4K
+3).
+
+The same policy drives MTP with `--adaptive-mtp=on` (the default;
+`--adaptive-mtp=off` keeps `--mtp-depth` every step). On the
+R9700 against `--mtp-depth 3` (same method, 36 requests per prompt and
+arm) it chains about 6.8 deep on code, +25.4% (+21.3 to +29.2), but loses
+on prose: essay -5.5% (-6.9 to -4.2), 2K -1.9%, 4K -3.0%. Later policy
+changes (warm-up before pricing widths, cheap refreshes) were not measured
+on MTP at that scale; a two-seed run of the essay was still about 3 to 4%
+below depth 3. An MTP chain's draft cost climbs in steps (about 3.6, 6.4,
+11.7, 11.9 and 15.7 ms for 1 to 5 proposals), so the depth choice is
+close; on prose `--adaptive-mtp=off` is the faster setting today.
 
 Greedy requests produced byte-identical text to master with the policy on
 and off (essay, code, 2K and 4K prompts).
