@@ -314,6 +314,13 @@ std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
   if (exact_rows > 1) return exact_rows;
   if (!d.valid || indexed || d.m <= 1 || !body_dot(s, d)) return 1;
   if (s.device == nullptr) return 1;
+  // A part's own shared-panel row that states its rows: the contraction
+  // reads the panel, not workgroup scratch, so the scratch the pricing below
+  // charges per row is not what it costs, and the part measured the rows.
+  if (const auto* panel = dispatch::q4_shared_panel_rule(s);
+      panel != nullptr && !panel->arch.empty() && panel->rows > 1 &&
+      dispatch::quant_plan(s, indexed).shared_activation_panel)
+    return panel->rows;
   const auto m = static_cast<std::uint32_t>(d.m);
   const auto row_limit = std::max(m, dispatch::quant_plan(s, indexed).row_ladder_ceiling);
   const std::uint32_t budget = workgroup_lds_bytes(s.device);

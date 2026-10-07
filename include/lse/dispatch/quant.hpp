@@ -139,14 +139,17 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     return nullptr;
   const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
   const auto n = s.inputs[1].dim(0);
+  // A part's own row is the measurement on that part and wins over the
+  // shared one for the same shape.
   const Q4PanelShape* measured = nullptr;
-  for (const auto& shape : kQ4PanelShapes)
-    if (n == shape.n && k == shape.k &&
-        s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
-      measured = &shape;
-  if (!measured && !arch.empty())
+  if (!arch.empty())
     for (const auto& shape : arch::tuning(arch).q4_panel_shapes)
-      if (shape.arch == arch && n == shape.n && k == shape.k &&
+      if (!measured && shape.arch == arch && n == shape.n && k == shape.k &&
+          s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
+        measured = &shape;
+  if (!measured)
+    for (const auto& shape : kQ4PanelShapes)
+      if (n == shape.n && k == shape.k &&
           s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
         measured = &shape;
   if (!measured || s.inputs[1] != Shape{n, k / 8} ||

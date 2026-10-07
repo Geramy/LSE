@@ -74,6 +74,23 @@ inline constexpr std::array kQ4DecodePanelShapes{
     Q4PanelShape{1, 12288, 5120, 0, 2, 1, kArch},
     Q4PanelShape{1, 1024, 5120, 0, 2, 1, kArch},
     Q4PanelShape{1, 48, 5120, 0, 1, 1, kArch},
+    // MTP=3's four-row verify passes, every row in one workgroup row: the
+    // shared rows leave the row count to the scratch-priced ladder, which on
+    // this part picked two and read every weight twice, and kept the MLP
+    // from fusing into the SwiGLU pair. rocprofv3, us per call:
+    //   gate + up        456 + 441 (two passes each) -> 448 fused
+    //   vocabulary      6153 -> 3411    attn q+gate  288 -> 177
+    //   GDN qkv          186 -> 140     GDN z        118 ->  91
+    //   output proj      164 -> 118
+    // MTP=3 decode 17.56 -> 23.34 tok/s (256-token prompt, 128 out).
+    Q4PanelShape{4, 17408, 5120, 4, 2, 1, kArch},
+    Q4PanelShape{4, 10240, 5120, 4, 2, 1, kArch},
+    Q4PanelShape{4, 6144, 5120, 4, 2, 1, kArch},
+    Q4PanelShape{4, 12288, 5120, 4, 1, 1, kArch},
+    Q4PanelShape{4, 5120, 6144, 4, 1, 1, kArch},
+    Q4PanelShape{4, 248320, 5120, 4, 1, 1, kArch},
+    Q4PanelShape{4, 1024, 5120, 4, 2, 1, kArch},
+    Q4PanelShape{4, 48, 5120, 4, 1, 1, kArch},
 };
 
 // The prefill GEMM's wide-pass tile (M >= 768): 256 x 128 outputs on 4 x 4
