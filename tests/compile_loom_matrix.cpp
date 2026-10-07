@@ -255,6 +255,78 @@ bool compile_flash(backend::DeviceInfo &info, backend::LoomcCompiler &compiler,
   return true;
 }
 
+// The decode contractions on the shared int8 activation panel: the 8-row
+// 4-bit down projection and an 8-row 8-bit projection, each with the panel
+// producer the graph pairs it with. Both groups are emitted and compiled.
+bool compile_decode_panels(backend::DeviceInfo &info,
+                           backend::LoomcCompiler &compiler,
+                           const std::string &path) {
+  auto leaf = [](Shape shape, DType type) {
+    auto node = std::make_shared<graph::Node>();
+    node->shape = shape;
+    node->dtype = type;
+    node->materialized = true;
+    return graph::Array(node);
+  };
+  struct Case {
+    const char *label;
+    int bits;
+    std::int64_t m, n, k;
+    std::string_view consumer;
+  };
+  const Case cases[] = {
+      {"q4_panel_m8_n5120_k17408", 4, 8, 5120, 17408,
+       "quant_linear.q4_matrix_panel.v1"},
+      {"q8_panel_m8_n17408_k5120", 8, 8, 17408, 5120,
+       "quant_linear.q8_matrix_panel.v1"},
+  };
+  bool ok = true;
+  for (const Case &c : cases) {
+    auto x = leaf(Shape{1, c.m, c.k}, DType::kF32);
+    auto w = leaf(Shape{c.n, c.k * c.bits / 32}, DType::kU32);
+    auto sc = leaf(Shape{c.n, c.k / 64}, DType::kBF16);
+    auto bi = leaf(Shape{c.n, c.k / 64}, DType::kBF16);
+    auto out = graph::quant_linear(x, w, sc, bi, c.bits, 64);
+    if (out.node()->prim == nullptr || out.node()->prim->name() != c.consumer) {
+      std::fprintf(stderr, "%s %s: the graph did not pick %.*s\n",
+                   info.arch.c_str(), c.label, static_cast<int>(c.consumer.size()),
+                   c.consumer.data());
+      ok = false;
+      continue;
+    }
+    const graph::NodePtr roots[] = {out.node()};
+    auto groups = graph::Partitioner::partition(roots);
+    std::size_t index = 0;
+    for (const auto &group : groups) {
+      const std::string label = std::string(c.label) + "_" + std::to_string(index++);
+      backend::LoomEmitter emitter;
+      auto emitted = emitter.emit(group, info);
+      if (!emitted.ok()) {
+        std::fprintf(stderr, "%s %s emit: %s\n", info.arch.c_str(), label.c_str(),
+                     emitted.status().to_string().c_str());
+        ok = false;
+        continue;
+      }
+      std::ofstream(path + "/" + label + ".loom") << emitted->source;
+      auto obj = compiler.compile(emitted->source, info.arch);
+      if (!obj.ok()) {
+        std::fprintf(stderr, "%s %s compile: %s\n", info.arch.c_str(),
+                     label.c_str(), obj.status().to_string().c_str());
+        ok = false;
+        continue;
+      }
+      std::ofstream file(path + "/" + label + ".hsaco", std::ios::binary);
+      file.write(reinterpret_cast<const char *>(obj->code.data()),
+                 obj->code.size());
+      std::printf("PASS decode panel %s %s matrix=%s bytes=%zu\n",
+                  info.arch.c_str(), label.c_str(),
+                  emitted->source.find("vector.mma") != std::string::npos ? "yes" : "no",
+                  obj->code.size());
+    }
+  }
+  return ok;
+}
+
 // Every emittable single-instruction row of one generation, by the operand
 // format it takes. A row the table does not hold is skipped at compile time;
 // a row it holds but has not measured is skipped too, since it never emits.
@@ -313,6 +385,7 @@ int main(int argc, char **argv) {
       for (const auto [n, k] : {std::pair<std::int64_t, std::int64_t>{17408, 5120},
                                 {5120, 17408}})
         ok = compile_q4_gemm(info, compiler, argv[1], m, n, k) && ok;
+  ok = compile_decode_panels(info, compiler, argv[1]) && ok;
   // The prefill attention, where the part has a rule for it.
   if (!dispatch::arch::tuning(info.arch).flash_wmma.empty())
     for (const auto storage : {kv::CacheDType::kBF16, kv::CacheDType::kF16})

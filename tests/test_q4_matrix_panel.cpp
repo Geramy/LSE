@@ -13,6 +13,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -358,6 +359,41 @@ LSE_TEST(q4_matrix_panel_dispatch_validates_geometry_capabilities_and_staging) {
     unknown.shapes.intrinsics = nullptr;
     LSE_EXPECT(dispatch::q4_matrix_panel_row(unknown.original()) == nullptr);
   }
+}
+// gfx1151 takes the 8-row decode contraction with its own matrix row: the
+// gfx11 iu8 WMMA, whose lanes carry the whole K16 step (four i32 operand
+// registers to RDNA4's two). Its 64-row prefill tiles stay gfx1201's alone.
+LSE_TEST(q4_matrix_panel_decode_runs_on_gfx1151_with_its_own_row) {
+  Fixture f(8);
+  f.device = {};
+  f.amd = {};
+  f.device.arch = "gfx1151";
+  backend::apply_arch_defaults(f.device, f.amd);
+  f.device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  f.device.extension = &f.amd;
+  const auto *row = dispatch::q4_matrix_panel_row(f.original());
+  LSE_EXPECT(row != nullptr);
+  if (row != nullptr) {
+    LSE_EXPECT(row->target == math::MatrixTarget::kRdna3);
+    LSE_EXPECT_EQ(row->a_len, 4);
+  }
+  const auto *kernel = dynamic_cast<const KernelPrimitiveBase *>(find_primitive(kConsumer));
+  LSE_EXPECT(kernel != nullptr);
+  if (kernel != nullptr) {
+    const auto source = kernel->emit_kernel(f.shapes);
+    LSE_EXPECT(source.find("vector.mma") != std::string::npos);
+    const auto at = source.find("vector.fragment<lhs>");
+    LSE_EXPECT(at != std::string::npos);
+    if (at != std::string::npos) {
+      const auto line = source.substr(at, source.find('\n', at) - at);
+      LSE_EXPECT(line.find("vector<4xi32>") != std::string::npos);
+    }
+  }
+  Fixture prefill(1024);
+  prefill.device = f.device;
+  prefill.amd = f.amd;
+  prefill.device.extension = &prefill.amd;
+  LSE_EXPECT(dispatch::q4_matrix_panel_row(prefill.original()) == nullptr);
 }
 LSE_TEST(q4_matrix_panel_cooperative_up_requires_exact_shape_and_lds_capacity) {
   Fixture f(1024, 17408, 5120);
@@ -812,8 +848,89 @@ int gpu_down(std::size_t rows = kRows, std::size_t columns = kColumns,
       rows);
   return lse::test::Registry::get().failures ? 1 : 0;
 }
+// The 8-bit decode contraction on the shared panel (byte order), on the
+// GPU, against the same group64 oracle with 8-bit codes: the graph must pick
+// the panel pair, run both on the device and match to the codec's precision.
+int gpu_q8_down(std::size_t rows, std::size_t columns, std::size_t width) {
+  auto *scheduler = default_scheduler();
+  if (!scheduler)
+    return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  const auto code8 = [](std::size_t col, std::size_t group, std::size_t at) {
+    return static_cast<std::int32_t>((col % kPeriod * 43 + group % 17 * 67 + at * 37) % 256);
+  };
+  auto data = activations(width, rows);
+  std::vector<std::uint32_t> weights(columns * width / 4);
+  std::vector<bfloat16_t> scales(columns * width / 64), biases(scales.size());
+  for (std::size_t col = 0; col < columns; ++col) {
+    for (std::size_t at = 0; at < width; at += 4) {
+      std::uint32_t word = 0;
+      for (std::size_t byte = 0; byte < 4; ++byte)
+        word |= static_cast<std::uint32_t>(code8(col, at / 64, at % 64 + byte))
+                << (byte * 8);
+      weights[col * (width / 4) + at / 4] = word;
+    }
+    for (std::size_t group = 0; group < width / 64; ++group) {
+      scales[col * (width / 64) + group] = bfloat16_t(weight_scale(col, group));
+      biases[col * (width / 64) + group] = bfloat16_t(weight_bias(col, group));
+    }
+  }
+  const auto upload = [&](Shape shape, DType type, const void *bytes,
+                          std::size_t size) {
+    auto storage = scheduler->backend().allocate(size, backend::MemoryClass::kDevice);
+    LSE_EXPECT(storage.ok());
+    auto buffer = storage.release();
+    LSE_EXPECT_OK(scheduler->backend().copy(buffer, bytes, size));
+    return Array::from_buffer(std::move(buffer), shape, type);
+  };
+  const auto r = static_cast<std::int64_t>(rows), n = static_cast<std::int64_t>(columns),
+             k = static_cast<std::int64_t>(width);
+  auto x = upload({1, r, k}, DType::kF32, data.data(), data.size() * 4);
+  auto w = upload({n, k / 4}, DType::kU32, weights.data(), weights.size() * 4);
+  auto sc = upload({n, k / 64}, DType::kBF16, scales.data(), scales.size() * 2);
+  auto bi = upload({n, k / 64}, DType::kBF16, biases.data(), biases.size() * 2);
+  auto output = quant_linear(x, w, sc, bi, 8, 64);
+  LSE_EXPECT(output.node()->prim->name() == "quant_linear.q8_matrix_panel.v1");
+  scheduler->reset_accumulated_trace();
+  const NodePtr roots[]{output.node()};
+  LSE_EXPECT_OK(scheduler->eval(roots, false));
+  LSE_EXPECT_OK(scheduler->drain());
+  const auto trace = scheduler->last_trace();
+  LSE_EXPECT_EQ(trace.host_groups, 0u);
+  LSE_EXPECT_EQ(trace.host_fallbacks, 0u);
+  const auto actual = read<float>(output);
+  double maximum = 0;
+  for (std::size_t row = 0; row < rows; ++row)
+    for (std::size_t col = 0; col < columns; ++col) {
+      float want = 0;
+      for (std::size_t group = 0; group < width / 64; ++group) {
+        const auto encoded = encode_group(data.data() + row * width + group * 64);
+        std::int32_t dot = 0;
+        for (std::size_t t = 0; t < 64; ++t)
+          dot += encoded.codes[t] * code8(col, group, t);
+        want = std::fma(weight_scale(col, group) * encoded.step,
+                        static_cast<float>(dot), want) +
+               weight_bias(col, group) * encoded.sum;
+      }
+      const auto got = actual[row * columns + col];
+      LSE_EXPECT(std::isfinite(got));
+      const auto difference = std::abs(static_cast<double>(got) - want);
+      maximum = std::max(maximum, difference);
+      LSE_EXPECT(difference <= 2e-4 + 5e-6 * std::abs(static_cast<double>(want)));
+    }
+  std::printf("M%zu N%zu K%zu 8-bit matrix panel maximum component error %.9g; "
+              "device groups %u, host %u\n",
+              rows, columns, width, maximum, trace.device_groups,
+              trace.host_groups);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
 } // namespace
 int main(int argc, char **argv) {
+  if (argc == 5 && std::string_view(argv[1]) == "--gpu-q8-down")
+    return gpu_q8_down(std::strtoul(argv[2], nullptr, 10),
+                       std::strtoul(argv[3], nullptr, 10),
+                       std::strtoul(argv[4], nullptr, 10));
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-down")
     return gpu_down();
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-prefill-down")
