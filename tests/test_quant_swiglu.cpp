@@ -108,9 +108,14 @@ LSE_TEST(
   }
 }
 LSE_TEST(swiglu_pair_requires_qualified_geometry_storage_and_device) {
-  for (auto rows : {4, 6, 1024}) {
+  for (auto rows : {6, 1024}) {
     Fixture f(rows);
     LSE_EXPECT_EQ(f.run(), 0u);
+  }
+  {
+    // A four-row (MTP=3) verify pass fuses like the eight-row one.
+    Fixture f(4);
+    LSE_EXPECT_EQ(f.run(), 1u);
   }
   {
     Fixture f;
