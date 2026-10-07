@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,6 +67,18 @@ class JitCache {
   Result<backend::KernelHandle> get_or_compile(std::size_t member,
                                                std::uint64_t signature,
                                                const EmittedKernel& emitted);
+
+  // Makes every kernel in `kernels` resident on `member`, loading those that
+  // are not as ONE executable: one code object, compiled (or read back from
+  // disk) as one, for the whole set. An executable holds device allocations
+  // of its own and a device grants a process a few thousand, so a server that
+  // makes every pass shape resident at load cannot spend one per kernel. Each
+  // kernel's source must be present; all share one dialect.
+  struct Preload {
+    std::uint64_t signature = 0;
+    const EmittedKernel* emitted = nullptr;
+  };
+  Status preload(std::size_t member, std::span<const Preload> kernels);
 
   // Live handle if this process already loaded the kernel ON THIS MEMBER in
   // THIS DIALECT. Does not compile, emit, or read disk. Counts as a memory

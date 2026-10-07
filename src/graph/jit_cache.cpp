@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -54,6 +55,18 @@ std::uint64_t fnv(std::string_view s) noexcept {
   for (char ch : s) {
     h ^= static_cast<unsigned char>(ch);
     h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// A second fingerprint of a source, independent of fnv(): with the length and
+// fnv() it stands in for the complete text when a loaded kernel is matched
+// again, so a resident kernel does not keep its source in memory.
+std::uint64_t fingerprint(std::string_view s) noexcept {
+  std::uint64_t h = 0x9e3779b97f4a7c15ull ^ s.size();
+  for (char ch : s) {
+    h = (h ^ static_cast<unsigned char>(ch)) * 0xff51afd7ed558ccdull;
+    h ^= h >> 32;
   }
   return h;
 }
@@ -703,7 +716,13 @@ struct JitCache::Impl {
     backend::KernelHandle handle;
     std::uint64_t source_hash = 0;
     std::string arch;
-    std::string source;
+    // Content-addressed kernels are matched on their complete source: its
+    // length and fingerprint() here, fnv() in source_hash.
+    std::size_t source_size = 0;
+    std::uint64_t source_print = 0;
+    [[nodiscard]] bool same_source(std::string_view text) const noexcept {
+      return text.size() == source_size && fingerprint(text) == source_print;
+    }
     // What the toolchain said about the object behind this handle. Carried
     // whether the object was compiled here or read back from disk: a warm
     // start that lost the numbers would make them a property of process age.
@@ -867,13 +886,18 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
         ? emitted.entry_name : emitted.structural_entry_name;
     opt::KernelMeasurements::instance().record(traffic_entry, emitted.traffic);
     if (emitted.content_addressed && !emitted.structural_entry_name.empty()) {
-      CacheDiskLock lock(cache_dir_);
-      if (lock) write_text(fs::path(cache_dir_) /
-          (artifact_stem(kernel_cache_version(), key) + ".alias"),
-          std::string(kAliasOwner) + "\n" + std::string(kernel_cache_version()) +
-          "\n" + emitted.structural_entry_name + "\n" +
-          artifact_stem(kernel_cache_version(), artifact_key) + "\n" +
-          std::to_string(slot->source_hash) + "\n");
+      const fs::path alias_path = fs::path(cache_dir_) /
+          (artifact_stem(kernel_cache_version(), key) + ".alias");
+      const std::string alias = std::string(kAliasOwner) + "\n" +
+          std::string(kernel_cache_version()) + "\n" + emitted.structural_entry_name +
+          "\n" + artifact_stem(kernel_cache_version(), artifact_key) + "\n" +
+          std::to_string(slot->source_hash) + "\n";
+      // A warm start finds the alias it would write already there; rewriting
+      // it is a rename per loaded kernel and changes nothing.
+      if (!source_matches(alias_path, alias)) {
+        CacheDiskLock lock(cache_dir_);
+        if (lock) write_text(alias_path, alias);
+      }
     }
   };
 
@@ -881,8 +905,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     const Impl::Slot& slot = *it->second.slot;
     if (slot.arch == arch &&
         (src_hash == 0 || src_hash == slot.source_hash) &&
-        (!emitted.content_addressed ||
-         slot.source == emitted.source)) {
+        (!emitted.content_addressed || slot.same_source(emitted.source))) {
       ++stats_.memory_hits;
       return slot.handle;
     }
@@ -892,7 +915,7 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     const auto [first, last] = impl_->artifacts[table].equal_range(artifact_key);
     for (auto it = first; it != last; ++it) {
       const auto& slot = it->second;
-      if (slot->arch == arch && slot->source == emitted.source) {
+      if (slot->arch == arch && slot->same_source(emitted.source)) {
         publish_alias(slot);
         ++stats_.memory_hits;
         return slot->handle;
@@ -1031,12 +1054,181 @@ Result<backend::KernelHandle> JitCache::get_or_compile(
     opt::KernelMeasurements::instance().record(c.entry, c);
   }
   auto slot = std::make_shared<const Impl::Slot>(Impl::Slot{
-      kernel, stored_hash, arch, emitted.content_addressed ? emitted.source : std::string{},
+      kernel, stored_hash, arch,
+      emitted.content_addressed ? emitted.source.size() : 0,
+      emitted.content_addressed ? fingerprint(emitted.source) : 0,
       std::move(resources), std::move(census)});
   publish_alias(slot);
   if (emitted.content_addressed)
     impl_->artifacts[table].emplace(artifact_key, slot);
   return kernel;
+}
+
+Status JitCache::preload(std::size_t member, std::span<const Preload> kernels) {
+  if (kernels.empty()) return OkStatus();
+  const Dialect dialect = kernels.front().emitted->dialect;
+  const std::size_t table = toolchain_slot(member, dialect);
+  if (table >= impl_->memory.size()) {
+    return LSE_ERROR(kOutOfRange, "device set has ",
+                     std::to_string(impl_->memory.size() / kDialectCount),
+                     " members; there is no member ", std::to_string(member));
+  }
+  backend::IBackend& be = devices_.device(member);
+  const IKernelCompiler* compiler = compiler_for(member, dialect);
+  if (compiler == nullptr) {
+    return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()), "' has no ",
+                     std::string(to_string(dialect)), " kernel compiler");
+  }
+  auto& slots = impl_->memory[table];
+  const std::string arch(be.device_info().arch);
+
+  auto record = [&](const std::shared_ptr<const Impl::Slot>& slot,
+                    const EmittedKernel& emitted, std::string_view entry) {
+    record_structural_measurements(emitted.structural_entry_name, entry,
+                                   slot->resources, slot->census);
+    const auto& traffic_entry = emitted.structural_entry_name.empty()
+        ? emitted.entry_name : emitted.structural_entry_name;
+    opt::KernelMeasurements::instance().record(traffic_entry, emitted.traffic);
+  };
+
+  struct Pending {
+    std::uint64_t key = 0, src_hash = 0, artifact_key = 0;
+    const EmittedKernel* emitted = nullptr;
+  };
+  std::vector<Pending> pending;
+  for (const Preload& k : kernels) {
+    const EmittedKernel& e = *k.emitted;
+    if (e.dialect != dialect)
+      return LSE_ERROR(kInvalidArgument, "kernels preloaded together must share a dialect");
+    if (e.source.empty())
+      return LSE_ERROR(kInvalidArgument, "preloading ", e.entry_name, " needs its source");
+    const std::uint64_t key = slot_key(member, dialect, k.signature);
+    const std::uint64_t src_hash = fnv(e.source);
+    if (const auto it = slots.find(key); it != slots.end()) {
+      const Impl::Slot& slot = *it->second.slot;
+      if (slot.arch == arch && src_hash == slot.source_hash &&
+          (!e.content_addressed || slot.same_source(e.source))) continue;
+    }
+    const std::uint64_t artifact_key = e.content_addressed
+        ? slot_key(member, dialect,
+                   mix(mix(fnv("jit.exact-source.v1"), static_cast<std::uint64_t>(dialect)),
+                       src_hash))
+        : key;
+    bool aliased = false;
+    if (e.content_addressed) {
+      const auto [first, last] = impl_->artifacts[table].equal_range(artifact_key);
+      for (auto it = first; it != last && !aliased; ++it) {
+        if (it->second->arch == arch && it->second->same_source(e.source)) {
+          slots.insert_or_assign(key, Impl::Alias{it->second, e.structural_entry_name});
+          record(it->second, e, e.entry_name);
+          aliased = true;
+        }
+      }
+    }
+    if (!aliased) pending.push_back({key, src_hash, artifact_key, &e});
+  }
+  if (pending.empty()) return OkStatus();
+
+  // Each distinct entry once, in a fixed order, so the same set always makes
+  // the same object.
+  std::map<std::string_view, const EmittedKernel*> entries;
+  for (const Pending& p : pending) {
+    const auto [it, inserted] = entries.emplace(p.emitted->entry_name, p.emitted);
+    if (!inserted && it->second->source != p.emitted->source)
+      return LSE_ERROR(kInternal, "two kernels named ", p.emitted->entry_name,
+                       " differ in source");
+  }
+  std::string bundle;
+  std::vector<std::string> names;
+  names.reserve(entries.size());
+  for (const auto& [entry, emitted] : entries) {
+    bundle += emitted->source;
+    bundle += '\n';
+    names.emplace_back(entry);
+  }
+  const std::uint64_t bundle_hash = fnv(bundle);
+  const std::uint64_t bundle_key =
+      slot_key(member, dialect, mix(fnv("jit.bundle.v1"), bundle_hash));
+  const fs::path stem = fs::path(cache_dir_) / artifact_stem(kernel_cache_version(), bundle_key);
+  const fs::path meta_path = stem.string() + ".meta";
+  const fs::path co_path = stem.string() + "." + std::to_string(bundle_hash) + ".co";
+  // No .source beside the object: its length and fingerprint, in the meta's
+  // entry line, stand in for the text when it is read back.
+  const std::string tag = "bundle " + std::to_string(bundle.size()) + " " +
+                          std::to_string(fingerprint(bundle));
+
+  std::vector<std::byte> code;
+  std::vector<backend::KernelResources> resources;
+  std::vector<backend::KernelCensus> census;
+  DiskMeta meta;
+  if (read_meta(meta_path, &meta) && meta.engine_version == kernel_cache_version() &&
+      meta.arch == arch && meta.source_hash == bundle_hash && meta.entry == tag) {
+    code = read_file(co_path);
+  }
+  if (!code.empty()) {
+    ++stats_.disk_hits;
+    bool metadata_changed = false;
+    if (meta.resource_version != compiler->resource_metadata_version()) {
+      meta.resources = compiler->resources(code);
+      meta.resource_version = compiler->resource_metadata_version();
+      metadata_changed = true;
+    }
+    if (meta.census.empty()) {
+      meta.census = compiler->census(code);
+      metadata_changed = !meta.census.empty() || metadata_changed;
+    }
+    if (metadata_changed) {
+      CacheDiskLock lock(cache_dir_);
+      if (lock) write_meta(meta_path, meta);
+    }
+    resources = std::move(meta.resources);
+    census = std::move(meta.census);
+  } else {
+    const auto begin = std::chrono::steady_clock::now();
+    auto compiled = compiler->compile(bundle, arch);
+    if (!compiled.ok()) return compiled.status();
+    CompiledKernel built = compiled.release();
+    stats_.compile_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count());
+    ++stats_.compiles;
+    code = std::move(built.code);
+    resources = std::move(built.resources);
+    census = std::move(built.census);
+    CacheDiskLock lock(cache_dir_);
+    if (lock) {
+      write_code(co_path, code);
+      write_meta(meta_path, DiskMeta{arch, bundle_hash, tag, resources, census,
+                                     compiler->resource_metadata_version(),
+                                     std::string(kernel_cache_version())});
+    }
+  }
+
+  LSE_ASSIGN_OR(std::vector<backend::KernelHandle> handles, be.load_executables(names, code));
+  for (const backend::KernelResources& r : resources)
+    opt::KernelMeasurements::instance().record(r.entry, r);
+  for (const backend::KernelCensus& c : census)
+    opt::KernelMeasurements::instance().record(c.entry, c);
+  std::map<std::string_view, std::shared_ptr<const Impl::Slot>> loaded;
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    const EmittedKernel& e = *entries.at(names[i]);
+    std::vector<backend::KernelResources> own_resources;
+    for (const auto& r : resources) if (r.entry == names[i]) own_resources.push_back(r);
+    std::vector<backend::KernelCensus> own_census;
+    for (const auto& c : census) if (c.entry == names[i]) own_census.push_back(c);
+    loaded.emplace(e.entry_name, std::make_shared<const Impl::Slot>(Impl::Slot{
+        handles[i], fnv(e.source), arch,
+        e.content_addressed ? e.source.size() : 0,
+        e.content_addressed ? fingerprint(e.source) : 0,
+        std::move(own_resources), std::move(own_census)}));
+  }
+  for (const Pending& p : pending) {
+    const auto& slot = loaded.at(p.emitted->entry_name);
+    slots.insert_or_assign(p.key, Impl::Alias{slot, p.emitted->structural_entry_name});
+    record(slot, *p.emitted, p.emitted->entry_name);
+    if (p.emitted->content_addressed) impl_->artifacts[table].emplace(p.artifact_key, slot);
+  }
+  return OkStatus();
 }
 
 const backend::KernelCensus* JitCache::census(

@@ -175,6 +175,9 @@ class HybridLM {
 
   // Commit valid input rows from the latest retained verifier, without its FFNs.
   Status commit_prefix(std::vector<MixerState>& states, std::size_t rows);
+  // The kernels every commit_prefix of the latest pass can launch, made
+  // resident (graph::Scheduler::prepare). The pass need not have run.
+  Status prepare_prefix_commits();
   Status retire_prefill(std::vector<MixerState>& states);
   Status retire_completed_passes(std::vector<MixerState>& states);
   // Lets go of every retained pass, whichever states it was built against,

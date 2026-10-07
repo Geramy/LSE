@@ -1,12 +1,14 @@
 #include "lse/runtime/generator.hpp"
 
 #include <algorithm>
+#include <set>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
 
 #include "lse/graph/graph.hpp"
+#include "lse/kv/block.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/core/hash.hpp"
@@ -85,7 +87,7 @@ constexpr std::size_t kRaggedRun = 16;
 // where the power-of-two split paid a whole weight pass per set bit. The
 // widths stay on a ladder of kRaggedRun, so the engine compiles at most
 // chunk / kRaggedRun prefill shapes.
-struct PassPlan { std::size_t width, valid; };
+using PassPlan = Generator::PassPlan;
 std::vector<PassPlan> padded_plan(std::size_t n, std::size_t chunk) {
   std::vector<PassPlan> plan;
   if (chunk == 0) return {{n, n}};
@@ -268,6 +270,145 @@ Status Generator::mtp_prefill_chunk(const Array& hidden,
   return OkStatus();
 }
 
+std::vector<PassPlan> Generator::prefill_passes(std::size_t tokens) const {
+  std::vector<PassPlan> passes;
+  if (mtp_ == nullptr && prefill_batch_.batch_size % prefill_batch_.ubatch_size == 0) {
+    passes = padded_plan(tokens, prefill_batch_.ubatch_size);
+  } else {
+    for (const auto batch : prefill_plan(tokens, prefill_batch_.batch_size)) {
+      for (const auto c : prefill_plan(batch, prefill_batch_.ubatch_size))
+        passes.push_back({c, c});
+    }
+  }
+  return passes;
+}
+
+Status Generator::prepare_kernels() {
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no scheduler to prepare kernels on");
+  if (!prefill_batch_.valid())
+    return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
+  // Every pass shape a prompt can be cut into. A pass's kernels follow its
+  // width, and a padded pass (fewer real tokens than rows) carries masks an
+  // unpadded one does not, so each (width, padded) pair is its own kernel set.
+  // Prompts longer than one batch repeat the shapes of the shorter ones.
+  std::set<std::pair<std::size_t, bool>> shapes;
+  const std::size_t longest =
+      std::max<std::size_t>(prefill_batch_.batch_size, prefill_batch_.ubatch_size);
+  for (std::size_t n = 1; n <= longest; ++n) {
+    for (const PassPlan& pass : prefill_passes(n))
+      shapes.emplace(pass.width, pass.valid < pass.width);
+  }
+  graph::Scheduler::Preparing preparing(*sched);
+  bool head_prepared = false;
+  for (const auto& [width, padded] : shapes) {
+    // A session of its own per shape: each pass starts a fresh sequence, as a
+    // request's first pass does, and builds against no other pass's state.
+    Session scratch("", model_.state_slots());
+    LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(width, 0u)));
+    model::FeatureCapture capture;
+    if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
+    const auto valid = static_cast<std::int32_t>(padded ? width - 1 : width);
+    LSE_ASSIGN_OR(Array hidden,
+                  model_.hidden(ids, &scratch.states(), nullptr, nullptr, nullptr,
+                                false, dflash2_ != nullptr ? &capture : nullptr,
+                                false, ops::AttentionExecutionPhase::kPrefill, valid));
+    if (!head_prepared) {
+      // The prompt's logits row: one row whatever the pass, so once. The head
+      // runs after the pass, against its finished hidden state.
+      hidden.node()->materialized = true;
+      LSE_ASSIGN_OR(Array last, last_hidden(hidden, valid));
+      LSE_ASSIGN_OR(Array logits, model_.lm_head(last));
+      const graph::NodePtr roots[] = {logits.node()};
+      LSE_RETURN_IF_ERROR(sched->prepare(roots));
+      head_prepared = true;
+    }
+    LSE_RETURN_IF_ERROR(model_.drop_retained_passes());
+  }
+  // A prompt longer than one pass runs its full-width passes further into the
+  // sequence, where the KV pool has grown: the pool's block count is part of
+  // the attention kernels' shape, and it doubles up to kv::kLargePoolStart
+  // blocks. The full pass at each doubling, then, with the pool sized for it.
+  {
+    const std::size_t width = prefill_passes(longest + 1).back().width;
+    const auto capacity = static_cast<std::size_t>(model_.config().kv_capacity());
+    const std::size_t doubled =
+        static_cast<std::size_t>(kv::kLargePoolStart) * static_cast<std::size_t>(kv::kBlockSize);
+    for (std::size_t kv_len = 2 * width; kv_len <= std::min(capacity, doubled); kv_len *= 2) {
+      Session scratch("", model_.state_slots());
+      for (model::MixerState& state : scratch.states())
+        state.position = static_cast<std::int32_t>(kv_len - width);
+      LSE_ASSIGN_OR(Array ids, token_array(std::vector<std::uint32_t>(width, 0u)));
+      model::FeatureCapture capture;
+      if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
+      LSE_RETURN_IF_ERROR(model_.hidden(ids, &scratch.states(), nullptr, nullptr, nullptr,
+                                        false, dflash2_ != nullptr ? &capture : nullptr,
+                                        false, ops::AttentionExecutionPhase::kPrefill,
+                                        static_cast<std::int32_t>(width)).status());
+      LSE_RETURN_IF_ERROR(model_.drop_retained_passes());
+    }
+  }
+  if (dflash2_ != nullptr) {
+    // Every verify width a decode step can take: the pass, the prefix commits
+    // it can make, and its head under each way a request can read it.
+    const SamplingParams& sp = sampler_.params();
+    const auto vocab = static_cast<std::size_t>(model_.config().vocab_size);
+    const std::uint32_t top_k =
+        !sp.greedy_argmax() && sampler_.decided_by_top(kSpecTopLimit, vocab) &&
+                graph::topk_pairs_fits(static_cast<std::int64_t>(vocab), sp.top_k)
+            ? static_cast<std::uint32_t>(sp.top_k) : 0u;
+    const std::uint32_t widest = dflash2_verify_depth(dflash2_->block_size()) + 1;
+    for (std::uint32_t m = 1; m <= widest; ++m) {
+      Session scratch("", model_.state_slots());
+      // Held as verify() holds them: a device buffer of m ids.
+      auto buffer = sched->backend().allocate(dtype_storage_bytes(DType::kF32, m),
+                                              backend::MemoryClass::kDevice);
+      if (!buffer.ok()) return buffer.status();
+      Array ids = Array::from_buffer(buffer.release(),
+                                     Shape{1, static_cast<std::int64_t>(m)}, DType::kF32);
+      {
+        graph::Node& n = *ids.node();
+        n.host_mirror.assign(dtype_storage_bytes(DType::kF32, m), std::byte{0});
+        n.materialized = true;
+      }
+      model::FeatureCapture capture;
+      capture.layer_ids = dflash2_->target_layers();
+      LSE_ASSIGN_OR(Array hidden,
+                    model_.hidden(ids, &scratch.states(), nullptr, nullptr, nullptr, false,
+                                  &capture, m > 1, ops::AttentionExecutionPhase::kSpeculative));
+      if (m > 1) LSE_RETURN_IF_ERROR(model_.prepare_prefix_commits());
+      hidden.node()->materialized = true;
+      // Each head is its own eval in verify(): greedy picks, the device top-k,
+      // or the logits themselves.
+      {
+        LSE_ASSIGN_OR(Array logits, model_.lm_head(hidden));
+        const Array pick = graph::argmax(logits);
+        const graph::NodePtr roots[] = {pick.node()};
+        LSE_RETURN_IF_ERROR(sched->prepare(roots));
+      }
+      if (top_k != 0) {
+        LSE_ASSIGN_OR(Array logits, model_.lm_head(hidden));
+        const Array top = graph::topk_pairs(logits, static_cast<int>(top_k));
+        const graph::NodePtr roots[] = {top.node()};
+        LSE_RETURN_IF_ERROR(sched->prepare(roots));
+      }
+      {
+        LSE_ASSIGN_OR(Array logits, model_.lm_head(hidden));
+        const graph::NodePtr roots[] = {logits.node()};
+        LSE_RETURN_IF_ERROR(sched->prepare(roots));
+      }
+      LSE_RETURN_IF_ERROR(model_.drop_retained_passes());
+    }
+    // The draft's context passes follow the target's pass widths, and the
+    // verified prefix of a decode step adds one of each width up to a block.
+    std::vector<std::int64_t> widths;
+    for (const auto& [width, padded] : shapes) widths.push_back(static_cast<std::int64_t>(width));
+    for (std::uint32_t rows = 1; rows <= dflash2_->block_size(); ++rows) widths.push_back(rows);
+    LSE_RETURN_IF_ERROR(dflash2_->prepare_kernels(widths));
+  }
+  return OkStatus();
+}
+
 Result<std::vector<float>> Generator::step(
     Session& session, const std::vector<std::uint32_t>& tokens) {
   // A context still held from an earlier prompt lands before this one.
@@ -298,15 +439,7 @@ Result<std::vector<float>> Generator::step(
   std::size_t at = 0;
   if (!prefill_batch_.valid())
     return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
-  std::vector<PassPlan> passes;
-  if (mtp_ == nullptr && prefill_batch_.batch_size % prefill_batch_.ubatch_size == 0) {
-    passes = padded_plan(tokens.size(), prefill_batch_.ubatch_size);
-  } else {
-    for (const auto batch : prefill_plan(tokens.size(), prefill_batch_.batch_size)) {
-      for (const auto c : prefill_plan(batch, prefill_batch_.ubatch_size))
-        passes.push_back({c, c});
-    }
-  }
+  const std::vector<PassPlan> passes = prefill_passes(tokens.size());
   std::size_t previous_width = 0;
   std::size_t last_valid = 0;
   for (const PassPlan& pass : passes) {
@@ -330,15 +463,18 @@ Result<std::vector<float>> Generator::step(
                                        dflash2_ != nullptr ? &capture : nullptr, false,
                                        ops::AttentionExecutionPhase::kPrefill,
                                        static_cast<std::int32_t>(take)));
-    if (dflash2_ != nullptr && take < pass.width)
-      capture.features = graph::slice(capture.features, 1, 0, static_cast<std::int64_t>(take));
+    // The draft takes the pass's features whole, padding included, and
+    // writes only the real rows: its context kernels then follow the pass
+    // width, not the prompt length.
     if (dflash2_ != nullptr) {
       if (&pass == &passes.back()) {
         pending_context_ = capture.features;
         pending_context_first_ = base + static_cast<std::int32_t>(at);
+        pending_context_rows_ = static_cast<std::int64_t>(take);
       } else {
         LSE_RETURN_IF_ERROR(dflash2_->append_context(
-            capture.features, base + static_cast<std::int32_t>(at)));
+            capture.features, base + static_cast<std::int32_t>(at),
+            static_cast<std::int64_t>(take)));
       }
     }
     if (mtp_ != nullptr) {
@@ -370,7 +506,8 @@ Status Generator::flush_draft_context() {
   Array features = std::move(pending_context_);
   pending_context_ = {};
   if (dflash2_ == nullptr) return OkStatus();
-  LSE_RETURN_IF_ERROR(dflash2_->append_context(features, pending_context_first_));
+  LSE_RETURN_IF_ERROR(dflash2_->append_context(features, pending_context_first_,
+                                               pending_context_rows_));
   return dflash2_->retire_prefill();
 }
 

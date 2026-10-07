@@ -213,6 +213,24 @@ class Generator {
     dflash2_ = &draft; mtp_ = nullptr;
   }
 
+  // One forward pass of a prompt: `width` rows, the first `valid` of them
+  // real tokens and the rest padding past the last one.
+  struct PassPlan {
+    std::size_t width = 0;
+    std::size_t valid = 0;
+  };
+  // The passes a prompt of `tokens` runs as under this generator's prefill
+  // batch, in order.
+  [[nodiscard]] std::vector<PassPlan> prefill_passes(std::size_t tokens) const;
+
+  // Makes every kernel a request can launch resident on the device before the
+  // first request arrives (Scheduler::prepare): the target pass of each pass
+  // shape prefill_passes can produce, the full-width pass at each KV pool
+  // doubling, and with a DFlash2 draft every verify width, its heads and
+  // prefix commits, and the draft's context and draft passes. Nothing runs;
+  // it is what a server does at load.
+  Status prepare_kernels();
+
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
   // `valid` rows of the sequence axis are real (0: all of them).
   static Result<graph::Array> last_hidden(const graph::Array& hidden,
@@ -311,6 +329,7 @@ class Generator {
   // after that token is out (flush_draft_context), not before it.
   graph::Array pending_context_;
   std::int32_t pending_context_first_ = 0;
+  std::int64_t pending_context_rows_ = 0;
   Status flush_draft_context();
 
   // Runs row tokens at the session cursor and leaves the

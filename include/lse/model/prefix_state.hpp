@@ -16,6 +16,9 @@ class PrefixStateCommit {
   Status retain(std::span<const MixerState> states, std::int64_t sequence_rows,
                 std::vector<graph::NodePtr>& roots);
   Status commit(std::size_t rows, graph::Scheduler& scheduler);
+  // The kernels commit(rows) launches, made resident (Scheduler::prepare)
+  // without the verifier having run.
+  Status prepare(std::size_t rows, graph::Scheduler& scheduler) const;
   [[nodiscard]] bool ready() const noexcept { return sequence_rows_ > 1; }
 
  private:
@@ -29,6 +32,7 @@ class PrefixStateCommit {
     std::vector<graph::Array> inputs;
     std::vector<graph::Array> outputs;
   };
+  void build_replay(Replay& replay, std::size_t rows, graph::Scheduler& scheduler) const;
   std::int64_t sequence_rows_ = 0;
   std::vector<Entry> entries_;
   std::vector<Replay> replays_;

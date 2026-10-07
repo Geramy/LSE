@@ -520,7 +520,12 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   if (emitted == nullptr) {
     ident = emitter->cache_key(group, be.device_info());
     impl_->dispatch_stage = DispatchStage::kEmit;
-    auto generated = emitter->emit(group, be.device_info());
+    // A kernel already resident needs only its launch description; its text
+    // is read by nothing but the compiler.
+    const bool resident =
+        impl_->jit->try_get(member, ident, emitter->dialect()) != nullptr;
+    auto generated = resident ? emitter->emit_launch(group, be.device_info())
+                              : emitter->emit(group, be.device_info());
     if (!generated.ok()) {
       trace_.spans.emit.add(elapsed_ns(t_emit, SpanClock::now()));
       return generated.status();
@@ -559,11 +564,24 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
           impl_->jit->try_get(member, ident, emitted->dialect)) {
     launched = *cached;
   } else {
-    auto kernel = impl_->jit->get_or_compile(member, ident, *emitted);
-    if (kernel.ok()) {
-      launched = kernel.release();
-    } else {
-      jit_status = kernel.status();
+    // A launch description retained without its text (a replay's, emitted
+    // while the kernel was resident) is written in full to build the kernel.
+    std::optional<EmittedKernel> full;
+    if (emitted->source.empty()) {
+      auto written = emitter->emit(group, be.device_info());
+      if (written.ok()) {
+        full.emplace(written.release());
+      } else {
+        jit_status = written.status();
+      }
+    }
+    if (jit_status.ok()) {
+      auto kernel = impl_->jit->get_or_compile(member, ident, full ? *full : *emitted);
+      if (kernel.ok()) {
+        launched = kernel.release();
+      } else {
+        jit_status = kernel.status();
+      }
     }
   }
   const auto t_resolved = SpanClock::now();
@@ -1080,6 +1098,7 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host) {
 
 Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
                       Program* plan) {
+  if (preparing_) return prepare(roots);
   const auto t_step = SpanClock::now();
   trace_ = Trace{};
   const Status ran = eval_step(roots, pull_host, plan);
@@ -1172,6 +1191,64 @@ Status Scheduler::eval(std::span<const NodePtr> roots, bool pull_host,
   return accumulated;
 }
 
+Status Scheduler::prepare(std::span<const NodePtr> roots) {
+  const std::size_t primary = devices_.primary();
+  const KernelToolchain* const tc = toolchain(primary);
+  const IKernelEmitter* const emitter = tc != nullptr ? tc->emitter : nullptr;
+  if (mode_ != Mode::kDeviceFirst || emitter == nullptr) {
+    return LSE_ERROR(kUnimplemented, "cannot prepare kernels: ",
+                     std::string(backend().name()),
+                     " has no device code generator in this mode");
+  }
+  // The same rewrite, phases and launch cut a first eval of these roots makes.
+  optimize_quant_swiglu(roots, devices_.device(primary).device_info(), *emitter,
+                        primary);
+  auto planned = Partitioner::phases(roots, &backend().device_info());
+  const std::vector<FusionGroup> groups = launch_groups(roots, planned, *emitter);
+  // What is not yet resident, per member: emitted in full and loaded together.
+  struct Missing {
+    std::vector<EmittedKernel> kernels;
+    std::vector<std::uint64_t> signatures;
+    std::unordered_set<std::uint64_t> seen;
+  };
+  std::vector<Missing> missing(devices_.size());
+  for (const FusionGroup& g : groups) {
+    if (views_only(g)) continue;
+    // Where eval_step would place it: member_for on a set, the one device
+    // otherwise.
+    const std::size_t member = devices_.size() > 1 ? member_for(g) : 0;
+    backend::IBackend& be = devices_.device(member);
+    const KernelToolchain* mtc = be.toolchain(dialect_);
+    const IKernelEmitter* memitter = mtc != nullptr ? mtc->emitter : nullptr;
+    if (memitter == nullptr) {
+      return LSE_ERROR(kUnimplemented, "backend '", std::string(be.name()),
+                       "' has no kernel emitter");
+    }
+    LSE_RETURN_IF_ERROR(impl_->ensure_jit(devices_, member, *mtc));
+    const std::uint64_t ident = memitter->cache_key(g, be.device_info());
+    if (impl_->jit->try_get(member, ident, memitter->dialect()) != nullptr) continue;
+    Missing& m = missing[member];
+    if (!m.seen.insert(ident).second) continue;
+    auto emitted = memitter->emit(g, be.device_info());
+    if (!emitted.ok()) {
+      return Status(emitted.status().code(), ::lse::detail::concat(
+          "preparing ", describe_group(g, 0), ": ", emitted.status().to_string()));
+    }
+    m.kernels.push_back(emitted.release());
+    m.signatures.push_back(ident);
+  }
+  for (std::size_t member = 0; member < missing.size(); ++member) {
+    const Missing& m = missing[member];
+    if (m.kernels.empty()) continue;
+    std::vector<JitCache::Preload> preload;
+    preload.reserve(m.kernels.size());
+    for (std::size_t i = 0; i < m.kernels.size(); ++i)
+      preload.push_back({m.signatures[i], &m.kernels[i]});
+    LSE_RETURN_IF_ERROR(impl_->jit->preload(member, preload));
+  }
+  return OkStatus();
+}
+
 Status Scheduler::run_group_on_host(const FusionGroup& g) {
   for (const NodePtr& n : g.nodes) {
     // Routing first: an intercepting handler may claim a node the backend
@@ -1228,6 +1305,277 @@ Status Scheduler::run_group_on_host(const FusionGroup& g) {
     ++trace_.nodes_evaluated;
   }
   return OkStatus();
+}
+
+// The launches a step is cut into, in issue order: the planned phases, each
+// split where this emitter's lowering needs a launch boundary. One cut for a
+// step that runs and for prepare(), so a prepared kernel is exactly the one
+// the step later launches.
+std::vector<FusionGroup> Scheduler::launch_groups(std::span<const NodePtr> roots,
+                                                  std::vector<Workgroup>& planned,
+                                                  const IKernelEmitter& emitter) {
+  std::vector<FusionGroup> phase_groups;
+  // Null when this emitter has no staged phase body: every node then takes
+  // the same one-group path a node it refuses to stage already takes.
+  const IPhaseStaging* staging = emitter.staging();
+  for (Workgroup& wg : planned) {
+    const std::size_t phase_begin = phase_groups.size();
+    FusionGroup g = Partitioner::phase_group(wg, roots);
+    if (g.nodes.empty()) continue;
+    alias_ready_views(g);
+    FusionGroup staged;
+    staged.is_phase = true;
+    staged.launches = 1;
+    staged.anchor_class = FusionClass::kBarrier;
+    bool staged_grid = false;
+    bool staged_lane = true;
+    bool staged_fused = false;
+    auto flush_staged = [&] {
+      if (staged.nodes.empty()) return;
+      // 4096, not the old 480: a phase past ~64 bindings is emitted with a
+      // pointer table (one kernarg instead of one per buffer), so the
+      // kernarg ceiling that forced 480 no longer binds. What still cuts a
+      // launch is geometry (Workgroup::cuts), not this.
+      auto chunks = Partitioner::phase_chunks(staged, 4096);
+      for (FusionGroup& c : chunks) phase_groups.push_back(std::move(c));
+      staged = FusionGroup{};
+      staged.is_phase = true;
+      staged.launches = 1;
+      staged.anchor_class = FusionClass::kBarrier;
+    };
+    // Mirrors the emitter's `dependent` test: a chunk whose stages never
+    // read each other needs no barrier, which is what lets it keep a grid.
+    auto reads_staged = [&](const NodePtr& n) {
+      for (const NodePtr& in : n->inputs) {
+        const Node* p = in.get();
+        while (p != nullptr && is_buffer_view(*p)) {
+          p = p->inputs[0].get();
+        }
+        for (const NodePtr& m : staged.nodes) {
+          if (m.get() == p) return true;
+        }
+      }
+      return false;
+    };
+    auto linear_n = [](const Node& n) -> std::int64_t {
+      if (n.inputs.size() < 2) return 0;
+      const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
+      if (kp == nullptr) return 0;
+      const auto name = kp->name();
+      // quant_linear belongs here too: it stages a row and is priced into
+      // run_lds_bytes exactly as the dense kernels are, so leaving it out of
+      // this list is what made every wide linear in a quantized checkpoint
+      // its own launch.
+      if (name != "linear" && name != "linear.lds" &&
+          name != "linear_indexed" && name != "linear_indexed.lds" &&
+          name != "quant_linear") {
+        return 0;
+      }
+      const Shape& w = n.inputs[1]->shape;
+      if (w.rank() == 3) return w.dim(1);
+      if (w.rank() >= 2) return w.dim(0);
+      return 0;
+    };
+    auto join_gdn_pair = [&](const NodePtr& n) -> bool {
+      if (phase_groups.empty()) return false;
+      FusionGroup& prev = phase_groups.back();
+      if (prev.is_phase || prev.nodes.size() != 1) return false;
+      const auto pair = exact_gdn_pair(prev.nodes.front(), n);
+      if (!pair) return false;
+      prev.nodes.push_back(n);
+      prev.outputs = {pair.output, pair.state};
+      return true;
+    };
+    auto join_wide_linear = [&](const NodePtr& n) -> bool {
+      if (phase_groups.empty()) return false;
+      FusionGroup& prev = phase_groups.back();
+      if (prev.is_phase || prev.nodes.empty()) return false;
+      if (n->inputs.empty()) return false;
+      const Node* x = n->inputs[0].get();
+      for (const NodePtr& m : prev.nodes) {
+        if (m->inputs.empty() || m->inputs[0].get() != x) return false;
+        for (const NodePtr& in : n->inputs) {
+          if (in.get() == m.get()) return false;
+        }
+      }
+      // RESIDENCY, AT THE POINT THE ALTERNATIVE STILL EXISTS. Refusing here
+      // leaves each member the group of its own it would have had, and each
+      // then gets its own self-indexed body. Refusing later, at emit time,
+      // does not: the group exists by then, and a multi-output group the
+      // emitter declines drops to the per-element scaffold, which is worse
+      // than either arrangement. So this is where the answer is taken.
+      //
+      // The emitter prices both arrangements — bytes are its lowering's
+      // business — and lse::opt counts what those bytes are worth in
+      // resident workgroups. `fused == 0` means the emitter would not write
+      // this run as one body and has nothing to say, so the arrangement
+      // stands as before.
+      std::vector<NodePtr> run(prev.nodes.begin(), prev.nodes.end());
+      run.push_back(n);
+      // A run the emitter cannot write as one body stays apart, planned
+      // as one group per node rather than discovered at dispatch.
+      if (!emitter.joins_run(run, backend().device_info())) return false;
+      const IKernelEmitter::RunScratch cost =
+          emitter.run_scratch(run, backend().device_info());
+      if (cost.fused != 0 && cost.threads != 0) {
+        opt::FusionCandidate cand;
+        cand.threads = cost.threads;
+        cand.fused_scratch_bytes = cost.fused;
+        cand.worst_solo_scratch_bytes = cost.worst_solo;
+        cand.fused_entry = cost.fused_entry;
+        cand.solo_entries = cost.solo_entries;
+        const opt::DeviceCapacity cap =
+            opt::DeviceCapacity::of(backend().device_info());
+        const opt::FusionVerdict v = opt::admit_fusion(cap, cand);
+        if (!v.admit) return false;
+      }
+      prev.nodes.push_back(n);
+      prev.outputs.push_back(n);
+      for (const NodePtr& in : n->inputs) {
+        bool seen = false;
+        for (const NodePtr& e : prev.inputs) {
+          if (e.get() == in.get()) {
+            seen = true;
+            break;
+          }
+        }
+        if (!seen) prev.inputs.push_back(in);
+      }
+      return true;
+    };
+    for (const NodePtr& n : g.nodes) {
+      if (n->kind == OpKind::kSlice && is_buffer_view(*n)) {
+        flush_staged();
+        FusionGroup view;
+        view.nodes = {n};
+        view.inputs = n->inputs;
+        view.outputs = {n};
+        view.anchor = n->kind;
+        view.anchor_class = n->fclass;
+        phase_groups.push_back(std::move(view));
+        continue;
+      }
+      // N>=128 matches Workgroup::is_wide_linear. Those GEMVs get a
+      // fat grid; stream visibility is the barrier. A software grid
+      // sync deadlocks without a cooperative launch.
+      const bool wide = linear_n(*n) >= 128;
+      if (wide) {
+        flush_staged();
+        if (join_wide_linear(n)) continue;
+        FusionGroup one;
+        one.nodes.push_back(n);
+        one.outputs.push_back(n);
+        one.inputs = n->inputs;
+        one.anchor = n->kind;
+        one.anchor_class = n->fclass;
+        phase_groups.push_back(std::move(one));
+        continue;
+      }
+      if (staging == nullptr ||
+          !staging->can_stage_on(*n, backend().device_info())) {
+        flush_staged();
+        if (join_gdn_pair(n)) continue;
+        // No staged/grid barrier is needed for a single-consumer pointwise
+        // chain. Keep the ordinary emitter's existing fused SSA form.
+        if (staging == nullptr && phase_groups.size() > phase_begin &&
+            join_pointwise_chain(phase_groups.back(), n, roots, emitter.sources())) {
+          continue;
+        }
+        FusionGroup one;
+        one.nodes.push_back(n);
+        one.outputs.push_back(n);
+        one.inputs = n->inputs;
+        one.anchor = n->kind;
+        one.anchor_class = n->fclass;
+        phase_groups.push_back(std::move(one));
+        continue;
+      }
+      // A stage with thousands of independent items must not share the
+      // one-workgroup fallback with the dependent chain around it: the
+      // launch boundary is the barrier a grid-wide stage needs, and it
+      // costs ~2 us against tens of microseconds of idle CUs. 2048 is
+      // eight workgroups — below that the grid is not worth the split.
+      constexpr std::uint32_t kGridStage = 2048;
+      const bool fat =
+          staging->stage_threads(*n, backend().device_info()) >= kGridStage;
+      const bool grid_chunk = staged_grid && !staged.nodes.empty();
+      // Mirrors the emitter's `lane_chunk`: every stage per-lane over one
+      // element count, every read of the chunk at the index the reading
+      // thread wrote. The launch boundary a dependence normally buys is a
+      // grid-wide barrier, and this chain never leaves the thread — so the
+      // chunk keeps it and the pair costs one launch. The predicate has to
+      // hold for the whole chunk, not just the edge, or the emitter would
+      // decline the grid and the merged stages would land on one workgroup.
+      bool lane_fits = staged_lane && staging->lane_stage(*n);
+      if (lane_fits) {
+        for (const NodePtr& m : staged.nodes) {
+          if (!staging->lane_aligned(*m, *n)) {
+            lane_fits = false;
+            break;
+          }
+        }
+      }
+      const bool lane_join = grid_chunk && lane_fits;
+      // A chunk holding a dependence only its lane shape can carry has to
+      // keep that shape. Admitting a stage that breaks it makes the emitter
+      // refuse the grid, and then every stage in the chunk — including the
+      // wide ones that were already on a grid — runs on one workgroup.
+      const bool breaks_lane_fused = staged_fused && !lane_fits;
+      // A grid chunk keeps growing while its stages stay independent, so
+      // sibling wide stages cost one launch, not one each.
+      if (breaks_lane_fused ||
+          (fat ? (!grid_chunk || (reads_staged(n) && !lane_join))
+               : (grid_chunk && reads_staged(n) && !lane_join))) {
+        flush_staged();
+      }
+      if (staged.nodes.empty()) {
+        staged_grid = fat;
+        // From the STORE pattern: what the chunk needs to know about its
+        // first stage is whether a later stage can read its output at its
+        // own index, which is a question about the store. Seeding from
+        // lane_stage asked about the LOAD too, so a cooperative reduction
+        // marked the chunk non-lane on arrival and every following stage
+        // then failed lane_fits -- which is what held 59% of launches to a
+        // single node.
+        staged_lane = staging->lane_writes(*n);
+        staged_fused = false;
+      } else {
+        staged_lane = lane_fits;
+        if (lane_join && reads_staged(n)) staged_fused = true;
+      }
+      staged.nodes.push_back(n);
+    }
+    flush_staged();
+  }
+
+  // Exact GDN siblings can be separated by consumers of the primary output.
+  // Both read the same six nodes, so the later pure recurrence can run at the
+  // earlier position. Preserve both original output identities and bindings.
+  if (emitter.staging() == nullptr) {
+    std::unordered_map<const Node*, std::vector<std::size_t>> candidates;
+    for (std::size_t i = 0; i < phase_groups.size(); ++i) {
+      auto& group = phase_groups[i];
+      if (group.is_phase || group.nodes.size() != 1) continue;
+      const auto n = group.nodes.front();
+      if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6) continue;
+      auto& earlier = candidates[n->inputs.front().get()];
+      bool merged = false;
+      for (auto j : earlier) {
+        auto& previous = phase_groups[j];
+        if (previous.nodes.size() != 1) continue;
+        const auto pair = exact_gdn_pair(previous.nodes.front(), n);
+        if (!pair) continue;
+        previous.nodes.push_back(n);
+        previous.outputs = {pair.output, pair.state};
+        group.nodes.clear();
+        merged = true;
+        break;
+      }
+      if (!merged) earlier.push_back(i);
+    }
+    std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
+  }
+  return phase_groups;
 }
 
 Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
@@ -1317,266 +1665,7 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   }
 
   if (device_first && !replayed) {
-    // Null when this emitter has no staged phase body: every node then takes
-    // the same one-group path a node it refuses to stage already takes.
-    const IPhaseStaging* staging = emitter->staging();
-    for (Workgroup& wg : planned) {
-      const std::size_t phase_begin = phase_groups.size();
-      FusionGroup g = Partitioner::phase_group(wg, roots);
-      if (g.nodes.empty()) continue;
-      alias_ready_views(g);
-      FusionGroup staged;
-      staged.is_phase = true;
-      staged.launches = 1;
-      staged.anchor_class = FusionClass::kBarrier;
-      bool staged_grid = false;
-      bool staged_lane = true;
-      bool staged_fused = false;
-      auto flush_staged = [&] {
-        if (staged.nodes.empty()) return;
-        // 4096, not the old 480: a phase past ~64 bindings is emitted with a
-        // pointer table (one kernarg instead of one per buffer), so the
-        // kernarg ceiling that forced 480 no longer binds. What still cuts a
-        // launch is geometry (Workgroup::cuts), not this.
-        auto chunks = Partitioner::phase_chunks(staged, 4096);
-        for (FusionGroup& c : chunks) phase_groups.push_back(std::move(c));
-        staged = FusionGroup{};
-        staged.is_phase = true;
-        staged.launches = 1;
-        staged.anchor_class = FusionClass::kBarrier;
-      };
-      // Mirrors the emitter's `dependent` test: a chunk whose stages never
-      // read each other needs no barrier, which is what lets it keep a grid.
-      auto reads_staged = [&](const NodePtr& n) {
-        for (const NodePtr& in : n->inputs) {
-          const Node* p = in.get();
-          while (p != nullptr && is_buffer_view(*p)) {
-            p = p->inputs[0].get();
-          }
-          for (const NodePtr& m : staged.nodes) {
-            if (m.get() == p) return true;
-          }
-        }
-        return false;
-      };
-      auto linear_n = [](const Node& n) -> std::int64_t {
-        if (n.inputs.size() < 2) return 0;
-        const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
-        if (kp == nullptr) return 0;
-        const auto name = kp->name();
-        // quant_linear belongs here too: it stages a row and is priced into
-        // run_lds_bytes exactly as the dense kernels are, so leaving it out of
-        // this list is what made every wide linear in a quantized checkpoint
-        // its own launch.
-        if (name != "linear" && name != "linear.lds" &&
-            name != "linear_indexed" && name != "linear_indexed.lds" &&
-            name != "quant_linear") {
-          return 0;
-        }
-        const Shape& w = n.inputs[1]->shape;
-        if (w.rank() == 3) return w.dim(1);
-        if (w.rank() >= 2) return w.dim(0);
-        return 0;
-      };
-      auto join_gdn_pair = [&](const NodePtr& n) -> bool {
-        if (phase_groups.empty()) return false;
-        FusionGroup& prev = phase_groups.back();
-        if (prev.is_phase || prev.nodes.size() != 1) return false;
-        const auto pair = exact_gdn_pair(prev.nodes.front(), n);
-        if (!pair) return false;
-        prev.nodes.push_back(n);
-        prev.outputs = {pair.output, pair.state};
-        return true;
-      };
-      auto join_wide_linear = [&](const NodePtr& n) -> bool {
-        if (phase_groups.empty()) return false;
-        FusionGroup& prev = phase_groups.back();
-        if (prev.is_phase || prev.nodes.empty()) return false;
-        if (n->inputs.empty()) return false;
-        const Node* x = n->inputs[0].get();
-        for (const NodePtr& m : prev.nodes) {
-          if (m->inputs.empty() || m->inputs[0].get() != x) return false;
-          for (const NodePtr& in : n->inputs) {
-            if (in.get() == m.get()) return false;
-          }
-        }
-        // RESIDENCY, AT THE POINT THE ALTERNATIVE STILL EXISTS. Refusing here
-        // leaves each member the group of its own it would have had, and each
-        // then gets its own self-indexed body. Refusing later, at emit time,
-        // does not: the group exists by then, and a multi-output group the
-        // emitter declines drops to the per-element scaffold, which is worse
-        // than either arrangement. So this is where the answer is taken.
-        //
-        // The emitter prices both arrangements — bytes are its lowering's
-        // business — and lse::opt counts what those bytes are worth in
-        // resident workgroups. `fused == 0` means the emitter would not write
-        // this run as one body and has nothing to say, so the arrangement
-        // stands as before.
-        std::vector<NodePtr> run(prev.nodes.begin(), prev.nodes.end());
-        run.push_back(n);
-        // A run the emitter cannot write as one body stays apart, planned
-        // as one group per node rather than discovered at dispatch.
-        if (!emitter->joins_run(run, backend().device_info())) return false;
-        const IKernelEmitter::RunScratch cost =
-            emitter->run_scratch(run, backend().device_info());
-        if (cost.fused != 0 && cost.threads != 0) {
-          opt::FusionCandidate cand;
-          cand.threads = cost.threads;
-          cand.fused_scratch_bytes = cost.fused;
-          cand.worst_solo_scratch_bytes = cost.worst_solo;
-          cand.fused_entry = cost.fused_entry;
-          cand.solo_entries = cost.solo_entries;
-          const opt::DeviceCapacity cap =
-              opt::DeviceCapacity::of(backend().device_info());
-          const opt::FusionVerdict v = opt::admit_fusion(cap, cand);
-          if (!v.admit) return false;
-        }
-        prev.nodes.push_back(n);
-        prev.outputs.push_back(n);
-        for (const NodePtr& in : n->inputs) {
-          bool seen = false;
-          for (const NodePtr& e : prev.inputs) {
-            if (e.get() == in.get()) {
-              seen = true;
-              break;
-            }
-          }
-          if (!seen) prev.inputs.push_back(in);
-        }
-        return true;
-      };
-      for (const NodePtr& n : g.nodes) {
-        if (n->kind == OpKind::kSlice && is_buffer_view(*n)) {
-          flush_staged();
-          FusionGroup view;
-          view.nodes = {n};
-          view.inputs = n->inputs;
-          view.outputs = {n};
-          view.anchor = n->kind;
-          view.anchor_class = n->fclass;
-          phase_groups.push_back(std::move(view));
-          continue;
-        }
-        // N>=128 matches Workgroup::is_wide_linear. Those GEMVs get a
-        // fat grid; stream visibility is the barrier. A software grid
-        // sync deadlocks without a cooperative launch.
-        const bool wide = linear_n(*n) >= 128;
-        if (wide) {
-          flush_staged();
-          if (join_wide_linear(n)) continue;
-          FusionGroup one;
-          one.nodes.push_back(n);
-          one.outputs.push_back(n);
-          one.inputs = n->inputs;
-          one.anchor = n->kind;
-          one.anchor_class = n->fclass;
-          phase_groups.push_back(std::move(one));
-          continue;
-        }
-        if (staging == nullptr ||
-            !staging->can_stage_on(*n, backend().device_info())) {
-          flush_staged();
-          if (join_gdn_pair(n)) continue;
-          // No staged/grid barrier is needed for a single-consumer pointwise
-          // chain. Keep the ordinary emitter's existing fused SSA form.
-          if (staging == nullptr && phase_groups.size() > phase_begin &&
-              join_pointwise_chain(phase_groups.back(), n, roots, emitter->sources())) {
-            continue;
-          }
-          FusionGroup one;
-          one.nodes.push_back(n);
-          one.outputs.push_back(n);
-          one.inputs = n->inputs;
-          one.anchor = n->kind;
-          one.anchor_class = n->fclass;
-          phase_groups.push_back(std::move(one));
-          continue;
-        }
-        // A stage with thousands of independent items must not share the
-        // one-workgroup fallback with the dependent chain around it: the
-        // launch boundary is the barrier a grid-wide stage needs, and it
-        // costs ~2 us against tens of microseconds of idle CUs. 2048 is
-        // eight workgroups — below that the grid is not worth the split.
-        constexpr std::uint32_t kGridStage = 2048;
-        const bool fat =
-            staging->stage_threads(*n, backend().device_info()) >= kGridStage;
-        const bool grid_chunk = staged_grid && !staged.nodes.empty();
-        // Mirrors the emitter's `lane_chunk`: every stage per-lane over one
-        // element count, every read of the chunk at the index the reading
-        // thread wrote. The launch boundary a dependence normally buys is a
-        // grid-wide barrier, and this chain never leaves the thread — so the
-        // chunk keeps it and the pair costs one launch. The predicate has to
-        // hold for the whole chunk, not just the edge, or the emitter would
-        // decline the grid and the merged stages would land on one workgroup.
-        bool lane_fits = staged_lane && staging->lane_stage(*n);
-        if (lane_fits) {
-          for (const NodePtr& m : staged.nodes) {
-            if (!staging->lane_aligned(*m, *n)) {
-              lane_fits = false;
-              break;
-            }
-          }
-        }
-        const bool lane_join = grid_chunk && lane_fits;
-        // A chunk holding a dependence only its lane shape can carry has to
-        // keep that shape. Admitting a stage that breaks it makes the emitter
-        // refuse the grid, and then every stage in the chunk — including the
-        // wide ones that were already on a grid — runs on one workgroup.
-        const bool breaks_lane_fused = staged_fused && !lane_fits;
-        // A grid chunk keeps growing while its stages stay independent, so
-        // sibling wide stages cost one launch, not one each.
-        if (breaks_lane_fused ||
-            (fat ? (!grid_chunk || (reads_staged(n) && !lane_join))
-                 : (grid_chunk && reads_staged(n) && !lane_join))) {
-          flush_staged();
-        }
-        if (staged.nodes.empty()) {
-          staged_grid = fat;
-          // From the STORE pattern: what the chunk needs to know about its
-          // first stage is whether a later stage can read its output at its
-          // own index, which is a question about the store. Seeding from
-          // lane_stage asked about the LOAD too, so a cooperative reduction
-          // marked the chunk non-lane on arrival and every following stage
-          // then failed lane_fits -- which is what held 59% of launches to a
-          // single node.
-          staged_lane = staging->lane_writes(*n);
-          staged_fused = false;
-        } else {
-          staged_lane = lane_fits;
-          if (lane_join && reads_staged(n)) staged_fused = true;
-        }
-        staged.nodes.push_back(n);
-      }
-      flush_staged();
-    }
-  }
-
-  // Exact GDN siblings can be separated by consumers of the primary output.
-  // Both read the same six nodes, so the later pure recurrence can run at the
-  // earlier position. Preserve both original output identities and bindings.
-  if (!replayed && emitter != nullptr && emitter->staging() == nullptr) {
-    std::unordered_map<const Node*, std::vector<std::size_t>> candidates;
-    for (std::size_t i = 0; i < phase_groups.size(); ++i) {
-      auto& group = phase_groups[i];
-      if (group.is_phase || group.nodes.size() != 1) continue;
-      const auto n = group.nodes.front();
-      if (!n || n->kind != OpKind::kGDNChunkScan || n->inputs.size() != 6) continue;
-      auto& earlier = candidates[n->inputs.front().get()];
-      bool merged = false;
-      for (auto j : earlier) {
-        auto& previous = phase_groups[j];
-        if (previous.nodes.size() != 1) continue;
-        const auto pair = exact_gdn_pair(previous.nodes.front(), n);
-        if (!pair) continue;
-        previous.nodes.push_back(n);
-        previous.outputs = {pair.output, pair.state};
-        group.nodes.clear();
-        merged = true;
-        break;
-      }
-      if (!merged) earlier.push_back(i);
-    }
-    std::erase_if(phase_groups, [](const FusionGroup& g) { return g.nodes.empty(); });
+    phase_groups = launch_groups(roots, planned, *emitter);
   }
 
   // Slot planning and backend allocation may wait for earlier stream work.

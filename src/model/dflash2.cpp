@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <utility>
 
@@ -292,7 +293,7 @@ struct DFlash2Module::Impl {
   };
   std::vector<Layer> layers;
   struct ContextPass {
-    Array features, offset;
+    Array features, offset, valid;
     std::vector<Array> keys, values;
     graph::Program program;
     std::vector<graph::NodePtr> roots;
@@ -370,6 +371,7 @@ Result<DFlash2Module::Impl::ContextPass> DFlash2Module::Impl::context_pass(std::
   ContextPass p;
   LSE_ASSIGN_OR(p.features, slot(Shape{1, rows, static_cast<std::int64_t>(config.hidden_size) * static_cast<std::int64_t>(config.target_layers.size())}));
   LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
+  LSE_ASSIGN_OR(p.valid, slot(Shape{1}));
   Array context = norm(graph::linear(p.features, fc), hidden_norm, config.rms_eps);
   for (Layer& l : layers) {
     Array k = ops::split_heads(graph::linear(context, l.k), config.kv_heads, config.head_dim);
@@ -378,8 +380,8 @@ Result<DFlash2Module::Impl::ContextPass> DFlash2Module::Impl::context_pass(std::
     Array v = ops::split_heads(graph::linear(context, l.v), config.kv_heads, config.head_dim);
     const std::array<float,4> geometry{static_cast<float>(config.kv_heads), static_cast<float>(capacity),
         static_cast<float>(config.head_dim), static_cast<float>(rows)};
-    LSE_ASSIGN_OR(Array keys, graph::custom("dflash2.cache_write", {l.keys, k, p.offset}, geometry));
-    LSE_ASSIGN_OR(Array values, graph::custom("dflash2.cache_write", {l.values, v, p.offset}, geometry));
+    LSE_ASSIGN_OR(Array keys, graph::custom("dflash2.cache_write", {l.keys, k, p.offset, p.valid}, geometry));
+    LSE_ASSIGN_OR(Array values, graph::custom("dflash2.cache_write", {l.values, v, p.offset, p.valid}, geometry));
     p.keys.push_back(std::move(keys));
     p.values.push_back(std::move(values));
     p.roots.push_back(p.keys.back().node()); p.roots.push_back(p.values.back().node());
@@ -513,12 +515,17 @@ Status DFlash2Module::rewind(std::int32_t position) {
   impl_->position = position; impl_->live -= drop;
   return OkStatus();
 }
-Status DFlash2Module::append_context(const Array& features, std::int32_t first) {
+Status DFlash2Module::append_context(const Array& features, std::int32_t first,
+                                     std::int64_t rows) {
   if (!features.valid() || features.dtype() != DType::kF32 || features.shape().rank() != 3 ||
       features.shape().dim(0) != 1 || features.shape().dim(1) <= 0 ||
       features.shape().dim(2) != static_cast<std::int64_t>(impl_->config.hidden_size) * static_cast<std::int64_t>(impl_->config.target_layers.size()) || first < 0)
     return LSE_ERROR(kInvalidArgument, "invalid DFlash2 target features");
-  auto rows = features.shape().dim(1);
+  auto width = features.shape().dim(1);
+  if (rows == 0) rows = width;
+  if (rows < 0 || rows > width)
+    return LSE_ERROR(kInvalidArgument, "DFlash2 context has ", std::to_string(rows),
+                     " real rows in a pass of ", std::to_string(width));
   if (static_cast<std::int64_t>(first) + rows > impl_->max_position)
     return LSE_ERROR(kInvalidArgument, "DFlash2 context exceeds target KV capacity");
   if (first < impl_->position) LSE_RETURN_IF_ERROR(rewind(first));
@@ -526,12 +533,17 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
   Array input = features;
   if (rows > impl_->capacity) {
     input = graph::slice(features, 1, rows - impl_->capacity, rows);
-    first += static_cast<std::int32_t>(rows - impl_->capacity); rows = impl_->capacity;
+    first += static_cast<std::int32_t>(rows - impl_->capacity);
+    width = rows = impl_->capacity;
+  } else if (width > impl_->capacity) {
+    // Padding past what the ring holds: the real rows alone.
+    input = graph::slice(features, 1, 0, rows);
+    width = rows;
   }
   // Keep one wide prefill program; narrow verifier widths replay during decode.
   const auto obsolete = [&](const auto& entry) {
     return entry.first > static_cast<std::int64_t>(impl_->config.block_size) &&
-           entry.first != rows;
+           entry.first != width;
   };
   if (std::any_of(impl_->contexts.begin(), impl_->contexts.end(), obsolete)) {
     auto* scheduler = graph::default_scheduler();
@@ -539,10 +551,10 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
     LSE_RETURN_IF_ERROR(scheduler->drain());
     std::erase_if(impl_->contexts, obsolete);
   }
-  auto it = impl_->contexts.find(rows);
+  auto it = impl_->contexts.find(width);
   if (it == impl_->contexts.end()) {
-    LSE_ASSIGN_OR(auto pass, impl_->context_pass(rows));
-    it = impl_->contexts.emplace(rows, std::move(pass)).first;
+    LSE_ASSIGN_OR(auto pass, impl_->context_pass(width));
+    it = impl_->contexts.emplace(width, std::move(pass)).first;
   }
   auto& pass = it->second;
   {
@@ -556,6 +568,8 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
     DraftProfile profile("context-offset-upload");
     const float offset = static_cast<float>(first);
     LSE_RETURN_IF_ERROR(poke(pass.offset, std::span(&offset, 1)));
+    const float real = static_cast<float>(rows);
+    LSE_RETURN_IF_ERROR(poke(pass.valid, std::span(&real, 1)));
   }
   {
     DraftProfile profile("context-submit");
@@ -569,6 +583,26 @@ Status DFlash2Module::append_context(const Array& features, std::int32_t first) 
   impl_->live = std::min(impl_->capacity, impl_->live + static_cast<std::int32_t>(rows));
   return OkStatus();
 }
+Status DFlash2Module::prepare_kernels(std::span<const std::int64_t> context_widths) {
+  auto* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "DFlash2 needs a scheduler");
+  const graph::Scheduler::Preparing preparing(*scheduler);
+  std::set<std::int64_t> widths;
+  for (const std::int64_t width : context_widths)
+    widths.insert(std::min<std::int64_t>(width, impl_->capacity));
+  for (const std::int64_t width : widths) {
+    LSE_ASSIGN_OR(auto pass, impl_->context_pass(width));
+    LSE_RETURN_IF_ERROR(scheduler->prepare(pass.roots));
+  }
+  const auto block = impl_->config.block_size;
+  const auto output = dispatch::dflash2_output_plan(block, block - 1);
+  for (const bool sampled : {false, true}) {
+    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(output.head_rows, output.selector_positions, sampled));
+    LSE_RETURN_IF_ERROR(scheduler->prepare(pass.roots));
+  }
+  return OkStatus();
+}
+
 Result<DFlash2Module::Impl::DraftPass*> DFlash2Module::Impl::run_draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals, bool sampled) {
   if (anchor >= static_cast<std::uint32_t>(config.vocab_size) || first != position ||
       live <= 0 || proposals == 0 || proposals >= config.block_size ||

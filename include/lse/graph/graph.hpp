@@ -358,6 +358,8 @@ void record_cpu_fallback(const std::string& cause);
 // number (from the last few thousand).
 [[nodiscard]] std::vector<CpuFallbackEvent> cpu_fallback_events(std::uint64_t after = 0);
 
+class IKernelEmitter;
+
 class Scheduler {
  public:
   // The devices this scheduler may run on. One member or eight is a difference
@@ -392,6 +394,35 @@ class Scheduler {
   // When `plan` is set, replay and retain write that Program instead of the
   // scheduler's leftover one. Same-root reuse is how decode avoids rebuild.
   Status eval(std::span<const NodePtr> roots, bool pull_host, Program* plan);
+
+  // Every kernel the step `roots` would launch, emitted and loaded on the
+  // device that would run it -- and nothing else: no activation is planned or
+  // allocated, nothing is bound, nothing reaches a queue, no program is
+  // retained and `roots` stay unmaterialized. Kernels are specialized to their
+  // shapes, so a server prepares at load every shape its requests can take;
+  // the first request of a shape then launches resident kernels back to back
+  // instead of emitting and loading them between launches, which leaves the
+  // GPU a long stretch of sparse work right when the request needs it busy.
+  Status prepare(std::span<const NodePtr> roots);
+
+  // While one is alive, eval() prepares instead of running, so the graph a
+  // model builds for a pass can be prepared through the same code that builds
+  // it. Nothing an eval would have produced exists afterwards: whatever ran
+  // under it builds graphs only and reads back no values.
+  class Preparing {
+   public:
+    explicit Preparing(Scheduler& s) noexcept : s_(s), was_(s.preparing_) {
+      s_.preparing_ = true;
+    }
+    ~Preparing() { s_.preparing_ = was_; }
+    Preparing(const Preparing&) = delete;
+    Preparing& operator=(const Preparing&) = delete;
+
+   private:
+    Scheduler& s_;
+    bool was_;
+  };
+  [[nodiscard]] bool preparing() const noexcept { return preparing_; }
 
   // Device-first: every group that can be compiled is compiled and dispatched
   // on the selected backend. The host path runs only when a group cannot be
@@ -436,6 +467,10 @@ class Scheduler {
   Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
                             std::size_t member, Program* replay = nullptr,
                             std::size_t group_index = 0);
+  // The launches a step is cut into; shared by eval_step and prepare.
+  std::vector<FusionGroup> launch_groups(std::span<const NodePtr> roots,
+                                         std::vector<Workgroup>& planned,
+                                         const IKernelEmitter& emitter);
   // Which member of the set runs this group: the one already holding its
   // operands. Not a cost decision — a group whose inputs are resident on one
   // device has nowhere else to run until something moves them, and moving them
@@ -612,6 +647,7 @@ class Scheduler {
   std::unique_ptr<backend::SingleDevice> own_set_;
   backend::IDeviceSet& devices_;
   Mode mode_ = Mode::kDeviceFirst;
+  bool preparing_ = false;
   DialectPreference dialect_;
   FallbackChain* fallbacks_ = nullptr;
   Trace trace_;

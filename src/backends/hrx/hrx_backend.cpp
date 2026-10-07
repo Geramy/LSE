@@ -2854,6 +2854,45 @@ Result<KernelHandle> HrxBackend::load_executable_impl(
 #endif
 }
 
+Result<std::vector<KernelHandle>> HrxBackend::load_executables_impl(
+    std::span<const std::string> names, std::span<const std::byte> code_object) {
+#if !LSE_HRX_LINKED
+  (void)names; (void)code_object;
+  return LSE_ERROR(kUnimplemented, "libhrx not linked");
+#else
+  if (code_object.empty()) {
+    return LSE_ERROR(kInvalidArgument, "empty code object");
+  }
+  hrx_executable_t executable = nullptr;
+  LSE_RETURN_IF_ERROR(from_hrx(
+      hrx_executable_load_data(static_cast<hrx_device_t>(device_),
+                               code_object.data(), code_object.size(), "amdgpu",
+                               info_.arch.c_str(), &executable),
+      "hrx_executable_load_data"));
+  std::vector<KernelHandle> handles;
+  handles.reserve(names.size());
+  for (const std::string& name : names) {
+    std::uint32_t ordinal = 0;
+    const hrx_status_t looked_up =
+        hrx_executable_lookup_export_by_name(executable, name.c_str(), &ordinal);
+    if (!hrx_status_is_ok(looked_up)) {
+      hrx_status_ignore(looked_up);
+      hrx_executable_release(executable);
+      return LSE_ERROR(kNotFound, "no export '", name, "' in a code object of ",
+                       std::to_string(names.size()), " kernels");
+    }
+    KernelHandle handle;
+    handle.executable = reinterpret_cast<std::uint64_t>(executable);
+    handle.export_ordinal = ordinal;
+    handle.name = name;
+    handles.push_back(std::move(handle));
+  }
+  // Owned here and released at shutdown, as load_executable_impl's are.
+  loaded_executables_.push_back(executable);
+  return handles;
+#endif
+}
+
 Status HrxBackend::begin_decode_sample_impl(std::uint64_t key) {
   if (!automatic_submission_) return OkStatus();
   if (submission_sample_ != nullptr) {

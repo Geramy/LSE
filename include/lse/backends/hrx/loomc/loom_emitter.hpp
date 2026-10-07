@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <string>
@@ -37,6 +38,8 @@ class LoomEmitter final : public graph::IKernelEmitter {
 
   Result<graph::EmittedKernel> emit(const graph::FusionGroup& group,
                                     const DeviceInfo& device) const override;
+  Result<graph::EmittedKernel> emit_launch(const graph::FusionGroup& group,
+                                           const DeviceInfo& device) const override;
 
   [[nodiscard]] std::uint64_t cache_key(
       const graph::FusionGroup& group,
@@ -72,7 +75,18 @@ class LoomEmitter final : public graph::IKernelEmitter {
 
  private:
   mutable std::mutex cache_mutex_;
-  mutable std::unordered_map<std::string, graph::EmittedKernel> emit_cache_;
+  Result<graph::EmittedKernel> emit_kernel(const graph::FusionGroup& group,
+                                           const DeviceInfo& device,
+                                           bool with_source) const;
+  // One entry per emission identity: the launch description (no source, no
+  // bindings) and the source text beside it while the text budget lasts. A
+  // server prepares every pass shape at load, so the descriptions of all of
+  // them stay; only text, which a resident kernel never needs, is budgeted.
+  struct CachedEmission {
+    graph::EmittedKernel launch;
+    std::shared_ptr<const std::string> source;
+  };
+  mutable std::unordered_map<std::string, CachedEmission> emit_cache_;
   mutable std::size_t cache_hits_ = 0, cache_misses_ = 0, cache_bytes_ = 0;
 };
 

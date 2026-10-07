@@ -841,6 +841,25 @@ class Backend {
     return derived().load_executable_impl(name, code_object);
   }
 
+  // Every export named in `names`, from one code object loaded once: one
+  // executable's device allocations for all of them. A backend that does not
+  // share an executable between handles loads the object once per name.
+  Result<std::vector<KernelHandle>> load_executables(
+      std::span<const std::string> names, std::span<const std::byte> code_object) {
+    if constexpr (requires(Derived& d) { d.load_executables_impl(names, code_object); }) {
+      return derived().load_executables_impl(names, code_object);
+    } else {
+      std::vector<KernelHandle> handles;
+      handles.reserve(names.size());
+      for (const std::string& name : names) {
+        auto handle = derived().load_executable_impl(name, code_object);
+        if (!handle.ok()) return handle.status();
+        handles.push_back(handle.release());
+      }
+      return handles;
+    }
+  }
+
   Status launch(const KernelHandle& kernel, const LaunchDims& dims,
                 const DispatchArgs& args, const DispatchTarget& target = {}) {
     // The one invariant this layer can settle alone: a launch addressed to
@@ -1207,6 +1226,20 @@ class IBackend {
 
   virtual Result<KernelHandle> load_executable(
       std::string_view name, std::span<const std::byte> code_object) = 0;
+  // Every export named in `names` from one code object; see
+  // Backend::load_executables. Without an executable shared between handles,
+  // the object is loaded once per name.
+  virtual Result<std::vector<KernelHandle>> load_executables(
+      std::span<const std::string> names, std::span<const std::byte> code_object) {
+    std::vector<KernelHandle> handles;
+    handles.reserve(names.size());
+    for (const std::string& name : names) {
+      auto handle = load_executable(name, code_object);
+      if (!handle.ok()) return handle.status();
+      handles.push_back(handle.release());
+    }
+    return handles;
+  }
   virtual Status launch(const KernelHandle& kernel, const LaunchDims& dims,
                         const DispatchArgs& args,
                         const DispatchTarget& target) = 0;
@@ -1388,6 +1421,10 @@ class BackendAdapter final : public IBackend {
   Result<KernelHandle> load_executable(
       std::string_view n, std::span<const std::byte> code) override {
     return impl_.load_executable(n, code);
+  }
+  Result<std::vector<KernelHandle>> load_executables(
+      std::span<const std::string> n, std::span<const std::byte> code) override {
+    return impl_.load_executables(n, code);
   }
   Status launch(const KernelHandle& k, const LaunchDims& d,
                 const DispatchArgs& a, const DispatchTarget& t) override {

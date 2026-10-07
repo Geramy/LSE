@@ -52,6 +52,8 @@ static_assert(kBlockSize == (1 << kBlockShift), "kBlockSize must be 1<<kBlockShi
 // engine can ever compile at log2(capacity / block_size) instead of one per
 // length. Same shape of answer as the prefill chunk ladder.
 inline constexpr std::int32_t kMinPoolBlocks = 8;
+// Pools double up to this many blocks and grow by a fixed step beyond it.
+inline constexpr std::int32_t kLargePoolStart = 2048;
 
 // Smallest rung that holds `blocks`, never below kMinPoolBlocks and never above
 // `ceiling` (which is the whole engine capacity in blocks and is itself a valid

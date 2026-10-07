@@ -1116,6 +1116,18 @@ void Router::use_dflash2(model::DFlash2Module& draft) noexcept {
   impl_->dflash2 = &draft; impl_->mtp = nullptr;
 }
 
+Status Router::prepare_kernels() {
+  std::lock_guard<std::mutex> held(impl_->generate_lock);
+  // What a request that names no sampling settings runs with.
+  LSE_ASSIGN_OR(runtime::SamplingParams sampling,
+                detail::request_sampling(json::object(),
+                                         impl_->model.config().sampling_defaults));
+  runtime::Generator gen(impl_->model, sampling, impl_->opt.prefill);
+  if (impl_->mtp != nullptr) gen.use_mtp(*impl_->mtp);
+  if (impl_->dflash2 != nullptr) gen.use_dflash2(*impl_->dflash2);
+  return gen.prepare_kernels();
+}
+
 const ServerOptions& Router::options() const noexcept { return impl_->opt; }
 
 namespace {

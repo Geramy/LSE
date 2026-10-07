@@ -391,6 +391,55 @@ Status PrefixStateCommit::retain(std::span<const MixerState> states,
   return OkStatus();
 }
 
+void PrefixStateCommit::build_replay(Replay& replay, std::size_t rows,
+                                     graph::Scheduler& scheduler) const {
+  for (const Entry& entry : entries_) {
+    const auto member = entry.output->member != graph::Node::kAnyMember
+        ? static_cast<std::size_t>(entry.output->member)
+        : scheduler.devices().member_of(entry.output->buffer.residency);
+    const graph::ScopedMember on(member < scheduler.devices().size()
+                                    ? member : scheduler.devices().primary());
+    std::vector<Array> inputs;
+    for (std::size_t i = 0; i < entry.sources.size(); ++i) {
+      const auto& source = entry.sources[i];
+      auto node = std::make_shared<graph::Node>();
+      node->kind = graph::OpKind::kBuffer;
+      node->fclass = graph::FusionClass::kLeaf;
+      // B1 prefixes are contiguous windows; no activation copies are needed.
+      const bool sequence = entry.recurrent ? i < 4 : i == 1;
+      for (std::size_t axis = 0; axis < source->shape.rank(); ++axis)
+        node->shape.push_back(sequence && axis == 1
+            ? static_cast<std::int64_t>(rows) : source->shape.dim(axis));
+      node->dtype = source->dtype;
+      node->member = source->member;
+      inputs.emplace_back(node);
+      replay.inputs.emplace_back(node);
+    }
+    Array output;
+    if (entry.recurrent) {
+      // Q affects only discarded outputs; the state reads K/V/alpha/beta.
+      (void)graph::gated_delta_step(inputs[0], inputs[0], inputs[1], inputs[2],
+                                    inputs[3], inputs[4], &output);
+    } else {
+      output = graph::conv_tail(inputs[0], inputs[1]);
+    }
+    replay.outputs.push_back(output);
+  }
+}
+
+Status PrefixStateCommit::prepare(std::size_t rows, graph::Scheduler& scheduler) const {
+  if (!ready() || rows == 0 || rows >= static_cast<std::size_t>(sequence_rows_))
+    return LSE_ERROR(kInvalidArgument, "prefix rows must be inside the retained pass");
+  Replay replay;
+  build_replay(replay, rows, scheduler);
+  // The leaves stand for the verifier's windows commit() binds; the kernels
+  // only see their shapes.
+  for (Array& input : replay.inputs) input.node()->materialized = true;
+  std::vector<graph::NodePtr> roots;
+  for (const Array& output : replay.outputs) roots.push_back(output.node());
+  return roots.empty() ? OkStatus() : scheduler.prepare(roots);
+}
+
 Status PrefixStateCommit::commit(std::size_t rows, graph::Scheduler& scheduler) {
   if (!ready() || rows == 0 || rows >= static_cast<std::size_t>(sequence_rows_))
     return LSE_ERROR(kInvalidArgument, "prefix rows must be inside the retained pass");
@@ -446,40 +495,7 @@ Status PrefixStateCommit::commit(std::size_t rows, graph::Scheduler& scheduler) 
     }
   }
   Replay& replay = replays_[rows];
-  if (replay.outputs.empty() && !entries_.empty()) {
-    for (const Entry& entry : entries_) {
-      const auto member = entry.output->member != graph::Node::kAnyMember
-          ? static_cast<std::size_t>(entry.output->member)
-          : scheduler.devices().member_of(entry.output->buffer.residency);
-      const graph::ScopedMember on(member < scheduler.devices().size()
-                                      ? member : scheduler.devices().primary());
-      std::vector<Array> inputs;
-      for (std::size_t i = 0; i < entry.sources.size(); ++i) {
-        const auto& source = entry.sources[i];
-        auto node = std::make_shared<graph::Node>();
-        node->kind = graph::OpKind::kBuffer;
-        node->fclass = graph::FusionClass::kLeaf;
-        // B1 prefixes are contiguous windows; no activation copies are needed.
-        const bool sequence = entry.recurrent ? i < 4 : i == 1;
-        for (std::size_t axis = 0; axis < source->shape.rank(); ++axis)
-          node->shape.push_back(sequence && axis == 1
-              ? static_cast<std::int64_t>(rows) : source->shape.dim(axis));
-        node->dtype = source->dtype;
-        node->member = source->member;
-        inputs.emplace_back(node);
-        replay.inputs.emplace_back(node);
-      }
-      Array output;
-      if (entry.recurrent) {
-        // Q affects only discarded outputs; the state reads K/V/alpha/beta.
-        (void)graph::gated_delta_step(inputs[0], inputs[0], inputs[1], inputs[2],
-                                      inputs[3], inputs[4], &output);
-      } else {
-        output = graph::conv_tail(inputs[0], inputs[1]);
-      }
-      replay.outputs.push_back(output);
-    }
-  }
+  if (replay.outputs.empty()) build_replay(replay, rows, scheduler);
   replay.program.reset_compute();
   std::size_t input_index = 0;
   std::vector<graph::NodePtr> roots;
@@ -518,6 +534,20 @@ Status PrefixStateCommit::commit(std::size_t rows, graph::Scheduler& scheduler) 
     entry.output->materialized = true;
   }
   return OkStatus();
+}
+
+Status HybridLM::prepare_prefix_commits() {
+  graph::Scheduler* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "no scheduler for prefix state");
+  for (const ForwardCache& cache : caches_) {
+    if (cache.pass_id == 0 || cache.pass_id != last_pass_id_) continue;
+    if (!cache.retains_prefix_state || !cache.prefix.ready())
+      return LSE_ERROR(kInvalidArgument, "the latest pass retained no prefix state");
+    for (std::int64_t rows = 1; rows < cache.seq; ++rows)
+      LSE_RETURN_IF_ERROR(cache.prefix.prepare(static_cast<std::size_t>(rows), *scheduler));
+    return OkStatus();
+  }
+  return LSE_ERROR(kInvalidArgument, "no pass has been built to prepare prefix commits for");
 }
 
 Status HybridLM::commit_prefix(std::vector<MixerState>& states, std::size_t rows) {
