@@ -1,5 +1,6 @@
 #include "lse/model/mtp.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -345,6 +346,15 @@ Result<Array> MtpModule::record(std::int64_t rows) {
   LSE_ASSIGN_OR(Array logits, model_->lm_head(last));
   Array pick = graph::argmax(logits);
   if (!pick.valid()) return LSE_ERROR(kInternal, "argmax over an empty row");
+  if (scored_) {
+    // The pick's probability: the row's largest softmax value, reduced on
+    // the device (softmax_top) so only one float joins the readback.
+    const auto vocab = static_cast<float>(logits.shape().dim(logits.shape().rank() - 1));
+    LSE_ASSIGN_OR(Array partial, graph::custom("softmax_top.partial", {logits},
+                                               {vocab, 0.0f, 0.0f, 0.0f}));
+    LSE_ASSIGN_OR(pass_.top, graph::custom("softmax_top.final", {partial},
+        {static_cast<float>(partial.shape().dim(1)), 0.0f, 0.0f, 0.0f}));
+  }
   return pick;
 }
 
@@ -464,6 +474,7 @@ Status MtpModule::submit_pass(
 
     std::vector<graph::NodePtr> roots{pass_.pick.node()};
     if (pass_.last.valid()) roots.push_back(pass_.last.node());
+    if (pass_.top.valid()) roots.push_back(pass_.top.node());
     for (const Array& a : {state_.key_cache, state_.value_cache}) {
       if (a.valid() && a.node() && !a.node()->materialized) {
         roots.push_back(a.node());
@@ -496,34 +507,51 @@ Result<std::uint32_t> MtpModule::draft(
 Result<std::vector<std::uint32_t>> MtpModule::draft_chain(
     std::span<const float> hidden, std::span<const std::uint32_t> tokens,
     std::int32_t first, std::uint32_t depth) {
-  return draft_chain_impl(hidden, nullptr, tokens, first, depth);
+  return draft_chain_impl(hidden, nullptr, tokens, first, depth, nullptr);
 }
 
 Result<std::vector<std::uint32_t>> MtpModule::draft_chain(
     const Array& hidden, std::span<const std::uint32_t> tokens,
-    std::int32_t first, std::uint32_t depth) {
-  return draft_chain_impl({}, &hidden, tokens, first, depth);
+    std::int32_t first, std::uint32_t depth, std::vector<double>* confidence) {
+  return draft_chain_impl({}, &hidden, tokens, first, depth, confidence);
+}
+
+void MtpModule::set_scored(bool scored) {
+  if (scored == scored_) return;
+  if (auto* sched = graph::default_scheduler()) (void)sched->drain();
+  scored_ = scored;
+  pass_ = Pass{};
+  passes_.clear();
 }
 
 Result<std::vector<std::uint32_t>> MtpModule::draft_chain_impl(
     std::span<const float> hidden, const Array* device_hidden,
     std::span<const std::uint32_t> tokens, std::int32_t first,
-    std::uint32_t depth) {
+    std::uint32_t depth, std::vector<double>* confidence) {
   std::vector<std::uint32_t> out;
   if (depth == 0) return out;
+  if (depth > kChainSlots)
+    return LSE_ERROR(kInvalidArgument, "an MTP chain holds at most ", std::to_string(kChainSlots),
+                     " proposals, asked for ", std::to_string(depth));
+  if (confidence != nullptr && !scored_)
+    return LSE_ERROR(kInvalidArgument, "MTP confidence needs a scored module (set_scored)");
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) return LSE_ERROR(kInternal, "no backend to run the MTP module");
   auto& be = sched->backend();
   // Every pass feeds the next its proposal and hidden on the device; their
   // picks are copied, in stream order, into one buffer read back once.
-  if (!chain_picks_.valid() ||
-      chain_picks_.shape().elem_count() < static_cast<std::size_t>(depth)) {
-    LSE_ASSIGN_OR(chain_picks_, device_slot(Shape{static_cast<std::int64_t>(std::max(depth, 8u))}));
+  if (!chain_picks_.valid()) {
+    LSE_ASSIGN_OR(chain_picks_, device_slot(Shape{2 * kChainSlots}));
   }
   auto gather = [&](std::uint32_t i) -> Status {
     const auto& pick = pass_.pick.node()->buffer;
-    return be.copy_ordered(pick, chain_picks_.node()->buffer, sizeof(float), 0,
-                           i * sizeof(float));
+    LSE_RETURN_IF_ERROR(be.copy_ordered(pick, chain_picks_.node()->buffer, sizeof(float), 0,
+                                        i * sizeof(float)));
+    if (confidence == nullptr) return OkStatus();
+    if (!pass_.top.valid() || !pass_.top.node()->buffer.valid())
+      return LSE_ERROR(kInternal, "the MTP pass kept no pick probability");
+    return be.copy_ordered(pass_.top.node()->buffer, chain_picks_.node()->buffer, sizeof(float),
+                           0, (kChainSlots + i) * sizeof(float));
   };
   LSE_RETURN_IF_ERROR(submit_pass(hidden, tokens, first, device_hidden, nullptr));
   LSE_RETURN_IF_ERROR(gather(0));
@@ -537,9 +565,20 @@ Result<std::vector<std::uint32_t>> MtpModule::draft_chain_impl(
     LSE_RETURN_IF_ERROR(submit_pass({}, std::span(&row, 1), position_, &own, &previous));
     LSE_RETURN_IF_ERROR(gather(i));
   }
-  std::vector<float> picks(depth);
+  std::vector<float> picks(confidence != nullptr ? 2 * kChainSlots : depth);
   LSE_RETURN_IF_ERROR(be.copy(picks.data(), backend::MemRef(chain_picks_.node()->buffer, 0),
                               picks.size() * sizeof(float)));
+  if (confidence != nullptr) {
+    confidence->clear();
+    for (std::uint32_t i = 0; i < depth; ++i) {
+      const float top = picks[kChainSlots + i];
+      if (!(top > 0.0f && top <= 1.0f))
+        return LSE_ERROR(kInternal, "MTP pick probability ", std::to_string(top),
+                         " is not a probability");
+      confidence->push_back(static_cast<double>(top));
+    }
+    picks.resize(depth);
+  }
   out.reserve(depth);
   const auto vocab = static_cast<float>(config_.vocab_size);
   for (const float pick : picks) {

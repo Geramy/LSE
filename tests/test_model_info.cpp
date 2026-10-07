@@ -298,6 +298,18 @@ json estimate(const model::MemoryPlanRequest& r) {
 
 }  // namespace
 
+LSE_TEST(lse_config_init_turns_adaptive_drafting_on) {
+  // --adaptive-dflash2 and --adaptive-mtp default to on; an embedder turns
+  // either off with 0.
+  lse_config cfg;
+  std::memset(&cfg, 0x5a, sizeof cfg);
+  lse_config_init(&cfg);
+  LSE_EXPECT_EQ(cfg.adaptive_dflash2, 1);
+  LSE_EXPECT_EQ(cfg.adaptive_mtp, 1);
+  LSE_EXPECT_EQ(cfg.dflash2, 0);
+  LSE_EXPECT_EQ(cfg.struct_size, static_cast<uint32_t>(sizeof(lse_config)));
+}
+
 LSE_TEST(dense_qwen_fixture_reports_the_loader_facts) {
   TempDir dir("dense");
   write_qwen(dir.path, false);

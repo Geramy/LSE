@@ -365,6 +365,12 @@ Use a matching Q8 MTP module. For Qwen3.8-27B, see
 
 MTP depth accepts values from 1 to 7. Its default is 3.
 A request can override this value with `"mtp_depth": 3`.
+With `--adaptive-mtp=on` (the default), a sampled request instead chains, each step, as many
+proposals as are expected to pay on this GPU (up to 7), from the module's per-position
+acceptance and draft and verify costs measured at run time, and verifies the prefix its
+proposals' own probabilities justify. Greedy requests, requests that name `mtp_depth`, and
+`--adaptive-mtp=off` use the fixed depth. See
+[adaptive verify width](docs/DFLASH2.md#adaptive-verify-width) for the policy.
 Without `--no-mtp`, LSE can use an MTP module found beside the target model.
 
 ### DFlash2 with a Q8 draft model
@@ -388,7 +394,10 @@ unconverted. See [automatic Q8 conversion](docs/DFLASH2.md#automatic-q8-conversi
 ```
 
 DFlash2 replaces MTP for this server process. It evaluates a draft block of eight positions.
-The verifier checks the anchor token and all seven proposals.
+For a sampled request, each step verifies the anchor token and the prefix of the seven
+proposals expected to decode fastest on this GPU, from the draft's confidence and verify
+costs measured at run time; `--adaptive-dflash2=off` verifies all seven every step. Greedy
+requests always verify all seven. See [adaptive verify width](docs/DFLASH2.md#adaptive-verify-width).
 See [DFlash2](docs/DFLASH2.md) for model compatibility and sampling limits.
 
 ## Connect a client

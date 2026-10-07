@@ -227,6 +227,7 @@ target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry lse_
 # happens to lower them.
 add_library(lse_kernels
   src/kernels/argmax.cpp
+  src/kernels/softmax_top.cpp
   src/kernels/concat.cpp
   src/kernels/conv.cpp
   src/kernels/gather.cpp
@@ -341,6 +342,7 @@ lse_apply_common_flags(lse_sampling)
 
 add_library(lse_runtime
   src/runtime/batch.cpp
+  src/runtime/draft_width.cpp
   src/runtime/generator.cpp
   src/runtime/perplexity.cpp
   src/runtime/session.cpp

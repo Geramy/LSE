@@ -224,6 +224,35 @@ void Program::fold_carries() noexcept {
   }
 }
 
+bool Program::can_adopt_carries(const Program& previous) const noexcept {
+  if (carries_.size() != previous.carries_.size() || carries_.empty()) return false;
+  for (std::size_t i = 0; i < carries_.size(); ++i) {
+    const Node* in = carry_owner(carries_[i].in);
+    const Node* out = carry_owner(previous.carries_[i].out);
+    if (!in || !out || in->dtype != out->dtype || in->shape != out->shape ||
+        !out->materialized || !out->buffer.valid() || !in->buffer.valid() ||
+        out->buffer.size_bytes < dtype_storage_bytes(out->dtype, out->element_count()) ||
+        in->buffer.size_bytes < dtype_storage_bytes(in->dtype, in->element_count()))
+      return false;
+  }
+  return true;
+}
+
+void Program::adopt_carries(Program& previous) noexcept {
+  for (std::size_t i = 0; i < carries_.size() && i < previous.carries_.size(); ++i) {
+    Node* in = carry_owner(carries_[i].in);
+    Node* out = carry_owner(previous.carries_[i].out);
+    if (!in || !out || in == out) continue;
+    std::swap(in->buffer, out->buffer);
+    in->materialized = true;
+    in->device_dirty = true;
+    in->host_dirty = false;
+    out->materialized = false;
+    refresh_carry_view(carries_[i].in);
+    refresh_carry_view(previous.carries_[i].out);
+  }
+}
+
 void Program::hold_carries() noexcept {
   for (Carry& c : carries_) {
     Node* in = carry_owner(c.in);

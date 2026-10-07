@@ -916,10 +916,25 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                          cache_.prev_pass == prev_pass_run) ||
                         (cache_.pass_id != 0 &&
                          cache_.pass_id == prev_pass_run);
+  // Any other pass over the same states that ran last can hand this slot its
+  // state instead: its carried outputs (after a prefix commit, the committed
+  // prefix's state) become this slot's carried inputs. That is what lets
+  // verify passes of different widths alternate without rebuilding either.
+  ForwardCache* handoff = nullptr;
+  if (!chain_ok && !replaces_previous && prev_pass_run != 0 && states != nullptr &&
+      !cache_.program.empty()) {
+    for (ForwardCache& c : caches_) {
+      if (&c != &cache_ && c.pass_id == prev_pass_run && c.states == states &&
+          cache_.program.can_adopt_carries(c.program)) {
+        handoff = &c;
+        break;
+      }
+    }
+  }
   const bool split_scope_ok = !cache_.split_decode_attention || replaces_previous ||
                               cache_.seq == 1 || kv_len >= 512;
   const bool can_reuse =
-      chain_ok && split_scope_ok && feature_layers_match(cache_) &&
+      (chain_ok || handoff != nullptr) && split_scope_ok && feature_layers_match(cache_) &&
       cache_.retains_prefix_state == retain_prefix_state &&
       (capture == nullptr || cache_.features.valid()) &&
       aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
@@ -975,6 +990,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     } else if (cache_.pass_id == prev_pass_run) {
       // Same program again: its outs are the freshest state, move them in.
       cache_.program.fold_carries();
+    } else if (!chain_ok && handoff != nullptr) {
+      cache_.program.adopt_carries(handoff->program);
     }
     // Different program ran last: this slot's in-nodes are that program's out
     // nodes and were just written by its eval — nothing to fold.
@@ -1009,6 +1026,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     if (capture != nullptr) capture->features = cache_.features;
     return cache_.hidden;
   }
+  ++builds_;
 
   if (replaces_previous) {
     // A rebuild records the graph from whatever the state Arrays hold now,

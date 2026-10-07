@@ -14,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -475,6 +476,220 @@ LSE_TEST(greedy_sampling_ignores_every_other_knob) {
   LSE_EXPECT_EQ(argmax(logits), 1u);
 }
 
+namespace {
+// A policy that has measured every verify width: `base` ns for one row and
+// `per_row` more for each further row, drafts of `draft` ns, and a long-run
+// rate of `rate_tps` tokens per second.
+DraftWidthPolicy measured_policy(double base, double per_row, double draft, double rate_tps) {
+  DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 1);  // warm-up: priced nothing
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass)
+    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows)
+      policy.observe_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 1)));
+  if (draft > 0) policy.observe_draft(static_cast<std::uint64_t>(draft));
+  policy.observe_step(1, static_cast<std::uint64_t>(1e9 / rate_tps));
+  return policy;
+}
+}  // namespace
+
+LSE_TEST(draft_width_policy_measures_every_width_first) {
+  DraftWidthPolicy policy;
+  // While the clocks ramp up: the full width, no measuring.
+  const std::array<double, 7> unsure{0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1};
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_EQ(policy.proposals(unsure), 7u);
+  LSE_EXPECT_EQ(policy.depth(7, 3), 3u);
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 99'000'000);  // priced nothing
+  // Width 1 is a plain step: no draft at all.
+  LSE_EXPECT_EQ(policy.exploring(), 1u);
+  LSE_EXPECT(!policy.draft_next());
+  const std::array<double, 7> sure{1, 1, 1, 1, 1, 1, 1};
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
+    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
+      LSE_EXPECT_EQ(policy.exploring(), rows);
+      if (rows > 1) {
+        LSE_EXPECT(policy.draft_next());
+        LSE_EXPECT_EQ(policy.proposals(sure), rows - 1);
+      }
+      policy.observe_verify(rows, 30'000'000 + 1'000'000 * rows);
+    }
+  }
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_NEAR(policy.verify_ns(8), 38e6, 1.0);
+  LSE_EXPECT_NEAR(policy.verify_ns(1), 31e6, 1.0);
+}
+
+LSE_TEST(draft_width_policy_verifies_what_pays_for_its_rows) {
+  // 32 ms for one row, 1 ms per further row, an 8 ms draft, 50 tok/s.
+  DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
+  const std::array<double, 7> sure{0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99};
+  LSE_EXPECT_EQ(policy.proposals(sure), 7u);
+  // Confident first proposals, then a draft that has lost the thread, after
+  // the target has shown that such proposals are rarely accepted: a proposal
+  // reached with a few percent chance does not buy a millisecond at 50
+  // tok/s (0.05 tokens per millisecond).
+  for (int i = 0; i < 1000; ++i) {
+    policy.observe_acceptance(0.02, 2, i % 50 == 0);
+    policy.observe_acceptance(0.99, 0, i % 50 != 0);
+  }
+  const std::array<double, 7> fading{0.99, 0.99, 0.02, 0.02, 0.02, 0.02, 0.02};
+  const std::uint32_t k = policy.proposals(fading);
+  LSE_EXPECT(k >= 2 && k <= 3);
+  // Free rows: everything with any chance is verified.
+  DraftWidthPolicy flat = measured_policy(32e6, 0.0, 8e6, 50.0);
+  LSE_EXPECT_EQ(flat.proposals(fading), 7u);
+}
+
+LSE_TEST(draft_width_policy_is_a_stopping_rule) {
+  // Whether proposal j is verified may depend on the draft's distributions at
+  // positions up to j only: confidence after the stopping point never changes
+  // the choice. That is what keeps rejection sampling exact.
+  DraftWidthPolicy policy = measured_policy(32e6, 2e6, 8e6, 40.0);
+  std::mt19937_64 rng(7);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  for (int trial = 0; trial < 2000; ++trial) {
+    std::array<double, 7> c{};
+    for (double& v : c) v = unit(rng);
+    const std::uint32_t k = policy.proposals(c);
+    for (int variant = 0; variant < 4; ++variant) {
+      std::array<double, 7> other = c;
+      for (std::uint32_t j = k + 1; j < other.size(); ++j) other[j] = unit(rng);
+      LSE_EXPECT_EQ(policy.proposals(other), k);
+    }
+  }
+}
+
+LSE_TEST(draft_width_policy_skips_a_draft_that_does_not_pay) {
+  DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 30.0);
+  // Drafts whose proposals are almost never right: drafting costs more than
+  // it returns, so plain steps follow, with a probing draft every
+  // kProbeAfter of them.
+  const std::array<double, 1> none{0.0};
+  for (int i = 0; i < 32; ++i) policy.observe_draft_value(none, 1);
+  std::uint32_t drafted = 0;
+  const std::uint32_t steps = 4 * (DraftWidthPolicy::kProbeAfter + 1);
+  for (std::uint32_t i = 0; i < steps; ++i) drafted += policy.draft_next() ? 1 : 0;
+  LSE_EXPECT_EQ(drafted, 4u);
+  // Proposals that are usually right make drafting worth it again.
+  const std::array<double, 7> good{0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9};
+  for (int i = 0; i < 64; ++i) policy.observe_draft_value(good, 7);
+  LSE_EXPECT(policy.draft_next());
+  LSE_EXPECT(policy.draft_next());
+}
+
+LSE_TEST(draft_width_policy_chains_as_deep_as_pays) {
+  // An MTP-like chain: each proposal costs a 2 ms pass, verify rows 1 ms.
+  DraftWidthPolicy policy = measured_policy(32e6, 1e6, 0.0, 50.0);
+  for (std::uint32_t d = 0; d <= DraftWidthPolicy::kMaxProposals; ++d)
+    policy.observe_draft(static_cast<std::uint64_t>(2e6 + 2e6 * d), d);
+  // Positions that are almost always accepted: chain all the way.
+  for (int i = 0; i < 4000; ++i)
+    policy.observe_acceptance(0.999, static_cast<std::uint32_t>(i % 7), i % 50 != 0);
+  LSE_EXPECT_EQ(policy.depth(7, 3), 7u);
+  LSE_EXPECT_EQ(policy.depth(3, 3), 3u);
+  // Positions that are rarely accepted, with 5 ms passes: a 6 ms proposal
+  // returning about a tenth of a token loses at 50 tok/s (0.3 tokens).
+  DraftWidthPolicy weak = measured_policy(32e6, 1e6, 0.0, 50.0);
+  for (std::uint32_t d = 0; d <= DraftWidthPolicy::kMaxProposals; ++d)
+    weak.observe_draft(static_cast<std::uint64_t>(2e6 + 5e6 * d), d);
+  for (int i = 0; i < 4000; ++i)
+    weak.observe_acceptance(0.5, static_cast<std::uint32_t>(i % 7), i % 40 == 0);
+  LSE_EXPECT_EQ(weak.depth(7, 3), 0u);
+}
+
+LSE_TEST(draft_width_policy_follows_a_change_of_text_within_steps) {
+  // Prose: proposals of confidence 0.8 accepted half the time. Then code:
+  // the same confidence accepted 95% of the time. Within a few dozen checks
+  // the estimate has moved most of the way, before the bin itself has.
+  DraftWidthPolicy policy;
+  for (int i = 0; i < 3000; ++i) policy.observe_acceptance(0.8, 0, i % 2 == 0);
+  const double prose = policy.acceptance(0.8);
+  LSE_EXPECT_NEAR(prose, 0.5, 0.05);
+  for (int i = 0; i < 60; ++i) policy.observe_acceptance(0.8, 0, i % 20 != 0);
+  LSE_EXPECT(policy.acceptance(0.8) > 0.8);
+}
+
+LSE_TEST(draft_width_policy_measures_stale_widths_only_when_cheap) {
+  // Every width measured, then only the full block for a long stretch.
+  const auto run_full_block = [](double accepted) {
+    DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
+    for (int i = 0; i < 2000; ++i)
+      policy.observe_acceptance(0.9, static_cast<std::uint32_t>(i % 7), (i % 100) < accepted * 100);
+    for (std::uint64_t i = 0; i <= DraftWidthPolicy::kRefreshSteps; ++i)
+      policy.observe_verify(DraftWidthPolicy::kMaxRows, 39'000'000);
+    return policy;
+  };
+  // Code: every narrower width would throw away most of a step.
+  LSE_EXPECT_EQ(run_full_block(0.98).refresh(DraftWidthPolicy::kMaxProposals, false), 0u);
+  // Prose: some narrower width costs next to nothing, and gets measured.
+  const std::uint32_t rows = run_full_block(0.3).refresh(DraftWidthPolicy::kMaxProposals, false);
+  LSE_EXPECT(rows >= 1 && rows < DraftWidthPolicy::kMaxRows);
+}
+
+LSE_TEST(draft_width_policy_calibrates_confidence_to_acceptance) {
+  DraftWidthPolicy policy;
+  // Unobserved, a bin believes its own confidence (its middle: 0.925 falls in
+  // [0.9, 0.944), a quarter decade of 1 - c).
+  LSE_EXPECT_NEAR(policy.acceptance(0.925), 1.0 - std::pow(10.0, -1.125), 1e-12);
+  LSE_EXPECT_EQ(DraftWidthPolicy::bin_of(0.0), 0u);
+  LSE_EXPECT_EQ(DraftWidthPolicy::bin_of(0.995), 9u);
+  LSE_EXPECT_EQ(DraftWidthPolicy::bin_of(1.0), DraftWidthPolicy::kBins - 1);
+  // A draft that claims 0.9 but is right half the time is believed at 0.5.
+  for (int i = 0; i < 2000; ++i) policy.observe_acceptance(0.91, 0, i % 2 == 0);
+  LSE_EXPECT_NEAR(policy.acceptance(0.91), 0.5, 0.02);
+  // Other confidences keep their own estimate.
+  LSE_EXPECT_NEAR(policy.acceptance(0.9999), 1.0 - std::pow(10.0, -4.125), 1e-3);
+}
+
+LSE_TEST(a_draft_side_stopping_rule_keeps_the_target_distribution) {
+  // Two positions over a three-token vocabulary. The draft's second
+  // conditional depends on its first token; the verifier checks proposal 2
+  // only when the draft's second distribution is confident, which depends on
+  // the first drafted token but not on the second. Rejection sampling must
+  // still emit (t1, t2) with the target's joint distribution.
+  const auto dist = [](std::vector<double> p) {
+    DiscreteDistribution d;
+    d.ids = {0, 1, 2};
+    d.probabilities = std::move(p);
+    return d;
+  };
+  const DiscreteDistribution p1 = dist({0.5, 0.3, 0.2});
+  const std::array<DiscreteDistribution, 3> p2{dist({0.6, 0.3, 0.1}), dist({0.1, 0.2, 0.7}),
+                                               dist({0.3, 0.4, 0.3})};
+  const DiscreteDistribution q1 = dist({0.2, 0.5, 0.3});
+  const std::array<DiscreteDistribution, 3> q2{dist({0.9, 0.05, 0.05}), dist({0.3, 0.4, 0.3}),
+                                               dist({0.05, 0.05, 0.9})};
+  std::mt19937_64 rng(2026);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  const auto draw = [&](const DiscreteDistribution& d) {
+    auto t = sample_distribution(d, unit(rng));
+    return t.ok() ? *t : 0u;
+  };
+  std::array<std::array<double, 3>, 3> seen{};
+  const int trials = 400000;
+  for (int trial = 0; trial < trials; ++trial) {
+    const std::uint32_t x1 = draw(q1), x2 = draw(q2[x1]);
+    const double top2 = *std::max_element(q2[x1].probabilities.begin(), q2[x1].probabilities.end());
+    const bool check_second = top2 > 0.5;
+    auto first = verify_proposal(p1, q1, x1, unit(rng), unit(rng));
+    if (!first.ok()) { LSE_EXPECT(false); return; }
+    std::uint32_t t2 = 0;
+    if (first->accepted && check_second) {
+      auto second = verify_proposal(p2[first->token], q2[x1], x2, unit(rng), unit(rng));
+      if (!second.ok()) { LSE_EXPECT(false); return; }
+      t2 = second->token;
+    } else {
+      t2 = draw(p2[first->token]);
+    }
+    seen[first->token][t2] += 1.0;
+  }
+  for (std::uint32_t a = 0; a < 3; ++a)
+    for (std::uint32_t b = 0; b < 3; ++b)
+      LSE_EXPECT_NEAR(seen[a][b] / trials, p1.probabilities[a] * p2[a].probabilities[b], 0.004);
+}
+
 LSE_TEST(top_k_of_one_is_deterministic_whatever_the_seed) {
   SamplingParams p;
   p.temperature = 1.0f;
@@ -826,6 +1041,42 @@ LSE_TEST(graph_argmax_matches_the_host_sampler_argmax) {
   // All-negative row: nothing beats index ordering on the way down.
   for (float& v : row) v = -std::abs(v) - 1.0f;
   LSE_EXPECT_EQ(pick_of(row), argmax(row));
+}
+
+LSE_TEST(softmax_top_matches_the_largest_softmax_probability) {
+  // Two rows over three chunks (the last one partial): the in-chunk reduce,
+  // the cross-chunk fold, and a chunk of -inf that must add nothing.
+  const std::int64_t n = 9000;
+  std::vector<float> rows(static_cast<std::size_t>(2 * n));
+  for (std::size_t i = 0; i < rows.size(); ++i)
+    rows[i] = 2.0f * std::sin(static_cast<float>(i) * 0.37f);
+  rows[17] = 12.0f;                       // row 0: one dominant logit
+  for (std::int64_t i = 0; i < 4096; ++i)  // row 1: first chunk all -inf
+    rows[static_cast<std::size_t>(n + i)] = -std::numeric_limits<float>::infinity();
+  rows[static_cast<std::size_t>(n + 8999)] = 4.0f;
+  const auto reference = [&](std::int64_t r) {
+    const float* x = rows.data() + r * n;
+    const double top = *std::max_element(x, x + n);
+    double sum = 0.0;
+    for (std::int64_t i = 0; i < n; ++i) sum += std::exp(static_cast<double>(x[i]) - top);
+    return 1.0 / sum;
+  };
+  graph::Array a = graph::Array::zeros(Shape{2, n}, DType::kF32);
+  LSE_EXPECT_OK(a.eval());
+  for (std::size_t i = 0; i < rows.size(); ++i)
+    graph::interpreter::store_element(*a.node(), i, rows[i]);
+  auto partial = graph::custom("softmax_top.partial", {a},
+                               {static_cast<float>(n), 0.0f, 0.0f, 0.0f});
+  LSE_EXPECT_OK(partial.status());
+  if (!partial.ok()) return;
+  LSE_EXPECT(partial->shape() == (Shape{2, 3, 2}));
+  auto top = graph::custom("softmax_top.final", {*partial}, {3.0f, 0.0f, 0.0f, 0.0f});
+  LSE_EXPECT_OK(top.status());
+  if (!top.ok()) return;
+  std::vector<float> out(2);
+  LSE_EXPECT_OK(top->to_host(out.data(), out.size() * sizeof(float)));
+  for (std::int64_t r = 0; r < 2; ++r)
+    LSE_EXPECT_NEAR(out[static_cast<std::size_t>(r)], reference(r), 2e-6 * reference(r) + 1e-7);
 }
 
 LSE_TEST(greedy_device_decode_matches_the_host_argmax_path) {

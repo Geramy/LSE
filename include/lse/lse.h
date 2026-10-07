@@ -111,6 +111,22 @@ typedef struct lse_config {
    * lse_status (engine.cpu_fallback) and reported to the client as
    * "lse_warnings". LSE_REQUIRE_DEVICE_KERNELS=1 has the same effect. */
   int32_t disable_cpu_fallback;
+
+  /* --adaptive-dflash2=on|off. With DFlash2, nonzero (lse_config_init's
+   * default) verifies, each step, the prefix of the draft block expected to
+   * yield the most tokens per second on this device, from the draft's own
+   * confidence and measured verify costs, and skips drafting when a plain
+   * step is faster; output is unchanged (greedy output is identical, sampled
+   * output keeps the target distribution). 0 verifies the whole block every
+   * step. */
+  int32_t adaptive_dflash2;
+
+  /* --adaptive-mtp=on|off. With MTP, nonzero (lse_config_init's default)
+   * lets a sampled request chain as many proposals as pay on this device
+   * (up to 7), from the module's own confidence and measured draft and
+   * verify costs, and verify the prefix worth its rows; greedy requests and
+   * 0 use mtp_depth every step. Output is unchanged. */
+  int32_t adaptive_mtp;
 } lse_config;
 
 LSE_API void lse_config_init(lse_config *cfg);

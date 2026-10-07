@@ -52,6 +52,8 @@ struct Options {
   std::string mtp;
   bool no_mtp = false;
   bool dflash2 = false;
+  bool adaptive_dflash2 = true;
+  bool adaptive_mtp = true;
   std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
@@ -106,8 +108,14 @@ void usage() {
       "                         .safetensors or an HF repo id. Default: the one\n"
       "                         beside the model, when the checkpoint has one\n"
       "      --mtp-depth N      draft proposals per verifier pass (1..7, default 3)\n"
+      "      --adaptive-mtp=off draft --mtp-depth proposals every step (on/off;\n"
+      "                         default on: sampled runs draft as deep as pays,\n"
+      "                         up to 7)\n"
       "      --dflash2=on       use the DFlash2 block drafter (default off)\n"
       "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
+      "      --adaptive-dflash2=off  verify every DFlash2 proposal each step\n"
+      "                         (on/off; default on: verify the prefix expected\n"
+      "                         to decode fastest)\n"
       "      --no-mtp           decode one token per pass, ignoring any\n"
       "                         multi-token-prediction module\n"
       "      --list-models      print the registered model kernels and exit\n"
@@ -261,6 +269,28 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->dflash2 = v == "on";
     } else if (a == "--dflash2-model") {
       if (!take_value(argc, argv, i, "--dflash2-model", &opt->dflash2_model)) return false;
+    } else if (a == "--adaptive-mtp" || a.starts_with("--adaptive-mtp=")) {
+      if (a == "--adaptive-mtp") {
+        if (!take_value(argc, argv, i, "--adaptive-mtp", &v)) return false;
+      } else {
+        v = a.substr(std::string("--adaptive-mtp=").size());
+      }
+      if (v != "on" && v != "off") {
+        std::fputs("lse: --adaptive-mtp must be on or off\n", stderr);
+        return false;
+      }
+      opt->adaptive_mtp = v == "on";
+    } else if (a == "--adaptive-dflash2" || a.starts_with("--adaptive-dflash2=")) {
+      if (a == "--adaptive-dflash2") {
+        if (!take_value(argc, argv, i, "--adaptive-dflash2", &v)) return false;
+      } else {
+        v = a.substr(std::string("--adaptive-dflash2=").size());
+      }
+      if (v != "on" && v != "off") {
+        std::fputs("lse: --adaptive-dflash2 must be on or off\n", stderr);
+        return false;
+      }
+      opt->adaptive_dflash2 = v == "on";
     } else if (a == "--no-mtp") {
       opt->no_mtp = true;
     } else if (a == "--arch") {
@@ -829,8 +859,9 @@ int main(int argc, char** argv) {
                  dflash2->block_size(), opt.dflash2_model.c_str());
   }
   runtime::Generator gen(*lm, opt.sampling, opt.prefill);
-  if (mtp != nullptr) gen.use_mtp(*mtp);
-  if (dflash2 != nullptr) gen.use_dflash2(*dflash2);
+  runtime::DraftWidthPolicy widths;
+  if (mtp != nullptr) gen.use_mtp(*mtp, opt.adaptive_mtp ? &widths : nullptr);
+  if (dflash2 != nullptr) gen.use_dflash2(*dflash2, opt.adaptive_dflash2 ? &widths : nullptr);
   auto stream = tok->stream();
 
   // Streamed through DecodeStream so a multi-byte character is never cut in
@@ -865,7 +896,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "prompt %d tokens, prefill %.2f s (%.2f tok/s) | generated %d tokens | "
                  "decode %d tokens in %.3f s (%.2f tok/s)\n"
-                 "mtp depth %u | dflash2 depth %u | spec steps %u accepted %u/%u (%.1f%%) | %u verify pass(es) "
+                 "mtp depth %u | dflash2 depth %u%s | spec steps %u accepted %u/%u (%.1f%%) "
+                 "of %u proposed, mean width %.2f, %u plain | %u verify pass(es) "
                  "%.1f ms each | draft %.1f ms each\n"
                  "launches %u | phases %u (ideal %u launch%s) | groups "
                  "device=%u host=%u views=%u fallbacks=%u\n"
@@ -878,8 +910,10 @@ int main(int argc, char** argv) {
                  s.prompt_tokens_per_second(), s.generated_tokens,
                  s.decoded_tokens(), static_cast<double>(s.decode_ns) / 1e9,
                  s.decode_tokens_per_second(),
-                 s.mtp_depth, s.dflash2_depth, s.spec_steps, s.spec_accepted, s.spec_tested,
-                 s.acceptance_rate() * 100.0,
+                 s.mtp_depth, s.dflash2_depth, s.spec_adaptive ? " adaptive" : "",
+                 s.spec_steps, s.spec_accepted, s.spec_tested,
+                 s.acceptance_rate() * 100.0, s.spec_proposed, s.mean_verify_width(),
+                 s.spec_plain_steps,
                  s.spec_verify_passes,
                  s.spec_verify_passes == 0
                      ? 0.0

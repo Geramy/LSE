@@ -16,9 +16,11 @@ model verifies proposals and determines every emitted token.
 ```
 
 Conditional draft selection uses the request's sampling settings. The target
-verifies all seven proposals with probability-ratio rejection and residual
-sampling. Greedy requests retain deterministic draft selection. DFlash2 remains
-opt-in. Current matched results and limits are in the
+verifies proposals with probability-ratio rejection and residual sampling; a
+sampled request verifies, each step, the prefix of the draft block expected to
+decode fastest (see [adaptive verify width](#adaptive-verify-width)). Greedy
+requests retain deterministic draft selection and verify all seven proposals.
+DFlash2 remains opt-in. Current matched results and limits are in the
 [final mode comparison](benchmarks/forward-modes-final-2026-09-29.md).
 
 ```sh
@@ -72,12 +74,111 @@ Target feature taps are post-block outputs at zero-based layers
 
 Every draft evaluates the complete trained block of eight positions: one anchor
 and seven mask tokens. Returning a shorter prefix preserves that computation.
-The target verifier consumes the anchor plus all seven proposals. Health and
-timing fields report depth seven; the trained draft block remains eight positions.
+The target verifier consumes the anchor plus up to seven proposals (all seven
+for greedy requests and with `--adaptive-dflash2=off`). Health and timing
+fields report depth seven; the trained draft block remains eight positions.
 Attention is noncausal within the draft block, including future mask positions;
 context keys obey the 2048-position sliding window. Learned dynamic convolutions
 have two taps and groups of 16 channels. The selector conditions each choice on
 its predecessor using top-16 candidates and rank-256 codebooks.
+
+## Adaptive verify width
+
+A verify pass costs more the more rows it carries, and a proposal behind a
+likely rejection rarely pays for its row. With `--adaptive-dflash2=on` (the
+default; `lse_config.adaptive_dflash2`), each step of a sampled request
+verifies the prefix of the draft block that maximizes expected tokens per
+second (`src/runtime/draft_width.cpp`):
+
+- **Acceptance estimate.** Proposal j's chance of acceptance, given the ones
+  before it were accepted, comes from the draft's own conditional
+  distribution at j: its largest probability, mapped through a calibration
+  table (20 bins) that learns from every proposal the target checks how often
+  proposals of that confidence are accepted. Old observations fade (half
+  weight after 512 more checks, about one 640-token request), so the table
+  follows the text.
+- **Costs.** The wall time of each verify width (1 to 8 rows) and of a draft
+  is measured on the device for this model; the first steps of a process
+  visit every width twice, and each width is measured again every 4,096
+  steps. A shared level follows the context length, and a per-width offset
+  holds what the extra rows cost. A step that recorded a program (a width's
+  first pass in a request) or compiled a kernel is left out. Nothing is
+  hard-coded, so each GPU tunes itself: on the R9700 the step costs of 1 to 8
+  rows measured 33.7, 35.3, 36.2, 35.9, 36.1, 36.5, 38.1 and 38.7 ms (verify
+  pass, acceptance walk and context append; 640-token essay, warm), and
+  before the verify widths moved onto the four- and eight-row kernels the 3,
+  5, 6 and 7-row passes took 48 to 89 ms and the policy avoided them.
+- **Stopping rule.** Proposal j is verified when some prefix ending at or
+  after j adds more expected tokens per added nanosecond than the long-run
+  rate; positions after j enter at their mean acceptance, not their own
+  confidence. Whether proposal j is verified therefore depends only on the
+  draft's distributions up to j, never on token j itself, so every verified
+  proposal is still a sample of the draft's conditional and rejection
+  sampling keeps the target's distribution exactly.
+  `a_draft_side_stopping_rule_keeps_the_target_distribution` in
+  `tests/test_runtime.cpp` checks this on a two-position example.
+- **Skipping the draft.** When drafting is expected to lose to a plain
+  one-row step, the next steps skip the draft, with a probing draft every
+  eight plain steps. The draft keeps no state between drafts beyond its
+  context ring, and every verify pass, plain or not, appends its verified
+  rows to that ring, so a skipped draft leaves nothing to repair.
+
+Greedy requests always verify all seven proposals. The target's logits differ
+in their last bits between pass widths (the GEMM shape and the Gated DeltaNet
+chunking follow the rows of a pass), so a different width can flip a near-tie
+between two tokens; master's greedy DFlash2 output already differs from plain
+decoding for the same reason. Verifying the whole block keeps greedy output
+byte-identical whatever the policy has learned.
+
+Verify passes of different widths alternate without rebuilding: a retained
+pass whose chain predecessor did not just run takes the carried state of the
+pass that did by exchanging buffers (`graph::Program::adopt_carries`). Before
+this, every width change rebuilt the pass (about 25 ms).
+
+Timings report `spec_proposed` (proposals the passes carried), `spec_tested`
+(proposals the target checked before the first rejection), `spec_accepted`,
+`spec_mean_width` (rows per pass), `spec_plain_steps` (passes with no
+proposals) and `dflash2_adaptive`. Acceptance rate is accepted over tested;
+with a shorter prefix fewer of the doubtful proposals are tested at all, so
+compare accepted over proposed as well.
+
+DSpark ([arXiv 2607.05147](https://huggingface.co/papers/2607.05147))
+schedules verify prefixes the same way, from a learned confidence head and a
+profiled width curve.
+
+Measured on the R9700 (macOS, driver build 266, master 1f1c3cd plus this
+change), the pinned DFlash2 configuration at temperature 0.6: three
+interleaved pairs of servers, `--adaptive-dflash2=off` then on, each pair
+running 12 seeds of every prompt (36 requests per prompt and arm). Fixed
+output is the same text on every run of a seed; adaptive output is a
+different sample of the same distribution, so the comparison is over 36
+texts each.
+
+| Prompt | Fixed (median) | Adaptive (median) | Change | Mean change (95% CI) | Acceptance fixed / adaptive | Rows per pass fixed / adaptive |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 640-token essay | 62.0 tok/s | 67.4 tok/s | +8.8% | +8.4% (+6.8 to +10.0) | 67.2% / 69.5% | 7.95 / 5.79 |
+| Code (HumanEval-style, 640 tokens) | 152.8 tok/s | 152.2 tok/s | -0.3% | -1.0% (-3.7 to +1.7) | 97.2% / 97.1% | 7.96 / 7.79 |
+| 2K prompt, 256 tokens | 70.6 tok/s | 70.9 tok/s | +0.4% | +2.3% (-0.9 to +5.8) | 75.0% / 76.0% | 7.91 / 5.94 |
+| 4K prompt, 256 tokens | 64.9 tok/s | 66.7 tok/s | +2.7% | +2.5% (-1.0 to +6.3) | 74.4% / 75.8% | 7.91 / 5.87 |
+
+On a Radeon 8060S (gfx1151), where a 4-row verify pass costs 92 ms and an
+8-row one 116 ms, three interleaved pairs measured essay +5.8%, 2K +6.9%,
+code +0.6% and 4K -2.9% (means; essay and code 9 runs per arm, 2K and 4K
+3).
+
+The same policy drives MTP with `--adaptive-mtp=on` (the default;
+`--adaptive-mtp=off` keeps `--mtp-depth` every step). On the
+R9700 against `--mtp-depth 3` (same method, 36 requests per prompt and
+arm) it chains about 6.8 deep on code, +25.4% (+21.3 to +29.2), but loses
+on prose: essay -5.5% (-6.9 to -4.2), 2K -1.9%, 4K -3.0%. Later policy
+changes (warm-up before pricing widths, cheap refreshes) were not measured
+on MTP at that scale; a two-seed run of the essay was still about 3 to 4%
+below depth 3. An MTP chain's draft cost climbs in steps (about 3.6, 6.4,
+11.7, 11.9 and 15.7 ms for 1 to 5 proposals), so the depth choice is
+close; on prose `--adaptive-mtp=off` is the faster setting today.
+
+Greedy requests produced byte-identical text to master with the policy on
+and off (essay, code, 2K and 4K prompts).
 
 ## Automatic Q8 conversion
 
