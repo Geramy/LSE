@@ -116,7 +116,10 @@ std::vector<std::uint32_t> codec(const std::vector<float> &x, std::size_t k,
         std::uint32_t packed = 0;
         for (std::size_t byte = 0; byte < 4; ++byte)
           packed |=
-              (static_cast<std::uint32_t>(encoded.codes[word * 4 + byte]) &
+              (static_cast<std::uint32_t>(
+                   encoded.codes[tile_rows == 16u
+                                     ? (word / 2) * 8 + word % 2 + 2 * byte
+                                     : word * 4 + byte]) &
                255u)
               << (byte * 8);
         const auto at =
