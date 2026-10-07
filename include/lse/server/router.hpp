@@ -14,12 +14,14 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "lse/backend/backend.hpp"
 #include "lse/core/status.hpp"
+#include "lse/runtime/perplexity.hpp"
 #include "lse/runtime/prefill_batch.hpp"
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
@@ -124,6 +126,15 @@ class Router {
   [[nodiscard]] RouteReply handle(std::string_view method, std::string_view path,
                                   std::string_view body,
                                   const std::atomic<bool>* stopping = nullptr);
+
+  // Scores `tokens` with the target model alone (runtime::score_perplexity),
+  // queued behind any generation in flight as a request is. A draft module is
+  // not used: it does not change the target's logits. What the model retained
+  // for the last session is released first; that session keeps its KV unless
+  // a draft module is attached, as when another request runs.
+  [[nodiscard]] Result<runtime::PerplexityReport> perplexity(
+      std::span<const std::uint32_t> tokens, std::size_t window, std::size_t stride,
+      std::size_t max_windows, const runtime::PerplexityProgress& progress = {});
 
   // Counters and the timings of the last completed generation, as JSON.
   [[nodiscard]] std::string metrics_json() const;

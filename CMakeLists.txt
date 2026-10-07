@@ -235,6 +235,7 @@ add_library(lse_kernels
   src/kernels/lds_linear.cpp
   src/kernels/linear_indexed.cpp
   src/kernels/linked.cpp
+  src/kernels/logit_pick.cpp
   src/kernels/matmul.cpp
   src/kernels/quant_embedding.cpp
   src/dispatch/quant.cpp
@@ -341,6 +342,7 @@ lse_apply_common_flags(lse_sampling)
 add_library(lse_runtime
   src/runtime/batch.cpp
   src/runtime/generator.cpp
+  src/runtime/perplexity.cpp
   src/runtime/session.cpp
 )
 add_library(lse::runtime ALIAS lse_runtime)

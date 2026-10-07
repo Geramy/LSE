@@ -231,6 +231,18 @@ class Generator {
   // it is what a server does at load.
   Status prepare_kernels();
 
+  // The negative log-likelihood, in nats, of tokens[first_target ..] given the
+  // tokens before each. `session` must be empty; `tokens` runs through the
+  // same prefill passes a prompt of that length takes (prefill_passes, the
+  // prompt attention phase, the session's KV storage), and the LM head is then
+  // applied to the scored rows of each pass, `kScoreRows` at a time, with the
+  // log-softmax statistics reduced on the device (logits.lse_pick.v1). No
+  // draft module may be attached: scoring is the target model alone.
+  static constexpr std::size_t kScoreRows = 128;
+  Result<std::vector<double>> score(Session& session,
+                                    std::span<const std::uint32_t> tokens,
+                                    std::size_t first_target);
+
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
   // `valid` rows of the sequence axis are real (0: all of them).
   static Result<graph::Array> last_hidden(const graph::Array& hidden,

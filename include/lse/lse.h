@@ -177,6 +177,30 @@ LSE_API lse_result lse_cancel(lse_engine *engine, lse_request_id id);
  * live sessions and the bytes each holds. */
 LSE_API lse_result lse_session_close(lse_engine *engine, const char *session_id);
 
+/* Perplexity of a fixed text through the engine's own prompt prefill: the
+ * same kernels, prefill attention (FlashPrefill V2 when the engine enables
+ * it), KV cache dtype and pass plan a request's prompt gets, then the LM head
+ * over every scored position. The target model alone is scored; a draft
+ * module, when one is loaded, does not change its logits and is not used.
+ * Blocks until done and queues behind generation like a request.
+ *
+ * request_json is an object with:
+ *   "text":        UTF-8 text, tokenized as a prompt is, without a chat template
+ *   "tokens":      or the token ids themselves (exactly one of the two)
+ *   "window":      tokens per window (required, at least 2)
+ *   "stride":      tokens between window starts, 1..window (default: window)
+ *   "max_windows": score only the first N windows (default 0: all)
+ *   "include_windows":   per-window results (default true)
+ *   "include_token_ids": echo the scored token ids (default false)
+ * Windows follow the standard sliding-window method: each scores only the
+ * tokens no earlier window scored, so every token after the first is scored
+ * once (see docs/PERPLEXITY.md). *json_out (release with lse_free) holds
+ * "tokens", "token_ids_sha256" (SHA-256 of the ids as little-endian uint32),
+ * "scored_tokens", "nll_sum", "mean_nll" (nats), "perplexity", the engine
+ * configuration that produced them, and "windows". */
+LSE_API lse_result lse_perplexity(lse_engine *engine, const char *request_json,
+                                  char **json_out, char **err);
+
 /* Device power, for hosts that suspend the app or the machine (iPadOS
  * background, macOS sleep), with a device runtime that tracks it (the
  * mac_linuxgpu HSA runtime). lse_status reports the state under "power":

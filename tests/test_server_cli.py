@@ -44,6 +44,17 @@ for value in ('true', 'false', '1', '', 'ON'):
 cases.append((['--dflash2'], 2, '--dflash2 needs a value'))
 cases.append((['--dflash2-model'], 2, '--dflash2-model needs a value'))
 cases.append((['--help'], 0, 'default: bf16 for BF16 models, fp16 otherwise'))
+cases.append((['--help'], 0, '--perplexity FILE'))
+for flag in ('--perplexity-window', '--perplexity-stride'):
+    cases.append(([flag, '512', '--help'], 0, '--perplexity-window N'))
+    for value in ('0', '-1', '1.5', '64x', ''):
+        cases.append(([flag, value], 2, flag + ' must be a positive integer'))
+    cases.append(([flag], 2, flag + ' needs a value'))
+cases += [(['--perplexity-max-windows', '0', '--help'], 0, '--perplexity-max-windows N'),
+          (['--perplexity-max-windows', 'x'], 2, 'must be a positive integer'),
+          (['--perplexity', '/not-a-file', '--model', '/not-opened'], 2, 'cannot read /not-a-file'),
+          (['--perplexity', '/not-a-file', '--perplexity-tokens', '/not-a-file', '--model', '/not-opened'],
+           2, 'not both')]
 for value in ('fp32', 'fp16', 'bf16', 'fp8', 'bf8'):
     cases.append((['--kv-cache-dtype', value, '--help'], 0, '--kv-cache-dtype TYPE'))
 for value in ('int8', '', 'invalid'):

@@ -52,7 +52,9 @@
 #include "lse/model/weights.hpp"
 #include "lse/models/thinking_controls.hpp"
 #include "lse/place/devices.hpp"
+#include "lse/core/sha256.hpp"
 #include "lse/runtime/generator.hpp"
+#include "lse/runtime/perplexity.hpp"
 #include "lse/server/http_server.hpp"
 #include "lse/server/in_process.hpp"
 #include "lse/server/router.hpp"
@@ -907,6 +909,108 @@ lse_result lse_session_close(lse_engine* e, const char* session_id) {
   if (e == nullptr || session_id == nullptr || *session_id == '\0') return LSE_ERR_INVALID_ARGUMENT;
   if (!e->router || e->closing.load()) return LSE_ERR_STATE;
   return e->router->close_session(session_id) ? LSE_OK : LSE_ERR_STATE;
+}
+
+lse_result lse_perplexity(lse_engine* e, const char* request_json, char** json_out, char** err) {
+  if (err != nullptr) *err = nullptr;
+  if (json_out != nullptr) *json_out = nullptr;
+  const auto refuse = [&](lse_result code, const std::string& message) {
+    if (err != nullptr) *err = dup_string(message);
+    return code;
+  };
+  if (e == nullptr || request_json == nullptr || json_out == nullptr)
+    return refuse(LSE_ERR_INVALID_ARGUMENT, "lse_perplexity needs an engine, a request and json_out");
+  if (!e->router || !e->tok || !e->cfg || e->closing.load())
+    return refuse(LSE_ERR_STATE, "the engine is not open");
+  try {
+    const json request = json::parse(request_json);
+    if (!request.is_object()) return refuse(LSE_ERR_INVALID_ARGUMENT, "the request must be a JSON object");
+    const bool has_text = request.contains("text"), has_tokens = request.contains("tokens");
+    if (has_text == has_tokens)
+      return refuse(LSE_ERR_INVALID_ARGUMENT, "give exactly one of \"text\" and \"tokens\"");
+    std::vector<std::uint32_t> tokens;
+    if (has_text) {
+      auto encoded = e->tok->encode(request.at("text").get<std::string>());
+      if (!encoded.ok())
+        return refuse(LSE_ERR_INVALID_ARGUMENT, "tokenizing: " + std::string(encoded.status().message()));
+      tokens = encoded.release();
+    } else {
+      tokens = request.at("tokens").get<std::vector<std::uint32_t>>();
+    }
+    if (!request.contains("window") || !request.at("window").is_number_unsigned())
+      return refuse(LSE_ERR_INVALID_ARGUMENT, "\"window\" must be a positive integer");
+    const auto window = request.at("window").get<std::size_t>();
+    const auto stride = request.value("stride", window);
+    const auto max_windows = request.value("max_windows", std::size_t{0});
+    const bool include_windows = request.value("include_windows", true);
+    const bool include_ids = request.value("include_token_ids", false);
+
+    std::string id_bytes(tokens.size() * 4, '\0');
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      for (int b = 0; b < 4; ++b) id_bytes[i * 4 + b] = static_cast<char>((tokens[i] >> (8 * b)) & 0xffu);
+
+    const auto progress = [](const runtime::WindowScore& w, std::size_t done, std::size_t total) {
+      std::fprintf(stderr, "lse: perplexity window %zu/%zu [%zu, %zu) mean NLL %.6f (%.1f ms)\n",
+                   done, total, w.window.begin, w.window.end, w.mean_nll(),
+                   static_cast<double>(w.elapsed_ns) / 1e6);
+    };
+    auto report = e->router->perplexity(tokens, window, stride, max_windows, progress);
+    if (!report.ok()) {
+      const bool bad_input = report.status().code() == lse::StatusCode::kInvalidArgument;
+      return refuse(bad_input ? LSE_ERR_INVALID_ARGUMENT : LSE_ERR_FAILED,
+                    std::string(report.status().message()));
+    }
+    const model::Config& config = *e->cfg;
+    const server::ServerOptions& opt = e->router->options();
+    const auto& prefill_attention = config.sparse_attention.prefill;
+    json out{{"object", "lse.perplexity"},
+             {"model", e->model_id},
+             {"engine_version", LSE_ENGINE_VERSION},
+             {"tokens", tokens.size()},
+             {"token_ids_sha256", lse::sha256(id_bytes)},
+             {"window", report->window},
+             {"stride", report->stride},
+             {"windows_scored", report->windows.size()},
+             {"scored_tokens", report->scored},
+             {"nll_sum", report->nll_sum},
+             {"mean_nll", report->mean_nll()},
+             {"perplexity", report->perplexity()},
+             {"elapsed_seconds", static_cast<double>(report->elapsed_ns) / 1e9},
+             {"config",
+              {{"device_arch", opt.device_arch},
+               {"prefill_attention", prefill_attention.flashprefill ? "flashprefill-v2"
+                                     : prefill_attention.blasst     ? "blasst"
+                                                                    : "dense"},
+               {"prefill_attention_scale", prefill_attention.enabled()
+                                               ? json(prefill_attention.scale) : json(nullptr)},
+               {"kv_cache_dtype", std::string(kv::to_string(config.kv_cache_dtype))},
+               {"kv_capacity", config.kv_capacity()},
+               {"batch_size", opt.prefill.batch_size},
+               {"ubatch_size", opt.prefill.ubatch_size},
+               {"head_rows", runtime::Generator::kScoreRows},
+               {"cpu_fallback_allowed", graph::cpu_fallback_allowed()}}}};
+    if (include_windows) {
+      json windows = json::array();
+      for (std::size_t i = 0; i < report->windows.size(); ++i) {
+        const runtime::WindowScore& w = report->windows[i];
+        windows.push_back({{"index", i},
+                           {"begin", w.window.begin},
+                           {"end", w.window.end},
+                           {"first_target", w.window.first_target},
+                           {"scored", w.window.scored()},
+                           {"nll_sum", w.nll_sum},
+                           {"mean_nll", w.mean_nll()},
+                           {"perplexity", std::exp(w.mean_nll())},
+                           {"seconds", static_cast<double>(w.elapsed_ns) / 1e9}});
+      }
+      out["windows"] = std::move(windows);
+    }
+    if (include_ids) out["token_ids"] = tokens;
+    *json_out = dup_string(out.dump());
+    return LSE_OK;
+  } catch (const std::exception& ex) {
+    return refuse(LSE_ERR_INVALID_ARGUMENT, std::string("perplexity request: ") + ex.what());
+  }
 }
 
 lse_result lse_cancel(lse_engine* e, lse_request_id id) {

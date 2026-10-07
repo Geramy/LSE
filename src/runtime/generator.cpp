@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <cmath>
 
 #include "lse/graph/graph.hpp"
 #include "lse/kv/block.hpp"
@@ -499,6 +500,99 @@ Result<std::vector<float>> Generator::step(
   if (dflash2_ != nullptr && !pending_context_.valid())
     LSE_RETURN_IF_ERROR(dflash2_->retire_prefill());
   return out;
+}
+
+Result<std::vector<double>> Generator::score(Session& session,
+                                             std::span<const std::uint32_t> tokens,
+                                             std::size_t first_target) {
+  if (mtp_ != nullptr || dflash2_ != nullptr)
+    return LSE_ERROR(kInvalidArgument, "scoring runs the target model alone; detach the draft module");
+  if (session.position() != 0)
+    return LSE_ERROR(kInvalidArgument, "scoring starts from an empty session");
+  const std::size_t n = tokens.size();
+  if (n < 2 || first_target < 1 || first_target >= n)
+    return LSE_ERROR(kInvalidArgument, "scoring needs first_target in [1, ", std::to_string(n),
+                     "), got ", std::to_string(first_target));
+  const auto capacity = static_cast<std::size_t>(model_.config().kv_capacity());
+  if (n > capacity)
+    return LSE_ERROR(kInvalidArgument, "a ", std::to_string(n), "-token window exceeds the KV capacity of ",
+                     std::to_string(capacity), " tokens; raise --kv-len");
+  const auto vocab = static_cast<std::uint32_t>(model_.config().vocab_size);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (tokens[i] >= vocab)
+      return LSE_ERROR(kInvalidArgument, "token ", std::to_string(tokens[i]), " at ", std::to_string(i),
+                       " is outside the vocabulary of ", std::to_string(vocab));
+  }
+  if (!prefill_batch_.valid())
+    return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
+  graph::Scheduler* sched = graph::default_scheduler();
+  if (sched == nullptr) return LSE_ERROR(kInternal, "no usable backend for scoring");
+
+  std::vector<double> nll;
+  nll.reserve(n - first_target);
+  std::vector<float> picked;
+  std::size_t at = 0;
+  std::size_t previous_width = 0;
+  Array hidden;
+  // The same pass plan and per-pass call step() makes for a prompt of n tokens.
+  for (const PassPlan& pass : prefill_passes(n)) {
+    const std::size_t take = pass.valid;
+    if (previous_width != 0) {
+      hidden = {};
+      if (pass.width != previous_width)
+        LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
+    }
+    previous_width = pass.width;
+    std::vector<std::uint32_t> pass_ids(tokens.begin() + static_cast<std::ptrdiff_t>(at),
+                                        tokens.begin() + static_cast<std::ptrdiff_t>(at + take));
+    pass_ids.resize(pass.width, 0u);  // padding past the last real token
+    LSE_ASSIGN_OR(Array ids, token_array(pass_ids));
+    LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr, nullptr, nullptr, false,
+                                       nullptr, false, ops::AttentionExecutionPhase::kPrefill,
+                                       static_cast<std::int32_t>(take)));
+    // Row j of the sequence predicts token j + 1. This pass holds rows
+    // [at, at + take); the scored ones predict a token at or past first_target.
+    const std::size_t lo = std::max(at, first_target - 1);
+    const std::size_t hi = std::min(at + take, n - 1);
+    const std::size_t width = std::min(kScoreRows, pass.width);
+    for (std::size_t row = lo; row < hi;) {
+      // A fixed-width slice wherever the pass is wide enough, so the head
+      // compiles one shape; rows past the scored range are read and ignored.
+      std::size_t start = row - at;
+      if (start + width > pass.width) start = pass.width - width;
+      const Array rows = graph::slice(hidden, 1, static_cast<std::int64_t>(start),
+                                      static_cast<std::int64_t>(start + width));
+      LSE_ASSIGN_OR(Array logits, model_.lm_head(rows));
+      std::vector<std::uint32_t> targets(width, 0u);
+      for (std::size_t i = 0; i < width; ++i) {
+        const std::size_t j = at + start + i;
+        if (j + 1 < n && j < at + take) targets[i] = tokens[j + 1];
+      }
+      LSE_ASSIGN_OR(Array target_ids, token_array(targets));
+      LSE_ASSIGN_OR(Array pick, graph::custom("logits.lse_pick.v1", {logits, target_ids}));
+      picked.resize(pick.shape().elem_count());
+      if (picked.size() != width * 3)
+        return LSE_ERROR(kInternal, "logits.lse_pick returned ", std::to_string(picked.size()),
+                         " values for ", std::to_string(width), " rows");
+      LSE_RETURN_IF_ERROR(pick.to_host(picked.data(), picked.size() * sizeof(float)));
+      const std::size_t last = std::min(hi, at + start + width);
+      for (std::size_t j = row; j < last; ++j) {
+        const std::size_t i = j - (at + start);
+        const double top = picked[3 * i], sum = picked[3 * i + 1], target = picked[3 * i + 2];
+        const double value = top + std::log(sum) - target;
+        if (!std::isfinite(value) || !(sum >= 1.0))
+          return LSE_ERROR(kInternal, "non-finite log-likelihood at position ", std::to_string(j + 1),
+                           " (max ", std::to_string(top), ", sum ", std::to_string(sum),
+                           ", target logit ", std::to_string(target), ")");
+        nll.push_back(value);
+      }
+      row = last;
+    }
+    at += take;
+  }
+  hidden = {};
+  LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
+  return nll;
 }
 
 Status Generator::flush_draft_context() {
