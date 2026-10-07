@@ -28,10 +28,11 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
 ## Performance on macOS (R9700)
 
 Qwen3.8-27B Q4 (MLX group-affine) on a Radeon AI PRO R9700 over Thunderbolt 5,
-Apple M5 Max, mac_linuxgpu v0.1.161 (build 265), LSE 0.5.5, measured 2026-10-06, with
-LSE 0.5.4 measured on the same driver. Server flags:
-`--pool hrx:0 --dialect loom --batch-size 1024 --ubatch-size 1024 --kv-cache-dtype bf16
---kv-len 262100 --temperature 0.6`, with `LSE_REQUIRE_DEVICE_KERNELS=1` (no CPU fallback).
+Apple M5 Max, mac_linuxgpu v0.1.162 (build 266), LSE 0.5.6, measured 2026-10-07, with
+LSE 0.5.5 measured on the same driver. Server flags:
+`--pool hrx:0 --batch-size 1024 --ubatch-size 1024 --kv-cache-dtype bf16
+--kv-len 262100 --temperature 0.6` (Loom, the default dialect; 0.5.5 with `--dialect loom`),
+with `LSE_REQUIRE_DEVICE_KERNELS=1` (no CPU fallback).
 DFlash2 uses the Q8 draft (`--dflash2=on --dflash2-model qwen38-27b-dflash2-q8`).
 
 Time to first token over the HTTP API, 128 tokens out. Cold is the first request
@@ -40,25 +41,29 @@ Warm is the median of five requests that follow five more at the same size; the 
 lowers its clocks after light, intermittent work, and the first warm requests bring
 them back up.
 
-| Prompt tokens | Warm TTFT | Warm prefill | Cold TTFT | 0.5.4 warm TTFT | 0.5.4 cold TTFT |
+| Prompt tokens | Warm TTFT | Warm prefill | Cold TTFT | 0.5.5 warm TTFT | 0.5.5 cold TTFT |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 137 | 0.128 s | 1,070 tok/s | 0.196 s | 0.171 s | 0.365 s |
-| 271 | 0.207 s | 1,309 tok/s | 0.210 s | 0.281 s | 0.441 s |
-| 532 | 0.385 s | 1,382 tok/s | 0.389 s | 0.427 s | 0.697 s |
-| 646 | 0.444 s | 1,455 tok/s | 0.449 s | 0.494 s | 0.734 s |
-| 1060 | 0.677 s | 1,566 tok/s | 0.695 s | 0.697 s | 1.153 s |
-| 2118 | 1.319 s | 1,606 tok/s | 1.347 s | 1.451 s | 1.804 s |
-| 4230 | 2.643 s | 1,600 tok/s | 2.644 s | 2.732 s | 2.865 s |
+| 137 | 0.127 s | 1,079 tok/s | 0.188 s | 0.123 s | 0.188 s |
+| 271 | 0.206 s | 1,316 tok/s | 0.210 s | 0.205 s | 0.206 s |
+| 532 | 0.380 s | 1,400 tok/s | 0.386 s | 0.380 s | 0.385 s |
+| 646 | 0.442 s | 1,462 tok/s | 0.445 s | 0.442 s | 0.444 s |
+| 1060 | 0.674 s | 1,573 tok/s | 0.683 s | 0.675 s | 0.684 s |
+| 2118 | 1.315 s | 1,611 tok/s | 1.343 s | 1.316 s | 1.345 s |
+| 4230 | 2.637 s | 1,604 tok/s | 2.636 s | 2.636 s | 2.639 s |
 
 Decode, sampled at temperature 0.6, median of five 640-token runs after one more:
 
-| Mode | 640-token decode | Draft acceptance | 2K prompt (2406 tokens) | 4K prompt (4787 tokens) | 0.5.4, 640-token decode |
+| Mode | 640-token decode | Draft acceptance | 2K prompt (2406 tokens) | 4K prompt (4787 tokens) | 0.5.5, 640-token decode |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash2 | 57.2 tok/s | 65.5% | 58.5 tok/s, TTFT 1.52 s | 65.8 tok/s, TTFT 3.05 s | 51.2 tok/s |
-| MTP=3 (`--mtp qwen38-27b-mtp-q8 --mtp-depth 3`) | 55.5 tok/s | 68.9% | 59.0 tok/s | — | 52.2 tok/s |
-| Plain (`--dflash2=off`) | 31.7 tok/s | — | 31.6 tok/s, TTFT 1.50 s | — | 28.8 tok/s |
+| DFlash2 | 58.7 tok/s | 65.5% | 60.2 tok/s, TTFT 1.50 s | 68.0 tok/s, TTFT 3.04 s | 57.8 tok/s |
+| MTP=3 (`--mtp qwen38-27b-mtp-q8 --mtp-depth 3`) | 58.8 tok/s | 68.9% | 61.7 tok/s | — | 56.2 tok/s |
+| Plain (`--dflash2=off`) | 31.9 tok/s | — | 31.5 tok/s, TTFT 1.50 s | — | 31.8 tok/s |
 
-Model load, launch to ready with the checkpoint in the file cache and the kernel cache on disk: 9.8 s with DFlash2, 8.6 s plain, 3.9 s with MTP (0.5.4: 4.1, 3.0 and 3.2 s). 0.5.5 prepares every request shape's kernels before it reports ready. Host memory footprint at ready with DFlash2: 610 MB (0.5.4: 384 MB). The first launch of a new LSE build, with none of its kernels in the cache, compiles them before it reports ready: 112 s with DFlash2 on this machine.
+Model load, launch to ready with the checkpoint in the file cache and the kernel cache on disk: 10.0 s with DFlash2, 8.3 s plain, 3.9 s with MTP (0.5.5: 9.8, 8.1 and 4.0 s). As in 0.5.5, the server prepares every request shape's kernels before it reports ready. Host memory footprint at ready with DFlash2: 616 MB (0.5.5: 613 MB). The first launch of a new LSE build, with none of its kernels in the cache, compiles them before it reports ready: 111 s with DFlash2 on this machine.
+
+### Linux (R9700)
+
+The packaged v0.5.6 Linux archive on a Radeon AI PRO R9700 runs with ROCm 7.13, the same model and flags, and the default dialect (Loom). A 640-token decode, median of five after one more, runs at 50.1 tok/s with DFlash2 (65.5% acceptance) and 27.9 tok/s plain. Loading with DFlash2 and the kernel cache on disk takes 21.5 s.
 
 ## HumanEval+ through 32K
 
@@ -158,13 +163,16 @@ Linux release targets include `gfx942`, `gfx1150`, `gfx1151`, `gfx1200`, and `gf
 The Linux archive bundles its selected HRX runtime and patched Loom compiler;
 root and `bin/` launchers load those libraries and forward the existing CLI arguments.
 A compatible Linux C/C++ runtime, ROCm 7.x, HSA and GPU driver remain required.
+The v0.5.6 binaries need glibc 2.43 or later and the GCC 16 libstdc++ (`GLIBCXX_3.4.35`,
+`CXXABI_1.3.15`), with ROCm 7.x `libamd_comgr.so.3` and `libhsa-runtime64.so.1`: an
+Ubuntu 26.04-class system.
 `BUILD.json` records the compiler source pins, patch hashes and bundled library hashes.
 Check each release for its build targets and runtime requirements.
 
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.5.0`.
+The examples below use `v0.5.6`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -173,7 +181,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.5.0
+   lse_tag=v0.5.6
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -206,7 +214,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.5.0
+   lse_tag=v0.5.6
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -231,7 +239,7 @@ You do not need to set `DYLD_LIBRARY_PATH` yourself.
 
 ### iOS and iPadOS
 
-Download `lse-v0.5.0-ios-arm64.xcframework.zip` and its `.sha256` from the same
+Download `lse-v0.5.6-ios-arm64.xcframework.zip` and its `.sha256` from the same
 release, check it with `shasum -a 256 -c`, and unzip it to get `LSE.xcframework`.
 See [iOS and iPadOS](#ios-and-ipados) for how an app uses it.
 
@@ -544,11 +552,11 @@ app's `Library/Caches/lse/kernels`.
 Measured on an iPad Pro (M4) with a Radeon AI PRO R9700 over Thunderbolt,
 Qwen3.8-27B Q4 with the Q8 DFlash2 draft, warm:
 
-| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.5.5 |
+| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.5.6 |
 | --- | ---: | ---: |
-| Decode | 40.5 tok/s at 73% draft acceptance | 57.2 tok/s at 66% |
+| Decode | 40.5 tok/s at 73% draft acceptance | 58.7 tok/s at 66% |
 | Decode at 85–93% acceptance | 57–70 tok/s | — |
-| Model load | about 34 s | 9.8 s |
+| Model load | about 34 s | 10.0 s |
 | Operations that fell back to the CPU | 0 | 0 |
 
 The MacBook Pro column is the 640-token decode from
