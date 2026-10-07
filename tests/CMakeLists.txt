@@ -26,6 +26,7 @@ target_sources(test_pointwise_fusion PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
 lse_add_test(test_dispatch_profile)
+lse_add_test(test_variant_book lse_graph)
 lse_add_test(test_dtype)
 lse_add_test(test_reflect)
 # lse_backends is the set of backends this build ships. A test that runs a

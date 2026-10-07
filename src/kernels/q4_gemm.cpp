@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -291,6 +292,20 @@ std::uint32_t lds_bytes(const Tile& t) {
   return (t.bm + t.bn) * kRowHalves * 2u;
 }
 
+// What a variant that reads A from the panel keeps of the A tile: a token
+// allocation, so the B tile sits where it always does.
+constexpr std::uint32_t kDirectAHalves = 8u;
+
+// Two B buffers take the K loop two steps at a time, one step per iteration.
+bool b_double_fits(const Dims& d, const Tile& t) {
+  return burst_steps(d, t) <= 1u && (d.k / kBK / d.slices) % 2u == 0u;
+}
+
+std::uint32_t variant_lds_bytes(const Tile& t, std::uint32_t variant) {
+  if (variant == 0u) return lds_bytes(t);
+  return (kDirectAHalves + t.bn * kRowHalves * (variant == 2u ? 2u : 1u)) * 2u;
+}
+
 bool device_fits(const KernelShapes& s, const Dims& d) {
   if (!d.valid || !s.device || !s.intrinsics) return false;
   const Tile t = tile_for(s, d);
@@ -331,9 +346,20 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   Args<S> a;
   if (!env::bind(kb, a, s)) return {};
   env::Emit e{&kb};
-  const auto As = e.lds<lse::f16>(t.bm * kRowHalves);
-  const auto Bs = e.lds<lse::f16>(t.bn * kRowHalves);
-  if (!As || !Bs) return {};
+  // Variants (Q4GemmKernel::variants): 1 reads each A fragment straight
+  // from the panel instead of through workgroup memory; 2 does that and
+  // double-buffers B, so a K step waits at one barrier instead of two. Each
+  // feeds the matrix instructions the same halves in the same order.
+  const bool a_direct = kFrag == 16 && s.variant >= 1u;
+  const bool b_double = a_direct && s.variant == 2u;
+  if (s.variant > 2u || (s.variant != 0u && !a_direct) ||
+      (b_double && !b_double_fits(d, t)))
+    return {};
+  const auto As = e.lds<lse::f16>(a_direct ? kDirectAHalves : t.bm * kRowHalves);
+  const auto Bs0 = e.lds<lse::f16>(t.bn * kRowHalves);
+  const auto Bs1 = b_double ? e.lds<lse::f16>(t.bn * kRowHalves) : Bs0;
+  kir::Tile<lse::f16> Bs = Bs0;
+  if (!As || !Bs0 || !Bs1) return {};
 
   const auto lid = e.let(math::local_id());
   const auto wave = e.let(lid / 32u);
@@ -405,8 +431,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   const auto issue = [&](const kir::Val<kir::u32>& kt) {
     Staged st;
     const auto koff = e.let(kt * kBK);
-    for (std::uint32_t c = 0; c < a_pieces; ++c)
-      st.av.push_back(e.load(a.panel, e.let(a_src[c] + koff), 16u));
+    if (!a_direct) {
+      for (std::uint32_t c = 0; c < a_pieces; ++c)
+        st.av.push_back(e.load(a.panel, e.let(a_src[c] + koff), 16u));
+    }
     const auto woff = e.let(kt * kWordsPerStep);
     const auto g = e.let(koff / d.gsize);
     for (std::uint32_t c = 0; c < b_pieces; ++c) {
@@ -423,7 +451,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     kb.store_pack<lse::f16>(tile.id(), at, v, 16u);
   };
   const auto commit = [&](const Staged& st) {
-    for (std::uint32_t c = 0; c < a_pieces; ++c) store8(As, a_dst[c], st.av[c]);
+    for (std::uint32_t c = 0; c < st.av.size(); ++c) store8(As, a_dst[c], st.av[c]);
     for (std::uint32_t c = 0; c < b_pieces; ++c) {
       const auto scale = e.let(math::widen(st.scale[c]));
       const auto bias = e.let(math::widen(st.bias[c]));
@@ -493,11 +521,25 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
   };
 
+  std::vector<kir::Val<kir::u32>> a_glob_base;
+  if (a_direct)
+    for (std::uint32_t fm = 0; fm < FM; ++fm) {
+      const auto grow = e.let(m0 + wave_m * TM + fm * 16u + lane_lo);
+      a_glob_base.push_back(e.let(select(grow < M, grow, e.u32(M - 1u)) * K));
+    }
+  std::optional<kir::Val<kir::u32>> cur_k;
   const auto compute = [&]() {
     for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
       std::vector<kir::Val<FragVec>> af, bf;
-      for (std::uint32_t fm = 0; fm < FM; ++fm)
-        af.push_back(fragment(As, e.let(a_frag_base[fm] + kk * 16u)));
+      for (std::uint32_t fm = 0; fm < FM; ++fm) {
+        if (a_direct) {
+          const auto p = kb.load_elems<lse::f16>(
+              a.panel.b.id(), e.let(a_glob_base[fm] + *cur_k * kBK + kk * 16u), 16u);
+          af.push_back(kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id()));
+        } else {
+          af.push_back(fragment(As, e.let(a_frag_base[fm] + kk * 16u)));
+        }
+      }
       for (std::uint32_t fn = 0; fn < FN; ++fn)
         bf.push_back(fragment(Bs, e.let(b_frag_base[fn] + kk * 16u)));
       for (std::uint32_t fm = 0; fm < FM; ++fm)
@@ -508,12 +550,34 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     }
   };
   const std::uint32_t burst = burst_steps(d, t);
-  if (burst <= 1u) {
+  if (b_double) {
+    // B in two buffers, A straight from the panel: one barrier a step, the
+    // next step's B written while this one's is read.
+    Bs = Bs0;
+    commit(issue(k_begin));
+    e.barrier();
+    for (auto kt : e.range(k_begin, k_end, 2u)) {
+      {
+        const Staged st = issue(e.let(kt + 1u));
+        Bs = Bs0; cur_k = kt; compute();
+        Bs = Bs1; commit(st);
+        e.barrier();
+      }
+      {
+        const auto next = e.let(select(kt + 2u < k_end, kt + 2u, kt + 1u));
+        const Staged st = issue(next);
+        Bs = Bs1; cur_k = e.let(kt + 1u); compute();
+        Bs = Bs0; commit(st);
+        e.barrier();
+      }
+    }
+  } else if (burst <= 1u) {
     commit(issue(k_begin));
     e.barrier();
     for (auto kt : e.range(k_begin, k_end, 1u)) {
       const auto next = e.let(select(kt + 1u < k_end, kt + 1u, kt));
       const Staged st = issue(next);
+      if (a_direct) cur_k = kt;
       compute();
       e.barrier();
       commit(st);
@@ -531,6 +595,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       for (std::uint32_t u = 0; u < burst; ++u) {
         commit(sts[u]);
         e.barrier();
+        if (a_direct) cur_k = e.let(kt + u);
         compute();
         e.barrier();
       }
@@ -692,6 +757,19 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
         });
   }
 
+  // A from workgroup memory (0), A from the panel (1), and that with B
+  // double-buffered (2), on a part whose fragments are whole 16-half loads.
+  std::uint32_t variants(const KernelShapes& s) const override {
+    const Dims d = dims_of(s, Sliced);
+    if (!d.valid || !device_fits(s, d)) return 1;
+    const auto* row = f16_row(s);
+    if (row == nullptr || row->a_len != 16) return 1;
+    const Tile t = tile_for(s, d);
+    const bool pairs = b_double_fits(d, t) &&
+        backend::workgroup_lds_bytes(s.device) >= variant_lds_bytes(t, 2u);
+    return pairs ? 3u : 2u;
+  }
+
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     const Dims d = dims_of(s, Sliced);
@@ -706,7 +784,7 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
     tp.workgroup_size[0] = t.wm * t.wn * 32u;
     tp.workgroup_count[0] =
         ((d.m + t.bm - 1u) / t.bm) * ((d.n + t.bn - 1u) / t.bn) * d.slices;
-    tp.lds_bytes = lds_bytes(t);
+    tp.lds_bytes = variant_lds_bytes(t, s.variant);
     return tp;
   }
 };

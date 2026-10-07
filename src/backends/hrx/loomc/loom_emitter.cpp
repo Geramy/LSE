@@ -167,6 +167,13 @@ std::uint64_t emission_identity(const FusionGroup& group, const DeviceInfo& devi
     for (float value : node->attrs) number(std::bit_cast<std::uint32_t>(value));
     text(node->prim ? node->prim->name() : std::string_view{});
   }
+  // A variant other than the primitive's default is a different text, so it
+  // is a different kernel. Variant 0 adds nothing: its identity is the one
+  // every kernel had before variants existed.
+  if (const std::uint32_t variant = emission_variant(); variant != 0) {
+    text("variant");
+    number(variant);
+  }
   return key.finish();
 }
 
@@ -386,6 +393,38 @@ std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
   return emission_identity(group, device);
 }
 
+std::uint32_t LoomEmitter::variants(const FusionGroup& group,
+                                    const DeviceInfo& device) const {
+  if (group.nodes.empty() || group.is_phase || group.outputs.size() != 1 ||
+      group.anchor_class == FusionClass::kCollective) return 1;
+  const DialectSourceTable spellings = sources();
+  const kir::TypeTable type_table = loom_types();
+  for (const NodePtr& n : group.nodes) {
+    const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
+    if (kp == nullptr) continue;
+    std::vector<Shape> shp;
+    std::vector<DType> dts;
+    for (const NodePtr& in : n->inputs) {
+      shp.push_back(in->shape);
+      dts.push_back(in->dtype);
+    }
+    KernelShapes s;
+    s.inputs = shp;
+    s.input_dtypes = dts;
+    s.output = n->shape;
+    s.output_dtype = n->dtype;
+    s.attrs = n->attrs;
+    s.iattrs = n->iattrs;
+    s.device = &device;
+    s.types = type_table;
+    s.intrinsics = &spellings;
+    const KernelPrimitiveBase* chosen = kp->specialize(s);
+    if (chosen == nullptr || !chosen->owns_indexing()) continue;
+    return std::max<std::uint32_t>(1, chosen->variants(s));
+  }
+  return 1;
+}
+
 bool LoomEmitter::joins_run(std::span<const NodePtr> run,
                             const DeviceInfo& device) const {
   if (run.size() < 2) return true;
@@ -530,6 +569,12 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
     si_shapes.inputs = si_storage;
     si_shapes.input_dtypes = si_dtypes;
   } else if (anchor) logical_inputs = anchor->inputs;
+  si_shapes.variant = emission_variant();
+  if (si_shapes.variant != 0 &&
+      (self_indexed == nullptr || si_shapes.variant >= self_indexed->variants(si_shapes))) {
+    return LSE_ERROR(kInvalidArgument, "variant ", si_shapes.variant,
+                     " was asked of a group whose primitive does not offer it");
+  }
 
   EmittedKernel out;
   out.dialect = Dialect::kLoom;
