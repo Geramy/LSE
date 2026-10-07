@@ -133,8 +133,8 @@ class Router {
   // for the last session is released first; that session keeps its KV unless
   // a draft module is attached, as when another request runs.
   [[nodiscard]] Result<runtime::PerplexityReport> perplexity(
-      std::span<const std::uint32_t> tokens, std::size_t window, std::size_t stride,
-      std::size_t max_windows, const runtime::PerplexityProgress& progress = {});
+      std::span<const std::uint32_t> tokens, const runtime::PerplexityOptions& options,
+      const runtime::PerplexityProgress& progress = {});
 
   // Counters and the timings of the last completed generation, as JSON.
   [[nodiscard]] std::string metrics_json() const;

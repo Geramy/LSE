@@ -937,45 +937,72 @@ lse_result lse_perplexity(lse_engine* e, const char* request_json, char** json_o
     } else {
       tokens = request.at("tokens").get<std::vector<std::uint32_t>>();
     }
-    if (!request.contains("window") || !request.at("window").is_number_unsigned())
-      return refuse(LSE_ERR_INVALID_ARGUMENT, "\"window\" must be a positive integer");
-    const auto window = request.at("window").get<std::size_t>();
-    const auto stride = request.value("stride", window);
-    const auto max_windows = request.value("max_windows", std::size_t{0});
+    runtime::PerplexityOptions options;
+    const std::string method = request.value("method", std::string("chunks"));
+    if (method != "chunks" && method != "sliding")
+      return refuse(LSE_ERR_INVALID_ARGUMENT, "\"method\" must be \"chunks\" or \"sliding\"");
+    options.method = method == "chunks" ? runtime::PerplexityMethod::kChunks
+                                        : runtime::PerplexityMethod::kSliding;
+    options.ctx = request.value("ctx", std::size_t{512});
+    options.stride = request.value("stride", std::size_t{0});
+    options.max_windows = request.value("chunks", std::size_t{0});
     const bool include_windows = request.value("include_windows", true);
     const bool include_ids = request.value("include_token_ids", false);
+    const std::string kld_out = request.value("kld_base_out", std::string());
+    const std::string kld_in = request.value("kld_base", std::string());
+    if (!kld_out.empty()) options.record_top_k = request.value("kld_top_k", std::size_t{32});
 
     std::string id_bytes(tokens.size() * 4, '\0');
     for (std::size_t i = 0; i < tokens.size(); ++i)
       for (int b = 0; b < 4; ++b) id_bytes[i * 4 + b] = static_cast<char>((tokens[i] >> (8 * b)) & 0xffu);
+    options.token_ids_sha256 = lse::sha256(id_bytes);
+    std::optional<runtime::KldBase> base;
+    if (!kld_in.empty()) {
+      auto read = runtime::KldBase::read(kld_in);
+      if (!read.ok()) return refuse(LSE_ERR_INVALID_ARGUMENT, std::string(read.status().message()));
+      base.emplace(read.release());
+      options.compare = &*base;
+    }
 
     const auto progress = [](const runtime::WindowScore& w, std::size_t done, std::size_t total) {
+      if (done != 1 && done % 16 != 0 && done != total) return;
       std::fprintf(stderr, "lse: perplexity window %zu/%zu [%zu, %zu) mean NLL %.6f (%.1f ms)\n",
                    done, total, w.window.begin, w.window.end, w.mean_nll(),
                    static_cast<double>(w.elapsed_ns) / 1e6);
     };
-    auto report = e->router->perplexity(tokens, window, stride, max_windows, progress);
+    auto report = e->router->perplexity(tokens, options, progress);
     if (!report.ok()) {
       const bool bad_input = report.status().code() == lse::StatusCode::kInvalidArgument;
       return refuse(bad_input ? LSE_ERR_INVALID_ARGUMENT : LSE_ERR_FAILED,
                     std::string(report.status().message()));
     }
+    if (report->recorded) {
+      if (const Status w = report->recorded->write(kld_out); !w.ok())
+        return refuse(LSE_ERR_FAILED, std::string(w.message()));
+    }
     const model::Config& config = *e->cfg;
     const server::ServerOptions& opt = e->router->options();
     const auto& prefill_attention = config.sparse_attention.prefill;
+    std::size_t processed = 0;
+    for (const runtime::WindowScore& w : report->windows) processed += w.window.end - w.window.begin;
+    const double seconds = static_cast<double>(report->elapsed_ns) / 1e9;
     json out{{"object", "lse.perplexity"},
              {"model", e->model_id},
              {"engine_version", LSE_ENGINE_VERSION},
              {"tokens", tokens.size()},
-             {"token_ids_sha256", lse::sha256(id_bytes)},
-             {"window", report->window},
+             {"token_ids_sha256", options.token_ids_sha256},
+             {"method", method},
+             {"ctx", report->ctx},
              {"stride", report->stride},
              {"windows_scored", report->windows.size()},
              {"scored_tokens", report->scored},
              {"nll_sum", report->nll_sum},
              {"mean_nll", report->mean_nll()},
              {"perplexity", report->perplexity()},
-             {"elapsed_seconds", static_cast<double>(report->elapsed_ns) / 1e9},
+             {"perplexity_uncertainty", report->perplexity_uncertainty()},
+             {"elapsed_seconds", seconds},
+             {"prefill_tokens", processed},
+             {"prefill_tokens_per_second", seconds > 0 ? static_cast<double>(processed) / seconds : 0.0},
              {"config",
               {{"device_arch", opt.device_arch},
                {"prefill_attention", prefill_attention.flashprefill ? "flashprefill-v2"
@@ -989,6 +1016,30 @@ lse_result lse_perplexity(lse_engine* e, const char* request_json, char** json_o
                {"ubatch_size", opt.prefill.ubatch_size},
                {"head_rows", runtime::Generator::kScoreRows},
                {"cpu_fallback_allowed", graph::cpu_fallback_allowed()}}}};
+    if (report->recorded) out["kld_base_out"] = {{"path", kld_out}, {"top_k", report->recorded->top_k}};
+    if (report->kld) {
+      const runtime::KldStats& k = *report->kld;
+      const double base_ppl = k.base_perplexity(), ppl = report->perplexity();
+      out["kld"] = {{"base", kld_in},
+                    {"top_k", k.top_k},
+                    {"tokens", k.count},
+                    {"base_perplexity", base_ppl},
+                    {"perplexity", ppl},
+                    {"delta_perplexity", ppl - base_ppl},
+                    {"perplexity_ratio", base_ppl > 0 ? ppl / base_ppl : 0.0},
+                    {"mean_log_ratio", k.mean_log_ratio},
+                    {"mean_log_ratio_uncertainty", k.log_ratio_uncertainty},
+                    {"mean_kld", k.mean_kld},
+                    {"mean_kld_uncertainty", k.kld_uncertainty},
+                    {"kld_p99", k.kld_p99},
+                    {"kld_max", k.kld_max},
+                    {"same_top", k.same_top},
+                    {"same_top_uncertainty", k.same_top_uncertainty},
+                    {"mean_delta_p", k.mean_delta_p},
+                    {"mean_delta_p_uncertainty", k.delta_p_uncertainty},
+                    {"rms_delta_p", k.rms_delta_p},
+                    {"mean_base_top_mass", k.mean_base_top_mass}};
+    }
     if (include_windows) {
       json windows = json::array();
       for (std::size_t i = 0; i < report->windows.size(); ++i) {

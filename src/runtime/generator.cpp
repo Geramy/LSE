@@ -502,9 +502,10 @@ Result<std::vector<float>> Generator::step(
   return out;
 }
 
-Result<std::vector<double>> Generator::score(Session& session,
-                                             std::span<const std::uint32_t> tokens,
-                                             std::size_t first_target) {
+Result<TokenScores> Generator::score(Session& session, std::span<const std::uint32_t> tokens,
+                                     std::size_t first_target, std::size_t top_k,
+                                     std::span<const std::uint32_t> probe_ids,
+                                     std::size_t probe_k) {
   if (mtp_ != nullptr || dflash2_ != nullptr)
     return LSE_ERROR(kInvalidArgument, "scoring runs the target model alone; detach the draft module");
   if (session.position() != 0)
@@ -513,24 +514,39 @@ Result<std::vector<double>> Generator::score(Session& session,
   if (n < 2 || first_target < 1 || first_target >= n)
     return LSE_ERROR(kInvalidArgument, "scoring needs first_target in [1, ", std::to_string(n),
                      "), got ", std::to_string(first_target));
+  const std::size_t scored = n - first_target;
+  if (probe_ids.size() != scored * probe_k)
+    return LSE_ERROR(kInvalidArgument, "scoring got ", std::to_string(probe_ids.size()),
+                     " probe ids for ", std::to_string(scored), " tokens x ", std::to_string(probe_k));
   const auto capacity = static_cast<std::size_t>(model_.config().kv_capacity());
   if (n > capacity)
     return LSE_ERROR(kInvalidArgument, "a ", std::to_string(n), "-token window exceeds the KV capacity of ",
                      std::to_string(capacity), " tokens; raise --kv-len");
   const auto vocab = static_cast<std::uint32_t>(model_.config().vocab_size);
+  if (top_k != 0 && !graph::topk_pairs_fits(vocab, static_cast<int>(top_k)))
+    return LSE_ERROR(kInvalidArgument, "the device top-k takes 1..32 ids over a vocabulary of at least 4096; got ",
+                     std::to_string(top_k), " over ", std::to_string(vocab));
   for (std::size_t i = 0; i < n; ++i) {
     if (tokens[i] >= vocab)
       return LSE_ERROR(kInvalidArgument, "token ", std::to_string(tokens[i]), " at ", std::to_string(i),
                        " is outside the vocabulary of ", std::to_string(vocab));
   }
+  for (const std::uint32_t id : probe_ids)
+    if (id >= vocab) return LSE_ERROR(kInvalidArgument, "probe id ", std::to_string(id), " is outside the vocabulary");
   if (!prefill_batch_.valid())
     return LSE_ERROR(kInvalidArgument, "invalid prefill batch sizes");
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) return LSE_ERROR(kInternal, "no usable backend for scoring");
 
-  std::vector<double> nll;
-  nll.reserve(n - first_target);
-  std::vector<float> picked;
+  TokenScores out;
+  out.top_k = top_k;
+  out.probe_k = probe_k;
+  out.nll.reserve(scored);
+  out.top_ids.reserve(scored * top_k);
+  out.top_logprobs.reserve(scored * top_k);
+  out.probe_logprobs.reserve(scored * probe_k);
+  const std::size_t picks = 1 + probe_k;
+  std::vector<float> picked, top;
   std::size_t at = 0;
   std::size_t previous_width = 0;
   Array hidden;
@@ -563,28 +579,48 @@ Result<std::vector<double>> Generator::score(Session& session,
       const Array rows = graph::slice(hidden, 1, static_cast<std::int64_t>(start),
                                       static_cast<std::int64_t>(start + width));
       LSE_ASSIGN_OR(Array logits, model_.lm_head(rows));
-      std::vector<std::uint32_t> targets(width, 0u);
+      // Per row: the next token, then the probe ids of the token it predicts.
+      std::vector<std::uint32_t> wanted(width * picks, 0u);
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t j = at + start + i;
-        if (j + 1 < n && j < at + take) targets[i] = tokens[j + 1];
+        if (j + 1 >= n || j >= at + take || j + 1 < first_target) continue;
+        wanted[i * picks] = tokens[j + 1];
+        for (std::size_t q = 0; q < probe_k; ++q)
+          wanted[i * picks + 1 + q] = probe_ids[(j + 1 - first_target) * probe_k + q];
       }
-      LSE_ASSIGN_OR(Array target_ids, token_array(targets));
-      LSE_ASSIGN_OR(Array pick, graph::custom("logits.lse_pick.v1", {logits, target_ids}));
+      LSE_ASSIGN_OR(Array wanted_ids, token_array(wanted));
+      const Array wanted_rows = graph::reshape(
+          wanted_ids, Shape{1, static_cast<std::int64_t>(width), static_cast<std::int64_t>(picks)});
+      LSE_ASSIGN_OR(Array pick, graph::custom("logits.lse_pick.v1", {logits, wanted_rows}));
       picked.resize(pick.shape().elem_count());
-      if (picked.size() != width * 3)
+      if (picked.size() != width * (picks + 2))
         return LSE_ERROR(kInternal, "logits.lse_pick returned ", std::to_string(picked.size()),
                          " values for ", std::to_string(width), " rows");
       LSE_RETURN_IF_ERROR(pick.to_host(picked.data(), picked.size() * sizeof(float)));
+      if (top_k != 0) {
+        Array best = graph::topk_pairs(logits, static_cast<int>(top_k));
+        if (!best.valid()) return LSE_ERROR(kInternal, "the device top-k declined this head");
+        top.resize(best.shape().elem_count());
+        if (top.size() != width * top_k * 2)
+          return LSE_ERROR(kInternal, "topk_pairs returned ", std::to_string(top.size()), " values");
+        LSE_RETURN_IF_ERROR(best.to_host(top.data(), top.size() * sizeof(float)));
+      }
       const std::size_t last = std::min(hi, at + start + width);
       for (std::size_t j = row; j < last; ++j) {
         const std::size_t i = j - (at + start);
-        const double top = picked[3 * i], sum = picked[3 * i + 1], target = picked[3 * i + 2];
-        const double value = top + std::log(sum) - target;
-        if (!std::isfinite(value) || !(sum >= 1.0))
+        const float* r = picked.data() + i * (picks + 2);
+        const double norm = static_cast<double>(r[0]) + std::log(static_cast<double>(r[1]));
+        const double value = norm - r[2];
+        if (!std::isfinite(value) || !(r[1] >= 1.0f))
           return LSE_ERROR(kInternal, "non-finite log-likelihood at position ", std::to_string(j + 1),
-                           " (max ", std::to_string(top), ", sum ", std::to_string(sum),
-                           ", target logit ", std::to_string(target), ")");
-        nll.push_back(value);
+                           " (max ", std::to_string(r[0]), ", sum ", std::to_string(r[1]),
+                           ", target logit ", std::to_string(r[2]), ")");
+        out.nll.push_back(value);
+        for (std::size_t q = 0; q < probe_k; ++q) out.probe_logprobs.push_back(r[3 + q] - norm);
+        for (std::size_t q = 0; q < top_k; ++q) {
+          out.top_logprobs.push_back(static_cast<float>(top[(i * top_k + q) * 2] - norm));
+          out.top_ids.push_back(static_cast<std::uint32_t>(top[(i * top_k + q) * 2 + 1]));
+        }
       }
       row = last;
     }
@@ -592,7 +628,7 @@ Result<std::vector<double>> Generator::score(Session& session,
   }
   hidden = {};
   LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
-  return nll;
+  return out;
 }
 
 Status Generator::flush_draft_context() {

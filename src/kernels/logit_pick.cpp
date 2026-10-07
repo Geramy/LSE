@@ -1,18 +1,20 @@
 // Per-row log-softmax statistics for scoring a known sequence.
 //
 // One workgroup per logit row. The row is read twice: a max pass, then a pass
-// summing exp(x - max), each tree-reduced through LDS. Lane 0 writes three
-// floats per row: the max M, the sum S and the logit of the row's target
-// token T. The caller forms the target's negative log-likelihood as
-// M + log(S) - T on the host in double precision, so the device returns 12
-// bytes per scored token instead of the whole vocabulary row.
+// summing exp(x - max), each tree-reduced through LDS. Each row has P picked
+// token ids (the next token, and for a KL-divergence comparison the base run's
+// top-k ids). The kernel writes P + 2 floats per row: the max M, the sum S and
+// the logit of each picked id. The caller forms log p(id) = logit - M - log(S)
+// on the host in double precision, so the device returns (P + 2) * 4 bytes per
+// scored token instead of the whole vocabulary row.
 //
-// Targets ride as f32, the engine's convention for indices, and must be
-// integers in [0, vocab).
+// Picks ride as f32, the engine's convention for indices, and must be integers
+// in [0, vocab).
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/graph/kernel_args.hpp"
@@ -30,19 +32,19 @@ namespace {
 
 constexpr std::uint32_t kBlock = 256;
 
-// [.., V] logits and [..] targets with the same leading element count.
+// [.., V] logits and [.., P] picks with the same leading dims -> [.., P + 2].
 Result<Shape> pick_shape(std::span<const Shape> in) {
-  if (in.size() != 2 || in[0].rank() == 0)
-    return LSE_ERROR(kInvalidArgument, "logits.lse_pick takes [.., V] logits and [..] targets");
-  const auto vocab = in[0].dim(in[0].rank() - 1);
-  if (vocab <= 0) return LSE_ERROR(kInvalidArgument, "logits.lse_pick over an empty vocabulary");
-  const auto rows = in[0].elem_count() / static_cast<std::size_t>(vocab);
-  if (in[1].elem_count() != rows)
-    return LSE_ERROR(kInvalidArgument, "logits.lse_pick needs one target per logit row, got ",
-                     std::to_string(in[1].elem_count()), " for ", std::to_string(rows), " rows");
+  if (in.size() != 2 || in[0].rank() == 0 || in[1].rank() != in[0].rank())
+    return LSE_ERROR(kInvalidArgument, "logits.lse_pick takes [.., V] logits and [.., P] picks");
+  const auto rank = in[0].rank();
+  for (std::size_t i = 0; i + 1 < rank; ++i)
+    if (in[0].dim(i) != in[1].dim(i))
+      return LSE_ERROR(kInvalidArgument, "logits.lse_pick needs one pick row per logit row");
+  if (in[0].dim(rank - 1) <= 0 || in[1].dim(rank - 1) <= 0)
+    return LSE_ERROR(kInvalidArgument, "logits.lse_pick over an empty vocabulary or pick list");
   Shape out;
-  for (std::size_t i = 0; i + 1 < in[0].rank(); ++i) out.push_back(in[0].dim(i));
-  out.push_back(3);
+  for (std::size_t i = 0; i + 1 < rank; ++i) out.push_back(in[0].dim(i));
+  out.push_back(in[1].dim(rank - 1) + 2);
   return out;
 }
 
@@ -70,6 +72,7 @@ struct LogitPickKernel final : KernelPrimitive<LogitPickKernel> {
         !s.store || !pick_shape(s.inputs).ok())
       return {};
     const auto vocab = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+    const auto picks = static_cast<std::uint32_t>(s.inputs[1].dim(s.inputs[1].rank() - 1));
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
@@ -112,12 +115,16 @@ struct LogitPickKernel final : KernelPrimitive<LogitPickKernel> {
       }
       e.barrier();
     }
+    const auto sum = e.let(ss[0].read());
+    const auto slot = e.let(row * e.u32(picks + 2));
     if (auto lead = e.when(lid == 0)) {
-      const auto target = e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(a.targets[row])));
-      const auto slot = e.let(row * e.u32(3));
       e.store(slot, top);
-      e.store(slot + e.u32(1), ss[0].read());
-      e.store(slot + e.u32(2), a.x[base + target]);
+      e.store(slot + e.u32(1), sum);
+    }
+    // One lane per pick.
+    for (auto j : e.range(lid, e.u32(picks), kBlock)) {
+      const auto id = e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(a.targets[row * picks + j])));
+      e.store(slot + e.u32(2) + j, a.x[base + id]);
     }
     if (!k.lds().ok()) return {};
     return k.str();
@@ -129,7 +136,9 @@ struct LogitPickKernel final : KernelPrimitive<LogitPickKernel> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
     tp.workgroup_size[0] = kBlock;
-    const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / 3);
+    const auto width = s.output.rank() == 0 ? 1u
+        : static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 1));
+    const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / width);
     tp.workgroup_count[0] = rows == 0 ? 1u : rows;
     tp.lds_bytes = 2 * kBlock * static_cast<std::uint32_t>(sizeof(float));
     return tp;
@@ -147,25 +156,30 @@ struct LogitPickKernel final : KernelPrimitive<LogitPickKernel> {
         out.bytes.size() != expect.elem_count() * 4)
       return LSE_ERROR(kInvalidArgument, "logits.lse_pick needs f32 buffers of the declared shapes");
     const auto vocab = static_cast<std::size_t>(shapes[0].dim(shapes[0].rank() - 1));
-    const std::size_t rows = shapes[1].elem_count();
+    const auto picks = static_cast<std::size_t>(shapes[1].dim(shapes[1].rank() - 1));
+    const std::size_t rows = shapes[0].elem_count() / vocab;
     const auto load = [&](std::size_t input, std::size_t at) {
       float v;
       std::memcpy(&v, in[input].bytes.data() + at * 4, 4);
       return v;
     };
+    std::vector<float> values(picks + 2);
     for (std::size_t r = 0; r < rows; ++r) {
-      const float id = load(1, r);
-      if (!(id >= 0.0f) || id >= static_cast<float>(vocab) || std::floor(id) != id)
-        return LSE_ERROR(kInvalidArgument, "logits.lse_pick target ", std::to_string(id),
-                         " is not a token id below ", std::to_string(vocab));
       float top = -std::numeric_limits<float>::infinity();
       for (std::size_t v = 0; v < vocab; ++v) top = std::max(top, load(0, r * vocab + v));
       double sum = 0.0;
       for (std::size_t v = 0; v < vocab; ++v)
         sum += std::exp(static_cast<double>(load(0, r * vocab + v)) - static_cast<double>(top));
-      const float values[3] = {top, static_cast<float>(sum),
-                               load(0, r * vocab + static_cast<std::size_t>(id))};
-      std::memcpy(out.bytes.data() + r * 3 * 4, values, sizeof(values));
+      values[0] = top;
+      values[1] = static_cast<float>(sum);
+      for (std::size_t j = 0; j < picks; ++j) {
+        const float id = load(1, r * picks + j);
+        if (!(id >= 0.0f) || id >= static_cast<float>(vocab) || std::floor(id) != id)
+          return LSE_ERROR(kInvalidArgument, "logits.lse_pick id ", std::to_string(id),
+                           " is not a token id below ", std::to_string(vocab));
+        values[2 + j] = load(0, r * vocab + static_cast<std::size_t>(id));
+      }
+      std::memcpy(out.bytes.data() + r * (picks + 2) * 4, values.data(), values.size() * 4);
     }
     return OkStatus();
   }

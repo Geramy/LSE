@@ -185,19 +185,26 @@ LSE_API lse_result lse_session_close(lse_engine *engine, const char *session_id)
  * Blocks until done and queues behind generation like a request.
  *
  * request_json is an object with:
- *   "text":        UTF-8 text, tokenized as a prompt is, without a chat template
- *   "tokens":      or the token ids themselves (exactly one of the two)
- *   "window":      tokens per window (required, at least 2)
- *   "stride":      tokens between window starts, 1..window (default: window)
- *   "max_windows": score only the first N windows (default 0: all)
+ *   "text":      UTF-8 text, tokenized as a prompt is, without a chat template
+ *   "tokens":    or the token ids themselves (exactly one of the two)
+ *   "method":    "chunks" (default): llama.cpp's llama-perplexity method --
+ *                non-overlapping chunks of ctx tokens, the second half of each
+ *                scored; "sliding": windows of ctx tokens every stride tokens,
+ *                each scoring the tokens no earlier window scored
+ *   "ctx":       tokens per chunk or window (default 512)
+ *   "stride":    sliding only, 1..ctx (default: ctx)
+ *   "chunks":    score only the first N chunks or windows (default 0: all)
+ *   "kld_base_out": write a KL-divergence base (top-k log-probabilities per
+ *                scored token) to this path
+ *   "kld_top_k": ids recorded per token in that base, 1..32 (default 32)
+ *   "kld_base":  compare against a base written earlier: KL divergence,
+ *                top-1 agreement, delta p and the PPL change
  *   "include_windows":   per-window results (default true)
- *   "include_token_ids": echo the scored token ids (default false)
- * Windows follow the standard sliding-window method: each scores only the
- * tokens no earlier window scored, so every token after the first is scored
- * once (see docs/PERPLEXITY.md). *json_out (release with lse_free) holds
- * "tokens", "token_ids_sha256" (SHA-256 of the ids as little-endian uint32),
- * "scored_tokens", "nll_sum", "mean_nll" (nats), "perplexity", the engine
- * configuration that produced them, and "windows". */
+ *   "include_token_ids": echo the token ids (default false)
+ * See docs/PERPLEXITY.md. *json_out (release with lse_free) holds "tokens",
+ * "token_ids_sha256" (SHA-256 of the ids as little-endian uint32),
+ * "scored_tokens", "mean_nll" (nats), "perplexity" and its uncertainty, the
+ * timing, the engine configuration, "kld" when comparing, and "windows". */
 LSE_API lse_result lse_perplexity(lse_engine *engine, const char *request_json,
                                   char **json_out, char **err);
 

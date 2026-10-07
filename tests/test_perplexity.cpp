@@ -104,7 +104,8 @@ void write_safetensors(const std::filesystem::path& path, const std::vector<Name
 
 model::Config tiny_config() {
   model::Config c;
-  c.vocab_size = 96;
+  // At least 4096, the narrowest row the device top-k takes.
+  c.vocab_size = 4096;
   c.hidden_size = 32;
   c.num_layers = 4;
   c.full_attention_interval = 4;
@@ -256,6 +257,32 @@ LSE_TEST(a_one_token_tail_window_is_dropped_not_scored_empty) {
   LSE_EXPECT(*plan == want);
 }
 
+LSE_TEST(chunks_follow_llama_perplexity_scoring_the_second_half) {
+  auto plan = perplexity_chunks(10, 4);
+  LSE_EXPECT(plan.ok());
+  if (!plan.ok()) return;
+  // floor(10 / 4) chunks; logits from position 2 on predict tokens 3 and on.
+  const std::vector<PerplexityWindow> want{{0, 4, 3}, {4, 8, 7}};
+  LSE_EXPECT(*plan == want);
+  auto llama = perplexity_chunks(297193, 512);
+  LSE_EXPECT(llama.ok());
+  if (!llama.ok()) return;
+  LSE_EXPECT_EQ(llama->size(), std::size_t{580});
+  LSE_EXPECT_EQ(llama->front().scored(), std::size_t{255});
+  LSE_EXPECT(!perplexity_chunks(1023, 512).ok());
+  LSE_EXPECT(!perplexity_chunks(100, 3).ok());
+}
+
+LSE_TEST(coarse_kld_is_zero_for_equal_and_matches_a_hand_value) {
+  const std::vector<float> base{std::log(0.5f), std::log(0.25f)};
+  const std::vector<double> same{std::log(0.5), std::log(0.25)};
+  LSE_EXPECT_NEAR(coarse_kld(base, same), 0.0, 1e-7);
+  // Two named outcomes and the rest: p = (0.5, 0.25, 0.25), q = (0.25, 0.25, 0.5).
+  const std::vector<double> other{std::log(0.25), std::log(0.25)};
+  const double want = 0.5 * std::log(2.0) + 0.25 * std::log(0.5);
+  LSE_EXPECT_NEAR(coarse_kld(base, other), want, 1e-7);
+}
+
 LSE_TEST(invalid_windows_are_refused) {
   LSE_EXPECT(!perplexity_windows(10, 1, 1).ok());
   LSE_EXPECT(!perplexity_windows(10, 4, 0).ok());
@@ -271,21 +298,25 @@ LSE_TEST(lse_pick_matches_a_double_precision_log_softmax) {
   for (std::size_t i = 0; i < logits.size(); ++i)
     logits[i] = 0.037f * static_cast<float>(static_cast<int>((i * 7919) % 2003) - 1001) *
                 static_cast<float>(1 + i / vocab);
-  const std::vector<float> targets{0.0f, 999.0f, 17.0f, 500.0f, 3.0f};
+  // Three picks per row: the next token and two more ids.
+  const std::vector<float> picks{0, 999, 5, 999, 0, 1, 17, 17, 400, 500, 2, 998, 3, 4, 6};
   graph::Array x = filled(Shape{1, rows, vocab}, logits);
-  graph::Array t = filled(Shape{1, rows}, targets);
+  graph::Array t = filled(Shape{1, rows, 3}, picks);
   auto pick = graph::custom("logits.lse_pick.v1", {x, t});
   LSE_EXPECT(pick.ok());
   if (!pick.ok()) return;
-  LSE_EXPECT(pick->shape() == (Shape{1, rows, 3}));
+  LSE_EXPECT(pick->shape() == (Shape{1, rows, 5}));
   const std::vector<float> got = read_all(*pick);
-  LSE_EXPECT_EQ(got.size(), rows * 3);
-  if (got.size() != rows * 3) return;
+  LSE_EXPECT_EQ(got.size(), rows * 5);
+  if (got.size() != rows * 5) return;
   for (std::size_t r = 0; r < rows; ++r) {
-    const double nll = got[3 * r] + std::log(static_cast<double>(got[3 * r + 1])) - got[3 * r + 2];
-    const double want = reference_nll(logits.data() + r * vocab, vocab, static_cast<std::uint32_t>(targets[r]));
-    std::printf("       row %zu: nll %.7f reference %.7f\n", r, nll, want);
-    LSE_EXPECT_NEAR(nll, want, 1e-4 * std::max(1.0, std::fabs(want)));
+    for (std::size_t j = 0; j < 3; ++j) {
+      const auto id = static_cast<std::uint32_t>(picks[r * 3 + j]);
+      const double nll = got[5 * r] + std::log(static_cast<double>(got[5 * r + 1])) - got[5 * r + 2 + j];
+      const double want = reference_nll(logits.data() + r * vocab, vocab, id);
+      if (j == 0) std::printf("       row %zu: nll %.7f reference %.7f\n", r, nll, want);
+      LSE_EXPECT_NEAR(nll, want, 1e-4 * std::max(1.0, std::fabs(want)));
+    }
   }
 }
 
@@ -304,7 +335,9 @@ LSE_TEST(scoring_matches_a_whole_sequence_forward_pass) {
     const std::vector<std::uint32_t> ids = sequence(n, static_cast<std::uint32_t>(tiny.config.vocab_size));
     for (const std::size_t first : {std::size_t{1}, n / 2}) {
       Session session("", tiny.lm->state_slots());
-      auto got = gen.score(session, ids, first);
+      auto scored = gen.score(session, ids, first);
+      auto got = scored.ok() ? Result<std::vector<double>>(scored->nll)
+                             : Result<std::vector<double>>(scored.status());
       LSE_EXPECT(got.ok());
       if (!got.ok()) {
         std::printf("       score failed: %s\n", got.status().to_string().c_str());
@@ -339,7 +372,11 @@ LSE_TEST(sliding_windows_add_up_to_the_per_window_scores) {
   const std::vector<std::uint32_t> ids = sequence(200, static_cast<std::uint32_t>(tiny.config.vocab_size));
   for (const std::size_t stride : {std::size_t{64}, std::size_t{32}}) {
     std::size_t calls = 0;
-    auto report = score_perplexity(gen, *tiny.lm, ids, 64, stride, 0,
+    PerplexityOptions options;
+    options.method = PerplexityMethod::kSliding;
+    options.ctx = 64;
+    options.stride = stride;
+    auto report = score_perplexity(gen, *tiny.lm, ids, options,
                                    [&](const WindowScore&, std::size_t done, std::size_t total) {
                                      ++calls;
                                      LSE_EXPECT(done <= total);
@@ -375,6 +412,69 @@ LSE_TEST(sliding_windows_add_up_to_the_per_window_scores) {
   }
 }
 
+LSE_TEST(a_kld_base_round_trips_and_a_run_matches_itself) {
+  Tiny tiny = build_tiny();
+  LSE_EXPECT(tiny.ok);
+  if (!tiny.ok) return;
+  PrefillBatch prefill;
+  prefill.batch_size = 128;
+  prefill.ubatch_size = 128;
+  Generator gen(*tiny.lm, SamplingParams{}, prefill);
+  const std::vector<std::uint32_t> ids = sequence(200, static_cast<std::uint32_t>(tiny.config.vocab_size));
+  PerplexityOptions options;
+  options.ctx = 64;
+  options.record_top_k = 8;
+  options.token_ids_sha256 = "test";
+  auto base = score_perplexity(gen, *tiny.lm, ids, options);
+  LSE_EXPECT(base.ok());
+  if (!base.ok()) {
+    std::printf("       base failed: %s\n", base.status().to_string().c_str());
+    return;
+  }
+  LSE_EXPECT(base->recorded.has_value());
+  // floor(200 / 64) = 3 chunks of 64 - 32 - 1 = 31 scored tokens.
+  LSE_EXPECT_EQ(base->scored, std::size_t{93});
+  LSE_EXPECT_EQ(base->recorded->scored(), std::size_t{93});
+  LSE_EXPECT_EQ(base->recorded->ids.size(), std::size_t{93 * 8});
+  const std::string path = (std::filesystem::temp_directory_path() / "lse-perplexity.kld").string();
+  LSE_EXPECT_OK(base->recorded->write(path));
+  auto read = KldBase::read(path);
+  LSE_EXPECT(read.ok());
+  if (!read.ok()) return;
+  LSE_EXPECT(read->ids == base->recorded->ids);
+  LSE_EXPECT(read->logprobs == base->recorded->logprobs);
+  LSE_EXPECT(read->nll == base->recorded->nll);
+  LSE_EXPECT(read->token_ids_sha256 == "test");
+  for (std::size_t t = 0; t < 93; ++t)
+    for (std::size_t j = 1; j < 8; ++j)
+      LSE_EXPECT(read->logprobs[t * 8 + j] <= read->logprobs[t * 8 + j - 1]);
+
+  PerplexityOptions compare;
+  compare.ctx = 64;
+  compare.compare = &*read;
+  compare.token_ids_sha256 = "test";
+  auto again = score_perplexity(gen, *tiny.lm, ids, compare);
+  LSE_EXPECT(again.ok());
+  if (!again.ok()) {
+    std::printf("       compare failed: %s\n", again.status().to_string().c_str());
+    return;
+  }
+  LSE_EXPECT(again->kld.has_value());
+  if (!again->kld) return;
+  const KldStats& k = *again->kld;
+  std::printf("       self: KLD %.3e, same top %.4f, delta p %.3e, top-8 mass %.4f\n", k.mean_kld,
+              k.same_top, k.mean_delta_p, k.mean_base_top_mass);
+  LSE_EXPECT(k.mean_kld < 1e-6 && k.mean_kld > -1e-6);
+  LSE_EXPECT_NEAR(k.same_top, 1.0, 1e-12);
+  LSE_EXPECT_NEAR(k.base_perplexity(), again->perplexity(), 1e-9 * again->perplexity());
+
+  compare.ctx = 32;
+  LSE_EXPECT(!score_perplexity(gen, *tiny.lm, ids, compare).ok());
+  compare.ctx = 64;
+  compare.token_ids_sha256 = "other";
+  LSE_EXPECT(!score_perplexity(gen, *tiny.lm, ids, compare).ok());
+}
+
 LSE_TEST(scoring_refuses_out_of_range_input) {
   Tiny tiny = build_tiny();
   LSE_EXPECT(tiny.ok);
@@ -388,7 +488,7 @@ LSE_TEST(scoring_refuses_out_of_range_input) {
   }
   {
     Session session("", tiny.lm->state_slots());
-    const std::vector<std::uint32_t> bad{1, 2, 96};
+    const std::vector<std::uint32_t> bad{1, 2, 4096};
     LSE_EXPECT(!gen.score(session, bad, 1).ok());
   }
   {
