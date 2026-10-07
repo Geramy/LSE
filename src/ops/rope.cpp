@@ -163,11 +163,10 @@ Result<Array> apply_rope(const Array& x, const RopeTables& tables,
   if (tables.dim == head_dim) {
     return graph::rope(x, tables.cos, tables.sin, offset);
   }
-  // Partial rotation: rotate the leading channels, pass the rest through.
-  Array rotated = graph::rope(graph::slice(x, -1, 0, tables.dim), tables.cos,
-                              tables.sin, offset);
-  Array passthrough = graph::slice(x, -1, tables.dim, head_dim);
-  return graph::concat({rotated, passthrough}, -1);
+  // Partial rotation: rotate the leading channels, pass the rest through, in
+  // one launch.
+  return graph::rope(x, tables.cos, tables.sin, offset,
+                     static_cast<int>(tables.dim));
 }
 
 Result<Array> apply_rope(const Array& x, const RopeTables& tables,
@@ -180,10 +179,8 @@ Result<Array> apply_rope(const Array& x, const RopeTables& tables,
   if (tables.dim == head_dim) {
     return graph::rope(x, tables.cos, tables.sin, offset);
   }
-  Array rotated = graph::rope(graph::slice(x, -1, 0, tables.dim), tables.cos,
-                              tables.sin, offset);
-  Array passthrough = graph::slice(x, -1, tables.dim, head_dim);
-  return graph::concat({rotated, passthrough}, -1);
+  return graph::rope(x, tables.cos, tables.sin, offset,
+                     static_cast<int>(tables.dim));
 }
 
 }  // namespace lse::ops

@@ -128,11 +128,13 @@ bool topk_pairs_fits(std::int64_t width, int k) noexcept;
 // rank-1 input), so greedy decode reads back one float instead of the row.
 Array argmax(const Array& x);
 
-// Interleaved-pair RoPE over [B, H, T, D]; cos/sin are [max_T, D].
-Array rope(const Array& x, const Array& cos, const Array& sin, int offset);
+// Interleaved-pair RoPE over [B, H, T, D]; cos/sin are [max_T, R]. `rotary`
+// R < D rotates the leading R channels and passes the rest through; 0 is D.
+Array rope(const Array& x, const Array& cos, const Array& sin, int offset,
+           int rotary = 0);
 // `offset` is a 1-element tensor so decode can poke it without a new kernel.
 Array rope(const Array& x, const Array& cos, const Array& sin,
-           const Array& offset);
+           const Array& offset, int rotary = 0);
 
 // x / sqrt(sum(x^2) + eps) over the last axis.
 Array l2_normalize(const Array& x, float eps = 1e-12f);

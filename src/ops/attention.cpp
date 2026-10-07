@@ -14,14 +14,18 @@
 
 namespace lse::ops {
 
+// One token's [B, 1, H, D] and [B, H, 1, D] are the same bytes, so a decode
+// pass reshapes where a wider pass transposes, and launches nothing.
 Array split_heads(const Array& x, std::int64_t heads, std::int64_t head_dim) {
   const Shape& s = x.shape();
+  if (s.dim(1) == 1) return graph::reshape(x, Shape{s.dim(0), heads, 1, head_dim});
   Array r = graph::reshape(x, Shape{s.dim(0), s.dim(1), heads, head_dim});
   return graph::transpose(r, {0, 2, 1, 3});
 }
 
 Array merge_heads(const Array& x) {
   const Shape& s = x.shape();  // [B, H, T, D]
+  if (s.dim(2) == 1) return graph::reshape(x, Shape{s.dim(0), 1, s.dim(1) * s.dim(3)});
   Array t = graph::transpose(x, {0, 2, 1, 3});
   return graph::reshape(t, Shape{s.dim(0), s.dim(2), s.dim(1) * s.dim(3)});
 }
