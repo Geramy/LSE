@@ -86,9 +86,13 @@ git -C "$work/hrx-source" init -q
 #   append. Without it a kernel with more than about 30 matrix operands in one
 #   function asks for gigabytes and fails to compile, which rules out the
 #   prefill GEMM's 64x64 wave tiles.
+# - gfx120x-hdp-kernarg-publication: admits RDNA4 to HRX's VRAM kernel-
+#   argument path. It turns on only when the HSA runtime reports the HDP flush
+#   registers and CPU access to the VRAM pool.
 hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
   gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
-  loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full)
+  loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
+  gfx120x-hdp-kernarg-publication)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"

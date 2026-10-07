@@ -1,0 +1,76 @@
+From cfa88848ba63555c6601a83445baf256c67eb2c4 Mon Sep 17 00:00:00 2001
+From: geramyloveless <gloveless@jqluv.com>
+Date: Tue, 6 Oct 2026 17:53:32 -0700
+Subject: [PATCH] [HAL/AMDGPU] Allow HDP kernarg publication on gfx120x
+
+RDNA4 (gfx1200, gfx1201) can publish kernel arguments from the host into
+CPU-visible device memory the same way gfx94x and gfx125x do: host stores
+through the BAR followed by an HDP_MEM_FLUSH_CNTL write. Its HDP 7.0
+block flushes through the same register.
+
+With the family admitted, a gfx120x device whose HSA runtime reports the
+HDP flush registers and CPU access to the device coarse pool gets its
+per-queue kernarg ring in CPU-visible VRAM, so the command processor and
+shaders read kernel arguments from local memory instead of across PCIe.
+Devices without those capabilities keep host kernarg memory as before.
+
+physical_device_capabilities_test covers gfx1200 and gfx1201 (admitted)
+and gfx1210 (not admitted).
+---
+ .../drivers/amdgpu/physical_device_capabilities.c   | 13 ++++++++++---
+ .../amdgpu/physical_device_capabilities_test.cc     |  6 +++++-
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities.c b/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities.c
+index 2c548b09e..ff665876c 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities.c
+@@ -654,6 +654,11 @@ static bool iree_hal_amdgpu_gfxip_is_gfx94x(
+   return version.major == 9 && version.minor >= 4 && version.stepping <= 2;
+ }
+ 
++static bool iree_hal_amdgpu_gfxip_is_gfx120x(
++    iree_hal_amdgpu_gfxip_version_t version) {
++  return version.major == 12 && version.minor == 0;
++}
++
+ static bool iree_hal_amdgpu_gfxip_is_gfx125x(
+     iree_hal_amdgpu_gfxip_version_t version) {
+   return version.major == 12 && version.minor >= 5;
+@@ -661,10 +666,12 @@ static bool iree_hal_amdgpu_gfxip_is_gfx125x(
+ 
+ bool iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(
+     iree_hal_amdgpu_gfxip_version_t version) {
+-  // Matches the device-kernarg family gate in CLR's setKernelArgImpl. Other
+-  // families stay on host kernarg memory until they have a validated device-
+-  // local publication path.
++  // Matches the device-kernarg family gate in CLR's setKernelArgImpl, plus
++  // RDNA4 (gfx120x): its HDP 7.0 block takes the same HDP_MEM_FLUSH_CNTL write
++  // to publish host stores into CPU-visible VRAM. Other families stay on host
++  // kernarg memory until they have a validated device-local publication path.
+   return iree_hal_amdgpu_gfxip_is_gfx94x(version) ||
++         iree_hal_amdgpu_gfxip_is_gfx120x(version) ||
+          iree_hal_amdgpu_gfxip_is_gfx125x(version);
+ }
+ 
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities_test.cc b/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities_test.cc
+index 5ca4e82de..4d5f0a727 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities_test.cc
++++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device_capabilities_test.cc
+@@ -595,8 +595,12 @@ TEST_F(PhysicalDeviceCapabilitiesTest, GfxIpGatesHdpPublication) {
+       iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(10, 3, 0)));
+   EXPECT_FALSE(
+       iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(11, 0, 0)));
+-  EXPECT_FALSE(
++  EXPECT_TRUE(
+       iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(12, 0, 0)));
++  EXPECT_TRUE(
++      iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(12, 0, 1)));
++  EXPECT_FALSE(
++      iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(12, 1, 0)));
+   EXPECT_TRUE(
+       iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(12, 5, 0)));
+ }
+-- 
+2.51.0
+

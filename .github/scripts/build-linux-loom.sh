@@ -37,7 +37,8 @@ git -C "$work/source" init -q
 # LSE's Loom patches (patches/hrx), then its HRX runtime patches (patches/).
 # loom-grow-arrays-only-when-full keeps loomc from asking for gigabytes on a
 # kernel with many matrix operands, such as the prefill GEMM's 64x64 tiles.
-patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch)
+# gfx120x-hdp-kernarg-publication lets RDNA4 keep kernel arguments in VRAM.
+patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch gfx120x-hdp-kernarg-publication.patch)
 for patch in "${patches[@]}"; do
   path="$root/patches/hrx/$patch"
   git -C "$work/source" apply --check "$path"
