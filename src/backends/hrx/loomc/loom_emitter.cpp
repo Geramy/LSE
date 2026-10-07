@@ -385,6 +385,17 @@ bool LoomEmitter::joins_run(std::span<const NodePtr> run,
 
 Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                                         const DeviceInfo& device) const {
+  return emit_kernel(group, device, true);
+}
+
+Result<EmittedKernel> LoomEmitter::emit_launch(const FusionGroup& group,
+                                               const DeviceInfo& device) const {
+  return emit_kernel(group, device, false);
+}
+
+Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
+                                               const DeviceInfo& device,
+                                               bool with_source) const {
   if (group.nodes.empty()) {
     return LSE_ERROR(kInvalidArgument, "cannot emit an empty fusion group");
   }
@@ -518,30 +529,44 @@ Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
   // this invocation, including a rebuilt graph after a request restart.
   {
     const std::lock_guard lock(cache_mutex_);
-    if (const auto it = emit_cache_.find(identity); it != emit_cache_.end()) {
+    if (const auto it = emit_cache_.find(identity);
+        it != emit_cache_.end() && (!with_source || it->second.source)) {
       auto bindings = std::move(out.binding_order);
-      out = it->second;
+      out = it->second.launch;
+      if (with_source) out.source = *it->second.source;
       out.binding_order = std::move(bindings);
       ++cache_hits_;
       return out;
     }
     ++cache_misses_;
   }
+  // A caller that asked for the launch only gets no text, whether it was just
+  // written or not: it has said the kernel is resident.
   auto remember = [&] {
     (void)finalize_source_identity(out, "lse_loom_");
-    EmittedKernel saved = out;
-    saved.binding_order.clear();
+    CachedEmission saved;
+    saved.launch = out;
+    saved.launch.source.clear();
+    saved.launch.binding_order.clear();
+    // Descriptions of every prepared shape fit many times over; the bound is
+    // for a process that keeps meeting new shapes. Text is kept only for a
+    // kernel built again on another device, which a resident one never is.
+    constexpr std::size_t kEntryLimit = 1u << 16;
+    constexpr std::size_t kSourceBudget = 16u * 1024u * 1024u;
     const std::lock_guard lock(cache_mutex_);
-    constexpr std::size_t kSourceBudget = 64u * 1024u * 1024u;
-    if (saved.source.size() > kSourceBudget) return;
-    if (emit_cache_.size() >= 1024 ||
-        cache_bytes_ + saved.source.size() > kSourceBudget) {
+    if (emit_cache_.size() >= kEntryLimit) {
       emit_cache_.clear();
       cache_bytes_ = 0;
     }
-    if (emit_cache_.emplace(identity, std::move(saved)).second) {
+    auto& entry = emit_cache_[identity];
+    if (entry.source) cache_bytes_ -= entry.source->size();
+    entry.launch = std::move(saved.launch);
+    entry.source.reset();
+    if (cache_bytes_ + out.source.size() <= kSourceBudget) {
+      entry.source = std::make_shared<const std::string>(out.source);
       cache_bytes_ += out.source.size();
     }
+    if (!with_source) out.source.clear();
   };
 
   // The launch parameters, and the views the body reads through. Parameter

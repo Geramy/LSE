@@ -8,7 +8,6 @@ std::int32_t pool_rung(std::int32_t blocks, std::int32_t ceiling) noexcept {
   // Beyond 32K tokens, a full doubling can exceed the free VRAM while both
   // the old and replacement pools are live. Add at most 256 blocks (4K tokens)
   // per rung instead.
-  constexpr std::int32_t kLargePoolStart = 2048;
   constexpr std::int32_t kLargePoolStep = 256;
   if (blocks > kLargePoolStart) {
     const std::int32_t remainder = blocks % kLargePoolStep;

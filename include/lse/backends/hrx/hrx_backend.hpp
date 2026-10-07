@@ -129,6 +129,8 @@ class HrxBackend : public Backend<HrxBackend> {
 
   Result<KernelHandle> load_executable_impl(std::string_view name,
                                             std::span<const std::byte> code_object);
+  Result<std::vector<KernelHandle>> load_executables_impl(
+      std::span<const std::string> names, std::span<const std::byte> code_object);
   Status launch_impl(const KernelHandle& kernel, const LaunchDims& dims,
                      const DispatchArgs& args, const DispatchTarget& target);
   Status synchronize_impl();

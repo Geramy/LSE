@@ -106,6 +106,12 @@ class Router {
   void use_mtp(model::MtpModule& mtp) noexcept;
   void use_dflash2(model::DFlash2Module& draft) noexcept;
 
+  // Makes resident, before the first request, every kernel a request can
+  // launch with this router's options and draft module
+  // (runtime::Generator::prepare_kernels). Called once at load, after the
+  // draft module is attached.
+  Status prepare_kernels();
+
   [[nodiscard]] const ServerOptions& options() const noexcept;
 
   // Every route handle() answers, in registration order.

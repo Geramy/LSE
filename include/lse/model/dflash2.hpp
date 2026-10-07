@@ -62,7 +62,14 @@ class DFlash2Module {
 
   // Features concatenate the selected target block outputs in target_layers()
   // order: [1,S,taps*D], F32. Only verified context belongs in this cache.
-  Status append_context(const graph::Array& features, std::int32_t first);
+  // The first `rows` of the S rows are real (0: all of them); the rest are a
+  // padded prompt pass's padding, which is never written. A context pass is
+  // built per S, so every prompt length that pads to one pass width shares it.
+  Status append_context(const graph::Array& features, std::int32_t first,
+                        std::int64_t rows = 0);
+  // Makes resident (graph::Scheduler::prepare) the kernels of a context pass
+  // of each width in `context_widths`, and of both draft passes. Nothing runs.
+  Status prepare_kernels(std::span<const std::int64_t> context_widths);
   Status rewind(std::int32_t position);
   void reset();
   // reset(), and the draft programs too: the workspace the module holds

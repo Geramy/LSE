@@ -559,6 +559,38 @@ LSE_TEST(dflash2_eight_row_body_prefix_matches_full_path_after_wrap_rewind_and_r
   LSE_EXPECT(!fixture.draft->draft(0, 20, 0).ok());
   LSE_EXPECT(!fixture.draft->draft(0, 20, 8).ok());
 }
+LSE_TEST(dflash2_padded_context_writes_only_its_real_rows) {
+  // A prompt pass padded to its width hands the draft every row and says how
+  // many are real. The ring then holds what the real rows alone put there:
+  // the same position, the same drafts, and the padding never written.
+  std::vector<float> real(11 * 8);
+  for (std::size_t i = 0; i < real.size(); ++i) real[i] = std::sin(static_cast<float>(i) * .53f) * .41f;
+  std::vector<float> padded(real);
+  padded.resize(16 * 8, 7.5f);
+  Fixture exact, pass;
+  LSE_EXPECT_OK(exact.open()); LSE_EXPECT_OK(pass.open());
+  if (!exact.draft || !pass.draft) return;
+  LSE_EXPECT_OK(exact.draft->append_context(filled({1, 11, 8}, real), 0));
+  LSE_EXPECT_OK(pass.draft->append_context(filled({1, 16, 8}, padded), 0, 11));
+  LSE_EXPECT_EQ(pass.draft->context_position(), 11);
+  for (std::uint32_t anchor = 0; anchor < 6; ++anchor) {
+    auto want = exact.draft->draft(anchor, 11, 2);
+    auto got = pass.draft->draft(anchor, 11, 2);
+    LSE_EXPECT(want.ok() && got.ok()); if (!want.ok() || !got.ok()) return;
+    LSE_EXPECT(*got == *want);
+  }
+  // The rows after the real ones come next and replace nothing real.
+  const std::vector<float> next(3 * 8, -.2f);
+  LSE_EXPECT_OK(exact.draft->append_context(filled({1, 3, 8}, next), 11));
+  LSE_EXPECT_OK(pass.draft->append_context(filled({1, 3, 8}, next), 11));
+  for (std::uint32_t anchor = 0; anchor < 6; ++anchor) {
+    auto want = exact.draft->draft(anchor, 14, 1);
+    auto got = pass.draft->draft(anchor, 14, 1);
+    LSE_EXPECT(want.ok() && got.ok()); if (!want.ok() || !got.ok()) return;
+    LSE_EXPECT(*got == *want);
+  }
+  LSE_EXPECT(!pass.draft->append_context(filled({1, 2, 8}, std::vector<float>(16, 0.f)), 14, 3).ok());
+}
 LSE_TEST(dflash2_context_overwrite_matches_fresh_prefix_and_does_not_alias_features) {
   Fixture fixture;
   auto opened = fixture.open(); LSE_EXPECT_OK(opened); if (!opened.ok()) return;
@@ -1120,9 +1152,10 @@ LSE_TEST(ring_cache_writes_only_new_rows_and_keeps_rewind_context) {
       expected_k[at]=update_k[(h*rows+t)*dim+d];expected_v[at]=update_v[(h*rows+t)*dim+d];
     }
     auto first=filled({1},{static_cast<float>(position)});
-    auto keys=graph::custom("dflash2.cache_write",{cache_k,filled({1,heads,static_cast<std::int64_t>(rows),dim},update_k),first},
+    auto count=filled({1},{static_cast<float>(rows)});
+    auto keys=graph::custom("dflash2.cache_write",{cache_k,filled({1,heads,static_cast<std::int64_t>(rows),dim},update_k),first,count},
         {static_cast<float>(heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(rows)});
-    auto values=graph::custom("dflash2.cache_write",{cache_v,filled({1,heads,static_cast<std::int64_t>(rows),dim},update_v),first},
+    auto values=graph::custom("dflash2.cache_write",{cache_v,filled({1,heads,static_cast<std::int64_t>(rows),dim},update_v),first,count},
         {static_cast<float>(heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(rows)});
     LSE_EXPECT(keys.ok());LSE_EXPECT(values.ok());if(!keys.ok()||!values.ok())return;
     LSE_EXPECT(read(*keys)==expected_k);LSE_EXPECT(read(*values)==expected_v);
@@ -1147,7 +1180,7 @@ LSE_TEST(ring_cache_and_attention_emit_native_loom_without_context_concatenation
     return graph::Array(node);
   };
   auto cache=leaf({1,8,2055,128}),update=leaf({1,8,8,128});
-  auto written=graph::custom("dflash2.cache_write",{cache,update,leaf({1})},{8,2055,128,8});
+  auto written=graph::custom("dflash2.cache_write",{cache,update,leaf({1}),leaf({1})},{8,2055,128,8});
   auto attention=graph::custom("dflash2.ring_attention.v2",{leaf({1,32,8,128}),cache,cache,update,update,leaf({3})},{32,8,128,2048});
   LSE_EXPECT(written.ok());LSE_EXPECT(attention.ok());if(!written.ok()||!attention.ok())return;
   backend::DeviceInfo device;device.arch="gfx1201";device.wavefront_size=32;
@@ -1188,9 +1221,10 @@ int gpu_ring_cache() {
   auto cache_k=filled({1,kv_heads,capacity,dim},initial_k),cache_v=filled(cache_k.shape(),initial_v);
   auto key_update=filled({1,kv_heads,queries,dim},update_k),value_update=filled(key_update.shape(),update_v);
   auto offset=filled({1},{static_cast<float>(first)});
-  auto written_k=graph::custom("dflash2.cache_write",{cache_k,key_update,offset},
+  auto rows=filled({1},{static_cast<float>(queries)});
+  auto written_k=graph::custom("dflash2.cache_write",{cache_k,key_update,offset,rows},
       {static_cast<float>(kv_heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(queries)});
-  auto written_v=graph::custom("dflash2.cache_write",{cache_v,value_update,offset},
+  auto written_v=graph::custom("dflash2.cache_write",{cache_v,value_update,offset,rows},
       {static_cast<float>(kv_heads),static_cast<float>(capacity),static_cast<float>(dim),static_cast<float>(queries)});
   LSE_EXPECT(written_k.ok());LSE_EXPECT(written_v.ok());if(!written_k.ok()||!written_v.ok())return 1;
   scheduler->reset_accumulated_trace();
@@ -1280,11 +1314,11 @@ LSE_TEST(
   const std::size_t first = capacity - 2, end = (first + queries) % capacity;
   auto offset = filled({1}, {static_cast<float>(first)});
   auto wk =
-      graph::custom("dflash2.cache_write", {ck, kp, offset},
+      graph::custom("dflash2.cache_write", {ck, kp, offset, filled({1}, {static_cast<float>(queries)})},
                     {1, static_cast<float>(capacity), static_cast<float>(dim),
                      static_cast<float>(queries)});
   auto wv =
-      graph::custom("dflash2.cache_write", {cv, vp, offset},
+      graph::custom("dflash2.cache_write", {cv, vp, offset, filled({1}, {static_cast<float>(queries)})},
                     {1, static_cast<float>(capacity), static_cast<float>(dim),
                      static_cast<float>(queries)});
   LSE_EXPECT(wk.ok());
@@ -1445,11 +1479,11 @@ int gpu_ring_split() {
        kp = filled({1, kvheads, queries, dim}, pk), vp = filled(kp.shape(), pv),
        offset = filled({1}, {static_cast<float>(first)});
   auto wk =
-      graph::custom("dflash2.cache_write", {ck, kp, offset},
+      graph::custom("dflash2.cache_write", {ck, kp, offset, filled({1}, {static_cast<float>(queries)})},
                     {static_cast<float>(kvheads), static_cast<float>(capacity),
                      static_cast<float>(dim), static_cast<float>(queries)});
   auto wv =
-      graph::custom("dflash2.cache_write", {cv, vp, offset},
+      graph::custom("dflash2.cache_write", {cv, vp, offset, filled({1}, {static_cast<float>(queries)})},
                     {static_cast<float>(kvheads), static_cast<float>(capacity),
                      static_cast<float>(dim), static_cast<float>(queries)});
   LSE_EXPECT(wk.ok());

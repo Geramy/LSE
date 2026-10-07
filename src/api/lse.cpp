@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -667,6 +668,21 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   if (e.mtp) e.router->use_mtp(*e.mtp);
   if (e.dflash2) e.router->use_dflash2(*e.dflash2);
   e.requests = std::make_unique<server::InProcess>(*e.router);
+
+  // Kernels are specialized to pass shapes; every shape a request can take is
+  // made resident now, so no request emits or loads one between its launches.
+  progress::begin("preparing_kernels");
+  {
+    const auto started = std::chrono::steady_clock::now();
+    if (const Status s = e.router->prepare_kernels(); !s.ok())
+      return fail(s, "preparing kernels");
+    const graph::Scheduler::JitStats jit = sched->jit_stats();
+    std::fprintf(stderr,
+                 "lse-server: kernels prepared in %.2f s; %llu loaded (%llu compiled)\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+                 static_cast<unsigned long long>(jit.disk_hits + jit.compiles),
+                 static_cast<unsigned long long>(jit.compiles));
+  }
 
   // Every weight is on the device: release what loading left on the host.
   // The mapped checkpoint stays mapped (views still name it) but its pages

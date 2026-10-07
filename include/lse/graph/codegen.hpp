@@ -165,6 +165,16 @@ class IKernelEmitter {
   virtual Result<EmittedKernel> emit(const FusionGroup& group,
                                      const backend::DeviceInfo& device) const = 0;
 
+  // What emit() returns minus the source text: entry, bindings, constants and
+  // launch geometry. For a kernel already resident on the device, whose text
+  // nothing reads again; a step launching thousands of resident kernels then
+  // copies no text. An emitter that keeps no launch description apart from
+  // its text writes the whole kernel.
+  virtual Result<EmittedKernel> emit_launch(const FusionGroup& group,
+                                            const backend::DeviceInfo& device) const {
+    return emit(group, device);
+  }
+
   // JIT identity for this group on this device. Must change when generated
   // source would change without FusionGroup::signature() changing (a
   // specialized primitive). Arch is mixed in by the cache, not here.
