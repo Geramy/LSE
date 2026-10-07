@@ -336,20 +336,28 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
       ++leaf->consumer_count;
     }
     n->prim = find_primitive("quant_linear.q8.wmma16.packed.v1");
-  } else if (dispatch::q4_matrix_panel_shape(geometry)) {
+  } else if (dispatch::q4_matrix_panel_shape(geometry) ||
+             dispatch::q8_matrix_panel_shape(geometry)) {
+    // 8-bit weights read the panel in byte order (attribute 0 = 8), 4-bit
+    // weights in nibble-plane order; siblings share it only in one order.
+    const bool bytes = dispatch::q8_matrix_panel_shape(geometry);
+    const std::int32_t order = bytes ? 8 : 0;
     const Shape panel_shape = dispatch::q4_matrix_panel_storage_shape(sx);
     auto panel = x.node()->quant_activation_panel.lock();
     if (!panel || panel->inputs.size() != 1 || panel->inputs[0] != x.node() ||
         panel->shape != panel_shape || panel->dtype != DType::kU32 ||
-        !panel->prim || panel->prim->name() != "quant_activation.q4_matrix_panel.v1") {
+        !panel->prim || panel->prim->name() != "quant_activation.q4_matrix_panel.v1" ||
+        panel->iattrs[0] != order) {
       panel = make(OpKind::kCustom, panel_shape, DType::kU32, {x.node()});
       panel->prim = find_primitive("quant_activation.q4_matrix_panel.v1");
+      panel->iattrs[0] = order;
       if (panel->prim) panel->fclass = panel->prim->fusion_class();
       x.node()->quant_activation_panel = panel;
     }
     n->inputs.push_back(panel);
     ++panel->consumer_count;
-    n->prim = find_primitive("quant_linear.q4_matrix_panel.v1");
+    n->prim = find_primitive(bytes ? "quant_linear.q8_matrix_panel.v1"
+                                   : "quant_linear.q4_matrix_panel.v1");
   } else if (dispatch::q4_shared_panel_shape(geometry)) {
     const auto k = sx.dim(sx.rank() - 1);
     const auto m = static_cast<std::int64_t>(sx.elem_count() / static_cast<std::uint64_t>(k));

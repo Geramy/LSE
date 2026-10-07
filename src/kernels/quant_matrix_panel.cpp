@@ -30,9 +30,11 @@ constexpr std::uint32_t kInputRows = 8;
 // nibble planes come in: the decode contraction then widens a weight word
 // into its matrix operand with one shift and one mask per register. The two
 // operands meet in the same order, so the integer products are unchanged.
+// A panel made for 8-bit weights (attribute 0 = 8) keeps four consecutive
+// values per word at every tile height: its weight words are already bytes.
 constexpr std::size_t code_slot(std::size_t word, std::size_t byte,
-                                std::size_t tile_rows) {
-  if (tile_rows != kRows)
+                                std::size_t tile_rows, bool bytes = false) {
+  if (tile_rows != kRows || bytes)
     return word * 4 + byte;
   return (word / 2) * 8 + word % 2 + 2 * byte;
 }
@@ -80,10 +82,11 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
   }
   Status eval_cpu_typed(std::span<const HostTensorView> in, HostOutputView out,
                         const std::array<float, 4> &,
-                        const std::array<std::int32_t, 4> &) const override {
+                        const std::array<std::int32_t, 4> &iattrs) const override {
     if (in.size() != 1 || in[0].dtype != DType::kF32 ||
         out.dtype != DType::kU32)
       return LSE_ERROR(kInvalidArgument, "invalid matrix panel storage");
+    const bool bytes = iattrs[0] == 8;
     const std::array input_shapes{in[0].shape};
     LSE_ASSIGN_OR(const auto expected, matrix_panel_shape(input_shapes));
     if (out.shape != expected ||
@@ -130,7 +133,7 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
           std::uint32_t packed = 0;
           for (std::size_t byte = 0; byte < 4; ++byte) {
             const float rounded =
-                std::nearbyint(values[code_slot(word, byte, tile_rows)] * inverse);
+                std::nearbyint(values[code_slot(word, byte, tile_rows, bytes)] * inverse);
             const auto code =
                 std::isfinite(rounded) ? static_cast<std::int32_t>(rounded) : 0;
             packed |= (static_cast<std::uint32_t>(code) & 255u) << (8 * byte);
@@ -204,7 +207,8 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
         auto word = e.let(e.u32(0));
         for (std::uint32_t byte_index = 0; byte_index < 4; ++byte_index) {
           const auto code = e.let(math::rint(
-              values[code_slot(word_index, byte_index, layout->rows)].read() *
+              values[code_slot(word_index, byte_index, layout->rows,
+                               s.iattrs[0] == 8)].read() *
               inverse));
           const auto byte =
               e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
@@ -283,7 +287,11 @@ std::uint32_t matrix_unroll(std::uint32_t groups) {
     unroll /= 2u;
   return unroll;
 }
+// `Bits` is the weight width: 4-bit words widen to matrix operands by nibble
+// plane, 8-bit words already are operands, four codes to a register.
+template <std::uint32_t Bits>
 std::string emit_matrix(const KernelShapes &s) {
+  static_assert(Bits == 4 || Bits == 8);
   using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kI32,
                             math::MatrixElem::kSU8, 16, 16, 16>;
   constexpr auto row = Mma::kRow;
@@ -294,7 +302,7 @@ std::string emit_matrix(const KernelShapes &s) {
   const auto k =
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
   const auto groups = k / 64u;
-  const auto lanes = k / 8u;
+  const auto lanes = k * Bits / 32u;
   const auto waves = matrix_waves(s, n);
   const auto unroll = matrix_unroll(groups);
   const auto tiles_n = (n + 15u) / 16u;
@@ -323,11 +331,13 @@ std::string emit_matrix(const KernelShapes &s) {
   // takes the group's words hi*4..hi*4+3 (one 16-byte load) and product t
   // pairs word hi*4+t, codes K[32hi+8t, +8), with the activation half that
   // holds the same codes: slice 2hi+t/2, half t%2.
+  // An 8-bit group is twice the words: each half-wave reads its eight in two
+  // 16-byte loads and product t takes words 2t and 2t+1.
   struct Loaded {
     kir::Val<lse::bf16> raw_scale, raw_bias;
-    kir::Pack<kir::u32> weight;
-    std::vector<kir::Pack<kir::u32>> acts, metadata;
+    std::vector<kir::Pack<kir::u32>> weight, acts, metadata;
   };
+  constexpr std::uint32_t kGroupWeightWords = 64u * Bits / 32u;
   const auto act_lane = e.let(hi * 128u + lo * 2u);
   for (auto g0 : e.range(0u, groups, unroll)) {
     std::vector<Loaded> loaded;
@@ -335,9 +345,11 @@ std::string emit_matrix(const KernelShapes &s) {
     for (std::uint32_t u = 0; u < unroll; ++u) {
       const auto g = e.let(g0 + u);
       const auto sa = e.let(safe_col * groups + g);
-      Loaded l{e.let(a.scales[sa]), e.let(a.biases[sa]),
-               e.load(a.packed, e.let(safe_col * lanes + g * 8u + hi * 4u), 16u),
-               {}, {}};
+      Loaded l{e.let(a.scales[sa]), e.let(a.biases[sa]), {}, {}, {}};
+      const auto wbase = e.let(safe_col * lanes + g * kGroupWeightWords +
+                               hi * (kGroupWeightWords / 2u));
+      for (std::uint32_t w = 0; w < kGroupWeightWords / 2u; w += 4u)
+        l.weight.push_back(e.load(a.packed, e.let(wbase + w), 16u));
       for (std::uint32_t t = 0; t < 4u; ++t)
         l.acts.push_back(e.load(
             a.panel, e.let(g * kGroupWords + act_lane + (t / 2u) * 64u + (t % 2u) * 32u), 8u));
@@ -356,14 +368,19 @@ std::string emit_matrix(const KernelShapes &s) {
       for (std::uint32_t t = 0; t < 4u; ++t) {
         const auto bf = e.local<kir::u32, kFrag>();
         const auto af = e.local<kir::u32, kFrag>();
-        // The panel pairs each weight word with its activations in nibble
-        // plane order (code_slot): plane f is the word's nibbles f, f+2, f+4
-        // and f+6, one to a byte.
-        const auto word = e.let(l.weight[static_cast<int>(t)]);
         for (int f = 0; f < kFrag; ++f) {
-          bf[f] = e.let(math::bit_and(
-              word / (1u << (4u * static_cast<std::uint32_t>(f))),
-              e.u32(0x0f0f0f0fu)));
+          if constexpr (Bits == 4) {
+            // The panel pairs each weight word with its activations in
+            // nibble plane order (code_slot): plane f is the word's nibbles
+            // f, f+2, f+4 and f+6, one to a byte.
+            const auto word = e.let(l.weight[0][static_cast<int>(t)]);
+            bf[f] = e.let(math::bit_and(
+                word / (1u << (4u * static_cast<std::uint32_t>(f))),
+                e.u32(0x0f0f0f0fu)));
+          } else {
+            const auto at = t * 2u + static_cast<std::uint32_t>(f);
+            bf[f] = e.let(l.weight[at / 4u][static_cast<int>(at % 4u)]);
+          }
           af[f] = l.acts[t][f];
         }
         acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
@@ -549,7 +566,7 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     if (dispatch::q4_matrix_panel_row(original)) {
       const auto *rule = dispatch::q4_matrix_panel_rule(original);
       if (rule->rows == kRows)
-        return emit_matrix(s);
+        return emit_matrix<4>(s);
       return rule->shared_words
                  ? (rule->n == 17408 ? emit_prefill_matrix<true, true>(s)
                                      : emit_prefill_matrix<true>(s))
@@ -584,7 +601,69 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     return tp;
   }
 };
+// The 8-row contraction over 8-bit weights on the shared activation panel.
+// The 8-bit matrix kernel (wmma_q8_linear.cpp) quantizes the activations in
+// every workgroup, a round of four groups at a time between two barriers,
+// with the weight reads of a round waiting behind them. This one reads the
+// panel quant_activation.q4_matrix_panel.v1 made once for all its siblings
+// (in byte order, attribute 0 = 8) and streams the weights. The panel holds
+// the codes, steps and sums the matrix kernel would compute -- the same
+// expressions in the same order -- and each output takes the same per-group
+// steps in the same group order, so the results are bit-identical.
+bool valid_q8_matrix_panel(const KernelShapes &s) {
+  if (s.inputs.size() != 5 || s.input_dtypes.size() != 5 ||
+      s.input_dtypes[4] != DType::kU32)
+    return false;
+  return dispatch::q8_matrix_panel_shape(original_shapes(s)) &&
+         s.inputs[4] == dispatch::q4_matrix_panel_storage_shape(s.inputs[0]);
+}
+struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
+  static constexpr std::string_view kName = "quant_linear.q8_matrix_panel.v1";
+  static constexpr std::string_view kEntry =
+      "lse_quant_linear_q8_matrix_panel_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 5; }
+  bool owns_indexing() const noexcept override { return true; }
+  DType infer_dtype(std::span<const DType>) const override {
+    return DType::kF32;
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 5 || !in[0].rank() || in[1].rank() != 2)
+      return LSE_ERROR(kInvalidArgument, "invalid matrix-panel contraction");
+    Shape out;
+    for (std::size_t axis = 0; axis + 1 < in[0].rank(); ++axis)
+      out.push_back(in[0].dim(axis));
+    out.push_back(in[1].dim(0));
+    return out;
+  }
+  std::string emit_kernel(const KernelShapes &s) const override {
+    if (!valid_q8_matrix_panel(s) || !s.types.scalar || !s.store ||
+        !s.intrinsics)
+      return {};
+    const auto original = original_shapes(s);
+    if (dispatch::q8_matrix_panel_row(original))
+      return emit_matrix<8>(s);
+    const auto *kernel = legacy(original);
+    return kernel ? kernel->emit_kernel(original) : std::string{};
+  }
+  static ThreadPlan plan_impl(const KernelShapes &s) {
+    ThreadPlan tp;
+    if (!valid_q8_matrix_panel(s))
+      return tp;
+    const auto original = original_shapes(s);
+    if (!dispatch::q8_matrix_panel_row(original)) {
+      const auto *kernel = legacy(original);
+      return kernel ? kernel->plan(original) : tp;
+    }
+    const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+    const auto waves = matrix_waves(s, n);
+    tp.workgroup_size[0] = waves * 32u;
+    tp.workgroup_count[0] = ((n + 15u) / 16u + waves - 1u) / waves;
+    return tp;
+  }
+};
 } // namespace
 LSE_REGISTER_PRIMITIVE(Q4MatrixPanelKernel);
 LSE_REGISTER_PRIMITIVE(Q4MatrixPanelLinear);
+LSE_REGISTER_PRIMITIVE(Q8MatrixPanelLinear);
 } // namespace lse::kernels
