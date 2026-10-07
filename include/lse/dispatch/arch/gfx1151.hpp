@@ -48,6 +48,24 @@ inline constexpr std::array kFlashWmmaRules{
     attention_shapes::FlashWmmaRule{kArch, 32, 256, 2, 512},
 };
 
+// Decode-time attention (sdpa.cpp, attention.cpp). Without these rules a
+// decode step's attention runs as one workgroup per KV-head pair over the
+// whole cache -- six workgroups on a 40-CU part, 52 ms a layer at a 1K cache
+// on gfx1151. The split forms cut the cache into 128-key partitions, one
+// 128-thread workgroup each, and merge them: the same kernels gfx1201 runs,
+// at the same wave, threads, head width and block bound, with scratch well
+// inside 64 KiB. The wave-per-row L2 normalization rides along at the same
+// geometry.
+inline constexpr std::array kDecodeRules{
+    attention_shapes::DecodeRule{kArch, 32, 128, 1, 256, 256},
+};
+inline constexpr std::array kSplitShortRules{
+    attention_shapes::SplitShortRule{kArch, 32, 2, 8, 128, 256},
+};
+inline constexpr std::array kWaveL2Rules{
+    attention_shapes::WaveL2Rule{kArch, 32, 128, 1, 1, 16, 128},
+};
+
 inline constexpr Tuning kTuning{
     .arch = kArch,
     .quant_int8_rows = kQuantInt8Rows,
@@ -55,12 +73,18 @@ inline constexpr Tuning kTuning{
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
     .q8_matrix_rules = kQ8MatrixRules,
     .flash_wmma = kFlashWmmaRules,
+    .decode = kDecodeRules,
+    .split_short = kSplitShortRules,
+    .wave_l2 = kWaveL2Rules,
 };
 
 static_assert(rows_name(kQuantInt8Rows, kArch) &&
               rows_name(kQuantMatrixRanges, kArch) &&
               rows_name(kQ4MatrixPanelShapes, kArch) &&
               rows_name(kQ8MatrixRules, kArch) &&
-              rows_name(kFlashWmmaRules, kArch));
+              rows_name(kFlashWmmaRules, kArch) &&
+              rows_name(kDecodeRules, kArch) &&
+              rows_name(kSplitShortRules, kArch) &&
+              rows_name(kWaveL2Rules, kArch));
 
 }  // namespace lse::dispatch::arch::gfx1151
