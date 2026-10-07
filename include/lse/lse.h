@@ -120,6 +120,13 @@ typedef struct lse_config {
    * output keeps the target distribution). 0 verifies the whole block every
    * step. */
   int32_t adaptive_dflash2;
+
+  /* --adaptive-mtp=on|off. With MTP, nonzero (lse_config_init's default)
+   * lets a sampled request chain as many proposals as pay on this device
+   * (up to 7), from the module's own confidence and measured draft and
+   * verify costs, and verify the prefix worth its rows; greedy requests and
+   * 0 use mtp_depth every step. Output is unchanged. */
+  int32_t adaptive_mtp;
 } lse_config;
 
 LSE_API void lse_config_init(lse_config *cfg);

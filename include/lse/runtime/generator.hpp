@@ -70,6 +70,9 @@ struct GenerationLimits {
   // Generation stops on any of these. Empty means run to a limit.
   std::vector<std::uint32_t> stop_tokens;
   std::uint32_t mtp_depth = kDefaultMtpDepth;
+  // With an adaptive MTP policy (Generator::use_mtp), a sampled request
+  // chains as deep as the policy picks; false holds it to mtp_depth.
+  bool adaptive_mtp = true;
 };
 
 // Why a generation ended.
@@ -151,8 +154,8 @@ struct GenerationStats {
   std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint32_t mtp_depth = 0;
   std::uint32_t dflash2_depth = 0;
-  // The verify width followed DraftWidthPolicy rather than the full block.
-  bool dflash2_adaptive = false;
+  // The verify width followed DraftWidthPolicy rather than a fixed width.
+  bool spec_adaptive = false;
   // Where a speculative step's time goes: the decoder passes that verify a
   // proposal (two of them when it is rejected) against the module pass that
   // made it. The second is what speculation costs whether or not it pays.
@@ -222,9 +225,16 @@ class Generator {
 
   // Proposals are checked by the decoder; limits.mtp_depth selects the chain
   // length. The module and session caches are reset together by generate().
-  void use_mtp(model::MtpModule& mtp) noexcept { mtp_ = &mtp; dflash2_ = nullptr; }
-  // With `widths`, each step verifies the prefix of the draft's block that
-  // policy chooses (and may skip the draft); without, the whole block.
+  // With `widths`, each step of a sampled request chains as deep as that
+  // policy chooses (up to kMaxMtpDepth) and verifies the prefix it keeps;
+  // without, and for greedy requests, limits.mtp_depth every step.
+  void use_mtp(model::MtpModule& mtp, DraftWidthPolicy* widths = nullptr) {
+    mtp_ = &mtp; dflash2_ = nullptr; widths_ = widths;
+    mtp.set_scored(widths != nullptr);
+  }
+  // With `widths`, each step of a sampled request verifies the prefix of the
+  // draft's block that policy chooses (and may skip the draft); without, and
+  // for greedy requests, the whole block.
   void use_dflash2(model::DFlash2Module& draft, DraftWidthPolicy* widths = nullptr) noexcept {
     dflash2_ = &draft; mtp_ = nullptr; widths_ = widths;
   }

@@ -43,6 +43,22 @@ for value in ('true', 'false', '1', '', 'ON'):
     cases.append(([f'--dflash2={value}'], 2, '--dflash2 must be on or off'))
 cases.append((['--dflash2'], 2, '--dflash2 needs a value'))
 cases.append((['--dflash2-model'], 2, '--dflash2-model needs a value'))
+cases.append((['--help'], 0, 'default on: verify the prefix expected to decode fastest'))
+for value in ('on', 'off'):
+    cases += [([f'--adaptive-dflash2={value}', '--help'], 0, '--adaptive-dflash2=off'),
+              (['--adaptive-dflash2', value, '--help'], 0, '--adaptive-dflash2=off'),
+              ([f'--adaptive-dflash2={value}', '--dflash2=on'], 2, 'no model.')]
+for value in ('true', 'false', '1', '', 'ON'):
+    cases.append(([f'--adaptive-dflash2={value}'], 2, '--adaptive-dflash2 must be on or off'))
+cases.append((['--adaptive-dflash2'], 2, '--adaptive-dflash2 needs a value'))
+cases.append((['--help'], 0, 'default on: sampled requests draft as deep as pays, up to 7'))
+for value in ('on', 'off'):
+    cases += [([f'--adaptive-mtp={value}', '--help'], 0, '--adaptive-mtp=off'),
+              (['--adaptive-mtp', value, '--help'], 0, '--adaptive-mtp=off'),
+              ([f'--adaptive-mtp={value}', '--mtp-depth', '3'], 2, 'no model.')]
+for value in ('true', 'false', '1', '', 'ON'):
+    cases.append(([f'--adaptive-mtp={value}'], 2, '--adaptive-mtp must be on or off'))
+cases.append((['--adaptive-mtp'], 2, '--adaptive-mtp needs a value'))
 cases.append((['--help'], 0, 'default: bf16 for BF16 models, fp16 otherwise'))
 cases.append((['--help'], 0, '--perplexity FILE'))
 for flag in ('--perplexity-ctx', '--perplexity-stride', '--perplexity-kld-top-k'):
@@ -148,6 +164,20 @@ if len(sys.argv) == 3:
         cli_cases.append(([f'--dflash2={value}'], 2, '--dflash2 must be on or off'))
     cli_cases.append((['--dflash2'], 2, '--dflash2 needs a value'))
     cli_cases.append((['--dflash2-model'], 2, '--dflash2-model needs a value'))
+    cli_cases.append((['--help'], 0, '--adaptive-dflash2=off'))
+    for value in ('on', 'off'):
+        cli_cases += [([f'--adaptive-dflash2={value}', '--help'], 0, '--adaptive-dflash2=off'),
+                      (['--adaptive-dflash2', value, '--help'], 0, '--adaptive-dflash2=off')]
+    for value in ('true', 'false', '1', '', 'ON'):
+        cli_cases.append(([f'--adaptive-dflash2={value}'], 2, '--adaptive-dflash2 must be on or off'))
+    cli_cases.append((['--adaptive-dflash2'], 2, '--adaptive-dflash2 needs a value'))
+    cli_cases.append((['--help'], 0, '--adaptive-mtp=off'))
+    for value in ('on', 'off'):
+        cli_cases += [([f'--adaptive-mtp={value}', '--help'], 0, '--adaptive-mtp=off'),
+                      (['--adaptive-mtp', value, '--help'], 0, '--adaptive-mtp=off')]
+    for value in ('true', 'false', '1', '', 'ON'):
+        cli_cases.append(([f'--adaptive-mtp={value}'], 2, '--adaptive-mtp must be on or off'))
+    cli_cases.append((['--adaptive-mtp'], 2, '--adaptive-mtp needs a value'))
     cli_cases.append((['--help'], 0, 'default: bf16 for BF16 models, fp16 otherwise'))
     for value in ('fp32', 'fp16', 'bf16', 'fp8', 'bf8'):
         cli_cases.append((['--kv-cache-dtype', value, '--help'], 0, '--kv-cache-dtype TYPE'))

@@ -52,6 +52,9 @@ struct ServerOptions {
   // DFlash2 verifies the prefix of each draft block that DraftWidthPolicy
   // picks (true), or the whole block every step (false).
   bool adaptive_dflash2 = true;
+  // A sampled MTP request chains as deep as DraftWidthPolicy picks, up to
+  // runtime::kMaxMtpDepth (true), or mtp_depth every step (false).
+  bool adaptive_mtp = true;
   runtime::PrefillBatch prefill;
   // Where the served model and its draft came from, and what they run on, for
   // /v1/lse/model_info and /v1/lse/estimate. Those routes describe the loaded

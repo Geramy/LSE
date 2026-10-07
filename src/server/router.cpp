@@ -186,7 +186,7 @@ struct Outcome {
   std::uint32_t spec_steps = 0, spec_tested = 0, spec_accepted = 0;
   std::uint32_t spec_proposed = 0, spec_plain_steps = 0;
   double spec_mean_width = 0.0;
-  bool dflash2_adaptive = false;
+  bool spec_adaptive = false;
   std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
   std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint64_t spec_draft_ns = 0, spec_verify_ns = 0;
@@ -217,6 +217,8 @@ struct Router::Impl {
   // DFlash2's verify-width policy: what each width costs on this device and
   // how the draft's confidence maps to acceptance, kept across requests.
   runtime::DraftWidthPolicy widths;
+  // MTP's chain-depth and verify-width policy, likewise.
+  runtime::DraftWidthPolicy mtp_widths;
   // One model on one device. Two decodes at once would interleave on the same
   // KV pool, so requests queue here instead.
   std::mutex generate_lock;
@@ -378,7 +380,8 @@ struct Router::Impl {
   json served() const {
     const model::Config& c = model.config();
     json draft = nullptr;
-    if (mtp != nullptr) draft = {{"kind", "mtp"}, {"depth", opt.mtp_depth}};
+    if (mtp != nullptr)
+      draft = {{"kind", "mtp"}, {"depth", opt.mtp_depth}, {"adaptive", opt.adaptive_mtp}};
     if (dflash2 != nullptr)
       draft = {{"kind", "dflash2"},
                {"block_size", dflash2->block_size()},
@@ -580,6 +583,8 @@ struct Router::Impl {
         return LSE_ERROR(kInvalidArgument, "mtp_depth");
       }
       r.limits.mtp_depth = depth.get<std::uint32_t>();
+      // A request that names its depth gets that depth every step.
+      r.limits.adaptive_mtp = false;
     }
     if (!runtime::valid_mtp_depth(r.limits.mtp_depth)) {
       send_error(res, 400, "mtp_depth must be an integer from 1 to 7",
@@ -635,7 +640,7 @@ Result<Outcome> Router::Impl::generate(
   const std::uint64_t fallbacks_before = graph::cpu_fallback_sequence();
 
   runtime::Generator gen(impl.model, r.sampling, impl.opt.prefill);
-  if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp);
+  if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp, impl.opt.adaptive_mtp ? &impl.mtp_widths : nullptr);
   if (impl.dflash2 != nullptr)
     gen.use_dflash2(*impl.dflash2, impl.opt.adaptive_dflash2 ? &impl.widths : nullptr);
 
@@ -767,7 +772,7 @@ Result<Outcome> Router::Impl::generate(
   out.spec_proposed = st.spec_proposed;
   out.spec_plain_steps = st.spec_plain_steps;
   out.spec_mean_width = st.mean_verify_width();
-  out.dflash2_adaptive = st.dflash2_adaptive;
+  out.spec_adaptive = st.spec_adaptive;
   out.spec_tested_by_position = st.spec_tested_by_position;
   out.spec_accepted_by_position = st.spec_accepted_by_position;
   out.spec_overlap_sum = st.spec_overlap_sum;
@@ -852,7 +857,7 @@ json timings_of(const Outcome& o) {
          {"predicted_per_second", o.decode_per_second}};
   t["mtp_depth"] = o.mtp_depth;
   t["dflash2_depth"] = o.dflash2_depth;
-  if (o.dflash2_depth != 0) t["dflash2_adaptive"] = o.dflash2_adaptive;
+  if (o.mtp_depth != 0 || o.dflash2_depth != 0) t["spec_adaptive"] = o.spec_adaptive;
   t["spec_method"] = o.dflash2_depth != 0 ? "dflash2"
                        : o.mtp_depth != 0 ? "mtp" : "none";
   o.jit.append_to(t);
@@ -1142,7 +1147,8 @@ Status Router::prepare_kernels() {
                 detail::request_sampling(json::object(),
                                          impl_->model.config().sampling_defaults));
   runtime::Generator gen(impl_->model, sampling, impl_->opt.prefill);
-  if (impl_->mtp != nullptr) gen.use_mtp(*impl_->mtp);
+  if (impl_->mtp != nullptr)
+    gen.use_mtp(*impl_->mtp, impl_->opt.adaptive_mtp ? &impl_->mtp_widths : nullptr);
   if (impl_->dflash2 != nullptr)
     gen.use_dflash2(*impl_->dflash2, impl_->opt.adaptive_dflash2 ? &impl_->widths : nullptr);
   return gen.prepare_kernels();
@@ -1222,7 +1228,8 @@ RouteReply Router::handle(std::string_view method, std::string_view path,
                             {"dflash2_enabled", impl.dflash2 != nullptr},
                             {"dflash2_depth", impl.dflash2 != nullptr
                                                  ? runtime::dflash2_verify_depth(impl.dflash2->block_size()) : 0},
-                            {"dflash2_adaptive", impl.dflash2 != nullptr && impl.opt.adaptive_dflash2}});
+                            {"dflash2_adaptive", impl.dflash2 != nullptr && impl.opt.adaptive_dflash2},
+                            {"mtp_adaptive", impl.mtp != nullptr && impl.opt.adaptive_mtp}});
       return res;
     }
     if (method == "GET" && path == "/v1/models") {

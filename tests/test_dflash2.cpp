@@ -343,31 +343,6 @@ LSE_TEST(dflash2_selector_follows_predecessor_conditioned_scores) {
   auto poison = scores; poison[1] = std::numeric_limits<float>::quiet_NaN();
   LSE_EXPECT(!model::dflash2_select_path(poison, candidates, 3, 2).ok());
 }
-LSE_TEST(dflash2_greedy_path_conditionals_follow_the_chosen_predecessor) {
-  // The walk's own choice at each position picks the next position's score
-  // row; each conditional is that row's softmax over the candidates.
-  const std::vector<std::uint32_t> candidates{10,11,20,21,30,31};
-  const std::vector<float> scores{0,2,0,2, 10,0,0,10, 1,0,0,1};
-  auto path = model::dflash2_select_path(scores, candidates, 3, 2);
-  LSE_EXPECT(path.ok()); if (!path.ok()) return;
-  auto q = model::dflash2_path_conditionals(scores, candidates, *path, 2);
-  LSE_EXPECT(q.ok()); if (!q.ok()) return;
-  LSE_EXPECT_EQ(q->size(), 3u);
-  const double sigmoid2 = 1.0 / (1.0 + std::exp(-2.0));
-  const double sigmoid10 = 1.0 / (1.0 + std::exp(-10.0));
-  const double sigmoid1 = 1.0 / (1.0 + std::exp(-1.0));
-  // Position 0 reads the anchor row (0, 2); position 1 the row of candidate
-  // 11 (0, 10); position 2 the row of candidate 21 (0, 1).
-  LSE_EXPECT_NEAR((*q)[0].probability(11), sigmoid2, 1e-12);
-  LSE_EXPECT_NEAR((*q)[1].probability(21), sigmoid10, 1e-12);
-  LSE_EXPECT_NEAR((*q)[2].probability(31), sigmoid1, 1e-12);
-  LSE_EXPECT_NEAR((*q)[2].probability(30), 1.0 - sigmoid1, 1e-12);
-  // A path the lattice could not have produced is refused.
-  const std::vector<std::uint32_t> stranger{11, 99, 31};
-  LSE_EXPECT(!model::dflash2_path_conditionals(scores, candidates, stranger, 2).ok());
-  LSE_EXPECT(!model::dflash2_path_conditionals(scores, std::span(candidates).first(4),
-                                               *path, 2).ok());
-}
 LSE_TEST(dflash2_attention_exposes_future_block_and_slides_only_context) {
   const float nan = std::numeric_limits<float>::quiet_NaN();
   const std::vector<float> q(2*3*2, 0.0f);

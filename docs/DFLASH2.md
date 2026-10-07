@@ -16,9 +16,11 @@ model verifies proposals and determines every emitted token.
 ```
 
 Conditional draft selection uses the request's sampling settings. The target
-verifies all seven proposals with probability-ratio rejection and residual
-sampling. Greedy requests retain deterministic draft selection. DFlash2 remains
-opt-in. Current matched results and limits are in the
+verifies proposals with probability-ratio rejection and residual sampling; a
+sampled request verifies, each step, the prefix of the draft block expected to
+decode fastest (see [adaptive verify width](#adaptive-verify-width)). Greedy
+requests retain deterministic draft selection and verify all seven proposals.
+DFlash2 remains opt-in. Current matched results and limits are in the
 [final mode comparison](benchmarks/forward-modes-final-2026-09-29.md).
 
 ```sh
@@ -72,12 +74,77 @@ Target feature taps are post-block outputs at zero-based layers
 
 Every draft evaluates the complete trained block of eight positions: one anchor
 and seven mask tokens. Returning a shorter prefix preserves that computation.
-The target verifier consumes the anchor plus all seven proposals. Health and
-timing fields report depth seven; the trained draft block remains eight positions.
+The target verifier consumes the anchor plus up to seven proposals (all seven
+for greedy requests and with `--adaptive-dflash2=off`). Health and timing
+fields report depth seven; the trained draft block remains eight positions.
 Attention is noncausal within the draft block, including future mask positions;
 context keys obey the 2048-position sliding window. Learned dynamic convolutions
 have two taps and groups of 16 channels. The selector conditions each choice on
 its predecessor using top-16 candidates and rank-256 codebooks.
+
+## Adaptive verify width
+
+A verify pass costs more the more rows it carries, and a proposal behind a
+likely rejection rarely pays for its row. With `--adaptive-dflash2=on` (the
+default; `lse_config.adaptive_dflash2`), each step of a sampled request
+verifies the prefix of the draft block that maximizes expected tokens per
+second (`src/runtime/draft_width.cpp`):
+
+- **Acceptance estimate.** Proposal j's chance of acceptance, given the ones
+  before it were accepted, comes from the draft's own conditional
+  distribution at j: its largest probability, mapped through a calibration
+  table (20 bins) that learns from every proposal the target checks how often
+  proposals of that confidence are accepted. Old observations fade (half
+  weight after 512 more checks, about one 640-token request), so the table
+  follows the text.
+- **Costs.** The wall time of each verify width (1 to 8 rows) and of a draft
+  is measured on the device for this model; the first steps of a process
+  visit every width twice, and each width is measured again every 4,096
+  steps. A shared level follows the context length, and a per-width offset
+  holds what the extra rows cost. Nothing is hard-coded, so each GPU tunes
+  itself. On the R9700 the curve is far from linear: the 1, 2, 4 and 8-row
+  passes take 31.4, 35.0, 34.2 and 38.7 ms, the 3, 5, 6 and 7-row passes
+  48.5, 75.5, 52.7 and 89.4 ms (640-token essay, warm), so the policy settles
+  on 1, 4 or 8 rows.
+- **Stopping rule.** Proposal j is verified when some prefix ending at or
+  after j adds more expected tokens per added nanosecond than the long-run
+  rate; positions after j enter at their mean acceptance, not their own
+  confidence. Whether proposal j is verified therefore depends only on the
+  draft's distributions up to j, never on token j itself, so every verified
+  proposal is still a sample of the draft's conditional and rejection
+  sampling keeps the target's distribution exactly.
+  `a_draft_side_stopping_rule_keeps_the_target_distribution` in
+  `tests/test_runtime.cpp` checks this on a two-position example.
+- **Skipping the draft.** When drafting is expected to lose to a plain
+  one-row step, the next steps skip the draft, with a probing draft every
+  eight plain steps. The draft keeps no state between drafts beyond its
+  context ring, and every verify pass, plain or not, appends its verified
+  rows to that ring, so a skipped draft leaves nothing to repair.
+
+Greedy requests always verify all seven proposals. The target's logits differ
+in their last bits between pass widths (the GEMM shape and the Gated DeltaNet
+chunking follow the rows of a pass), so a different width can flip a near-tie
+between two tokens; master's greedy DFlash2 output already differs from plain
+decoding for the same reason. Verifying the whole block keeps greedy output
+byte-identical whatever the policy has learned.
+
+Verify passes of different widths alternate without rebuilding: a retained
+pass whose chain predecessor did not just run takes the carried state of the
+pass that did by exchanging buffers (`graph::Program::adopt_carries`). Before
+this, every width change rebuilt the pass (about 25 ms).
+
+Timings report `spec_proposed` (proposals the passes carried), `spec_tested`
+(proposals the target checked before the first rejection), `spec_accepted`,
+`spec_mean_width` (rows per pass), `spec_plain_steps` (passes with no
+proposals) and `dflash2_adaptive`. Acceptance rate is accepted over tested;
+with a shorter prefix fewer of the doubtful proposals are tested at all, so
+compare accepted over proposed as well.
+
+DSpark ([arXiv 2607.05147](https://huggingface.co/papers/2607.05147))
+schedules verify prefixes the same way, from a learned confidence head and a
+profiled width curve.
+
+ADAPTIVE_RESULTS
 
 ## Automatic Q8 conversion
 

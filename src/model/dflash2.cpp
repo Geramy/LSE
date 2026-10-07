@@ -6,9 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
-#include <limits>
 #include <map>
-#include <tuple>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -267,41 +265,6 @@ Result<DFlash2Proposal> dflash2_sample_path(
   return result;
 }
 
-Result<std::vector<runtime::DiscreteDistribution>> dflash2_path_conditionals(
-    std::span<const float> scores, std::span<const std::uint32_t> candidates,
-    std::span<const std::uint32_t> path, std::uint32_t top_k) {
-  const auto positions = static_cast<std::uint32_t>(path.size());
-  if (positions == 0 || top_k == 0 ||
-      candidates.size() != static_cast<std::size_t>(positions) * top_k ||
-      scores.size() != static_cast<std::size_t>(positions) * top_k * top_k)
-    return LSE_ERROR(kInvalidArgument, "invalid DFlash2 candidate lattice");
-  std::vector<runtime::DiscreteDistribution> out(positions);
-  std::uint32_t predecessor = 0;
-  for (std::uint32_t p = 0; p < positions; ++p) {
-    const auto row = scores.subspan((static_cast<std::size_t>(p) * top_k + predecessor) * top_k, top_k);
-    const auto ids = candidates.subspan(static_cast<std::size_t>(p) * top_k, top_k);
-    auto& q = out[p];
-    q.ids.assign(ids.begin(), ids.end());
-    q.probabilities.resize(top_k);
-    double maximum = -std::numeric_limits<double>::infinity();
-    for (std::uint32_t k = 0; k < top_k; ++k) {
-      if (!std::isfinite(row[k])) return LSE_ERROR(kInvalidArgument, "nonfinite DFlash2 selector score");
-      maximum = std::max(maximum, static_cast<double>(row[k]));
-    }
-    double total = 0;
-    for (std::uint32_t k = 0; k < top_k; ++k) {
-      q.probabilities[k] = std::exp(static_cast<double>(row[k]) - maximum);
-      total += q.probabilities[k];
-    }
-    for (auto& probability : q.probabilities) probability /= total;
-    const auto chosen = std::find(ids.begin(), ids.end(), path[p]);
-    if (chosen == ids.end())
-      return LSE_ERROR(kInternal, "DFlash2 path token is not a candidate of its position");
-    predecessor = static_cast<std::uint32_t>(chosen - ids.begin());
-  }
-  return out;
-}
-
 Array dflash2_convolve(const Array& hidden, const Array& dynamic,
                        const Array& base, std::int32_t group_size) {
   if (!hidden.valid() || !dynamic.valid() || !base.valid() || hidden.shape().rank() != 3 ||
@@ -342,19 +305,12 @@ struct DFlash2Module::Impl {
     std::vector<graph::NodePtr> roots;
   };
   std::map<std::int64_t, ContextPass> contexts;
-  // Keyed by (positions, sampled, scored): a scored greedy pass also brings
-  // back the lattice its walk chose from.
-  std::map<std::tuple<std::uint32_t, bool, bool>, DraftPass> drafts;
+  std::map<std::pair<std::uint32_t, bool>, DraftPass> drafts;
 
   Status load(WeightBinder& binder);
   Result<ContextPass> context_pass(std::int64_t rows);
-  Result<DraftPass> draft_pass(std::uint32_t head_rows, std::uint32_t proposals, bool sampled,
-                               bool scored);
-  Result<DraftPass*> run_draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals,
-                               bool sampled, bool scored);
-  // The pass's selector scores and candidate ids, on the host.
-  Status read_lattice(const DraftPass& pass, std::vector<float>* scores,
-                      std::vector<std::uint32_t>* ids) const;
+  Result<DraftPass> draft_pass(std::uint32_t head_rows, std::uint32_t proposals, bool sampled);
+  Result<DraftPass*> run_draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals, bool sampled);
   Result<Array> attention(Array x, Layer& layer, const DraftPass& pass);
   std::pair<Array, Array> prepare(Array x, const Conv& conv) const;
 };
@@ -455,7 +411,7 @@ Result<Array> DFlash2Module::Impl::attention(Array x, Layer& l, const DraftPass&
   return graph::linear(ops::merge_heads(attended), l.o);
 }
 Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
-    std::uint32_t head_rows, std::uint32_t proposals, bool sampled, bool scored) {
+    std::uint32_t head_rows, std::uint32_t proposals, bool sampled) {
   DraftPass p;
   const auto rows = static_cast<std::int64_t>(config.block_size);
   LSE_ASSIGN_OR(p.inputs, slot(Shape{rows + 5}));
@@ -492,20 +448,17 @@ Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
   Array gate = graph::reshape(graph::linear(x, selector_projection), Shape{1, proposals, rank});
   LSE_ASSIGN_OR(p.scores, graph::custom("dflash2.selector", {pred, gate, succ, unary},
       {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(top), static_cast<float>(rank)}));
-  if (sampled || scored) {
+  if (sampled) {
     // Scores and candidate ids reach the host in one buffer, one read.
     p.lattice = graph::concat(
         {graph::reshape(p.scores, Shape{static_cast<std::int64_t>(p.scores.shape().elem_count())}),
          graph::reshape(p.indices, Shape{static_cast<std::int64_t>(p.indices.shape().elem_count())})}, 0);
     if (!p.lattice.valid()) return LSE_ERROR(kInternal, "DFlash2 lattice concat failed");
-  }
-  if (sampled) {
     p.roots = {p.lattice.node()};
   } else {
     LSE_ASSIGN_OR(p.path, graph::custom("dflash2.selector_walk.v1", {p.scores, p.indices},
         {static_cast<float>(proposals), static_cast<float>(top), static_cast<float>(config.vocab_size), 0.0f}));
     p.roots = {p.path.node()};
-    if (scored) p.roots.push_back(p.lattice.node());
   }
   return p;
 }
@@ -643,27 +596,23 @@ Status DFlash2Module::prepare_kernels(std::span<const std::int64_t> context_widt
   }
   const auto block = impl_->config.block_size;
   const auto output = dispatch::dflash2_output_plan(block, block - 1);
-  for (const auto& [sampled, scored] : {std::pair(false, false), std::pair(false, true),
-                                         std::pair(true, true)}) {
-    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(output.head_rows, output.selector_positions,
-                                               sampled, scored));
+  for (const bool sampled : {false, true}) {
+    LSE_ASSIGN_OR(auto pass, impl_->draft_pass(output.head_rows, output.selector_positions, sampled));
     LSE_RETURN_IF_ERROR(scheduler->prepare(pass.roots));
   }
   return OkStatus();
 }
 
-Result<DFlash2Module::Impl::DraftPass*> DFlash2Module::Impl::run_draft(
-    std::uint32_t anchor, std::int32_t first, std::uint32_t proposals, bool sampled, bool scored) {
+Result<DFlash2Module::Impl::DraftPass*> DFlash2Module::Impl::run_draft(std::uint32_t anchor, std::int32_t first, std::uint32_t proposals, bool sampled) {
   if (anchor >= static_cast<std::uint32_t>(config.vocab_size) || first != position ||
       live <= 0 || proposals == 0 || proposals >= config.block_size ||
       static_cast<std::int64_t>(first) + proposals >= max_position)
     return LSE_ERROR(kInvalidArgument, "invalid DFlash2 draft request");
   const auto output = dispatch::dflash2_output_plan(config.block_size, proposals);
-  const auto key = std::tuple(output.selector_positions, sampled, sampled || scored);
+  const auto key = std::pair(output.selector_positions, sampled);
   auto it = drafts.find(key);
   if (it == drafts.end()) {
-    LSE_ASSIGN_OR(auto pass, draft_pass(output.head_rows, output.selector_positions, sampled,
-                                        scored));
+    LSE_ASSIGN_OR(auto pass, draft_pass(output.head_rows, output.selector_positions, sampled));
     it = drafts.emplace(key, std::move(pass)).first;
   }
   auto& pass = it->second;
@@ -691,41 +640,9 @@ Result<DFlash2Module::Impl::DraftPass*> DFlash2Module::Impl::run_draft(
   return &pass;
 }
 
-Status DFlash2Module::Impl::read_lattice(const DraftPass& pass, std::vector<float>* scores,
-                                         std::vector<std::uint32_t>* ids) const {
-  const auto positions = config.block_size - 1;
-  const auto top = static_cast<std::uint32_t>(config.selector_top_k);
-  const auto score_count = pass.scores.shape().elem_count();
-  const auto id_count = pass.indices.shape().elem_count();
-  if (!pass.lattice.valid() ||
-      score_count < static_cast<std::size_t>(positions) * top * top ||
-      id_count < static_cast<std::size_t>(positions) * top ||
-      pass.lattice.shape().elem_count() != score_count + id_count)
-    return LSE_ERROR(kInternal, "DFlash2 lattice does not hold every candidate");
-  std::vector<float> lattice(score_count + id_count);
-  {
-    DraftProfile profile("lattice-readback");
-    graph::Array source = pass.lattice;
-    LSE_RETURN_IF_ERROR(source.to_host(lattice.data(), lattice.size() * sizeof(float)));
-  }
-  scores->assign(lattice.begin(),
-      lattice.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(positions) * top * top));
-  ids->resize(static_cast<std::size_t>(positions) * top);
-  for (std::size_t i = 0; i < ids->size(); ++i) {
-    const float raw = lattice[score_count + i];
-    if (!std::isfinite(raw) || raw < 0 || raw >= static_cast<float>(config.vocab_size) ||
-        std::floor(raw) != raw)
-      return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
-    (*ids)[i] = static_cast<std::uint32_t>(raw);
-  }
-  return OkStatus();
-}
-
 Result<std::vector<std::uint32_t>> DFlash2Module::draft(
-    std::uint32_t anchor, std::int32_t first, std::uint32_t proposals,
-    std::vector<runtime::DiscreteDistribution>* conditionals) {
-  LSE_ASSIGN_OR(auto ready,
-                impl_->run_draft(anchor, first, proposals, false, conditionals != nullptr));
+    std::uint32_t anchor, std::int32_t first, std::uint32_t proposals) {
+  LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, proposals, false));
   auto& pass = *ready;
   const auto output = dispatch::dflash2_output_plan(impl_->config.block_size, proposals);
   std::vector<std::uint32_t> path(output.selector_positions + 1);
@@ -738,25 +655,36 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(
   if (validation & 1u) return LSE_ERROR(kInvalidArgument, "nonfinite DFlash2 selector score");
   if (validation != 0) return LSE_ERROR(kInternal, "invalid DFlash2 selector validation");
   path.resize(proposals);
-  if (conditionals != nullptr) {
-    std::vector<float> scores;
-    std::vector<std::uint32_t> ids;
-    LSE_RETURN_IF_ERROR(impl_->read_lattice(pass, &scores, &ids));
-    const auto top = static_cast<std::uint32_t>(impl_->config.selector_top_k);
-    LSE_ASSIGN_OR(*conditionals, dflash2_path_conditionals(
-        std::span(scores).first(static_cast<std::size_t>(proposals) * top * top),
-        std::span(ids).first(static_cast<std::size_t>(proposals) * top), path, top));
-  }
   return path;
 }
 Result<DFlash2Proposal> DFlash2Module::draft_sampled(
     std::uint32_t anchor, std::int32_t first, std::uint32_t proposals,
     float temperature, runtime::SpeculativeSampler& sampler) {
-  LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, proposals, true, true));
-  std::vector<float> scores;
-  std::vector<std::uint32_t> ids;
-  LSE_RETURN_IF_ERROR(impl_->read_lattice(*ready, &scores, &ids));
+  LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, proposals, true));
+  const auto positions = impl_->config.block_size - 1;
   const auto top = static_cast<std::uint32_t>(impl_->config.selector_top_k);
+  const auto score_count = ready->scores.shape().elem_count();
+  const auto id_count = ready->indices.shape().elem_count();
+  if (score_count < static_cast<std::size_t>(positions) * top * top ||
+      id_count < static_cast<std::size_t>(positions) * top ||
+      ready->lattice.shape().elem_count() != score_count + id_count)
+    return LSE_ERROR(kInternal, "DFlash2 lattice does not hold every candidate");
+  std::vector<float> lattice(score_count + id_count);
+  {
+    DraftProfile profile("lattice-readback");
+    LSE_RETURN_IF_ERROR(ready->lattice.to_host(lattice.data(), lattice.size() * sizeof(float)));
+  }
+  std::vector<float> scores(lattice.begin(),
+      lattice.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(positions) * top * top));
+  std::vector<float> raw_ids(lattice.begin() + static_cast<std::ptrdiff_t>(score_count),
+      lattice.begin() + static_cast<std::ptrdiff_t>(score_count + static_cast<std::size_t>(positions) * top));
+  std::vector<std::uint32_t> ids(raw_ids.size());
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (!std::isfinite(raw_ids[i]) || raw_ids[i] < 0 ||
+        raw_ids[i] >= impl_->config.vocab_size || std::floor(raw_ids[i]) != raw_ids[i])
+      return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
+    ids[i] = static_cast<std::uint32_t>(raw_ids[i]);
+  }
   return dflash2_sample_path(std::span(scores).first(static_cast<std::size_t>(proposals) * top * top),
       std::span(ids).first(static_cast<std::size_t>(proposals) * top), proposals,
       top, impl_->config.vocab_size, temperature, sampler);

@@ -12,37 +12,46 @@ namespace {
 // at the acceptance the essay benchmark measured, and data takes over fast.
 constexpr double kPriorWeight = 2.0;
 constexpr double kPositionPrior = 0.6;
-// Old observations fade so the table follows the text being written: after
-// about this many checked proposals an observation weighs half as much.
-constexpr double kCalibrationDecay = 1.0 - 1.0 / 4096.0;
+// Old observations fade so the table follows the text being written (code
+// is accepted at confidences prose is not): an observation weighs half as
+// much after 512 more checked proposals, about one 640-token request.
+constexpr double kCalibrationDecay = 1.0 - 0.6931471805599453 / 512.0;
 // Cost tracking. The level follows the context quickly; a width's offset
 // (what its extra rows cost) changes slowly.
 constexpr double kBaseRate = 1.0 / 16.0;
 constexpr double kOffsetRate = 1.0 / 32.0;
 constexpr double kDraftRate = 1.0 / 16.0;
 constexpr double kRateRate = 1.0 / 32.0;
-constexpr double kValueRate = 1.0 / 4.0;
+// Slow on purpose: one weak draft says little about the next one, so drafting
+// stops only when drafts have been losing for a stretch.
+constexpr double kValueRate = 1.0 / 16.0;
 // One stalled step (a host hiccup, a clock change) moves an estimate by at
 // most this share of it.
 constexpr double kOutlierClamp = 0.25;
 
 double clamp_step(double residual, double scale) {
-  const double bound = kOutlierClamp * std::max(scale, 1.0);
+  // Scales below a millisecond clamp as one millisecond does.
+  const double bound = kOutlierClamp * std::max(scale, 1e6);
   return std::clamp(residual, -bound, bound);
 }
 }  // namespace
 
-double DraftWidthPolicy::acceptance(double confidence, bool sampled) const noexcept {
+std::size_t DraftWidthPolicy::bin_of(double confidence) noexcept {
   if (!(confidence >= 0.0)) confidence = 0.0;
-  const auto bin = std::min<std::size_t>(kBins - 1, static_cast<std::size_t>(confidence * kBins));
-  const double middle = (static_cast<double>(bin) + 0.5) / kBins;
-  const Bin& b = calibration_[sampled ? 1 : 0].bins[bin];
+  const double decades = -std::log10(std::max(1.0 - confidence, 1e-12));
+  return std::min<std::size_t>(kBins - 1, static_cast<std::size_t>(decades * kBinsPerDecade));
+}
+
+double DraftWidthPolicy::acceptance(double confidence) const noexcept {
+  const std::size_t bin = bin_of(confidence);
+  const double middle = 1.0 - std::pow(10.0, -(static_cast<double>(bin) + 0.5) / kBinsPerDecade);
+  const Bin& b = bins_[bin];
   return (b.accepted + kPriorWeight * middle) / (b.tested + kPriorWeight);
 }
 
-double DraftWidthPolicy::position_mean(std::uint32_t position, bool sampled) const noexcept {
+double DraftWidthPolicy::position_mean(std::uint32_t position) const noexcept {
   if (position >= kMaxProposals) return kPositionPrior;
-  const Bin& b = calibration_[sampled ? 1 : 0].positions[position];
+  const Bin& b = positions_[position];
   return (b.accepted + kPriorWeight * kPositionPrior) / (b.tested + kPriorWeight);
 }
 
@@ -63,12 +72,12 @@ std::uint32_t DraftWidthPolicy::exploring() const noexcept {
   return 0;
 }
 
-std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence, bool sampled,
+std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence,
                                           std::span<double> estimates) {
   const auto n = static_cast<std::uint32_t>(std::min<std::size_t>(confidence.size(), kMaxProposals));
   std::array<double, kMaxProposals> a{};
   for (std::uint32_t j = 0; j < n; ++j) {
-    a[j] = acceptance(confidence[j], sampled);
+    a[j] = acceptance(confidence[j]);
     if (j < estimates.size()) estimates[j] = a[j];
   }
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(n, rows - 1);
@@ -86,7 +95,7 @@ std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence, bo
     double gain = 0.0, chain = here;
     const double now = verify_ns(k + 1);
     for (std::uint32_t last = j; last < n; ++last) {
-      if (last > j) chain *= position_mean(last, sampled);
+      if (last > j) chain *= position_mean(last);
       gain += chain;
       const double cost = verify_ns(last + 2) - now;
       best = std::max(best, cost <= 0.0 ? std::numeric_limits<double>::infinity() : gain / cost);
@@ -113,17 +122,15 @@ bool DraftWidthPolicy::draft_next() {
 }
 
 void DraftWidthPolicy::observe_acceptance(double confidence, std::uint32_t position,
-                                          bool accepted, bool sampled) {
-  Calibration& c = calibration_[sampled ? 1 : 0];
-  for (Bin& b : c.bins) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
-  for (Bin& b : c.positions) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
-  if (!(confidence >= 0.0)) confidence = 0.0;
-  Bin& b = c.bins[std::min<std::size_t>(kBins - 1, static_cast<std::size_t>(confidence * kBins))];
+                                          bool accepted) {
+  for (Bin& b : bins_) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
+  for (Bin& b : positions_) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
+  Bin& b = bins_[bin_of(confidence)];
   b.tested += 1.0;
   b.accepted += accepted ? 1.0 : 0.0;
   if (position < kMaxProposals) {
-    c.positions[position].tested += 1.0;
-    c.positions[position].accepted += accepted ? 1.0 : 0.0;
+    positions_[position].tested += 1.0;
+    positions_[position].accepted += accepted ? 1.0 : 0.0;
   }
 }
 
@@ -150,10 +157,37 @@ void DraftWidthPolicy::observe_verify(std::uint32_t rows, std::uint64_t ns) {
   last_seen_[rows] = steps_;
 }
 
-void DraftWidthPolicy::observe_draft(std::uint64_t ns) {
+void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
+  if (depth > kMaxProposals) return;
   const auto t = static_cast<double>(ns);
-  if (draft_samples_++ == 0) draft_ns_ = t;
-  else draft_ns_ += kDraftRate * clamp_step(t - draft_ns_, draft_ns_);
+  double& d = draft_ns_[depth];
+  if (draft_samples_[depth]++ == 0) d = t;
+  else d += kDraftRate * clamp_step(t - d, d);
+}
+
+double DraftWidthPolicy::draft_ns(std::uint32_t depth) const noexcept {
+  return depth <= kMaxProposals ? draft_ns_[depth] : 0.0;
+}
+
+std::uint32_t DraftWidthPolicy::depth(std::uint32_t max) {
+  max = std::min(max, kMaxProposals);
+  if (const std::uint32_t rows = exploring(); rows != 0) return std::min(max, rows - 1);
+  const double rate_now = rate();
+  std::uint32_t best = 0;
+  double best_value = -std::numeric_limits<double>::infinity();
+  double gain = 0.0, chain = 1.0;
+  for (std::uint32_t d = 0; d <= max; ++d) {
+    if (d > 0) {
+      chain *= position_mean(d - 1);
+      gain += chain;
+    }
+    const double value = gain - rate_now * (draft_ns(d) + verify_ns(d + 1));
+    if (value > best_value) {
+      best_value = value;
+      best = d;
+    }
+  }
+  return best;
 }
 
 void DraftWidthPolicy::observe_step(std::uint32_t tokens, std::uint64_t ns) {
@@ -173,7 +207,7 @@ void DraftWidthPolicy::observe_draft_value(std::span<const double> estimates,
     chain *= estimates[j];
     gain += chain;
   }
-  const double cost = verify_ns(proposals + 1) - verify_ns(1) + draft_ns_;
+  const double cost = verify_ns(proposals + 1) - verify_ns(1) + draft_ns(kMaxProposals);
   const double value = gain - rate() * cost;
   if (!draft_value_known_) {
     draft_value_ = value;

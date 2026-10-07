@@ -71,9 +71,19 @@ class MtpModule {
       std::span<const float> hidden, std::span<const std::uint32_t> tokens,
       std::int32_t first, std::uint32_t depth);
 
+  // With `confidence` (and set_scored(true)), also each proposal's
+  // probability under the module: the largest softmax probability of its
+  // logit row, gathered on the device beside the picks and read with them.
   Result<std::vector<std::uint32_t>> draft_chain(
       const graph::Array& hidden, std::span<const std::uint32_t> tokens,
-      std::int32_t first, std::uint32_t depth);
+      std::int32_t first, std::uint32_t depth,
+      std::vector<double>* confidence = nullptr);
+
+  // Whether each pass also reduces its logit row to the pick's probability
+  // that draft_chain's `confidence` reads (two small launches per pass).
+  // Changing it drops the recorded passes.
+  void set_scored(bool scored);
+  [[nodiscard]] bool scored() const noexcept { return scored_; }
 
   // Attention-only state can discard a speculative suffix by live cursor.
   Status truncate(std::int32_t position);
@@ -107,7 +117,7 @@ class MtpModule {
   Result<std::vector<std::uint32_t>> draft_chain_impl(
       std::span<const float> hidden, const graph::Array* device_hidden,
       std::span<const std::uint32_t> tokens, std::int32_t first,
-      std::uint32_t depth);
+      std::uint32_t depth, std::vector<double>* confidence);
 
   std::string path_;
   // The parent's config with the module's own one-layer stack in it: the
@@ -120,8 +130,11 @@ class MtpModule {
   graph::Array fc_, pre_norm_hidden_, pre_norm_embedding_, final_norm_;
 
   MixerState state_;
-  // A chain's proposals, gathered on the device and read back once.
+  // A chain's proposals, gathered on the device and read back once: picks at
+  // [0, kChainSlots), their probabilities at [kChainSlots, 2 * kChainSlots).
+  static constexpr std::uint32_t kChainSlots = 8;
   graph::Array chain_picks_;
+  bool scored_ = false;
   std::int32_t position_ = 0;
   std::uint64_t revision_ = 0;
 
@@ -133,6 +146,9 @@ class MtpModule {
     graph::Array meta;     // kv::step_meta_elems(1) leaf, poked
     graph::Array pick;
     graph::Array last;     // [1, D]: the block's hidden for the drafted row
+    // [1]: the pick's softmax probability (softmax_top). Recorded only when
+    // the module is scored.
+    graph::Array top;
     std::int64_t rows = 0;
     graph::Node* keys = nullptr;
     graph::Node* values = nullptr;

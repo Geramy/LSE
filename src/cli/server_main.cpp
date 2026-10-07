@@ -60,6 +60,8 @@ void usage() {
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
       "                       beside the model, when the checkpoint has one)\n"
       "      --mtp-depth N    draft proposals per verifier pass (1..7, default 3)\n"
+      "      --adaptive-mtp=off  draft --mtp-depth proposals every step (on/off;\n"
+      "                       default on: sampled requests draft as deep as pays, up to 7)\n"
       "      --dflash2=on     use the DFlash2 block drafter (default off)\n"
       "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
       "      --adaptive-dflash2=off  verify every DFlash2 proposal each step (on/off;\n"
@@ -200,6 +202,16 @@ int main(int argc, char** argv) {
       dflash2_on = text == "on";
     }
     else if (a == "--dflash2-model") dflash2_model = value("--dflash2-model");
+    else if (a == "--adaptive-mtp" || a.starts_with("--adaptive-mtp=")) {
+      const std::string text = a == "--adaptive-mtp"
+                                  ? value("--adaptive-mtp")
+                                  : a.substr(std::string("--adaptive-mtp=").size());
+      if (text != "on" && text != "off") {
+        std::fputs("lse-server: --adaptive-mtp must be on or off\n", stderr);
+        return 2;
+      }
+      cfg.adaptive_mtp = text == "on" ? 1 : 0;
+    }
     else if (a == "--adaptive-dflash2" || a.starts_with("--adaptive-dflash2=")) {
       const std::string text = a == "--adaptive-dflash2"
                                   ? value("--adaptive-dflash2")

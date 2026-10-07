@@ -21,7 +21,11 @@
 // tokens before j, never on token j itself or anything after it. Under that
 // rule the proposal at every verified position is still a sample of the
 // draft's conditional there, so rejection sampling keeps the target's
-// distribution exactly, and greedy verification is unchanged.
+// distribution exactly. (DSpark, arXiv 2607.05147, schedules verify prefixes
+// the same way, from a learned confidence head and a profiled width curve.)
+//
+// Sampled requests use the policy; a greedy request verifies the whole block
+// (Generator::speculate says why).
 //
 // When even the best prefix is expected to lose to a plain decode step (one
 // row, no draft), the next steps skip the draft. The draft module keeps no
@@ -45,21 +49,23 @@ class DraftWidthPolicy {
   // Verify rows: the anchor and up to seven proposals.
   static constexpr std::uint32_t kMaxRows = 8;
   static constexpr std::uint32_t kMaxProposals = kMaxRows - 1;
-  // Calibration bins over the draft's top probability, [0, 1].
-  static constexpr std::size_t kBins = 20;
+  // Calibration bins over the draft's top probability c, a quarter decade of
+  // 1 - c each: [0, 0.44), [0.44, 0.68), ... [0.9, 0.944), ... up to
+  // 1 - 1e-6. Acceptance changes most between c = 0.9 and c = 0.9999.
+  static constexpr std::size_t kBins = 24;
+  static constexpr double kBinsPerDecade = 4.0;
+  [[nodiscard]] static std::size_t bin_of(double confidence) noexcept;
   // Observations of every verify width before the policy trusts its costs.
   static constexpr std::uint32_t kExploreSamples = 2;
   // Steps after which a width's cost is measured again.
   static constexpr std::uint64_t kRefreshSteps = 4096;
   // Skipped (draft-free) steps before a probing draft.
-  static constexpr std::uint32_t kProbeAfter = 8;
+  static constexpr std::uint32_t kProbeAfter = 4;
 
   // Proposals to verify, 0..confidence.size(): confidence[j] is the draft's
-  // top conditional probability at proposal j + 1. `sampled` selects the
-  // calibration table (sampled drafts and greedy drafts read their
-  // distributions at different temperatures). Fills `estimates` (when not
-  // empty) with the calibrated acceptance of each position.
-  [[nodiscard]] std::uint32_t proposals(std::span<const double> confidence, bool sampled,
+  // top conditional probability at proposal j + 1. Fills `estimates` (when
+  // not empty) with the calibrated acceptance of each position.
+  [[nodiscard]] std::uint32_t proposals(std::span<const double> confidence,
                                         std::span<double> estimates = {});
 
   // Whether the next step drafts at all. False means a plain step: one row,
@@ -67,12 +73,15 @@ class DraftWidthPolicy {
   [[nodiscard]] bool draft_next();
 
   // What the target said about a proposal of this confidence.
-  void observe_acceptance(double confidence, std::uint32_t position, bool accepted,
-                          bool sampled);
+  void observe_acceptance(double confidence, std::uint32_t position, bool accepted);
   // Wall time of a verify pass of `rows` rows, from its submission to the end
   // of its acceptance walk (prefix commit and context append included).
   void observe_verify(std::uint32_t rows, std::uint64_t ns);
-  void observe_draft(std::uint64_t ns);
+  // A draft of `depth` proposals. A DFlash2 draft costs the same at any
+  // depth (it always evaluates the whole block) and is recorded at the full
+  // depth; an MTP chain costs a pass per proposal, and depth 0 is the
+  // catch-up pass alone.
+  void observe_draft(std::uint64_t ns, std::uint32_t depth = kMaxProposals);
   // A whole step: tokens it emitted and its wall time, draft included.
   void observe_step(std::uint32_t tokens, std::uint64_t ns);
   // After a draft was verified with `estimates` for its chosen prefix of
@@ -82,11 +91,16 @@ class DraftWidthPolicy {
 
   // Estimated wall time of a verify pass of `rows` rows (0 until measured).
   [[nodiscard]] double verify_ns(std::uint32_t rows) const noexcept;
-  [[nodiscard]] double draft_ns() const noexcept { return draft_ns_; }
+  [[nodiscard]] double draft_ns(std::uint32_t depth = kMaxProposals) const noexcept;
+  // For a chained draft (MTP): how many proposals to draft before any of
+  // them exists, 0..max, maximizing expected tokens per second from each
+  // position's mean acceptance and the measured cost of each depth and verify
+  // width. proposals() then trims the verified prefix by confidence.
+  [[nodiscard]] std::uint32_t depth(std::uint32_t max);
   // Long-run tokens per nanosecond.
   [[nodiscard]] double rate() const noexcept;
   // Calibrated acceptance of a proposal of this confidence.
-  [[nodiscard]] double acceptance(double confidence, bool sampled) const noexcept;
+  [[nodiscard]] double acceptance(double confidence) const noexcept;
   // The width the next step must take to measure its cost, or 0 when every
   // width is measured and fresh.
   [[nodiscard]] std::uint32_t exploring() const noexcept;
@@ -95,21 +109,19 @@ class DraftWidthPolicy {
   struct Bin {
     double accepted = 0, tested = 0;
   };
-  struct Calibration {
-    std::array<Bin, kBins> bins{};
-    std::array<Bin, kMaxProposals> positions{};
-  };
-  [[nodiscard]] double position_mean(std::uint32_t position, bool sampled) const noexcept;
+  [[nodiscard]] double position_mean(std::uint32_t position) const noexcept;
 
-  std::array<Calibration, 2> calibration_{};  // [greedy, sampled]
+  // Acceptance by confidence, and by position (the mean the lookahead uses).
+  std::array<Bin, kBins> bins_{};
+  std::array<Bin, kMaxProposals> positions_{};
   // verify(m) = base_ + offset_[m]: one level that follows the context, and
   // per-width offsets that hold what the extra rows cost.
   double base_ = 0;
   std::array<double, kMaxRows + 1> offset_{};
   std::array<std::uint32_t, kMaxRows + 1> samples_{};
   std::array<std::uint64_t, kMaxRows + 1> last_seen_{};
-  double draft_ns_ = 0;
-  std::uint32_t draft_samples_ = 0;
+  std::array<double, kMaxRows> draft_ns_{};
+  std::array<std::uint32_t, kMaxRows> draft_samples_{};
   double rate_tokens_ = 0, rate_ns_ = 0;
   std::uint64_t steps_ = 0;
   // Expected tokens gained per drafted step minus what the draft and the

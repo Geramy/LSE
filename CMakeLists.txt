@@ -227,6 +227,7 @@ target_link_libraries(lse_graph PUBLIC lse_core lse_ir lse_backend_registry lse_
 # happens to lower them.
 add_library(lse_kernels
   src/kernels/argmax.cpp
+  src/kernels/softmax_top.cpp
   src/kernels/concat.cpp
   src/kernels/conv.cpp
   src/kernels/gather.cpp

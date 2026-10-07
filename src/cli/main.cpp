@@ -53,6 +53,7 @@ struct Options {
   bool no_mtp = false;
   bool dflash2 = false;
   bool adaptive_dflash2 = true;
+  bool adaptive_mtp = true;
   std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
@@ -107,6 +108,9 @@ void usage() {
       "                         .safetensors or an HF repo id. Default: the one\n"
       "                         beside the model, when the checkpoint has one\n"
       "      --mtp-depth N      draft proposals per verifier pass (1..7, default 3)\n"
+      "      --adaptive-mtp=off draft --mtp-depth proposals every step (on/off;\n"
+      "                         default on: sampled runs draft as deep as pays,\n"
+      "                         up to 7)\n"
       "      --dflash2=on       use the DFlash2 block drafter (default off)\n"
       "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
       "      --adaptive-dflash2=off  verify every DFlash2 proposal each step\n"
@@ -265,6 +269,17 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->dflash2 = v == "on";
     } else if (a == "--dflash2-model") {
       if (!take_value(argc, argv, i, "--dflash2-model", &opt->dflash2_model)) return false;
+    } else if (a == "--adaptive-mtp" || a.starts_with("--adaptive-mtp=")) {
+      if (a == "--adaptive-mtp") {
+        if (!take_value(argc, argv, i, "--adaptive-mtp", &v)) return false;
+      } else {
+        v = a.substr(std::string("--adaptive-mtp=").size());
+      }
+      if (v != "on" && v != "off") {
+        std::fputs("lse: --adaptive-mtp must be on or off\n", stderr);
+        return false;
+      }
+      opt->adaptive_mtp = v == "on";
     } else if (a == "--adaptive-dflash2" || a.starts_with("--adaptive-dflash2=")) {
       if (a == "--adaptive-dflash2") {
         if (!take_value(argc, argv, i, "--adaptive-dflash2", &v)) return false;
@@ -845,7 +860,7 @@ int main(int argc, char** argv) {
   }
   runtime::Generator gen(*lm, opt.sampling, opt.prefill);
   runtime::DraftWidthPolicy widths;
-  if (mtp != nullptr) gen.use_mtp(*mtp);
+  if (mtp != nullptr) gen.use_mtp(*mtp, opt.adaptive_mtp ? &widths : nullptr);
   if (dflash2 != nullptr) gen.use_dflash2(*dflash2, opt.adaptive_dflash2 ? &widths : nullptr);
   auto stream = tok->stream();
 
@@ -895,7 +910,7 @@ int main(int argc, char** argv) {
                  s.prompt_tokens_per_second(), s.generated_tokens,
                  s.decoded_tokens(), static_cast<double>(s.decode_ns) / 1e9,
                  s.decode_tokens_per_second(),
-                 s.mtp_depth, s.dflash2_depth, s.dflash2_adaptive ? " adaptive" : "",
+                 s.mtp_depth, s.dflash2_depth, s.spec_adaptive ? " adaptive" : "",
                  s.spec_steps, s.spec_accepted, s.spec_tested,
                  s.acceptance_rate() * 100.0, s.spec_proposed, s.mean_verify_width(),
                  s.spec_plain_steps,

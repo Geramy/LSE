@@ -44,13 +44,6 @@ Result<DFlash2Proposal> dflash2_sample_path(
     std::uint32_t positions, std::uint32_t top_k, std::uint32_t vocab_size,
     float temperature, runtime::SpeculativeSampler& sampler);
 
-// The selector's conditional distribution at each position of a greedy path:
-// the softmax (temperature 1) of the score row its predecessor selects, over
-// that position's candidates. The path must be the one the walk chose.
-Result<std::vector<runtime::DiscreteDistribution>> dflash2_path_conditionals(
-    std::span<const float> scores, std::span<const std::uint32_t> candidates,
-    std::span<const std::uint32_t> path, std::uint32_t top_k);
-
 // hidden [B,T,D], dynamic [B,T,2,D/group], base [2,D].
 graph::Array dflash2_convolve(const graph::Array& hidden,
                               const graph::Array& dynamic,
@@ -84,11 +77,9 @@ class DFlash2Module {
   void release_programs();
   Status retire_prefill();
 
-  // The greedy path. With `conditionals`, also the selector's distribution
-  // at each proposal (dflash2_path_conditionals), read in one small copy.
-  Result<std::vector<std::uint32_t>> draft(
-      std::uint32_t anchor, std::int32_t first, std::uint32_t proposals,
-      std::vector<runtime::DiscreteDistribution>* conditionals = nullptr);
+  Result<std::vector<std::uint32_t>> draft(std::uint32_t anchor,
+                                          std::int32_t first,
+                                          std::uint32_t proposals);
 
   Result<DFlash2Proposal> draft_sampled(std::uint32_t anchor,
       std::int32_t first, std::uint32_t proposals, float temperature,
