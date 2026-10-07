@@ -16,6 +16,11 @@ constexpr double kPositionPrior = 0.6;
 // is accepted at confidences prose is not): an observation weighs half as
 // much after 512 more checked proposals, about one 640-token request.
 constexpr double kCalibrationDecay = 1.0 - 0.6931471805599453 / 512.0;
+// Each position's mean acceptance decides how deep an MTP chain goes before
+// any proposal exists, so it has to follow a change of text within a request
+// (code to prose): half weight after 64 more checks, about 20 steps.
+constexpr double kPositionDecay = 1.0 - 0.6931471805599453 / 64.0;
+constexpr double kBiasRate = 0.1;
 // Cost tracking. The level follows the context quickly; a width's offset
 // (what its extra rows cost) changes slowly.
 constexpr double kBaseRate = 1.0 / 16.0;
@@ -46,7 +51,10 @@ double DraftWidthPolicy::acceptance(double confidence) const noexcept {
   const std::size_t bin = bin_of(confidence);
   const double middle = 1.0 - std::pow(10.0, -(static_cast<double>(bin) + 0.5) / kBinsPerDecade);
   const Bin& b = bins_[bin];
-  return (b.accepted + kPriorWeight * middle) / (b.tested + kPriorWeight);
+  const double p = std::clamp((b.accepted + kPriorWeight * middle) / (b.tested + kPriorWeight),
+                              1e-4, 1.0 - 1e-4);
+  if (bias_ == 0.0) return p;
+  return 1.0 / (1.0 + std::exp(-(std::log(p / (1.0 - p)) + bias_)));
 }
 
 double DraftWidthPolicy::position_mean(std::uint32_t position) const noexcept {
@@ -65,8 +73,11 @@ double DraftWidthPolicy::rate() const noexcept {
 }
 
 std::uint32_t DraftWidthPolicy::exploring() const noexcept {
+  std::uint32_t fewest = 0;
   for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows)
-    if (samples_[rows] < kExploreSamples) return rows;
+    if (samples_[rows] < kExploreSamples && (fewest == 0 || samples_[rows] < samples_[fewest]))
+      fewest = rows;
+  if (fewest != 0) return fewest;
   for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows)
     if (steps_ - last_seen_[rows] > kRefreshSteps) return rows;
   return 0;
@@ -123,8 +134,12 @@ bool DraftWidthPolicy::draft_next() {
 
 void DraftWidthPolicy::observe_acceptance(double confidence, std::uint32_t position,
                                           bool accepted) {
+  // One step of online logistic regression on the bias: it settles where the
+  // estimates are right on average, and at zero once the bins are.
+  const double predicted = acceptance(confidence);
+  bias_ = std::clamp(bias_ + kBiasRate * ((accepted ? 1.0 : 0.0) - predicted), -4.0, 4.0);
   for (Bin& b : bins_) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
-  for (Bin& b : positions_) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
+  for (Bin& b : positions_) { b.accepted *= kPositionDecay; b.tested *= kPositionDecay; }
   Bin& b = bins_[bin_of(confidence)];
   b.tested += 1.0;
   b.accepted += accepted ? 1.0 : 0.0;
@@ -148,9 +163,10 @@ void DraftWidthPolicy::observe_verify(std::uint32_t rows, std::uint64_t ns) {
   } else {
     const double predicted = base_ + offset_[rows];
     base_ += kBaseRate * clamp_step(t - predicted, predicted);
-    // While a width is being explored its offset is a plain average.
-    const double rate = samples_[rows] < kExploreSamples
-                            ? 1.0 / static_cast<double>(samples_[rows] + 1) : kOffsetRate;
+    // A width's first observations average; one seen rarely (a refresh
+    // every kRefreshSteps) keeps moving fast, so a sample taken while the
+    // clocks ramped does not price it for good.
+    const double rate = std::max(kOffsetRate, 1.0 / static_cast<double>(samples_[rows] + 1));
     offset_[rows] += rate * clamp_step(t - base_ - offset_[rows], predicted);
   }
   ++samples_[rows];

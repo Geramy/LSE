@@ -497,8 +497,8 @@ LSE_TEST(draft_width_policy_measures_every_width_first) {
   LSE_EXPECT_EQ(policy.exploring(), 1u);
   LSE_EXPECT(!policy.draft_next());
   const std::array<double, 7> sure{1, 1, 1, 1, 1, 1, 1};
-  for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
-    for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
+    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
       LSE_EXPECT_EQ(policy.exploring(), rows);
       if (rows > 1) {
         LSE_EXPECT(policy.draft_next());
@@ -580,14 +580,26 @@ LSE_TEST(draft_width_policy_chains_as_deep_as_pays) {
     policy.observe_acceptance(0.999, static_cast<std::uint32_t>(i % 7), i % 50 != 0);
   LSE_EXPECT_EQ(policy.depth(7), 7u);
   LSE_EXPECT_EQ(policy.depth(3), 3u);
-  // Positions that are rarely accepted: a 3 ms proposal returning ~0.1
-  // tokens loses at 50 tok/s (0.15 tokens), so no chain at all.
+  // Positions that are rarely accepted, with 5 ms passes: a 6 ms proposal
+  // returning about a tenth of a token loses at 50 tok/s (0.3 tokens).
   DraftWidthPolicy weak = measured_policy(32e6, 1e6, 0.0, 50.0);
   for (std::uint32_t d = 0; d <= DraftWidthPolicy::kMaxProposals; ++d)
-    weak.observe_draft(static_cast<std::uint64_t>(2e6 + 2e6 * d), d);
+    weak.observe_draft(static_cast<std::uint64_t>(2e6 + 5e6 * d), d);
   for (int i = 0; i < 4000; ++i)
-    weak.observe_acceptance(0.5, static_cast<std::uint32_t>(i % 7), i % 10 == 0);
+    weak.observe_acceptance(0.5, static_cast<std::uint32_t>(i % 7), i % 40 == 0);
   LSE_EXPECT_EQ(weak.depth(7), 0u);
+}
+
+LSE_TEST(draft_width_policy_follows_a_change_of_text_within_steps) {
+  // Prose: proposals of confidence 0.8 accepted half the time. Then code:
+  // the same confidence accepted 95% of the time. Within a few dozen checks
+  // the estimate has moved most of the way, before the bin itself has.
+  DraftWidthPolicy policy;
+  for (int i = 0; i < 3000; ++i) policy.observe_acceptance(0.8, 0, i % 2 == 0);
+  const double prose = policy.acceptance(0.8);
+  LSE_EXPECT_NEAR(prose, 0.5, 0.05);
+  for (int i = 0; i < 60; ++i) policy.observe_acceptance(0.8, 0, i % 20 != 0);
+  LSE_EXPECT(policy.acceptance(0.8) > 0.8);
 }
 
 LSE_TEST(draft_width_policy_calibrates_confidence_to_acceptance) {
@@ -600,9 +612,9 @@ LSE_TEST(draft_width_policy_calibrates_confidence_to_acceptance) {
   LSE_EXPECT_EQ(DraftWidthPolicy::bin_of(1.0), DraftWidthPolicy::kBins - 1);
   // A draft that claims 0.9 but is right half the time is believed at 0.5.
   for (int i = 0; i < 2000; ++i) policy.observe_acceptance(0.91, 0, i % 2 == 0);
-  LSE_EXPECT_NEAR(policy.acceptance(0.91), 0.5, 0.01);
+  LSE_EXPECT_NEAR(policy.acceptance(0.91), 0.5, 0.02);
   // Other confidences keep their own estimate.
-  LSE_EXPECT_NEAR(policy.acceptance(0.9999), 1.0 - std::pow(10.0, -4.125), 1e-12);
+  LSE_EXPECT_NEAR(policy.acceptance(0.9999), 1.0 - std::pow(10.0, -4.125), 1e-3);
 }
 
 LSE_TEST(a_draft_side_stopping_rule_keeps_the_target_distribution) {

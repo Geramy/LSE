@@ -55,10 +55,12 @@ class DraftWidthPolicy {
   static constexpr std::size_t kBins = 24;
   static constexpr double kBinsPerDecade = 4.0;
   [[nodiscard]] static std::size_t bin_of(double confidence) noexcept;
-  // Observations of every verify width before the policy trusts its costs.
+  // Observations of every verify width before the policy trusts its costs,
+  // taken round-robin so a clock ramp at the start of a process does not
+  // favor whichever widths come last.
   static constexpr std::uint32_t kExploreSamples = 2;
   // Steps after which a width's cost is measured again.
-  static constexpr std::uint64_t kRefreshSteps = 4096;
+  static constexpr std::uint64_t kRefreshSteps = 512;
   // Skipped (draft-free) steps before a probing draft.
   static constexpr std::uint32_t kProbeAfter = 4;
 
@@ -112,7 +114,11 @@ class DraftWidthPolicy {
   [[nodiscard]] double position_mean(std::uint32_t position) const noexcept;
 
   // Acceptance by confidence, and by position (the mean the lookahead uses).
+  // bias_ is a log-odds correction learned online with a short memory, so a
+  // change of text (prose to code) moves every estimate within a few steps
+  // while the bins catch up.
   std::array<Bin, kBins> bins_{};
+  double bias_ = 0;
   std::array<Bin, kMaxProposals> positions_{};
   // verify(m) = base_ + offset_[m]: one level that follows the context, and
   // per-width offsets that hold what the extra rows cost.
