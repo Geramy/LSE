@@ -438,12 +438,25 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         }
         continue;
       }
-      for (std::uint32_t w = 0; w < 4u; ++w) {
-        const auto word = e.let(st.bv[c][static_cast<int>(w)]);
-        const auto v =
-            kb.call<F16x8>("q4x8.f16", word, scale, bias);
-        store8(Bs, e.let(b_dst[c] + w * kCodesPerWord),
-               kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8));
+      const auto decode = [&] {
+        for (std::uint32_t w = 0; w < 4u; ++w) {
+          const auto word = e.let(st.bv[c][static_cast<int>(w)]);
+          const auto v =
+              kb.call<F16x8>("q4x8.f16", word, scale, bias);
+          store8(Bs, e.let(b_dst[c] + w * kCodesPerWord),
+                 kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8));
+        }
+      };
+      // A tile with fewer weight pieces than threads: only each piece's
+      // first thread decodes it; the repeats would write the same values
+      // and spend the step's VALU on it. Taken on the gfx11 generation,
+      // where it was measured (gfx1151, test_q4_gemm --gpu, 256 x 128 on
+      // 4 x 4 waves: M1024 N17408 K5120 5.48 -> 5.28 ms, N5120 K17408
+      // 6.05 -> 5.49 ms); RDNA4 keeps its form pending its own measurement.
+      if (kFrag == 16 && b_total % threads != 0u && c + 1u == b_pieces) {
+        if (auto first = e.when(lid + c * threads < b_total)) decode();
+      } else {
+        decode();
       }
     }
   };
