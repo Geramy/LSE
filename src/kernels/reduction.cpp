@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <type_traits>
 #include <array>
 #include <vector>
 
@@ -131,13 +132,18 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
           s.output.elem_count() <= static_cast<std::size_t>(kRmsCachedRows) * d &&
           s.device && s.device->wavefront_size == 32;
       std::vector<kir::Val<kir::f32>> row_values;
+      using GainT = std::remove_cvref_t<decltype(a.g[e.u32(0)])>;
+      std::vector<GainT> gains;
       if (cache_row) {
         // Retain decode inputs across the reduction without changing its order.
+        // The gains are read with the row, not after the reduction, so the
+        // store pass does not wait on a second round trip.
         for (std::uint32_t col = 0; col < d; col += kRmsBlock) {
-          const auto value = e.let(a.x[row + lane + col]);
-          row_values.push_back(value);
-          partial = math::fma(value, value, partial.read());
+          row_values.push_back(e.let(a.x[row + lane + col]));
+          gains.push_back(e.let(a.g[e.let(lane + col)]));
         }
+        for (const auto& value : row_values)
+          partial = math::fma(value, value, partial.read());
       } else {
         for (auto col : e.range(lane, e.u32(d), kRmsBlock)) {
           const auto value = e.let(a.x[row + col]);
@@ -166,7 +172,7 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
       if (cache_row) {
         for (std::uint32_t offset = 0; offset < d; offset += kRmsBlock) {
           const auto col = e.let(lane + offset);
-          const auto gain = math::widen(a.g[col]);
+          const auto gain = math::widen(gains[offset / kRmsBlock]);
           const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
           e.store(row + col, row_values[offset / kRmsBlock] * scale * weight);
         }
@@ -470,6 +476,118 @@ struct SiluL2NormKernel final : KernelPrimitive<SiluL2NormKernel> {
   }
 };
 LSE_REGISTER_PRIMITIVE(SiluL2NormKernel);
+
+// A decode row's q and k head norms in one launch: the leading `rows` heads
+// of D=128 columns of a [.., C] row (q then k, as the GDN conv lays them out),
+// one wave per head, and the first `scaled` of them times a constant. Each
+// head is l2_normalize.wave32.d128.m1.v1's arithmetic -- four squares per
+// lane added in order, the xor tree, 1 / max(sqrt, eps) -- and the scale is
+// the separate multiply that followed it, on the stored value.
+// attrs: eps, scale; iattrs: heads to scale. The output shape is the caller's.
+struct GdnQkL2NormKernel final : KernelPrimitive<GdnQkL2NormKernel> {
+  static constexpr std::string_view kName = "gdn.qk_l2norm.wave32.v1";
+  static constexpr std::string_view kEntry = "lse_gdn_qk_l2norm_wave32_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  static bool supported(const KernelShapes& s) {
+    if (s.inputs.size() != 1 || s.inputs[0].rank() < 1 || s.output.rank() < 2 ||
+        s.input_dtypes.empty() || s.input_dtypes[0] != DType::kF32 ||
+        s.output_dtype != DType::kF32 || !s.device || s.device->wavefront_size != kL2Wave ||
+        s.device->max_threads_per_workgroup < kL2Block || !s.intrinsics ||
+        !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f)
+      return false;
+    for (const auto symbol : {"wave.shfl_xor", "fma", "sqrt", "max"})
+      if (s.intrinsics->find(symbol).empty()) return false;
+    return last_dim(s.output) == kL2Head &&
+           s.output.elem_count() <= static_cast<std::uint64_t>(last_dim(s.inputs[0])) &&
+           s.inputs[0].elem_count() == static_cast<std::uint64_t>(last_dim(s.inputs[0])) &&
+           s.iattrs[0] >= 0 &&
+           static_cast<std::uint64_t>(s.iattrs[0]) * kL2Head <= s.output.elem_count();
+  }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!supported(s) || !s.store || !s.types.scalar) return {};
+    kir::KernelBody k(s.types, *s.intrinsics);
+    k.set_store(s.store);
+    L2NormArgs<env::Emit> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto local = e.let(math::local_id());
+    const auto lane = e.let(local % kL2Wave);
+    const auto head = e.let(math::workgroup_id_x() * (kL2Block / kL2Wave) + local / kL2Wave);
+    const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / kL2Head);
+    const auto row = e.let(head * kL2Head);
+    const auto safe_row = rows % (kL2Block / kL2Wave) == 0
+                              ? row
+                              : e.let(select(head < rows, row, e.u32((rows - 1u) * kL2Head)));
+    std::array<kir::Val<kir::f32>, kL2Head / kL2Wave> values;
+    auto partial = e.var(0.0f);
+    for (std::uint32_t j = 0; j < values.size(); ++j) {
+      values[j] = e.let(a.x[safe_row + lane + j * kL2Wave]);
+      partial = math::fma(values[j], values[j], partial.read());
+    }
+    auto sum = e.let(partial.read());
+    for (std::uint32_t mask = 1; mask < kL2Wave; mask <<= 1)
+      sum = e.let(sum + math::shfl_xor(sum, e.u32(mask)));
+    const auto inv = e.let(
+        e.f32(1.0f) / math::max(math::sqrt(sum), e.f32(s.attrs[0])));
+    const auto scaled = static_cast<std::uint32_t>(s.iattrs[0]);
+    for (std::uint32_t j = 0; j < values.size(); ++j) {
+      const auto normed = e.let(values[j] * inv);
+      const auto value = scaled == 0 ? normed
+          : e.let(select(safe_row < scaled * kL2Head, normed * e.f32(s.attrs[1]), normed));
+      e.store(e.let(safe_row + lane + j * kL2Wave), value);
+    }
+    return k.str();
+  }
+  bool has_typed_host_impl() const noexcept override { return true; }
+  Status eval_cpu_typed(std::span<const HostTensorView> in, HostOutputView out,
+                        const std::array<float, 4>& attrs,
+                        const std::array<std::int32_t, 4>& iattrs) const override {
+    if (in.size() != 1 || in[0].dtype != DType::kF32 || out.dtype != DType::kF32 ||
+        out.shape.rank() < 2 || last_dim(out.shape) != kL2Head ||
+        in[0].bytes.size() < out.shape.elem_count() * 4 ||
+        out.bytes.size() < out.shape.elem_count() * 4 || iattrs[0] < 0)
+      return LSE_ERROR(kInvalidArgument, "gdn.qk_l2norm.wave32.v1: invalid host storage");
+    const auto* x = reinterpret_cast<const float*>(in[0].bytes.data());
+    auto* y = reinterpret_cast<float*>(out.bytes.data());
+    const std::size_t rows = out.shape.elem_count() / kL2Head;
+    for (std::size_t row = 0; row < rows; ++row) {
+      std::array<float, kL2Wave> lanes{};
+      for (std::size_t l = 0; l < kL2Wave; ++l)
+        for (std::size_t j = 0; j < kL2Head / kL2Wave; ++j) {
+          const float v = x[row * kL2Head + l + j * kL2Wave];
+          lanes[l] = std::fma(v, v, lanes[l]);
+        }
+      for (std::size_t mask = 1; mask < kL2Wave; mask <<= 1) {
+        const auto previous = lanes;
+        for (std::size_t l = 0; l < kL2Wave; ++l) lanes[l] = previous[l] + previous[l ^ mask];
+      }
+      const float inv = 1.0f / std::max(std::sqrt(lanes[0]), attrs[0]);
+      for (std::size_t c = 0; c < kL2Head; ++c) {
+        float value = x[row * kL2Head + c] * inv;
+        if (row < static_cast<std::size_t>(iattrs[0])) value = value * attrs[1];
+        y[row * kL2Head + c] = value;
+      }
+    }
+    return OkStatus();
+  }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 1) return LSE_ERROR(kInvalidArgument, "qk_l2norm takes 1 input");
+    return in[0];
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    const auto rows = static_cast<std::uint32_t>(s.output.elem_count() / kL2Head);
+    constexpr std::uint32_t per_block = kL2Block / kL2Wave;
+    tp.workgroup_size[0] = kL2Block;
+    tp.workgroup_count[0] = (rows + per_block - 1u) / per_block;
+    return tp;
+  }
+};
+LSE_REGISTER_PRIMITIVE(GdnQkL2NormKernel);
 
 struct L2NormKernel final : KernelPrimitive<L2NormKernel> {
   static constexpr std::string_view kName = "l2_normalize";

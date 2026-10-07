@@ -913,6 +913,9 @@ Status eval_rope(Node& n) {
   const std::size_t rank = x.shape.rank();
   const auto dim = static_cast<std::size_t>(x.shape.dim(rank - 1));
   const auto seq = static_cast<std::size_t>(x.shape.dim(rank - 2));
+  const std::size_t rot = n.iattrs[1] > 0 ? static_cast<std::size_t>(n.iattrs[1]) : dim;
+  if (rot > dim || rot % 2 != 0)
+    return LSE_ERROR(kInvalidArgument, "rope rotates more channels than a row holds");
   const std::size_t rows = x.element_count() / dim;
   const auto batch = static_cast<std::size_t>(x.shape.dim(0));
   const std::size_t rows_per_batch = batch == 0 ? rows : rows / batch;
@@ -936,14 +939,16 @@ Status eval_rope(Node& n) {
                              static_cast<std::size_t>(kv::kStepMetaPerRow)))
                : offset;
     const std::size_t t = row_off + (r % seq);
-    for (std::size_t d = 0; d + 1 < dim; d += 2) {
-      const float c = load_element(cos, t * dim + d);
-      const float s = load_element(sin, t * dim + d);
+    for (std::size_t d = 0; d + 1 < rot; d += 2) {
+      const float c = load_element(cos, t * rot + d);
+      const float s = load_element(sin, t * rot + d);
       const float a = load_element(x, r * dim + d);
       const float b = load_element(x, r * dim + d + 1);
       store_element(n, r * dim + d, a * c - b * s);
       store_element(n, r * dim + d + 1, b * c + a * s);
     }
+    for (std::size_t d = rot; d < dim; ++d)
+      store_element(n, r * dim + d, load_element(x, r * dim + d));
   }
   return OkStatus();
 }

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <span>
 #include <string>
+#include <type_traits>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/kernels/lds_linear.hpp"
@@ -305,6 +306,8 @@ opt::TrafficModel traffic_at(const KernelShapes& s, const QuantDims& d,
   return m;
 }
 constexpr std::uint32_t kMaxRowsPerGroup = 8;
+// Most weight runs a decode lane issues before it accumulates the first.
+constexpr std::uint32_t kPrefetchRuns = 8;
 std::uint32_t rows_per_group(const KernelShapes& s, const QuantDims& d,
                              bool indexed) {
   const auto exact_rows = q6_prefill_rows(s, d, indexed);
@@ -462,6 +465,103 @@ void stage_dot_acts_all(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
   }
   e.barrier();
 }
+// stage_dot_acts_all for one k split, in two phases: `fetch` issues every
+// activation read a thread makes, `finish` quantizes and stores what they
+// returned. The decode body issues its weight reads between the two, so the
+// activation reads -- issued first -- are the ones the staging waits on.
+// Same values, same order, same scratch layout as stage_dot_acts_all.
+struct SplitStage {
+  std::uint32_t steps = 0;
+  std::vector<std::vector<std::array<kir::Val<kir::f32>, quant::kDot4ChunkCodes>>> v;
+};
+template <class A>
+SplitStage stage_dot_acts_fetch(env::Emit& e, const A& a,
+                                const kir::Tile<kir::f32>* xs,
+                                const kir::Val<kir::u32>& row,
+                                std::uint32_t rows, std::uint32_t m_rows,
+                                const kir::Val<kir::u32>& lid,
+                                std::uint32_t chunk_end, std::uint32_t max_bytes,
+                                std::uint32_t k, bool staged_row) {
+  constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
+  const std::uint32_t wide = row_pack(kCodes, max_bytes, 4);
+  SplitStage out;
+  out.steps = (chunk_end + kBlock - 1) / kBlock;
+  for (std::uint32_t step = 0; step < out.steps; ++step) {
+    // A thread past the last chunk reads the last chunk; finish never
+    // stores it.
+    const auto c = e.let(lid + step * kBlock);
+    const auto safe_c = (step + 1u) * kBlock <= chunk_end
+                            ? c
+                            : e.let(select(c < chunk_end, c, e.u32(chunk_end - 1u)));
+    std::vector<std::array<kir::Val<kir::f32>, kCodes>> v(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      const auto x_base =
+          e.let(staged_row ? e.u32(0)
+                           : e.let(math::min(row + r, e.u32(m_rows - 1)) * k));
+      const auto base = e.let(x_base + safe_c * kCodes);
+      if (xs != nullptr) {
+        for (std::uint32_t j = 0; j < kCodes; ++j)
+          v[r][j] = e.let((*xs)[e.let(base + j)].read());
+      } else {
+        for (std::uint32_t j = 0; j < kCodes; j += wide) {
+          const auto pack = e.load(a.x, e.let(base + j), max_bytes);
+          for (std::uint32_t t = 0; t < wide; ++t) v[r][j + t] = e.let(pack[t]);
+        }
+      }
+    }
+    out.v.push_back(std::move(v));
+  }
+  return out;
+}
+inline void stage_dot_acts_finish(env::Emit& e, const SplitStage& fetched,
+                                  const kir::Val<kir::u32>& row,
+                                  std::uint32_t rows, std::uint32_t m_rows,
+                                  std::span<const DotActs> q,
+                                  const kir::Val<kir::u32>& lid,
+                                  std::uint32_t chunk_end, std::uint32_t cpg) {
+  constexpr std::uint32_t kCodes = quant::kDot4ChunkCodes;
+  constexpr float kAmaxFloor = 1e-30f;
+  for (std::uint32_t step = 0; step < fetched.steps; ++step) {
+    const auto c = e.let(lid + step * kBlock);
+    const auto body = [&] {
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        const auto& v = fetched.v[step][r];
+        if (auto live = e.when(row + r < m_rows)) {
+          auto amax = e.let(math::abs(v[0]));
+          auto sum = v[0];
+          for (std::uint32_t j = 1; j < kCodes; ++j) {
+            amax = e.let(math::max(amax, math::abs(v[j])));
+            sum = e.let(sum + v[j]);
+          }
+          for (std::uint32_t bit = 1; bit < cpg; bit <<= 1) {
+            sum = e.let(sum + math::shfl_xor(sum, e.u32(bit)));
+          }
+          const auto qstep = e.let(amax * (1.0f / 127.0f));
+          const auto inv = e.let(127.0f / math::max(amax, e.f32(kAmaxFloor)));
+          const auto byte_of = [&](int j) {
+            const auto code =
+                e.let(math::rint(v[static_cast<std::size_t>(j)] * inv));
+            return e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
+          };
+          const auto slot = e.let(c * 2u);
+          q[r].codes[swz(e, slot)] = quant::dot4_activation_word(e, byte_of, 0);
+          q[r].codes[swz(e, e.let(slot + 1u))] =
+              quant::dot4_activation_word(e, byte_of, 1);
+          q[r].scale[swz(e, c)] = qstep;
+          if (auto lead = e.when(c % cpg == 0u)) {
+            q[r].sum[e.let(c / cpg)] = sum;
+          }
+        }
+      }
+    };
+    if ((step + 1u) * kBlock <= chunk_end) {
+      body();
+    } else if (auto live = e.when(c < chunk_end)) {
+      body();
+    }
+  }
+  e.barrier();
+}
 template <class A>
 void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
                     const kir::Val<kir::u32>& x_base, const DotActs& q,
@@ -489,17 +589,19 @@ void stage_dot_acts(env::Emit& e, const A& a, const kir::Tile<kir::f32>* xs,
       },
       q, lid, nchunks, cpg);
 }
+// One lane's run of `count` chunks from weight words and a group scale it
+// already holds. emit_run_dot reads them first; the decode body issues them
+// ahead so their latency overlaps the activation staging and earlier runs.
 template <class A>
-void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
-                  const kir::Val<kir::u32>& row_base,
-                  const kir::Val<kir::u32>& scale_base,
-                  const kir::Val<kir::u32>& chunk0, std::uint32_t count,
-                  std::span<const kir::LValue<kir::f32>> acc,
-                  std::uint32_t cpg, std::uint32_t stage_begin) {
+void emit_run_dot_loaded(env::Emit& e, std::span<const DotActs> q,
+                         const kir::Pack<kir::u32>& words,
+                         const kir::Val<kir::f32>& wscale,
+                         const kir::Val<kir::u32>& chunk0, std::uint32_t count,
+                         std::span<const kir::LValue<kir::f32>> acc,
+                         std::uint32_t stage_begin) {
   std::vector<kir::LValue<kir::f32>> facc;
   facc.reserve(acc.size());
   for (std::size_t r = 0; r < acc.size(); ++r) facc.push_back(e.var(e.f32(0.0f)));
-  const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
   for (auto uu : e.unroll(count)) {
     const auto chunk = e.let(chunk0 + uu);
     // Weights and the global scale index by the ABSOLUTE chunk; the staged
@@ -524,11 +626,21 @@ void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
                           kir::cast<kir::f32>(iacc.read()), facc[r].read());
     }
   }
-  const auto group = e.let(chunk0 / cpg);
-  const auto wscale = e.let(math::widen(a.scales[scale_base + group]));
   for (std::size_t r = 0; r < acc.size(); ++r) {
     acc[r] = math::fma(wscale, facc[r].read(), acc[r].read());
   }
+}
+template <class A>
+void emit_run_dot(env::Emit& e, const A& a, std::span<const DotActs> q,
+                  const kir::Val<kir::u32>& row_base,
+                  const kir::Val<kir::u32>& scale_base,
+                  const kir::Val<kir::u32>& chunk0, std::uint32_t count,
+                  std::span<const kir::LValue<kir::f32>> acc,
+                  std::uint32_t cpg, std::uint32_t stage_begin) {
+  const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
+  const auto group = e.let(chunk0 / cpg);
+  const auto wscale = e.let(math::widen(a.scales[scale_base + group]));
+  emit_run_dot_loaded<A>(e, q, words, wscale, chunk0, count, acc, stage_begin);
 }
 template <class A>
 void emit_bias(env::Emit& e, const A& a, std::span<const DotActs> q,
@@ -711,8 +823,137 @@ std::string emit_q6_decode_quad(const KernelShapes& s, const QuantDims& d) {
   return kb.lds().ok() ? kb.str() : std::string{};
 }
 
+// Whether the single-row decode dot product takes the prefetching body: one
+// k split, whole runs, and the integer path.
+bool decode_prefetch(const KernelShapes& s, const QuantDims& d, bool indexed) {
+  if (indexed || !d.valid || d.m != 1 || !s.device) return false;
+  if (q6_decode_columns(s, d, false) > 1 || q6_prefill_rows(s, d, false) > 1 ||
+      !body_dot(s, d) || dot_rows(s, d, false) != 1)
+    return false;
+  if (dot_ksplits(d, 1, workgroup_lds_bytes(s.device)) != 1) return false;
+  const auto vals = static_cast<std::uint32_t>(d.spec.values_per_chunk());
+  const auto nchunks = static_cast<std::uint32_t>(d.k) / vals;
+  const auto span = wave_of(s.device) * chunks_per_step(d, device_load_bytes(s.device));
+  return nchunks >= span && nchunks % span == 0 && nchunks / span <= kPrefetchRuns;
+}
+
+// Single-row decode over 4-bit weights with int8 activations. emit_body's dot
+// path waits on each run's weight words, then on its group scale, then on each
+// bias in turn: a column costs a dozen memory round trips in series. This body
+// issues the activation reads, then every weight word, group scale and bias
+// the lane will use, and only then quantizes the activations, so a column
+// costs about one round trip. The arithmetic and its order are emit_body's:
+// the lane map, the per-run accumulation, the bias pass and the shuffle tree.
+template <class A>
+std::string emit_decode_dot(const KernelShapes& s, const QuantDims& d) {
+  const auto n = static_cast<std::uint32_t>(d.n);
+  const auto k = static_cast<std::uint32_t>(d.k);
+  const auto lanes = static_cast<std::uint32_t>(d.lanes);
+  const auto groups = static_cast<std::uint32_t>(d.groups);
+  const auto vals = static_cast<std::uint32_t>(d.spec.values_per_chunk());
+  const std::uint32_t nchunks = k / vals;
+  const std::uint32_t cpg = static_cast<std::uint32_t>(d.spec.group_size) / vals;
+  const std::uint32_t wave = wave_of(s.device);
+  const std::uint32_t waves = kBlock / wave;
+  const std::uint32_t cpl = chunks_per_step(d, device_load_bytes(s.device));
+  const std::uint32_t span = wave * cpl;
+  const std::uint32_t runs = nchunks / span;
+  const std::uint32_t bias_steps = (groups + wave - 1) / wave;
+  const std::uint32_t ntiles = (n + waves - 1) / waves;
+
+  kir::KernelBody kb(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+  kb.set_store(s.store);
+  A a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+
+  const auto lid = e.let(math::local_id());
+  const auto wave_id = e.let(lid / wave);
+  const auto lane = e.let(lid % wave);
+  const auto tile = e.let(math::workgroup_id_x());
+  const auto col = e.let(tile * waves + wave_id);
+  const auto row = e.u32(0);
+  const bool use_hoisted = s.staged_quant.matches(k, d.spec.group_size, d.spec.bits);
+  kir::Tile<kir::f32> xs;
+  if (s.staged.count == k && !s.staged.name.empty())
+    xs = kir::Tile<kir::f32>(&kb, &kb.types(), std::string(s.staged.name), k);
+  const bool stage = static_cast<bool>(xs);
+  DotActs q;
+  if (use_hoisted) {
+    const auto& sq = s.staged_quant;
+    q.codes = kir::Tile<kir::u32>(&kb, &kb.types(), std::string(sq.codes),
+                                  swz_words(2 * nchunks));
+    q.scale = kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.scale),
+                                  swz_words(nchunks));
+    q.sum = kir::Tile<kir::f32>(&kb, &kb.types(), std::string(sq.sum), groups);
+  } else {
+    q.codes = e.lds<kir::u32>(swz_words(2 * nchunks));
+    q.scale = e.lds<kir::f32>(swz_words(nchunks));
+    q.sum = e.lds<kir::f32>(groups);
+  }
+  const std::span<const DotActs> qs{&q, 1};
+
+  auto acc = e.var(0.0f);
+  const std::span<const kir::LValue<kir::f32>> accs{&acc, 1};
+  if (auto in_grid = e.when(tile < ntiles)) {
+    // Activation reads first: the staging waits on them alone.
+    SplitStage fetched;
+    if (!use_hoisted)
+      fetched = stage_dot_acts_fetch<A>(e, a, stage ? &xs : nullptr, row, 1, 1,
+                                        lid, nchunks, device_load_bytes(s.device),
+                                        k, stage);
+    // A wave past the last column reads the last column; it never stores.
+    const auto safe_col = e.let(select(col < n, col, e.u32(n - 1u)));
+    const auto row_base = e.let(safe_col * lanes);
+    const auto scale_base = e.let(safe_col * groups);
+    std::vector<kir::Pack<kir::u32>> words;
+    std::vector<kir::Val<kir::u32>> chunk;
+    using ScaleT = std::remove_cvref_t<decltype(a.scales[e.u32(0)])>;
+    std::vector<ScaleT> scale, bias;
+    for (std::uint32_t run = 0; run < runs; ++run) {
+      chunk.push_back(e.let(lane * cpl + run * span));
+      words.push_back(e.load(a.packed, row_base + chunk.back(), cpl * 4u));
+      scale.push_back(e.let(a.scales[scale_base + e.let(chunk.back() / cpg)]));
+    }
+    for (std::uint32_t t = 0; t < bias_steps; ++t) {
+      const auto g = e.let(lane + t * wave);
+      const auto safe_g = (t + 1u) * wave <= groups
+                              ? g
+                              : e.let(select(g < groups, g, e.u32(groups - 1u)));
+      bias.push_back(e.let(a.biases[scale_base + safe_g]));
+    }
+    if (!use_hoisted)
+      stage_dot_acts_finish(e, fetched, row, 1, 1, qs, lid, nchunks, cpg);
+    if (auto in_cols = e.when(col < n)) {
+      for (std::uint32_t run = 0; run < runs; ++run)
+        emit_run_dot_loaded<A>(e, qs, words[run], e.let(math::widen(scale[run])),
+                               chunk[run], cpl, accs, 0);
+      for (std::uint32_t t = 0; t < bias_steps; ++t) {
+        const auto g = e.let(lane + t * wave);
+        const auto apply = [&] {
+          acc = math::fma(e.let(math::widen(bias[t])), q.sum[g].read(), acc.read());
+        };
+        if ((t + 1u) * wave <= groups) {
+          apply();
+        } else if (auto live = e.when(g < groups)) {
+          apply();
+        }
+      }
+    }
+  }
+  // Outside every guard: shfl_xor is wave-cooperative.
+  for (std::uint32_t bit = 1; bit < wave; bit <<= 1)
+    acc = acc.read() + math::shfl_xor(acc.read(), e.u32(bit));
+  if (auto lane0 = e.when(lane == 0 && col < n)) e.store(col, acc.read());
+  if (!kb.lds().ok()) return {};
+  return kb.str();
+}
+
 template <class A>
 std::string emit_body(const KernelShapes& s, const QuantDims& d) {
+  if constexpr (!Indexed<A>) {
+    if (decode_prefetch(s, d, false)) return emit_decode_dot<A>(s, d);
+  }
   if (q6_decode_columns(s, d, Indexed<A>) == 4) return emit_q6_decode_quad<A>(s, d);
   if (const auto rows = q6_prefill_rows(s, d, Indexed<A>); rows > 1) {
     return emit_q6_prefill<A>(s, d, rows);

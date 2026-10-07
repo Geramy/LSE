@@ -19,7 +19,9 @@ struct RopeArgs {
 };
 
 // Interleaved pairs: (x0,x1) -> (x0 c - x1 s, x1 c + x0 s). cos/sin are
-// [max_T, D]; position is offset + (row % seq).
+// [max_T, R]; position is offset + (row % seq). iattrs[1] = R < D rotates the
+// leading R channels of each D-wide row and passes the rest through, which is
+// what slice -> rope -> concat computed in three more launches.
 struct RopeKernel final : KernelPrimitive<RopeKernel> {
   static constexpr std::string_view kName = "rope";
   static constexpr std::string_view kEntry = "lse_rope";
@@ -38,7 +40,8 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
     const auto seq = static_cast<std::uint32_t>(x.dim(x.rank() - 2));
     const auto baked_off = static_cast<std::uint32_t>(s.iattrs[0]);
     const bool live_off = s.inputs.size() >= 4;
-    if (dim < 2 || seq == 0) return {};
+    const auto rot = s.iattrs[1] > 0 ? static_cast<std::uint32_t>(s.iattrs[1]) : dim;
+    if (dim < 2 || seq == 0 || rot > dim || rot % 2 != 0) return {};
     // Rows per batch entry: [B, H, T, D] flattens to B*H*T rows of D, so a
     // thread's batch entry is its row over H*T.
     const auto batch = static_cast<std::uint32_t>(x.dim(0));
@@ -71,14 +74,28 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
       offset = e.let(kir::cast<kir::u32>(a.off[0u]));
     }
     const auto t = e.let(offset + (r % seq));
-    const auto pair = e.let((d / 2u) * 2u);
+    if (rot == dim) {
+      const auto pair = e.let((d / 2u) * 2u);
+      const auto base = e.let(r * dim + pair);
+      const auto ang = e.let(t * dim + pair);
+      const auto x0 = e.let(a.x[base]);
+      const auto x1 = e.let(a.x[base + 1u]);
+      const auto c = e.let(a.cos[ang]);
+      const auto s0 = e.let(a.sin[ang]);
+      e.ret(select((d % 2u) == 0u, x0 * c - x1 * s0, x1 * c + x0 * s0));
+      return k.str();
+    }
+    // A pass-through channel reads pair 0's angle and discards the rotation.
+    const auto rotated = e.let(d < rot);
+    const auto pair = e.let(select(rotated, (d / 2u) * 2u, e.u32(0)));
     const auto base = e.let(r * dim + pair);
-    const auto ang = e.let(t * dim + pair);
+    const auto ang = e.let(t * rot + pair);
     const auto x0 = e.let(a.x[base]);
     const auto x1 = e.let(a.x[base + 1u]);
     const auto c = e.let(a.cos[ang]);
     const auto s0 = e.let(a.sin[ang]);
-    e.ret(select((d % 2u) == 0u, x0 * c - x1 * s0, x1 * c + x0 * s0));
+    const auto spun = e.let(select((d % 2u) == 0u, x0 * c - x1 * s0, x1 * c + x0 * s0));
+    e.ret(select(rotated, spun, a.x[e.let(r * dim + d)]));
     return k.str();
   }
 

@@ -581,19 +581,22 @@ Array overwrite_slice(const Array& dst, const Array& src, int axis,
   return Array(n);
 }
 
-Array rope(const Array& x, const Array& cos, const Array& sin, int offset) {
+Array rope(const Array& x, const Array& cos, const Array& sin, int offset,
+           int rotary) {
   auto n = make(OpKind::kRoPE, x.shape(), x.dtype(),
                 {x.node(), cos.node(), sin.node()});
   n->iattrs[0] = offset;
+  n->iattrs[1] = rotary;
   n->prim = find_primitive("rope");
   return Array(n);
 }
 
 Array rope(const Array& x, const Array& cos, const Array& sin,
-           const Array& offset) {
+           const Array& offset, int rotary) {
   auto n = make(OpKind::kRoPE, x.shape(), x.dtype(),
                 {x.node(), cos.node(), sin.node(), offset.node()});
   n->iattrs[0] = 0;
+  n->iattrs[1] = rotary;
   n->prim = find_primitive("rope");
   return Array(n);
 }

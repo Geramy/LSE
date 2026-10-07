@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "lse/graph/ops.hpp"
+#include "lse/graph/graph.hpp"
 
 namespace lse::ops {
 
@@ -113,15 +114,24 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   const std::int64_t key_width = kh * kd;
   const std::int64_t value_width = vh * vd;
 
-  Array q_raw, k_raw, v_raw, qkv;
+  Array q_raw, k_raw, v_raw, qkv, qkv_act;
+  // A decode row takes SiLU over the whole conv output, where it rides the
+  // conv kernel's epilogue, and slices q, k and v out of that: one row's
+  // slices are contiguous windows, so they cost nothing, where SiLU after the
+  // slices was three more launches. The values are the same SiLU of the same
+  // conv outputs.
+  bool silu_first = false;
   if (spec.layout == ProjLayout::kFusedQKV) {
     qkv = conv_stream(graph::linear(x, w.in_proj_qkv), w.conv_w, w.conv_b,
                       spec.conv_bias,
                       state != nullptr ? &state->conv_qkv : nullptr,
                       state != nullptr ? state->tail_rows : Array{});
-    q_raw = graph::slice(qkv, -1, 0, key_width);
-    k_raw = graph::slice(qkv, -1, key_width, 2 * key_width);
-    v_raw = graph::slice(qkv, -1, 2 * key_width, 2 * key_width + value_width);
+    silu_first = spec.conv_activation && batch == 1 && seq == 1;
+    qkv_act = silu_first ? graph::silu(qkv) : qkv;
+    const Array& act = qkv_act;
+    q_raw = graph::slice(act, -1, 0, key_width);
+    k_raw = graph::slice(act, -1, key_width, 2 * key_width);
+    v_raw = graph::slice(act, -1, 2 * key_width, 2 * key_width + value_width);
   } else {
     q_raw = conv_stream(graph::linear(x, w.in_proj_q), w.conv_q_w, w.conv_q_b,
                         spec.conv_bias,
@@ -154,7 +164,27 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
     LSE_ASSIGN_OR(q, silu_l2norm(0, spec.query_scale));
     LSE_ASSIGN_OR(k, silu_l2norm(key_width, 1.0f));
   }
-  if (spec.conv_activation) {
+  // A decode row's q and k head norms (and q's scale) in one launch, on a
+  // wave32 device whose heads are 128 wide: what the two l2_normalize
+  // launches and the multiply computed, value for value.
+  bool qk_fused = false;
+  if (silu_first && kd == 128) {
+    if (graph::Scheduler* scheduler = graph::default_scheduler()) {
+      const auto member = graph::preferred_member();
+      qk_fused = member < scheduler->devices().size() &&
+                 scheduler->devices().device(member).device_info().wavefront_size == 32;
+    }
+  }
+  if (qk_fused) {
+    LSE_ASSIGN_OR(Array qk, graph::custom("gdn.qk_l2norm.wave32.v1",
+        {graph::slice(qkv_act, -1, 0, 2 * key_width)},
+        {spec.eps, spec.query_scale, 0.0f, 0.0f}));
+    qk.node()->shape = Shape{batch, seq, 2 * kh, kd};
+    qk.node()->iattrs[0] = spec.query_scale != 1.0f ? static_cast<std::int32_t>(kh) : 0;
+    q = graph::slice(qk, 2, 0, kh);
+    k = graph::slice(qk, 2, kh, 2 * kh);
+  }
+  if (spec.conv_activation && !silu_first) {
     if (!fused_prep) {
       q_raw = graph::silu(q_raw);
       k_raw = graph::silu(k_raw);
@@ -163,7 +193,7 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   }
 
   const Shape key_shape{batch, seq, kh, kd};
-  if (!fused_prep) {
+  if (!fused_prep && !qk_fused) {
     q = graph::l2_normalize(graph::reshape(q_raw, key_shape), spec.eps);
     k = graph::l2_normalize(graph::reshape(k_raw, key_shape), spec.eps);
     if (spec.query_scale != 1.0f) {
