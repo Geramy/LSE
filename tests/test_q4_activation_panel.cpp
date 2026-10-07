@@ -286,10 +286,12 @@ LSE_TEST(q4_panel_M8_rate_projections_share_existing_GDN_source_panel) {
   const auto cloned = contraction(Array(clone), 48, 5120);
   LSE_EXPECT(cloned.node()->inputs[4] != shared);
   LSE_EXPECT(cloned.node()->inputs[4]->inputs[0] == clone);
-  for (const auto m : {1, 4, 6, 7, 9}) {
+  for (const auto m : {1, 6, 7, 9}) {
     const auto unmeasured = contraction(leaf({1, m, 5120}, DType::kF32), 48, 5120);
     LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
   }
+  LSE_EXPECT_EQ(contraction(leaf({1, 4, 5120}, DType::kF32), 48, 5120)
+                    .node()->inputs.size(), 5u);
   LSE_EXPECT_EQ(contraction(x, 49, 5120).node()->inputs.size(), 4u);
   LSE_EXPECT_EQ(contraction(leaf({1, 8, 6144}, DType::kF32), 48, 6144)
                     .node()->inputs.size(), 4u);
