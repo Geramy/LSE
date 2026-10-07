@@ -482,6 +482,8 @@ namespace {
 // rate of `rate_tps` tokens per second.
 DraftWidthPolicy measured_policy(double base, double per_row, double draft, double rate_tps) {
   DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 1);  // warm-up: priced nothing
   for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass)
     for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows)
       policy.observe_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 1)));
@@ -493,6 +495,13 @@ DraftWidthPolicy measured_policy(double base, double per_row, double draft, doub
 
 LSE_TEST(draft_width_policy_measures_every_width_first) {
   DraftWidthPolicy policy;
+  // While the clocks ramp up: the full width, no measuring.
+  const std::array<double, 7> unsure{0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1};
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_EQ(policy.proposals(unsure), 7u);
+  LSE_EXPECT_EQ(policy.depth(7, 3), 3u);
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 99'000'000);  // priced nothing
   // Width 1 is a plain step: no draft at all.
   LSE_EXPECT_EQ(policy.exploring(), 1u);
   LSE_EXPECT(!policy.draft_next());
@@ -578,8 +587,8 @@ LSE_TEST(draft_width_policy_chains_as_deep_as_pays) {
   // Positions that are almost always accepted: chain all the way.
   for (int i = 0; i < 4000; ++i)
     policy.observe_acceptance(0.999, static_cast<std::uint32_t>(i % 7), i % 50 != 0);
-  LSE_EXPECT_EQ(policy.depth(7), 7u);
-  LSE_EXPECT_EQ(policy.depth(3), 3u);
+  LSE_EXPECT_EQ(policy.depth(7, 3), 7u);
+  LSE_EXPECT_EQ(policy.depth(3, 3), 3u);
   // Positions that are rarely accepted, with 5 ms passes: a 6 ms proposal
   // returning about a tenth of a token loses at 50 tok/s (0.3 tokens).
   DraftWidthPolicy weak = measured_policy(32e6, 1e6, 0.0, 50.0);
@@ -587,7 +596,7 @@ LSE_TEST(draft_width_policy_chains_as_deep_as_pays) {
     weak.observe_draft(static_cast<std::uint64_t>(2e6 + 5e6 * d), d);
   for (int i = 0; i < 4000; ++i)
     weak.observe_acceptance(0.5, static_cast<std::uint32_t>(i % 7), i % 40 == 0);
-  LSE_EXPECT_EQ(weak.depth(7), 0u);
+  LSE_EXPECT_EQ(weak.depth(7, 3), 0u);
 }
 
 LSE_TEST(draft_width_policy_follows_a_change_of_text_within_steps) {

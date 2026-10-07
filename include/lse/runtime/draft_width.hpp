@@ -66,6 +66,13 @@ class DraftWidthPolicy {
   // away most of a step).
   static constexpr std::uint64_t kRefreshSteps = 512;
   static constexpr double kRefreshLoss = 0.1;
+  // ... and whatever it costs after this many, so an estimate that came out
+  // high (and so is never cheap) cannot keep its width out of use for good.
+  static constexpr std::uint64_t kHardRefreshSteps = 2048;
+  // Measured steps before the first measurements of every width: the GPU's
+  // clocks ramp up over a process's first steps, and a width measured then
+  // would be priced high. Until then the full width is used.
+  static constexpr std::uint64_t kWarmupSteps = 32;
   // Skipped (draft-free) steps before a probing draft.
   static constexpr std::uint32_t kProbeAfter = 4;
 
@@ -103,13 +110,14 @@ class DraftWidthPolicy {
   // them exists, 0..max, maximizing expected tokens per second from each
   // position's mean acceptance and the measured cost of each depth and verify
   // width. proposals() then trims the verified prefix by confidence.
-  [[nodiscard]] std::uint32_t depth(std::uint32_t max);
+  // `initial` is the depth used while the policy warms up (kWarmupSteps).
+  [[nodiscard]] std::uint32_t depth(std::uint32_t max, std::uint32_t initial);
   // Long-run tokens per nanosecond.
   [[nodiscard]] double rate() const noexcept;
   // Calibrated acceptance of a proposal of this confidence.
   [[nodiscard]] double acceptance(double confidence) const noexcept;
-  // The width the next step must take to measure its cost, or 0 when every
-  // width is measured and fresh.
+  // The width the next step must take for its first measurements, or 0
+  // (also 0 while warming up).
   [[nodiscard]] std::uint32_t exploring() const noexcept;
   // A stale width (unmeasured for kRefreshSteps) cheap enough to measure on
   // this step, or 0. `chained`: the draft costs a pass per proposal (MTP).

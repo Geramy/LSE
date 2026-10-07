@@ -74,6 +74,7 @@ double DraftWidthPolicy::rate() const noexcept {
 }
 
 std::uint32_t DraftWidthPolicy::exploring() const noexcept {
+  if (steps_ < kWarmupSteps) return 0;
   std::uint32_t fewest = 0;
   for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows)
     if (samples_[rows] < kExploreSamples && (fewest == 0 || samples_[rows] < samples_[fewest]))
@@ -98,7 +99,8 @@ std::uint32_t DraftWidthPolicy::refresh(std::uint32_t max, bool chained) const n
   }
   std::uint32_t stalest = 0;
   for (std::uint32_t rows = 1; rows <= max + 1; ++rows) {
-    if (steps_ - last_seen_[rows] <= kRefreshSteps || best - value[rows - 1] > kRefreshLoss)
+    const std::uint64_t age = steps_ - last_seen_[rows];
+    if (age <= kRefreshSteps || (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps))
       continue;
     if (stalest == 0 || last_seen_[rows] < last_seen_[stalest]) stalest = rows;
   }
@@ -113,6 +115,7 @@ std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence,
     a[j] = acceptance(confidence[j]);
     if (j < estimates.size()) estimates[j] = a[j];
   }
+  if (steps_ < kWarmupSteps) return n;
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(n, rows - 1);
   if (const std::uint32_t rows = refresh(n, false); rows != 0) return rows - 1;
   // Verify proposal j + 1 when some prefix ending at or after it adds more
@@ -198,7 +201,8 @@ void DraftWidthPolicy::observe_acceptance(double confidence, std::uint32_t posit
 
 void DraftWidthPolicy::observe_verify(std::uint32_t rows, std::uint64_t ns) {
   if (rows == 0 || rows > kMaxRows) return;
-  ++steps_;
+  // Warm-up steps count toward the warm-up and price nothing.
+  if (steps_++ < kWarmupSteps) return;
   const auto t = static_cast<double>(ns);
   bool any = false;
   for (std::uint32_t m = 1; m <= kMaxRows; ++m) any = any || samples_[m] != 0;
@@ -221,7 +225,7 @@ void DraftWidthPolicy::observe_verify(std::uint32_t rows, std::uint64_t ns) {
 }
 
 void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
-  if (depth > kMaxProposals) return;
+  if (depth > kMaxProposals || steps_ <= kWarmupSteps) return;
   const auto t = static_cast<double>(ns);
   double& d = draft_ns_[depth];
   if (draft_samples_[depth]++ == 0) d = t;
@@ -232,8 +236,9 @@ double DraftWidthPolicy::draft_ns(std::uint32_t depth) const noexcept {
   return depth <= kMaxProposals ? draft_ns_[depth] : 0.0;
 }
 
-std::uint32_t DraftWidthPolicy::depth(std::uint32_t max) {
+std::uint32_t DraftWidthPolicy::depth(std::uint32_t max, std::uint32_t initial) {
   max = std::min(max, kMaxProposals);
+  if (steps_ < kWarmupSteps) return std::min(max, initial);
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(max, rows - 1);
   if (const std::uint32_t rows = refresh(max, true); rows != 0) return rows - 1;
   const double rate_now = rate();

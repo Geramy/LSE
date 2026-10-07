@@ -987,7 +987,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       estimates.clear();
       // How deep to chain is decided before any proposal exists; the
       // verified prefix is then trimmed by the proposals' own probabilities.
-      const std::uint32_t chained = proposals == 0 ? 0 : widths->depth(proposals);
+      const std::uint32_t chained = proposals == 0 ? 0 : widths->depth(proposals, limits.mtp_depth);
       const std::uint64_t started = now_ns();
       std::vector<std::uint32_t> chain;
       if (chained == 0) {
