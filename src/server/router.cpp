@@ -1128,6 +1128,29 @@ Status Router::prepare_kernels() {
   return gen.prepare_kernels();
 }
 
+Result<runtime::PerplexityReport> Router::perplexity(
+    std::span<const std::uint32_t> tokens, const runtime::PerplexityOptions& options,
+    const runtime::PerplexityProgress& progress) {
+  Impl& impl = *impl_;
+  std::lock_guard<std::mutex> held(impl.generate_lock);
+  if (impl.bound_live) {
+    std::unique_ptr<Impl::SessionEntry>* previous = nullptr;
+    {
+      std::lock_guard sessions_held(impl.sessions_lock);
+      auto it = impl.sessions.find(impl.bound);
+      if (it != impl.sessions.end()) previous = &it->second;
+    }
+    impl.release_bindings(previous != nullptr ? &(*previous)->session : nullptr);
+  }
+  // Sampling settings do not enter scoring; the model's defaults fill them.
+  LSE_ASSIGN_OR(runtime::SamplingParams sampling,
+                detail::request_sampling(json::object(), impl.model.config().sampling_defaults));
+  runtime::Generator gen(impl.model, sampling, impl.opt.prefill);
+  auto report = runtime::score_perplexity(gen, impl.model, tokens, options, progress);
+  (void)impl.model.drop_retained_passes();
+  return report;
+}
+
 const ServerOptions& Router::options() const noexcept { return impl_->opt; }
 
 namespace {

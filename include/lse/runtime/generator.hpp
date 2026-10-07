@@ -23,6 +23,7 @@
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/dflash2.hpp"
+#include "lse/runtime/perplexity.hpp"
 #include "lse/runtime/sampler.hpp"
 #include "lse/runtime/prefill_batch.hpp"
 #include "lse/runtime/session.hpp"
@@ -230,6 +231,23 @@ class Generator {
   // prefix commits, and the draft's context and draft passes. Nothing runs;
   // it is what a server does at load.
   Status prepare_kernels();
+
+  // Scores tokens[first_target ..], each given the tokens before it: the
+  // negative log-likelihood in nats and, on request, this run's top_k ids with
+  // their log-probabilities and its log-probability of each probe id
+  // (probe_ids holds probe_k ids per scored token). `session` must be empty;
+  // `tokens` runs through the same prefill passes a prompt of that length takes
+  // (prefill_passes, the prompt attention phase, the session's KV storage), and
+  // the LM head is then applied to the scored rows of each pass, kScoreRows at
+  // a time. The log-softmax statistics are reduced on the device
+  // (logits.lse_pick.v1) and the top k is selected there (topk_pairs, which
+  // needs a vocabulary of at least 4096). No draft module may be attached:
+  // scoring is the target model alone.
+  static constexpr std::size_t kScoreRows = 128;
+  Result<TokenScores> score(Session& session, std::span<const std::uint32_t> tokens,
+                            std::size_t first_target, std::size_t top_k = 0,
+                            std::span<const std::uint32_t> probe_ids = {},
+                            std::size_t probe_k = 0);
 
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
   // `valid` rows of the sequence axis are real (0: all of them).

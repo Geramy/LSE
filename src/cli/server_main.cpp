@@ -10,10 +10,13 @@
 #include <cstdlib>
 #include <chrono>
 #include <csignal>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 
 #include "lse/lse.h"
+#include "nlohmann/json.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/kv/cache_dtype.hpp"
@@ -83,6 +86,19 @@ void usage() {
       "                       allocate (JSON) and exit, without opening a device;\n"
       "                       JSON may set context_tokens, sequences, device_arch,\n"
       "                       kv_storage and device_memory_bytes\n"
+      "      --perplexity FILE  score FILE (UTF-8 text) through the prompt\n"
+      "                       prefill, write the result (JSON) and exit\n"
+      "      --perplexity-tokens FILE  score a JSON array of token ids instead\n"
+      "      --perplexity-method M  chunks (default; llama.cpp's method: chunks of\n"
+      "                       ctx tokens, second half scored) or sliding\n"
+      "      --perplexity-ctx N  tokens per chunk or window (default 512)\n"
+      "      --perplexity-stride N  sliding: tokens between windows (default: ctx)\n"
+      "      --perplexity-chunks N  score only the first N chunks (default all)\n"
+      "      --perplexity-kld-base-out FILE  record a KL-divergence base\n"
+      "      --perplexity-kld-top-k K  ids per token in that base (1..32, default 32)\n"
+      "      --perplexity-kld FILE  compare against a recorded base\n"
+      "      --perplexity-output PATH  write the JSON here (default stdout)\n"
+      "      --perplexity-token-ids  include the token ids in the JSON\n"
       "  -h, --help           this message\n"
       "\n"
       "Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions,\n"
@@ -116,6 +132,10 @@ int main(int argc, char** argv) {
   int shutdown_grace_seconds = 30;
   bool model_info = false;
   std::optional<std::string> estimate;
+  std::string perplexity_text, perplexity_tokens, perplexity_output, perplexity_method = "chunks";
+  std::string perplexity_kld_out, perplexity_kld;
+  std::size_t perplexity_ctx = 512, perplexity_stride = 0, perplexity_chunks = 0, perplexity_top_k = 32;
+  bool perplexity_ids = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -236,6 +256,35 @@ int main(int argc, char** argv) {
         return 2;
       }
     }
+    else if (a == "--perplexity") perplexity_text = value("--perplexity");
+    else if (a == "--perplexity-tokens") perplexity_tokens = value("--perplexity-tokens");
+    else if (a == "--perplexity-output") perplexity_output = value("--perplexity-output");
+    else if (a == "--perplexity-token-ids") perplexity_ids = true;
+    else if (a == "--perplexity-method") {
+      perplexity_method = value("--perplexity-method");
+      if (perplexity_method != "chunks" && perplexity_method != "sliding") {
+        std::fputs("lse-server: --perplexity-method must be chunks or sliding\n", stderr);
+        return 2;
+      }
+    }
+    else if (a == "--perplexity-kld-base-out") perplexity_kld_out = value(a.c_str());
+    else if (a == "--perplexity-kld") perplexity_kld = value(a.c_str());
+    else if (a == "--perplexity-ctx" || a == "--perplexity-stride" ||
+             a == "--perplexity-chunks" || a == "--perplexity-kld-top-k") {
+      const auto text = value(a.c_str());
+      std::size_t n = 0;
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(), n);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          (n == 0 && a != "--perplexity-chunks") || (a == "--perplexity-kld-top-k" && n > 32)) {
+        std::fprintf(stderr, "lse-server: %s must be a positive integer%s\n", a.c_str(),
+                     a == "--perplexity-kld-top-k" ? " up to 32" : "");
+        return 2;
+      }
+      (a == "--perplexity-ctx"      ? perplexity_ctx
+       : a == "--perplexity-stride" ? perplexity_stride
+       : a == "--perplexity-chunks" ? perplexity_chunks
+                                    : perplexity_top_k) = n;
+    }
     else if (a == "--model-info") model_info = true;
     else if (a == "--estimate") estimate = std::string();
     else if (a.starts_with("--estimate=")) estimate = a.substr(std::string("--estimate=").size());
@@ -293,11 +342,89 @@ int main(int argc, char** argv) {
     lse_free(json);
     return 0;
   }
+  const bool scoring = !perplexity_text.empty() || !perplexity_tokens.empty();
+  nlohmann::json perplexity_request;
+  if (scoring) {
+    // Read before the model loads, so a wrong path fails in a second.
+    if (!perplexity_text.empty() && !perplexity_tokens.empty()) {
+      std::fputs("lse-server: give --perplexity or --perplexity-tokens, not both\n", stderr);
+      return 2;
+    }
+    const std::string& path = perplexity_text.empty() ? perplexity_tokens : perplexity_text;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      std::fprintf(stderr, "lse-server: cannot read %s\n", path.c_str());
+      return 2;
+    }
+    std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!perplexity_text.empty()) {
+      perplexity_request["text"] = std::move(body);
+    } else {
+      try {
+        perplexity_request["tokens"] = nlohmann::json::parse(body);
+      } catch (const std::exception& ex) {
+        std::fprintf(stderr, "lse-server: %s is not a JSON array of token ids: %s\n", path.c_str(), ex.what());
+        return 2;
+      }
+    }
+    perplexity_request["method"] = perplexity_method;
+    perplexity_request["ctx"] = perplexity_ctx;
+    perplexity_request["stride"] = perplexity_stride;
+    perplexity_request["chunks"] = perplexity_chunks;
+    perplexity_request["include_token_ids"] = perplexity_ids;
+    if (!perplexity_kld_out.empty()) {
+      perplexity_request["kld_base_out"] = perplexity_kld_out;
+      perplexity_request["kld_top_k"] = perplexity_top_k;
+    }
+    if (!perplexity_kld.empty()) perplexity_request["kld_base"] = perplexity_kld;
+  }
+
   lse_engine* engine = lse_open(&cfg, &err);
   if (engine == nullptr) {
     std::fprintf(stderr, "lse-server: %s\n", err != nullptr ? err : "could not open the engine");
     lse_free(err);
     return lse_last_error() == LSE_ERR_INVALID_ARGUMENT ? 2 : 1;
+  }
+
+  if (scoring) {
+    char* json = nullptr;
+    const lse_result r = lse_perplexity(engine, perplexity_request.dump().c_str(), &json, &err);
+    int code = 0;
+    if (r != LSE_OK) {
+      std::fprintf(stderr, "lse-server: perplexity: %s\n", err != nullptr ? err : "failed");
+      code = r == LSE_ERR_INVALID_ARGUMENT ? 2 : 1;
+    } else {
+      const auto result = nlohmann::json::parse(json);
+      std::fprintf(stderr, "lse-server: perplexity %.4f +/- %.5f, mean NLL %.6f over %zu scored tokens in %zu %s (%.1f s, %.0f prefill tok/s)\n",
+                   result.at("perplexity").get<double>(), result.at("perplexity_uncertainty").get<double>(),
+                   result.at("mean_nll").get<double>(),
+                   result.at("scored_tokens").get<std::size_t>(),
+                   result.at("windows_scored").get<std::size_t>(),
+                   perplexity_method == "chunks" ? "chunks" : "windows",
+                   result.at("elapsed_seconds").get<double>(),
+                   result.at("prefill_tokens_per_second").get<double>());
+      if (result.contains("kld")) {
+        const auto& k = result.at("kld");
+        std::fprintf(stderr, "lse-server: vs base: KLD %.6f +/- %.6f (top-%d), same top %.3f%%, delta PPL %+.4f, RMS delta p %.3f%%\n",
+                     k.at("mean_kld").get<double>(), k.at("mean_kld_uncertainty").get<double>(),
+                     k.at("top_k").get<int>(), 100.0 * k.at("same_top").get<double>(),
+                     k.at("delta_perplexity").get<double>(), 100.0 * k.at("rms_delta_p").get<double>());
+      }
+      if (perplexity_output.empty()) {
+        std::puts(json);
+      } else {
+        std::ofstream out(perplexity_output, std::ios::binary);
+        out << result.dump(1) << "\n";
+        if (!out) {
+          std::fprintf(stderr, "lse-server: writing %s failed\n", perplexity_output.c_str());
+          code = 1;
+        }
+      }
+    }
+    lse_free(json);
+    lse_free(err);
+    lse_close(engine);
+    return code;
   }
 
   std::signal(SIGINT, on_signal);

@@ -694,6 +694,7 @@ Multi-device model partitioning and continuous HTTP batching remain development 
 | Q4 compute selection | [INT8 policy](docs/INT8_POLICY.md) |
 | Quantized weights and compute formats | [Quantized operands](docs/QUANT_OPERANDS.md) |
 | FP8 and BF8 conversion | [FP8 conversion](docs/FP8_CONVERSION.md) |
+| Output quality: perplexity scoring | [Perplexity](docs/PERPLEXITY.md) |
 | Measured optimization results | [Benchmark reports](docs/benchmarks/) |
 | Earlier versions and measurements | [Release history](docs/RELEASE_HISTORY.md) |
 
