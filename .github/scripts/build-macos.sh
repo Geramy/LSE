@@ -89,10 +89,17 @@ git -C "$work/hrx-source" init -q
 # - gfx120x-hdp-kernarg-publication: admits RDNA4 to HRX's VRAM kernel-
 #   argument path. It turns on only when the HSA runtime reports the HDP flush
 #   registers and CPU access to the VRAM pool.
+# - hsa-bar-write-bracket: opts into the mac_linuxgpu runtime's BAR writes,
+#   which makes it report those, and brackets every submission's stores into
+#   the GPU's BARs (kernargs, HDP flush, doorbell) under the driver's gate,
+#   with aligned stores only (Apple silicon maps a BAR as device memory).
+#   Needs mac_linuxgpu build 265 (older runtimes lack the bracket and keep
+#   kernel arguments in host memory); a runtime that refuses fails device
+#   creation.
 hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
   gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
   loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
-  gfx120x-hdp-kernarg-publication)
+  gfx120x-hdp-kernarg-publication hsa-bar-write-bracket)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"
