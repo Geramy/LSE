@@ -469,18 +469,15 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   using FragVec = lse::vec<lse::f16, kFrag>;
   const auto fragment = [&](const kir::Tile<lse::f16>& tile,
                             const kir::Val<kir::u32>& at) -> kir::Val<FragVec> {
-    if constexpr (kFrag == 8) {
-      const auto p = tile.load(at, 16u);
-      return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
-    } else {
-      const auto f = e.local<lse::f16, kFrag>();
-      for (int piece = 0; piece < kFrag / 8; ++piece) {
-        const auto p =
-            tile.load(e.let(at + static_cast<std::uint32_t>(piece * 8)), 16u);
-        for (int j = 0; j < 8; ++j) f[piece * 8 + j] = p[j];
-      }
-      return f.value();
-    }
+    // One vector of the whole fragment, which the target splits into its
+    // 16-byte loads straight into the operand registers. A gfx11 fragment is
+    // two loads wide; assembling it a half at a time from two 8-half loads
+    // cost ~1500 VALU bit moves per K step per wave on gfx1151, more than
+    // the step's 32 matrix instructions (test_q4_gemm --gpu, M1024 N17408
+    // K5120: 10.16 -> 5.89 ms, 18.0 -> 31.0 TFLOPS).
+    const auto p = kFrag == 8 ? tile.load(at, 16u)
+                              : tile.load_elems(at, static_cast<std::uint32_t>(kFrag));
+    return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
   };
 
   const auto compute = [&]() {

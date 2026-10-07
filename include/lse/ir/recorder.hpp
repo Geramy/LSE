@@ -427,6 +427,11 @@ class Tile {
   // As with Buffer::load, the caller establishes these index preconditions.
   [[nodiscard]] Pack<T> load(const Val<u32>& index,
                              std::uint32_t max_bytes) const;
+  // `count` elements as one vector value, wider than one load instruction
+  // may be: a matrix operand fragment the target splits into its loads.
+  // Same preconditions as load().
+  [[nodiscard]] Pack<T> load_elems(const Val<u32>& index,
+                                   std::uint32_t count) const;
 
   template <typename I>
   [[nodiscard]] LValue<T> operator[](const Val<I>& index) const {
@@ -624,6 +629,10 @@ class KernelBody {
   template <typename T>
   void store_pack(ValueId buf, const Val<u32>& index, const Pack<T>& v,
                   std::uint32_t max_bytes);
+  // A vector load of exactly `count` elements.
+  template <typename T>
+  [[nodiscard]] Pack<T> load_elems(ValueId buf, const Val<u32>& index,
+                                   std::uint32_t count);
 
   // A mutable local — an accumulator. `let` is the immutable form.
   template <typename T>
@@ -848,6 +857,10 @@ template <typename T>
 Pack<T> Tile<T>::load(const Val<u32>& index, std::uint32_t max_bytes) const {
   return body_->load_pack<T>(id_, off_ ? index + off_ : index, max_bytes);
 }
+template <typename T>
+Pack<T> Tile<T>::load_elems(const Val<u32>& index, std::uint32_t count) const {
+  return body_->load_elems<T>(id_, off_ ? index + off_ : index, count);
+}
 
 template <typename T>
 void Buffer<T>::store(const Val<u32>& index, const Pack<T>& value,
@@ -934,6 +947,23 @@ Pack<T> KernelBody::load_pack(ValueId buf, const Val<u32>& index,
   }
   const ValueId v = ir_.add_value(std::move(o), fresh_name("ld"));
   return {types_, &ir_, v, n};
+}
+
+template <typename T>
+Pack<T> KernelBody::load_elems(ValueId buf, const Val<u32>& index,
+                               std::uint32_t count) {
+  Operation o;
+  o.kind = OpKind::kLoadVec;
+  o.operands = {buf, index.id()};
+  o.imm = count;
+  if (count <= 1) {
+    o.type = scalar_type(scalar_of<T>::value);
+  } else {
+    o.type = ir::vector_type(scalar_of<T>::value, count);
+    o.text = ir_.vector_typedef(scalar_of<T>::value, static_cast<int>(count));
+  }
+  const ValueId v = ir_.add_value(std::move(o), fresh_name("ld"));
+  return {types_, &ir_, v, count};
 }
 
 template <typename T>
