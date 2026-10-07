@@ -207,6 +207,9 @@ class HybridLM {
   }
 
   [[nodiscard]] const Config& config() const noexcept { return config_; }
+  // Passes hidden() has built rather than replayed, since load. A step that
+  // built one paid for recording it, which is not what the pass costs.
+  [[nodiscard]] std::uint64_t builds() const noexcept { return builds_; }
   [[nodiscard]] std::size_t num_layers() const noexcept { return blocks_.size(); }
 
   // How many states each layer keeps. A tensor split shards the KV pool and the
@@ -309,6 +312,7 @@ class HybridLM {
   // else cannot be replaced: the carried state travels differently there, and
   // the pass replacing it would start from what it is meant to discard.
   std::uint32_t last_pass_host_groups_ = 0;
+  std::uint64_t builds_ = 0;
 };
 
 }  // namespace lse::model

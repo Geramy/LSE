@@ -1026,6 +1026,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     if (capture != nullptr) capture->features = cache_.features;
     return cache_.hidden;
   }
+  ++builds_;
 
   if (replaces_previous) {
     // A rebuild records the graph from whatever the state Arrays hold now,

@@ -928,6 +928,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
                                                   : limits.mtp_depth;
   std::vector<double> confidence, estimates;
   std::uint64_t last_draft_ns = 0;
+  std::int32_t last_draft_depth = -1;  // -1: the step drew no draft
   const auto next_width = [&] {
     return mtp_verify_rows(
         depth, static_cast<std::uint64_t>(limits.max_tokens) - generated.size(),
@@ -941,6 +942,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       confidence.clear();
       estimates.clear();
       last_draft_ns = 0;
+      last_draft_depth = -1;
       if (proposals == 0) return std::vector<std::uint32_t>{};
       if (widths != nullptr) {
         // A plain step: nothing to verify, so nothing to draft. The verify
@@ -953,7 +955,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         proposal_distributions = std::move(proposal.conditionals);
         std::vector<std::uint32_t> tokens_out = std::move(proposal.tokens);
         last_draft_ns = now_ns() - started;
-        widths->observe_draft(last_draft_ns);
+        last_draft_depth = static_cast<std::int32_t>(DraftWidthPolicy::kMaxProposals);
         if (proposal_distributions.size() != tokens_out.size())
           return LSE_ERROR(kInternal, "DFlash2 draft returned ", std::to_string(tokens_out.size()),
                            " proposals with ", std::to_string(proposal_distributions.size()),
@@ -994,7 +996,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         LSE_ASSIGN_OR(chain, mtp_->draft_chain(hidden, tokens, first, chained, &confidence));
       }
       last_draft_ns = now_ns() - started;
-      widths->observe_draft(last_draft_ns, chained);
+      last_draft_depth = static_cast<std::int32_t>(chained);
       if (confidence.size() != chain.size())
         return LSE_ERROR(kInternal, "MTP chain returned ", std::to_string(chain.size()),
                          " proposals with ", std::to_string(confidence.size()), " confidences");
@@ -1090,28 +1092,52 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   // The step just finished, for the width policy: from one verify pass's
   // submission to the next's, less the draft between them, is what the pass
   // and its acceptance walk cost.
+  // A step that built a target pass (a width's first pass in a request, a
+  // retained pass rebuilt) or compiled or loaded a kernel is not what that
+  // width costs, and is left out. (Partition passes do not tell: the small
+  // evals of every step, such as the verified feature prefix, partition.)
   std::uint64_t step_top = 0;
   std::size_t step_rows = 0, step_tokens = 0;
   std::int32_t step_at = 0;
   std::string step_trace;
+  struct StepWork {
+    std::uint64_t compiles = 0, disk_loads = 0, builds = 0, host_groups = 0;
+    bool operator==(const StepWork&) const = default;
+  };
+  StepWork step_counters;
+  const auto counters_now = [this]() {
+    StepWork c;
+    if (graph::Scheduler* sched = graph::default_scheduler()) {
+      const auto jit = sched->jit_stats();
+      c = {jit.compiles, jit.disk_hits, model_.builds(), sched->accumulated_trace().host_groups};
+    }
+    return c;
+  };
   while (running) {
     m = row_in.size();
     const auto at = static_cast<std::int32_t>(session.position());
     if (widths != nullptr) {
       const std::uint64_t now = now_ns();
+      const StepWork counters = counters_now();
       if (step_top != 0) {
         const std::uint64_t period = now - step_top;
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
-        widths->observe_verify(static_cast<std::uint32_t>(step_rows), verify_ns);
-        widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
+        const bool warm = step_counters == counters;
+        if (warm) {
+          widths->observe_verify(static_cast<std::uint32_t>(step_rows), verify_ns);
+          widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
+          if (last_draft_depth >= 0)
+            widths->observe_draft(last_draft_ns, static_cast<std::uint32_t>(last_draft_depth));
+        }
         if (lse::debug())
-          std::fprintf(stderr, "[dflash2-width] position=%d rows=%zu tokens=%zu verify_ms=%.3f "
-                       "draft_ms=%.3f next_rows=%zu rate_tps=%.2f estimates=%s\n",
+          std::fprintf(stderr, "[spec-width] position=%d rows=%zu tokens=%zu verify_ms=%.3f "
+                       "draft_ms=%.3f warm=%d next_rows=%zu rate_tps=%.2f estimates=%s\n",
                        step_at, step_rows, step_tokens, static_cast<double>(verify_ns) / 1e6,
-                       static_cast<double>(last_draft_ns) / 1e6, m, widths->rate() * 1e9,
-                       step_trace.c_str());
+                       static_cast<double>(last_draft_ns) / 1e6, warm ? 1 : 0, m,
+                       widths->rate() * 1e9, step_trace.c_str());
       }
       step_top = now;
+      step_counters = counters;
       step_rows = m;
       step_at = at;
       if (lse::debug()) {
