@@ -73,6 +73,7 @@ struct LogitPickKernel final : KernelPrimitive<LogitPickKernel> {
       return {};
     const auto vocab = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
     const auto picks = static_cast<std::uint32_t>(s.inputs[1].dim(s.inputs[1].rank() - 1));
+    if (picks > kBlock) return {};  // one lane per pick
 
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
@@ -121,10 +122,11 @@ struct LogitPickKernel final : KernelPrimitive<LogitPickKernel> {
       e.store(slot, top);
       e.store(slot + e.u32(1), sum);
     }
-    // One lane per pick.
-    for (auto j : e.range(lid, e.u32(picks), kBlock)) {
-      const auto id = e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(a.targets[row * picks + j])));
-      e.store(slot + e.u32(2) + j, a.x[base + id]);
+    // One lane per pick: a guarded store, not a lane-divergent loop, which
+    // Loom's branch lowering does not take.
+    if (auto lane = e.when(lid < e.u32(picks))) {
+      const auto id = e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(a.targets[row * picks + lid])));
+      e.store(slot + e.u32(2) + lid, a.x[base + id]);
     }
     if (!k.lds().ok()) return {};
     return k.str();
