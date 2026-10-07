@@ -1,4 +1,5 @@
 #include "lse/dispatch/quant.hpp"
+#include "lse/backends/hrx/device_info.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -89,6 +90,72 @@ void dot(env::Emit &e, const Args &a, const kir::Val<kir::u32> &wb,
     ua[r] = math::fma(us, uf[r].read(), ua[r].read());
   }
 }
+// dot() with the rows' panel words for the current block staged in scratch:
+// row r's codes at r * kStageRow + 2 * local, its steps at
+// r * kStageRow + 256 + local, `local` the chunk's offset in the block.
+constexpr std::uint32_t kStageRow = 384;
+void dot_staged(env::Emit &e, const Args &a, const kir::Tile<kir::u32> &tile,
+                const kir::Val<kir::u32> &wb, const kir::Val<kir::u32> &sb,
+                const kir::Val<kir::u32> &chunk, const kir::Val<kir::u32> &local,
+                std::uint32_t count, std::span<const kir::LValue<kir::f32>> ga,
+                std::span<const kir::LValue<kir::f32>> ua) {
+  std::vector<kir::LValue<kir::f32>> gf, uf;
+  for (std::size_t r = 0; r < ga.size(); ++r) {
+    gf.push_back(e.var(0.0f));
+    uf.push_back(e.var(0.0f));
+  }
+  auto gwords = e.load(a.gw, wb + chunk, count * 4u);
+  auto uwords = e.load(a.uw, wb + chunk, count * 4u);
+  std::vector<std::array<kir::Val<kir::u32>, 2>> gp, up;
+  for (std::uint32_t j = 0; j < count; ++j) {
+    std::array<kir::Val<kir::u32>, 2> g, u;
+    for (int p = 0; p < 2; ++p) {
+      g[p] = quant::dot4_code_plane(e, e.let(gwords[static_cast<int>(j)]), p);
+      u[p] = quant::dot4_code_plane(e, e.let(uwords[static_cast<int>(j)]), p);
+    }
+    gp.push_back(g);
+    up.push_back(u);
+  }
+  for (std::size_t rp = 0; rp < ga.size(); rp += 2) {
+    std::vector<kir::Pack<kir::u32>> first, second, steps;
+    const auto pair_rows = std::min<std::size_t>(2, ga.size() - rp);
+    for (std::size_t at = 0; at < pair_rows; ++at) {
+      const auto row_base = static_cast<std::uint32_t>((rp + at) * kStageRow);
+      first.push_back(tile.load(e.let(local * 2u + row_base), count == 4 ? 16u : 8u));
+      if (count == 4)
+        second.push_back(tile.load(e.let(local * 2u + (row_base + 4u)), 16u));
+      steps.push_back(tile.load(e.let(local + (row_base + 256u)), count * 4u));
+    }
+    for (std::uint32_t j = 0; j < count; ++j) {
+      for (std::size_t at = 0; at < pair_rows; ++at) {
+        auto gi = e.var(kir::cast<kir::i32>(e.u32(0)));
+        auto ui = e.var(kir::cast<kir::i32>(e.u32(0)));
+        for (int p = 0; p < 2; ++p) {
+          auto x =
+              e.let((j < 2 ? first[at]
+                           : second[at])[static_cast<int>((j % 2) * 2u) + p]);
+          gi = math::dot4_iu8(kir::cast<kir::i32>(x),
+                              kir::cast<kir::i32>(gp[j][p]), gi.read());
+          ui = math::dot4_iu8(kir::cast<kir::i32>(x),
+                              kir::cast<kir::i32>(up[j][p]), ui.read());
+        }
+        auto step =
+            e.let(math::from_bits<lse::f32>(steps[at][static_cast<int>(j)]));
+        gf[rp + at] =
+            math::fma(step, kir::cast<kir::f32>(gi.read()), gf[rp + at].read());
+        uf[rp + at] =
+            math::fma(step, kir::cast<kir::f32>(ui.read()), uf[rp + at].read());
+      }
+    }
+  }
+  auto group = e.let(chunk / 8u);
+  auto gs = e.let(math::widen(a.gs[sb + group]));
+  auto us = e.let(math::widen(a.us[sb + group]));
+  for (std::size_t r = 0; r < ga.size(); ++r) {
+    ga[r] = math::fma(gs, gf[r].read(), ga[r].read());
+    ua[r] = math::fma(us, uf[r].read(), ua[r].read());
+  }
+}
 KernelShapes original(const KernelShapes &s) {
   auto t = s;
   t.inputs = s.inputs.first(4);
@@ -136,6 +203,90 @@ struct Pair final : KernelPrimitive<Pair> {
            schedule.chunks_per_lane == rule->chunks_per_lane &&
            schedule.k_splits == rule->k_splits;
   }
+  // The rows' panel words are staged one 128-chunk block at a time in
+  // scratch, which the workgroup's eight waves (eight columns) then read,
+  // instead of every wave reading every row's words from the cache: at
+  // eight rows that is 24 panel words per weight word, and the cache, not
+  // the weights, bound the pass. Same blocks, chunks, accumulation order
+  // and bias pass as the unstaged body; the grid covers exactly 17408
+  // columns, so every wave reaches every barrier.
+  static std::string emit_staged(const KernelShapes &s, const Dot4Schedule &sched,
+                                 std::uint32_t rows) {
+    kir::KernelBody kb(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+    kb.set_store(s.store);
+    Args a;
+    if (!env::bind(kb, a, s))
+      return {};
+    env::Emit e{&kb};
+    const auto tile = e.lds<kir::u32>(rows * kStageRow);
+    auto lid = e.let(math::local_id());
+    auto lane = e.let(lid % 32u);
+    auto col = e.let(math::workgroup_id_x() * 8u + lid / 32u);
+    std::vector<kir::LValue<kir::f32>> ga, ua;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      ga.push_back(e.var(0.0f));
+      ua.push_back(e.var(0.0f));
+    }
+    auto wb = e.let(col * 640u);
+    auto sb = e.let(col * 80u);
+    for (std::uint32_t ks = 0; ks < sched.k_splits; ++ks) {
+      const std::uint32_t cb = ks * (640u / sched.k_splits), ce = cb + 640u / sched.k_splits;
+      for (std::uint32_t b0 = cb; b0 < ce; b0 += 128u) {
+        const std::uint32_t len = std::min(128u, ce - b0);
+        // Stage: per row, the block's codes (2 words a chunk) then its steps.
+        const std::uint32_t code_vecs = len / 2u, step_vecs = len / 4u;
+        const std::uint32_t per_row = code_vecs + step_vecs, total = rows * per_row;
+        for (std::uint32_t first = 0; first < total; first += 256u) {
+          const auto item = e.let(lid + first);
+          const auto stage = [&] {
+            const auto r = e.let(item / per_row), j = e.let(item % per_row);
+            const auto is_code = e.let(j < code_vecs);
+            // Step vectors follow the code vectors in `j`; the constant
+            // offsets fold the j - code_vecs shift without a wrap.
+            const auto src = e.let(select(is_code, r * 2000u + j * 4u + b0 * 2u,
+                                          r * 2000u + j * 4u + (1280u + b0 - 4u * code_vecs)));
+            const auto dst = e.let(select(is_code, r * kStageRow + j * 4u,
+                                          r * kStageRow + j * 4u + (256u - 4u * code_vecs)));
+            kb.store_pack<kir::u32>(tile.id(), dst, e.load(a.panel, src, 16u), 16u);
+          };
+          if (first + 256u <= total) stage();
+          else if (auto live = e.when(item < total)) stage();
+        }
+        e.barrier();
+        if (len == 128u) {
+          dot_staged(e, a, tile, wb, sb, e.let(lane * 4u + b0), e.let(lane * 4u), 4, ga, ua);
+        } else {
+          for (std::uint32_t c = 0; c < len; c += 32u)
+            dot_staged(e, a, tile, wb, sb, e.let(lane + (b0 + c)), e.let(lane + c), 1, ga, ua);
+        }
+        e.barrier();
+      }
+      for (auto g : e.range(e.u32(cb / 8u) + lane, e.u32(ce / 8u), 32u)) {
+        auto gb = e.let(math::widen(a.gb[sb + g]));
+        auto ub = e.let(math::widen(a.ub[sb + g]));
+        for (std::uint32_t r = 0; r < rows; ++r) {
+          auto sum = e.let(math::from_bits<lse::f32>(
+              a.panel[e.u32(static_cast<std::uint32_t>(r * 2000 + 1920)) + g]));
+          ga[r] = math::fma(gb, sum, ga[r].read());
+          ua[r] = math::fma(ub, sum, ua[r].read());
+        }
+      }
+    }
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      for (std::uint32_t bit = 1; bit < 32; bit <<= 1)
+        ga[r] = ga[r].read() + math::shfl_xor(ga[r].read(), e.u32(bit));
+      for (std::uint32_t bit = 1; bit < 32; bit <<= 1)
+        ua[r] = ua[r].read() + math::shfl_xor(ua[r].read(), e.u32(bit));
+    }
+    if (auto lane0 = e.when(lane == 0u))
+      for (std::uint32_t r = 0; r < rows; ++r) {
+        auto g = ga[r].read();
+        auto silu = e.let(math::emit<Silu>(g));
+        e.store(e.u32(static_cast<std::uint32_t>(r * 17408)) + col,
+                silu * ua[r].read());
+      }
+    return kb.lds().ok() ? kb.str() : std::string{};
+  }
   std::string emit_kernel(const KernelShapes &s) const override {
     if (!valid(s) || !s.types.scalar || !s.store || !s.intrinsics)
       return {};
@@ -144,6 +295,9 @@ struct Pair final : KernelPrimitive<Pair> {
     // its own rows alone, each exactly as the rule's pass computes it.
     const auto rows = std::min<std::uint32_t>(
         sched.rows, static_cast<std::uint32_t>(s.inputs[0].dim(1)));
+    const auto *rule = dispatch::q4_swiglu_rule(s);
+    if (rule->stage_panel && rows > 1)
+      return emit_staged(s, sched, rows);
     kir::KernelBody kb(s.types, *s.intrinsics, 0);
     kb.set_store(s.store);
     Args a;
@@ -212,6 +366,10 @@ struct Pair final : KernelPrimitive<Pair> {
     if (valid(s)) {
       p.workgroup_size[0] = 256;
       p.workgroup_count[0] = 2176;
+      const auto rows = std::min<std::uint32_t>(
+          dot4_schedule(original(s)).rows, static_cast<std::uint32_t>(s.inputs[0].dim(1)));
+      if (dispatch::q4_swiglu_rule(s)->stage_panel && rows > 1)
+        p.lds_bytes = rows * kStageRow * 4u;
     }
     return p;
   }

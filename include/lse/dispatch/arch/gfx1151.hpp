@@ -48,7 +48,8 @@ inline constexpr std::array kQuantRowLadderShapes{
 inline constexpr std::array kQ4SwiGluShapes{
     Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 1, 1, 17408, 5120},
     Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 1, 4, 17408, 5120},
-    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 2, 8, 17408, 5120},
+    // Eight rows: the panel staged in scratch per 128-chunk block.
+    Q4SwiGluShape{kArch, 32, 4, 64, 256, 4, 2, 8, 17408, 5120, true},
 };
 inline constexpr auto kQuantMatrixRanges = generic::kQuantMatrixRanges;
 

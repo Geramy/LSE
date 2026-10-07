@@ -106,6 +106,10 @@ struct Q4SwiGluShape {
   std::string_view arch;
   std::uint32_t wave, bits, group, threads, chunks_per_lane, k_splits;
   std::int64_t m, n, k;
+  // Each 128-chunk block of the activation panel is staged once in
+  // workgroup scratch for the workgroup's eight columns instead of every
+  // wave reading it from the cache.
+  bool stage_panel = false;
 };
 
 struct Q4MatrixPanelShape {
