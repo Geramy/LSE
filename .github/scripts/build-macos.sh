@@ -96,10 +96,12 @@ git -C "$work/hrx-source" init -q
 #   Needs mac_linuxgpu build 265 (older runtimes lack the bracket and keep
 #   kernel arguments in host memory); a runtime that refuses fails device
 #   creation.
+# - loom-vmem-load-latency: loomc's scheduler gives a global load its real
+#   latency, so loads issue ahead of the math that waits on them.
 hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
   gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
   loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
-  gfx120x-hdp-kernarg-publication hsa-bar-write-bracket)
+  gfx120x-hdp-kernarg-publication hsa-bar-write-bracket loom-vmem-load-latency)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"

@@ -1,0 +1,299 @@
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/common.py b/loom/py/loom/target/arch/amdgpu/descriptors/common.py
+index b084439..4d6ba3f 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/common.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/common.py
+@@ -928,10 +928,14 @@ def _common_scalar_vector_memory_schedule_classes(
+             flags=(ScheduleClassFlag.MAY_STORE,),
+             model_quality=ModelQuality.FALLBACK,
+         ),
++        # A vector-memory load returns its data hundreds of cycles after issue,
++        # even when it hits in cache. With that latency modeled, the scheduler
++        # issues a ready load ahead of ALU work that does not consume it rather
++        # than sinking the load toward its first use.
+         ScheduleClass(
+             _SCHEDULE_VMEM_LOAD,
+             latency_kind=LatencyKind.VARIABLE,
+-            latency_cycles=16,
++            latency_cycles=320,
+             issue_uses=(IssueUse(_RESOURCE_VMEM_LOAD, cycles=1, units=1),),
+             hazards=vmem_load_hazards,
+             flags=(ScheduleClassFlag.MAY_LOAD,),
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test
+new file mode 100644
+index 0000000..c40eb86
+--- /dev/null
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test
+@@ -0,0 +1,216 @@
++// RUN: emit amdgpu-assembly @second_batch_loads_issue_before_alu strategy=resource-stall
++
++amdgpu.target<gfx1201> @target
++
++low.func.def target<amdgpu.rdna4.core>(@target) @second_batch_loads_issue_before_alu(%workitem_id: reg<amdgpu.vgpr>, %base: reg<amdgpu.sgpr x2>, %out_view: reg<amdgpu.sgpr x2>) asm {
++  %offset = v_lshlrev_b32_src0_inline %workitem_id, 4
++  %batch0_0 = global_load_b128_saddr %offset, %base {offset = 0}
++  %batch0_1 = global_load_b128_saddr %offset, %base {offset = 16}
++  %batch0_2 = global_load_b128_saddr %offset, %base {offset = 32}
++  %batch0_3 = global_load_b128_saddr %offset, %base {offset = 48}
++  %batch1_0 = global_load_b128_saddr %offset, %base {offset = 64}
++  %batch1_1 = global_load_b128_saddr %offset, %base {offset = 80}
++  %batch1_2 = global_load_b128_saddr %offset, %base {offset = 96}
++  %batch1_3 = global_load_b128_saddr %offset, %base {offset = 112}
++  %b0_0_0 = slice %batch0_0[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_0_1 = slice %batch0_0[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_0_2 = slice %batch0_0[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_0_3 = slice %batch0_0[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_1_0 = slice %batch0_1[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_1_1 = slice %batch0_1[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_1_2 = slice %batch0_1[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_1_3 = slice %batch0_1[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_2_0 = slice %batch0_2[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_2_1 = slice %batch0_2[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_2_2 = slice %batch0_2[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_2_3 = slice %batch0_2[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_3_0 = slice %batch0_3[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_3_1 = slice %batch0_3[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_3_2 = slice %batch0_3[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_3_3 = slice %batch0_3[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b0_acc0 = v_xor_b32 %b0_0_0, %b0_0_1
++  %b0_acc1 = v_xor_b32 %b0_acc0, %b0_0_2
++  %b0_acc2 = v_xor_b32 %b0_acc1, %b0_0_3
++  %b0_acc3 = v_xor_b32 %b0_acc2, %b0_1_0
++  %b0_acc4 = v_xor_b32 %b0_acc3, %b0_1_1
++  %b0_acc5 = v_xor_b32 %b0_acc4, %b0_1_2
++  %b0_acc6 = v_xor_b32 %b0_acc5, %b0_1_3
++  %b0_acc7 = v_xor_b32 %b0_acc6, %b0_2_0
++  %b0_acc8 = v_xor_b32 %b0_acc7, %b0_2_1
++  %b0_acc9 = v_xor_b32 %b0_acc8, %b0_2_2
++  %b0_acc10 = v_xor_b32 %b0_acc9, %b0_2_3
++  %b0_acc11 = v_xor_b32 %b0_acc10, %b0_3_0
++  %b0_acc12 = v_xor_b32 %b0_acc11, %b0_3_1
++  %b0_acc13 = v_xor_b32 %b0_acc12, %b0_3_2
++  %b0_acc14 = v_xor_b32 %b0_acc13, %b0_3_3
++  %b0_acc15 = v_xor_b32 %b0_acc14, %b0_0_1
++  %b0_acc16 = v_xor_b32 %b0_acc15, %b0_0_2
++  %b0_acc17 = v_xor_b32 %b0_acc16, %b0_0_3
++  %b0_acc18 = v_xor_b32 %b0_acc17, %b0_1_0
++  %b0_acc19 = v_xor_b32 %b0_acc18, %b0_1_1
++  %b0_acc20 = v_xor_b32 %b0_acc19, %b0_1_2
++  %b0_acc21 = v_xor_b32 %b0_acc20, %b0_1_3
++  %b0_acc22 = v_xor_b32 %b0_acc21, %b0_2_0
++  %b0_acc23 = v_xor_b32 %b0_acc22, %b0_2_1
++  global_store_b32_saddr %offset, %b0_acc23, %out_view {offset = 0}
++  %b1_0_0 = slice %batch1_0[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_0_1 = slice %batch1_0[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_0_2 = slice %batch1_0[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_0_3 = slice %batch1_0[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_1_0 = slice %batch1_1[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_1_1 = slice %batch1_1[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_1_2 = slice %batch1_1[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_1_3 = slice %batch1_1[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_2_0 = slice %batch1_2[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_2_1 = slice %batch1_2[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_2_2 = slice %batch1_2[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_2_3 = slice %batch1_2[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_3_0 = slice %batch1_3[0] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_3_1 = slice %batch1_3[1] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_3_2 = slice %batch1_3[2] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_3_3 = slice %batch1_3[3] : reg<amdgpu.vgpr x4> -> reg<amdgpu.vgpr>
++  %b1_acc0 = v_xor_b32 %b1_0_0, %b1_0_1
++  %b1_acc1 = v_xor_b32 %b1_acc0, %b1_0_2
++  %b1_acc2 = v_xor_b32 %b1_acc1, %b1_0_3
++  %b1_acc3 = v_xor_b32 %b1_acc2, %b1_1_0
++  %b1_acc4 = v_xor_b32 %b1_acc3, %b1_1_1
++  %b1_acc5 = v_xor_b32 %b1_acc4, %b1_1_2
++  %b1_acc6 = v_xor_b32 %b1_acc5, %b1_1_3
++  %b1_acc7 = v_xor_b32 %b1_acc6, %b1_2_0
++  %b1_acc8 = v_xor_b32 %b1_acc7, %b1_2_1
++  %b1_acc9 = v_xor_b32 %b1_acc8, %b1_2_2
++  %b1_acc10 = v_xor_b32 %b1_acc9, %b1_2_3
++  %b1_acc11 = v_xor_b32 %b1_acc10, %b1_3_0
++  %b1_acc12 = v_xor_b32 %b1_acc11, %b1_3_1
++  %b1_acc13 = v_xor_b32 %b1_acc12, %b1_3_2
++  %b1_acc14 = v_xor_b32 %b1_acc13, %b1_3_3
++  %b1_acc15 = v_xor_b32 %b1_acc14, %b1_0_1
++  %b1_acc16 = v_xor_b32 %b1_acc15, %b1_0_2
++  %b1_acc17 = v_xor_b32 %b1_acc16, %b1_0_3
++  %b1_acc18 = v_xor_b32 %b1_acc17, %b1_1_0
++  %b1_acc19 = v_xor_b32 %b1_acc18, %b1_1_1
++  %b1_acc20 = v_xor_b32 %b1_acc19, %b1_1_2
++  %b1_acc21 = v_xor_b32 %b1_acc20, %b1_1_3
++  %b1_acc22 = v_xor_b32 %b1_acc21, %b1_2_0
++  %b1_acc23 = v_xor_b32 %b1_acc22, %b1_2_1
++  global_store_b32_saddr %offset, %b1_acc23, %out_view {offset = 4}
++  return
++}
++
++// Both batches of global loads are ready at entry. The second batch is not
++// consumed until the first batch's ALU chain finishes, so its loads issue
++// with the first batch and their memory latency overlaps that chain instead
++// of starting after it.
++// ----
++  v_lshlrev_b32 v0, 4, v0
++  global_load_b128 v[4:7], v0, s[0:1] offset:0
++  global_load_b128 v[8:11], v0, s[0:1] offset:16
++  global_load_b128 v[12:15], v0, s[0:1] offset:32
++  global_load_b128 v[16:19], v0, s[0:1] offset:48
++  global_load_b128 v[20:23], v0, s[0:1] offset:64
++  global_load_b128 v[24:27], v0, s[0:1] offset:80
++  global_load_b128 v[28:31], v0, s[0:1] offset:96
++  global_load_b128 v[32:35], v0, s[0:1] offset:112
++  s_wait_loadcnt loadcnt(7)
++  v_xor_b32 v1, v4, v5
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v1, v1, v6
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v1, v1, v7
++  s_wait_loadcnt loadcnt(6)
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v1, v1, v8
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v1, v1, v9
++  s_wait_loadcnt loadcnt(3)
++  v_xor_b32 v2, v20, v21
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v10
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v22
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v11
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v23
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v12
++  s_wait_loadcnt loadcnt(2)
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v24
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v13
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v25
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v14
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v26
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v15
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v27
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v16
++  s_wait_loadcnt loadcnt(1)
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v28
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v17
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v29
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v18
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v30
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v19
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v31
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v5
++  s_wait_loadcnt loadcnt(0)
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v32
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v6
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v33
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v7
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v34
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v8
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v35
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v9
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v21
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v10
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v22
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v11
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v23
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v12
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v24
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v1, v1, v13
++  s_delay_alu instid0(VALU_DEP_2)
++  v_xor_b32 v2, v2, v25
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v2, v2, v26
++  global_store_b32 v0, v1, s[2:3] offset:0
++  v_xor_b32 v2, v2, v27
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v2, v2, v28
++  s_delay_alu instid0(VALU_DEP_1)
++  v_xor_b32 v2, v2, v29
++  global_store_b32 v0, v2, s[2:3] offset:4
++  s_wait_storecnt storecnt(0)
++  s_endpgm
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_wmma_schedule.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_wmma_schedule.loom-test
+index 536b84f..b925b38 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_wmma_schedule.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_wmma_schedule.loom-test
+@@ -459,6 +459,12 @@ low.func.def target<amdgpu.gfx11.generic.core>(@target) @bf16_four_k_block_loads
+   s_waitcnt vmcnt(12) lgkmcnt(63)
+   s_delay_alu instid0(VALU_DEP_1)
+   v_wmma_f32_16x16x16_bf16 v[8:15], v[16:23], v[24:31], v[8:15]
++  s_waitcnt vmcnt(8) lgkmcnt(63)
++  s_delay_alu instid0(VALU_DEP_1)
++  v_wmma_f32_16x16x16_bf16 v[8:15], v[32:39], v[40:47], v[8:15]
++  s_waitcnt vmcnt(4) lgkmcnt(63)
++  s_delay_alu instid0(VALU_DEP_1)
++  v_wmma_f32_16x16x16_bf16 v[8:15], v[48:55], v[56:63], v[8:15]
+   s_waitcnt vmcnt(2) lgkmcnt(63)
+   v_mov_b32 v16, v4
+   v_mov_b32 v17, v5
+@@ -468,11 +474,8 @@ low.func.def target<amdgpu.gfx11.generic.core>(@target) @bf16_four_k_block_loads
+   v_mov_b32 v21, v65
+   v_mov_b32 v22, v66
+   v_mov_b32 v23, v67
+-  v_wmma_f32_16x16x16_bf16 v[8:15], v[32:39], v[40:47], v[8:15]
+-  s_delay_alu instid0(VALU_DEP_1)
+-  v_wmma_f32_16x16x16_bf16 v[8:15], v[48:55], v[56:63], v[8:15]
+   s_waitcnt vmcnt(0) lgkmcnt(63)
+-  s_delay_alu instid0(VALU_DEP_1) | instid1(VALU_DEP_3)
++  s_delay_alu instid0(VALU_DEP_1)
+   v_wmma_f32_16x16x16_bf16 v[8:15], v[16:23], v[72:79], v[8:15]
+   global_store_b32 v0, v8, s[4:5] offset:0
+   global_store_b32 v0, v9, s[4:5] offset:128
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/assembly.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/assembly.loom-test
+index a0a8880..d1ac346 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/test/assembly.loom-test
++++ b/loom/src/loom/target/emit/native/amdgpu/test/assembly.loom-test
+@@ -3061,18 +3061,18 @@ low.func.def target<amdgpu.rdna3.core>(@gfx11_target) @gfx11_stress_fragment(%s0
+ }
+ 
+ // ----
+-  v_wmma_f32_16x16x16_f16 v[0:7], v[16:23], v[24:31], v[0:7]
+   buffer_load_dword v11, v10, s[4:7], s8 offen offset:4
+   buffer_load_b128 v[12:15], v10, s[4:7], s8 offen offset:16
++  v_wmma_f32_16x16x16_f16 v[0:7], v[16:23], v[24:31], v[0:7]
+   s_load_dwordx2 s[0:1], s[0:1], s8 offset:16
+   s_buffer_load_dword s1, s[4:7], s8 offset:0
+   s_add_u32 s2, s2, s3
+   v_add_u32 v8, v8, v9
+   s_add_u32 s1, s2, s1
+-  v_add_u32 v8, v8, v11
+-  buffer_store_dword v8, v10, s[4:7], s1 offen offset:8
+-  buffer_store_b128 v[12:15], v10, s[4:7], s0 offen offset:32
+   v_wmma_f32_16x16x16_f16 v[0:7], v[16:23], v[24:31], v[0:7]
++  v_add_u32 v4, v8, v11
++  buffer_store_dword v4, v10, s[4:7], s1 offen offset:8
++  buffer_store_b128 v[12:15], v10, s[4:7], s0 offen offset:32
+   buffer_store_b128 v[0:3], v10, s[4:7], s8 offen offset:48
+   s_waitcnt vmcnt(0) lgkmcnt(0)
+   s_waitcnt_depctr depctr(0)

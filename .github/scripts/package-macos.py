@@ -110,7 +110,8 @@ def main():
                                      'gfx12-vopd-identical-source', 'kv-fragment-addressing',
                                      'cooperative-matrix-operands', 'loop-invariant-motion',
                                      'rdna4-prefetch-address-span', 'loom-grow-arrays-only-when-full',
-                                     'gfx120x-hdp-kernarg-publication', 'hsa-bar-write-bracket')},
+                                     'gfx120x-hdp-kernarg-publication', 'hsa-bar-write-bracket',
+                                     'loom-vmem-load-latency')},
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
     }
