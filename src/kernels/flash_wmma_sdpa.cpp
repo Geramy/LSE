@@ -324,25 +324,31 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
             const std::uint32_t steps = padded_depth / 16u;
             for (std::uint32_t first = 0; first < steps; first += kStepsPerBatch) {
               const std::uint32_t last = std::min(steps, first + kStepsPerBatch);
+              // Each key fragment is one sixteen-element load, which the
+              // target splits into its two 16-byte loads straight into the
+              // operand registers; built a half at a time it cost a bit move
+              // per half (4096-token prefill 466.5 -> 474.7 tok/s on the
+              // 8060S). The query fragment stays half by half: loaded whole
+              // from scratch, the target holds every step's query at once
+              // and the kernel spills.
+              using KeyFrag = lse::vec<Narrow, 16>;
               std::vector<kir::Pack<KvElement<Storage>>> keys;
-              for (std::uint32_t step = first; step < last; ++step) {
-                keys.push_back(e.load(a.k, e.let(kbase + step * 16u), 16u));
-                keys.push_back(e.load(a.k, e.let(kbase + (step * 16u + 8u)), 16u));
-              }
+              for (std::uint32_t step = first; step < last; ++step)
+                keys.push_back(k.load_elems<KvElement<Storage>>(
+                    a.k.b.id(), e.let(kbase + step * 16u), 16u));
               for (std::uint32_t step = first; step < last; ++step) {
                 const auto qbase = e.let(lane_lo * padded_depth + step * 16u);
                 const auto qlo = qs.load(qbase, 16u);
                 const auto qhi = qs.load(e.let(qbase + 8u), 16u);
                 auto qa = e.local<Narrow, 16>();
-                auto kb = e.local<Narrow, 16>();
-                const std::size_t at = 2u * (step - first);
                 for (int j = 0; j < 8; ++j) {
                   qa[j] = qlo[j];
                   qa[8 + j] = qhi[j];
-                  kb[j] = keys[at][j];
-                  kb[8 + j] = keys[at + 1u][j];
                 }
-                acc = math::mma<Mma>(qa.value(), kb.value(), acc.value());
+                acc = math::mma<Mma>(
+                    qa.value(),
+                    kir::Val<KeyFrag>(&k.types(), &k.ir(), keys[step - first].id()),
+                    acc.value());
               }
             }
             }
