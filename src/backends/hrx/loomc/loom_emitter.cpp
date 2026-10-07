@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,20 +34,55 @@ namespace {
 // Full structural identity, independent of graph addresses. The graph's
 // display signature omits edges and aliasing; those change argument indices
 // and cannot identify reusable source or JIT objects.
-std::string emission_identity(const FusionGroup& group, const DeviceInfo& device) {
-  std::string key;
-  key.reserve(1024);
-  auto number = [&](std::uint64_t value) {
-    for (unsigned byte = 0; byte < 8; ++byte) {
-      key.push_back(static_cast<char>((value >> (byte * 8)) & 255u));
-    }
-  };
-  auto text = [&](std::string_view value) {
+//
+// STREAMED, NOT SPELLED. The identity is hashed as it is walked rather than
+// written out as text and hashed after: it is taken for every group of every
+// shape a server prepares and again per launch, and building it a byte at a
+// time into a 1-3 KiB string was a seventh of a warm start's preparation.
+// Every field is mixed whole, so nothing that used to distinguish two groups
+// stops distinguishing them.
+class IdentityHash {
+ public:
+  void number(std::uint64_t value) noexcept {
+    h_ = std::rotl(h_ ^ (value * 0x87c37b91114253d5ull), 31) * 0x4cf5ad432745937full +
+         0x52dce729ull;
+    ++words_;
+  }
+  void text(std::string_view value) noexcept {
     number(value.size());
-    key.append(value);
-  };
+    std::size_t at = 0;
+    for (; at + 8 <= value.size(); at += 8) {
+      std::uint64_t word = 0;
+      std::memcpy(&word, value.data() + at, 8);
+      number(word);
+    }
+    if (at < value.size()) {
+      std::uint64_t word = 0;
+      std::memcpy(&word, value.data() + at, value.size() - at);
+      number(word);
+    }
+  }
+  [[nodiscard]] std::uint64_t finish() const noexcept {
+    std::uint64_t h = h_ ^ words_;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return h;
+  }
+
+ private:
+  std::uint64_t h_ = 0x6c6f6f6d2d696431ull;
+  std::uint64_t words_ = 0;
+};
+
+std::uint64_t emission_identity(const FusionGroup& group, const DeviceInfo& device) {
+  IdentityHash key;
+  auto number = [&](std::uint64_t value) { key.number(value); };
+  auto text = [&](std::string_view value) { key.text(value); };
   text("loom");
-  number(5);
+  number(6);
   number(dispatch::specialization_cache_key(0, group, device,
                                            loom_types(), loom_sources()));
   text(device.arch);
@@ -95,6 +131,9 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
   number(group.is_phase);
   std::unordered_map<const Node*, std::uint64_t> ids;
   std::vector<const Node*> nodes;
+  const std::size_t expected = group.inputs.size() + group.nodes.size() * 2 + 4;
+  ids.reserve(expected);
+  nodes.reserve(expected);
   auto identify = [&](const NodePtr& node) {
     if (!node) return std::uint64_t{0};
     const auto [it, inserted] = ids.emplace(node.get(), ids.size() + 1);
@@ -121,20 +160,14 @@ std::string emission_identity(const FusionGroup& group, const DeviceInfo& device
     for (std::size_t i = 0; i < node->shape.rank(); ++i) {
       number(static_cast<std::uint64_t>(node->shape.dim(i)));
     }
+    // Counted, so attributes cannot slide between the integer and float lists.
+    number(node->iattrs.size());
     for (auto value : node->iattrs) number(static_cast<std::uint64_t>(value));
+    number(node->attrs.size());
     for (float value : node->attrs) number(std::bit_cast<std::uint32_t>(value));
     text(node->prim ? node->prim->name() : std::string_view{});
   }
-  return key;
-}
-
-std::uint64_t identity_hash(std::string_view key) {
-  std::uint64_t hash = 1469598103934665603ull;
-  for (unsigned char c : key) {
-    hash ^= c;
-    hash *= 1099511628211ull;
-  }
-  return hash;
+  return key.finish();
 }
 
 kir::Scalar elem_of(DType dt) {
@@ -350,7 +383,7 @@ std::string kernel_header(const EmittedKernel& out,
 
 std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
                                      const DeviceInfo& device) const {
-  return identity_hash(emission_identity(group, device));
+  return emission_identity(group, device);
 }
 
 bool LoomEmitter::joins_run(std::span<const NodePtr> run,
@@ -500,8 +533,8 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
 
   EmittedKernel out;
   out.dialect = Dialect::kLoom;
-  const std::string identity = emission_identity(group, device);
-  out.entry_name = "lse_loom_" + std::to_string(identity_hash(identity));
+  const std::uint64_t identity = emission_identity(group, device);
+  out.entry_name = "lse_loom_" + std::to_string(identity);
 
   std::unordered_map<const Node*, std::size_t> binding_of;
   auto bind = [&](const NodePtr& n) {
@@ -545,10 +578,18 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
   // written or not: it has said the kernel is resident.
   auto remember = [&] {
     (void)finalize_source_identity(out, "lse_loom_");
+    // The description is copied WITHOUT the text and the bindings. Copying
+    // `out` whole and clearing the copy's source kept every kernel's text
+    // capacity alive behind an empty string: ~220 MiB of host memory once a
+    // server had prepared every shape.
+    std::string text = std::move(out.source);
+    std::vector<NodePtr> bindings = std::move(out.binding_order);
+    out.source = std::string();
+    out.binding_order = std::vector<NodePtr>();
     CachedEmission saved;
     saved.launch = out;
-    saved.launch.source.clear();
-    saved.launch.binding_order.clear();
+    out.source = std::move(text);
+    out.binding_order = std::move(bindings);
     // Descriptions of every prepared shape fit many times over; the bound is
     // for a process that keeps meeting new shapes. Text is kept only for a
     // kernel built again on another device, which a resident one never is.
@@ -1148,6 +1189,19 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
       kernel_header(out, params) + prologue + body + "  kernel.return\n}\n";
   remember();
   return out;
+}
+
+bool LoomEmitter::adopt_launch(std::uint64_t key, const EmittedKernel& launch) const {
+  if (!launch.source.empty() || !launch.binding_order.empty() ||
+      launch.dialect != Dialect::kLoom || launch.entry_name.empty())
+    return false;
+  const std::lock_guard lock(cache_mutex_);
+  // An entry this process wrote itself is the same description and may carry
+  // text besides; it is kept.
+  if (emit_cache_.contains(key)) return true;
+  if (emit_cache_.size() >= (1u << 16)) return false;
+  emit_cache_[key].launch = launch;
+  return true;
 }
 
 LoomEmitter::CacheStats LoomEmitter::cache_stats() const {

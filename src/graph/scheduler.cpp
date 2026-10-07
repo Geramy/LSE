@@ -224,7 +224,8 @@ std::shared_ptr<kv::MemoryManager> Scheduler::kv_memory() const {
 Scheduler::JitStats Scheduler::jit_stats() const noexcept {
   if (impl_->jit == nullptr) return {};
   const JitCache::Stats& s = impl_->jit->stats();
-  return JitStats{s.memory_hits, s.disk_hits, s.compiles, s.compile_ns};
+  return JitStats{s.memory_hits, s.disk_hits, s.compiles, s.compile_ns,
+                  s.index_hits, s.index_misses, s.index_rejects};
 }
 
 std::string Scheduler::device_gap(const Node& node,
@@ -1205,9 +1206,12 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
                         primary);
   auto planned = Partitioner::phases(roots, &backend().device_info());
   const std::vector<FusionGroup> groups = launch_groups(roots, planned, *emitter);
-  // What is not yet resident, per member: emitted in full and loaded together.
+  // What is not yet resident, per member: restored from the launch index
+  // when this exact set was prepared before, else emitted in full and loaded
+  // together.
   struct Missing {
-    std::vector<EmittedKernel> kernels;
+    const IKernelEmitter* emitter = nullptr;
+    std::vector<const FusionGroup*> groups;
     std::vector<std::uint64_t> signatures;
     std::unordered_set<std::uint64_t> seen;
   };
@@ -1229,22 +1233,36 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
     if (impl_->jit->try_get(member, ident, memitter->dialect()) != nullptr) continue;
     Missing& m = missing[member];
     if (!m.seen.insert(ident).second) continue;
-    auto emitted = memitter->emit(g, be.device_info());
-    if (!emitted.ok()) {
-      return Status(emitted.status().code(), ::lse::detail::concat(
-          "preparing ", describe_group(g, 0), ": ", emitted.status().to_string()));
-    }
-    m.kernels.push_back(emitted.release());
+    m.emitter = memitter;
+    m.groups.push_back(&g);
     m.signatures.push_back(ident);
   }
   for (std::size_t member = 0; member < missing.size(); ++member) {
     const Missing& m = missing[member];
-    if (m.kernels.empty()) continue;
+    if (m.groups.empty()) continue;
+    const bool indexed = m.emitter->keeps_launches();
+    if (indexed) {
+      LSE_ASSIGN_OR(const bool restored,
+                    impl_->jit->restore(member, m.emitter->dialect(), m.signatures,
+                                        *m.emitter));
+      if (restored) continue;
+    }
+    const backend::DeviceInfo& info = devices_.device(member).device_info();
+    std::vector<EmittedKernel> kernels;
+    kernels.reserve(m.groups.size());
+    for (const FusionGroup* g : m.groups) {
+      auto emitted = m.emitter->emit(*g, info);
+      if (!emitted.ok()) {
+        return Status(emitted.status().code(), ::lse::detail::concat(
+            "preparing ", describe_group(*g, 0), ": ", emitted.status().to_string()));
+      }
+      kernels.push_back(emitted.release());
+    }
     std::vector<JitCache::Preload> preload;
-    preload.reserve(m.kernels.size());
-    for (std::size_t i = 0; i < m.kernels.size(); ++i)
-      preload.push_back({m.signatures[i], &m.kernels[i]});
-    LSE_RETURN_IF_ERROR(impl_->jit->preload(member, preload));
+    preload.reserve(kernels.size());
+    for (std::size_t i = 0; i < kernels.size(); ++i)
+      preload.push_back({m.signatures[i], &kernels[i]});
+    LSE_RETURN_IF_ERROR(impl_->jit->preload(member, preload, indexed));
   }
   return OkStatus();
 }

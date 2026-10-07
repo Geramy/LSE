@@ -106,6 +106,18 @@ LSE-owned artifact families from the selected directory. It preserves current
 and newer releases, unrelated files, incomplete records and symlinks. An update
 can compile kernels again; later launches reuse the current release cache.
 
+Beside the compiled objects, each build keeps a launch index in
+`launch-<release>-<build>/`. For every set of kernels the server prepares before
+it reports ready, the index holds each kernel's launch description and the object
+that contains them, keyed by what is known before any source is written: the
+kernels' structural identities, the device, the compiler and a digest of the
+engine's own source tree. A warm start makes those kernels resident from the
+index without generating their source. Any change to the engine's source is a new
+digest, so a rebuilt engine prepares from source once and indexes again; startup
+keeps the indexes of the three most recently used other builds of the release and
+removes older releases' indexes. An index entry or object that fails its checksum
+is reported on stderr, discarded and rebuilt from source; it is never used.
+
 ## KV storage
 
 K/V storage defaults to BF16 when the model declares BF16, including the local

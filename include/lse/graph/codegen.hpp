@@ -175,6 +175,23 @@ class IKernelEmitter {
     return emit(group, device);
   }
 
+  // Launch descriptions kept across processes. An emitter that keeps the
+  // description emit_launch() returns under its cache_key() says so here,
+  // and can then be handed one the JIT read back from its launch index:
+  // `launch` is that description with no source and no bindings, filed under
+  // `key`. A warm start then makes a kernel resident and launches it without
+  // writing its source at all. False (the default) keeps the JIT from
+  // indexing this emitter's kernels, and every start writes them out.
+  [[nodiscard]] virtual bool keeps_launches() const noexcept { return false; }
+  // False when the description was not taken (wrong dialect, carries text or
+  // bindings, or the table is full). The kernel is resident either way; an
+  // untaken description is written again the first time it is launched.
+  virtual bool adopt_launch(std::uint64_t key, const EmittedKernel& launch) const {
+    (void)key;
+    (void)launch;
+    return false;
+  }
+
   // JIT identity for this group on this device. Must change when generated
   // source would change without FusionGroup::signature() changing (a
   // specialized primitive). Arch is mixed in by the cache, not here.

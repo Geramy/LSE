@@ -5,7 +5,11 @@
 #include "lse/graph/ops.hpp"
 #include "lse/graph/program.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cctype>
+#include <unordered_set>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -835,6 +839,474 @@ LSE_TEST(retained_emission_refuses_changed_buffer_alias_class) {
   // Disjoint windows in one slab still permit the original noalias source.
   retained.inputs[1]->buffer.offset = retained.inputs[0]->buffer.size_bytes;
   LSE_EXPECT_EQ(key, emitter.cache_key(retained, info));
+}
+
+// ---- launch index ----------------------------------------------------------
+
+namespace {
+// Accepts a bundle: every requested export must be in the object.
+struct BundleBackend final : backend::IBackend {
+  backend::DeviceInfo info = device();
+  int loads = 0;
+  int bundle_loads = 0;
+  Status init(int) override { return OkStatus(); }
+  void shutdown() noexcept override {}
+  const backend::DeviceInfo& device_info() const noexcept override { return info; }
+  Result<backend::DeviceBuffer> allocate(std::size_t, backend::MemoryClass,
+                                         backend::Stream) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  void deallocate(backend::DeviceBuffer&) noexcept override {}
+  Status copy_h2d(const void*, backend::DeviceBuffer&, std::size_t,
+                  std::size_t) override { return LSE_ERROR(kUnimplemented, "stub"); }
+  Status copy_d2h(const backend::DeviceBuffer&, void*, std::size_t,
+                  std::size_t) override { return LSE_ERROR(kUnimplemented, "stub"); }
+  Result<backend::KernelHandle> load_executable(
+      std::string_view name, std::span<const std::byte> bytes) override {
+    const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    if (text.find("export(\"" + std::string(name) + "\")") == std::string_view::npos)
+      return LSE_ERROR(kNotFound, "executable does not export ", std::string(name));
+    backend::KernelHandle handle;
+    handle.executable = 1000 + static_cast<std::uint64_t>(++loads);
+    handle.name = name;
+    return handle;
+  }
+  Result<std::vector<backend::KernelHandle>> load_executables(
+      std::span<const std::string> names, std::span<const std::byte> bytes) override {
+    ++bundle_loads;
+    return IBackend::load_executables(names, bytes);
+  }
+  Status launch(const backend::KernelHandle&, const backend::LaunchDims&,
+                const backend::DispatchArgs&, const backend::DispatchTarget&) override {
+    return LSE_ERROR(kUnimplemented, "stub");
+  }
+  Status synchronize() override { return OkStatus(); }
+  std::string_view name() const noexcept override { return "bundle-test"; }
+  std::span<const KernelToolchain> toolchains() const noexcept override { return {}; }
+};
+
+FusionGroup scaled(std::int64_t width) {
+  auto a = leaf(Shape{width}), b = leaf(Shape{width});
+  auto out = a * b;
+  FusionGroup group;
+  group.nodes = {out.node()};
+  group.inputs = {a.node(), b.node()};
+  group.outputs = {out.node()};
+  group.anchor = out.node()->kind;
+  group.anchor_class = out.node()->fclass;
+  return group;
+}
+
+// A prepared set as Scheduler::prepare hands it over: the groups' cache keys
+// and their full emissions.
+struct PreparedSet {
+  std::vector<FusionGroup> groups;
+  std::vector<std::uint64_t> signatures;
+  std::vector<EmittedKernel> kernels;
+  std::vector<JitCache::Preload> preload;
+};
+PreparedSet prepared(const backend::LoomEmitter& emitter, const backend::DeviceInfo& info,
+                     std::vector<FusionGroup> groups) {
+  PreparedSet out;
+  out.groups = std::move(groups);
+  for (const FusionGroup& g : out.groups) {
+    out.signatures.push_back(emitter.cache_key(g, info));
+    auto emitted = emitter.emit(g, info);
+    LSE_EXPECT(emitted.ok());
+    out.kernels.push_back(emitted.ok() ? emitted.release() : EmittedKernel{});
+  }
+  for (std::size_t i = 0; i < out.kernels.size(); ++i)
+    out.preload.push_back({out.signatures[i], &out.kernels[i]});
+  return out;
+}
+std::vector<FusionGroup> three_groups() { return {subtraction(), subtraction(true), scaled(256)}; }
+
+std::vector<std::filesystem::path> files_with(const std::filesystem::path& dir,
+                                              std::string_view suffix) {
+  std::vector<std::filesystem::path> out;
+  std::error_code ec;
+  for (std::filesystem::recursive_directory_iterator it(dir, ec), end; !ec && it != end; ++it)
+    if (it->path().string().ends_with(suffix)) out.push_back(it->path());
+  return out;
+}
+void flip_byte(const std::filesystem::path& path, std::size_t from_end) {
+  std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+  f.seekg(0, std::ios::end);
+  const auto size = static_cast<std::size_t>(f.tellg());
+  const auto at = static_cast<std::streamoff>(size - 1 - std::min(from_end, size - 1));
+  f.seekg(at);
+  char c = 0;
+  f.read(&c, 1);
+  c = static_cast<char>(c ^ 0x5a);
+  f.seekp(at);
+  f.write(&c, 1);
+}
+}  // namespace
+
+LSE_TEST(launch_index_makes_a_prepared_set_resident_without_writing_source) {
+  ArtifactDirectory dir;
+  const auto info = device();
+  {
+    ArtifactCompiler compiler;
+    BundleBackend backend;
+    backend::LoomEmitter emitter;
+    auto set = prepared(emitter, info, three_groups());
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+    LSE_EXPECT_EQ(compiler.compiles, 1);
+    LSE_EXPECT_EQ(files_with(cache.launch_index_dir(), ".launch").size(), 1u);
+  }
+  // A second process: new emitter, new cache, the same groups rebuilt.
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  backend::LoomEmitter emitter;
+  JitCache cache(backend, compiler, dir.path.string());
+  const auto groups = three_groups();
+  std::vector<std::uint64_t> signatures;
+  for (const auto& g : groups) signatures.push_back(emitter.cache_key(g, info));
+  auto restored = cache.restore(0, Dialect::kLoom, signatures, emitter);
+  LSE_EXPECT(restored.ok() && *restored);
+  LSE_EXPECT_EQ(compiler.compiles, 0);
+  LSE_EXPECT_EQ(backend.bundle_loads, 1);
+  LSE_EXPECT_EQ(cache.stats().index_hits, 1u);
+  LSE_EXPECT_EQ(cache.stats().index_misses, 0u);
+  // Nothing was emitted to get here...
+  LSE_EXPECT_EQ(emitter.cache_stats().misses, 0u);
+  LSE_EXPECT_EQ(emitter.cache_stats().entries, groups.size());
+  for (std::size_t i = 0; i < groups.size(); ++i) {
+    LSE_EXPECT(cache.try_get(0, signatures[i], Dialect::kLoom) != nullptr);
+    // ...and launching writes no text either: the description is the index's.
+    auto launch = emitter.emit_launch(groups[i], info);
+    auto fresh = backend::LoomEmitter{}.emit(groups[i], info);
+    LSE_EXPECT(launch.ok() && fresh.ok());
+    if (!launch.ok() || !fresh.ok()) continue;
+    LSE_EXPECT(launch->source.empty());
+    LSE_EXPECT(launch->entry_name == fresh->entry_name);
+    LSE_EXPECT(launch->structural_entry_name == fresh->structural_entry_name);
+    LSE_EXPECT(launch->content_addressed == fresh->content_addressed);
+    LSE_EXPECT(launch->binding_order == fresh->binding_order);
+    LSE_EXPECT_EQ(launch->constants.total_bytes, fresh->constants.total_bytes);
+    LSE_EXPECT_EQ(launch->constants.fields.size(), fresh->constants.fields.size());
+    for (int d = 0; d < 3; ++d) {
+      LSE_EXPECT_EQ(launch->dims.workgroup_count[d], fresh->dims.workgroup_count[d]);
+      LSE_EXPECT_EQ(launch->dims.workgroup_size[d], fresh->dims.workgroup_size[d]);
+    }
+    LSE_EXPECT_EQ(launch->lds_bytes, fresh->lds_bytes);
+    const auto* handle = cache.try_get(0, signatures[i], Dialect::kLoom);
+    LSE_EXPECT(handle != nullptr && handle->name == fresh->entry_name);
+  }
+  LSE_EXPECT_EQ(emitter.cache_stats().misses, 0u);
+  // The object a restored kernel stands for is the one its source names: a
+  // later compile request with the real text is a memory hit, not a rebuild.
+  auto again = backend::LoomEmitter{}.emit(groups[0], info);
+  LSE_EXPECT(again.ok());
+  if (again.ok()) LSE_EXPECT_OK(cache.get_or_compile(0, signatures[0], *again).status());
+  LSE_EXPECT_EQ(compiler.compiles, 0);
+}
+
+LSE_TEST(launch_index_key_changes_with_every_input_that_changes_source) {
+  ArtifactDirectory dir;
+  const auto info = device();
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  backend::LoomEmitter emitter;
+  auto set = prepared(emitter, info, three_groups());
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+  }
+  auto misses = [&](const std::vector<FusionGroup>& groups, backend::DeviceInfo at,
+                    std::string compiler_id = "exact-source-test.v1") {
+    ArtifactCompiler other;
+    other.id = std::move(compiler_id);
+    BundleBackend device_backend;
+    device_backend.info = at;
+    backend::LoomEmitter fresh;
+    JitCache cache(device_backend, other, dir.path.string());
+    std::vector<std::uint64_t> signatures;
+    for (const auto& g : groups) signatures.push_back(fresh.cache_key(g, at));
+    auto restored = cache.restore(0, Dialect::kLoom, signatures, fresh);
+    return restored.ok() && !*restored && cache.stats().index_rejects == 0 &&
+           fresh.cache_stats().entries == 0;
+  };
+  // The control: the same groups on the same device are a hit.
+  LSE_EXPECT(!misses(three_groups(), info));
+  // A shape.
+  LSE_EXPECT(misses({subtraction(), subtraction(true), scaled(512)}, info));
+  // The edges (a-b against b-a) in the set's place.
+  LSE_EXPECT(misses({subtraction(true), subtraction(), scaled(256)}, info));
+  // A device fact the emitter writes against.
+  auto halved = info;
+  halved.lds_bytes_per_workgroup /= 2;
+  LSE_EXPECT(misses(three_groups(), halved));
+  auto cus = info;
+  cus.compute_units = 40;
+  LSE_EXPECT(misses(three_groups(), cus));
+  auto arch = info;
+  arch.arch = "gfx1151";
+  LSE_EXPECT(misses(three_groups(), arch));
+  // The compiler.
+  LSE_EXPECT(misses(three_groups(), info, "exact-source-test.v2"));
+  // A subset of the set is another set.
+  LSE_EXPECT(misses({subtraction(), subtraction(true)}, info));
+}
+
+LSE_TEST(launch_index_is_scoped_to_the_engine_build_identity) {
+  // The digest names this build's whole source tree, which is where every
+  // kernel template is: an edit to one within a release is a new identity,
+  // a new index directory and a new key, so no entry it wrote is reachable.
+  const std::string_view build = engine_build_identity();
+  LSE_EXPECT_EQ(build.size(), 64u);
+  LSE_EXPECT(std::all_of(build.begin(), build.end(), [](char c) {
+    return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+  }));
+  ArtifactDirectory dir;
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  JitCache cache(backend, compiler, dir.path.string());
+  LSE_EXPECT(std::filesystem::path(cache.launch_index_dir()).filename().string() ==
+             "launch-" + std::string(kernel_cache_version()) + "-" +
+                 std::string(build.substr(0, 16)));
+  // Every engine source and header is hashed, not a list of kernel files that
+  // a new template could be missing from.
+  std::ifstream listed_file(LSE_IDENTITY_SOURCES);
+  std::unordered_set<std::string> listed;
+  for (std::string line; std::getline(listed_file, line);) listed.insert(line);
+  std::size_t expected = 0;
+  for (const char* tree : {"src", "include"}) {
+    for (const auto& item : std::filesystem::recursive_directory_iterator(
+             std::filesystem::path(LSE_SOURCE_ROOT) / tree)) {
+      if (!item.is_regular_file()) continue;
+      const auto rel = std::filesystem::relative(item.path(), LSE_SOURCE_ROOT).generic_string();
+      if (rel.find("/.") != std::string::npos) continue;
+      ++expected;
+      if (!listed.contains(rel)) std::printf("    not in the build identity: %s\n", rel.c_str());
+      LSE_EXPECT(listed.contains(rel));
+    }
+  }
+  LSE_EXPECT(expected > 300);
+  for (const char* must : {"src/backends/hrx/loomc/loom_emitter.cpp",
+                           "src/backends/hrx/loomc/loom_sources.cpp",
+                           "src/kernels/quant_linear.cpp", "include/lse/dispatch/cache.hpp"})
+    LSE_EXPECT(listed.contains(must));
+
+  // An entry that names another build is never served, even if found.
+  auto info = device();
+  backend::LoomEmitter emitter;
+  auto set = prepared(emitter, info, three_groups());
+  LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+  const auto entries = files_with(cache.launch_index_dir(), ".launch");
+  LSE_EXPECT_EQ(entries.size(), 1u);
+  if (entries.size() != 1) return;
+  std::string bytes = cache_text(entries[0]);
+  const auto at = bytes.find(std::string(build));
+  LSE_EXPECT(at != std::string::npos);
+  if (at == std::string::npos) return;
+  bytes[at] = bytes[at] == '0' ? '1' : '0';
+  cache_write(entries[0], bytes);
+  backend::LoomEmitter fresh;
+  JitCache other(backend, compiler, dir.path.string());
+  auto restored = other.restore(0, Dialect::kLoom, set.signatures, fresh);
+  LSE_EXPECT(restored.ok() && !*restored);
+  LSE_EXPECT_EQ(other.stats().index_rejects, 1u);
+}
+
+LSE_TEST(launch_index_rejects_a_corrupt_entry_and_rebuilds_it) {
+  ArtifactDirectory dir;
+  const auto info = device();
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  backend::LoomEmitter emitter;
+  auto set = prepared(emitter, info, three_groups());
+  std::filesystem::path entry;
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+    const auto entries = files_with(cache.launch_index_dir(), ".launch");
+    LSE_EXPECT_EQ(entries.size(), 1u);
+    if (entries.size() != 1) return;
+    entry = entries[0];
+  }
+  for (const std::size_t from_end : {std::size_t{0}, std::size_t{40}, std::size_t{100000}}) {
+    flip_byte(entry, from_end);
+    backend::LoomEmitter fresh;
+    JitCache cache(backend, compiler, dir.path.string());
+    auto restored = cache.restore(0, Dialect::kLoom, set.signatures, fresh);
+    LSE_EXPECT(restored.ok() && !*restored);
+    LSE_EXPECT_EQ(cache.stats().index_rejects, 1u);
+    LSE_EXPECT(!std::filesystem::exists(entry));
+    LSE_EXPECT_EQ(fresh.cache_stats().entries, 0u);
+    LSE_EXPECT(cache.try_get(0, set.signatures[0], Dialect::kLoom) == nullptr);
+    // The miss path rebuilds the entry; the object on disk was sound.
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+    LSE_EXPECT(std::filesystem::exists(entry));
+  }
+  LSE_EXPECT_EQ(compiler.compiles, 1);
+  // Truncated.
+  {
+    const std::string bytes = cache_text(entry);
+    cache_write(entry, bytes.substr(0, bytes.size() / 2));
+    backend::LoomEmitter fresh;
+    JitCache cache(backend, compiler, dir.path.string());
+    auto restored = cache.restore(0, Dialect::kLoom, set.signatures, fresh);
+    LSE_EXPECT(restored.ok() && !*restored);
+    LSE_EXPECT_EQ(cache.stats().index_rejects, 1u);
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+  }
+  // The bundle object damaged in place, same size: rejected by its checksum,
+  // removed, and compiled again rather than loaded.
+  const auto objects = files_with(dir.path, ".co");
+  LSE_EXPECT_EQ(objects.size(), 1u);
+  if (objects.size() != 1) return;
+  flip_byte(objects[0], 10);
+  {
+    backend::LoomEmitter fresh;
+    JitCache cache(backend, compiler, dir.path.string());
+    const int loads_before = backend.bundle_loads;
+    auto restored = cache.restore(0, Dialect::kLoom, set.signatures, fresh);
+    LSE_EXPECT(restored.ok() && !*restored);
+    LSE_EXPECT_EQ(cache.stats().index_rejects, 1u);
+    LSE_EXPECT(!std::filesystem::exists(objects[0]));
+    LSE_EXPECT_EQ(backend.bundle_loads, loads_before);  // the damaged bytes never load
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+    LSE_EXPECT_EQ(compiler.compiles, 2);
+  }
+  backend::LoomEmitter fresh;
+  JitCache cache(backend, compiler, dir.path.string());
+  auto restored = cache.restore(0, Dialect::kLoom, set.signatures, fresh);
+  LSE_EXPECT(restored.ok() && *restored);
+  LSE_EXPECT_EQ(cache.stats().index_rejects, 0u);
+}
+
+LSE_TEST(launch_index_misses_when_the_object_or_the_resident_set_differs) {
+  ArtifactDirectory dir;
+  const auto info = device();
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  backend::LoomEmitter emitter;
+  auto set = prepared(emitter, info, three_groups());
+  {
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.preload(0, set.preload, true));
+  }
+  // One kernel of the set already resident from elsewhere: the bundle would
+  // load a set this process does not need, so it is a miss, not a partial hit.
+  {
+    backend::LoomEmitter fresh;
+    JitCache cache(backend, compiler, dir.path.string());
+    LSE_EXPECT_OK(cache.get_or_compile(0, set.signatures[2], set.kernels[2]).status());
+    auto restored = cache.restore(0, Dialect::kLoom, set.signatures, fresh);
+    LSE_EXPECT(restored.ok() && !*restored);
+    LSE_EXPECT_EQ(cache.stats().index_rejects, 0u);
+  }
+  // The bundle object gone (a cache cleaned by hand): a miss, not damage.
+  for (const auto& path : files_with(dir.path, ".co")) std::filesystem::remove(path);
+  backend::LoomEmitter fresh;
+  JitCache cache(backend, compiler, dir.path.string());
+  auto restored = cache.restore(0, Dialect::kLoom, set.signatures, fresh);
+  LSE_EXPECT(restored.ok() && !*restored);
+  LSE_EXPECT_EQ(cache.stats().index_rejects, 0u);
+  LSE_EXPECT_EQ(cache.stats().index_misses, 1u);
+  LSE_EXPECT(!files_with(cache.launch_index_dir(), ".launch").empty());
+}
+
+LSE_TEST(launch_index_concurrent_writers_and_readers_see_only_complete_entries) {
+  ArtifactDirectory dir;
+  const auto info = device();
+  constexpr unsigned kWriters = 4;
+  constexpr unsigned kRounds = 25;
+  std::barrier start(kWriters + 1);
+  std::atomic<unsigned> failures{0};
+  std::atomic<unsigned> rejects{0};
+  std::atomic<bool> writing{true};
+  auto writer = [&](unsigned index) {
+    ArtifactCompiler compiler;
+    BundleBackend backend;
+    backend::LoomEmitter emitter;
+    // Two writers share a set, two write their own.
+    auto groups = index % 2 == 0 ? three_groups()
+        : std::vector<FusionGroup>{subtraction(), scaled(64 * (index + 1))};
+    auto set = prepared(emitter, info, std::move(groups));
+    start.arrive_and_wait();
+    for (unsigned round = 0; round < kRounds; ++round) {
+      JitCache cache(backend, compiler, dir.path.string());
+      if (!cache.preload(0, set.preload, true).ok()) ++failures;
+    }
+  };
+  auto reader = [&] {
+    ArtifactCompiler compiler;
+    BundleBackend backend;
+    const auto groups = three_groups();
+    start.arrive_and_wait();
+    while (writing.load()) {
+      backend::LoomEmitter emitter;
+      std::vector<std::uint64_t> signatures;
+      for (const auto& g : groups) signatures.push_back(emitter.cache_key(g, info));
+      JitCache cache(backend, compiler, dir.path.string());
+      auto restored = cache.restore(0, Dialect::kLoom, signatures, emitter);
+      if (!restored.ok()) ++failures;
+      rejects += static_cast<unsigned>(cache.stats().index_rejects);
+    }
+  };
+  std::vector<std::thread> threads;
+  for (unsigned i = 0; i < kWriters; ++i) threads.emplace_back(writer, i);
+  std::thread read(reader);
+  for (auto& t : threads) t.join();
+  writing = false;
+  read.join();
+  LSE_EXPECT_EQ(failures.load(), 0u);
+  LSE_EXPECT_EQ(rejects.load(), 0u);
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  backend::LoomEmitter emitter;
+  const auto groups = three_groups();
+  std::vector<std::uint64_t> signatures;
+  for (const auto& g : groups) signatures.push_back(emitter.cache_key(g, info));
+  JitCache cache(backend, compiler, dir.path.string());
+  auto restored = cache.restore(0, Dialect::kLoom, signatures, emitter);
+  LSE_EXPECT(restored.ok() && *restored);
+  LSE_EXPECT_EQ(compiler.compiles, 0);
+  // Writers leave entries and objects, never their temporaries.
+  for (const auto& item : std::filesystem::recursive_directory_iterator(dir.path))
+    LSE_EXPECT(item.path().filename().string().find(".tmp") == std::string::npos);
+  LSE_EXPECT_EQ(files_with(cache.launch_index_dir(), ".launch").size(), 3u);
+}
+
+LSE_TEST(launch_index_prunes_other_builds_but_keeps_recent_ones) {
+  ArtifactDirectory dir;
+  const std::string version(kernel_cache_version());
+  auto seed = [&](const std::string& name, int age_minutes, bool notes = false) {
+    const auto path = dir.path / name;
+    std::filesystem::create_directories(path);
+    cache_write(path / "1.launch", "entry");
+    if (notes) cache_write(path / "user-notes.txt", "mine");
+    std::filesystem::last_write_time(
+        path, std::filesystem::file_time_type::clock::now() - std::chrono::minutes(age_minutes));
+    return path;
+  };
+  const auto older_release = seed("launch-0.0.1-00000000000000aa", 1);
+  const auto newer_release = seed("launch-999.0.0-00000000000000bb", 1);
+  std::vector<std::filesystem::path> builds;
+  for (int i = 0; i < 5; ++i) {
+    char hex[17];
+    std::snprintf(hex, sizeof hex, "%016x", 0xc0 + i);
+    builds.push_back(seed("launch-" + version + "-" + hex, 10 * (i + 1)));
+  }
+  const auto foreign = dir.path / ("launch-" + version + "-notabuild");
+  std::filesystem::create_directories(foreign);
+  const auto keep_file = seed("launch-" + version + "-00000000000000ff", 100, true);
+  ArtifactCompiler compiler;
+  BundleBackend backend;
+  JitCache cache(backend, compiler, dir.path.string());
+  LSE_EXPECT(!std::filesystem::exists(older_release));
+  LSE_EXPECT(std::filesystem::exists(newer_release));
+  // The three most recently used other builds of this release stay.
+  for (int i = 0; i < 5; ++i) LSE_EXPECT(std::filesystem::exists(builds[i]) == (i < 3));
+  LSE_EXPECT(std::filesystem::exists(foreign));
+  // A pruned directory holding anything but entries keeps that and itself.
+  LSE_EXPECT(std::filesystem::exists(keep_file / "user-notes.txt"));
+  LSE_EXPECT(!std::filesystem::exists(keep_file / "1.launch"));
+  LSE_EXPECT(std::filesystem::exists(cache.launch_index_dir()));
 }
 
 LSE_TEST_MAIN()

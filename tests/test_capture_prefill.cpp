@@ -120,6 +120,19 @@ struct CaptureEmitter final : IKernelEmitter {
   std::string_view prelude() const noexcept override { return {}; }
   DialectSourceTable sources() const noexcept override { return real.sources(); }
   std::uint64_t cache_key(const FusionGroup& g, const DeviceInfo& d) const override { return real.cache_key(g, d); }
+  // The launch-only path and the launch index, as the real emitter offers
+  // them, so a capture prepares and launches as a server does.
+  Result<EmittedKernel> emit_launch(const FusionGroup& g, const DeviceInfo& d) const override {
+    if (!decline.empty())
+      for (const NodePtr& n : g.nodes)
+        if (n && n->prim != nullptr && n->prim->name() == decline)
+          return LSE_ERROR(kUnimplemented, "capture emitter has no kernel for " + decline);
+    return real.emit_launch(g, d);
+  }
+  bool keeps_launches() const noexcept override { return real.keeps_launches(); }
+  bool adopt_launch(std::uint64_t key, const EmittedKernel& launch) const override {
+    return real.adopt_launch(key, launch);
+  }
   bool joins_run(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.joins_run(run, d); }
   RunScratch run_scratch(std::span<const NodePtr> run, const DeviceInfo& d) const override { return real.run_scratch(run, d); }
 };
