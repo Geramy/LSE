@@ -360,7 +360,9 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
     ++panel->consumer_count;
     n->prim = find_primitive(bytes ? "quant_linear.q8_matrix_panel.v1"
                                    : "quant_linear.q4_matrix_panel.v1");
-  } else if (dispatch::q4_shared_panel_shape(geometry)) {
+  } else if (dispatch::q4_shared_panel_shape(
+                 geometry, device ? std::string_view(device->arch)
+                                  : std::string_view{})) {
     const auto k = sx.dim(sx.rank() - 1);
     const auto m = static_cast<std::int64_t>(sx.elem_count() / static_cast<std::uint64_t>(k));
     const Shape panel_shape{m, (k / 64) * 25};

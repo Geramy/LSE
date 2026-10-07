@@ -420,6 +420,36 @@ LSE_TEST(verify_pass_panel_is_qualified_per_part) {
   }
 }
 
+// gfx1151's single-row attention projections read the shared int8 panel
+// from its own header's rows; gfx1201 keeps its per-workgroup staging for
+// them, and neither part takes the panel for the output projection.
+LSE_TEST(decode_panel_rows_are_qualified_per_part) {
+  for (auto [n, k] : {std::pair{10240, 5120}, std::pair{6144, 5120},
+                      std::pair{12288, 5120}, std::pair{1024, 5120},
+                      std::pair{48, 5120}, std::pair{5120, 6144}}) {
+    Fixture f(1, n, k, 4, true);
+    const bool attention = k == 5120;
+    LSE_EXPECT(!f.plan().shared_activation_panel);
+    LSE_EXPECT(!dispatch::q4_shared_panel_shape(f.shapes, "gfx1201"));
+    f.device = {};
+    f.amd = {};
+    f.device.arch = "gfx1151";
+    f.device.compute_units = 40;
+    f.device.wavefront_size = 32;
+    f.device.max_threads_per_workgroup = 1024;
+    f.device.lds_bytes_per_workgroup = 65536;
+    backend::apply_arch_defaults(f.device, f.amd);
+    f.device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    f.device.extension = &f.amd;
+    LSE_EXPECT_EQ(f.plan().shared_activation_panel, attention);
+    LSE_EXPECT_EQ(dispatch::q4_shared_panel_shape(f.shapes, "gfx1151"), attention);
+    LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(f.shapes),
+                  attention && n != 48 ? 2u : 1u);
+    // A graph built with no device takes only the rows every part shares.
+    LSE_EXPECT(!dispatch::q4_shared_panel_shape(f.shapes, {}));
+  }
+}
+
 // Each part's dispatch rows come from its own header and only from there:
 // a device gets its part's rows followed by the generic ones, an unknown part
 // the generic rows alone, and no part reads another's.
@@ -441,6 +471,7 @@ LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
                own(*t, t->quant_matrix_ranges) && own(*t, t->quant_scalar_shapes) &&
                own(*t, t->quant_row_ladders) && own(*t, t->quant_panel_devices) &&
                own(*t, t->q4_swiglu_shapes) && own(*t, t->q4_matrix_panel_shapes) &&
+               own(*t, t->q4_panel_shapes) &&
                own(*t, t->q8_matrix_rules) && own(*t, t->q8_panel_rules) &&
                own(*t, t->flash_wmma) &&
                own(*t, t->flash_cache) && own(*t, t->decode) &&
