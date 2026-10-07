@@ -101,7 +101,7 @@ EncodedGroup encode_group(const float *x) {
   return result;
 }
 std::vector<std::uint32_t> codec(const std::vector<float> &x, std::size_t k,
-                                 std::size_t rows = kRows) {
+                                 std::size_t rows = kRows, bool bytes = false) {
   const auto tile_rows = rows == kRows ? 16u : 64u;
   const auto tile_words = tile_rows / 16u * 288u;
   std::vector<std::uint32_t> words((rows + tile_rows - 1) / tile_rows *
@@ -117,7 +117,7 @@ std::vector<std::uint32_t> codec(const std::vector<float> &x, std::size_t k,
         for (std::size_t byte = 0; byte < 4; ++byte)
           packed |=
               (static_cast<std::uint32_t>(
-                   encoded.codes[tile_rows == 16u
+                   encoded.codes[tile_rows == 16u && !bytes
                                      ? (word / 2) * 8 + word % 2 + 2 * byte
                                      : word * 4 + byte]) &
                255u)
@@ -180,6 +180,58 @@ FusionGroup group(const Array &output) {
 }
 } // namespace
 
+LSE_TEST(q8_matrix_panel_routes_measured_eight_row_shapes_in_byte_order) {
+  const auto q8 = [](const Array &x, std::int64_t n, std::int64_t k) {
+    return quant_linear(x, leaf({n, k / 4}, DType::kU32),
+                        leaf({n, k / 64}, DType::kBF16),
+                        leaf({n, k / 64}, DType::kBF16), 8, 64);
+  };
+  auto x = leaf({1, 8, 5120}, DType::kF32);
+  auto gate = q8(x, 17408, 5120), q = q8(x, 4096, 5120);
+  for (const auto &y : {gate, q}) {
+    LSE_EXPECT(y.node()->prim &&
+               y.node()->prim->name() == "quant_linear.q8_matrix_panel.v1");
+    LSE_EXPECT_EQ(y.node()->inputs.size(), 5u);
+    LSE_EXPECT(y.node()->inputs[4]->prim->name() == kProducer);
+    LSE_EXPECT_EQ(y.node()->inputs[4]->iattrs[0], 8);
+  }
+  LSE_EXPECT(gate.node()->inputs[4] == q.node()->inputs[4]);
+  // The same activation feeding 4-bit and 8-bit weights gets one panel per
+  // byte order.
+  auto wide = leaf({1, 8, 17408}, DType::kF32);
+  auto down4 = contraction(wide, 5120, 17408), down8 = q8(wide, 5120, 17408);
+  LSE_EXPECT(down4.node()->prim->name() == kConsumer);
+  LSE_EXPECT(down8.node()->prim->name() == "quant_linear.q8_matrix_panel.v1");
+  LSE_EXPECT(down4.node()->inputs[4] != down8.node()->inputs[4]);
+  LSE_EXPECT_EQ(down4.node()->inputs[4]->iattrs[0], 0);
+  // Unmeasured widths and other row counts keep the 8-bit matrix route.
+  for (const auto m : {1, 7, 9}) {
+    auto other = q8(leaf({1, m, 5120}, DType::kF32), 17408, 5120);
+    LSE_EXPECT(other.node()->prim->name() != "quant_linear.q8_matrix_panel.v1");
+  }
+  auto unmeasured = q8(leaf({1, 8, 5120}, DType::kF32), 6144, 5120);
+  LSE_EXPECT(unmeasured.node()->prim->name() != "quant_linear.q8_matrix_panel.v1");
+}
+LSE_TEST(q8_matrix_panel_typed_codec_keeps_byte_order) {
+  auto *scheduler = default_scheduler();
+  LSE_EXPECT(scheduler != nullptr);
+  if (!scheduler)
+    return;
+  scheduler->set_mode(Scheduler::Mode::kHostOnly);
+  auto data = activations(128);
+  auto x = filled({1, 8, 128}, DType::kF32, data);
+  auto result = custom(kProducer, {x});
+  LSE_EXPECT(result.ok());
+  if (!result.ok())
+    return;
+  auto output = result.release();
+  output.node()->iattrs[0] = 8;
+  const NodePtr roots[]{output.node()};
+  Program program;
+  LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
+  LSE_EXPECT(read<std::uint32_t>(output) == codec(data, 128, kRows, true));
+  LSE_EXPECT(read<std::uint32_t>(output) != codec(data, 128));
+}
 LSE_TEST(q4_matrix_panel_selects_only_measured_down_and_shares_same_input) {
   auto x = leaf({1, 8, 17408}, DType::kF32);
   auto a = contraction(x, 5120, 17408), b = contraction(x, 5120, 17408);

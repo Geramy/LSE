@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/dispatch/q8_tuneconfig.h"
 #include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/math.hpp"
@@ -225,6 +226,40 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
                (rule->rows / kQ4MatrixPanelRows) * kQ4MatrixPanelGroupWords};
 }
 [[nodiscard]] const math::MatrixCoreRow* q4_matrix_panel_row(
+    const graph::KernelShapes&);
+
+// An 8-row contraction over 8-bit group-affine weights that reads the shared
+// 16-row activation panel (quant_activation.q4_matrix_panel.v1, attribute 0 =
+// 8) instead of quantizing its activations in every workgroup: the 8-row
+// shapes the 8-bit matrix table measures (q8_shapes::kShapes, 16-row tile).
+[[nodiscard]] inline bool q8_matrix_panel_shape(const graph::KernelShapes& s) {
+  if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
+      s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
+      s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
+      s.output_dtype != DType::kF32 || s.iattrs[0] != 8 || s.iattrs[1] != 64 ||
+      !s.inputs[0].rank() || s.inputs[1].rank() != 2)
+    return false;
+  const auto* layout = q4_matrix_panel_layout(s.inputs[0]);
+  if (!layout || layout->rows != kQ4MatrixPanelRows) return false;
+  const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
+  const auto n = s.inputs[1].dim(0);
+  if (n < 128 || s.inputs[1] != Shape{n, k / 4} ||
+      s.inputs[2] != Shape{n, k / 64} || s.inputs[3] != s.inputs[2])
+    return false;
+  Shape expected;
+  for (std::size_t axis = 0; axis + 1 < s.inputs[0].rank(); ++axis)
+    expected.push_back(s.inputs[0].dim(axis));
+  expected.push_back(n);
+  if (s.output != expected) return false;
+  const auto m = static_cast<std::uint64_t>(layout->m);
+  for (const auto& rule : q8_shapes::kShapes)
+    if (rule.rows == kQ4MatrixPanelRows && m >= rule.min_m && m <= rule.max_m &&
+        (rule.n == 0 || static_cast<std::int64_t>(rule.n) == n) &&
+        (rule.k == 0 || static_cast<std::int64_t>(rule.k) == k))
+      return true;
+  return false;
+}
+[[nodiscard]] const math::MatrixCoreRow* q8_matrix_panel_row(
     const graph::KernelShapes&);
 
 [[nodiscard]] QuantPlan quant_plan(const graph::KernelShapes&, bool indexed = false);

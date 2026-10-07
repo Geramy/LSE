@@ -177,6 +177,23 @@ const math::MatrixCoreRow* q4_matrix_panel_row(const KernelShapes& s) {
   return row && row->chained == 1 ? row : nullptr;
 }
 
+const math::MatrixCoreRow* q8_matrix_panel_row(const KernelShapes& s) {
+  if (!q8_matrix_panel_shape(s) || !s.device || !s.intrinsics ||
+      !s.staged.name.empty() || !s.staged_quant.codes.empty() ||
+      s.device->wavefront_size != 32 || s.device->max_threads_per_workgroup < 256)
+    return nullptr;
+  for (const auto symbol :
+       {"bits.f32", "value.f32", "wave.shfl_xor", "rint", "max", "abs"})
+    if (s.intrinsics->find(symbol).empty()) return nullptr;
+  bool measured = false;
+  for (const auto& rule : q8_shapes::kMatrixRules)
+    measured |= rule.arch == s.device->arch && rule.wave == s.device->wavefront_size &&
+                rule.bits == 8 && rule.rows == kQ4MatrixPanelRows;
+  if (!measured) return nullptr;
+  const auto* row = matrix_row(s, math::MatrixElem::kI32, math::MatrixElem::kSU8);
+  return row && row->chained == 1 ? row : nullptr;
+}
+
 const math::MatrixCoreRow* linear_matrix_row(const KernelShapes& s) {
   if (s.inputs.size() != 2 || s.input_dtypes.size() != 2 || !s.device ||
       s.device->max_threads_per_workgroup < 64 || s.output_dtype != DType::kF32 ||
