@@ -615,6 +615,7 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
   }
   const Candidate* best = &candidates[0];
   for (const Candidate& c : candidates) {
+    if (candidates.size() < 2) break;
     char part[48];
     std::snprintf(part, sizeof(part), " %u=%.1fus", c.variant, c.best_us);
     note += part;
@@ -1072,8 +1073,18 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     trace_.spans.host_wait.add(trial_ns);
     if (why == "unmeasurable") impl_->variants.hold(pick.key, 0);
     else impl_->variants.record(pick.key, chosen, why);
-    std::fprintf(stderr, "lse: variants of %s:%s -> %u (%.1f ms)\n",
-                 emitted->entry_name.c_str(), why.c_str(), chosen,
+    // Named by what it computes, so a reader can tell the shapes apart.
+    std::string what;
+    for (const NodePtr& n : group.nodes) {
+      if (n && dynamic_cast<const KernelPrimitiveBase*>(n->prim) != nullptr) {
+        what = std::string(n->prim->name());
+        for (const NodePtr& in : n->inputs) what += " " + in->shape.to_string();
+        what += " -> " + n->shape.to_string();
+        break;
+      }
+    }
+    std::fprintf(stderr, "lse: variants of %s [%s]:%s -> %u (%.1f ms)\n",
+                 emitted->entry_name.c_str(), what.c_str(), why.c_str(), chosen,
                  static_cast<double>(trial_ns) / 1e6);
     // The step's retained emission is the one later replays launch.
     if (chosen != 0 && replay != nullptr) {
