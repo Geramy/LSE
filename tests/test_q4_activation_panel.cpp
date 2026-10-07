@@ -286,10 +286,12 @@ LSE_TEST(q4_panel_M8_rate_projections_share_existing_GDN_source_panel) {
   const auto cloned = contraction(Array(clone), 48, 5120);
   LSE_EXPECT(cloned.node()->inputs[4] != shared);
   LSE_EXPECT(cloned.node()->inputs[4]->inputs[0] == clone);
-  for (const auto m : {1, 4, 6, 7, 9}) {
+  for (const auto m : {1, 6, 7, 9}) {
     const auto unmeasured = contraction(leaf({1, m, 5120}, DType::kF32), 48, 5120);
     LSE_EXPECT_EQ(unmeasured.node()->inputs.size(), 4u);
   }
+  LSE_EXPECT_EQ(contraction(leaf({1, 4, 5120}, DType::kF32), 48, 5120)
+                    .node()->inputs.size(), 5u);
   LSE_EXPECT_EQ(contraction(x, 49, 5120).node()->inputs.size(), 4u);
   LSE_EXPECT_EQ(contraction(leaf({1, 8, 6144}, DType::kF32), 48, 6144)
                     .node()->inputs.size(), 4u);
@@ -466,9 +468,11 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
                   four_chunks ? 4u : adjacent ? 2u : 1u);
     // The vocabulary projection at six to eight rows gives each wave four
-    // columns; every other shape keeps one.
+    // columns and the 4-row down projection two; every other shape keeps one.
     const std::uint32_t columns =
-        dimensions[1] == 248320 && dimensions[0] >= 6 ? 4u : 1u;
+        dimensions[1] == 248320 && dimensions[0] >= 6 ? 4u
+        : dimensions[0] == 4 && dimensions[1] == 5120 && dimensions[2] == 17408
+            ? 2u : 1u;
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_columns(original_shape), columns);
     const auto *consumer =
         dynamic_cast<const KernelPrimitiveBase *>(out.node()->prim);

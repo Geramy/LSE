@@ -81,8 +81,10 @@ LSE_TEST(quant_M8_rate_panel_is_shape_and_device_qualified) {
     f.amd.has_dot4_iu8 = true;
     f.dtypes[2] = f.dtypes[3] = DType::kF32;
     LSE_EXPECT(!f.plan().shared_activation_panel);
-    for (const auto m : {1, 4, 6, 7, 9})
+    for (const auto m : {1, 6, 7, 9})
       LSE_EXPECT(!Fixture(m, 48, 5120, 4, loom).plan().shared_activation_panel);
+    // The 4-row (MTP=3) verify pass shares the panel too.
+    LSE_EXPECT(Fixture(4, 48, 5120, 4, loom).plan().shared_activation_panel);
     LSE_EXPECT(!Fixture(8, 49, 5120, 4, loom).plan().shared_activation_panel);
     LSE_EXPECT(!Fixture(8, 48, 6144, 4, loom).plan().shared_activation_panel);
   }
