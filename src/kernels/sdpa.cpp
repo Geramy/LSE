@@ -5,6 +5,7 @@
 #include "lse/kv/block.hpp"
 #include "lse/kernels/sdpa.hpp"
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/math.hpp"
 #include "lse/backends/hrx/device_info.hpp"
@@ -207,7 +208,7 @@ struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
   std::string emit_kernel(const KernelShapes& s) const override {
-    if(!dispatch::paged_attention_inputs_valid(s) || !s.device || s.device->arch!="gfx1201" ||
+    if(!dispatch::paged_attention_inputs_valid(s) || !s.device || !dispatch::arch::tuning(s.device->arch).flash_prefill ||
        s.inputs[0].dim(3)!=256 || s.iattrs[0]!=1 || !s.store) return {};
     return with_kv_storage(s.input_dtypes[1],s.attrs[1],[&]<kv::CacheDType Storage>() {
       kir::KernelBody k(s.types,*s.intrinsics,workgroup_lds_bytes(s.device)); k.set_store(s.store);
@@ -267,7 +268,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
   bool supports_epilogue() const noexcept override { return false; }
   std::string emit_kernel(const KernelShapes& s) const override {
     if(s.inputs.size()!=3 || s.inputs[0].rank()!=4 || s.inputs[1].rank()!=4 ||
-       s.inputs[0].dim(3)!=256 || !s.device || s.device->arch!="gfx1201" ||
+       s.inputs[0].dim(3)!=256 || !s.device || !dispatch::arch::tuning(s.device->arch).flash_prefill ||
        !s.store || !std::isfinite(s.attrs[2]) || s.attrs[2]<0 || s.attrs[2]>1) return {};
     constexpr auto threads = dispatch::attention_shapes::kFlashPrefillSelectorThreads;
     const auto heads=static_cast<std::uint32_t>(s.inputs[0].dim(1));

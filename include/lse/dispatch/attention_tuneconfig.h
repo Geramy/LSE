@@ -19,25 +19,13 @@ struct FlashWmmaRule {
   std::string_view arch;
   std::uint32_t wave, threads, min_rows, max_head_dim;
 };
-inline constexpr std::array kFlashWmmaRules{
-    FlashWmmaRule{"gfx1201", 32, 256, 2, 512},
-};
+// The device rows of these rules live in the per-architecture headers
+// (lse/dispatch/arch/<gfx>.hpp) and are selected by dispatch::arch::tuning.
 
 struct FlashCacheRule {
   std::string_view arch;
   std::uint32_t min_rows, min_capacity;
 };
-inline constexpr std::array kFlashCacheRules{
-    FlashCacheRule{"gfx1201", 1024, 65536},
-};
-
-[[nodiscard]] constexpr bool flash_retain_far_cache(std::string_view arch,
-    std::uint32_t rows, std::uint64_t capacity) noexcept {
-  for (const auto& rule : kFlashCacheRules)
-    if (arch == rule.arch && rows >= rule.min_rows && capacity >= rule.min_capacity)
-      return true;
-  return false;
-}
 
 // Query tile, scores and softmax state, plus the smallest value-staging block
 // (16 keys of value_dim + 8 halves) when value_dim is given.
@@ -53,9 +41,6 @@ struct DecodeRule {
   std::string_view arch;
   std::uint32_t wave, threads, query_rows, head_dim;
   std::uint32_t max_block;
-};
-inline constexpr std::array kDecodeRules{
-    DecodeRule{"gfx1201", 32, 128, 1, 256, 256},
 };
 
 struct DecodeHeadRule {
@@ -76,9 +61,6 @@ inline constexpr std::array kDecodeHeadRules{
 struct SplitShortRule {
   std::string_view arch;
   std::uint32_t wave, min_rows, max_rows, threads, head_dim;
-};
-inline constexpr std::array kSplitShortRules{
-    SplitShortRule{"gfx1201", 32, 2, 8, 128, 256},
 };
 
 struct ShortTileRule {
@@ -159,9 +141,6 @@ inline constexpr std::array kShortDefaults{
 struct WaveL2Rule {
   std::string_view arch;
   std::uint32_t wave, threads, batch, heads, rows, width;
-};
-inline constexpr std::array kWaveL2Rules{
-    WaveL2Rule{"gfx1201", 32, 128, 1, 1, 16, 128},
 };
 
 }  // namespace lse::dispatch::attention_shapes

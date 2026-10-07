@@ -1,4 +1,5 @@
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 
 #include <cmath>
@@ -20,12 +21,13 @@ constexpr std::uint32_t kThreads = 256;
 bool short_default_shape(const Shape& query, std::int64_t capacity,
                          const shapes::ShortDefaultRule& geometry) {
   if (query.rank() != 4) return false;
-  for (const auto& rule : shapes::kSplitShortRules)
-    if (query.dim(0) == geometry.batch && query.dim(1) == geometry.query_heads &&
-        query.dim(2) >= rule.min_rows && query.dim(2) <= rule.max_rows &&
-        query.dim(3) == rule.head_dim && capacity >= geometry.min_keys &&
-        capacity <= UINT32_MAX) return true;
-  return false;
+  // Shape scope, before the device is known: any part's rule.
+  return arch::any_rule<&arch::Tuning::split_short>([&](const auto& rule) {
+    return query.dim(0) == geometry.batch && query.dim(1) == geometry.query_heads &&
+           query.dim(2) >= rule.min_rows && query.dim(2) <= rule.max_rows &&
+           query.dim(3) == rule.head_dim && capacity >= geometry.min_keys &&
+           capacity <= UINT32_MAX;
+  });
 }
 
 bool power_of_two(std::int64_t n) { return n >= 2 && (n & (n - 1)) == 0; }
@@ -131,7 +133,7 @@ bool flash_wmma_supported(const KernelShapes& s) {
       !std::isfinite(d.scale) || d.scale <= 0.0f ||
       !s.staged.name.empty() || !s.staged_quant.codes.empty()) return false;
   bool geometry = false;
-  for (const auto& rule : shapes::kFlashWmmaRules)
+  for (const auto& rule : arch::tuning(s.device->arch).flash_wmma)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.device->max_threads_per_workgroup >= rule.threads && d.tq >= rule.min_rows &&
         d.dh <= rule.max_head_dim && d.dv <= rule.max_head_dim &&
@@ -154,9 +156,8 @@ bool flash_wmma_supported(const KernelShapes& s) {
 
 bool split_decode_scope(const Shape& query, std::int64_t offset, std::int64_t capacity) {
   if (query.rank() != 4 || offset < 0 || capacity <= 0) return false;
-  for (const auto& rule : shapes::kDecodeRules)
-    if (query.dim(2) == rule.query_rows) return true;
-  return false;
+  return arch::any_rule<&arch::Tuning::decode>(
+      [&](const auto& rule) { return query.dim(2) == rule.query_rows; });
 }
 
 bool split_decode_supported(const KernelShapes& s) {
@@ -166,7 +167,7 @@ bool split_decode_supported(const KernelShapes& s) {
   const auto& q = s.inputs[0];
   const auto block = s.inputs[1].dim(2);
   const auto capacity = s.inputs[4].dim(1) * block;
-  for (const auto& rule : shapes::kDecodeRules) {
+  for (const auto& rule : arch::tuning(s.device->arch).decode) {
     if (s.device->arch != rule.arch || s.device->wavefront_size != rule.wave ||
         s.device->max_threads_per_workgroup < rule.threads ||
         q.dim(2) != rule.query_rows || q.dim(3) != rule.head_dim ||
@@ -189,7 +190,7 @@ bool split_decode_merge_supported(const KernelShapes& s) {
       !positive_shape(s.inputs[0]) || s.inputs[0].dim(3) != shapes::kSplitRecord ||
       !f32_inputs(s, 1) || !s.device || !attention_ops(s)) return false;
   const auto bytes = static_cast<std::uint64_t>(s.inputs[0].dim(2)) * sizeof(float);
-  for (const auto& rule : shapes::kDecodeRules)
+  for (const auto& rule : arch::tuning(s.device->arch).decode)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1), 1, rule.head_dim} &&
@@ -223,7 +224,7 @@ bool split_short_supported(const KernelShapes& s) {
   const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
   const auto tile_capacity = static_cast<std::uint32_t>(capacity);
   const auto units = static_cast<std::uint32_t>(s.device->compute_units);
-  for (const auto& rule : shapes::kSplitShortRules)
+  for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
@@ -246,7 +247,7 @@ bool split_short_merge_supported(const KernelShapes& s) {
   if (s.inputs.size() != 1 || s.inputs[0].rank() != 5 ||
       !positive_shape(s.inputs[0]) || s.inputs[0].dim(4) != shapes::kSplitRecord || !f32_inputs(s, 1) ||
       !s.device || !attention_ops(s)) return false;
-  for (const auto& rule : shapes::kSplitShortRules)
+  for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
@@ -296,20 +297,20 @@ bool wave32_l2_supported(const KernelShapes& s) {
       !s.staged.name.empty() || !s.staged_quant.codes.empty() ||
       !has_ops(s, {"thread.local_id", "thread.workgroup_id.x", "wave.shfl_xor",
                    "fma", "sqrt", "max"})) return false;
-  for (const auto& rule : shapes::kWaveL2Rules)
+  for (const auto& rule : arch::tuning(s.device->arch).wave_l2)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.inputs[0] == Shape{rule.batch, rule.heads, rule.rows, rule.width}) return true;
   // Any row count at the rules' row width and wave: one wave per row. The
   // per-element form re-reads its whole row for every element, which at a
   // prefill's thousands of rows is the row width times the work.
-  for (const auto& rule : shapes::kWaveL2Rules)
-    if (s.device->wavefront_size == rule.wave &&
-        s.device->max_threads_per_workgroup >= rule.threads &&
-        s.inputs[0].rank() >= 1 &&
-        s.inputs[0].dim(s.inputs[0].rank() - 1) == rule.width &&
-        rule.width % rule.wave == 0) return true;
-  return false;
+  return arch::any_rule<&arch::Tuning::wave_l2>([&](const auto& rule) {
+    return s.device->wavefront_size == rule.wave &&
+           s.device->max_threads_per_workgroup >= rule.threads &&
+           s.inputs[0].rank() >= 1 &&
+           s.inputs[0].dim(s.inputs[0].rank() - 1) == rule.width &&
+           rule.width % rule.wave == 0;
+  });
 }
 
 std::uint32_t scalar_threads(const KernelShapes& s) {

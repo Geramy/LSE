@@ -21,6 +21,7 @@
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/ops.hpp"
@@ -2351,7 +2352,7 @@ static void check_split_attention_masks_and_replay(int queries) {
   scheduler->set_mode(graph::Scheduler::Mode::kDeviceFirst);
   auto& backend = scheduler->backend();
   const auto& device = backend.device_info();
-  const auto& rules = dispatch::attention_shapes::kDecodeRules;
+  const auto rules = dispatch::arch::tuning(device.arch).decode;
   if (!std::any_of(rules.begin(), rules.end(), [&](const auto& rule) {
         return device.arch == rule.arch && device.wavefront_size == rule.wave &&
                device.max_threads_per_workgroup >= rule.threads;

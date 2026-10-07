@@ -2,6 +2,7 @@
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/hipc/hip_sources.hpp"
 #include "lse/backends/hrx/loomc/loom_sources.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/quant.hpp"
 
 #include <array>
@@ -387,6 +388,44 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
       LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(unchanged.shapes), 1u);
     }
   }
+}
+
+// Each part's dispatch rows come from its own header and only from there:
+// a device gets its part's rows followed by the generic ones, an unknown part
+// the generic rows alone, and no part reads another's.
+LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
+  namespace arch = dispatch::arch;
+  const auto& r9700 = arch::tuning("gfx1201");
+  const auto& halo = arch::tuning("gfx1151");
+  const auto& other = arch::tuning("gfx1100");
+  LSE_EXPECT(r9700.arch == "gfx1201");
+  LSE_EXPECT(halo.arch == "gfx1151");
+  LSE_EXPECT(other.arch.empty());
+  const auto own = [](const arch::Tuning& t, const auto& rows) {
+    for (const auto& row : rows)
+      if (!row.arch.empty() && row.arch != t.arch) return false;
+    return true;
+  };
+  for (const arch::Tuning* t : {&r9700, &halo, &other}) {
+    LSE_EXPECT(own(*t, t->quant_matrix_shapes) && own(*t, t->quant_int8_rows) &&
+               own(*t, t->quant_matrix_ranges) && own(*t, t->quant_scalar_shapes) &&
+               own(*t, t->quant_row_ladders) && own(*t, t->quant_panel_devices) &&
+               own(*t, t->q4_swiglu_shapes) && own(*t, t->q4_matrix_panel_shapes) &&
+               own(*t, t->q8_matrix_rules) && own(*t, t->flash_wmma) &&
+               own(*t, t->flash_cache) && own(*t, t->decode) &&
+               own(*t, t->split_short) && own(*t, t->wave_l2));
+    // The generic admissions follow every part's own rows.
+    LSE_EXPECT(!t->quant_int8_rows.empty() && t->quant_int8_rows.back().arch.empty());
+    LSE_EXPECT(!t->quant_matrix_ranges.empty() &&
+               t->quant_matrix_ranges.back().arch.empty());
+  }
+  // gfx1201's measured rows, unchanged by the move into its header.
+  LSE_EXPECT_EQ(r9700.quant_matrix_shapes.size(), 4u);
+  LSE_EXPECT_EQ(r9700.q4_matrix_panel_shapes.size(), 6u);
+  LSE_EXPECT_EQ(r9700.q8_matrix_rules.size(), 2u);
+  LSE_EXPECT_EQ(r9700.decode.size(), 1u);
+  LSE_EXPECT(r9700.flash_prefill && !halo.flash_prefill && !other.flash_prefill);
+  LSE_EXPECT(other.quant_matrix_shapes.empty() && other.flash_wmma.empty());
 }
 
 LSE_TEST_MAIN()

@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/q8_tuneconfig.h"
 #include "lse/dispatch/quant_tuneconfig.h"
 #include "lse/graph/kernel_primitive.hpp"
@@ -220,22 +221,24 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
       return nullptr;
     count *= static_cast<std::uint64_t>(extent);
   }
-  for (const auto& rule : kQ4MatrixPanelShapes) {
-    if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
-        s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
-        s.inputs[0].dim(s.inputs[0].rank() - 1) != rule.k ||
-        s.inputs[0].elem_count() != static_cast<std::uint64_t>(rule.m * rule.k) ||
-        s.inputs[1] != Shape{rule.n, rule.k / 8} ||
-        s.inputs[2] != Shape{rule.n, rule.k / rule.group} ||
-        s.inputs[3] != s.inputs[2])
-      continue;
-    Shape expected;
-    for (std::size_t axis = 0; axis + 1 < s.inputs[0].rank(); ++axis)
-      expected.push_back(s.inputs[0].dim(axis));
-    expected.push_back(rule.n);
-    return s.output == expected ? &rule : nullptr;
-  }
-  return nullptr;
+  const Shape& x = s.inputs[0];
+  const auto* rule = arch::first_rule<&arch::Tuning::q4_matrix_panel_shapes>(
+      s.device ? std::string_view(s.device->arch) : std::string_view{},
+      [&](const Q4MatrixPanelShape& r) {
+        return s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
+               s.iattrs[1] == static_cast<std::int32_t>(r.group) &&
+               x.dim(x.rank() - 1) == r.k &&
+               x.elem_count() == static_cast<std::uint64_t>(r.m * r.k) &&
+               s.inputs[1] == Shape{r.n, r.k / 8} &&
+               s.inputs[2] == Shape{r.n, r.k / r.group} &&
+               s.inputs[3] == s.inputs[2];
+      });
+  if (rule == nullptr) return nullptr;
+  Shape expected;
+  for (std::size_t axis = 0; axis + 1 < x.rank(); ++axis)
+    expected.push_back(x.dim(axis));
+  expected.push_back(rule->n);
+  return s.output == expected ? rule : nullptr;
 }
 [[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s) {
   return q4_matrix_panel_rule(s) != nullptr;
@@ -335,22 +338,22 @@ q4_swiglu_shape(const graph::KernelShapes &s) {
   for (const auto slot : {2u, 3u, 5u, 6u})
     if (s.input_dtypes[slot] != DType::kBF16)
       return nullptr;
-  for (const auto &rule : kQ4SwiGluShapes) {
-    if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
-        s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
-        s.inputs[0] != Shape{1, rule.m, rule.k} ||
-        s.output != Shape{1, rule.m, rule.n} ||
-        s.inputs[1] != Shape{rule.n, rule.k / 8} ||
-        s.inputs[4] != s.inputs[1] ||
-        s.inputs[7] != Shape{rule.m, (rule.k / rule.group) * 25})
-      continue;
-    bool affines = true;
-    for (const auto slot : {2u, 3u, 5u, 6u})
-      affines &= s.inputs[slot] == Shape{rule.n, rule.k / rule.group};
-    if (affines)
-      return &rule;
-  }
-  return nullptr;
+  return arch::first_rule<&arch::Tuning::q4_swiglu_shapes>(
+      s.device ? std::string_view(s.device->arch) : std::string_view{},
+      [&](const Q4SwiGluShape &rule) {
+        if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
+            s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
+            s.inputs[0] != Shape{1, rule.m, rule.k} ||
+            s.output != Shape{1, rule.m, rule.n} ||
+            s.inputs[1] != Shape{rule.n, rule.k / 8} ||
+            s.inputs[4] != s.inputs[1] ||
+            s.inputs[7] != Shape{rule.m, (rule.k / rule.group) * 25})
+          return false;
+        bool affines = true;
+        for (const auto slot : {2u, 3u, 5u, 6u})
+          affines &= s.inputs[slot] == Shape{rule.n, rule.k / rule.group};
+        return affines;
+      });
 }
 [[nodiscard]] inline const Q4SwiGluShape *
 q4_swiglu_rule(const graph::KernelShapes &s) {
