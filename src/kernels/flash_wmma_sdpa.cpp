@@ -462,6 +462,81 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
         }  // retained softmax
         e.barrier();
 
+        // A pruned block's vote is uniform across the workgroup, but the
+        // target cannot prove it of a value read from scratch, and the staged
+        // value loop's barriers would sit inside that branch. On a contiguous
+        // fragment generation the staged loop runs unconditionally with only
+        // its work under the vote (the barriers are then outside it); the
+        // RDNA4 form keeps its branch, which its target accepts.
+        if (sparse && stage_values && vsub != 0 && !kGeo.split_k) {
+          const std::uint32_t pieces_per_key = d.dv / 8u;
+          const std::uint32_t pieces = vsub * pieces_per_key;
+          if (auto voted = e.when(retain.read() != 0.0f)) {
+            for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+              for (auto f : e.unroll(8u)) {
+                const auto row = acc_row(f);
+                o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
+              }
+            }
+          }
+          for (auto sub : e.range(0u, kKWin, vsub)) {
+            if (auto voted = e.when(retain.read() != 0.0f)) {
+            // Every value row this block needs, 16 bytes per thread per
+            // piece. A key past the row reads the window's first key: its
+            // probability is exactly zero, so only finiteness matters.
+            std::vector<kir::Pack<KvElement<Storage>>> rows;
+            std::vector<kir::Val<kir::u32>> slots;
+            for (std::uint32_t c = 0; c * kThreads < pieces; ++c) {
+              const auto piece = e.let(select(lid + c * kThreads < pieces,
+                                              lid + c * kThreads, e.u32(pieces - 1u)));
+              const auto slot_key = e.let(piece / pieces_per_key);
+              const auto part = e.let(piece % pieces_per_key);
+              const auto key = e.let(wbase + sub + slot_key);
+              const auto safe_key = e.let(select(key < row_len, key, wbase));
+              const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+              const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+              rows.push_back(e.load(a.v, e.let(vector * d.dv + part * 8u), 16u));
+              slots.push_back(e.let(slot_key * vrow + part * 8u));
+            }
+            if constexpr (kWideKv)
+              for (std::size_t c = 0; c < rows.size(); ++c)
+                k.store_pack<Narrow>(vs.id(), slots[c], rows[c], 16u);
+            }
+            e.barrier();
+            if (auto voted = e.when(retain.read() != 0.0f)) {
+            for (std::uint32_t tile = 0; tile < vsub; tile += 16u) {
+              // This lane's keys of the 16-key step: its half on a split
+              // layout, all sixteen on a contiguous one.
+              const auto key_half = [&] {
+                if constexpr (kGeo.split_k) return e.let(lane_hi * 8u);
+                else return e.u32(0);
+              }();
+              auto af = e.local<Narrow, static_cast<int>(kFrag)>();
+              for (auto f : e.unroll(kFrag)) {
+                if constexpr (kGeo.split_k)
+                  af[f] = math::narrow<Narrow>(
+                      sc[e.let(lane_lo * kKWin + sub + tile + key_half + f)].read());
+                else
+                  af[f] = math::narrow<Narrow>(
+                      sc[e.let(lane_lo * kKWin + sub + tile + f)].read());
+              }
+              for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+                const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
+                const auto safe_dim = e.let(select(dimension < d.dv, dimension, e.u32(d.dv - 1u)));
+                auto bf = e.local<Narrow, static_cast<int>(kFrag)>();
+                for (auto f : e.unroll(kFrag)) {
+                  if constexpr (kGeo.split_k)
+                    bf[f] = vs[e.let((tile + key_half + f) * vrow + safe_dim)].read();
+                  else
+                    bf[f] = vs[e.let((tile + f) * vrow + safe_dim)].read();
+                }
+                o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
+              }
+            }
+            }
+            e.barrier();
+          }
+        } else
         if (auto retained_values = e.when(retain.read() != 0.0f)) {
         if (stage_values && vsub != 0) {
           for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
