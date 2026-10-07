@@ -39,7 +39,7 @@ git -C "$work/source" init -q
 # kernel with many matrix operands, such as the prefill GEMM's 64x64 tiles.
 # gfx120x-hdp-kernarg-publication lets RDNA4 keep kernel arguments in VRAM.
 # loom-vmem-load-latency schedules global loads with their real latency.
-patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch gfx120x-hdp-kernarg-publication.patch loom-vmem-load-latency.patch)
+patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch gfx120x-hdp-kernarg-publication.patch loom-vmem-load-latency.patch loom-repair-iterations.patch)
 for patch in "${patches[@]}"; do
   path="$root/patches/hrx/$patch"
   git -C "$work/source" apply --check "$path"

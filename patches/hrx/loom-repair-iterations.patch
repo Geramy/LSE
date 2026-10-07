@@ -1,0 +1,12 @@
+diff --git a/loom/src/loom/codegen/low/frame.c b/loom/src/loom/codegen/low/frame.c
+--- a/loom/src/loom/codegen/low/frame.c
++++ b/loom/src/loom/codegen/low/frame.c
+@@ -30,7 +30,7 @@
+ // Every repair callback operates on a complete snapshot, so reaching this
+ // limit indicates a non-convergent strategy rather than useful fine-grained
+ // progress.
+-#define LOOM_LOW_EMISSION_FRAME_MAX_REPAIR_ITERATIONS 8
++#define LOOM_LOW_EMISSION_FRAME_MAX_REPAIR_ITERATIONS 32
+ 
+ typedef struct loom_low_emission_frame_materialization_summary_t {
+   // Cumulative spill storage materialized while building the final frame.
