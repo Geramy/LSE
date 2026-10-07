@@ -32,6 +32,7 @@ endif()
 include(LSEOptions)
 include(LSECompilerFlags)
 include(LSERust)
+include(LSEBuildIdentity)
 
 # ---------------------------------------------------------------------------
 # core — dtype/status/shape/quant. No device dependency; always builds.
@@ -290,6 +291,8 @@ lse_apply_common_flags(lse_graph)
 target_compile_definitions(lse_graph PRIVATE
   "LSE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\""
   "LSE_ENGINE_VERSION=\"${PROJECT_VERSION}\"")
+# engine_build_identity(): the kernel launch index's key on template text.
+lse_add_build_identity(lse_graph)
 
 lse_provide_fastokens("${CMAKE_CURRENT_SOURCE_DIR}/reference/fastokens")
 lse_add_rust_staticlib(fastokens_ffi

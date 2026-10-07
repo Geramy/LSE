@@ -98,6 +98,10 @@ target_sources(test_loom_cache PRIVATE
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
   ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
+# The launch index test checks the build identity hashes the whole engine tree.
+target_compile_definitions(test_loom_cache PRIVATE
+  "LSE_SOURCE_ROOT=\"${CMAKE_SOURCE_DIR}\""
+  "LSE_IDENTITY_SOURCES=\"${CMAKE_BINARY_DIR}/generated/lse_build_identity_sources.txt\"")
 lse_add_test(test_quant)
 # Compiler/layout contracts only; this test never opens a GPU.
 lse_add_test(test_quant_prefill lse_graph lse_kernels lse_backends lse_ir)

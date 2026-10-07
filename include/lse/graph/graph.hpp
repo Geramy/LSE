@@ -624,6 +624,11 @@ class Scheduler {
     std::uint64_t disk_hits = 0;
     std::uint64_t compiles = 0;
     std::uint64_t compile_ns = 0;
+    // Prepared sets restored from the launch index without source, sets
+    // emitted, and index entries discarded as corrupt.
+    std::uint64_t index_hits = 0;
+    std::uint64_t index_misses = 0;
+    std::uint64_t index_rejects = 0;
   };
   [[nodiscard]] JitStats jit_stats() const noexcept;
   [[nodiscard]] const Trace& last_trace() const noexcept { return trace_; }

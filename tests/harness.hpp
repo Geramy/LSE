@@ -46,7 +46,16 @@ inline int run_all() {
   Registry& r = Registry::get();
   int passed = 0;
   int skipped = 0;
+  // LSE_TEST_ONLY=<name>[,<name>...] runs just those cases, so one gated case
+  // can be run without the cases before it leaving process-wide knobs set.
+  const char* only = std::getenv("LSE_TEST_ONLY");
+  std::size_t run = 0;
   for (const auto& c : r.cases) {
+    if (only != nullptr && *only != '\0') {
+      const std::string list = std::string(",") + only + ",";
+      if (list.find("," + c.name + ",") == std::string::npos) continue;
+    }
+    ++run;
     if (std::getenv("LSE_TEST_TRACE") != nullptr) {
       std::fprintf(stderr, "[test] start %s\n", c.name.c_str());
     }
@@ -66,10 +75,9 @@ inline int run_all() {
     }
   }
   if (skipped == 0) {
-    std::printf("\n%d/%zu passed\n", passed, r.cases.size());
+    std::printf("\n%d/%zu passed\n", passed, run);
   } else {
-    std::printf("\n%d passed, %d skipped / %zu\n", passed, skipped,
-                r.cases.size());
+    std::printf("\n%d passed, %d skipped / %zu\n", passed, skipped, run);
   }
   return r.failures == 0 ? 0 : 1;
 }

@@ -24,6 +24,13 @@ namespace lse::graph {
 // The release compiled into the cache implementation.
 std::string_view kernel_cache_version() noexcept;
 
+// Digest of every engine source file and the compiler configuration this
+// binary was built from (generated at build time; see
+// cmake/LSEBuildIdentity.cmake). Kernel templates live in that source, so two
+// builds of one release that could write different text for the same group
+// carry different identities. The launch index is keyed on it.
+std::string_view engine_build_identity() noexcept;
+
 // $LSE_CACHE_DIR when set, otherwise ~/.lse/cache.
 std::string default_cache_dir();
 
@@ -78,7 +85,40 @@ class JitCache {
     std::uint64_t signature = 0;
     const EmittedKernel* emitted = nullptr;
   };
-  Status preload(std::size_t member, std::span<const Preload> kernels);
+  //
+  // With `index`, the set is also written to the LAUNCH INDEX: under a key
+  // made only of things known before any source exists (the kernels' cache
+  // keys as slot_key extends them, the dialect, and engine_build_identity()),
+  // the launch description and source fingerprints of each kernel and the
+  // bundle object they were loaded from. restore() reads it back.
+  Status preload(std::size_t member, std::span<const Preload> kernels,
+                 bool index = false);
+
+  // Makes the kernels `signatures` name resident on `member` from the launch
+  // index, without their source: the bundle object an earlier preload of the
+  // same set loaded is loaded again, and each kernel's launch description is
+  // handed to `emitter` (IKernelEmitter::adopt_launch), so launching one
+  // writes no text either. `signatures` is the list preload was given, in
+  // its order.
+  //
+  // True when every kernel is resident. False is a MISS and changes nothing:
+  // the caller emits the sources and preloads them, exactly as with no
+  // index, and that preload rewrites the entry. A miss is any entry not on
+  // disk, or one whose set no longer matches what this process has resident,
+  // or whose bundle object is no longer on disk.
+  //
+  // CORRUPTION POLICY: rejected and rebuilt, never served and never fatal.
+  // Every entry carries a checksum and echoes its own key, build identity,
+  // release, device and kernel list; the bundle object's bytes are checked
+  // against the checksum recorded when the entry was written. An entry or
+  // object that fails any check is reported on stderr with its path and the
+  // check it failed, removed, and counted in Stats::index_rejects, and the
+  // call returns false so the kernels are written and compiled from source.
+  // Nothing in the index can make a kernel run that its source would not
+  // have produced: a damaged entry costs one cold preparation of its set.
+  Result<bool> restore(std::size_t member, Dialect dialect,
+                       std::span<const std::uint64_t> signatures,
+                       const IKernelEmitter& emitter);
 
   // Live handle if this process already loaded the kernel ON THIS MEMBER in
   // THIS DIALECT. Does not compile, emit, or read disk. Counts as a memory
@@ -111,14 +151,31 @@ class JitCache {
     std::uint64_t disk_hits = 0;
     std::uint64_t compiles = 0;
     std::uint64_t compile_ns = 0;
+    // Launch index: sets made resident without source, sets that had to be
+    // emitted, and entries discarded as corrupt (also counted as misses).
+    std::uint64_t index_hits = 0;
+    std::uint64_t index_misses = 0;
+    std::uint64_t index_rejects = 0;
   };
   [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+
+  // Where this binary's launch index lives, inside the cache directory.
+  [[nodiscard]] const std::string& launch_index_dir() const noexcept {
+    return index_dir_;
+  }
 
  private:
   // Everything that decides what SOURCE this device would be given, which is
   // what an object on disk is only valid for.
   [[nodiscard]] std::uint64_t slot_key(std::size_t member, Dialect dialect,
                                        std::uint64_t signature) const noexcept;
+  // Finds or makes this build's index directory and prunes other builds'.
+  void open_launch_index();
+  // The launch index entry for `signatures` on `member`: their slot keys,
+  // the dialect and the build identity, all known before any source exists.
+  [[nodiscard]] std::uint64_t index_key(
+      std::size_t member, Dialect dialect,
+      std::span<const std::uint64_t> signatures) const noexcept;
   // The compiler declared beside the emitter that writes `dialect`, or nullptr
   // when this member declares no such dialect.
   [[nodiscard]] const IKernelCompiler* compiler_for(
@@ -141,6 +198,9 @@ class JitCache {
   // identity into the other one's cache slots.
   std::vector<std::uint64_t> compiler_id_;
   std::string cache_dir_;
+  // <cache_dir>/launch-<release>-<build identity prefix>: one directory per
+  // build, so two builds sharing a cache never read each other's entries.
+  std::string index_dir_;
   Stats stats_;
   struct Impl;
   std::unique_ptr<Impl> impl_;

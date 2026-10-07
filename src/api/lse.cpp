@@ -692,10 +692,14 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
       return fail(s, "preparing kernels");
     const graph::Scheduler::JitStats jit = sched->jit_stats();
     std::fprintf(stderr,
-                 "lse-server: kernels prepared in %.2f s; %llu loaded (%llu compiled)\n",
+                 "lse-server: kernels prepared in %.2f s; %llu loaded (%llu compiled); "
+                 "launch index: %llu of %llu sets without source%s\n",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
                  static_cast<unsigned long long>(jit.disk_hits + jit.compiles),
-                 static_cast<unsigned long long>(jit.compiles));
+                 static_cast<unsigned long long>(jit.compiles),
+                 static_cast<unsigned long long>(jit.index_hits),
+                 static_cast<unsigned long long>(jit.index_hits + jit.index_misses),
+                 jit.index_rejects != 0 ? " (corrupt entries discarded; see above)" : "");
   }
 
   // Every weight is on the device: release what loading left on the host.

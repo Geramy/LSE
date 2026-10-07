@@ -45,6 +45,12 @@ class LoomEmitter final : public graph::IKernelEmitter {
       const graph::FusionGroup& group,
       const DeviceInfo& device) const override;
 
+  // Every description emit() writes is kept under cache_key(), so one read
+  // back from the JIT's launch index stands in for writing the source.
+  [[nodiscard]] bool keeps_launches() const noexcept override { return true; }
+  bool adopt_launch(std::uint64_t key,
+                    const graph::EmittedKernel& launch) const override;
+
   [[nodiscard]] graph::Dialect dialect() const noexcept override {
     return graph::Dialect::kLoom;
   }
@@ -86,7 +92,9 @@ class LoomEmitter final : public graph::IKernelEmitter {
     graph::EmittedKernel launch;
     std::shared_ptr<const std::string> source;
   };
-  mutable std::unordered_map<std::string, CachedEmission> emit_cache_;
+  // Keyed by cache_key(): the identity is hashed as it is walked, never
+  // spelled out as text, so a key costs no allocation.
+  mutable std::unordered_map<std::uint64_t, CachedEmission> emit_cache_;
   mutable std::size_t cache_hits_ = 0, cache_misses_ = 0, cache_bytes_ = 0;
 };
 
