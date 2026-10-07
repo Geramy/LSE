@@ -57,7 +57,7 @@ void emit_run_dot(env::Emit &e, const Args &a,
   for (std::size_t r = 0; r < acc.size(); ++r)
     facc.push_back(e.var(e.f32(0.0f)));
   const auto words = e.load(a.packed, row_base + chunk0, count * 4u);
-  if (load_chunks == 4 && count == 4 && acc.size() == 8) {
+  if (load_chunks == 4 && count == 4 && acc.size() >= 2) {
     // Four weight chunks are decoded once; each row keeps the original chunk order.
     std::vector<std::array<kir::Val<kir::u32>, 2>> planes;
     for (std::uint32_t j = 0; j < count; ++j) {
@@ -68,8 +68,9 @@ void emit_run_dot(env::Emit &e, const Args &a,
       planes.push_back(value);
     }
     for (std::size_t row_pair = 0; row_pair < acc.size(); row_pair += 2) {
+      const auto pair_rows = std::min<std::size_t>(2, acc.size() - row_pair);
       std::vector<kir::Pack<kir::u32>> codes_first, codes_second, steps;
-      for (std::size_t at = 0; at < 2; ++at) {
+      for (std::size_t at = 0; at < pair_rows; ++at) {
         const auto r = row_pair + at;
         const auto input_row =
             e.let(select(row + static_cast<std::uint32_t>(r) < m,
@@ -80,7 +81,7 @@ void emit_run_dot(env::Emit &e, const Args &a,
         steps.push_back(e.load(a.panel, e.let(panel_base + k / 4u + chunk0), 16u));
       }
       for (std::uint32_t j = 0; j < count; ++j) {
-        for (std::size_t at = 0; at < 2; ++at) {
+        for (std::size_t at = 0; at < pair_rows; ++at) {
           const auto r = row_pair + at;
           auto iacc = e.var(kir::cast<kir::i32>(e.u32(0)));
           for (std::size_t plane = 0; plane < 2; ++plane) {
@@ -239,8 +240,12 @@ std::string emit_panel_columns(const KernelShapes &s,
   acc.reserve(values);
   for (std::uint32_t v = 0; v < values; ++v)
     acc.push_back(e.var(0.0f));
+  // A pass shorter than its schedule's rows (dispatch::verify_rows) computes
+  // its own rows alone; the others hold zero through the reduction and are
+  // never stored.
+  const auto live = std::min(rows, m);
   std::vector<kir::Val<kir::u32>> panel_base, row_base, scale_base;
-  for (std::uint32_t r = 0; r < rows; ++r) {
+  for (std::uint32_t r = 0; r < live; ++r) {
     const auto input_row = e.let(select(row + r < m, row + r, e.u32(0)));
     panel_base.push_back(e.let(input_row * stride));
   }
@@ -277,7 +282,7 @@ std::string emit_panel_columns(const KernelShapes &s,
         wscale.push_back(e.let(math::widen(raw[c])));
       }
     }
-    for (std::uint32_t r = 0; r < rows; ++r) {
+    for (std::uint32_t r = 0; r < live; ++r) {
       std::vector<kir::Val<kir::u32>> codes;
       for (std::uint32_t at = 0; at < count * 2u; at += 4u) {
         const auto width = std::min(4u, count * 2u - at);
@@ -323,7 +328,7 @@ std::string emit_panel_columns(const KernelShapes &s,
         std::vector<kir::Val<kir::f32>> bias;
         for (std::uint32_t c = 0; c < columns; ++c)
           bias.push_back(e.let(math::widen(a.biases[scale_base[c] + g])));
-        for (std::uint32_t r = 0; r < rows; ++r) {
+        for (std::uint32_t r = 0; r < live; ++r) {
           const auto sum = e.let(math::from_bits<lse::f32>(
               a.panel[panel_base[r] + 3u * k / 8u + g]));
           for (std::uint32_t c = 0; c < columns; ++c) {
@@ -403,9 +408,12 @@ std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule,
   const auto tile = e.let(math::workgroup_id_x());
   const auto col = e.let(tile * waves + wave_id);
   const auto row = e.let(math::workgroup_id_y() * rows);
+  // A pass shorter than its schedule's rows (dispatch::verify_rows) computes
+  // its own rows alone, each exactly as the schedule's pass computes it.
+  const auto live = std::min(rows, m);
   std::vector<kir::LValue<kir::f32>> acc;
-  acc.reserve(rows);
-  for (std::uint32_t r = 0; r < rows; ++r)
+  acc.reserve(live);
+  for (std::uint32_t r = 0; r < live; ++r)
     acc.push_back(e.var(0.0f));
   const std::span<const kir::LValue<kir::f32>> accs{acc};
   if (auto in_grid = e.when(tile < ntiles && row < m)) {
@@ -433,10 +441,10 @@ std::string emit_panel(const KernelShapes &s, const Dot4Schedule &schedule,
       }
     }
   }
-  for (std::uint32_t r = 0; r < rows; ++r)
+  for (std::uint32_t r = 0; r < live; ++r)
     for (std::uint32_t bit = 1; bit < wave; bit <<= 1)
       acc[r] = acc[r].read() + math::shfl_xor(acc[r].read(), e.u32(bit));
-  for (std::uint32_t r = 0; r < rows; ++r) {
+  for (std::uint32_t r = 0; r < live; ++r) {
     const auto rr = e.let(row + r);
     if (auto lane0 = e.when(lane == 0 && col < n && rr < m))
       e.store(rr * n + col, acc[r].read());

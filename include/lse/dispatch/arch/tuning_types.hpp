@@ -35,6 +35,7 @@ struct Tuning {
   std::span<const QuantScalarShape> quant_scalar_shapes;
   std::span<const QuantRowLadderShape> quant_row_ladders;
   std::span<const QuantPanelDevice> quant_panel_devices;
+  std::span<const QuantVerifyRows> quant_verify_rows;
   std::span<const Q4SwiGluShape> q4_swiglu_shapes;
   std::span<const Q4MatrixPanelShape> q4_matrix_panel_shapes;
   // Contractions that read the shared int8 activation panel on this part,

@@ -1133,6 +1133,26 @@ std::string emit_body(const KernelShapes& s, const QuantDims& d) {
 }  // namespace
 
 Dot4Schedule dot4_schedule(const graph::KernelShapes& s) {
+  // A pass the part runs as a measured row count (dispatch::verify_rows)
+  // takes that pass's schedule: its rows, chunks and K splits, so each row
+  // accumulates in the measured pass's order. The rows past the pass's own
+  // are masked by the kernel.
+  if (s.inputs.size() == 4 && s.inputs[0].rank() != 0 && s.output.rank() != 0) {
+    const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
+    const auto n = s.output.dim(s.output.rank() - 1);
+    if (k > 0 && n > 0 && s.inputs[0].elem_count() % static_cast<std::uint64_t>(k) == 0) {
+      const auto m = static_cast<std::int64_t>(s.inputs[0].elem_count() /
+                                               static_cast<std::uint64_t>(k));
+      if (const auto rows = dispatch::verify_rows(s, m); rows != m) {
+        const std::array<Shape, 4> inputs{Shape{rows, k}, s.inputs[1], s.inputs[2],
+                                          s.inputs[3]};
+        auto padded = s;
+        padded.inputs = inputs;
+        padded.output = Shape{rows, n};
+        return dot4_schedule(padded);
+      }
+    }
+  }
   const auto d = dims_of(s, false);
   if (!d.valid || !body_dot(s, d)) return {};
   const auto rows = dot_rows(s, d, false);

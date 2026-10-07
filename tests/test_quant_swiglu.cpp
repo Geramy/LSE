@@ -108,14 +108,37 @@ LSE_TEST(
   }
 }
 LSE_TEST(swiglu_pair_requires_qualified_geometry_storage_and_device) {
-  for (auto rows : {6, 1024}) {
+  for (auto rows : {9, 1024}) {
     Fixture f(rows);
     LSE_EXPECT_EQ(f.run(), 0u);
   }
-  {
-    // A four-row (MTP=3) verify pass fuses like the eight-row one.
-    Fixture f(4);
+  // A four-row (MTP=3) verify pass fuses like the eight-row one, and so does
+  // every width gfx1201 runs as one of them (dispatch::verify_rows).
+  for (auto rows : {4, 6}) {
+    Fixture f(rows);
     LSE_EXPECT_EQ(f.run(), 1u);
+  }
+  // The rule a pass of each width takes: its own, or the four- or eight-row
+  // pass's it runs as; the activation, panel and output keep its own rows.
+  for (std::int64_t m = 1; m <= 8; ++m) {
+    backend::DeviceInfo device;
+    device.arch = "gfx1201";
+    device.wavefront_size = 32;
+    const std::array inputs{Shape{1, m, 5120}, Shape{17408, 640}, Shape{17408, 80},
+                            Shape{17408, 80}, Shape{17408, 640}, Shape{17408, 80},
+                            Shape{17408, 80}, Shape{m, 2000}};
+    const std::array types{DType::kF32,  DType::kU32, DType::kBF16, DType::kBF16,
+                           DType::kU32,  DType::kBF16, DType::kBF16, DType::kU32};
+    KernelShapes s;
+    s.inputs = inputs;
+    s.input_dtypes = types;
+    s.output = Shape{1, m, 17408};
+    s.iattrs = {4, 64, 0, 0};
+    s.device = &device;
+    const auto *rule = dispatch::q4_swiglu_shape(s);
+    LSE_EXPECT(rule != nullptr);
+    if (rule)
+      LSE_EXPECT_EQ(rule->m, m == 1 ? 1 : m <= 4 ? 4 : 8);
   }
   {
     Fixture f;

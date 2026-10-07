@@ -126,6 +126,21 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
          m * static_cast<std::uint64_t>(n) <= UINT32_MAX &&
          static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(lanes) <= UINT32_MAX;
 }
+// The rows whose kernels an m-row pass runs on this part
+// (arch::Tuning::quant_verify_rows): m itself unless the part names another.
+[[nodiscard]] constexpr std::int64_t verify_rows(std::string_view arch,
+                                                 std::int64_t m) noexcept {
+  if (!arch.empty())
+    for (const auto& rule : arch::tuning(arch).quant_verify_rows)
+      if (rule.arch == arch && rule.m == m) return rule.rows;
+  return m;
+}
+[[nodiscard]] inline std::int64_t verify_rows(const graph::KernelShapes& s,
+                                              std::int64_t m) noexcept {
+  return verify_rows(s.device ? std::string_view(s.device->arch)
+                              : std::string_view{}, m);
+}
+
 // `arch` adds that part's own rows (arch::Tuning::q4_panel_shapes) after the
 // shared table; the graph names the device it builds for, a kernel reads it
 // from its shapes.
@@ -139,18 +154,24 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     return nullptr;
   const auto k = s.inputs[0].dim(s.inputs[0].rank() - 1);
   const auto n = s.inputs[1].dim(0);
+  if (k <= 0 || s.inputs[0].elem_count() % static_cast<std::uint64_t>(k) != 0)
+    return nullptr;
+  // The rows the pass runs as: a pass the part pads to a measured row count
+  // takes that count's rule.
+  const auto m = verify_rows(
+      arch, static_cast<std::int64_t>(s.inputs[0].elem_count() /
+                                      static_cast<std::uint64_t>(k)));
   // A part's own row is the measurement on that part and wins over the
   // shared one for the same shape.
   const Q4PanelShape* measured = nullptr;
   if (!arch.empty())
     for (const auto& shape : arch::tuning(arch).q4_panel_shapes)
       if (!measured && shape.arch == arch && n == shape.n && k == shape.k &&
-          s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
+          m == shape.m)
         measured = &shape;
   if (!measured)
     for (const auto& shape : kQ4PanelShapes)
-      if (n == shape.n && k == shape.k &&
-          s.inputs[0].elem_count() == static_cast<std::uint64_t>(shape.m * k))
+      if (n == shape.n && k == shape.k && m == shape.m)
         measured = &shape;
   if (!measured || s.inputs[1] != Shape{n, k / 8} ||
       s.inputs[2] != Shape{n, k / 64} || s.inputs[3] != s.inputs[2])
@@ -180,7 +201,7 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
 }
 
 [[nodiscard]] inline const Q4MatrixPanelShape* q4_matrix_panel_rule(
-    const graph::KernelShapes& s) {
+    const graph::KernelShapes& s, std::string_view arch) {
   if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 ||
       s.input_dtypes[0] != DType::kF32 || s.input_dtypes[1] != DType::kU32 ||
       s.input_dtypes[2] != DType::kBF16 || s.input_dtypes[3] != DType::kBF16 ||
@@ -194,13 +215,14 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     count *= static_cast<std::uint64_t>(extent);
   }
   const Shape& x = s.inputs[0];
+  const auto k = x.dim(x.rank() - 1);
+  if (count % static_cast<std::uint64_t>(k) != 0) return nullptr;
+  const auto m = verify_rows(arch, static_cast<std::int64_t>(count / static_cast<std::uint64_t>(k)));
   const auto* rule = arch::first_rule<&arch::Tuning::q4_matrix_panel_shapes>(
-      s.device ? std::string_view(s.device->arch) : std::string_view{},
-      [&](const Q4MatrixPanelShape& r) {
+      arch, [&](const Q4MatrixPanelShape& r) {
         return s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
                s.iattrs[1] == static_cast<std::int32_t>(r.group) &&
-               x.dim(x.rank() - 1) == r.k &&
-               x.elem_count() == static_cast<std::uint64_t>(r.m * r.k) &&
+               k == r.k && m == r.m &&
                s.inputs[1] == Shape{r.n, r.k / 8} &&
                s.inputs[2] == Shape{r.n, r.k / r.group} &&
                s.inputs[3] == s.inputs[2];
@@ -211,6 +233,15 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     expected.push_back(x.dim(axis));
   expected.push_back(rule->n);
   return s.output == expected ? rule : nullptr;
+}
+[[nodiscard]] inline const Q4MatrixPanelShape* q4_matrix_panel_rule(
+    const graph::KernelShapes& s) {
+  return q4_matrix_panel_rule(
+      s, s.device ? std::string_view(s.device->arch) : std::string_view{});
+}
+[[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s,
+                                                std::string_view arch) {
+  return q4_matrix_panel_rule(s, arch) != nullptr;
 }
 [[nodiscard]] inline bool q4_matrix_panel_shape(const graph::KernelShapes& s) {
   return q4_matrix_panel_rule(s) != nullptr;
@@ -230,7 +261,8 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   if (k % 64 != 0) return nullptr;
   const auto m = count / static_cast<std::uint64_t>(k);
   for (const auto& rule : kQ4MatrixPanelLayouts) {
-    if (m != static_cast<std::uint64_t>(rule.m) || (rule.k && k != rule.k))
+    if (m < static_cast<std::uint64_t>(rule.min_m) ||
+        m > static_cast<std::uint64_t>(rule.m) || (rule.k && k != rule.k))
       continue;
     const auto blocks = (m + rule.rows - 1) / rule.rows;
     const auto words = blocks * static_cast<std::uint64_t>(k / 64) *
@@ -247,7 +279,9 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   const auto groups = input.dim(input.rank() - 1) / 64;
   if (rule->rows == kQ4MatrixPanelRows)
     return Shape{groups, kQ4MatrixPanelGroupWords};
-  return Shape{(rule->m + rule->rows - 1) / rule->rows, groups,
+  const auto m = static_cast<std::int64_t>(
+      input.elem_count() / static_cast<std::uint64_t>(input.dim(input.rank() - 1)));
+  return Shape{(m + rule->rows - 1) / rule->rows, groups,
                (rule->rows / kQ4MatrixPanelRows) * kQ4MatrixPanelGroupWords};
 }
 [[nodiscard]] const math::MatrixCoreRow* q4_matrix_panel_row(
@@ -276,7 +310,10 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     expected.push_back(s.inputs[0].dim(axis));
   expected.push_back(n);
   if (s.output != expected) return false;
+  // The 8-row draft passes the panel was measured on; a shorter pass keeps
+  // the 8-bit matrix kernel.
   const auto m = static_cast<std::uint64_t>(layout->m);
+  if (s.inputs[0].elem_count() != m * static_cast<std::uint64_t>(k)) return false;
   for (const auto& rule : q8_shapes::kShapes)
     if (rule.rows == kQ4MatrixPanelRows && m >= rule.min_m && m <= rule.max_m &&
         (rule.n == 0 || static_cast<std::int64_t>(rule.n) == n) &&
@@ -310,16 +347,21 @@ q4_swiglu_shape(const graph::KernelShapes &s) {
   for (const auto slot : {2u, 3u, 5u, 6u})
     if (s.input_dtypes[slot] != DType::kBF16)
       return nullptr;
+  if (s.inputs[0].rank() != 3 || s.inputs[0].dim(0) != 1) return nullptr;
+  // The rows the pass runs as (verify_rows); the activation, panel and output
+  // keep the pass's own rows.
+  const auto m = s.inputs[0].dim(1);
+  const auto rows = verify_rows(s, m);
   return arch::first_rule<&arch::Tuning::q4_swiglu_shapes>(
       s.device ? std::string_view(s.device->arch) : std::string_view{},
       [&](const Q4SwiGluShape &rule) {
         if (s.iattrs[0] != static_cast<std::int32_t>(rule.bits) ||
             s.iattrs[1] != static_cast<std::int32_t>(rule.group) ||
-            s.inputs[0] != Shape{1, rule.m, rule.k} ||
-            s.output != Shape{1, rule.m, rule.n} ||
+            rows != rule.m || s.inputs[0] != Shape{1, m, rule.k} ||
+            s.output != Shape{1, m, rule.n} ||
             s.inputs[1] != Shape{rule.n, rule.k / 8} ||
             s.inputs[4] != s.inputs[1] ||
-            s.inputs[7] != Shape{rule.m, (rule.k / rule.group) * 25})
+            s.inputs[7] != Shape{m, (rule.k / rule.group) * 25})
           return false;
         bool affines = true;
         for (const auto slot : {2u, 3u, 5u, 6u})
