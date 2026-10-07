@@ -140,7 +140,10 @@ struct Pair final : KernelPrimitive<Pair> {
     if (!valid(s) || !s.types.scalar || !s.store || !s.intrinsics)
       return {};
     auto sched = dot4_schedule(original(s));
-    const auto rows = sched.rows;
+    // A pass shorter than the rule's rows (dispatch::verify_rows) computes
+    // its own rows alone, each exactly as the rule's pass computes it.
+    const auto rows = std::min<std::uint32_t>(
+        sched.rows, static_cast<std::uint32_t>(s.inputs[0].dim(1)));
     kir::KernelBody kb(s.types, *s.intrinsics, 0);
     kb.set_store(s.store);
     Args a;
@@ -247,7 +250,8 @@ Status Pair::eval_cpu_typed(std::span<const HostTensorView> in,
   const auto chunks = static_cast<std::size_t>(rule->k / 8);
   const auto groups = static_cast<std::size_t>(rule->k / rule->group);
   const auto stride = groups * 25;
-  for (std::size_t row = 0; row < static_cast<std::size_t>(rule->m); ++row)
+  const auto pass_rows = static_cast<std::size_t>(in[0].shape.dim(1));
+  for (std::size_t row = 0; row < pass_rows; ++row)
     for (std::size_t col = 0; col < static_cast<std::size_t>(rule->n); ++col) {
       std::array<std::array<float, 32>, 2> acc{};
       for (std::size_t split = 0; split < rule->k_splits; ++split) {

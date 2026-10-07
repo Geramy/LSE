@@ -45,6 +45,22 @@ inline constexpr std::array kQuantRowLadderShapes{
     QuantRowLadderShape{kArch, 32, 7, 8, 33152, 17408, 5120},
     QuantRowLadderShape{kArch, 32, 7, 8, 56192, 5120, 17408},
 };
+// Verify passes of two and three rows run on the four-row kernels, five to
+// seven rows on the eight-row ones (shared activation panel, fused SwiGLU,
+// 16-row matrix down projection, four-column vocabulary waves), the rows
+// past the pass masked. Without these a pass of a width no rule names fell
+// to row groups that read the weights once per group. DFlash2 verify pass,
+// pinned 27B Q4, ms per pass (rows 1..8):
+//   own row groups: 31.4 35.2 48.8 33.0 74.9 51.5 89.2 37.6
+//   these rows:     31.4 32.3 32.7 33.0 33.7 35.2 36.0 37.7
+// (DFlash2 at a fixed seven rows 31.7 -> 63.6 tok/s.) A padded pass skips
+// the masked rows' arithmetic where its kernel computes rows one by one, so
+// five rows cost less than eight.
+inline constexpr std::array kQuantVerifyRows{
+    QuantVerifyRows{kArch, 2, 4}, QuantVerifyRows{kArch, 3, 4},
+    QuantVerifyRows{kArch, 5, 8}, QuantVerifyRows{kArch, 6, 8},
+    QuantVerifyRows{kArch, 7, 8},
+};
 inline constexpr std::array kQuantPanelDevices{
     QuantPanelDevice{kArch, 32, 4, 64, 256},
 };
@@ -93,6 +109,7 @@ inline constexpr Tuning kTuning{
     .quant_scalar_shapes = kQuantScalarShapes,
     .quant_row_ladders = kQuantRowLadderShapes,
     .quant_panel_devices = kQuantPanelDevices,
+    .quant_verify_rows = kQuantVerifyRows,
     .q4_swiglu_shapes = kQ4SwiGluShapes,
     .q4_matrix_panel_shapes = kQ4MatrixPanelShapes,
     .q8_matrix_rules = kQ8MatrixRules,
@@ -114,6 +131,7 @@ static_assert(rows_name(kQuantMatrixShapes, kArch) &&
               rows_name(kQuantScalarShapes, kArch) &&
               rows_name(kQuantRowLadderShapes, kArch) &&
               rows_name(kQuantPanelDevices, kArch) &&
+              rows_name(kQuantVerifyRows, kArch) &&
               rows_name(kQ4SwiGluShapes, kArch) &&
               rows_name(kQ4MatrixPanelShapes, kArch) &&
               rows_name(kQ8MatrixRules, kArch) &&

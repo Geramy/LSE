@@ -453,7 +453,7 @@ LSE_TEST(q4_matrix_panel_typed_codec_pads_sixteen_rows_and_refreshes_replay) {
   if (!primitive)
     return;
   for (const auto shape :
-       {Shape{7, 64}, Shape{16, 64}, Shape{8, 65}, Shape{1024, 128},
+       {Shape{9, 64}, Shape{16, 64}, Shape{8, 65}, Shape{1024, 128},
         Shape{8, INT64_MAX}, Shape{INT64_MAX, 8, 64}}) {
     const std::array inputs{shape};
     LSE_EXPECT(!primitive->infer_shape(inputs).ok());

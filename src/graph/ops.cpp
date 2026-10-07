@@ -338,7 +338,9 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
       ++leaf->consumer_count;
     }
     n->prim = find_primitive("quant_linear.q8.wmma16.packed.v1");
-  } else if (dispatch::q4_matrix_panel_shape(geometry) ||
+  } else if (dispatch::q4_matrix_panel_shape(
+                 geometry, device ? std::string_view(device->arch)
+                                  : std::string_view{}) ||
              dispatch::q8_matrix_panel_shape(geometry)) {
     // 8-bit weights read the panel in byte order (attribute 0 = 8), 4-bit
     // weights in nibble-plane order; siblings share it only in one order.

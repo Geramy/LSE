@@ -81,8 +81,11 @@ LSE_TEST(quant_M8_rate_panel_is_shape_and_device_qualified) {
     f.amd.has_dot4_iu8 = true;
     f.dtypes[2] = f.dtypes[3] = DType::kF32;
     LSE_EXPECT(!f.plan().shared_activation_panel);
-    for (const auto m : {1, 6, 7, 9})
+    for (const auto m : {1, 9})
       LSE_EXPECT(!Fixture(m, 48, 5120, 4, loom).plan().shared_activation_panel);
+    // Two to seven rows run as gfx1201's four- or eight-row passes.
+    for (const auto m : {2, 3, 5, 6, 7})
+      LSE_EXPECT(Fixture(m, 48, 5120, 4, loom).plan().shared_activation_panel);
     // The 4-row (MTP=3) verify pass shares the panel too.
     LSE_EXPECT(Fixture(4, 48, 5120, 4, loom).plan().shared_activation_panel);
     LSE_EXPECT(!Fixture(8, 49, 5120, 4, loom).plan().shared_activation_panel);
@@ -384,8 +387,8 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
     }
     for (auto [m, n, k] : {std::array{4, 5120, 17408}, {4, 12288, 5120},
                            {4, 5120, 6144}, {4, 248320, 5120},
-                           {6, 17408, 5120},
-                           {3, 17408, 5120}, {4, 17, 5120}}) {
+                           {3, 5120, 17408}, {2, 12288, 5120},
+                           {4, 17, 5120}}) {
       Fixture unchanged(m, n, k, 4, loom);
       LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(unchanged.shapes), 1u);
     }

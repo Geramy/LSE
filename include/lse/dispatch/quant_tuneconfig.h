@@ -57,6 +57,16 @@ struct QuantRowLadderShape {
   std::uint64_t n, k;
 };
 
+// A pass of `m` rows (a speculative verify pass, 2 to 7 rows) that runs on the
+// kernels measured at `rows` rows, the rows past m masked: it reads the
+// weights once, as the measured pass does, where a pass with no rows of its
+// own falls to row groups that read them once per group. Each row's products
+// and sums are the measured pass's for that row.
+struct QuantVerifyRows {
+  std::string_view arch;
+  std::int64_t m, rows;
+};
+
 struct QuantPanelDevice {
   std::string_view arch;
   std::uint32_t wave, bits, group, threads;
@@ -105,14 +115,18 @@ struct Q4MatrixPanelShape {
   std::uint32_t rows = 16;
   std::uint32_t shared_words = 0;
 };
+// Passes of min_m to m rows over K (0: any) store their int8 activation
+// panel in `rows`-row tiles. The 16-row decode tile holds any pass of up to
+// eight rows, its padding rows zero; which passes read it is the consumers'
+// rules' choice.
 struct Q4MatrixPanelLayout {
-  std::int64_t m, k;
+  std::int64_t min_m, m, k;
   std::uint32_t rows;
 };
 inline constexpr std::array kQ4MatrixPanelLayouts{
-    Q4MatrixPanelLayout{8, 0, 16},
-    Q4MatrixPanelLayout{1024, 17408, 64},
-    Q4MatrixPanelLayout{1024, 5120, 64},
+    Q4MatrixPanelLayout{1, 8, 0, 16},
+    Q4MatrixPanelLayout{1024, 1024, 17408, 64},
+    Q4MatrixPanelLayout{1024, 1024, 5120, 64},
 };
 inline constexpr std::uint32_t kQ4MatrixPanelRows = 16;
 inline constexpr std::uint32_t kQ4MatrixPanelGroupWords = 288;

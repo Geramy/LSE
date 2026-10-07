@@ -452,19 +452,37 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
     auto original_shape = invocation;
     original_shape.inputs = invocation.inputs.first(4);
     original_shape.input_dtypes = invocation.input_dtypes.first(4);
+    // gfx1201 runs six- and seven-row passes on the eight-row rules
+    // (dispatch::verify_rows).
+    const auto rows = dispatch::verify_rows(device.arch, dimensions[0]);
+    LSE_EXPECT_EQ(rows, dimensions[0] >= 6 ? 8 : dimensions[0]);
+    {
+      // A padded pass is scheduled as the pass it runs as, so each of its
+      // rows accumulates in that pass's order.
+      std::vector<Shape> as_rows(input_shapes.begin(), input_shapes.begin() + 4);
+      as_rows[0] = Shape{1, rows, dimensions[2]};
+      auto measured = original_shape;
+      measured.inputs = as_rows;
+      measured.output = Shape{1, rows, dimensions[1]};
+      const auto a = lse::kernels::dot4_schedule(original_shape);
+      const auto b = lse::kernels::dot4_schedule(measured);
+      LSE_EXPECT(a.valid());
+      LSE_EXPECT_EQ(a.rows, b.rows);
+      LSE_EXPECT_EQ(a.chunks_per_lane, b.chunks_per_lane);
+      LSE_EXPECT_EQ(a.k_splits, b.k_splits);
+    }
     const bool adjacent =
-        (dimensions[0] == 4 && dimensions[2] == 5120 &&
+        (rows == 4 && dimensions[2] == 5120 &&
          (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144)) ||
-        (dimensions[0] == 8 &&
+        (rows == 8 &&
          ((dimensions[2] == 5120 &&
            (dimensions[1] == 17408 || dimensions[1] == 10240 || dimensions[1] == 6144)) ||
           (dimensions[1] == 5120 &&
            (dimensions[2] == 17408 || dimensions[2] == 6144))));
     const bool four_chunks =
         dimensions[2] == 5120 &&
-        ((dimensions[0] == 8 && (dimensions[1] == 17408 || dimensions[1] == 10240 ||
-                                 dimensions[1] == 12288 || dimensions[1] == 248320)) ||
-         (dimensions[0] == 7 && dimensions[1] == 248320));
+        rows == 8 && (dimensions[1] == 17408 || dimensions[1] == 10240 ||
+                      dimensions[1] == 12288 || dimensions[1] == 248320);
     LSE_EXPECT_EQ(dispatch::q4_shared_panel_load_chunks(original_shape),
                   four_chunks ? 4u : adjacent ? 2u : 1u);
     // The vocabulary projection at six to eight rows gives each wave four
@@ -488,8 +506,6 @@ LSE_TEST(q4_panel_native_emit_uses_zero_lds_and_legacy_nontarget_plan) {
         auto original = invocation;
         original.inputs = invocation.inputs.first(4);
         original.input_dtypes = invocation.input_dtypes.first(4);
-        if (dimensions[0] != 8)
-          LSE_EXPECT_EQ(lse::kernels::dot4_schedule(original).k_splits, 1u);
         LSE_EXPECT_EQ(dispatch::q4_shared_panel_rows(original), 8u);
         LSE_EXPECT_EQ(selected->plan(invocation).workgroup_count[1], 1u);
       }

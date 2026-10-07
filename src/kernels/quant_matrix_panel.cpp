@@ -20,7 +20,6 @@ namespace {
 constexpr std::uint32_t kBlock = 256;
 constexpr std::uint32_t kRows = dispatch::kQ4MatrixPanelRows;
 constexpr std::uint32_t kGroupWords = dispatch::kQ4MatrixPanelGroupWords;
-constexpr std::uint32_t kInputRows = 8;
 
 // Which of a group's 64 values byte `byte` of panel word `word` carries.
 //
@@ -96,7 +95,7 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
     const auto k =
         static_cast<std::size_t>(in[0].shape.dim(in[0].shape.rank() - 1));
     const auto *layout = dispatch::q4_matrix_panel_layout(in[0].shape);
-    const auto rows = static_cast<std::size_t>(layout->m);
+    const auto rows = in[0].shape.elem_count() / k;
     const auto tile_rows = static_cast<std::size_t>(layout->rows);
     const auto padded_rows = (rows + tile_rows - 1) / tile_rows * tile_rows;
     const auto tile_words = tile_rows / kRows * kGroupWords;
@@ -156,7 +155,8 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
         static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
     const auto groups = k / 64u;
     const auto *layout = dispatch::q4_matrix_panel_layout(s.inputs[0]);
-    const auto input_rows = static_cast<std::uint32_t>(layout->m);
+    const auto input_rows = static_cast<std::uint32_t>(
+        s.inputs[0].elem_count() / static_cast<std::uint64_t>(k));
     const auto padded_rows =
         (input_rows + layout->rows - 1u) / layout->rows * layout->rows;
     const auto tile_words = layout->rows / kRows * kGroupWords;
@@ -233,9 +233,11 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
         s.inputs[0].dim(s.inputs[0].rank() - 1) / 64);
     tp.workgroup_size[0] = kBlock;
     tp.workgroup_count[0] = (groups + 63u) / 64u;
+    const auto input_rows = static_cast<std::uint32_t>(
+        s.inputs[0].elem_count() /
+        static_cast<std::uint64_t>(s.inputs[0].dim(s.inputs[0].rank() - 1)));
     tp.workgroup_count[1] =
-        (static_cast<std::uint32_t>(layout->m) + layout->rows - 1u) /
-        layout->rows * layout->rows;
+        (input_rows + layout->rows - 1u) / layout->rows * layout->rows;
     return tp;
   }
 };
@@ -313,6 +315,9 @@ std::string emit_matrix(const KernelShapes &s) {
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   const auto k =
       static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  // The pass's rows; the tile's other rows are the panel's zero padding.
+  const auto input_rows = static_cast<std::uint32_t>(
+      s.inputs[0].elem_count() / static_cast<std::uint64_t>(k));
   const auto groups = k / 64u;
   const auto lanes = k * Bits / 32u;
   const auto waves = matrix_waves(s, n);
@@ -443,7 +448,7 @@ std::string emit_matrix(const KernelShapes &s) {
     const auto output_row =
         e.let(m0 + hi * geo.half_rows +
               static_cast<std::uint32_t>(z) * geo.slot_step);
-    if (auto valid = e.when(live && output_row < kInputRows))
+    if (auto valid = e.when(live && output_row < input_rows))
       e.store(output_row * n + col, out[static_cast<std::size_t>(z)].read());
   }
   return kb.str();
@@ -653,7 +658,8 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
     tp.workgroup_size[0] = kBlock;
     const auto *rule = dispatch::q4_matrix_panel_rule(original);
-    const auto m = static_cast<std::uint32_t>(rule->m);
+    const auto m = static_cast<std::uint32_t>(
+        s.output.elem_count() / static_cast<std::uint64_t>(n));
     tp.lds_bytes = rule->shared_words * sizeof(std::uint32_t);
     tp.workgroup_count[0] =
         ((m + rule->rows - 1u) / rule->rows) * ((n + 127u) / 128u);
