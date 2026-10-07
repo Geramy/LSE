@@ -3,6 +3,18 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.5: faster decode and short prompts, HRX kernel arguments in VRAM
+
+Requires mac_linuxgpu v0.1.151 (build 255) or later; kernel arguments in VRAM need v0.1.161 (build 265). Measured on builds 264 and 265.
+
+1. **Decode:** the single-row 4-bit decode contraction issues all of a column's weight, scale and bias reads before staging the activations; partial RoPE rotates in one launch; one-token passes reshape heads instead of transposing them; a decode row's GDN q/k preparation is one launch. Plain decode runs 352 fewer launches per token. 640-token decode on build 264: plain **30.9** tok/s (before: 28.6), DFlash2 **51.8** (48.8), MTP=3 **53.1** (46.4).
+2. **Short prefill:** 4-bit GEMMs of 65 to 767 rows are tiled from 48x32 wave tiles, so one row tile holds a whole pass of up to 192 rows. Warm TTFT on build 264: 137 tokens **0.138 s** (before: 0.182 s), 271 tokens 0.236 s (0.276 s), 532 tokens 0.393 s (0.425 s), 646 tokens 0.468 s (0.490 s).
+3. **Speculative verify and draft:** the 8-row down projection widens each weight word with one shift and one mask per operand register; a vocabulary-projection wave owns four columns at 6 to 8 rows, so a verify pass or DFlash2 draft reads each activation run once for all four; a 4-row MTP=3 verify pass runs its gate and up projections as one fused SwiGLU launch; a DFlash2 draft pass's 8-row 8-bit projections read a shared activation panel made once per input. DFlash2 640-token decode on build 264: **53.3** tok/s (before: 52.4) from the down projection; on build 265 the vocabulary projection takes DFlash2 from 52.4 to **53.6** tok/s, the fused 4-row SwiGLU takes MTP=3 from 53.6 to **54.4**, and the shared 8-bit panel cuts a draft step from 10.4 to 8.0 ms, taking DFlash2 from 53.1 to **55.1** tok/s.
+4. **HRX kernel arguments in VRAM:** `gfx120x-hdp-kernarg-publication` (the change in ROCm/hrx-system#1331) on the Linux and macOS builds, and on macOS `hsa-bar-write-bracket`, which brackets each submission's BAR stores under the driver's gate. 640-token decode on build 265: plain **31.8** tok/s (before: 30.7), DFlash2 **54.2** (53.0), MTP=3 **54.0–55.4** (53.6). Linux with ROCm 7.13: DFlash2 +4.9 to +7.5%, plain +2.2 to +3.7%.
+5. **Loom load scheduling:** `loom-vmem-load-latency` sets loomc's AMDGPU global-load latency to 320 cycles instead of 16 (macOS and Linux builds), so the 4-bit GEMM issues its loads ahead of the math that waits on them. On build 265: prefill GEMM M 656 x 5120 x 17408 1.728 -> **1.378** ms, 0.350 ms saved (+25%), warm TTFT at 648 tokens 475 -> 453 ms, 640-token decode plain 31.63 -> 31.73 tok/s, DFlash2 54.16 -> 54.30.
+6. **Kernels prepared at load:** the server makes every request shape's kernels resident before it reports ready, loaded together as one code object per shape set (about 260 executables instead of about 4000). On build 265, first request at each size after a cold start: 137 tokens **250 ms** (before: 344 ms), 271 tokens 273 ms (407 ms), 532 tokens 402 ms (514 ms), 1060 tokens 727 ms (1115 ms); first 640-token decode after load 52.4 tok/s (49.4). Load takes 10.2 s instead of 3.8 s, host footprint is 654 MiB instead of 390 MiB, and the KV pool peaks at 2 GiB while preparing.
+7. **RDNA4 matrix-core tools:** standalone microbenchmarks and an FP8 Q4 prefill GEMM prototype in `scripts/rdna4-matrix`.
+
 ## v0.5.4: twice the prefill, faster speculative decode and HRX patches in-tree
 
 Requires mac_linuxgpu v0.1.151 (build 255) or later; measured on v0.1.156 (build 260).
