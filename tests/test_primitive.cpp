@@ -126,7 +126,11 @@ LSE_TEST(user_primitive_computes_correctly) {
 
 LSE_TEST(user_primitive_matches_the_equivalent_builtin) {
   // test.swish and the built-in silu are the same function, so they must agree
-  // bit-for-bit through the shared evaluation path.
+  // bit-for-bit through the shared evaluation path. That path is the host
+  // interpreter: test.swish spells only HIP, so under Loom, the default
+  // dialect, it has no device source while silu does, and a device result is
+  // not bit-comparable with a host one.
+  const HostOnly_ pinned;
   Array x = Array::full(Shape{16}, DType::kF32, -0.75f);
   auto mine = custom("test.swish", {x});
   LSE_EXPECT(mine.ok());

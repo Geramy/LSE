@@ -3,7 +3,7 @@
 Use `--kv-cache-dtype` when you start `lse` or `lse-server`:
 
 ```bash
-lse-server --model /path/to/model --pool hrx:0 --dialect loom \
+lse-server --model /path/to/model --pool hrx:0 \
   --kv-cache-dtype fp16 --kv-len 32768
 ```
 
@@ -57,10 +57,10 @@ in BF16 for Qwen3.8-27B. The DFlash2 ring is fixed at its sliding window
 Tokens are paged in blocks of 16. How blocks become device memory depends on
 the kernel dialect:
 
-- **Loom (macOS, iPadOS):** each layer's K and V are backed by 256 KiB
+- **Loom (the default on every platform):** each layer's K and V are backed by 256 KiB
   fragments covering the blocks in use, drawn from 256 MiB arenas that all
   layers share. A layer's address table is reserved for the whole `--kv-len`.
-- **HIP:** each layer's K and V are contiguous pools. A pool starts at 8 blocks
+- **HIP (`--dialect hip`, Linux only):** each layer's K and V are contiguous pools. A pool starts at 8 blocks
   and doubles up to 2,048 blocks (32K tokens), then grows 256 blocks (4K tokens)
   at a time, never past `--kv-len`. While a pool moves to its next size, that
   layer's old and new pools are briefly both allocated.
@@ -76,7 +76,7 @@ longest `--kv-len` that fits:
 
 ```bash
 lse-server --model /path/to/qwen38-27b-q4 --kv-len 65536 --kv-cache-dtype fp8 \
-  --dialect loom --estimate='{"device_memory_bytes": 34359738368}'
+  --estimate='{"device_memory_bytes": 34359738368}'
 ```
 
 ## GPU selection

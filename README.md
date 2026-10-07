@@ -1,7 +1,7 @@
 # Lemon Seed Engine (LSE)
 
 LSE is an LLM inference engine with a built-in kernel compiler and optimization engine.
-It specializes GPU kernels for the model and device, compiles them through HIP or Loom,
+It specializes GPU kernels for the model and device, compiles them through Loom,
 and caches the compiled kernels for reuse. LSE runs text models on AMD GPUs through
 an HTTP server, a command-line program, or inside your own app through libLSE, its C API.
 
@@ -14,7 +14,8 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
 - **In-process library:** libLSE, a plain C API (`include/lse/lse.h`) on every platform,
   including an XCFramework for iOS and iPadOS.
 - **Model info and memory estimates:** inspect a checkpoint and size a context before loading it.
-- **GPU execution:** HRX with HIP or Loom kernel source, subject to platform support.
+- **GPU execution:** HRX with Loom kernel source, the default on every platform. On Linux the
+  legacy HIP dialect remains selectable with `--dialect hip`.
 - **CPU backend:** Reference execution and a fallback when available GPU backends cannot start.
   CPU fallback is always reported; `--no-cpu-fallback` turns it into an error.
 
@@ -137,7 +138,7 @@ remain available for reuse.
 
 | Platform | GPU requirements | Kernel source |
 |---|---|---|
-| Linux x86_64 | ROCm 7.x and [HRX](https://github.com/ROCm/hrx-system) | HIP or Loom |
+| Linux x86_64 | ROCm 7.x and [HRX](https://github.com/ROCm/hrx-system) | Loom (legacy HIP with `--dialect hip`) |
 | macOS on Apple Silicon | An external AMD GPU and the installed [mac_linuxgpu driver](https://github.com/lemonade-sdk/mac_linuxgpu) | Loom |
 | iPadOS on an M-series iPad | An external AMD GPU over Thunderbolt and an app that embeds the mac_linuxgpu driver and links `LSE.xcframework` | Loom, in process |
 | CPU | A build with the CPU backend | CPU reference execution |
@@ -260,7 +261,7 @@ Start ordinary decoding first:
 "$LSE_BIN/lse-server" \
   --model "$LSE_MODEL" \
   --no-mtp \
-  --pool hrx:0 --dialect loom \
+  --pool hrx:0 \
   --temperature 0.6 --batch-size 1024 --ubatch-size 1024 \
   --kv-len 32768 \
   --served-name qwen38-q4 \
@@ -268,7 +269,8 @@ Start ordinary decoding first:
 ```
 
 Confirm that startup reports `device hrx` and `generates loom`.
-On Linux, you can select `--dialect hip` instead.
+Loom is the default kernel dialect on every platform, so `--dialect` can be left out.
+On Linux, `--dialect hip` selects the legacy HIP dialect instead.
 A dialect request is a preference. If unavailable, LSE reports the change and selects an available toolchain.
 
 In another terminal, check the server:
@@ -331,7 +333,7 @@ Use a matching Q8 MTP module. For Qwen3.8-27B, see
   --model "$LSE_MODEL" \
   --mtp /absolute/path/to/qwen38-27b-mtp-q8 \
   --mtp-depth 3 \
-  --pool hrx:0 --dialect loom --kv-len 32768 \
+  --pool hrx:0 --kv-len 32768 \
   --temperature 0.6 --batch-size 1024 --ubatch-size 1024 \
   --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```
@@ -355,7 +357,7 @@ unconverted. See [automatic Q8 conversion](docs/DFLASH2.md#automatic-q8-conversi
   --model "$LSE_MODEL" \
   --dflash2=on \
   --dflash2-model /absolute/path/to/qwen38-27b-dflash2-q8 \
-  --pool hrx:0 --dialect loom --kv-len 32768 \
+  --pool hrx:0 --kv-len 32768 \
   --temperature 0.6 --batch-size 1024 --ubatch-size 1024 \
   --served-name qwen38-q4 --host 127.0.0.1 --port 8080
 ```
@@ -429,7 +431,7 @@ open no device and allocate no GPU memory.
 "$LSE_BIN/lse-server" --model "$LSE_MODEL" --model-info
 "$LSE_BIN/lse-server" --model "$LSE_MODEL" --dflash2=on \
   --dflash2-model /absolute/path/to/qwen38-27b-dflash2-q8 \
-  --kv-len 65536 --kv-cache-dtype bf16 --dialect loom \
+  --kv-len 65536 --kv-cache-dtype bf16 \
   --estimate='{"device_memory_bytes": 34359738368}'
 ```
 
@@ -497,8 +499,7 @@ int main(void) {
   cfg.dflash2_model = "/models/qwen38-27b-dflash2-q8";
   cfg.kv_len = 32768;
   cfg.kv_cache_dtype = "bf16";
-  cfg.pool = "hrx:0";
-  cfg.dialect = "loom";
+  cfg.pool = "hrx:0";                /* cfg.dialect NULL: Loom, the default */
 
   char *plan = NULL;                 /* what lse_open(&cfg) would allocate */
   if (lse_estimate(&cfg, "{\"device_memory_bytes\": 34359738368}", &plan, &err) == LSE_OK) {

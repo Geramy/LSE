@@ -78,6 +78,14 @@ char* dup_string(const std::string& s) {
 
 std::string str(const char* s) { return s != nullptr ? std::string(s) : std::string(); }
 
+// The kernel dialect a configuration asks for. Loom is the default on every
+// platform; HIP is used only when a caller names it.
+constexpr const char* kDefaultDialect = "loom";
+std::string dialect_or_default(const lse_config& c) {
+  const std::string named = str(c.dialect);
+  return named.empty() ? std::string(kDefaultDialect) : named;
+}
+
 // ---------------------------------------------------------------------------
 // Log capture. The engine reports through stderr; while a callback is set,
 // fd 2 is a pipe whose reader hands each line to the callback and still copies
@@ -337,8 +345,8 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     return invalid("temperature must be a finite number from 0 to 2");
   if (c.shutdown_grace_seconds < 1 || c.shutdown_grace_seconds > 600)
     return invalid("shutdown grace must be an integer from 1 to 600 seconds");
-  const std::string dialect = str(c.dialect);
-  if (!dialect.empty() && !graph::dialect_from_name(dialect).has_value())
+  const std::string dialect = dialect_or_default(c);
+  if (!graph::dialect_from_name(dialect).has_value())
     return invalid("no dialect is spelled '" + dialect + "'");
   const std::string kv_cache_dtype = str(c.kv_cache_dtype);
   if (!kv_cache_dtype.empty()) {
@@ -469,7 +477,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     return fail(LSE_ERROR(kDeviceError, "no scheduler could be built"),
                 "selecting the kernel dialect");
   }
-  if (!dialect.empty()) {
+  {
     const graph::Dialect want = *graph::dialect_from_name(dialect);
     sched->set_dialect(want);
     for (std::size_t i = 0; i < devices->size(); ++i) {
@@ -753,14 +761,8 @@ Result<model::MemoryPlanRequest> plan_request(const lse_config& c, const char* o
     r.draft_path = str(c.mtp_path);
   }
   // Loom keeps K/V in fragments; HIP keeps contiguous pools. With no dialect
-  // named, the device's first toolchain decides, which is HIP only where this
-  // build has COMGR.
-  const std::string dialect = str(c.dialect);
-#if defined(LSE_HAVE_COMGR) && LSE_HAVE_COMGR
-  r.fragmented_kv = dialect == "loom";
-#else
-  r.fragmented_kv = dialect != "hip";
-#endif
+  // named, the run uses Loom.
+  r.fragmented_kv = dialect_or_default(c) != "hip";
   if (options != nullptr && *options) {
     const json o = json::parse(options, nullptr, false);
     if (o.is_discarded() || !o.is_object())

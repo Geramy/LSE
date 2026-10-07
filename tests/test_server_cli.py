@@ -14,6 +14,7 @@ env = dict(os.environ)
 env.pop('LSE_MODEL', None)
 cases = [
     (['--help'], 0, '--dialect NAME'),
+    (['--help'], 0, 'source dialect: loom or hip (default: loom)'),
     (['--dialect', 'loom', '--help'], 0, 'Endpoints:'),
     (['--dialect', 'hip', '--help'], 0, 'Endpoints:'),
     (['--dialect', 'unknown', '--model', '/not-opened'], 2, "no dialect is spelled 'unknown'"),
@@ -68,7 +69,12 @@ for value in ('true', 'false', '1', '', 'ON'):
     cases.append(([f'--FlashPrefillV2={value}'], 2, '--FlashPrefillV2 must be on or off'))
 cases += [(['--FlashPrefillV2'], 2, '--FlashPrefillV2 needs a value'),
           (['--FlashPrefillV2=off'], 2, 'no model.'),
-          (['--FlashPrefillV2=on'], 2, 'requires --dialect loom'),
+          # Loom is the default dialect, so the experimental attention modes
+          # that need it are accepted without naming it, and refused only
+          # when the legacy HIP dialect is named.
+          (['--FlashPrefillV2=on'], 2, 'no model.'),
+          (['--FlashPrefillV2=on', '--dialect', 'hip'], 2, 'requires --dialect loom'),
+          (['--FlashPrefillV2=on', '--no-mtp'], 2, 'no model.'),
           (['--FlashPrefillV2=on', '--no-mtp', '--dialect', 'loom'], 2, 'no model.'),
           (['--attention-prefill', 'flashprefill-v2', '--no-mtp', '--dialect', 'loom'], 2, 'no model.'),
           (['--FlashPrefillV2=off', '--dflash2=on'], 2, 'no model.'),
@@ -91,7 +97,8 @@ cases += [(['--attention-prefill', 'flashprefill-v2', '--help'], 0, '--attention
           (['--attention-prefill', 'blasst'], 2, 'requires --no-mtp'),
           (['--attention-decode', 'blasst', '--no-mtp'], 2, 'requires --attention-calibration'),
           (['--attention-calibration'], 2, '--attention-calibration needs a value'),
-          (['--attention-decode', 'blasst', '--no-mtp', '--attention-calibration', '/not-present'], 2, 'requires --dialect loom'),
+          (['--attention-decode', 'blasst', '--no-mtp', '--attention-calibration', '/not-present'], 2, 'invalid attention calibration'),
+          (['--attention-decode', 'blasst', '--no-mtp', '--attention-calibration', '/not-present', '--dialect', 'hip'], 2, 'requires --dialect loom'),
           (['--attention-decode', 'blasst', '--no-mtp', '--attention-calibration', '/not-present', '--dialect', 'loom'], 2, 'invalid attention calibration')]
 calibration_dir = tempfile.TemporaryDirectory()
 for index, (payload, mode, message) in enumerate([

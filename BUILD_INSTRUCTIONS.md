@@ -150,7 +150,7 @@ With the driver activated and the model present:
 
 ```bash
 export DYLD_LIBRARY_PATH=<hrx-install>/lib:$DYLD_LIBRARY_PATH   # so libhsa-runtime64 is found
-./build/macos/lse-server -m <model-dir> --pool hrx:0 --dialect loom
+./build/macos/lse-server -m <model-dir> --pool hrx:0
 ```
 
 Use the `macos-arm64` release asset for Apple Silicon; it bundles HRX and Loom

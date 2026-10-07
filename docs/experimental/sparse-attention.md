@@ -27,7 +27,7 @@ Conflicting explicit prefill switches are rejected regardless of order.
 For BLASST, add these arguments to an existing baseline server command:
 
 ```sh
---no-mtp --dialect loom \
+--no-mtp \
 --attention-prefill blasst --attention-decode blasst \
 --attention-calibration /path/to/attention-calibration.json
 ```

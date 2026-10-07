@@ -2326,17 +2326,22 @@ LSE_TEST(emitted_source_carries_the_dialect_of_its_emitter) {
   LSE_EXPECT(e->dialect == Dialect::kHip);
 }
 
-LSE_TEST(the_hrx_device_prefers_an_available_compiler) {
+// Loom is the default dialect on every platform: the HRX device declares it
+// first, and hands HIP the front only to a build that has COMGR and no loomc.
+LSE_TEST(the_hrx_device_prefers_loom) {
   backend::BackendAdapter<backend::HrxBackend> hrx;
   LSE_EXPECT_EQ(hrx.toolchains().size(), 2u);
   const KernelToolchain* hip = hrx.toolchain_for(Dialect::kHip);
   const KernelToolchain* loom = hrx.toolchain_for(Dialect::kLoom);
   LSE_EXPECT(hip != nullptr && loom != nullptr);
   if (hip == nullptr || loom == nullptr) return;
-  const Dialect preferred = !hip->compiler->available() &&
-                                    loom->compiler->available()
-                                ? Dialect::kLoom
-                                : Dialect::kHip;
+  const Dialect preferred = !loom->compiler->available() &&
+                                    hip->compiler->available()
+                                ? Dialect::kHip
+                                : Dialect::kLoom;
+#if defined(LSE_HAVE_LOOMC) && LSE_HAVE_LOOMC
+  LSE_EXPECT(preferred == Dialect::kLoom);
+#endif
   LSE_EXPECT(hrx.toolchains().front().dialect == preferred);
   LSE_EXPECT(hrx.emitter() != nullptr);
   LSE_EXPECT(hrx.compiler() != nullptr);

@@ -75,13 +75,23 @@ echo "== server =="
 "$BUILD/lse-server" -m "$MODEL" --host "$HOST" --port "$PORT" >/tmp/lse-smoke-server.log 2>&1 &
 server_pid=$!
 # The server is up when it answers, not when the process exists: loading the
-# weights takes longer than starting the listener.
+# weights takes longer than starting the listener, and the server prepares
+# every request shape's kernels before it reports ready. On the first launch
+# of a build, with none of its kernels in the cache, that compiles them, which
+# took more than 240 s on an R9700 with ROCm 7.13.
+ready_wait="${LSE_SMOKE_READY_SECONDS:-1200}"
 trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-for _ in $(seq 1 120); do
+ready_start=$(date +%s)
+while :; do
   curl -sf -m 2 "http://$HOST:$PORT/health" >/dev/null 2>&1 && break
   kill -0 "$server_pid" 2>/dev/null || { echo "server died:"; tail -20 /tmp/lse-smoke-server.log; exit 1; }
+  if [ $(( $(date +%s) - ready_start )) -ge "$ready_wait" ]; then
+    echo "server not ready after ${ready_wait} s:"; tail -20 /tmp/lse-smoke-server.log
+    break
+  fi
   sleep 2
 done
+echo "  server ready after $(( $(date +%s) - ready_start )) s"
 
 curl -sf -m 5 "http://$HOST:$PORT/health" >/dev/null && pass "GET /health" || fail "GET /health"
 

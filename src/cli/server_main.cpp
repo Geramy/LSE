@@ -76,7 +76,7 @@ void usage() {
       "      --kv-len N       allocate the KV cache for N tokens\n"
       "      --cache-dir PATH kernel cache directory (default ~/.lse/cache)\n"
       "      --pool LIST      device pool, for example hrx:0 or cpu:0\n"
-      "      --dialect NAME   source dialect: hip or loom\n"
+      "      --dialect NAME   source dialect: loom or hip (default: loom)\n"
       "      --model-info     print what the model is (JSON) and exit; reads\n"
       "                       config.json and tensor headers only\n"
       "      --estimate[=JSON]  print the device memory the other options would\n"
