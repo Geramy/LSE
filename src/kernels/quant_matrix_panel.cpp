@@ -22,6 +22,20 @@ constexpr std::uint32_t kRows = dispatch::kQ4MatrixPanelRows;
 constexpr std::uint32_t kGroupWords = dispatch::kQ4MatrixPanelGroupWords;
 constexpr std::uint32_t kInputRows = 8;
 
+// Which of a group's 64 values byte `byte` of panel word `word` carries.
+//
+// The 64-row prefill tile packs four consecutive values per word. The 16-row
+// decode tile instead puts the even values of each run of eight in its first
+// word and the odd values in its second, the order a 4-bit weight word's two
+// nibble planes come in: the decode contraction then widens a weight word
+// into its matrix operand with one shift and one mask per register. The two
+// operands meet in the same order, so the integer products are unchanged.
+constexpr std::size_t code_slot(std::size_t word, std::size_t byte,
+                                std::size_t tile_rows) {
+  if (tile_rows != kRows)
+    return word * 4 + byte;
+  return (word / 2) * 8 + word % 2 + 2 * byte;
+}
 Result<Shape> matrix_panel_shape(std::span<const Shape> in) {
   if (in.size() != 1 || !in[0].rank())
     return LSE_ERROR(kInvalidArgument,
@@ -116,7 +130,7 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
           std::uint32_t packed = 0;
           for (std::size_t byte = 0; byte < 4; ++byte) {
             const float rounded =
-                std::nearbyint(values[word * 4 + byte] * inverse);
+                std::nearbyint(values[code_slot(word, byte, tile_rows)] * inverse);
             const auto code =
                 std::isfinite(rounded) ? static_cast<std::int32_t>(rounded) : 0;
             packed |= (static_cast<std::uint32_t>(code) & 255u) << (8 * byte);
@@ -189,8 +203,9 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
       for (std::uint32_t word_index = 0; word_index < 4; ++word_index) {
         auto word = e.let(e.u32(0));
         for (std::uint32_t byte_index = 0; byte_index < 4; ++byte_index) {
-          const auto code = e.let(
-              math::rint(values[word_index * 4 + byte_index].read() * inverse));
+          const auto code = e.let(math::rint(
+              values[code_slot(word_index, byte_index, layout->rows)].read() *
+              inverse));
           const auto byte =
               e.let(kir::cast<kir::u32>(kir::cast<kir::i32>(code)) % 256u);
           word = e.let(word + byte * (1u << (8u * byte_index)));
@@ -341,17 +356,14 @@ std::string emit_matrix(const KernelShapes &s) {
       for (std::uint32_t t = 0; t < 4u; ++t) {
         const auto bf = e.local<kir::u32, kFrag>();
         const auto af = e.local<kir::u32, kFrag>();
+        // The panel pairs each weight word with its activations in nibble
+        // plane order (code_slot): plane f is the word's nibbles f, f+2, f+4
+        // and f+6, one to a byte.
+        const auto word = e.let(l.weight[static_cast<int>(t)]);
         for (int f = 0; f < kFrag; ++f) {
-          auto expanded = e.let(e.u32(0));
-          const auto word = e.let(l.weight[static_cast<int>(t)]);
-          for (std::uint32_t b = 0; b < 4u; ++b) {
-            const auto code =
-                e.let((word /
-                       (1u << (4u * (static_cast<std::uint32_t>(f) * 4u + b)))) %
-                      16u);
-            expanded = e.let(expanded + code * (1u << (8u * b)));
-          }
-          bf[f] = expanded;
+          bf[f] = e.let(math::bit_and(
+              word / (1u << (4u * static_cast<std::uint32_t>(f))),
+              e.u32(0x0f0f0f0fu)));
           af[f] = l.acts[t][f];
         }
         acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
