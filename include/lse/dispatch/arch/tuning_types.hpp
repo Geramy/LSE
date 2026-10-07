@@ -37,6 +37,9 @@ struct Tuning {
   std::span<const QuantPanelDevice> quant_panel_devices;
   std::span<const Q4SwiGluShape> q4_swiglu_shapes;
   std::span<const Q4MatrixPanelShape> q4_matrix_panel_shapes;
+  // Contractions that read the shared int8 activation panel on this part,
+  // beyond the kQ4PanelShapes every part with the panel takes.
+  std::span<const Q4PanelShape> q4_panel_shapes;
 
   // 8-bit contractions: the WMMA tiles of wmma_q8_linear and the packed
   // weights (q8_matrix.cpp), and separately the 8-row decode form on the

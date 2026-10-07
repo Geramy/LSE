@@ -25,6 +25,10 @@
 #if TARGET_OS_IOS
 #include <os/proc.h>
 #endif
+#elif defined(__linux__)
+#include <malloc.h>
+#include <fstream>
+#include <string>
 #endif
 
 namespace {
@@ -45,9 +49,15 @@ struct CompileMemory {
 };
 CompileMemory g_compile_memory;
 
+// What a block really holds, so a free takes back what its allocation added.
+// Without it a free subtracts nothing and the count is every byte the compile
+// ever asked for: on Linux that read as 8-15 GiB "peak" for a 2.4 MB source,
+// and as hundreds of GiB "held" across a cold start.
 std::uint64_t allocation_size(void* p) {
 #if defined(__APPLE__)
   return p != nullptr ? malloc_size(p) : 0;
+#elif defined(__linux__)
+  return p != nullptr ? malloc_usable_size(p) : 0;
 #else
   (void)p;
   return 0;
@@ -57,6 +67,14 @@ std::uint64_t allocation_size(void* p) {
 std::uint64_t available_memory() {
 #if defined(__APPLE__) && TARGET_OS_IOS
   return os_proc_available_memory();
+#elif defined(__linux__)
+  // MemAvailable: what the kernel could hand out without swapping.
+  std::ifstream meminfo("/proc/meminfo");
+  std::string line;
+  while (std::getline(meminfo, line))
+    if (line.rfind("MemAvailable:", 0) == 0)
+      return std::strtoull(line.c_str() + 13, nullptr, 10) * 1024;
+  return 0;
 #else
   return 0;
 #endif

@@ -68,6 +68,9 @@ struct Q4PanelShape {
   std::uint32_t load_chunks = 1;
   // Adjacent columns one wave owns; rows * columns is at most a wave.
   std::uint32_t columns = 1;
+  // Empty for the rows below, which hold on every part that has the panel;
+  // a part's own rows (arch::Tuning::q4_panel_shapes) name it.
+  std::string_view arch{};
 };
 inline constexpr std::array kQ4PanelShapes{
     Q4PanelShape{1, 17408, 5120, 0, 4},
