@@ -483,7 +483,23 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     }
   };
 
+  static const bool arow = std::getenv("LSE_EXP_Q4_AROW") != nullptr;
   const auto compute = [&]() {
+    if (arow) {
+      for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
+        std::vector<kir::Val<FragVec>> bf;
+        for (std::uint32_t fn = 0; fn < FN; ++fn)
+          bf.push_back(fragment(Bs, e.let(b_frag_base[fn] + kk * 16u)));
+        for (std::uint32_t fm = 0; fm < FM; ++fm) {
+          const auto af = fragment(As, e.let(a_frag_base[fm] + kk * 16u));
+          for (std::uint32_t fn = 0; fn < FN; ++fn) {
+            auto& c = acc[fm * FN + fn];
+            c = math::mma<Op>(af, bf[fn], c.value());
+          }
+        }
+      }
+      return;
+    }
     for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
       std::vector<kir::Val<FragVec>> af, bf;
       for (std::uint32_t fm = 0; fm < FM; ++fm)

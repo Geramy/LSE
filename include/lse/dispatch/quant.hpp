@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
 
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/arch/tuning.hpp"
@@ -67,7 +70,15 @@ struct QuantPlan {
   // down 2.01 -> 1.64 ms). They need sixteen accumulators per wave, which
   // the compiler takes only with its arrays growing per overflow, not per
   // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
-  if (m >= 768) return tune.q4_gemm_wide.bm ? tune.q4_gemm_wide : kQ4GemmWideTile;
+  if (m >= 768) {
+    if (!std::is_constant_evaluated())
+      if (const char* env = std::getenv("LSE_EXP_Q4_WIDE")) {
+        unsigned v[4] = {0, 0, 0, 0};
+        if (std::sscanf(env, "%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3]) == 4)
+          return {v[0], v[1], v[2], v[3]};
+      }
+    return tune.q4_gemm_wide.bm ? tune.q4_gemm_wide : kQ4GemmWideTile;
+  }
   const std::uint64_t rows96 = (m + 95) / 96 * 96, rows144 = (m + 143) / 144 * 144;
   return rows144 <= rows96 ? Q4GemmTile{144, 128, 3, 4} : Q4GemmTile{96, 128, 2, 4};
 }
