@@ -15,6 +15,15 @@
 #include <string>
 
 
+// ru_maxrss is bytes on macOS and KiB on Linux.
+double maxrss_mib(const rusage& ru) {
+#if defined(__APPLE__)
+  return double(ru.ru_maxrss) / 1048576.0;
+#else
+  return double(ru.ru_maxrss) / 1024.0;
+#endif
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr, "usage: measure_loomc_compile FILE.source [ARCH]\n");
@@ -28,7 +37,7 @@ int main(int argc, char** argv) {
   lse::backend::LoomcCompiler compiler;
   rusage ru{};
   getrusage(RUSAGE_SELF, &ru);
-  const double before = double(ru.ru_maxrss) / 1048576.0;
+  const double before = maxrss_mib(ru);
   // The compiler logs its own peak and largest allocation (loomc_compiler.cpp).
   setenv("LSE_TRACE_COMPILE_MEMORY", "1", 1);
   const auto t0 = std::chrono::steady_clock::now();
@@ -37,6 +46,6 @@ int main(int argc, char** argv) {
   getrusage(RUSAGE_SELF, &ru);
   std::printf("%s: %zu bytes of Loom, %s in %.2f s; peak RSS %.1f MiB (%.1f before)\n",
               argv[1], source.size(), compiled.ok() ? "compiled" : compiled.status().to_string().c_str(),
-              std::chrono::duration<double>(t1 - t0).count(), double(ru.ru_maxrss) / 1048576.0, before);
+              std::chrono::duration<double>(t1 - t0).count(), maxrss_mib(ru), before);
   return compiled.ok() ? 0 : 1;
 }
