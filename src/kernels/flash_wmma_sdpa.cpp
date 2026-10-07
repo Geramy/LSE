@@ -1,4 +1,5 @@
 // Typed paged KV; FP32 matrix accumulators and online softmax state.
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <string_view>
@@ -74,17 +75,55 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
     if constexpr(MeanCorrection)
       if(s.iattrs[0]!=1 || s.inputs[0].dim(3)!=256 || s.output.dim(3)!=256 ||
          !std::isfinite(s.attrs[2]) || s.attrs[2]<0 || s.attrs[2]>1) return {};
+    // The device's matrix generation picks the row, and with it the fragment
+    // layout every index below follows (see lse/math/matrix_rdna*.hpp).
+    const auto target = matrix_target(*s.device);
+    if (!target) return {};
     return with_kv_storage(s.input_dtypes[1], s.attrs[1],
-                           [&]<kv::CacheDType Storage>() { return emit_storage<Storage>(s); });
+        [&]<kv::CacheDType Storage>() {
+          return with_matrix_target<std::string>(
+              *target, [&]<math::MatrixTarget G>() -> std::string {
+                constexpr auto operand = Storage == kv::CacheDType::kF16
+                                             ? math::MatrixElem::kF16
+                                             : math::MatrixElem::kBF16;
+                if constexpr (!math::has_matrix_core_row(
+                                  G, math::MatrixElem::kF32, operand, 16, 16, 16)) {
+                  return {};
+                } else if constexpr (math::matrix_core_row(
+                                         G, math::MatrixElem::kF32, operand, 16,
+                                         16, 16).wave != 32) {
+                  return {};
+                } else {
+                  return emit_storage<Storage, G>(s);
+                }
+              });
+        });
   }
 
-  template <kv::CacheDType Storage>
+  // One body for every wave32 WMMA generation. What differs between them is
+  // the row's fragment layout: RDNA4 splits each 16-wide K step across the
+  // half-waves (8 operand values per lane, the upper half-wave reading K 8..15)
+  // and gives each half-wave a block of 8 accumulator rows; RDNA3/3.5 gives
+  // every lane the whole K step (16 values, the half-waves repeating the same
+  // rows) and interleaves the half-waves' accumulator rows. kGeo carries that,
+  // and the few places that index a lane's slice branch on it at compile time.
+  template <kv::CacheDType Storage, math::MatrixTarget G>
   std::string emit_storage(const KernelShapes& s) const {
     constexpr auto operand = Storage == kv::CacheDType::kF16
                                  ? math::MatrixElem::kF16 : math::MatrixElem::kBF16;
-    using Mma = math::op::Mma<math::MatrixTarget::kRdna4, math::MatrixElem::kF32,
-                              operand, 16, 16, 16>;
+    using Mma = math::op::Mma<G, math::MatrixElem::kF32, operand, 16, 16, 16>;
     using Narrow = math::matrix_scalar_t<Mma::kRow.a_elem>;
+    constexpr TileGeometry kGeo = geometry_of(Mma::kRow);
+    // Operand values per lane per instruction, and accumulator slots.
+    constexpr std::uint32_t kFrag = kGeo.lane_k;
+    constexpr int kSlots = Mma::kRow.c_len;
+    static_assert(Mma::kRow.k == 16 && Mma::kRow.n == 16 && kSlots == 8 &&
+                  static_cast<std::uint32_t>(Mma::kRow.a_len) == kFrag &&
+                  (kFrag == 8 || kFrag == 16) && Mma::kRow.chained == 1,
+                  "the flash tile is written for 16x16x16 wave32 rows with "
+                  "eight accumulator slots");
+    static_assert(kGeo.split_k == (kFrag == 8),
+                  "a split-K row holds half the step, a contiguous one all of it");
     const Dims d = dispatch::flash_dimensions(dense_request(s));
     const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
     const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
@@ -182,10 +221,18 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
     const auto lane = e.let(lid % 32u);
     const auto lane_lo = e.let(lane % 16u);
     const auto lane_hi = e.let(lane / 16u);
-    std::vector<decltype(e.local<kir::f32, 8>())> o;
+    // The output row accumulator slot f of this lane holds: block layout
+    // f + 8 * half-wave, pair layout 2f + half-wave.
+    const auto acc_row = [&](const auto& f) {
+      if constexpr (kGeo.slot_step == 1u)
+        return e.let(f + lane_hi * kGeo.half_rows);
+      else
+        return e.let(f * kGeo.slot_step + lane_hi * kGeo.half_rows);
+    };
+    std::vector<decltype(e.local<kir::f32, kSlots>())> o;
     o.reserve(value_tiles);
     for (std::uint32_t tile = 0; tile < value_tiles; ++tile)
-      o.push_back(e.local<kir::f32, 8>());
+      o.push_back(e.local<kir::f32, kSlots>());
     for (auto& fragment : o)
       for (auto f : e.unroll(8u)) fragment[f] = e.f32(0.0f);
     const auto last_query = e.let(select(q0 + (QTile - 1u) < d.tq,
@@ -253,6 +300,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
             const auto safe_key = e.let(select(key < row_len, key, wbase));
             const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
             const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+            if constexpr (kGeo.split_k) {
             const auto kbase = e.let(vector * d.dh + lane_hi * 8u);
             std::vector<kir::Pack<KvElement<Storage>>> keys;
             for (std::uint32_t depth = 0; depth < padded_depth; depth += 16u)
@@ -264,12 +312,50 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
                                    kir::Val<Frag>(&k.types(), &k.ir(), keys[step].id()),
                                    acc.value());
             }
+            } else {
+            // Every lane takes all sixteen depths of its key and query rows,
+            // two 16-byte moves each; the half-waves read the same rows. The
+            // key fragment is twice RDNA4's, so the loads issue a batch of
+            // steps at a time: eight steps hold as many key registers in
+            // flight as RDNA4's whole 256-deep row does.
+            if constexpr (kWideKv) {
+            constexpr std::uint32_t kStepsPerBatch = 8;
+            const auto kbase = e.let(vector * d.dh);
+            const std::uint32_t steps = padded_depth / 16u;
+            for (std::uint32_t first = 0; first < steps; first += kStepsPerBatch) {
+              const std::uint32_t last = std::min(steps, first + kStepsPerBatch);
+              std::vector<kir::Pack<KvElement<Storage>>> keys;
+              for (std::uint32_t step = first; step < last; ++step) {
+                keys.push_back(e.load(a.k, e.let(kbase + step * 16u), 16u));
+                keys.push_back(e.load(a.k, e.let(kbase + (step * 16u + 8u)), 16u));
+              }
+              for (std::uint32_t step = first; step < last; ++step) {
+                const auto qbase = e.let(lane_lo * padded_depth + step * 16u);
+                const auto qlo = qs.load(qbase, 16u);
+                const auto qhi = qs.load(e.let(qbase + 8u), 16u);
+                auto qa = e.local<Narrow, 16>();
+                auto kb = e.local<Narrow, 16>();
+                const std::size_t at = 2u * (step - first);
+                for (int j = 0; j < 8; ++j) {
+                  qa[j] = qlo[j];
+                  qa[8 + j] = qhi[j];
+                  kb[j] = keys[at][j];
+                  kb[8 + j] = keys[at + 1u][j];
+                }
+                acc = math::mma<Mma>(qa.value(), kb.value(), acc.value());
+              }
+            }
+            }
+            }
           } else {
           for (auto depth : e.range(0u, padded_depth, 16u)) {
-            auto af = e.local<Narrow, 8>();
-            auto bf = e.local<Narrow, 8>();
-            const auto kk = e.let(depth + lane_hi * 8u);
-            for (auto f : e.unroll(8u)) {
+            auto af = e.local<Narrow, static_cast<int>(kFrag)>();
+            auto bf = e.local<Narrow, static_cast<int>(kFrag)>();
+            const auto kk = [&] {
+              if constexpr (kGeo.split_k) return e.let(depth + lane_hi * 8u);
+              else return e.let(depth + 0u);
+            }();
+            for (auto f : e.unroll(kFrag)) {
               af[f] = qs[e.let(lane_lo * padded_depth + kk + f)].read();
               bf[f] = math::narrow<Narrow>(e.f32(0.0f));
             }
@@ -281,12 +367,16 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
                 if (d.dh % 16u == 0) {
                   const auto packed = e.load(a.k, base, 16u);
                   for (auto f : e.unroll(8u)) bf[f] = packed[f];
+                  if constexpr (kFrag == 16u) {
+                    const auto upper = e.load(a.k, e.let(base + 8u), 16u);
+                    for (int f = 0; f < 8; ++f) bf[8 + f] = upper[f];
+                  }
                 } else {
-                  for (auto f : e.unroll(8u))
+                  for (auto f : e.unroll(kFrag))
                     if (auto tail = e.when(kk + f < d.dh)) bf[f] = a.k[e.let(base + f)];
                 }
               } else {
-                for (auto f : e.unroll(8u)) {
+                for (auto f : e.unroll(kFrag)) {
                   auto load_key = [&] {
                     bf[f] = math::narrow<Narrow>(kv_load_vector<Storage>(e, a.k, vector, e.let(kk + f), d.dh));
                   };
@@ -299,7 +389,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
           }
           }
           for (auto f : e.unroll(8u))
-            write_score(e.let(f + lane_hi * 8u), key, e.let(acc[f].read() * d.scale));
+            write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
         }
         e.barrier();
 
@@ -370,7 +460,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
         if (stage_values && vsub != 0) {
           for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
             for (auto f : e.unroll(8u)) {
-              const auto row = e.let(f + lane_hi * 8u);
+              const auto row = acc_row(f);
               o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
             }
           }
@@ -399,17 +489,31 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
                 k.store_pack<Narrow>(vs.id(), slots[c], rows[c], 16u);
             e.barrier();
             for (std::uint32_t tile = 0; tile < vsub; tile += 16u) {
-              const auto key_half = e.let(lane_hi * 8u);
-              auto af = e.local<Narrow, 8>();
-              for (auto f : e.unroll(8u))
-                af[f] = math::narrow<Narrow>(
-                    sc[e.let(lane_lo * kKWin + sub + tile + key_half + f)].read());
+              // This lane's keys of the 16-key step: its half on a split
+              // layout, all sixteen on a contiguous one.
+              const auto key_half = [&] {
+                if constexpr (kGeo.split_k) return e.let(lane_hi * 8u);
+                else return e.u32(0);
+              }();
+              auto af = e.local<Narrow, static_cast<int>(kFrag)>();
+              for (auto f : e.unroll(kFrag)) {
+                if constexpr (kGeo.split_k)
+                  af[f] = math::narrow<Narrow>(
+                      sc[e.let(lane_lo * kKWin + sub + tile + key_half + f)].read());
+                else
+                  af[f] = math::narrow<Narrow>(
+                      sc[e.let(lane_lo * kKWin + sub + tile + f)].read());
+              }
               for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
                 const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
                 const auto safe_dim = e.let(select(dimension < d.dv, dimension, e.u32(d.dv - 1u)));
-                auto bf = e.local<Narrow, 8>();
-                for (auto f : e.unroll(8u))
-                  bf[f] = vs[e.let((tile + key_half + f) * vrow + safe_dim)].read();
+                auto bf = e.local<Narrow, static_cast<int>(kFrag)>();
+                for (auto f : e.unroll(kFrag)) {
+                  if constexpr (kGeo.split_k)
+                    bf[f] = vs[e.let((tile + key_half + f) * vrow + safe_dim)].read();
+                  else
+                    bf[f] = vs[e.let((tile + f) * vrow + safe_dim)].read();
+                }
                 o[column_tile] = math::mma<Mma>(af.value(), bf.value(), o[column_tile].value());
               }
             }
@@ -420,15 +524,21 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
         for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
           const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
           for (auto f : e.unroll(8u)) {
-            const auto row = e.let(f + lane_hi * 8u);
+            const auto row = acc_row(f);
             o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
           }
           for (auto tile : e.range(0u, kKWin, 16u)) {
-            auto af = e.local<Narrow, 8>();
-            auto bf = e.local<Narrow, 8>();
-            const auto key_half = e.let(lane_hi * 8u);
-            for (auto f : e.unroll(8u)) {
-              const auto key_slot = e.let(tile + key_half + f);
+            auto af = e.local<Narrow, static_cast<int>(kFrag)>();
+            auto bf = e.local<Narrow, static_cast<int>(kFrag)>();
+            const auto key_half = [&] {
+              if constexpr (kGeo.split_k) return e.let(lane_hi * 8u);
+              else return e.u32(0);
+            }();
+            for (auto f : e.unroll(kFrag)) {
+              const auto key_slot = [&] {
+                if constexpr (kGeo.split_k) return e.let(tile + key_half + f);
+                else return e.let(tile + f);
+              }();
               const auto key = e.let(wbase + key_slot);
               af[f] = math::narrow<Narrow>(sc[e.let(lane_lo * kKWin + key_slot)].read());
               bf[f] = math::narrow<Narrow>(e.f32(0.0f));
@@ -494,7 +604,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
               const auto dimension=e.let((wave+column_tile*8u)*16u+lane_lo);
               const auto value=e.let(a.pooled[pool+256u+dimension]);
               for(auto f:e.unroll(8u)) {
-                const auto row=e.let(f+lane_hi*8u);
+                const auto row=acc_row(f);
                 o[column_tile][f]=math::fma(sc[row].read(),value,
                     o[column_tile][f].read()*arow[row].read());
               }
@@ -508,7 +618,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
     for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
       const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
       for (auto f : e.unroll(8u)) {
-        const auto row = e.let(f + lane_hi * 8u);
+        const auto row = acc_row(f);
         const auto qrow = e.let(q0 + row);
         const auto den = e.let(drow[row].read());
         const auto inv = e.let(select(den == 0.0f, e.f32(1.0f), den));

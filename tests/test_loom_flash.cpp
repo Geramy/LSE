@@ -273,6 +273,49 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()&&restored.ok()) LSE_EXPECT(restored->source==emitted->source);
 }
 
+// gfx1151 (RDNA3.5) runs the same flash tile with its own matrix rows: the
+// gfx11 WMMA takes the whole 16-wide K step in every lane, so the fragments
+// the tile emits are 16 wide where gfx1201's are 8, and the accumulators stay
+// 8 f32 on both.
+LSE_TEST(flash_wmma_takes_each_generations_fragment_width) {
+  using namespace lse;
+  using namespace lse::graph;
+  auto leaf=[](Shape shape,DType dtype=DType::kF32) {
+    auto n=std::make_shared<Node>(); n->shape=shape; n->dtype=dtype; n->materialized=true;
+    return Array(n);
+  };
+  for (const char* arch : {"gfx1201", "gfx1151"}) {
+    backend::DeviceInfo device; backend::AmdDeviceInfo amd;
+    device.arch=arch; backend::apply_arch_defaults(device,amd);
+    device.extension_id=backend::AmdDeviceInfo::kExtensionId; device.extension=&amd;
+    for (const auto storage : {kv::CacheDType::kBF16, kv::CacheDType::kF16}) {
+      const DType kv = storage == kv::CacheDType::kF16 ? DType::kF16 : DType::kBF16;
+      auto output=sdpa_paged(leaf({1,24,512,256}),leaf({64,4,16,256},kv),
+          leaf({64,4,16,256},kv),0.0625f,MaskKind::kCausal,0,
+          leaf({kv::step_meta_elems(1)}),leaf({1,32}),16,&device,storage);
+      const NodePtr roots[]{output.node()};
+      const auto groups=Partitioner::partition(roots);
+      LSE_EXPECT_EQ(groups.size(),1u);
+      if(groups.size()!=1) continue;
+      auto emitted=backend::LoomEmitter{}.emit(groups[0],device);
+      LSE_EXPECT(emitted.ok());
+      if(!emitted.ok()) continue;
+      const bool gfx11 = std::string_view(arch) == "gfx1151";
+      const std::string elem = storage == kv::CacheDType::kF16 ? "f16" : "bf16";
+      const std::string wide = "vector<16x" + elem + ">", narrow = "vector<8x" + elem + ">";
+      LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
+      LSE_EXPECT((emitted->source.find("vector.fragment<lhs> ") != std::string::npos));
+      // The fragment the matrix instruction takes, by generation.
+      const auto at = emitted->source.find("vector.fragment<lhs>");
+      const auto line = emitted->source.substr(at, emitted->source.find('\n', at) - at);
+      LSE_EXPECT(line.find(gfx11 ? wide : narrow) != std::string::npos);
+      LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
+      LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
+      LSE_EXPECT_EQ(emitted->lds_bytes,41664u);
+    }
+  }
+}
+
 LSE_TEST(flash_wmma_emits_typed_operands_for_packed_and_unequal_widths) {
   using namespace lse;
   using namespace lse::graph;

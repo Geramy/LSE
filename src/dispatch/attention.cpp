@@ -149,7 +149,10 @@ bool flash_wmma_supported(const KernelShapes& s) {
     if (row.target == *target && row.wave == s.device->wavefront_size &&
         row.acc == math::MatrixElem::kF32 && row.operand == operand &&
         row.m == 16 && row.n == 16 && row.k_step == 16 && row.chained == 1 &&
-        row.a_len == 8 && row.b_len == 8 && row.c_len == 8 && row.emittable() &&
+        // RDNA4's split-K fragment (8 values per lane) or RDNA3/3.5's whole-K
+        // one (16); eight accumulator slots on both.
+        row.a_len == kernels::geometry_of(row).lane_k && row.b_len == row.a_len &&
+        (row.a_len == 8 || row.a_len == 16) && row.c_len == 8 && row.emittable() &&
         math::has_cap(caps, row.cap) && !s.intrinsics->find(row.key).empty()) return true;
   return false;
 }

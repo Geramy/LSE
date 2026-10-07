@@ -9,6 +9,9 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/graph/ops.hpp"
+#include "lse/kv/block.hpp"
+#include "lse/kv/cache_dtype.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/dispatch/quant.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -194,6 +197,64 @@ bool compile_q4_gemm(backend::DeviceInfo &info, backend::LoomcCompiler &compiler
   return true;
 }
 
+// The flash WMMA prefill attention, as the graph builds it for this device:
+// a Qwen3.5 head geometry (24 query heads over 4 KV heads, 256 wide), a
+// causal mask, `rows` query rows against a 4096-slot paged cache.
+bool compile_flash(backend::DeviceInfo &info, backend::LoomcCompiler &compiler,
+                   const std::string &path, std::int64_t rows,
+                   kv::CacheDType storage) {
+  auto leaf = [](Shape shape, DType type) {
+    auto node = std::make_shared<graph::Node>();
+    node->shape = shape;
+    node->dtype = type;
+    node->materialized = true;
+    return graph::Array(node);
+  };
+  constexpr std::int64_t kSlots = 4096, kBlock = 16;
+  const DType kv = storage == kv::CacheDType::kF16 ? DType::kF16 : DType::kBF16;
+  auto q = leaf(Shape{1, 24, rows, 256}, DType::kF32);
+  auto k = leaf(Shape{kSlots / kBlock, 4, kBlock, 256}, kv);
+  auto v = leaf(Shape{kSlots / kBlock, 4, kBlock, 256}, kv);
+  auto meta = leaf(Shape{kv::step_meta_elems(1)}, DType::kF32);
+  auto table = leaf(Shape{1, kSlots / kBlock}, DType::kF32);
+  auto out = graph::sdpa_paged(q, k, v, 0.0625f, graph::MaskKind::kCausal, 0,
+                               meta, table, static_cast<int>(kBlock), &info,
+                               storage);
+  const graph::NodePtr roots[] = {out.node()};
+  auto groups = graph::Partitioner::partition(roots);
+  const std::string label = std::string("flash_") +
+                            (kv == DType::kF16 ? "f16" : "bf16") + "_rows" +
+                            std::to_string(rows);
+  if (groups.size() != 1) return false;
+  backend::LoomEmitter emitter;
+  auto emitted = emitter.emit(groups[0], info);
+  if (!emitted.ok()) {
+    std::fprintf(stderr, "%s %s emit: %s\n", info.arch.c_str(), label.c_str(),
+                 emitted.status().to_string().c_str());
+    return false;
+  }
+  // sdpa_paged specializes when it is emitted; the flash WMMA form is the
+  // only one with matrix instructions.
+  if (emitted->source.find("vector.mma") == std::string::npos) {
+    std::fprintf(stderr, "%s %s: the flash WMMA kernel was not selected\n",
+                 info.arch.c_str(), label.c_str());
+    return false;
+  }
+  std::ofstream(path + "/" + label + ".loom") << emitted->source;
+  auto obj = compiler.compile(emitted->source, info.arch);
+  if (!obj.ok()) {
+    std::fprintf(stderr, "%s %s compile: %s\n", info.arch.c_str(),
+                 label.c_str(), obj.status().to_string().c_str());
+    return false;
+  }
+  std::ofstream file(path + "/" + label + ".hsaco", std::ios::binary);
+  file.write(reinterpret_cast<const char *>(obj->code.data()),
+             obj->code.size());
+  std::printf("PASS flash WMMA attention %s %s bytes=%zu\n", info.arch.c_str(),
+              label.c_str(), obj->code.size());
+  return true;
+}
+
 // Every emittable single-instruction row of one generation, by the operand
 // format it takes. A row the table does not hold is skipped at compile time;
 // a row it holds but has not measured is skipped too, since it never emits.
@@ -252,5 +313,10 @@ int main(int argc, char **argv) {
       for (const auto [n, k] : {std::pair<std::int64_t, std::int64_t>{17408, 5120},
                                 {5120, 17408}})
         ok = compile_q4_gemm(info, compiler, argv[1], m, n, k) && ok;
+  // The prefill attention, where the part has a rule for it.
+  if (!dispatch::arch::tuning(info.arch).flash_wmma.empty())
+    for (const auto storage : {kv::CacheDType::kBF16, kv::CacheDType::kF16})
+      for (const std::int64_t rows : {16, 512})
+        ok = compile_flash(info, compiler, argv[1], rows, storage) && ok;
   return ok ? 0 : 1;
 }
