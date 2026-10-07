@@ -57,7 +57,7 @@ struct QuantPlan {
 // generation whose operand fragments are wider than RDNA4's spends its
 // registers differently, so the tile is measured per part.
 [[nodiscard]] constexpr Q4GemmTile q4_gemm_tile(
-    std::uint64_t m, const arch::Tuning& tune = arch::generic::kTuning) noexcept {
+    std::uint64_t m, const arch::Tuning& tune = arch::generic::kTuning, std::uint64_t exp_n = 0) noexcept {
   if (m <= 32) return {32, 128, 1, 8};
   if (m <= 64) return {64, 128, 2, 4};
   if (m <= 192) {
@@ -72,7 +72,8 @@ struct QuantPlan {
   // append (patches/hrx/loom-grow-arrays-only-when-full.patch).
   if (m >= 768) {
     if (!std::is_constant_evaluated())
-      if (const char* env = std::getenv("LSE_EXP_Q4_WIDE")) {
+      if (const char* env = std::getenv("LSE_EXP_Q4_WIDE"); env &&
+          exp_n >= (std::getenv("LSE_EXP_Q4_WIDE_MIN_N") ? std::strtoull(std::getenv("LSE_EXP_Q4_WIDE_MIN_N"), nullptr, 10) : 0)) {
         unsigned v[4] = {0, 0, 0, 0};
         if (std::sscanf(env, "%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3]) == 4)
           return {v[0], v[1], v[2], v[3]};
@@ -100,7 +101,7 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
     std::uint32_t compute_units,
     const arch::Tuning& tune = arch::generic::kTuning) noexcept {
   if (compute_units == 0 || k % kQ4GemmStepK != 0) return 1;
-  const auto t = q4_gemm_tile(m, tune);
+  const auto t = q4_gemm_tile(m, tune, n);
   const std::uint64_t tiles = ((m + t.bm - 1) / t.bm) * ((n + t.bn - 1) / t.bn);
   const std::uint64_t steps = k / kQ4GemmStepK;
   const std::uint64_t fill = (q4_gemm_wave48(t) ? 3ull : 2ull) * compute_units;

@@ -237,7 +237,7 @@ std::uint32_t burst_steps(const Dims& d, const struct Tile& t);
 Tile tile_for(const KernelShapes& s, const Dims& d) {
   const auto t = dispatch::q4_gemm_tile(
       d.m, dispatch::arch::tuning(s.device ? std::string_view(s.device->arch)
-                                           : std::string_view{}));
+                                           : std::string_view{}), d.n);
   return {t.bm, t.bn, t.wm, t.wn};
 }
 
