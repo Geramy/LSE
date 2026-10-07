@@ -1,0 +1,823 @@
+From c6ef968eda7cf14e18eab063d86ba1871900db08 Mon Sep 17 00:00:00 2001
+From: geramyloveless <gloveless@jqluv.com>
+Date: Tue, 6 Oct 2026 19:09:05 -0700
+Subject: [PATCH] [HAL/AMDGPU] Bracket a submission's BAR stores on the macOS
+ runtime
+
+On the mac_linuxgpu HSA runtime a CPU store to a GPU that stopped
+answering (powered down, reset, or gone from the Thunderbolt link) can
+panic the Mac. With kernel arguments in CPU-visible VRAM a submission
+stores into the BARs three ways: the kernarg copy, the HDP flush store
+and its read back, and the doorbell. The runtime offers the HDP flush
+registers and CPU access to the device coarse pool only to a process
+that brackets those stores under its gate.
+
+With the macOS adapter, libhsa looks up the runtime's optional
+mac_hsa_bar_writes_enable, mac_hsa_bar_write_begin and
+mac_hsa_bar_write_end. A physical device opts in before querying
+HSA_AMD_AGENT_INFO_HDP_FLUSH and fails creation if the runtime refuses,
+rather than silently keeping kernel arguments in host memory. The
+writer travels with the kernarg ring's HDP publication, and the host
+queue's submission lock opens one bracket per submission: every kernarg
+write, HDP publication and doorbell already happens under that lock.
+The ring's first-touch store is bracketed too. Profile event records,
+which the CPU writes outside a submission, stay in host memory.
+
+Apple silicon maps a BAR as device memory, where every access must be
+aligned to its size. Kernel-argument copies and fills go through
+iree_amdgpu_memcpy/memset, which with the adapter store only aligned
+bytes and 64-bit words (memcpy/memset elsewhere, unchanged), and the
+driver is compiled with -mstrict-align so no store is merged into a
+wider unaligned one.
+
+When the device is gone for the process the bracket does not open; the
+runtime has already replaced every BAR mapping with host memory, so the
+submission's stores land there and its doorbell fails.
+
+Builds without IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER are unchanged.
+---
+ .../iree/hal/drivers/amdgpu/CMakeLists.txt    |  8 +++
+ .../hal/drivers/amdgpu/aql_block_processor.c  |  7 ++-
+ .../amdgpu/aql_block_processor_profile.c      |  7 ++-
+ .../amdgpu/device/support/aligned_store.h     | 57 +++++++++++++++++++
+ .../drivers/amdgpu/device/support/common.h    |  4 ++
+ .../src/iree/hal/drivers/amdgpu/host_queue.c  | 16 +++---
+ .../src/iree/hal/drivers/amdgpu/host_queue.h  | 38 +++++++++++++
+ .../iree/hal/drivers/amdgpu/host_queue_blit.c |  8 ++-
+ .../amdgpu/host_queue_command_buffer_replay.c |  4 +-
+ .../iree/hal/drivers/amdgpu/host_queue_file.c |  4 +-
+ .../hal/drivers/amdgpu/host_queue_pending.c   | 20 +++----
+ .../amdgpu/host_queue_profile_events.c        |  4 +-
+ .../hal/drivers/amdgpu/host_queue_staging.c   |  8 +--
+ .../iree/hal/drivers/amdgpu/kernarg_layout.c  | 17 ++++--
+ .../iree/hal/drivers/amdgpu/physical_device.c | 41 +++++++++++++
+ .../iree/hal/drivers/amdgpu/physical_device.h |  5 ++
+ .../hal/drivers/amdgpu/profile_counters.c     |  8 +--
+ .../hal/drivers/amdgpu/util/kernarg_ring.c    | 22 +++++++
+ .../hal/drivers/amdgpu/util/kernarg_ring.h    |  7 +++
+ .../src/iree/hal/drivers/amdgpu/util/libhsa.c | 16 ++++++
+ .../src/iree/hal/drivers/amdgpu/util/libhsa.h | 11 ++++
+ 21 files changed, 265 insertions(+), 47 deletions(-)
+ create mode 100644 runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h
+
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt b/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt
+index eaddd8e37..17e5191e1 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt
++++ b/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt
+@@ -7,6 +7,14 @@
+ # To disable autogeneration for this file entirely, delete this header.        #
+ ################################################################################
+ 
++# The macOS adapter may write kernel arguments straight into CPU-visible
++# VRAM, which Apple silicon maps as device memory: every access there must
++# be aligned to its size, so the compiler may not merge stores into wider
++# unaligned ones (device/support/common.h covers the copies).
++if(CMAKE_C_FLAGS MATCHES "IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER")
++  add_compile_options(-mstrict-align)
++endif()
++
+ iree_add_all_subdirs()
+ 
+ if(IREE_HAL_DRIVER_AMDGPU)
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c
+index dc5d9d873..fc6e2f106 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c
+@@ -488,7 +488,7 @@ static inline void iree_hal_amdgpu_aql_block_processor_copy_dispatch_template(
+   if (kernarg_length > 0) {
+     const uint8_t* kernarg_template =
+         (const uint8_t*)dispatch_command + dispatch_command->payload_reference;
+-    memcpy(kernarg_data, kernarg_template, kernarg_length);
++    iree_amdgpu_memcpy(kernarg_data, kernarg_template, kernarg_length);
+   }
+ }
+ 
+@@ -856,10 +856,11 @@ iree_hal_amdgpu_aql_block_processor_replay_update_packet_body(
+   }
+ 
+   uint8_t* staged_source_bytes = kernarg_data + source_payload_offset;
+-  memcpy(kernarg_data, &kernargs, sizeof(kernargs));
++  iree_amdgpu_memcpy(kernarg_data, &kernargs, sizeof(kernargs));
+   ((iree_hal_amdgpu_device_buffer_copy_kernargs_t*)kernarg_data)->source_ptr =
+       staged_source_bytes;
+-  memcpy(staged_source_bytes, source_bytes, update_command->length);
++  iree_amdgpu_memcpy(staged_source_bytes, source_bytes,
++                     update_command->length);
+   packet->dispatch.kernarg_address = kernarg_data;
+   packet->dispatch.completion_signal = completion_signal;
+   *out_setup = packet->dispatch.setup;
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c
+index 7c3c50e9b..f07690c70 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c
+@@ -507,7 +507,7 @@ iree_hal_amdgpu_aql_block_processor_profile_copy_dispatch_template(
+   if (kernarg_length > 0) {
+     const uint8_t* kernarg_template =
+         (const uint8_t*)dispatch_command + dispatch_command->payload_reference;
+-    memcpy(kernarg_data, kernarg_template, kernarg_length);
++    iree_amdgpu_memcpy(kernarg_data, kernarg_template, kernarg_length);
+   }
+ }
+ 
+@@ -847,10 +847,11 @@ iree_hal_amdgpu_aql_block_processor_profile_replay_update_packet_body(
+   }
+ 
+   uint8_t* staged_source_bytes = kernarg_data + source_payload_offset;
+-  memcpy(kernarg_data, &kernargs, sizeof(kernargs));
++  iree_amdgpu_memcpy(kernarg_data, &kernargs, sizeof(kernargs));
+   ((iree_hal_amdgpu_device_buffer_copy_kernargs_t*)kernarg_data)->source_ptr =
+       staged_source_bytes;
+-  memcpy(staged_source_bytes, source_bytes, update_command->length);
++  iree_amdgpu_memcpy(staged_source_bytes, source_bytes,
++                     update_command->length);
+   packet->dispatch.kernarg_address = kernarg_data;
+   packet->dispatch.completion_signal = completion_signal;
+   *out_setup = packet->dispatch.setup;
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h b/runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h
+new file mode 100644
+index 000000000..8e1479d46
+--- /dev/null
++++ b/runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The IREE Authors
++//
++// Licensed under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++
++// Host-side iree_amdgpu_memcpy/memset for the macOS adapter, where kernel
++// arguments may be written straight into CPU-visible VRAM. Apple silicon maps
++// a BAR as device memory, where every access must be aligned to its size;
++// libc's memcpy and memset use unaligned and overlapping wide accesses. These
++// store only naturally aligned bytes and 64-bit words (loads from |src|, host
++// memory, may be unaligned). Elsewhere they are memcpy and memset.
++
++#ifndef IREE_HAL_DRIVERS_AMDGPU_DEVICE_SUPPORT_ALIGNED_STORE_H_
++#define IREE_HAL_DRIVERS_AMDGPU_DEVICE_SUPPORT_ALIGNED_STORE_H_
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++
++static inline void iree_amdgpu_memcpy(void* dst, const void* src,
++                                      size_t length) {
++  volatile uint8_t* d = (volatile uint8_t*)dst;
++  const uint8_t* s = (const uint8_t*)src;
++  while (length && ((uintptr_t)d & 7)) {
++    *d++ = *s++;
++    --length;
++  }
++  for (; length >= 8; length -= 8, d += 8, s += 8) {
++    uint64_t word;
++    __builtin_memcpy(&word, s, sizeof(word));
++    *(volatile uint64_t*)d = word;
++  }
++  while (length--) *d++ = *s++;
++}
++
++static inline void iree_amdgpu_memset(void* dst, int value, size_t length) {
++  volatile uint8_t* d = (volatile uint8_t*)dst;
++  const uint64_t word = 0x0101010101010101ull * (uint8_t)value;
++  while (length && ((uintptr_t)d & 7)) {
++    *d++ = (uint8_t)value;
++    --length;
++  }
++  for (; length >= 8; length -= 8, d += 8) *(volatile uint64_t*)d = word;
++  while (length--) *d++ = (uint8_t)value;
++}
++
++#elif !defined(iree_amdgpu_memcpy)
++
++#define iree_amdgpu_memcpy memcpy
++#define iree_amdgpu_memset memset
++
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
++
++#endif  // IREE_HAL_DRIVERS_AMDGPU_DEVICE_SUPPORT_ALIGNED_STORE_H_
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h b/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h
+index e7b328ea7..d342c63aa 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h
+@@ -300,6 +300,10 @@ static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE void iree_amdgpu_memset(
+   }
+ }
+ 
++#elif defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++
++#include "iree/hal/drivers/amdgpu/device/support/aligned_store.h"
++
+ #else
+ 
+ #define iree_amdgpu_memcpy memcpy
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
+index 7538f1dd2..52a0be801 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
+@@ -46,7 +46,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
+   iree_hal_amdgpu_host_queue_kernel_submission_t submission;
+   bool ready = false;
+   uint64_t submission_epoch = 0;
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_status_t status = iree_hal_amdgpu_host_queue_try_begin_kernel_submission(
+       queue, &resolution, iree_hal_semaphore_list_empty(),
+       /*operation_resource_count=*/0, /*payload_packet_count=*/1,
+@@ -93,7 +93,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
+     iree_hal_amdgpu_aql_ring_doorbell(&queue->aql_ring,
+                                       submission.first_packet_id);
+   }
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+   if (iree_status_is_ok(status)) {
+     status = iree_hal_amdgpu_host_queue_wait_for_setup_epoch(queue,
+                                                              submission_epoch);
+@@ -993,9 +993,9 @@ void iree_hal_amdgpu_host_queue_deinitialize(
+   IREE_ASSERT_ARGUMENT(queue);
+   IREE_TRACE_ZONE_BEGIN(z0);
+ 
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   queue->is_shutting_down = true;
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ 
+   iree_hal_amdgpu_host_queue_wait_idle_before_teardown(queue);
+ 
+@@ -1186,7 +1186,7 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_begin(
+   out_submission->ready = true;
+   out_submission->wait_for_capacity = false;
+ 
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_hal_amdgpu_host_queue_resolve_waits(queue, wait_semaphore_list,
+                                            &out_submission->resolution);
+ }
+@@ -1203,7 +1203,7 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_defer_for_capacity(
+ static inline iree_status_t iree_hal_amdgpu_host_queue_op_submission_end(
+     iree_hal_amdgpu_host_queue_op_submission_t* submission,
+     iree_status_t status) {
+-  iree_slim_mutex_unlock(&submission->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(submission->queue);
+ 
+   if (iree_status_is_ok(status) && submission->deferred_op) {
+     status = iree_hal_amdgpu_pending_op_start(submission->deferred_op,
+@@ -1298,12 +1298,12 @@ static iree_status_t iree_hal_amdgpu_host_queue_validate_buffer_state(
+ static iree_status_t iree_hal_amdgpu_host_queue_signal_empty_barrier(
+     iree_hal_amdgpu_host_queue_t* queue,
+     const iree_hal_semaphore_list_t signal_semaphore_list) {
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_status_t status = iree_ok_status();
+   if (IREE_UNLIKELY(queue->is_shutting_down)) {
+     status = iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+   }
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ 
+   if (iree_status_is_ok(status)) {
+     // Signal outside submission_mutex: semaphore signaling dispatches satisfied
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue.h b/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
+index bd036be48..46705efee 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
+@@ -309,6 +309,11 @@ typedef struct iree_hal_amdgpu_host_queue_t {
+     // Serializes the post-drain continuation list.
+     iree_slim_mutex_t post_drain_mutex;
+   } locks;
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // Whether the holder of submission_mutex holds a BAR-write bracket
++  // (iree_hal_amdgpu_host_queue_lock_submission). Guarded by the mutex.
++  bool bar_write_bracket_held;
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+ 
+   // Post-drain continuation queue for work that cannot run while notification
+   // drain is still publishing or reclaiming ring state.
+@@ -699,6 +704,39 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
+     uint32_t upload_capacity, iree_allocator_t host_allocator,
+     iree_hal_amdgpu_host_queue_t* out_queue);
+ 
++// Acquires the submission lock. With kernel arguments in CPU-visible VRAM
++// on the mac_linuxgpu runtime, every host store into the BARs a submission
++// makes (the kernarg memcpy, the HDP flush store and read back, the
++// doorbell) happens while this lock is held, so the lock also opens the
++// runtime's BAR-write bracket: one bracket per submission. The bracket
++// waits while the driver holds the device for a power transition or a
++// reset. Once the device is gone for this process it opens no bracket; the
++// runtime has replaced every BAR mapping with host memory first, so the
++// submission's stores land there and its doorbell fails.
++static inline void iree_hal_amdgpu_host_queue_lock_submission(
++    iree_hal_amdgpu_host_queue_t* queue) {
++  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  void* writer = queue->kernarg_ring.publication.bar_writer;
++  queue->bar_write_bracket_held =
++      writer && queue->libhsa->mac_hsa_bar_write_begin(writer) ==
++                    HSA_STATUS_SUCCESS;
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
++}
++
++// Releases the submission lock and the bracket it opened.
++static inline void iree_hal_amdgpu_host_queue_unlock_submission(
++    iree_hal_amdgpu_host_queue_t* queue) {
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  if (queue->bar_write_bracket_held) {
++    queue->bar_write_bracket_held = false;
++    queue->libhsa->mac_hsa_bar_write_end(
++        queue->kernarg_ring.publication.bar_writer);
++  }
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
++  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++}
++
+ // Initializes queue-owned TSAN state.
+ //
+ // This is called after queue creation when logical TSAN is enabled. The queue
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c
+index d4aaff95a..593e0eb8a 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c
+@@ -652,7 +652,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_copy_with_action(
+       &profile_event_info, out_ready, &submission));
+   if (!*out_ready) return iree_ok_status();
+ 
+-  memcpy(submission.kernel.kernargs.blocks->data, &kernargs, sizeof(kernargs));
++  iree_amdgpu_memcpy(submission.kernel.kernargs.blocks->data, &kernargs,
++                     sizeof(kernargs));
+   submission.dispatch_setup =
+       iree_hal_amdgpu_host_queue_write_dispatch_packet_body(
+           &submission.dispatch_slot->dispatch, &dispatch_packet,
+@@ -844,11 +845,12 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_update(
+ 
+   uint8_t* staged_source_bytes =
+       (uint8_t*)submission.kernel.kernargs.blocks + source_payload_offset;
+-  memcpy(submission.kernel.kernargs.blocks->data, &kernargs, sizeof(kernargs));
++  iree_amdgpu_memcpy(submission.kernel.kernargs.blocks->data, &kernargs,
++                     sizeof(kernargs));
+   ((iree_hal_amdgpu_device_buffer_copy_kernargs_t*)
+        submission.kernel.kernargs.blocks->data)
+       ->source_ptr = staged_source_bytes;
+-  memcpy(staged_source_bytes, source_bytes, source_length);
++  iree_amdgpu_memcpy(staged_source_bytes, source_bytes, source_length);
+   submission.dispatch_setup =
+       iree_hal_amdgpu_host_queue_write_dispatch_packet_body(
+           &submission.dispatch_slot->dispatch, &dispatch_packet,
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c
+index dd87c0700..2c607c6fb 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c
+@@ -374,11 +374,11 @@ static iree_status_t iree_hal_amdgpu_command_buffer_replay_resume_under_lock(
+ static void iree_hal_amdgpu_command_buffer_replay_post_drain(void* user_data) {
+   iree_hal_amdgpu_command_buffer_replay_t* replay =
+       (iree_hal_amdgpu_command_buffer_replay_t*)user_data;
+-  iree_slim_mutex_lock(&replay->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(replay->queue);
+   iree_status_t status =
+       iree_hal_amdgpu_command_buffer_replay_resume_under_lock(
+           replay, iree_hal_amdgpu_command_buffer_replay_post_drain);
+-  iree_slim_mutex_unlock(&replay->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(replay->queue);
+   if (!iree_status_is_ok(status)) {
+     iree_hal_amdgpu_command_buffer_replay_fail_signals(replay, status);
+   }
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c
+index 915153c5a..9eb04d3e3 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c
+@@ -242,7 +242,7 @@ static iree_status_t iree_hal_amdgpu_file_action_submit_signal_barrier(
+   resolution.inline_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
+   resolution.barrier_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
+ 
+-  iree_slim_mutex_lock(&state->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(state->queue);
+   bool ready = false;
+   uint64_t submission_id = 0;
+   iree_hal_amdgpu_host_queue_profile_event_info_t profile_event_info = {
+@@ -273,7 +273,7 @@ static iree_status_t iree_hal_amdgpu_file_action_submit_signal_barrier(
+         state->queue, &state->signal_capacity_retry,
+         iree_hal_amdgpu_file_action_signal_capacity_post_drain, state);
+   }
+-  iree_slim_mutex_unlock(&state->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(state->queue);
+   return status;
+ }
+ 
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c
+index b50c44ddd..3881bcb18 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c
+@@ -957,7 +957,7 @@ iree_status_t iree_hal_amdgpu_pending_op_allocate(
+ // submission_mutex to emit AQL packets and commit signals.
+ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+   iree_hal_amdgpu_host_queue_t* queue = op->queue;
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+ 
+   iree_status_t status = iree_ok_status();
+   iree_hal_amdgpu_pending_op_payload_issue_t issue = {
+@@ -987,7 +987,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+     resolution.barrier_acquire_scope = IREE_HSA_FENCE_SCOPE_NONE;
+     status = iree_hal_amdgpu_pending_op_issue_payload(op, &resolution, &issue);
+     if (iree_status_is_ok(status) && issue.memory_wait_op) {
+-      iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++      iree_hal_amdgpu_host_queue_unlock_submission(queue);
+       iree_hal_amdgpu_pending_op_enqueue_alloca_memory_wait(
+           issue.memory_wait_op);
+       return;
+@@ -996,7 +996,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+ 
+   if (iree_status_is_ok(status) && !issue.ready) {
+     iree_hal_amdgpu_pending_op_enqueue_capacity_retry(op);
+-    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++    iree_hal_amdgpu_host_queue_unlock_submission(queue);
+     return;
+   }
+ 
+@@ -1017,7 +1017,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+   iree_notification_deinitialize(&op->callback_notification);
+   iree_arena_deinitialize(&op->arena);
+ 
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ }
+ 
+ // Fails a deferred operation. Propagates the error to all signal semaphores
+@@ -1037,9 +1037,9 @@ static void iree_hal_amdgpu_pending_op_fail(iree_hal_amdgpu_pending_op_t* op,
+   iree_hal_amdgpu_pending_op_release_retained(op);
+   // Release wait semaphores (separately retained by the clone).
+   iree_hal_semaphore_list_release(op->wait_semaphore_list);
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_hal_amdgpu_pending_op_unlink(op);
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+   iree_notification_deinitialize(&op->callback_notification);
+   iree_arena_deinitialize(&op->arena);
+ }
+@@ -1051,13 +1051,13 @@ static void iree_hal_amdgpu_pending_op_fail(iree_hal_amdgpu_pending_op_t* op,
+ void iree_hal_amdgpu_host_queue_cancel_pending(
+     iree_hal_amdgpu_host_queue_t* queue, iree_status_code_t status_code,
+     const char* status_message) {
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   queue->is_shutting_down = true;
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ 
+   for (;;) {
+     iree_hal_amdgpu_pending_op_t* op = NULL;
+-    iree_slim_mutex_lock(&queue->locks.submission_mutex);
++    iree_hal_amdgpu_host_queue_lock_submission(queue);
+     for (iree_hal_amdgpu_pending_op_t* candidate = queue->pending_head;
+          candidate != NULL; candidate = candidate->next) {
+       int32_t expected_state = IREE_HAL_AMDGPU_PENDING_OP_LIFECYCLE_PENDING;
+@@ -1071,7 +1071,7 @@ void iree_hal_amdgpu_host_queue_cancel_pending(
+       }
+     }
+     bool has_pending_ops = queue->pending_head != NULL;
+-    iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++    iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ 
+     if (op == NULL) {
+       if (!has_pending_ops) break;
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
+index 2b6dead38..5ef806063 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
+@@ -90,7 +90,7 @@ iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
+   iree_hal_amdgpu_wait_resolution_t resolution;
+   bool ready = false;
+   uint64_t submission_epoch = 0;
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_hal_amdgpu_host_queue_resolve_waits(
+       queue, iree_hal_semaphore_list_empty(), &resolution);
+   iree_status_t status = iree_hal_amdgpu_host_queue_submit_dispatch_packet(
+@@ -100,7 +100,7 @@ iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
+       IREE_HSA_FENCE_SCOPE_SYSTEM, /*profile_queue_event_info=*/NULL,
+       IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_NONE, &ready,
+       &submission_epoch);
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+   if (iree_status_is_ok(status) && IREE_UNLIKELY(!ready)) {
+     status = iree_make_status(
+         IREE_STATUS_RESOURCE_EXHAUSTED,
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c
+index ba2b3f882..f0167dfd7 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c
+@@ -658,7 +658,7 @@ static iree_status_t iree_hal_amdgpu_staging_transfer_submit_signal_barrier(
+   resolution.inline_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
+   resolution.barrier_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
+ 
+-  iree_slim_mutex_lock(&transfer->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(transfer->queue);
+   bool ready = false;
+   uint64_t submission_id = 0;
+   iree_hal_amdgpu_host_queue_profile_event_info_t profile_event_info = {
+@@ -690,7 +690,7 @@ static iree_status_t iree_hal_amdgpu_staging_transfer_submit_signal_barrier(
+         transfer->queue, &transfer->signal_capacity_retry,
+         iree_hal_amdgpu_staging_signal_capacity_post_drain, transfer);
+   }
+-  iree_slim_mutex_unlock(&transfer->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(transfer->queue);
+   return status;
+ }
+ 
+@@ -846,7 +846,7 @@ static iree_status_t iree_hal_amdgpu_staging_chunk_submit_copy(
+   }
+ 
+   iree_hal_resource_t* extra_resources[1] = {&transfer->resource};
+-  iree_slim_mutex_lock(&transfer->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(transfer->queue);
+   bool ready = false;
+   iree_status_t status = iree_hal_amdgpu_host_queue_submit_copy_with_action(
+       transfer->queue, &resolution, iree_hal_semaphore_list_empty(),
+@@ -864,7 +864,7 @@ static iree_status_t iree_hal_amdgpu_staging_chunk_submit_copy(
+         transfer->queue, &chunk->post_drain_action,
+         iree_hal_amdgpu_staging_copy_capacity_post_drain, chunk);
+   }
+-  iree_slim_mutex_unlock(&transfer->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(transfer->queue);
+   return status;
+ }
+ 
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c b/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c
+index 75f567dde..bd0376a49 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c
+@@ -6,6 +6,8 @@
+ 
+ #include "iree/hal/drivers/amdgpu/kernarg_layout.h"
+ 
++#include "iree/hal/drivers/amdgpu/device/support/aligned_store.h"
++
+ #include <string.h>
+ 
+ //===----------------------------------------------------------------------===//
+@@ -387,7 +389,7 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
+   if (iree_any_bit_set(
+           layout->flags,
+           IREE_HAL_AMDGPU_KERNARG_LAYOUT_FLAG_REQUIRES_ZERO_FILL)) {
+-    memset(target, 0, layout->kernarg_byte_length);
++    iree_amdgpu_memset(target, 0, layout->kernarg_byte_length);
+   }
+ 
+   const iree_hal_amdgpu_kernarg_binding_slot_t* binding_slots =
+@@ -395,11 +397,13 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
+   if (iree_any_bit_set(
+           layout->flags,
+           IREE_HAL_AMDGPU_KERNARG_LAYOUT_FLAG_PACKED_BINDING_PREFIX)) {
+-    memcpy(target, binding_ptrs, layout->binding_count * sizeof(uint64_t));
++    iree_amdgpu_memcpy(target, binding_ptrs,
++                       layout->binding_count * sizeof(uint64_t));
+   } else {
+     for (iree_host_size_t i = 0; i < layout->binding_count; ++i) {
+-      memcpy(target + binding_slots[i].target_qword_index * sizeof(uint64_t),
+-             &binding_ptrs[i], sizeof(uint64_t));
++      iree_amdgpu_memcpy(
++          target + binding_slots[i].target_qword_index * sizeof(uint64_t),
++          &binding_ptrs[i], sizeof(uint64_t));
+     }
+   }
+ 
+@@ -407,7 +411,8 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
+       iree_hal_amdgpu_kernarg_layout_constant_spans(layout);
+   for (iree_host_size_t i = 0; i < layout->constant_span_count; ++i) {
+     const iree_hal_amdgpu_kernarg_constant_span_t span = constant_spans[i];
+-    memcpy(target + span.target_byte_offset,
+-           constants.data + span.source_byte_offset, span.byte_length);
++    iree_amdgpu_memcpy(target + span.target_byte_offset,
++                       constants.data + span.source_byte_offset,
++                       span.byte_length);
+   }
+ }
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device.c b/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
+index 60007355d..8e0acf86b 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
+@@ -945,6 +945,26 @@ iree_status_t iree_hal_amdgpu_physical_device_initialize(
+     status = iree_hal_amdgpu_query_workgroup_cluster_capabilities(
+         libhsa, device_agent, &out_physical_device->workgroup_cluster);
+   }
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // The mac_linuxgpu runtime reports the HDP flush registers and CPU access
++  // to the device coarse pool only to a process that brackets its BAR
++  // stores. Opt in before querying them; a runtime that has the bracket but
++  // refuses it fails device creation instead of silently keeping kernel
++  // arguments in host memory.
++  if (iree_status_is_ok(status) && libhsa->mac_hsa_bar_writes_enable) {
++    const hsa_status_t hsa_status = libhsa->mac_hsa_bar_writes_enable(
++        device_agent, &out_physical_device->bar_writer);
++    if (hsa_status != HSA_STATUS_SUCCESS || !out_physical_device->bar_writer) {
++      status = iree_make_status(
++          IREE_STATUS_UNAVAILABLE,
++          "the HSA runtime refused BAR writes for GPU %" PRIhsz
++          " (HSA status 0x%x): kernel arguments in VRAM need mac_linuxgpu "
++          "build 265 or newer with a KFD compute session",
++          device_ordinal, (uint32_t)hsa_status);
++      out_physical_device->bar_writer = NULL;
++    }
++  }
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+   if (iree_status_is_ok(status)) {
+     out_physical_device->hdp_flush =
+         iree_hal_amdgpu_physical_device_query_hdp_flush_registers(libhsa,
+@@ -1028,6 +1048,21 @@ iree_status_t iree_hal_amdgpu_physical_device_initialize(
+             &system->topology,
+             &out_physical_device->cpu_visible_device_coarse_memory);
+   }
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // VRAM kernargs with HDP publication are bracketed; without the bracket
++  // (a runtime with BAR writes always has one) the path is not offered.
++  if (iree_status_is_ok(status) &&
++      iree_hal_amdgpu_cpu_visible_device_coarse_memory_is_available(
++          &out_physical_device->cpu_visible_device_coarse_memory)) {
++    if (out_physical_device->bar_writer) {
++      out_physical_device->cpu_visible_device_coarse_memory
++          .host_write_publication.bar_writer = out_physical_device->bar_writer;
++    } else {
++      memset(&out_physical_device->cpu_visible_device_coarse_memory, 0,
++             sizeof(out_physical_device->cpu_visible_device_coarse_memory));
++    }
++  }
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+   if (iree_status_is_ok(status)) {
+     status =
+         iree_hal_amdgpu_physical_device_initialize_memory_system_capabilities(
+@@ -1189,8 +1224,14 @@ iree_status_t iree_hal_amdgpu_physical_device_assign_frontier(
+   // without fine-grained memory can still profile. Otherwise fall back to
+   // shared host-fine memory, which remains CPU-writable and device-visible on
+   // platforms where fine device memory is not directly host-accessible.
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // Profile event records are written by the CPU outside a submission's
++  // BAR-write bracket: keep them in host memory.
++  if (false) {
++#else
+   if (iree_hal_amdgpu_cpu_visible_device_coarse_memory_is_available(
+           &physical_device->cpu_visible_device_coarse_memory)) {
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+     profiling_memory.event_memory_pool =
+         physical_device->cpu_visible_device_coarse_memory.memory_pool;
+     profiling_memory.event_access_agents =
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device.h b/runtime/src/iree/hal/drivers/amdgpu/physical_device.h
+index 8cdec46f1..9c1f61b33 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/physical_device.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device.h
+@@ -226,6 +226,11 @@ typedef struct iree_hal_amdgpu_physical_device_t {
+   uint64_t timestamp_frequency_hz;
+   // HDP flush register descriptor reported by HSA for this GPU agent.
+   hsa_amd_hdp_flush_t hdp_flush;
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // The HSA runtime's BAR-write bracket for this GPU agent, or NULL when the
++  // runtime has none (libhsa's mac_hsa_bar_writes_enable).
++  void* bar_writer;
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+   // Host memory pools for the CPU agent nearest to |device_agent|.
+   iree_hal_amdgpu_host_memory_pools_t host_memory_pools;
+   // Cold memory-system facts used to derive conservative topology flags.
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
+index 4b863b01f..2d2dd7428 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
+@@ -2233,7 +2233,7 @@ iree_status_t iree_hal_amdgpu_host_queue_start_profile_counter_ranges(
+   IREE_RETURN_IF_ERROR(
+       iree_hal_amdgpu_host_queue_profile_counter_range_start_packet_count(
+           queue, &packet_count));
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_status_t status = iree_ok_status();
+   if (IREE_UNLIKELY(queue->is_shutting_down)) {
+     status = iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+@@ -2248,7 +2248,7 @@ iree_status_t iree_hal_amdgpu_host_queue_start_profile_counter_ranges(
+                                       first_packet_id + packet_count - 1u);
+     queue->profiling.counters.ranges.is_active = true;
+   }
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+   return status;
+ }
+ 
+@@ -2691,7 +2691,7 @@ iree_status_t iree_hal_amdgpu_host_queue_flush_profile_counter_ranges(
+       &completion_signal));
+ 
+   uint32_t stopped_bank = 0;
+-  iree_slim_mutex_lock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(queue);
+   iree_status_t status = iree_ok_status();
+   if (IREE_UNLIKELY(queue->is_shutting_down)) {
+     status = iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+@@ -2718,7 +2718,7 @@ iree_status_t iree_hal_amdgpu_host_queue_flush_profile_counter_ranges(
+     iree_hal_amdgpu_aql_ring_doorbell(&queue->aql_ring,
+                                       first_packet_id + packet_count - 1u);
+   }
+-  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ 
+   if (iree_status_is_ok(status)) {
+     status = iree_hal_amdgpu_host_queue_wait_profile_counter_range(
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.c b/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.c
+index f8cfca898..715452ea7 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.c
+@@ -112,7 +112,29 @@ iree_status_t iree_hal_amdgpu_kernarg_ring_initialize(
+ 
+   // Fault in the host mapping on the initialization path instead of the first
+   // submitter that writes into the ring.
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // A ring in CPU-visible VRAM is written only inside a BAR-write bracket.
++  if (memory->publication.bar_writer) {
++    if (libhsa->mac_hsa_bar_write_begin(memory->publication.bar_writer) !=
++        HSA_STATUS_SUCCESS) {
++      status = iree_hsa_amd_memory_pool_free(IREE_LIBHSA(libhsa),
++                                             out_ring->base);
++      memset(out_ring, 0, sizeof(*out_ring));
++      IREE_RETURN_AND_END_ZONE_IF_ERROR(
++          z0, iree_status_join(
++                  iree_make_status(IREE_STATUS_UNAVAILABLE,
++                                   "the GPU stopped answering before its "
++                                   "kernarg ring was first written"),
++                  status));
++    }
++    out_ring->base[0].data[0] = 0;
++    libhsa->mac_hsa_bar_write_end(memory->publication.bar_writer);
++  } else {
++    out_ring->base[0].data[0] = 0;
++  }
++#else
+   out_ring->base[0].data[0] = 0;
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+ 
+   IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, (int64_t)capacity);
+   IREE_TRACE_ZONE_END(z0);
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.h b/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.h
+index f2a751649..724fbc764 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/kernarg_ring.h
+@@ -62,6 +62,13 @@ typedef struct iree_hal_amdgpu_kernarg_ring_publication_t {
+   // HDP memory-flush register used when |mode| is
+   // IREE_HAL_AMDGPU_KERNARG_RING_PUBLICATION_MODE_HDP_FLUSH.
+   volatile uint32_t* hdp_mem_flush_control;
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // The HSA runtime's BAR-write bracket for this GPU (libhsa's
++  // mac_hsa_bar_write_begin/end), set with HDP_FLUSH publication: every
++  // host store into the ring, the HDP flush and the doorbell happen inside
++  // one bracket per submission (host_queue.h's submission lock).
++  void* bar_writer;
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+ } iree_hal_amdgpu_kernarg_ring_publication_t;
+ 
+ // Memory backing policy for a queue-owned kernarg ring.
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
+index ab1d3837c..30c25d8ec 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
+@@ -245,6 +245,22 @@ static iree_status_t iree_hal_amdgpu_libhsa_load_symbols(
+   IREE_RETURN_IF_ERROR(iree_dynamic_library_lookup_symbol(                   \
+       library, #symbol, (void**)&out_libhsa->symbol));
+ #include "iree/hal/drivers/amdgpu/util/libhsa_tables.h"  // IWYU pragma: keep
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // Optional: present only in the mac_linuxgpu runtime.
++  iree_status_ignore(iree_dynamic_library_lookup_symbol(
++      library, "mac_hsa_bar_writes_enable",
++      (void**)&out_libhsa->mac_hsa_bar_writes_enable));
++  iree_status_ignore(iree_dynamic_library_lookup_symbol(
++      library, "mac_hsa_bar_write_begin",
++      (void**)&out_libhsa->mac_hsa_bar_write_begin));
++  iree_status_ignore(iree_dynamic_library_lookup_symbol(
++      library, "mac_hsa_bar_write_end",
++      (void**)&out_libhsa->mac_hsa_bar_write_end));
++  if (!out_libhsa->mac_hsa_bar_write_begin ||
++      !out_libhsa->mac_hsa_bar_write_end) {
++    out_libhsa->mac_hsa_bar_writes_enable = NULL;
++  }
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+   return iree_ok_status();
+ }
+ 
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h
+index a906f3574..5ff054fc1 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h
++++ b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h
+@@ -129,6 +129,17 @@ typedef struct iree_hal_amdgpu_libhsa_t {
+   // HSA_EXTENSION_AMD_LOADER extension table.
+   // Always required even when statically linking.
+   hsa_ven_amd_loader_1_03_pfn_t amd_loader;
++
++#if defined(IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER)
++  // Optional exports of the macOS mac_linuxgpu HSA runtime (NULL elsewhere).
++  // A CPU store to a GPU that stopped answering can panic the Mac, so a
++  // process that stores into the GPU's BARs on its submission path (kernel
++  // arguments in CPU-visible VRAM, the HDP flush register, the doorbell)
++  // opts in once per GPU agent and brackets each submission's stores.
++  hsa_status_t (*mac_hsa_bar_writes_enable)(hsa_agent_t agent, void** writer);
++  hsa_status_t (*mac_hsa_bar_write_begin)(void* writer);
++  void (*mac_hsa_bar_write_end)(void* writer);
++#endif  // IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER
+ } iree_hal_amdgpu_libhsa_t;
+ 
+ // Initializes |out_libhsa| in-place with dynamically loaded HSA symbols.
+-- 
+2.51.0
+
