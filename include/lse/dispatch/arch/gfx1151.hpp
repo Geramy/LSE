@@ -147,15 +147,19 @@ inline constexpr Q4GemmTile kQ4GemmWide{256, 128, 4, 4};
 // CUs, each walking all of K; the 8-bit draft's widest shapes stream poorly
 // at two groups a round. Warm per-call us on the 8060S at 8 rows
 // (test_q4_matrix_panel, rocprofv3 median of 10), untuned -> tuned:
-//   4-bit 5120 x 17408 (target down)   392 -> 340 (in-model, K/4)
 //   8-bit 17408 x 5120                1289 -> 469 (K/4)
 //   8-bit 5120 x 17408                 643 -> 574 (K/4, four groups)
 //   8-bit 5120 x 10240                 537 -> 457 (K/4, four groups)
 //   8-bit 5120 x 4096                  188 ->  89 (K/4, four groups)
 //   8-bit 1024 x 5120                   77 ->  33 (K/4)
 //   8-bit 1280 x 5120                   34 ->  27 (K/2, four groups)
+// Only the draft's 8-bit shapes: a split sums each tile's K slices in a
+// different order than the single-slice loop, which moves the target's
+// logits by noise that flips near-ties in greedy output (the target's
+// eight-row down projection measured 392 -> 340 us split, and DFlash2
+// greedy text then differed from 2048 tokens on). The draft's numbers only
+// steer which tokens are proposed.
 inline constexpr std::array kMatrixPanelTunes{
-    MatrixPanelTune{kArch, 4, 5120, 17408, 4, 0},
     MatrixPanelTune{kArch, 8, 17408, 5120, 4, 0},
     MatrixPanelTune{kArch, 8, 5120, 17408, 4, 4},
     MatrixPanelTune{kArch, 8, 5120, 10240, 4, 4},
