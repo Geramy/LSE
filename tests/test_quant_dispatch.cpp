@@ -392,6 +392,34 @@ LSE_TEST(quant_panel_adjacent_loads_use_measured_shapes_and_device_admission) {
   }
 }
 
+// gfx1151's verify passes take int8 activations, the shared panel (4 and 8
+// rows) and the row ladder (3 and 7) from its own header, as gfx1201's do from its; a part with no
+// such rows (gfx1100) keeps the one-row-at-a-time contraction.
+LSE_TEST(verify_pass_panel_is_qualified_per_part) {
+  for (const int m : {3, 4, 7, 8}) {
+    Fixture f(m, 17408, 5120, 4, true);
+    f.inputs[0] = Shape{1, m, 5120};
+    f.shapes.output = Shape{1, m, 17408};
+    f.device = {};
+    f.amd = {};
+    f.device.arch = "gfx1151";
+    f.device.compute_units = 40;
+    f.device.wavefront_size = 32;
+    f.device.max_threads_per_workgroup = 1024;
+    f.device.lds_bytes_per_workgroup = 65536;
+    backend::apply_arch_defaults(f.device, f.amd);
+    f.device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    f.device.extension = &f.amd;
+    const auto halo = f.plan();
+    LSE_EXPECT(halo.int8_activations);
+    LSE_EXPECT_EQ(halo.shared_activation_panel, m == 4 || m == 8);
+    LSE_EXPECT_EQ(halo.row_ladder_ceiling, m == 3 ? 4u : m == 7 ? 8u : 0u);
+    f.device.arch = "gfx1100";
+    const auto other = f.plan();
+    LSE_EXPECT(!other.int8_activations && !other.shared_activation_panel);
+  }
+}
+
 // Each part's dispatch rows come from its own header and only from there:
 // a device gets its part's rows followed by the generic ones, an unknown part
 // the generic rows alone, and no part reads another's.
