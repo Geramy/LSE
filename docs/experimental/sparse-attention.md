@@ -1,7 +1,7 @@
 # Experimental sparse attention through HRX / LOOM
 
 The HTTP server enables FlashPrefill V2 by default for Qwen3.5-family
-models with 256-wide heads on gfx1201 Wave32 through LOOM, using BF16 or FP32
+models with 256-wide heads on gfx1201 and gfx1151 Wave32 through LOOM, using BF16 or FP32
 KV. The default alpha is 0.1; decode remains dense. Disable it with
 `--FlashPrefillV2=off`. Batch/ubatch remain 1024.
 

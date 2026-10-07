@@ -102,6 +102,16 @@ inline constexpr std::array kQ4DecodePanelShapes{
     Q4PanelShape{4, 248320, 5120, 4, 1, 1, kArch},
     Q4PanelShape{4, 1024, 5120, 4, 2, 1, kArch},
     Q4PanelShape{4, 48, 5120, 4, 1, 1, kArch},
+    // Eight-row verify passes (DFlash2) with two adjacent columns per wave,
+    // which read each row's panel codes once for both. The eight-row form
+    // reads 24 panel words per weight word, and at one column a wave that
+    // is what binds it. rocprofv3, us per call at width 8:
+    //   GDN qkv 224 -> 177, GDN z 158 -> 115, output proj 154 -> 140
+    // (four columns: 192, 131, 176). The MLP's eight rows stay in the
+    // SwiGLU pair: as two two-column contractions they cost the same.
+    Q4PanelShape{8, 10240, 5120, 8, 4, 2, kArch},
+    Q4PanelShape{8, 6144, 5120, 8, 2, 2, kArch},
+    Q4PanelShape{8, 5120, 6144, 8, 2, 2, kArch},
 };
 
 // The prefill GEMM's wide-pass tile (M >= 768): 256 x 128 outputs on 4 x 4
@@ -179,6 +189,13 @@ inline constexpr Tuning kTuning{
     .decode = kDecodeRules,
     .split_short = kSplitShortRules,
     .wave_l2 = kWaveL2Rules,
+    // FlashPrefill V2 (block-sparse prefill attention, alpha 0.1): its pool
+    // and selector kernels and the mean-corrected flash kernel on the gfx11
+    // fragments pass test_sparse_attention --gpu on the 8060S. Pinned model,
+    // prefill tok/s, dense -> FlashPrefill V2: 4096 tokens 488 -> 501,
+    // 8192 442 -> 485, 16384 378 -> 467, 32768 533 -> 696; 1024 and 2048
+    // unchanged (attention is a small share of a short prefill here).
+    .flash_prefill = true,
     .q4_gemm_wide = kQ4GemmWide,
 };
 

@@ -1,4 +1,5 @@
 #include "harness.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/ops.hpp"
@@ -103,7 +104,7 @@ int gpu_check() {
   scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
   scheduler->set_dialect(Dialect::kLoom);
   const auto& d=scheduler->backend().device_info();
-  if(d.arch!="gfx1201") { std::fprintf(stderr,"requires gfx1201\n"); return 1; }
+  if(!dispatch::arch::tuning(d.arch).flash_prefill) { std::fprintf(stderr,"requires a part with FlashPrefill qualified\n"); return 1; }
   auto upload=[&](Shape shape,const std::vector<float>& data) {
     auto allocation=scheduler->backend().allocate(data.size()*4,backend::MemoryClass::kDevice);
     if(!allocation.ok()) return Array{};

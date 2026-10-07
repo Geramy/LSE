@@ -456,7 +456,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     for (std::size_t i = 0; i < devices->size(); ++i) {
       const auto& info = devices->device(i).device_info();
       if (!dispatch::arch::tuning(info.arch).flash_prefill || info.wavefront_size != 32)
-        return invalid("experimental sparse attention is qualified only for gfx1201 Wave32");
+        return invalid("experimental sparse attention is qualified only for gfx1201 and gfx1151 Wave32");
     }
   }
   backend::IBackend& first_device = devices->device(devices->primary());
