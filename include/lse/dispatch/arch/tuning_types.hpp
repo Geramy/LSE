@@ -49,6 +49,8 @@ struct Tuning {
   // one well and the other not.
   std::span<const q8_shapes::MatrixRule> q8_matrix_rules;
   std::span<const q8_shapes::MatrixRule> q8_panel_rules;
+  // The 16-row matrix panel kernel's K split and load grouping per shape.
+  std::span<const MatrixPanelTune> matrix_panel_tunes;
 
   // Attention (attention.cpp).
   std::span<const attention_shapes::FlashWmmaRule> flash_wmma;
