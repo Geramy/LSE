@@ -602,6 +602,23 @@ LSE_TEST(draft_width_policy_follows_a_change_of_text_within_steps) {
   LSE_EXPECT(policy.acceptance(0.8) > 0.8);
 }
 
+LSE_TEST(draft_width_policy_measures_stale_widths_only_when_cheap) {
+  // Every width measured, then only the full block for a long stretch.
+  const auto run_full_block = [](double accepted) {
+    DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
+    for (int i = 0; i < 2000; ++i)
+      policy.observe_acceptance(0.9, static_cast<std::uint32_t>(i % 7), (i % 100) < accepted * 100);
+    for (std::uint64_t i = 0; i <= DraftWidthPolicy::kRefreshSteps; ++i)
+      policy.observe_verify(DraftWidthPolicy::kMaxRows, 39'000'000);
+    return policy;
+  };
+  // Code: every narrower width would throw away most of a step.
+  LSE_EXPECT_EQ(run_full_block(0.98).refresh(DraftWidthPolicy::kMaxProposals, false), 0u);
+  // Prose: some narrower width costs next to nothing, and gets measured.
+  const std::uint32_t rows = run_full_block(0.3).refresh(DraftWidthPolicy::kMaxProposals, false);
+  LSE_EXPECT(rows >= 1 && rows < DraftWidthPolicy::kMaxRows);
+}
+
 LSE_TEST(draft_width_policy_calibrates_confidence_to_acceptance) {
   DraftWidthPolicy policy;
   // Unobserved, a bin believes its own confidence (its middle: 0.925 falls in

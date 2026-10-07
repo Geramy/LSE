@@ -1136,6 +1136,8 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
                        static_cast<double>(last_draft_ns) / 1e6, warm ? 1 : 0, m,
                        widths->rate() * 1e9, step_trace.c_str());
       }
+      if (lse::debug() && stats_.spec_steps % 64 == 0)
+        std::fprintf(stderr, "[spec-width-policy] position=%d %s\n", at, widths->describe().c_str());
       step_top = now;
       step_counters = counters;
       step_rows = m;

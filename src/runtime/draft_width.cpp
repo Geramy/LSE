@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 
 namespace lse::runtime {
@@ -77,10 +78,31 @@ std::uint32_t DraftWidthPolicy::exploring() const noexcept {
   for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows)
     if (samples_[rows] < kExploreSamples && (fewest == 0 || samples_[rows] < samples_[fewest]))
       fewest = rows;
-  if (fewest != 0) return fewest;
-  for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows)
-    if (steps_ - last_seen_[rows] > kRefreshSteps) return rows;
-  return 0;
+  return fewest;
+}
+
+std::uint32_t DraftWidthPolicy::refresh(std::uint32_t max, bool chained) const noexcept {
+  // Decided from history alone (position means, costs), never from this
+  // step's proposals, so a refresh is a stopping rule like any other choice.
+  max = std::min(max, kMaxProposals);
+  const double rate_now = rate();
+  std::array<double, kMaxRows> value{};
+  double best = -std::numeric_limits<double>::infinity(), gain = 0.0, chain = 1.0;
+  for (std::uint32_t d = 0; d <= max; ++d) {
+    if (d > 0) {
+      chain *= position_mean(d - 1);
+      gain += chain;
+    }
+    value[d] = gain - rate_now * ((chained ? draft_ns(d) : 0.0) + verify_ns(d + 1));
+    best = std::max(best, value[d]);
+  }
+  std::uint32_t stalest = 0;
+  for (std::uint32_t rows = 1; rows <= max + 1; ++rows) {
+    if (steps_ - last_seen_[rows] <= kRefreshSteps || best - value[rows - 1] > kRefreshLoss)
+      continue;
+    if (stalest == 0 || last_seen_[rows] < last_seen_[stalest]) stalest = rows;
+  }
+  return stalest;
 }
 
 std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence,
@@ -92,6 +114,7 @@ std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence,
     if (j < estimates.size()) estimates[j] = a[j];
   }
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(n, rows - 1);
+  if (const std::uint32_t rows = refresh(n, false); rows != 0) return rows - 1;
   // Verify proposal j + 1 when some prefix ending at or after it adds more
   // expected tokens per added nanosecond than the long-run rate: the step's
   // tokens minus rate * time grows. Positions after j enter at their mean
@@ -116,6 +139,30 @@ std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence,
     reach = here;
   }
   return k;
+}
+
+std::string DraftWidthPolicy::describe() const {
+  std::string out = "verify_ms=";
+  char item[32];
+  for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows) {
+    std::snprintf(item, sizeof item, "%s%.1f", rows == 1 ? "" : ",", verify_ns(rows) / 1e6);
+    out += item;
+  }
+  out += " draft_ms=";
+  for (std::uint32_t d = 0; d <= kMaxProposals; ++d) {
+    std::snprintf(item, sizeof item, "%s%.1f", d == 0 ? "" : ",", draft_ns(d) / 1e6);
+    out += item;
+  }
+  out += " position_mean=";
+  for (std::uint32_t p = 0; p < kMaxProposals; ++p) {
+    std::snprintf(item, sizeof item, "%s%.2f", p == 0 ? "" : ",", position_mean(p));
+    out += item;
+  }
+  std::snprintf(item, sizeof item, " bias=%.2f", bias_);
+  out += item;
+  std::snprintf(item, sizeof item, " rate_tps=%.1f", rate() * 1e9);
+  out += item;
+  return out;
 }
 
 bool DraftWidthPolicy::draft_next() {
@@ -188,6 +235,7 @@ double DraftWidthPolicy::draft_ns(std::uint32_t depth) const noexcept {
 std::uint32_t DraftWidthPolicy::depth(std::uint32_t max) {
   max = std::min(max, kMaxProposals);
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(max, rows - 1);
+  if (const std::uint32_t rows = refresh(max, true); rows != 0) return rows - 1;
   const double rate_now = rate();
   std::uint32_t best = 0;
   double best_value = -std::numeric_limits<double>::infinity();

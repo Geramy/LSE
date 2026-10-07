@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 
 namespace lse::runtime {
 
@@ -59,8 +60,12 @@ class DraftWidthPolicy {
   // taken round-robin so a clock ramp at the start of a process does not
   // favor whichever widths come last.
   static constexpr std::uint32_t kExploreSamples = 2;
-  // Steps after which a width's cost is measured again.
+  // Steps after which a width's cost is measured again, on a step where that
+  // costs at most kRefreshLoss expected tokens by the position means (on
+  // code at the full block a narrower width never qualifies; it would throw
+  // away most of a step).
   static constexpr std::uint64_t kRefreshSteps = 512;
+  static constexpr double kRefreshLoss = 0.1;
   // Skipped (draft-free) steps before a probing draft.
   static constexpr std::uint32_t kProbeAfter = 4;
 
@@ -106,6 +111,11 @@ class DraftWidthPolicy {
   // The width the next step must take to measure its cost, or 0 when every
   // width is measured and fresh.
   [[nodiscard]] std::uint32_t exploring() const noexcept;
+  // A stale width (unmeasured for kRefreshSteps) cheap enough to measure on
+  // this step, or 0. `chained`: the draft costs a pass per proposal (MTP).
+  [[nodiscard]] std::uint32_t refresh(std::uint32_t max, bool chained) const noexcept;
+  // Everything the policy has learned, on one line (for LSE_DEBUG traces).
+  [[nodiscard]] std::string describe() const;
 
  private:
   struct Bin {
