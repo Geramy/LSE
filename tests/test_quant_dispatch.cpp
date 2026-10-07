@@ -448,6 +448,16 @@ LSE_TEST(decode_panel_rows_are_qualified_per_part) {
     // A graph built with no device takes only the rows every part shares.
     LSE_EXPECT(!dispatch::q4_shared_panel_shape(f.shapes, {}));
   }
+  // Four-row verify passes: gfx1151's own row states all four rows; gfx1201
+  // keeps the shared row, which leaves the count to the ladder.
+  for (auto [n, k] : {std::pair{17408, 5120}, std::pair{10240, 5120},
+                      std::pair{248320, 5120}, std::pair{5120, 6144}}) {
+    Fixture f(4, n, k, 4, true);
+    const auto* shared = dispatch::q4_shared_panel_rule(f.shapes, "gfx1201");
+    LSE_EXPECT(shared != nullptr && shared->rows == 0 && shared->arch.empty());
+    const auto* own = dispatch::q4_shared_panel_rule(f.shapes, "gfx1151");
+    LSE_EXPECT(own != nullptr && own->rows == 4 && own->arch == "gfx1151");
+  }
 }
 
 // Each part's dispatch rows come from its own header and only from there:
