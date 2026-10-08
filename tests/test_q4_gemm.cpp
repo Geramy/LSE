@@ -242,6 +242,11 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
                    DType::kF32, x);
   auto aw = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(k / per_word)},
                    DType::kU32, w);
+  std::mt19937 rng2(4321);
+  std::vector<std::uint32_t> w2(w.size());
+  for (auto& v : w2) v = static_cast<std::uint32_t>(rng2());
+  auto aw2 = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(k / per_word)},
+                    DType::kU32, w2);
   auto as = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(groups)},
                    DType::kBF16, s);
   auto ab = filled(Shape{static_cast<std::int64_t>(n), static_cast<std::int64_t>(groups)},
@@ -310,6 +315,32 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
     }
     LSE_EXPECT(worst_act < 1e-2);
     std::printf("q4_gemm swiglu epilogue worst_rel=%.6g\n", worst_act);
+    // The same product from the two projections materialized apart and the
+    // silu and multiply run as their own kernel: bit for bit what the fused
+    // launch (one kernel for both projections at prefill shapes) wrote.
+    auto gate2 = quant_linear(ax, aw, as, ab, bits, 64);
+    auto up2 = quant_linear(ax, aw2, as, ab, bits, 64);
+    const NodePtr proj_roots[]{gate2.node(), up2.node()};
+    LSE_EXPECT_OK(scheduler->eval(proj_roots, false));
+    auto act2 = silu(gate2) * up2;
+    const NodePtr act2_roots[]{act2.node()};
+    LSE_EXPECT_OK(scheduler->eval(act2_roots, false));
+    auto gate3 = quant_linear(ax, aw, as, ab, bits, 64);
+    auto up3 = quant_linear(ax, aw2, as, ab, bits, 64);
+    auto act3 = silu(gate3) * up3;
+    const NodePtr act3_roots[]{act3.node()};
+    LSE_EXPECT_OK(scheduler->eval(act3_roots, false));
+    LSE_EXPECT_OK(scheduler->drain());
+    const auto apart = read<float>(act2);
+    const auto together = read<float>(act3);
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < apart.size(); ++i)
+      differ += std::memcmp(&apart[i], &together[i], sizeof(float)) != 0;
+    LSE_EXPECT_EQ(differ, 0u);
+    std::printf("q4_gemm swiglu pair: %zu of %zu outputs differ from the "
+                "projections run apart (fused kernel: %s)\n",
+                differ, apart.size(), std::string(act3.node()->prim
+                    ? act3.node()->prim->name() : "none").c_str());
   }
   for (int warm = 0; warm < 3; ++warm) {
     program.reset_compute();

@@ -627,6 +627,422 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   return kb.str();
 }
 
+// ---------------------------------------------------------------------------
+// The gate and up projections of a SwiGLU MLP in one launch
+// ---------------------------------------------------------------------------
+//
+// silu(x Wg^T) * (x Wu^T) for the two projections of one activation, as the
+// plain GEMM computes each of them, with the product formed in registers.
+// A workgroup owns bn / 2 output columns and stages both matrices' weights
+// for them: within every wave column of the B tile the first half holds the
+// gate's columns and the second the up projection's same columns, so each
+// lane ends up holding a gate accumulator and the up accumulator of the
+// same output element. Each accumulator walks the same matrix instructions
+// over the same halves in the same order as the plain GEMM's, and the
+// product takes the epilogue's silu and multiply, so every output is the
+// value the two GEMMs and the fused multiply wrote; what goes away is the
+// gate's output round trip through memory and the second launch.
+
+constexpr std::string_view kGemmPairName = "quant_linear.q4_gemm_f16.swiglu.v1";
+
+// The elementwise silu row, the one a fused epilogue spells.
+struct PairSilu {
+  static constexpr std::string_view key = "silu";
+  using result = lse::f32;
+};
+
+template <class S>
+struct PairArgs {
+  env::In<kir::f32, env::Emit> x;
+  env::In<std::uint32_t, env::Emit> gpacked;
+  env::In<S, env::Emit> gscales;
+  env::In<S, env::Emit> gbiases;
+  env::In<std::uint32_t, env::Emit> upacked;
+  env::In<S, env::Emit> uscales;
+  env::In<S, env::Emit> ubiases;
+  env::In<lse::f16, env::Emit> panel;
+  env::Out<kir::f32, env::Emit> out;
+};
+
+struct PairDims {
+  Dims d;
+  bool valid = false;
+};
+
+PairDims pair_dims(const KernelShapes& s, std::vector<Shape>& shapes,
+                   std::vector<DType>& dtypes) {
+  PairDims p;
+  if (s.inputs.size() != 8 || s.input_dtypes.size() != 8) return p;
+  if (s.inputs[1] != s.inputs[4] || s.inputs[2] != s.inputs[5] ||
+      s.inputs[3] != s.inputs[6] || s.input_dtypes[1] != s.input_dtypes[4] ||
+      s.input_dtypes[2] != s.input_dtypes[5] ||
+      s.input_dtypes[3] != s.input_dtypes[6])
+    return p;
+  shapes = {s.inputs[0], s.inputs[1], s.inputs[2], s.inputs[3], s.inputs[7]};
+  dtypes = {s.input_dtypes[0], s.input_dtypes[1], s.input_dtypes[2],
+            s.input_dtypes[3], s.input_dtypes[7]};
+  KernelShapes g = s;
+  g.inputs = shapes;
+  g.input_dtypes = dtypes;
+  p.d = dims_of(g, false);
+  p.valid = p.d.valid && p.d.bits == 4;
+  return p;
+}
+
+// Registers a lane of the pair holds through its K loop, counted as the
+// plain GEMM's body allocates them: the accumulators, one step's A and B
+// fragments, the next step's staged activation pieces and both matrices'
+// staged weight piece (four words) with its scale and bias, and the
+// addresses of every staged piece and fragment row.
+std::uint32_t pair_live_registers(const KernelShapes& s, const Dims& d, const Tile& t) {
+  const auto* row = f16_row(s);
+  if (row == nullptr || t.wm == 0 || t.wn == 0) return UINT32_MAX;
+  const std::uint32_t threads = t.wm * t.wn * 32u;
+  const std::uint32_t fm = t.bm / t.wm / 16u, fn = t.bn / t.wn / 16u;
+  const std::uint32_t frag = static_cast<std::uint32_t>(row->a_len) / 2u;  // halves -> registers
+  const std::uint32_t a_pieces = t.bm * (kBK / kRun) / threads;
+  const std::uint32_t accumulators = fm * fn * static_cast<std::uint32_t>(row->c_len);
+  const std::uint32_t fragments = (fm + fn) * frag;
+  const std::uint32_t staging = a_pieces * 4u + 2u * (4u + 2u);
+  const std::uint32_t addresses = a_pieces * 2u + 2u * 3u + fm + fn;
+  (void)d;
+  return accumulators + fragments + staging + addresses;
+}
+
+// What loomc allocates beyond that count, for its own moves and temporaries:
+// the plain GEMM counts 151 and is given 168 on gfx1151's 64 x 32 wave
+// tiles, counts 225 and is given 240-256 on gfx1201's 64 x 64 ones. The pair
+// on the latter counts 234 and does not compile (BACKEND/021
+// spill-materialization-iteration-limit); on the former it counts 160.
+constexpr std::uint32_t kCompilerRegisterReserve = 32;
+
+// Whether the pair fits the part's tile: an even number of fragment columns
+// per wave, the threads to stage both halves of the weight tile at once, and
+// a lane's registers within the device's addressable budget.
+bool pair_fits(const KernelShapes& s, const Dims& d, const Tile& t) {
+  if (t.wn == 0 || t.bn % (2u * t.wn) != 0u) return false;
+  const std::uint32_t tn = t.bn / t.wn;
+  const std::uint32_t threads = t.wm * t.wn * 32u;
+  const std::uint32_t per = (t.bn / 2u) * (kBK / (32u / d.bits) / 4u);
+  const auto& budget = s.device->arch_facts.vector_registers_addressable_per_wave;
+  // Single-step K loops only: a tile that bursts several steps' reads would
+  // hold both matrices' weights for every step of the burst, and measured
+  // slower than the two launches (8060S, 512-token prefill on 144 x 128
+  // tiles: 1.247 -> 1.407 s).
+  return tn % 32u == 0u && 2u * per <= threads && d.slices == 1u &&
+         burst_steps(d, t) <= 1u && budget.known() &&
+         pair_live_registers(s, d, t) + kCompilerRegisterReserve <= budget.value;
+}
+
+template <class S, math::MatrixTarget G>
+std::string emit_pair_body(const KernelShapes& s, const Dims& d) {
+  using Op = math::op::Mma<G, math::MatrixElem::kF32, math::MatrixElem::kF16,
+                           16, 16, 16>;
+  constexpr math::MatrixCoreRow kRow = Op::kRow;
+  constexpr TileGeometry kGeo = geometry_of(kRow);
+  constexpr int kFrag = kRow.a_len;
+  constexpr int kSlots = kRow.c_len;
+  constexpr std::uint32_t kLaneK = kGeo.lane_k;
+  static_assert(kLaneK % kRun == 0u, "fragments load in whole runs");
+
+  const Tile t = tile_for(s, d);
+  if (!pair_fits(s, d, t)) return {};
+  const std::uint32_t M = d.m, N = d.n, K = d.k;
+  const std::uint32_t KT = K / kBK;
+  const std::uint32_t half_bn = t.bn / 2u;
+  const std::uint32_t tiles_n = (N + half_bn - 1u) / half_bn;
+  const std::uint32_t tiles_m = (M + t.bm - 1u) / t.bm;
+  const std::uint32_t TM = t.bm / t.wm, TN = t.bn / t.wn, half_tn = TN / 2u;
+  const std::uint32_t FM = TM / 16u, FN = TN / 16u;
+  const std::uint32_t threads = t.wm * t.wn * 32u;
+
+  kir::KernelBody kb(s.types, *s.intrinsics,
+                     backend::workgroup_lds_bytes(s.device));
+  kb.set_store(s.store);
+  PairArgs<S> a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+  const auto As = e.lds<lse::f16>(t.bm * kRowHalves);
+  const auto Bs = e.lds<lse::f16>(t.bn * kRowHalves);
+  if (!As || !Bs) return {};
+
+  const auto lid = e.let(math::local_id());
+  const auto wave = e.let(lid / 32u);
+  const auto lane = e.let(lid % 32u);
+  const auto lane_lo = e.let(lane % 16u);
+  const auto lane_hi = e.let(lane / 16u);
+  const auto wg = e.let(math::workgroup_id_x());
+  const auto tn = e.let(wg % tiles_n);
+  const auto tm = e.let((wg / tiles_n) % tiles_m);
+  const auto m0 = e.let(tm * t.bm);
+  const auto n0 = e.let(tn * half_bn);
+  const auto wave_m = e.let(wave / t.wn);
+  const auto wave_n = e.let(wave % t.wn);
+  const auto k_begin = e.u32(0u);
+  const auto k_end = e.u32(KT);
+
+  constexpr std::uint32_t kAPerRow = kBK / kRun;
+  const std::uint32_t a_pieces = t.bm * kAPerRow / threads;
+  std::vector<kir::Val<kir::u32>> a_src, a_dst;
+  for (std::uint32_t c = 0; c < a_pieces; ++c) {
+    const auto f = e.let(lid + c * threads);
+    const auto r = e.let(f / kAPerRow);
+    const auto run = e.let(f % kAPerRow);
+    const auto grow = e.let(m0 + r);
+    const auto safe = e.let(select(grow < M, grow, e.u32(M - 1u)));
+    a_src.push_back(e.let(safe * K + run * kRun));
+    a_dst.push_back(e.let(r * kRowHalves + run * kRun));
+  }
+  // Weight staging: one 16-byte piece (32 codes) per thread per matrix. The
+  // first `per` threads stage the gate's pieces and the next `per` the up
+  // projection's; every thread reads a valid piece of both.
+  constexpr std::uint32_t kCodesPerWord = 8u;
+  constexpr std::uint32_t kWordsPerStep = kBK / kCodesPerWord;
+  constexpr std::uint32_t kBPerCol = kWordsPerStep / 4u;
+  const std::uint32_t per = half_bn * kBPerCol;
+  std::vector<kir::Val<kir::u32>> b_src, b_dst, b_aff;
+  std::vector<kir::Val<kir::boolean>> b_mine;
+  for (std::uint32_t m = 0; m < 2u; ++m) {
+    const auto pm = e.let((lid + (threads - m * per) % threads) % threads);
+    b_mine.push_back(pm < per);
+    const auto f = e.let(pm % per);
+    const auto c = e.let(f / kBPerCol);
+    const auto part = e.let(f % kBPerCol);
+    const auto gcol = e.let(n0 + c);
+    const auto safe = e.let(select(gcol < N, gcol, e.u32(N - 1u)));
+    const auto lcol = e.let((c / half_tn) * TN + m * half_tn + c % half_tn);
+    b_src.push_back(e.let(safe * d.lanes + part * 4u));
+    b_dst.push_back(e.let(lcol * kRowHalves + part * 4u * kCodesPerWord));
+    b_aff.push_back(e.let(safe * d.groups));
+  }
+
+  using F16x8 = lse::vec<lse::f16, 8>;
+  struct Staged {
+    std::vector<kir::Pack<lse::f16>> av;
+    std::vector<kir::Pack<std::uint32_t>> bv;
+    std::vector<kir::Val<S>> scale, bias;
+  };
+  const auto issue = [&](const kir::Val<kir::u32>& kt) {
+    Staged st;
+    const auto koff = e.let(kt * kBK);
+    for (std::uint32_t c = 0; c < a_pieces; ++c)
+      st.av.push_back(e.load(a.panel, e.let(a_src[c] + koff), 16u));
+    const auto woff = e.let(kt * kWordsPerStep);
+    const auto g = e.let(koff / d.gsize);
+    st.bv.push_back(e.load(a.gpacked, e.let(b_src[0] + woff), 16u));
+    st.scale.push_back(e.let(a.gscales[e.let(b_aff[0] + g)]));
+    st.bias.push_back(e.let(a.gbiases[e.let(b_aff[0] + g)]));
+    st.bv.push_back(e.load(a.upacked, e.let(b_src[1] + woff), 16u));
+    st.scale.push_back(e.let(a.uscales[e.let(b_aff[1] + g)]));
+    st.bias.push_back(e.let(a.ubiases[e.let(b_aff[1] + g)]));
+    return st;
+  };
+  const auto commit = [&](const Staged& st) {
+    for (std::uint32_t c = 0; c < a_pieces; ++c)
+      kb.store_pack<lse::f16>(As.id(), a_dst[c], st.av[c], 16u);
+    for (std::uint32_t m = 0; m < 2u; ++m) {
+      if (auto mine = e.when(b_mine[m])) {
+        const auto scale = e.let(math::widen(st.scale[m]));
+        const auto bias = e.let(math::widen(st.bias[m]));
+        for (std::uint32_t w = 0; w < 4u; ++w) {
+          const auto word = e.let(st.bv[m][static_cast<int>(w)]);
+          const auto v = kb.call<F16x8>("q4x8.f16", word, scale, bias);
+          kb.store_pack<lse::f16>(
+              Bs.id(), e.let(b_dst[m] + w * kCodesPerWord),
+              kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8), 16u);
+        }
+      }
+    }
+  };
+
+  std::vector<kir::Local<lse::f32, kSlots>> acc;
+  acc.reserve(FM * FN);
+  for (std::uint32_t i = 0; i < FM * FN; ++i) {
+    acc.push_back(e.local<lse::f32, kSlots>());
+    for (int z = 0; z < kSlots; ++z) acc[i][z] = e.f32(0.0f);
+  }
+  const auto lane_k0 = e.let(lane_hi * (kGeo.split_k ? kLaneK : 0u));
+  std::vector<kir::Val<kir::u32>> a_frag_base, b_frag_base;
+  for (std::uint32_t fm = 0; fm < FM; ++fm)
+    a_frag_base.push_back(
+        e.let((wave_m * TM + fm * 16u + lane_lo) * kRowHalves + lane_k0));
+  for (std::uint32_t fn = 0; fn < FN; ++fn)
+    b_frag_base.push_back(
+        e.let((wave_n * TN + fn * 16u + lane_lo) * kRowHalves + lane_k0));
+  using FragVec = lse::vec<lse::f16, kFrag>;
+  const auto fragment = [&](const kir::Tile<lse::f16>& tile,
+                            const kir::Val<kir::u32>& at) -> kir::Val<FragVec> {
+    const auto p = kFrag == 8 ? tile.load(at, 16u)
+                              : tile.load_elems(at, static_cast<std::uint32_t>(kFrag));
+    return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
+  };
+  const auto compute = [&]() {
+    for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
+      std::vector<kir::Val<FragVec>> af, bf;
+      for (std::uint32_t fm = 0; fm < FM; ++fm)
+        af.push_back(fragment(As, e.let(a_frag_base[fm] + kk * 16u)));
+      for (std::uint32_t fn = 0; fn < FN; ++fn)
+        bf.push_back(fragment(Bs, e.let(b_frag_base[fn] + kk * 16u)));
+      for (std::uint32_t fm = 0; fm < FM; ++fm)
+        for (std::uint32_t fn = 0; fn < FN; ++fn) {
+          auto& c = acc[fm * FN + fn];
+          c = math::mma<Op>(af[fm], bf[fn], c.value());
+        }
+    }
+  };
+  const std::uint32_t burst = burst_steps(d, t);
+  if (burst <= 1u) {
+    commit(issue(k_begin));
+    e.barrier();
+    for (auto kt : e.range(k_begin, k_end, 1u)) {
+      const auto next = e.let(select(kt + 1u < k_end, kt + 1u, kt));
+      const Staged st = issue(next);
+      compute();
+      e.barrier();
+      commit(st);
+      e.barrier();
+    }
+  } else {
+    for (auto kt : e.range(k_begin, k_end, burst)) {
+      std::vector<Staged> sts;
+      for (std::uint32_t u = 0; u < burst; ++u) sts.push_back(issue(e.let(kt + u)));
+      for (std::uint32_t u = 0; u < burst; ++u) {
+        commit(sts[u]);
+        e.barrier();
+        compute();
+        e.barrier();
+      }
+    }
+  }
+
+  const std::uint32_t pairs = FN / 2u;
+  for (std::uint32_t fm = 0; fm < FM; ++fm) {
+    for (std::uint32_t fp = 0; fp < pairs; ++fp) {
+      const auto col = e.let(n0 + wave_n * half_tn + fp * 16u + lane_lo);
+      for (int z = 0; z < kSlots; ++z) {
+        const auto row = e.let(m0 + wave_m * TM + fm * 16u +
+                               static_cast<std::uint32_t>(z) * kGeo.slot_step +
+                               lane_hi * kGeo.half_rows);
+        const auto g = acc[fm * FN + fp][z].read();
+        const auto u = acc[fm * FN + pairs + fp][z].read();
+        const auto value = e.let(e.let(math::emit<PairSilu>(g)) * u);
+        if (M % t.bm == 0 && N % half_bn == 0) {
+          e.store(row * N + col, value);
+        } else if (N % half_bn == 0) {
+          if (auto in = e.when(row < M)) e.store(row * N + col, value);
+        } else {
+          if (auto in = e.when(row < M && col < N)) e.store(row * N + col, value);
+        }
+      }
+    }
+  }
+  if (!kb.lds().ok()) return {};
+  return kb.str();
+}
+
+struct Q4GemmPairKernel final : graph::KernelPrimitive<Q4GemmPairKernel> {
+  static constexpr std::string_view kName = kGemmPairName;
+  static constexpr std::string_view kEntry = "lse_quant_linear_q4_gemm_f16_swiglu_v1";
+  static constexpr std::string_view kSource = {};
+
+  std::size_t arity() const noexcept override { return 8; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return true; }
+  bool has_typed_host_impl() const noexcept override { return true; }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 8 || !in[0].rank() || in[1].rank() != 2 || in[4] != in[1])
+      return LSE_ERROR(kInvalidArgument,
+                       "q4 swiglu gemm takes x, gate packed/scales/biases, up "
+                       "packed/scales/biases, f16 panel");
+    Shape out;
+    for (std::size_t i = 0; i + 1 < in[0].rank(); ++i) out.push_back(in[0].dim(i));
+    out.push_back(in[1].dim(0));
+    return out;
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+
+  // silu(gate) * up, each projection as quant_linear computes it from the
+  // f32 activation, and silu as the elementwise primitive spells it.
+  Status eval_cpu_typed(std::span<const graph::HostTensorView> in,
+                        graph::HostOutputView out,
+                        const std::array<float, 4>& attrs,
+                        const std::array<std::int32_t, 4>& iattrs) const override {
+    if (in.size() != 8 || out.dtype != DType::kF32)
+      return LSE_ERROR(kInvalidArgument, "invalid q4 swiglu gemm storage");
+    const auto* plain = dynamic_cast<const graph::KernelPrimitiveBase*>(
+        graph::find_primitive(kGemmName));
+    if (plain == nullptr)
+      return LSE_ERROR(kInternal, "q4 swiglu gemm needs the plain gemm");
+    std::vector<std::byte> gate(out.bytes.size()), up(out.bytes.size());
+    const std::array<graph::HostTensorView, 5> gin{in[0], in[1], in[2], in[3], in[7]};
+    const std::array<graph::HostTensorView, 5> uin{in[0], in[4], in[5], in[6], in[7]};
+    graph::HostOutputView gout = out, uout = out;
+    gout.bytes = gate;
+    uout.bytes = up;
+    LSE_RETURN_IF_ERROR(plain->eval_cpu_typed(gin, gout, attrs, iattrs));
+    LSE_RETURN_IF_ERROR(plain->eval_cpu_typed(uin, uout, attrs, iattrs));
+    for (std::size_t i = 0; i < out.bytes.size() / 4; ++i) {
+      float g, u;
+      std::memcpy(&g, gate.data() + i * 4, 4);
+      std::memcpy(&u, up.data() + i * 4, 4);
+      const float v = g / (1.0f + std::exp(-g)) * u;
+      std::memcpy(out.bytes.data() + i * 4, &v, 4);
+    }
+    return OkStatus();
+  }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    std::vector<Shape> shapes;
+    std::vector<DType> dtypes;
+    const PairDims p = pair_dims(s, shapes, dtypes);
+    if (!p.valid || !s.store || s.types.scalar == nullptr) return {};
+    KernelShapes g = s;
+    g.inputs = shapes;
+    g.input_dtypes = dtypes;
+    if (!device_fits(g, p.d) || !pair_fits(g, p.d, tile_for(g, p.d))) return {};
+    const auto* row = f16_row(g);
+    return with_matrix_target<std::string>(
+        row->target, [&]<math::MatrixTarget G>() -> std::string {
+          if constexpr (!math::has_matrix_core_row(G, math::MatrixElem::kF32,
+                                                   math::MatrixElem::kF16, 16,
+                                                   16, 16)) {
+            return {};
+          } else if constexpr (math::matrix_core_row(
+                                   G, math::MatrixElem::kF32,
+                                   math::MatrixElem::kF16, 16, 16, 16)
+                                   .wave != 32) {
+            return {};
+          } else {
+            return with_elem(s.input_dtypes[2], [&]<class S>() -> std::string {
+              return emit_pair_body<S, G>(s, p.d);
+            });
+          }
+        });
+  }
+
+  // An empty grid where the pair does not apply, which is what keeps the
+  // graph from rewriting the two projections into it.
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    tp.workgroup_count[0] = 0;
+    std::vector<Shape> shapes;
+    std::vector<DType> dtypes;
+    const PairDims p = pair_dims(s, shapes, dtypes);
+    if (!p.valid) return tp;
+    KernelShapes g = s;
+    g.inputs = shapes;
+    g.input_dtypes = dtypes;
+    if (!device_fits(g, p.d)) return tp;
+    const Tile t = tile_for(g, p.d);
+    if (!pair_fits(g, p.d, t)) return tp;
+    tp.workgroup_size[0] = t.wm * t.wn * 32u;
+    tp.workgroup_count[0] =
+        ((p.d.m + t.bm - 1u) / t.bm) * ((p.d.n + t.bn / 2u - 1u) / (t.bn / 2u));
+    tp.lds_bytes = lds_bytes(t);
+    return tp;
+  }
+};
+
 // The original contraction on the first four operands, for a device the GEMM
 // does not fit. The panel is then simply not read.
 const graph::KernelPrimitiveBase* legacy(const KernelShapes& original) {
@@ -889,5 +1305,6 @@ LSE_REGISTER_PRIMITIVE(F16PanelKernel);
 LSE_REGISTER_PRIMITIVE(Q4GemmPlain);
 LSE_REGISTER_PRIMITIVE(Q4GemmSlices);
 LSE_REGISTER_PRIMITIVE(Q4SliceSumKernel);
+LSE_REGISTER_PRIMITIVE(Q4GemmPairKernel);
 
 }  // namespace lse::kernels
