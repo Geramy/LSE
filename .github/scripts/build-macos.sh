@@ -109,12 +109,20 @@ git -C "$work/hrx-source" init -q
 #   each round retires distinct values and repair runs until no spill plan
 #   remains, or fails with the register class's budget and peak, instead of
 #   stopping after eight rounds (ROCm/hrx-system#1391).
+# - loom-vmem-sources-at-issue, loom-scalar-source-capture: upstream 30246a9d6
+#   and c07086aa1 backported. A VMEM store reads its VGPR address and data, and
+#   a memory instruction its scalar address inputs, when it issues, so loomc
+#   can reuse those registers without waiting for the access to complete.
+# - loom-issue-sources-gfx11: those two releases apply to the gfx11 (RDNA3/3.5)
+#   descriptor sets only. They measured faster decode on gfx1151 but slower MTP
+#   and DFlash2 decode on gfx1201, which keeps its previous leases.
 hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
   gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
   loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
   gfx120x-hdp-kernarg-publication hsa-bar-write-bracket loom-vmem-load-latency
   loom-allocation-entry-preamble loom-terminal-spill-register-requirements
-  loom-spill-materialization-converges)
+  loom-spill-materialization-converges loom-vmem-sources-at-issue
+  loom-scalar-source-capture loom-issue-sources-gfx11)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"

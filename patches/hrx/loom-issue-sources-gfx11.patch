@@ -1,0 +1,635 @@
+From e4fb699815294ebbc98967ed0ebbe641acff3738 Mon Sep 17 00:00:00 2001
+From: geramyloveless <gloveless@jqluv.com>
+Date: Thu, 8 Oct 2026 11:40:28 -0700
+Subject: [PATCH] [Loom/AMDGPU] Release memory sources at issue only on gfx11
+
+Consuming VMEM store VGPR sources and scalar memory sources at issue
+(30246a9d6, c07086aa1) measured faster decode on gfx1151 for LSE's
+qwen38-27b-q4 kernels (plain +2%, DFlash2 +6-22%) but 1-9% slower MTP
+and DFlash2 decode on gfx1201. Add an issue-captured-sources builder flag,
+set for the rdna3, gfx11_generic and rdna3_5 core descriptor sets. The
+other sets keep the completion-released leases they had before those
+changes: scalar address inputs until VMEM load, VMEM store or tensor
+completion, and VMEM store VGPR sources until store completion, with the
+amdgpu.store_source_reuse wait reason.
+
+Test cases on the other sets take their previous expectations again,
+low_memory_scalar_capture keeps its gfx11 cases, and the gfx1151
+live_in_split_follows_entry_preamble case takes the combined register
+reuse.
+---
+ .../target/arch/amdgpu/descriptors/api.py     | 180 +++++++++++++++++-
+ .../target/arch/amdgpu/planning/wait_plan.c   |   4 +
+ .../target/arch/amdgpu/planning/wait_plan.h   |   4 +-
+ .../test/source_low/low_allocation.loom-test  |   8 +-
+ .../source_low/low_edge_copy_wait.loom-test   |   1 +
+ .../low_memory_scalar_capture.loom-test       | 161 ----------------
+ .../low_vmem_latency_schedule.loom-test       |   8 +-
+ .../test/source_low/low_wait_plan.loom-test   |   4 +-
+ .../amdgpu/test/spill_lowering.loom-test      |  12 +-
+ 9 files changed, 202 insertions(+), 180 deletions(-)
+
+diff --git a/loom/py/loom/target/arch/amdgpu/descriptors/api.py b/loom/py/loom/target/arch/amdgpu/descriptors/api.py
+index 1045866d1..5121072fb 100644
+--- a/loom/py/loom/target/arch/amdgpu/descriptors/api.py
++++ b/loom/py/loom/target/arch/amdgpu/descriptors/api.py
+@@ -889,6 +889,14 @@ _AMDGPU_READ_COUNTER_MASK = (
+     | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_ASYNC]
+ )
+ 
++_AMDGPU_WRITE_COUNTER_MASK = (
++    _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_VMEM_STORE]
++    | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_LDS]
++    | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_SMEM]
++    | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_TENSOR]
++    | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_ASYNC]
++)
++
+ _AMDGPU_STORAGE_LEASE_MEMORY_SPACES = frozenset(
+     (
+         MemorySpace.GENERIC,
+@@ -924,6 +932,8 @@ _GFX125X_XCNT_SCHEDULE_CLASSES = frozenset(
+ 
+ _AMDGPU_WAIT_PLAN_RESIDUAL_ACTION_WAIT_PACKET = 1
+ _AMDGPU_WAIT_PLAN_RESIDUAL_ACTION_WAIT_PACKET_NAME = "amdgpu.wait_packet"
++_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE = 4
++_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE_NAME = "amdgpu.store_source_reuse"
+ _AMDGPU_WAIT_PLAN_REASON_READ_RESULT_REUSE = 5
+ _AMDGPU_WAIT_PLAN_REASON_READ_RESULT_REUSE_NAME = "amdgpu.read_result_reuse"
+ _AMDGPU_WAIT_PLAN_REASON_MEMORY_SOURCE_REUSE = 10
+@@ -1010,6 +1020,27 @@ def _amdgpu_storage_lease_result_counter_mask(
+     return read_counter_mask
+ 
+ 
++def _amdgpu_storage_lease_write_counter_mask(
++    schedule_classes: dict[str, ScheduleClass],
++    descriptor: Descriptor,
++) -> int:
++    hazard_counter_mask = _amdgpu_descriptor_hazard_counter_mask(
++        schedule_classes, descriptor
++    )
++    write_counter_mask = 0
++    for effect in descriptor.effects:
++        if not _amdgpu_storage_lease_effect_is_dependency_memory(effect):
++            continue
++        if effect.kind is EffectKind.WRITE:
++            write_counter_mask |= _amdgpu_effect_counter_mask(
++                descriptor,
++                effect,
++                hazard_counter_mask,
++                _AMDGPU_WRITE_COUNTER_MASK,
++            )
++    return write_counter_mask
++
++
+ def _amdgpu_storage_lease(
+     *,
+     kind: StorageLeaseKind,
+@@ -1046,11 +1077,128 @@ def _amdgpu_operand_is_packet_input(operand: Operand) -> bool:
+     )
+ 
+ 
++def _amdgpu_operand_accepts_vgpr(operand: Operand) -> bool:
++    return any(
++        reg_alt.reg_class == _REG_VGPR
++        and RegClassAltFlag.IMMEDIATE not in reg_alt.flags
++        for reg_alt in operand.reg_alts
++    )
++
++
++def _amdgpu_operand_accepts_sgpr(operand: Operand) -> bool:
++    return any(
++        reg_alt.reg_class == _REG_SGPR
++        and RegClassAltFlag.IMMEDIATE not in reg_alt.flags
++        for reg_alt in operand.reg_alts
++    )
++
++
++def _amdgpu_append_memory_source_leases(
++    storage_leases: list[StorageLease],
++    operand: Operand,
++    packet_operand_index: int,
++    counter_mask: int,
++) -> None:
++    for counter_id, counter_bit in _AMDGPU_WAIT_COUNTER_MASKS.items():
++        if (counter_mask & counter_bit) == 0:
++            continue
++        storage_leases.append(
++            _amdgpu_storage_lease(
++                kind=StorageLeaseKind.SOURCE_READ,
++                attachment=StorageLeaseAttachment.OPERAND,
++                attachment_index=packet_operand_index,
++                unit_count=operand.unit_count,
++                release_class_id=counter_id,
++                release_reason_id=_AMDGPU_WAIT_PLAN_REASON_MEMORY_SOURCE_REUSE,
++                release_reason_name=_AMDGPU_WAIT_PLAN_REASON_MEMORY_SOURCE_REUSE_NAME,
++                flags=_AMDGPU_STORAGE_LEASE_FLAGS,
++            )
++        )
++
++
++def _amdgpu_completion_source_leases(
++    schedule_classes: dict[str, ScheduleClass],
++    descriptor: Descriptor,
++    read_counter_mask: int,
++    *,
++    enable_gfx125x_xcnt: bool,
++) -> list[StorageLease]:
++    # Descriptor sets without issue-captured sources keep every memory source
++    # leased until the access completes: scalar address inputs until VMEM load,
++    # VMEM store or tensor completion, and VMEM store VGPR sources until store
++    # completion.
++    write_counter_mask = _amdgpu_storage_lease_write_counter_mask(
++        schedule_classes, descriptor
++    )
++    storage_leases: list[StorageLease] = []
++    memory_source_read_counter_mask = read_counter_mask & (
++        _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_VMEM_LOAD]
++        | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_TENSOR]
++    )
++    memory_source_write_counter_mask = write_counter_mask & (
++        _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_VMEM_STORE]
++        | _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_TENSOR]
++    )
++    vmem_write_counter_mask = (
++        write_counter_mask & _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_VMEM_STORE]
++    )
++    xcnt_source_counter_mask = (
++        _AMDGPU_WAIT_COUNTER_MASKS[_COUNTER_X]
++        if enable_gfx125x_xcnt
++        and descriptor.schedule_class in _GFX125X_XCNT_SCHEDULE_CLASSES
++        else 0
++    )
++    if (
++        memory_source_read_counter_mask != 0
++        or memory_source_write_counter_mask != 0
++        or xcnt_source_counter_mask != 0
++    ):
++        packet_operand_index = 0
++        for operand in descriptor.operands[_descriptor_result_count(descriptor) :]:
++            if not _amdgpu_operand_is_packet_input(operand):
++                continue
++            current_packet_operand_index = packet_operand_index
++            packet_operand_index += 1
++            if operand.unit_count == 0:
++                continue
++            if xcnt_source_counter_mask != 0:
++                _amdgpu_append_memory_source_leases(
++                    storage_leases,
++                    operand,
++                    current_packet_operand_index,
++                    xcnt_source_counter_mask,
++                )
++            if _amdgpu_operand_accepts_vgpr(operand) and vmem_write_counter_mask != 0:
++                storage_leases.append(
++                    _amdgpu_storage_lease(
++                        kind=StorageLeaseKind.SOURCE_READ,
++                        attachment=StorageLeaseAttachment.OPERAND,
++                        attachment_index=current_packet_operand_index,
++                        unit_count=operand.unit_count,
++                        release_class_id=_COUNTER_VMEM_STORE,
++                        release_reason_id=_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE,
++                        release_reason_name=(
++                            _AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE_NAME
++                        ),
++                        flags=_AMDGPU_STORAGE_LEASE_FLAGS,
++                    )
++                )
++            if _amdgpu_operand_accepts_sgpr(operand):
++                _amdgpu_append_memory_source_leases(
++                    storage_leases,
++                    operand,
++                    current_packet_operand_index,
++                    memory_source_read_counter_mask | memory_source_write_counter_mask,
++                )
++    return storage_leases
++
++
+ def _amdgpu_descriptor_storage_leases(
+     schedule_classes: dict[str, ScheduleClass],
+     descriptor: Descriptor,
+     *,
+     enable_gfx125x_xcnt: bool,
++    issue_captured_sources: bool,
+ ) -> tuple[StorageLease, ...]:
+     if descriptor.storage_leases:
+         raise ValueError(
+@@ -1082,6 +1230,16 @@ def _amdgpu_descriptor_storage_leases(
+                     flags=_AMDGPU_PRESSURE_STORAGE_LEASE_FLAGS,
+                 )
+             )
++    if not issue_captured_sources:
++        storage_leases.extend(
++            _amdgpu_completion_source_leases(
++                schedule_classes,
++                descriptor,
++                read_counter_mask,
++                enable_gfx125x_xcnt=enable_gfx125x_xcnt,
++            )
++        )
++        return tuple(storage_leases)
+     # Memory completion owns result storage, not address inputs. Supported native
+     # families capture scalar inputs independently of completion. Gfx125x
+     # SMEM/VMEM packets retain their inputs until the separate X event; tensor
+@@ -1124,7 +1282,10 @@ def _descriptor_result_count(descriptor: Descriptor) -> int:
+ 
+ 
+ def _with_storage_lease_rows(
+-    descriptor_set: DescriptorSet, *, enable_gfx125x_xcnt: bool = False
++    descriptor_set: DescriptorSet,
++    *,
++    enable_gfx125x_xcnt: bool = False,
++    issue_captured_sources: bool = True,
+ ) -> DescriptorSet:
+     schedule_classes = {
+         schedule_class.name: schedule_class
+@@ -1139,6 +1300,7 @@ def _with_storage_lease_rows(
+                     schedule_classes,
+                     descriptor,
+                     enable_gfx125x_xcnt=enable_gfx125x_xcnt,
++                    issue_captured_sources=issue_captured_sources,
+                 ),
+             )
+             for descriptor in descriptor_set.descriptors
+@@ -1225,6 +1387,12 @@ def _with_instruction_classes(descriptor_set: DescriptorSet) -> DescriptorSet:
+ 
+ 
+ _AMDGPU_CORE_DESCRIPTOR_SET_BUILDER_FLAG_GFX125X = 1 << 0
++# VMEM store VGPR sources and scalar memory sources are released when the
++# packet issues instead of when the access completes. Set for the gfx11
++# (RDNA3/3.5) sets only: on LSE's qwen38-27b-q4 kernels this measured faster
++# decode on gfx1151 (plain +2%, DFlash2 +6-22%) but 1-9% slower MTP and DFlash2
++# decode on gfx1201, so the other sets keep completion-released leases.
++_AMDGPU_CORE_DESCRIPTOR_SET_BUILDER_FLAG_ISSUE_CAPTURED_SOURCES = 1 << 1
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -1265,12 +1433,14 @@ _AMDGPU_CORE_DESCRIPTOR_SET_BUILDERS = {
+         overlay_rows=_gfx11_core_overlays,
+         overlay_descriptors=_gfx11_core_overlay_descriptors,
+         extra_descriptors=(_s_delay_alu_descriptor(),),
++        flags=_AMDGPU_CORE_DESCRIPTOR_SET_BUILDER_FLAG_ISSUE_CAPTURED_SOURCES,
+     ),
+     "gfx11_generic": _AmdgpuCoreDescriptorSetBuilder(
+         base=_AMDGPU_GFX11_GENERIC_CORE_DESCRIPTOR_SET_BASE,
+         overlay_rows=_gfx11_generic_core_overlays,
+         overlay_descriptors=_gfx11_generic_core_overlay_descriptors,
+         extra_descriptors=(_s_delay_alu_descriptor(),),
++        flags=_AMDGPU_CORE_DESCRIPTOR_SET_BUILDER_FLAG_ISSUE_CAPTURED_SOURCES,
+     ),
+     "gfx12_generic": _AmdgpuCoreDescriptorSetBuilder(
+         base=_AMDGPU_GFX12_GENERIC_CORE_DESCRIPTOR_SET_BASE,
+@@ -1290,6 +1460,7 @@ _AMDGPU_CORE_DESCRIPTOR_SET_BUILDERS = {
+         overlay_rows=_gfx117x_core_overlays,
+         overlay_descriptors=_gfx117x_core_overlay_descriptors,
+         extra_descriptors=(_s_delay_alu_descriptor(),),
++        flags=_AMDGPU_CORE_DESCRIPTOR_SET_BUILDER_FLAG_ISSUE_CAPTURED_SOURCES,
+     ),
+     "rdna4": _AmdgpuCoreDescriptorSetBuilder(
+         base=_AMDGPU_RDNA4_CORE_DESCRIPTOR_SET_BASE,
+@@ -1340,7 +1511,12 @@ def _build_amdgpu_core_descriptor_set_from_spec(
+     if is_gfx125x:
+         descriptor_set = _with_gfx125x_vgpr_msb_address_states(descriptor_set)
+     descriptor_set = _with_storage_lease_rows(
+-        descriptor_set, enable_gfx125x_xcnt=is_gfx125x
++        descriptor_set,
++        enable_gfx125x_xcnt=is_gfx125x,
++        issue_captured_sources=bool(
++            builder.flags
++            & _AMDGPU_CORE_DESCRIPTOR_SET_BUILDER_FLAG_ISSUE_CAPTURED_SOURCES
++        ),
+     )
+     descriptor_set = _with_instruction_classes(descriptor_set)
+     _validate_descriptor_encoding_formats(target, spec, descriptor_set)
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c b/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c
+index e7fe35d28..8bbf4eb0b 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c
++++ b/loom/src/loom/target/arch/amdgpu/planning/wait_plan.c
+@@ -349,6 +349,8 @@ iree_string_view_t loom_amdgpu_wait_plan_reason_name(
+       return IREE_SV("amdgpu.ssa_use");
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_BARRIER:
+       return IREE_SV("amdgpu.barrier");
++    case LOOM_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE:
++      return IREE_SV("amdgpu.store_source_reuse");
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_READ_RESULT_REUSE:
+       return IREE_SV("amdgpu.read_result_reuse");
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_TRANS_RESULT_USE:
+@@ -407,6 +409,7 @@ static bool loom_amdgpu_wait_plan_reason_has_consumer(
+     loom_amdgpu_wait_plan_reason_t reason) {
+   switch (reason) {
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_SSA_USE:
++    case LOOM_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE:
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_READ_RESULT_REUSE:
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_TRANS_RESULT_USE:
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_VALU_SGPR_READ:
+@@ -423,6 +426,7 @@ static bool loom_amdgpu_wait_plan_reason_has_consumer(
+ static bool loom_amdgpu_wait_plan_reason_is_storage_release(
+     loom_amdgpu_wait_plan_reason_t reason) {
+   switch (reason) {
++    case LOOM_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE:
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_READ_RESULT_REUSE:
+     case LOOM_AMDGPU_WAIT_PLAN_REASON_MEMORY_SOURCE_REUSE:
+       return true;
+diff --git a/loom/src/loom/target/arch/amdgpu/planning/wait_plan.h b/loom/src/loom/target/arch/amdgpu/planning/wait_plan.h
+index 8469f11c0..5598dc6fc 100644
+--- a/loom/src/loom/target/arch/amdgpu/planning/wait_plan.h
++++ b/loom/src/loom/target/arch/amdgpu/planning/wait_plan.h
+@@ -51,7 +51,9 @@ typedef enum loom_amdgpu_wait_plan_reason_e {
+   LOOM_AMDGPU_WAIT_PLAN_REASON_SSA_USE = 2,
+   // A barrier observes memory that may still have outstanding packets.
+   LOOM_AMDGPU_WAIT_PLAN_REASON_BARRIER = 3,
+-  // Reason identifier 4 is reserved to keep report identifiers stable.
++  // A packet reuses physical VGPRs still consumed by an outstanding store.
++  // Only descriptor sets without issue-captured sources project this lease.
++  LOOM_AMDGPU_WAIT_PLAN_REASON_STORE_SOURCE_REUSE = 4,
+   // A packet overwrites physical registers that still receive an outstanding
+   // memory-read result.
+   LOOM_AMDGPU_WAIT_PLAN_REASON_READ_RESULT_REUSE = 5,
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test
+index 14d389c49..4be7dd2e5 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test
+@@ -482,16 +482,16 @@ low.kernel.def target<amdgpu.rdna3_5.core>(@target) abi_layout({constant_count =
+   s_mov_b64_exec_read s[4:5]
+   s_mov_b64 exec, -1
+   s_waitcnt_vscnt vscnt(0)
+-  scratch_load_b32 v2, off, off offset:0 glc:0 slc:0 dlc:0
++  scratch_load_b32 v1, off, off offset:0 glc:0 slc:0 dlc:0
+   s_waitcnt vmcnt(0) lgkmcnt(63)
+-  v_readfirstlane_b32 s1, v2
++  v_readfirstlane_b32 s1, v1
+   s_mov_b64 exec, s[4:5]
+   s_delay_alu instid0(VALU_DEP_1)
+   s_add_u32 s0, s0, s1
+   s_load_dwordx2 s[2:3], s[2:3] offset:0
+-  v_mov_b32_copy v2, s0
++  v_mov_b32_copy v1, s0
+   v_lshlrev_b32 v0, 2, v0
+   s_waitcnt vmcnt(63) lgkmcnt(0)
+-  global_store_b32 v0, v2, s[2:3] offset:0
++  global_store_b32 v0, v1, s[2:3] offset:0
+   s_waitcnt_vscnt vscnt(0)
+   s_endpgm
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_edge_copy_wait.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_edge_copy_wait.loom-test
+index 6f97a0ded..303c7092b 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_edge_copy_wait.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_edge_copy_wait.loom-test
+@@ -38,6 +38,7 @@ low.func.def target<amdgpu.rdna4.gfx125x.core>(@target) @branch_edge_copy_preced
+   v_mov_b32 v0, v3
+ .Lbb1:
+   global_store_b32 v0, v1, s[0:1] offset:0
++  s_wait_storecnt storecnt(0)
+   s_wait_xcnt xcnt(0)
+   v_mov_b32 v0, v2
+   s_branch .Lbb1
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_memory_scalar_capture.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_memory_scalar_capture.loom-test
+index 6cf474ace..d41beb31b 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_memory_scalar_capture.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_memory_scalar_capture.loom-test
+@@ -1,69 +1,3 @@
+-// Copyright 2026 The IREE Authors
+-//
+-// Licensed under the Apache License v2.0 with LLVM Exceptions.
+-// See https://llvm.org/LICENSE.txt for license information.
+-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+-
+-// Scalar input capture and result readiness are separate hardware events.
+-// Fixed assignments force the overwrite; available spare SGPRs cannot hide it.
+-
+-// RUN: emit amdgpu-assembly @buffer_scalar_capture_gfx942 strategy=source fixed=%resource:physical_register:32:4 fixed=%offset:physical_register:40:1 fixed=%next_offset:physical_register:40:1 fixed=%first:physical_register:8:1 fixed=%second:physical_register:12:1
+-
+-amdgpu.target<gfx942> @target
+-
+-low.func.def target<amdgpu.cdna3.core>(@target) @buffer_scalar_capture_gfx942(%resource: reg<amdgpu.sgpr x4>, %address: reg<amdgpu.vgpr>, %offset: reg<amdgpu.sgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+-  %first = buffer_load_dword %resource, %address, %offset
+-  %next_offset = s_add_u32_rhs_inline %offset, 4
+-  %second = buffer_load_dword %resource, %address, %next_offset
+-  return %first, %second
+-}
+-
+-// ----
+-  buffer_load_dword v8, v0, s[32:35], s40 offen offset:0
+-  s_add_u32 s40, s40, 4
+-  buffer_load_dword v12, v0, s[32:35], s40 offen offset:0
+-  s_waitcnt vmcnt(0) lgkmcnt(15)
+-  s_endpgm
+-
+-// ====
+-// RUN: emit amdgpu-assembly @buffer_scalar_capture_gfx950 strategy=source fixed=%resource:physical_register:32:4 fixed=%offset:physical_register:40:1 fixed=%next_offset:physical_register:40:1 fixed=%first:physical_register:8:1 fixed=%second:physical_register:12:1
+-
+-amdgpu.target<gfx950> @target
+-
+-low.func.def target<amdgpu.cdna4.core>(@target) @buffer_scalar_capture_gfx950(%resource: reg<amdgpu.sgpr x4>, %address: reg<amdgpu.vgpr>, %offset: reg<amdgpu.sgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+-  %first = buffer_load_dword %resource, %address, %offset
+-  %next_offset = s_add_u32_rhs_inline %offset, 4
+-  %second = buffer_load_dword %resource, %address, %next_offset
+-  return %first, %second
+-}
+-
+-// ----
+-  buffer_load_dword v8, v0, s[32:35], s40 offen offset:0
+-  s_add_u32 s40, s40, 4
+-  buffer_load_dword v12, v0, s[32:35], s40 offen offset:0
+-  s_waitcnt vmcnt(0) lgkmcnt(15)
+-  s_endpgm
+-
+-// ====
+-// RUN: emit amdgpu-assembly @buffer_scalar_capture_gfx9_4_generic strategy=source fixed=%resource:physical_register:32:4 fixed=%offset:physical_register:40:1 fixed=%next_offset:physical_register:40:1 fixed=%first:physical_register:8:1 fixed=%second:physical_register:12:1
+-
+-amdgpu.target<gfx9-4-generic> @target
+-
+-low.func.def target<amdgpu.gfx9_4.generic.core>(@target) @buffer_scalar_capture_gfx9_4_generic(%resource: reg<amdgpu.sgpr x4>, %address: reg<amdgpu.vgpr>, %offset: reg<amdgpu.sgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+-  %first = buffer_load_dword %resource, %address, %offset
+-  %next_offset = s_add_u32_rhs_inline %offset, 4
+-  %second = buffer_load_dword %resource, %address, %next_offset
+-  return %first, %second
+-}
+-
+-// ----
+-  buffer_load_dword v8, v0, s[32:35], s40 offen offset:0
+-  s_add_u32 s40, s40, 4
+-  buffer_load_dword v12, v0, s[32:35], s40 offen offset:0
+-  s_waitcnt vmcnt(0) lgkmcnt(15)
+-  s_endpgm
+-
+-// ====
+ // RUN: emit amdgpu-assembly @buffer_scalar_capture_gfx1100 strategy=source fixed=%resource:physical_register:32:4 fixed=%offset:physical_register:40:1 fixed=%next_offset:physical_register:40:1 fixed=%first:physical_register:8:1 fixed=%second:physical_register:12:1
+ 
+ amdgpu.target<gfx1100> @target
+@@ -120,44 +54,6 @@ low.func.def target<amdgpu.rdna3_5.core>(@target) @buffer_scalar_capture_gfx1151
+   s_waitcnt vmcnt(0) lgkmcnt(63)
+   s_endpgm
+ 
+-// ====
+-// RUN: emit amdgpu-assembly @buffer_scalar_capture_gfx1201 strategy=source fixed=%resource:physical_register:32:4 fixed=%offset:physical_register:40:1 fixed=%next_offset:physical_register:40:1 fixed=%first:physical_register:8:1 fixed=%second:physical_register:12:1
+-
+-amdgpu.target<gfx1201> @target
+-
+-low.func.def target<amdgpu.rdna4.core>(@target) @buffer_scalar_capture_gfx1201(%resource: reg<amdgpu.sgpr x4>, %address: reg<amdgpu.vgpr>, %offset: reg<amdgpu.sgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+-  %first = buffer_load_dword %resource, %address, %offset
+-  %next_offset = s_add_u32_rhs_inline %offset, 4
+-  %second = buffer_load_dword %resource, %address, %next_offset
+-  return %first, %second
+-}
+-
+-// ----
+-  buffer_load_dword v8, v0, s[32:35], s40 offen offset:0
+-  s_add_u32 s40, s40, 4
+-  buffer_load_dword v12, v0, s[32:35], s40 offen offset:0
+-  s_wait_loadcnt loadcnt(0)
+-  s_endpgm
+-
+-// ====
+-// RUN: emit amdgpu-assembly @buffer_scalar_capture_gfx12_generic strategy=source fixed=%resource:physical_register:32:4 fixed=%offset:physical_register:40:1 fixed=%next_offset:physical_register:40:1 fixed=%first:physical_register:8:1 fixed=%second:physical_register:12:1
+-
+-amdgpu.target<gfx12-generic> @target
+-
+-low.func.def target<amdgpu.gfx12.generic.core>(@target) @buffer_scalar_capture_gfx12_generic(%resource: reg<amdgpu.sgpr x4>, %address: reg<amdgpu.vgpr>, %offset: reg<amdgpu.sgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) asm {
+-  %first = buffer_load_dword %resource, %address, %offset
+-  %next_offset = s_add_u32_rhs_inline %offset, 4
+-  %second = buffer_load_dword %resource, %address, %next_offset
+-  return %first, %second
+-}
+-
+-// ----
+-  buffer_load_dword v8, v0, s[32:35], s40 offen offset:0
+-  s_add_u32 s40, s40, 4
+-  buffer_load_dword v12, v0, s[32:35], s40 offen offset:0
+-  s_wait_loadcnt loadcnt(0)
+-  s_endpgm
+-
+ // ====
+ // RUN: emit amdgpu-assembly @buffer_atomic_scalar_capture strategy=source fixed=%base:physical_register:32:4 fixed=%replacement:physical_register:32:1 fixed=%old:physical_register:8:1
+ 
+@@ -174,60 +70,3 @@ low.func.def target<amdgpu.rdna3_5.core>(@target) @buffer_atomic_scalar_capture(
+   s_mov_b32 s32, 0
+   s_waitcnt vmcnt(0) lgkmcnt(63)
+   s_endpgm
+-
+-// ====
+-// RUN: emit amdgpu-assembly @global_store_scalar_capture strategy=source fixed=%base:physical_register:32:2 fixed=%replacement:physical_register:32:1
+-
+-amdgpu.target<gfx1201> @target
+-
+-low.func.def target<amdgpu.rdna4.core>(@target) @global_store_scalar_capture(%base: reg<amdgpu.sgpr x2>, %address: reg<amdgpu.vgpr>, %value: reg<amdgpu.vgpr>) -> (reg<amdgpu.sgpr>) asm {
+-  global_store_b32_saddr %address, %value, %base
+-  %replacement = s_mov_b32 0
+-  return %replacement
+-}
+-
+-// ----
+-  global_store_b32 v0, v1, s[32:33] offset:0
+-  s_mov_b32 s32, 0
+-  s_wait_storecnt storecnt(0)
+-  s_endpgm
+-
+-// ====
+-// RUN: emit amdgpu-assembly @ldsdma_scalar_capture strategy=source fixed=%base:physical_register:32:2 fixed=%replacement:physical_register:32:1
+-
+-amdgpu.target<gfx942> @target
+-
+-low.func.def target<amdgpu.cdna3.core>(@target) @ldsdma_scalar_capture(%base: reg<amdgpu.sgpr x2>, %address: reg<amdgpu.vgpr>, %m0: reg<amdgpu.m0>) -> (reg<amdgpu.vgpr>, reg<amdgpu.sgpr>) asm {
+-  global_load_lds_dword_saddr %address, %base, %m0
+-  %replacement = s_mov_b32 0
+-  %loaded = ds_read_b32 %address
+-  return %loaded, %replacement
+-}
+-
+-// ----
+-  global_load_lds_dword v0, s[32:33] offset:0
+-  s_mov_b32 s32, 0
+-  s_waitcnt vmcnt(0) lgkmcnt(15)
+-  ds_read_b32 v0, v0 offset:0
+-  s_waitcnt vmcnt(63) lgkmcnt(0)
+-  s_endpgm
+-
+-// ====
+-// RUN: emit amdgpu-assembly @tensor_dgroup_capture strategy=source fixed=%d0:physical_register:0:4 fixed=%d1:physical_register:8:8 fixed=%replacement:physical_register:0:1
+-
+-amdgpu.target<gfx1250> @target
+-
+-low.func.def target<amdgpu.rdna4.gfx125x.core>(@target) @tensor_dgroup_capture(%d0: reg<amdgpu.sgpr x4>, %d1: reg<amdgpu.sgpr x8>, %address: reg<amdgpu.vgpr>) -> (reg<amdgpu.vgpr>, reg<amdgpu.sgpr>) asm {
+-  tensor_load_to_lds_d2 %d0, %d1
+-  %replacement = s_mov_b32 0
+-  %loaded = ds_read_b32 %address
+-  return %loaded, %replacement
+-}
+-
+-// ----
+-  tensor_load_to_lds s[0:3], s[8:15]
+-  s_mov_b32 s0, 0
+-  s_wait_tensorcnt tensorcnt(0)
+-  ds_read_b32 v0, v0 offset:0
+-  s_wait_dscnt dscnt(0)
+-  s_endpgm
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test
+index c549213c8..c40eb86ca 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_vmem_latency_schedule.loom-test
+@@ -206,11 +206,11 @@ low.func.def target<amdgpu.rdna4.core>(@target) @second_batch_loads_issue_before
+   s_delay_alu instid0(VALU_DEP_1)
+   v_xor_b32 v2, v2, v26
+   global_store_b32 v0, v1, s[2:3] offset:0
+-  v_xor_b32 v1, v2, v27
++  v_xor_b32 v2, v2, v27
+   s_delay_alu instid0(VALU_DEP_1)
+-  v_xor_b32 v1, v1, v28
++  v_xor_b32 v2, v2, v28
+   s_delay_alu instid0(VALU_DEP_1)
+-  v_xor_b32 v1, v1, v29
+-  global_store_b32 v0, v1, s[2:3] offset:4
++  v_xor_b32 v2, v2, v29
++  global_store_b32 v0, v2, s[2:3] offset:4
+   s_wait_storecnt storecnt(0)
+   s_endpgm
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_wait_plan.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_wait_plan.loom-test
+index 8a9edf4c3..0d8233137 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_wait_plan.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_wait_plan.loom-test
+@@ -738,9 +738,9 @@ low.func.def target<amdgpu.cdna3.core>(@target) @cdna_scratch_packets_read_m0_st
+   s_mov_b32 m0, 0
+   scratch_store_b32 off, v0, off offset:0 nt:0 sc0:0 sc1:0
+   s_waitcnt vmcnt(0) lgkmcnt(15)
+-  scratch_load_b32 v0, off, off offset:0 nt:0 sc0:0 sc1:0
++  scratch_load_b32 v2, off, off offset:0 nt:0 sc0:0 sc1:0
+   s_waitcnt vmcnt(0) lgkmcnt(15)
+-  global_store_dword v1, v0, s[0:1] offset:0
++  global_store_dword v1, v2, s[0:1] offset:0
+   s_waitcnt vmcnt(0) lgkmcnt(15)
+   s_endpgm
+ 
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test
+index 1f98ece58..4e6958030 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test
++++ b/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test
+@@ -79,21 +79,21 @@ low.func.def target<amdgpu.gfx9_4.generic.core>(@gfx9_4_generic_target) @gfx9_4_
+   v_mov_b32_copy v0, s0
+   s_mov_b32 m0, 0
+   scratch_store_b32 off, v0, off offset:0 nt:0 sc0:0 sc1:0
+-  v_mov_b32_copy v0, s1
++  v_mov_b32_copy v1, s1
+   s_mov_b32 m0, 0
+-  scratch_store_b32 off, v0, off offset:4 nt:0 sc0:0 sc1:0
++  scratch_store_b32 off, v1, off offset:4 nt:0 sc0:0 sc1:0
+   s_mov_b64 exec, s[2:3]
+   s_mov_b64_exec_read s[0:1]
+   s_mov_b64 exec, -1
+   s_mov_b32 m0, 0
+   s_waitcnt vmcnt(0) lgkmcnt(15)
+-  scratch_load_b32 v0, off, off offset:0 nt:0 sc0:0 sc1:0
++  scratch_load_b32 v2, off, off offset:0 nt:0 sc0:0 sc1:0
+   s_waitcnt vmcnt(0) lgkmcnt(15)
+-  v_readfirstlane_b32 s2, v0
++  v_readfirstlane_b32 s2, v2
+   s_mov_b32 m0, 0
+-  scratch_load_b32 v0, off, off offset:4 nt:0 sc0:0 sc1:0
++  scratch_load_b32 v2, off, off offset:4 nt:0 sc0:0 sc1:0
+   s_waitcnt vmcnt(0) lgkmcnt(15)
+-  v_readfirstlane_b32 s3, v0
++  v_readfirstlane_b32 s3, v2
+   s_mov_b64 exec, s[0:1]
+   s_endpgm
+ 
+-- 
+2.51.0
+
