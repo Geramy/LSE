@@ -10,6 +10,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/hybrid_lm.hpp"
+#include "lse/runtime/draft_tree.hpp"
 #include "lse/runtime/sampler.hpp"
 
 namespace lse::model {
@@ -84,6 +85,10 @@ class DFlash2Module {
   Result<DFlash2Proposal> draft_sampled(std::uint32_t anchor,
       std::int32_t first, std::uint32_t proposals, float temperature,
       runtime::SpeculativeSampler& sampler);
+
+  // The whole block's candidate lattice (every proposal position's candidates
+  // given each candidate of the position before), for a draft tree.
+  Result<runtime::DraftLattice> draft_lattice(std::uint32_t anchor, std::int32_t first);
 
  private:
   struct Impl;

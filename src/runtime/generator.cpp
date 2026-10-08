@@ -1,9 +1,11 @@
 #include "lse/runtime/generator.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <cmath>
@@ -362,7 +364,13 @@ Status Generator::prepare_kernels() {
             ? static_cast<std::uint32_t>(sp.top_k) : 0u;
     const std::uint32_t widest =
         dflash2_ != nullptr ? dflash2_verify_depth(dflash2_->block_size()) + 1 : kMaxMtpDepth + 1;
-    for (std::uint32_t m = 1; m <= widest; ++m) {
+    // With draft trees, every tree rung as well (kTreeRows; rows past `widest`
+    // are tree passes only).
+    std::vector<std::pair<std::uint32_t, bool>> passes;
+    for (std::uint32_t m = 1; m <= widest; ++m) passes.emplace_back(m, false);
+    if (dflash2_ != nullptr && tree_)
+      for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows) passes.emplace_back(rows, true);
+    for (const auto& [m, tree_pass] : passes) {
       Session scratch("", model_.state_slots());
       // Held as verify() holds them: a device buffer of m ids.
       auto buffer = sched->backend().allocate(dtype_storage_bytes(DType::kF32, m),
@@ -377,11 +385,23 @@ Status Generator::prepare_kernels() {
       }
       model::FeatureCapture capture;
       if (dflash2_ != nullptr) capture.layer_ids = dflash2_->target_layers();
+      // A tree's kernels follow its row count alone: a root and m - 1 children.
+      model::TreeLayout star;
+      if (tree_pass) {
+        star.depth.assign(m, 1);
+        star.parent.assign(m, 0);
+        star.depth[0] = 0;
+        star.parent[0] = -1;
+        star.main_rows = 2;
+      }
       LSE_ASSIGN_OR(Array hidden,
                     model_.hidden(ids, &scratch.states(), nullptr, nullptr, nullptr, false,
-                                  dflash2_ != nullptr ? &capture : nullptr, m > 1,
-                                  ops::AttentionExecutionPhase::kSpeculative));
-      if (m > 1) LSE_RETURN_IF_ERROR(model_.prepare_prefix_commits());
+                                  dflash2_ != nullptr ? &capture : nullptr, m > 1 && !tree_pass,
+                                  tree_pass ? ops::AttentionExecutionPhase::kTree
+                                            : ops::AttentionExecutionPhase::kSpeculative,
+                                  0, tree_pass ? &star : nullptr));
+      if (tree_pass) LSE_RETURN_IF_ERROR(model_.prepare_tree_commit());
+      else if (m > 1) LSE_RETURN_IF_ERROR(model_.prepare_prefix_commits());
       hidden.node()->materialized = true;
       // Each head is its own eval in verify(): greedy picks, the device top-k,
       // or the logits themselves.
@@ -649,21 +669,24 @@ Status Generator::flush_draft_context() {
 
 Status Generator::verify(Session& session,
                          std::span<const std::uint32_t> rows,
-                         bool replaces_previous) {
+                         bool replaces_previous, const model::TreeLayout* tree) {
   graph::Scheduler* sched = graph::default_scheduler();
   if (sched == nullptr) {
     return LSE_ERROR(kInternal, "no usable backend for the verify pass");
   }
   const auto m = static_cast<std::int64_t>(rows.size());
-  if (spec_ids_.valid() &&
-      spec_ids_.shape().elem_count() != rows.size()) {
+  // Chain and tree passes of one width are different programs: each keeps
+  // its own head and token slot.
+  const std::size_t key = rows.size() + (tree != nullptr ? kTreeHeadKey : 0);
+  if (spec_ids_.valid() && spec_key_ != key) {
     // Park this width's head and ids and take the other width's back out;
     // each width keeps its recorded programs across switches.
-    spec_by_m_[spec_ids_.shape().elem_count()] = std::move(spec_);
-    spec_ids_by_m_[spec_ids_.shape().elem_count()] = std::move(spec_ids_);
-    spec_ = std::move(spec_by_m_[rows.size()]);
-    spec_ids_ = std::move(spec_ids_by_m_[rows.size()]);
+    spec_by_m_[spec_key_] = std::move(spec_);
+    spec_ids_by_m_[spec_key_] = std::move(spec_ids_);
+    spec_ = std::move(spec_by_m_[key]);
+    spec_ids_ = std::move(spec_ids_by_m_[key]);
   }
+  spec_key_ = key;
   if (!spec_ids_.valid()) {
     const std::size_t bytes = dtype_storage_bytes(DType::kF32, rows.size());
     auto buf = sched->backend().allocate(bytes, backend::MemoryClass::kDevice);
@@ -680,6 +703,9 @@ Status Generator::verify(Session& session,
     n.materialized = true;
   }
 
+  // A tree pass's contractions may take the part's tree-only widths.
+  std::optional<graph::TreePassScope> tree_pass;
+  if (tree != nullptr) tree_pass.emplace();
   const std::uint64_t started = now_ns();
   LSE_RETURN_IF_ERROR(begin_verify_burst());
   model::FeatureCapture capture;
@@ -688,7 +714,10 @@ Status Generator::verify(Session& session,
                 model_.hidden(spec_ids_, &session.states(), nullptr, nullptr,
                               nullptr, replaces_previous,
                               dflash2_ != nullptr ? &capture : nullptr,
-                              m > 1, ops::AttentionExecutionPhase::kSpeculative));
+                              m > 1 && tree == nullptr,
+                              tree != nullptr ? ops::AttentionExecutionPhase::kTree
+                                              : ops::AttentionExecutionPhase::kSpeculative,
+                              0, tree));
   spec_features_ = std::move(capture.features);
 
   const SamplingParams& sp = sampler_.params();
@@ -892,6 +921,21 @@ Status Generator::append_draft_context(std::size_t rows, std::int32_t first) {
   return OkStatus();
 }
 
+Status Generator::append_draft_path(std::span<const std::uint32_t> path, std::int32_t first,
+                                    const Array& gathered) {
+  if (dflash2_ == nullptr) return OkStatus();
+  bool prefix = true;
+  for (std::size_t j = 0; j < path.size(); ++j) prefix = prefix && path[j] == j;
+  if (prefix) return append_draft_context(path.size(), first);
+  if (!gathered.valid() || gathered.shape().rank() != 3 ||
+      gathered.shape().dim(1) != static_cast<std::int64_t>(path.size()))
+    return LSE_ERROR(kInternal, "the tree commit gathered no features for its path");
+  const auto started = now_ns();
+  LSE_RETURN_IF_ERROR(dflash2_->append_context(gathered, first));
+  stats_.spec_draft_ns += now_ns() - started;
+  return OkStatus();
+}
+
 // Commit valid verifier inputs and discard the unaccepted suffix's state.
 Result<std::vector<std::uint32_t>> Generator::speculate(
     Session& session, std::vector<float>& prefill_logits,
@@ -919,8 +963,11 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   // bits between verify widths (the GEMM shape and the Gated DeltaNet
   // chunking follow the rows of a pass), and that can flip a near-tie
   // between two tokens.
+  // A draft tree's output is the target's own answers at every width, so
+  // greedy tree requests take the policy too.
+  const bool tree_mode = dflash2_ != nullptr && tree_;
   DraftWidthPolicy* const widths =
-      sampled && (dflash2_ != nullptr || limits.adaptive_mtp) ? widths_ : nullptr;
+      (sampled || tree_mode) && (dflash2_ != nullptr || limits.adaptive_mtp) ? widths_ : nullptr;
   stats_.spec_adaptive = widths != nullptr;
   // An adaptive MTP chain may run as deep as a chain and a verify pass go.
   const std::uint32_t depth = dflash2_ != nullptr ? dflash2_verify_depth(dflash2_->block_size())
@@ -929,6 +976,14 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   std::vector<double> confidence, estimates;
   std::uint64_t last_draft_ns = 0;
   std::int32_t last_draft_depth = -1;  // -1: the step drew no draft
+  // The tree the next pass verifies, when the draft made one.
+  std::optional<DraftTree> tree_now;
+  model::TreeLayout tree_layout;
+  DraftLattice tree_lattice;
+  double tree_temperature = 1.0;
+  std::uint32_t fixed_tree_nodes = 15;
+  if (const char* nodes = std::getenv("LSE_DFLASH2_TREE_NODES"))
+    fixed_tree_nodes = static_cast<std::uint32_t>(std::strtoul(nodes, nullptr, 10));
   const auto next_width = [&] {
     return mtp_verify_rows(
         depth, static_cast<std::uint64_t>(limits.max_tokens) - generated.size(),
@@ -938,6 +993,96 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
                                     std::span<const std::uint32_t> tokens,
                                     std::int32_t first, std::uint32_t proposals)
       -> Result<std::vector<std::uint32_t>> {
+    if (dflash2_ != nullptr && tree_) {
+      confidence.clear();
+      estimates.clear();
+      last_draft_ns = 0;
+      last_draft_depth = -1;
+      tree_now.reset();
+      if (proposals == 0) return std::vector<std::uint32_t>{};
+      if (widths != nullptr && !widths->draft_next(true)) return std::vector<std::uint32_t>{};
+      const std::uint64_t started = now_ns();
+      const auto anchor_at = first + static_cast<std::int32_t>(tokens.size()) - 1;
+      LSE_ASSIGN_OR(DraftLattice lattice, dflash2_->draft_lattice(tokens.back(), anchor_at));
+      last_draft_ns = now_ns() - started;
+      last_draft_depth = static_cast<std::int32_t>(DraftWidthPolicy::kMaxProposals);
+      // A shorter remaining output or context cuts the tree's depth.
+      if (proposals < lattice.positions) {
+        lattice.positions = proposals;
+        lattice.scores.resize(static_cast<std::size_t>(proposals) * lattice.top * lattice.top);
+        lattice.ids.resize(static_cast<std::size_t>(proposals) * lattice.top);
+      }
+      const auto room = static_cast<std::int64_t>(model_.config().kv_capacity()) - anchor_at;
+      std::uint32_t nodes = widths != nullptr ? DraftWidthPolicy::kMaxTreeNodes : fixed_tree_nodes;
+      if (static_cast<std::int64_t>(nodes) + 1 > room)
+        nodes = room > 1 ? static_cast<std::uint32_t>(room - 1) : 0u;
+      const double temperature = sampled ? sampler_.params().temperature : 1.0;
+      TreeExpansion expansion;
+      if (nodes > 0) {
+        std::function<double(double)> calibrate;
+        if (widths != nullptr) calibrate = [widths](double q) { return widths->candidate(q); };
+        LSE_ASSIGN_OR(expansion, expand_tree(lattice, temperature, nodes, calibrate));
+        nodes = static_cast<std::uint32_t>(expansion.nodes.size());
+        if (widths != nullptr) {
+          // The draft's top path verified as a chain, valued the same way:
+          // chain_prefix[k] for its first k proposals.
+          std::vector<double> chain_prefix{0.0}, q(lattice.top);
+          double reach = 1.0;
+          for (std::uint32_t p = 0, pred = 0; p < lattice.positions; ++p) {
+            lattice.conditional(p, pred, temperature, q);
+            pred = static_cast<std::uint32_t>(std::max_element(q.begin(), q.end()) - q.begin());
+            reach *= widths->candidate(q[pred]);
+            chain_prefix.push_back(chain_prefix.back() + reach);
+          }
+          nodes = widths->tree_nodes(expansion.value_prefix, chain_prefix);
+        }
+      }
+      if (nodes > 0) {
+        LSE_ASSIGN_OR(DraftTree tree, layout_tree(lattice, tokens.back(), expansion, nodes));
+        if (tree.rows() < 2) return std::vector<std::uint32_t>{};
+        if (widths != nullptr)
+          widths->observe_tree_value(expansion.value_prefix[nodes],
+                                     static_cast<std::uint32_t>(tree.rows()));
+        std::vector<std::uint32_t> out(tree.tokens.begin() + 1, tree.tokens.end());
+        tree_now = std::move(tree);
+        tree_lattice = std::move(lattice);
+        tree_temperature = temperature;
+        return out;
+      }
+      // A chain through the same lattice: sampled from the draft's
+      // conditionals for a sampled request, its best path for a greedy one,
+      // and with the policy, trimmed to the prefix that pays as without trees.
+      std::vector<std::uint32_t> chain;
+      if (sampled) {
+        LSE_ASSIGN_OR(auto proposal, model::dflash2_sample_path(
+            lattice.scores, lattice.ids, lattice.positions, lattice.top,
+            static_cast<std::uint32_t>(model_.config().vocab_size),
+            sampler_.params().temperature, speculative_sampler));
+        proposal_distributions = std::move(proposal.conditionals);
+        chain = std::move(proposal.tokens);
+        for (const DiscreteDistribution& d : proposal_distributions)
+          confidence.push_back(d.probabilities.empty() ? 0.0
+              : *std::max_element(d.probabilities.begin(), d.probabilities.end()));
+      } else {
+        LSE_ASSIGN_OR(chain, model::dflash2_select_path(lattice.scores, lattice.ids,
+                                                       lattice.positions, lattice.top));
+        std::vector<double> q(lattice.top);
+        for (std::uint32_t p = 0, pred = 0; p < lattice.positions; ++p) {
+          lattice.conditional(p, pred, 1.0, q);
+          pred = static_cast<std::uint32_t>(std::max_element(q.begin(), q.end()) - q.begin());
+          confidence.push_back(q[pred]);
+        }
+      }
+      if (widths != nullptr && !chain.empty()) {
+        estimates.assign(confidence.size(), 0.0);
+        const std::uint32_t k = widths->proposals(confidence, estimates);
+        widths->observe_draft_value(estimates, k);
+        chain.resize(k);
+        confidence.resize(k);
+        estimates.resize(k);
+      }
+      return chain;
+    }
     if (dflash2_ != nullptr) {
       confidence.clear();
       estimates.clear();
@@ -1098,6 +1243,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   // evals of every step, such as the verified feature prefix, partition.)
   std::uint64_t step_top = 0;
   std::size_t step_rows = 0, step_tokens = 0;
+  bool step_tree = false;
   std::int32_t step_at = 0;
   std::string step_trace;
   struct StepWork {
@@ -1116,6 +1262,15 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   while (running) {
     m = row_in.size();
     const auto at = static_cast<std::int32_t>(session.position());
+    if (tree_now) {
+      tree_layout.depth.clear();
+      tree_layout.parent.clear();
+      for (std::size_t r = 0; r < tree_now->rows(); ++r) {
+        tree_layout.depth.push_back(static_cast<std::int32_t>(tree_now->depth[r]));
+        tree_layout.parent.push_back(tree_now->parent[r]);
+      }
+      tree_layout.main_rows = static_cast<std::int32_t>(tree_now->main_rows);
+    }
     if (widths != nullptr) {
       const std::uint64_t now = now_ns();
       const StepWork counters = counters_now();
@@ -1123,7 +1278,11 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         const std::uint64_t period = now - step_top;
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
         const bool warm = step_counters == counters;
-        if (warm) {
+        if (warm && step_tree) {
+          widths->observe_tree_step(static_cast<std::uint32_t>(step_rows), period);
+          widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
+        }
+        if (warm && !step_tree) {
           widths->observe_verify(static_cast<std::uint32_t>(step_rows), verify_ns);
           widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
           if (last_draft_depth >= 0)
@@ -1141,6 +1300,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       step_top = now;
       step_counters = counters;
       step_rows = m;
+      step_tree = tree_now.has_value();
       step_at = at;
       if (lse::debug()) {
         step_trace.clear();
@@ -1152,10 +1312,99 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         }
       }
     }
-    LSE_RETURN_IF_ERROR(verify(session, row_in, false));
+    const std::uint64_t verify_started = now_ns();
+    const std::uint64_t builds_before = model_.builds();
+    LSE_RETURN_IF_ERROR(verify(session, row_in, false, tree_now ? &tree_layout : nullptr));
     ++stats_.spec_steps;
     stats_.spec_proposed += static_cast<std::uint32_t>(m - 1);
     if (m == 1) ++stats_.spec_plain_steps;
+
+    if (tree_now) {
+      // A draft tree: walk down while the target's answer is a child.
+      const DraftTree& tree = *tree_now;
+      ++stats_.tree_steps;
+      stats_.tree_rows += static_cast<std::uint32_t>(m);
+      LSE_ASSIGN_OR(TreeWalk walk, walk_tree(tree, [&](std::uint32_t row)
+          -> Result<std::pair<std::uint32_t, bool>> {
+        std::uint32_t token = 0;
+        if (spec_.greedy) {
+          token = static_cast<std::uint32_t>(graph::interpreter::load_element(*spec_.pick.node(), row));
+        } else if (spec_.top_k != 0) {
+          LSE_RETURN_IF_ERROR(spec_top_row(row));
+          LSE_ASSIGN_OR(auto target, sampler_.distribution_top(spec_top_values_, spec_top_ids_));
+          LSE_ASSIGN_OR(token, speculative_sampler.sample_target(target));
+        } else {
+          LSE_RETURN_IF_ERROR(spec_logit_rows(row + 1));
+          const std::size_t v = spec_logits_.size() / m;
+          LSE_ASSIGN_OR(auto target, sampler_.distribution(
+              std::span<float>(spec_logits_.data() + row * v, v), session.history()));
+          LSE_ASSIGN_OR(token, speculative_sampler.sample_target(target));
+        }
+        return std::pair(token, give(token));
+      }));
+      running = !walk.stopped;
+      // What the target answered at each reached row, against every
+      // candidate the draft had for the position after it.
+      if (widths != nullptr) {
+        std::vector<double> q(tree_lattice.top);
+        for (std::size_t j = 0; j < walk.path.size(); ++j) {
+          const std::uint32_t row = walk.path[j];
+          const std::uint32_t position = tree.depth[row];
+          if (position >= tree_lattice.positions) continue;
+          tree_lattice.conditional(position, row == 0 ? 0u : static_cast<std::uint32_t>(tree.candidate[row]),
+                                   tree_temperature, q);
+          for (std::uint32_t c = 0; c < tree_lattice.top; ++c)
+            widths->observe_candidate(q[c], tree_lattice.ids[position * tree_lattice.top + c] ==
+                                                walk.answers[j]);
+        }
+      }
+      for (std::size_t j = 0; j < walk.path.size(); ++j) {
+        const std::uint32_t row = walk.path[j];
+        if (tree.children[row].empty() || (j + 1 == walk.path.size() && walk.stopped)) continue;
+        const std::size_t position = std::min<std::size_t>(tree.depth[row], 6);
+        ++stats_.spec_tested;
+        ++stats_.spec_tested_by_position[position];
+        if (j + 1 < walk.path.size()) {
+          ++stats_.spec_accepted;
+          ++stats_.spec_accepted_by_position[position];
+        }
+      }
+      const auto commit_started = now_ns();
+      Array path_features;
+      LSE_RETURN_IF_ERROR(model_.commit_tree(session.states(), walk.path,
+                                             dflash2_ != nullptr ? &path_features : nullptr));
+      const auto commit_done = now_ns();
+      stats_.spec_verify_ns += commit_done - commit_started;
+      LSE_RETURN_IF_ERROR(append_draft_path(walk.path, at, path_features));
+      if (lse::debug())
+        std::fprintf(stderr, "[tree-step] position=%d rows=%zu top=%u path=%zu verify_walk_ms=%.3f "
+                     "commit_ms=%.3f context_ms=%.3f built=%d\n", at, m, tree.main_rows,
+                     walk.path.size(), static_cast<double>(commit_started - verify_started) / 1e6,
+                     static_cast<double>(commit_done - commit_started) / 1e6,
+                     static_cast<double>(now_ns() - commit_done) / 1e6,
+                     model_.builds() != builds_before ? 1 : 0);
+      session.advance(static_cast<std::int32_t>(walk.path.size()));
+      retained_rows = 0;
+      retained_first = at;
+      step_tokens = walk.path.size();
+      tree_now.reset();
+      if (!running) break;
+      pending = walk.answers.back();
+      const std::uint32_t width = next_width();
+      if (width == 0) {
+        out_of_positions();
+        running = false;
+        break;
+      }
+      const auto drafted = now_ns();
+      LSE_ASSIGN_OR(std::vector<std::uint32_t> chain,
+                    draft_for_width(spec_.hidden, std::span(&pending, 1), session.position(),
+                                    width - 1));
+      stats_.spec_draft_ns += now_ns() - drafted;
+      row_in.assign(1, pending);
+      row_in.insert(row_in.end(), chain.begin(), chain.end());
+      continue;
+    }
 
     std::size_t emitted_to = 0;
     bool mismatch = false;

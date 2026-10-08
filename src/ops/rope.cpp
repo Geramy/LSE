@@ -183,4 +183,15 @@ Result<Array> apply_rope(const Array& x, const RopeTables& tables,
                      static_cast<int>(tables.dim));
 }
 
+Result<Array> apply_rope_rows(const Array& x, const RopeTables& tables,
+                              const Array& positions) {
+  const Shape& s = x.shape();
+  const std::int64_t head_dim = s.dim(s.rank() - 1);
+  if (tables.dim > head_dim) {
+    return LSE_ERROR(kInvalidArgument, "rope dim exceeds head_dim");
+  }
+  return graph::rope_rows(x, tables.cos, tables.sin, positions,
+                          tables.dim == head_dim ? 0 : static_cast<int>(tables.dim));
+}
+
 }  // namespace lse::ops

@@ -52,8 +52,12 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
     // sit at different absolute positions, and one shared angle would rotate
     // every row but one to somebody else's position. A 1-element input is the
     // single-sequence form and stays exactly that.
+    // iattrs[2] = 1: the 4th input holds one absolute position per sequence
+    // row (a draft tree's rows sit at their depth, not at their index).
+    const bool per_row = live_off && s.iattrs[2] == 1;
+    if (per_row && s.inputs[3].elem_count() < seq) return {};
     const bool ragged =
-        live_off && s.inputs[3].elem_count() >=
+        live_off && !per_row && s.inputs[3].elem_count() >=
                         static_cast<std::size_t>(kv::step_meta_elems(
                             static_cast<std::int32_t>(batch)));
 
@@ -70,10 +74,11 @@ struct RopeKernel final : KernelPrimitive<RopeKernel> {
       offset = e.let(kir::cast<kir::u32>(
           a.off[e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
                 b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow))]));
-    } else if (live_off) {
+    } else if (live_off && !per_row) {
       offset = e.let(kir::cast<kir::u32>(a.off[0u]));
     }
-    const auto t = e.let(offset + (r % seq));
+    const auto t = per_row ? e.let(kir::cast<kir::u32>(a.off[e.let(r % seq)]))
+                           : e.let(offset + (r % seq));
     if (rot == dim) {
       const auto pair = e.let((d / 2u) * 2u);
       const auto base = e.let(r * dim + pair);

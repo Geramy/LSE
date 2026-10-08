@@ -52,7 +52,8 @@ namespace {
 constexpr std::uint32_t kRmsBlock = 256;
 constexpr std::uint32_t kRmsScratch = kRmsBlock * sizeof(float);
 // Register-held rows: up to 32 values per lane, for up to 8 rows (a verify).
-constexpr std::uint32_t kRmsCachedPerLane = 32, kRmsCachedRows = 8;
+// Up to a 31-row draft-tree verify pass: the cached rows sum in the same order.
+constexpr std::uint32_t kRmsCachedPerLane = 32, kRmsCachedRows = 32;
 // Rows no wider than four wave32 lanes' worth (a head's 128) take a wave
 // each, eight to a workgroup, instead of a 256-lane workgroup each.
 constexpr std::uint32_t kNarrowRows = kRmsBlock / 32u;

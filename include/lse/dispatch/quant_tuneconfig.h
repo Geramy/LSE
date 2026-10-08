@@ -62,10 +62,15 @@ struct QuantRowLadderShape {
 // weights once, as the measured pass does, where a pass with no rows of its
 // own falls to row groups that read them once per group. Each row's products
 // and sums are the measured pass's for that row.
+// `tree`: only a draft tree's verify pass takes the rule (graph::TreePassScope
+// marks its contractions with kQuantTreePass in iattrs[3]); a prompt pass of
+// the same width keeps its own kernels.
 struct QuantVerifyRows {
   std::string_view arch;
   std::int64_t m, rows;
+  bool tree = false;
 };
+inline constexpr std::int32_t kQuantTreePass = 0x54524545;
 
 struct QuantPanelDevice {
   std::string_view arch;
@@ -118,6 +123,7 @@ struct Q4MatrixPanelShape {
   std::int64_t m, n, k;
   std::uint32_t rows = 16;
   std::uint32_t shared_words = 0;
+  bool tree = false;  // as QuantVerifyRows::tree
 };
 // Passes of min_m to m rows over K (0: any) store their int8 activation
 // panel in `rows`-row tiles. The 16-row decode tile holds any pass of up to
@@ -139,6 +145,12 @@ struct Q4MatrixPanelLayout {
 };
 inline constexpr std::array kQ4MatrixPanelLayouts{
     Q4MatrixPanelLayout{1, 8, 0, 16},
+    // A draft tree's verify pass of 9 to 15 rows (runtime::DraftTree): one
+    // 16-row tile, as the 8-row passes use. Only tree passes take these rows
+    // (Q4MatrixPanelShape::tree).
+    Q4MatrixPanelLayout{9, 15, 0, 16},
+    // ... and of 17 to 31 rows: two 16-row tiles.
+    Q4MatrixPanelLayout{17, 31, 0, 16},
     Q4MatrixPanelLayout{1024, 1024, 17408, 64},
     Q4MatrixPanelLayout{1024, 1024, 5120, 64},
 };

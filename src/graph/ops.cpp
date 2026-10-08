@@ -1,4 +1,5 @@
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/dispatch/quant.hpp"
 #include "lse/dispatch/q8_matrix.hpp"
 #include "lse/graph/ops.hpp"
@@ -266,6 +267,13 @@ Array linear(const Array& x, const Array& w) {
   return Array(n);
 }
 
+namespace {
+thread_local int tree_pass_scopes = 0;
+}  // namespace
+TreePassScope::TreePassScope() noexcept { ++tree_pass_scopes; }
+TreePassScope::~TreePassScope() { --tree_pass_scopes; }
+bool TreePassScope::active() noexcept { return tree_pass_scopes > 0; }
+
 Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                    const Array& biases, int bits, int group_size) {
   const Shape& sx = x.shape();
@@ -278,6 +286,7 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                 {x.node(), packed.node(), scales.node(), biases.node()});
   n->iattrs[0] = bits;
   n->iattrs[1] = group_size;
+  if (TreePassScope::active()) n->iattrs[3] = dispatch::kQuantTreePass;
   const std::array<Shape, 4> shapes{sx, packed.shape(), scales.shape(), biases.shape()};
   const std::array<DType, 4> dtypes{x.dtype(), packed.dtype(), scales.dtype(), biases.dtype()};
   KernelShapes geometry;
@@ -291,7 +300,14 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   const backend::DeviceInfo* device = nullptr;
   if (Scheduler* scheduler = default_scheduler())
     device = &scheduler->backend().device_info();
-  if (dispatch::q4_gemm_shape(geometry) &&
+  // A draft tree's verify pass of a width the matrix panel names takes it
+  // ahead of the tiled GEMM; every other pass of nine rows or more keeps the
+  // GEMM (a prompt chunk of 1024 rows among them).
+  const bool tree_panel =
+      TreePassScope::active() &&
+      dispatch::q4_matrix_panel_shape(geometry, device ? std::string_view(device->arch)
+                                                       : std::string_view{});
+  if (!tree_panel && dispatch::q4_gemm_shape(geometry) &&
       (device == nullptr || dispatch::q4_gemm_device(*device))) {
     // The tiled GEMM reads an f16 copy of the activation, made once and
     // shared by every contraction over the same activation.
@@ -616,6 +632,17 @@ Array rope(const Array& x, const Array& cos, const Array& sin,
   return Array(n);
 }
 
+Array rope_rows(const Array& x, const Array& cos, const Array& sin,
+                const Array& positions, int rotary) {
+  auto n = make(OpKind::kRoPE, x.shape(), x.dtype(),
+                {x.node(), cos.node(), sin.node(), positions.node()});
+  n->iattrs[0] = 0;
+  n->iattrs[1] = rotary;
+  n->iattrs[2] = 1;
+  n->prim = find_primitive("rope");
+  return Array(n);
+}
+
 Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
            MaskKind mask, int window, int offset) {
   const Shape& sq = q.shape();
@@ -644,15 +671,21 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 }
 
 namespace {
-Array split_paged_attention(const NodePtr& baseline, bool blasst=false) {
-  const auto* partial_prim = find_primitive(blasst ? "attention.blasst.partial1024.v2" : "attention.split_partial128.wg128c2.v1");
+// `flash_parts`: a tree pass's flash split into that many shares of the key
+// windows (dispatch::attention_shapes::flash_split_parts).
+Array split_paged_attention(const NodePtr& baseline, bool blasst=false,
+                            std::uint32_t flash_parts = 0) {
+  const auto* partial_prim = find_primitive(
+      flash_parts ? "attention.flash_split.wmma16.v1"
+      : blasst ? "attention.blasst.partial1024.v2" : "attention.split_partial128.wg128c2.v1");
   const auto* merge_prim = find_primitive("attention.split_merge128.wg128c2.v1");
   if (!partial_prim || !merge_prim) return Array(baseline);
   const auto& q = baseline->inputs[0]->shape;
   const bool short_query = q.dim(2) > 1;
   const auto capacity = baseline->inputs[1]->shape.dim(2) * baseline->inputs[4]->shape.dim(1);
   const auto partition_keys=blasst?1024:128;
-  const auto parts = (capacity + partition_keys - 1) / partition_keys;
+  const auto parts = flash_parts ? static_cast<std::int64_t>(flash_parts)
+                                 : (capacity + partition_keys - 1) / partition_keys;
   const Shape shape = short_query ? Shape{q.dim(0), q.dim(1), q.dim(2), parts, 258}
                                   : Shape{q.dim(0), q.dim(1), parts, 258};
   auto partial = make(OpKind::kCustom, shape, DType::kF32, baseline->inputs);
@@ -734,6 +767,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     if (dispatch::split_short_default_supported(request) ||
         dispatch::split_decode_supported(request))
       return split_paged_attention(n);
+    if (mask == MaskKind::kTree && dispatch::flash_split_scope(request))
+      return split_paged_attention(n, false, dispatch::attention_shapes::flash_split_parts(
+          static_cast<std::uint64_t>(table.shape().dim(1)) * static_cast<std::uint64_t>(block_size),
+          static_cast<std::uint32_t>(sq.dim(1)), static_cast<std::uint32_t>(sq.dim(2)),
+          static_cast<std::uint32_t>(device->compute_units)));
   }
   return Array(n);
 }
@@ -748,6 +786,52 @@ Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
   n->kv_fragments = dst.node()->kv_fragments;
   if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
   return Array(n);
+}
+
+Array kv_page_write_rows(const Array& dst, const Array& src, const Array& table,
+                         const Array& path, int block_size, kv::CacheDType storage) {
+  auto n = make(OpKind::kCustom, dst.shape(), dst.dtype(),
+                {dst.node(), src.node(), table.node(), path.node()});
+  n->iattrs[0] = block_size;
+  n->iattrs[1] = static_cast<std::int32_t>(storage);
+  n->prim = find_primitive("kv_page_write.rows.v1");
+  n->kv_fragments = dst.node()->kv_fragments;
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+
+namespace {
+Array custom_node(std::string_view name, const Shape& shape, const std::vector<Array>& inputs) {
+  std::vector<NodePtr> in;
+  for (const Array& a : inputs) in.push_back(a.node());
+  auto n = make(OpKind::kCustom, shape, DType::kF32, std::move(in));
+  n->prim = find_primitive(name);
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+}  // namespace
+
+Array gated_delta_tree(const Array& q, const Array& k, const Array& v, const Array& alpha,
+                       const Array& beta, const Array& state_in, const Array& depth) {
+  return custom_node("gdn.tree_scan.v1", v.shape(), {q, k, v, alpha, beta, state_in, depth});
+}
+
+Array gated_delta_path(const Array& k, const Array& v, const Array& alpha, const Array& beta,
+                       const Array& state_in, const Array& path) {
+  return custom_node("gdn.path_state.v1", state_in.shape(), {k, v, alpha, beta, state_in, path});
+}
+
+Array causal_conv1d_tree(const Array& x, const Array& weight, const Array& bias,
+                         const Array& tail, const Array& ancestors) {
+  std::vector<NodePtr> in{x.node(), weight.node(), bias.node(), tail.node(), ancestors.node()};
+  auto n = make(OpKind::kCustom, x.shape(), x.dtype(), std::move(in));
+  n->prim = find_primitive("causal_conv1d.tree.v1");
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+
+Array conv_tail_rows(const Array& tail, const Array& x, const Array& path) {
+  return custom_node("conv_tail.rows.v1", tail.shape(), {tail, x, path});
 }
 
 Result<Array> custom(std::string_view primitive, const std::vector<Array>& inputs,

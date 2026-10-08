@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace lse::runtime {
 
@@ -84,7 +85,8 @@ class DraftWidthPolicy {
 
   // Whether the next step drafts at all. False means a plain step: one row,
   // no proposals, no draft.
-  [[nodiscard]] bool draft_next();
+  // `tree`: the drafts are trees (observe_tree_step measures them).
+  [[nodiscard]] bool draft_next(bool tree = false);
 
   // What the target said about a proposal of this confidence.
   void observe_acceptance(double confidence, std::uint32_t position, bool accepted);
@@ -125,6 +127,40 @@ class DraftWidthPolicy {
   // Everything the policy has learned, on one line (for LSE_DEBUG traces).
   [[nodiscard]] std::string describe() const;
 
+  // Draft trees (runtime::DraftTree). A tree pass's rows come in rungs, the
+  // widths whose costs the policy measures; a tree of b nodes takes b + 1 rows.
+  // 15 and 31 rather than 16 and 32 rows: draft-tree verify widths that no
+  // prompt pass takes, with one and two 16-row tiles of kernels of their own
+  // (the 16-row matrix panel, kQuantVerifyRows).
+  static constexpr std::array<std::uint32_t, 4> kTreeRows{4, 8, 15, 31};
+  static constexpr std::uint32_t kMaxTreeNodes = 30;
+  // The chance the target answers a candidate the draft gives conditional
+  // probability q, learned from every candidate of every row a tree walk
+  // reaches (the draft's own probability until it has data).
+  [[nodiscard]] double candidate(double q) const noexcept;
+  void observe_candidate(double q, bool answered);
+  // Nodes for the next tree, given its expansion's value prefix
+  // (value_prefix[b]: expected accepted nodes of the best b-node tree): the
+  // rung that maximizes expected tokens per second, b + 1 <= the rung's rows.
+  // Decided from the draft's distributions alone, never from any token the
+  // target has not yet answered, so the walk stays exact.
+  //
+  // `chain_prefix[k]` is the expected accepted proposals of the first k of
+  // the draft's top path verified as a chain (k + 1 rows). 0 means a chain
+  // is expected to decode faster than any tree, or a chain width still has
+  // to be measured: the step then drafts a chain and proposals() picks its
+  // width as it does without trees.
+  [[nodiscard]] std::uint32_t tree_nodes(std::span<const double> value_prefix,
+                                         std::span<const double> chain_prefix = {});
+  // A tree step's whole wall time, draft and commit included: a tree's
+  // commit runs on the device while the next draft waits for it, so the two
+  // are priced together rather than split.
+  void observe_tree_step(std::uint32_t rows, std::uint64_t ns);
+  [[nodiscard]] double tree_step_ns(std::uint32_t rows) const noexcept;
+  // After a tree of `rows` rows with expected accepted nodes `gain`: what
+  // drafting was worth (draft_next).
+  void observe_tree_value(double gain, std::uint32_t rows);
+
  private:
   struct Bin {
     double accepted = 0, tested = 0;
@@ -153,6 +189,21 @@ class DraftWidthPolicy {
   double draft_value_ = 0;
   bool draft_value_known_ = false;
   std::uint32_t skipped_ = 0;
+
+  [[nodiscard]] static std::size_t tree_rung(std::uint32_t rows) noexcept;
+  [[nodiscard]] std::uint32_t tree_exploring() const noexcept;
+  static constexpr std::size_t kCandidateBins = 20;
+  std::array<Bin, kCandidateBins> candidates_{};
+  double tree_base_ = 0;
+  std::array<double, kTreeRows.size()> tree_offset_{};
+  std::array<std::uint32_t, kTreeRows.size()> tree_samples_{};
+  std::array<std::uint64_t, kTreeRows.size()> tree_last_seen_{};
 };
+
+// Whether DFlash2 steps verify draft trees when the configuration leaves it
+// to the device: the part's tuning (dispatch::arch::Tuning::draft_trees).
+[[nodiscard]] bool draft_trees_by_default(std::string_view arch);
+// `setting`: lse_config::dflash2_tree (negative: the device's default).
+[[nodiscard]] bool draft_trees_enabled(int setting);
 
 }  // namespace lse::runtime

@@ -20,6 +20,9 @@ struct FlashDims {
 [[nodiscard]] AttentionPlan attention_plan(const graph::KernelShapes&);
 [[nodiscard]] FlashDims flash_dimensions(const graph::KernelShapes&);
 [[nodiscard]] bool flash_wmma_supported(const graph::KernelShapes&);
+// A tree pass the flash split serves, by shape and device part (the kernel
+// checks the rest when it emits).
+[[nodiscard]] bool flash_split_scope(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_scope(const Shape& query, std::int64_t offset,
                                        std::int64_t capacity);
 [[nodiscard]] bool split_decode_supported(const graph::KernelShapes&);

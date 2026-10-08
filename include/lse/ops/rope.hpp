@@ -29,5 +29,8 @@ Result<Array> apply_rope(const Array& x, const RopeTables& tables,
                          std::int32_t offset);
 Result<Array> apply_rope(const Array& x, const RopeTables& tables,
                          const Array& offset);
+// One absolute position per sequence row (graph::rope_rows).
+Result<Array> apply_rope_rows(const Array& x, const RopeTables& tables,
+                              const Array& positions);
 
 }  // namespace lse::ops

@@ -121,7 +121,26 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // slices was three more launches. The values are the same SiLU of the same
   // conv outputs.
   bool silu_first = false;
-  if (spec.layout == ProjLayout::kFusedQKV) {
+  const bool tree = state != nullptr && state->tree_depth.valid();
+  if (tree && (spec.layout != ProjLayout::kFusedQKV || batch != 1 || !state->conv_qkv.valid() ||
+               !state->tree_ancestors.valid() || !state->tree_path.valid() ||
+               state->step_mask.valid()))
+    return LSE_ERROR(kUnimplemented, "a tree verify pass needs one sequence, a fused q/k/v "
+                     "projection and its conv tail");
+  if (tree) {
+    // Each row convolves its own ancestors; the carried tail is the top path's.
+    const Array input = graph::linear(x, w.in_proj_qkv);
+    const Array bias = spec.conv_bias ? w.conv_b
+        : Array::zeros(Shape{w.conv_w.shape().dim(0)}, w.conv_w.dtype());
+    const Array prev = state->conv_qkv;
+    qkv = graph::causal_conv1d_tree(input, w.conv_w, bias, prev, state->tree_ancestors);
+    state->conv_qkv = graph::conv_tail_rows(prev, input, state->tree_path);
+    state->tree_conv_input = input;
+    qkv_act = qkv;
+    q_raw = graph::slice(qkv, -1, 0, key_width);
+    k_raw = graph::slice(qkv, -1, key_width, 2 * key_width);
+    v_raw = graph::slice(qkv, -1, 2 * key_width, 2 * key_width + value_width);
+  } else if (spec.layout == ProjLayout::kFusedQKV) {
     qkv = conv_stream(graph::linear(x, w.in_proj_qkv), w.conv_w, w.conv_b,
                       spec.conv_bias,
                       state != nullptr ? &state->conv_qkv : nullptr,
@@ -151,8 +170,11 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // straight from the conv output in one dispatch each (gdn.silu_l2norm.v1),
   // computing what the separate slice/silu and l2_normalize kernels did. One
   // row (wave-level norm) and long prefill chunks keep the separate ops.
+  // A tree pass of any width takes it too: its scans read every row's q and k
+  // more than once, and a normalization fused into their loads would be
+  // recomputed at each read.
   const bool fused_prep = qkv.valid() && spec.conv_activation && batch == 1 &&
-                          seq > 1 && seq <= kFusedPrepRows;
+                          seq > 1 && (seq <= kFusedPrepRows || tree);
   auto silu_l2norm = [&](std::int64_t offset, float scale) -> Result<Array> {
     LSE_ASSIGN_OR(Array out, graph::custom("gdn.silu_l2norm.v1", {qkv},
         {static_cast<float>(offset), spec.eps, scale, 0.0f}));
@@ -233,9 +255,20 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
                    ? state->recurrent
                    : Array::zeros(Shape{batch, vh, vd, vd}, DType::kF32);
 
-  Array s_out;
-  Array o = graph::gated_delta_step(q, k, v, alpha, beta, s_in,
-                                    state != nullptr ? &s_out : nullptr);
+  Array s_out, o;
+  if (tree) {
+    // Every row's output from its parent's state; the carried state is the
+    // top path's, and the commit replays whichever path was accepted.
+    o = graph::gated_delta_tree(q, k, v, alpha, beta, s_in, state->tree_depth);
+    s_out = graph::gated_delta_path(k, v, alpha, beta, s_in, state->tree_path);
+    state->tree_k = k;
+    state->tree_v = v;
+    state->tree_alpha = alpha;
+    state->tree_beta = beta;
+  } else {
+    o = graph::gated_delta_step(q, k, v, alpha, beta, s_in,
+                                state != nullptr ? &s_out : nullptr);
+  }
   if (state != nullptr) state->recurrent = s_out;
 
   o = graph::rms_norm(o, w.norm, spec.norm_eps, spec.zero_centered_norm);

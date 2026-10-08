@@ -1,5 +1,8 @@
 #include "lse/runtime/draft_width.hpp"
 
+#include "lse/dispatch/arch/tuning.hpp"
+#include "lse/graph/graph.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -161,6 +164,17 @@ std::string DraftWidthPolicy::describe() const {
     std::snprintf(item, sizeof item, "%s%.2f", p == 0 ? "" : ",", position_mean(p));
     out += item;
   }
+  out += " tree_ms=";
+  for (std::size_t r = 0; r < kTreeRows.size(); ++r) {
+    std::snprintf(item, sizeof item, "%s%u:%.1f", r == 0 ? "" : ",", kTreeRows[r],
+                  tree_step_ns(kTreeRows[r]) / 1e6);
+    out += item;
+  }
+  out += " candidate=";
+  for (const double q : {0.05, 0.2, 0.5, 0.8, 0.95}) {
+    std::snprintf(item, sizeof item, "%s%.2f", q == 0.05 ? "" : ",", candidate(q));
+    out += item;
+  }
   std::snprintf(item, sizeof item, " bias=%.2f", bias_);
   out += item;
   std::snprintf(item, sizeof item, " rate_tps=%.1f", rate() * 1e9);
@@ -168,8 +182,14 @@ std::string DraftWidthPolicy::describe() const {
   return out;
 }
 
-bool DraftWidthPolicy::draft_next() {
-  if (const std::uint32_t rows = exploring(); rows != 0) return rows > 1;
+bool DraftWidthPolicy::draft_next(bool tree) {
+  if (tree) {
+    // Trees take no chain widths: a plain step is the only one to measure.
+    if (steps_ >= kWarmupSteps && samples_[1] < kExploreSamples) return false;
+    if (tree_exploring() != 0) return true;
+  } else if (const std::uint32_t rows = exploring(); rows != 0) {
+    return rows > 1;
+  }
   if (!draft_value_known_ || draft_value_ >= 0.0) {
     skipped_ = 0;
     return true;
@@ -284,6 +304,133 @@ void DraftWidthPolicy::observe_draft_value(std::span<const double> estimates,
   } else {
     draft_value_ += kValueRate * (value - draft_value_);
   }
+}
+
+double DraftWidthPolicy::candidate(double q) const noexcept {
+  if (!(q >= 0.0)) q = 0.0;
+  q = std::min(q, 1.0);
+  const auto bin = std::min<std::size_t>(kCandidateBins - 1,
+      static_cast<std::size_t>(q * static_cast<double>(kCandidateBins)));
+  const Bin& b = candidates_[bin];
+  return std::clamp((b.accepted + kPriorWeight * q) / (b.tested + kPriorWeight), 0.0, 1.0);
+}
+
+void DraftWidthPolicy::observe_candidate(double q, bool answered) {
+  // Sixteen candidates per reached row: the memory is sixteen times as many
+  // observations as a chain's (half weight after about 8k).
+  constexpr double kDecay = 1.0 - 0.6931471805599453 / 8192.0;
+  if (!(q >= 0.0)) q = 0.0;
+  for (Bin& b : candidates_) { b.accepted *= kDecay; b.tested *= kDecay; }
+  Bin& b = candidates_[std::min<std::size_t>(kCandidateBins - 1,
+      static_cast<std::size_t>(std::min(q, 1.0) * static_cast<double>(kCandidateBins)))];
+  b.tested += 1.0;
+  b.accepted += answered ? 1.0 : 0.0;
+}
+
+std::size_t DraftWidthPolicy::tree_rung(std::uint32_t rows) noexcept {
+  for (std::size_t i = 0; i < kTreeRows.size(); ++i)
+    if (kTreeRows[i] == rows) return i;
+  return kTreeRows.size();
+}
+
+double DraftWidthPolicy::tree_step_ns(std::uint32_t rows) const noexcept {
+  const std::size_t r = tree_rung(rows);
+  if (r >= kTreeRows.size() || tree_samples_[r] == 0) return 0.0;
+  return std::max(0.0, tree_base_ + tree_offset_[r]);
+}
+
+std::uint32_t DraftWidthPolicy::tree_exploring() const noexcept {
+  if (steps_ < kWarmupSteps) return 0;
+  std::size_t fewest = kTreeRows.size();
+  for (std::size_t r = 0; r < kTreeRows.size(); ++r)
+    if (tree_samples_[r] < kExploreSamples &&
+        (fewest == kTreeRows.size() || tree_samples_[r] < tree_samples_[fewest]))
+      fewest = r;
+  return fewest < kTreeRows.size() ? kTreeRows[fewest] : 0;
+}
+
+std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
+                                           std::span<const double> chain_prefix) {
+  if (value_prefix.size() < 2) return 0;
+  const auto most = static_cast<std::uint32_t>(value_prefix.size() - 1);
+  const auto fit = [&](std::uint32_t rows) { return std::min(most, rows - 1); };
+  const auto chain_rows = static_cast<std::uint32_t>(
+      std::min<std::size_t>(chain_prefix.size(), kMaxRows));
+  const bool chain = chain_rows >= 2;
+  // Warming up: the rung a chain would take.
+  if (steps_ < kWarmupSteps) return fit(kTreeRows[1]);
+  if (const std::uint32_t rows = tree_exploring(); rows != 0) return fit(rows);
+  if (chain && exploring() != 0) return 0;
+  // A rung unmeasured for long enough is measured again, whatever it costs.
+  for (std::size_t r = 0; r < kTreeRows.size(); ++r)
+    if (steps_ - tree_last_seen_[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
+  const double draft = draft_ns(kMaxProposals);
+  std::uint32_t best = fit(kTreeRows[0]);
+  double best_rate = -1.0;
+  for (const std::uint32_t rows : kTreeRows) {
+    const std::uint32_t nodes = fit(rows);
+    const double cost = tree_step_ns(rows);
+    if (cost <= 0.0) continue;
+    const double rate = (1.0 + value_prefix[nodes]) / cost;
+    if (rate > best_rate) {
+      best_rate = rate;
+      best = nodes;
+    }
+    if (nodes == most) break;
+  }
+  // The best chain prefix, priced as chain steps are.
+  for (std::uint32_t rows = 2; chain && rows <= chain_rows; ++rows) {
+    const double cost = draft + verify_ns(rows);
+    if (cost > 0.0 && verify_ns(rows) > 0.0 && (1.0 + chain_prefix[rows - 1]) / cost > best_rate)
+      return 0;
+  }
+  return best;
+}
+
+void DraftWidthPolicy::observe_tree_step(std::uint32_t rows, std::uint64_t ns) {
+  const std::size_t r = tree_rung(rows);
+  if (r >= kTreeRows.size()) return;
+  if (steps_++ < kWarmupSteps) return;
+  // A level of its own that follows the context, and per-rung offsets, as
+  // the chain widths have.
+  const auto t = static_cast<double>(ns);
+  bool any = false;
+  for (const auto s : tree_samples_) any = any || s != 0;
+  if (!any) {
+    tree_base_ = t;
+    tree_offset_[r] = 0.0;
+  } else if (tree_samples_[r] == 0) {
+    tree_offset_[r] = t - tree_base_;
+  } else {
+    const double predicted = tree_base_ + tree_offset_[r];
+    tree_base_ += kBaseRate * clamp_step(t - predicted, predicted);
+    const double rate = std::max(kOffsetRate, 1.0 / static_cast<double>(tree_samples_[r] + 1));
+    tree_offset_[r] += rate * clamp_step(t - tree_base_ - tree_offset_[r], predicted);
+  }
+  ++tree_samples_[r];
+  tree_last_seen_[r] = steps_;
+}
+
+void DraftWidthPolicy::observe_tree_value(double gain, std::uint32_t rows) {
+  const double cost = tree_step_ns(rows) - verify_ns(1);
+  const double value = gain - rate() * cost;
+  if (!draft_value_known_) {
+    draft_value_ = value;
+    draft_value_known_ = true;
+  } else {
+    draft_value_ += kValueRate * (value - draft_value_);
+  }
+}
+
+bool draft_trees_by_default(std::string_view arch) {
+  return !arch.empty() && dispatch::arch::tuning(arch).draft_trees;
+}
+
+bool draft_trees_enabled(int setting) {
+  if (setting >= 0) return setting > 0;
+  const graph::Scheduler* scheduler = graph::default_scheduler();
+  return scheduler != nullptr &&
+         draft_trees_by_default(scheduler->backend().device_info().arch);
 }
 
 }  // namespace lse::runtime

@@ -427,7 +427,15 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
   if (paged && cache->capacity <= 0) cache->capacity = spec.kv_length;
   if (paged && cache->used == 0 && offset > 0) cache->used = offset;
 
-  if (paged && cache->meta.valid()) {
+  const bool tree = phase == AttentionExecutionPhase::kTree;
+  if (tree && (!paged || !cache->tree_positions.valid() || x.shape().dim(0) != 1))
+    return LSE_ERROR(kInvalidArgument, "a tree verify pass needs a paged cache and row positions");
+  if (tree) {
+    LSE_ASSIGN_OR(q, apply_rope_rows(q, rope, cache->tree_positions));
+    LSE_ASSIGN_OR(k, apply_rope_rows(k, rope, cache->tree_positions));
+    cache->tree_keys = k;
+    cache->tree_values = v;
+  } else if (paged && cache->meta.valid()) {
     LSE_ASSIGN_OR(q, apply_rope(q, rope, cache->meta));
     LSE_ASSIGN_OR(k, apply_rope(k, rope, cache->meta));
   } else {
@@ -467,7 +475,8 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
 
   const backend::DeviceInfo* split_device = nullptr;
   const auto table_capacity = paged ? cache->table.shape().dim(1) * kv::kBlockSize : 0;
-  if (paged && (dispatch::split_decode_scope(q.shape(), offset, table_capacity) ||
+  // A tree pass may take the flash split (dispatch::flash_split_scope).
+  if (paged && (tree || dispatch::split_decode_scope(q.shape(), offset, table_capacity) ||
                 dispatch::split_short_scope(q.shape(), offset, table_capacity))) {
     if (auto* scheduler = graph::default_scheduler()) {
       const auto member = graph::preferred_member();
@@ -476,7 +485,8 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
     }
   }
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-  Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale, spec.mask,
+  Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale,
+                                      tree ? graph::MaskKind::kTree : spec.mask,
                                       spec.window, cache->meta, cache->table,
                                       kv::kBlockSize, split_device, spec.kv_cache_dtype,
                                       sparse)

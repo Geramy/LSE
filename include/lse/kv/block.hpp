@@ -96,6 +96,20 @@ inline constexpr std::int32_t kStepMetaPerRow = 2;
   return kStepMetaHeader + kStepMetaPerRow * (rows > 0 ? rows : 0);
 }
 
+// A tree verify pass (graph::MaskKind::kTree) is one sequence whose query
+// rows are the nodes of a draft tree, written to the cache at positions
+// first + row. After the per-row descriptors its step descriptor holds the
+// ancestor mask, tq x tq floats: entry (q, j) is 1 when query row q may see the
+// key written at row j (j is q or one of its ancestors) and 0 otherwise. Keys
+// before the pass are visible to every row.
+[[nodiscard]] constexpr std::int32_t tree_mask_offset(std::int32_t rows) noexcept {
+  return step_meta_elems(rows);
+}
+[[nodiscard]] constexpr std::int32_t tree_meta_elems(std::int32_t rows,
+                                                     std::int32_t queries) noexcept {
+  return step_meta_elems(rows) + (queries > 0 ? queries * queries : 0);
+}
+
 // What one block of one attention layer holds. `head_dim` is the K width; a
 // model whose V width differs would need two geometries, and none here does.
 struct BlockGeometry {

@@ -69,6 +69,18 @@ Array linear_indexed(const Array& x, const Array& w, const Array& idx,
 // are [out, in/group_size] in the checkpoint's own narrow float. The weight is
 // never widened in memory — that is the whole point of the op existing rather
 // than a dequantize pass feeding `linear`.
+// While one is alive, the contractions quant_linear builds on this thread
+// belong to a draft tree's verify pass (runtime::DraftTree): their widths may
+// take the part's tree-only rules (dispatch::QuantVerifyRows::tree), which a
+// prompt pass of the same width never does.
+class TreePassScope {
+ public:
+  TreePassScope() noexcept;
+  ~TreePassScope();
+  TreePassScope(const TreePassScope&) = delete;
+  TreePassScope& operator=(const TreePassScope&) = delete;
+  [[nodiscard]] static bool active() noexcept;
+};
 Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                    const Array& biases, int bits, int group_size);
 // The indexed form of the same: `packed` is [E, out, in*bits/32] and the
@@ -136,6 +148,12 @@ Array rope(const Array& x, const Array& cos, const Array& sin, int offset,
 Array rope(const Array& x, const Array& cos, const Array& sin,
            const Array& offset, int rotary = 0);
 
+// `positions` holds one absolute position per sequence row (x's second-last
+// axis), for rows that do not sit at consecutive positions: a draft tree's
+// nodes take the position of their depth.
+Array rope_rows(const Array& x, const Array& cos, const Array& sin,
+                const Array& positions, int rotary = 0);
+
 // x / sqrt(sum(x^2) + eps) over the last axis.
 Array l2_normalize(const Array& x, float eps = 1e-12f);
 
@@ -163,7 +181,9 @@ Array gated_delta_step(const Array& q, const Array& k, const Array& v,
                        const Array& alpha, const Array& beta,
                        const Array& state_in, Array* state_out);
 
-enum class MaskKind : std::uint8_t { kNone, kCausal, kSlidingWindow };
+// kTree: the query rows are the nodes of a draft tree (see kv::tree_meta_elems);
+// a row sees every key before the pass and, inside it, its own ancestors.
+enum class MaskKind : std::uint8_t { kNone, kCausal, kSlidingWindow, kTree };
 
 // q [B, Hq, T, Dh], k/v [B, Hkv, S, Dh]. GQA is handled internally.
 Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
@@ -193,6 +213,30 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
 Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
                     const Array& table, int block_size,
                     kv::CacheDType storage = kv::CacheDType::kF32);
+
+// Draft-tree verification (runtime::DraftTree, model::TreeLayout). A tree
+// pass's rows are its nodes in depth-first preorder; `depth` [T] holds each
+// row's depth. A path descriptor is f32 [2 + rows]: {count, first position,
+// row 0, row 1, ...}, its row indices into the pass.
+//
+// gated_delta_tree: gated_delta_step's output for every row, each row's state
+// continuing from its parent's (the root's from state_in).
+Array gated_delta_tree(const Array& q, const Array& k, const Array& v, const Array& alpha,
+                       const Array& beta, const Array& state_in, const Array& depth);
+// The state after the path's rows, from state_in.
+Array gated_delta_path(const Array& k, const Array& v, const Array& alpha, const Array& beta,
+                       const Array& state_in, const Array& path);
+// causal_conv1d over each row's ancestors: `ancestors` [T, K-1] holds the row
+// b levels up for b = 1..K-1, or -1 - c for column c of `tail` past the root.
+Array causal_conv1d_tree(const Array& x, const Array& weight, const Array& bias,
+                         const Array& tail, const Array& ancestors);
+// The last tail-many columns of tail ++ x[path rows].
+Array conv_tail_rows(const Array& tail, const Array& x, const Array& path);
+// Writes src [1, Hkv, T, Dh] rows path[2 + j] at positions first + j of the
+// pool, following `table` (one sequence). Aliases the pool like kv_page_write.
+Array kv_page_write_rows(const Array& dst, const Array& src, const Array& table,
+                         const Array& path, int block_size,
+                         kv::CacheDType storage = kv::CacheDType::kF32);
 
 // Records a node for a registered primitive. Returns an invalid Array if the
 // name is unknown or the arity/shapes do not match.

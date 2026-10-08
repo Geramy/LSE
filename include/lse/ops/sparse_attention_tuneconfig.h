@@ -14,7 +14,9 @@ struct SparseAttentionPhase {
   [[nodiscard]] bool enabled() const { return blasst || flashprefill; }
 };
 // Query width alone cannot distinguish prompt chunks from speculative verification.
-enum class AttentionExecutionPhase { kDecode, kPrefill, kSpeculative };
+// kTree is a draft tree's verify pass (model::TreeLayout): speculative, and its
+// rows are tree nodes rather than consecutive positions.
+enum class AttentionExecutionPhase { kDecode, kPrefill, kSpeculative, kTree };
 
 struct SparseAttentionOptions {
   SparseAttentionPhase prefill;
@@ -25,7 +27,8 @@ struct SparseAttentionOptions {
 inline SparseAttentionPhase attention_for_phase(const SparseAttentionOptions& options,
                                                 AttentionExecutionPhase phase,
                                                 std::int64_t queries) {
-  if (phase == AttentionExecutionPhase::kSpeculative) return {};
+  if (phase == AttentionExecutionPhase::kSpeculative ||
+      phase == AttentionExecutionPhase::kTree) return {};
   if (phase == AttentionExecutionPhase::kPrefill)
     return queries > 1 ? options.prefill : SparseAttentionPhase{};
   return options.decode;

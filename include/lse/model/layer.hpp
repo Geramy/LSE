@@ -51,6 +51,15 @@ struct MixerState {
   // recurrence (1 real, 0 padded, and its complement) and the rows of the
   // conv input that become the conv tail. Unset on an unpadded pass.
   Array pad_mask, pad_unmask, pad_tail_rows;
+  // A draft tree's verify pass (TreeLayout), the same views on every layer:
+  // each row's depth, its conv ancestors, its absolute position and the top
+  // path descriptor. Unset on every other pass.
+  Array tree_depth, tree_ancestors, tree_positions, tree_path;
+  // Set by a tree pass's build, per layer: what the tree commit replays the
+  // accepted path from. GDN: the conv input rows and the recurrence's k, v,
+  // alpha and beta. Attention: the pass's rotated keys and its values.
+  Array tree_conv_input, tree_k, tree_v, tree_alpha, tree_beta;
+  Array tree_keys, tree_values;
 
   [[nodiscard]] bool empty() const noexcept {
     return !gdn_state.valid() && !key_cache.valid();

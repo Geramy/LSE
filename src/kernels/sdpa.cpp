@@ -894,6 +894,19 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
       offset = e.let(kir::cast<kir::u32>(a.meta[0u]));
     }
     const auto abs_i = e.let(offset + qi);
+    // A tree pass (kv::tree_meta_elems): keys before it, then its own rows by
+    // the ancestor mask. Only a paged single sequence carries one.
+    if (mask == 3 && (!paged || bsz != 1 || s.inputs[3].elem_count() <
+            static_cast<std::size_t>(kv::tree_meta_elems(1, static_cast<std::int32_t>(tq)))))
+      return {};
+    const auto tree_visible = [&](const kir::Val<kir::u32>& j) {
+      const auto before = e.let(j < offset);
+      const auto column = e.let(kir::cast<kir::u32>(select(before, kir::cast<std::int64_t>(e.u32(0)),
+                  kir::cast<std::int64_t>(j) - kir::cast<std::int64_t>(offset))));
+      const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
+                                           qi * tq + column)]);
+      return e.let(j <= abs_i && (before || seen != 0.0f));
+    };
 
     if (!paged) {
       const auto used = e.let(offset + tq);
@@ -987,6 +1000,8 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
                 take();
               } else if (mask == 1) {
                 if (auto g = e.when(j <= abs_i)) take();
+              } else if (mask == 3) {
+                if (auto g = e.when(tree_visible(j))) take();
               } else {
                 if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
               }
@@ -1018,6 +1033,8 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
                 apply();
               } else if (mask == 1) {
                 if (auto g = e.when(j <= abs_i)) apply();
+              } else if (mask == 3) {
+                if (auto g = e.when(tree_visible(j))) apply();
               } else {
                 if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
               }
@@ -1266,5 +1283,101 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
   }
 };
 LSE_REGISTER_PRIMITIVE(KvPageWriteKernel);
+
+template <class E, kv::CacheDType Storage = kv::CacheDType::kF32>
+struct KvPageWriteRowsArgs {
+  env::In<KvElement<Storage>, E> dst;  // inplace pool; written through the store hook
+  env::In<kir::f32, E> src;
+  env::In<kir::f32, E> table;
+  env::In<kir::f32, E> path;
+  env::Out<KvElement<Storage>, E> out;
+};
+
+// A draft tree's accepted path, moved into place: src [1, kvh, T, width] is a
+// tree verify pass's keys or values, and the path descriptor {count, first,
+// rows...} (gdn.cpp) sends row path[2 + j] to position first + j. The pass
+// wrote every row at first + row, and the rows of a path only move down, so
+// reading the pass's own activations rather than the pool keeps the copy free
+// of any ordering between its threads.
+struct KvPageWriteRowsKernel final : KernelPrimitive<KvPageWriteRowsKernel> {
+  static constexpr std::string_view kName = "kv_page_write.rows.v1";
+  static constexpr std::string_view kEntry = "lse_kv_page_write_rows_v1";
+  static constexpr std::string_view kSource = {};
+
+  std::size_t arity() const noexcept override { return 4; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  int inplace_input() const noexcept override { return 0; }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 4 || s.input_dtypes.size() != 4 || s.inputs[0].rank() != 4 ||
+        s.inputs[1].rank() != 4 || s.inputs[2].rank() != 2 || s.inputs[0] != s.output ||
+        s.input_dtypes[0] != s.output_dtype || s.input_dtypes[1] != DType::kF32 ||
+        s.input_dtypes[2] != DType::kF32 || s.input_dtypes[3] != DType::kF32 ||
+        s.inputs[1].dim(0) != 1 || s.inputs[2].dim(0) < 1 || s.inputs[3].elem_count() < 3)
+      return {};
+    return with_kv_storage(s.input_dtypes[0], static_cast<float>(s.iattrs[1]),
+        [&]<kv::CacheDType Storage>() -> std::string {
+          if constexpr (kv::packed_cache(Storage)) return {};
+          else return emit_storage<Storage>(s);
+        });
+  }
+
+  template <kv::CacheDType Storage>
+  std::string emit_storage(const KernelShapes& s) const {
+    if (!s.types.scalar || !s.intrinsics || !s.store) return {};
+    const Shape& dst = s.inputs[0];
+    const Shape& src = s.inputs[1];
+    const auto kvh = static_cast<std::uint32_t>(dst.dim(1));
+    const auto bs = static_cast<std::uint32_t>(dst.dim(2));
+    const auto width = static_cast<std::uint32_t>(kv::logical_width(Storage, dst.dim(3)));
+    const auto t = static_cast<std::uint32_t>(src.dim(2));
+    const auto stride = static_cast<std::uint32_t>(s.inputs[2].dim(1));
+    const auto most = static_cast<std::uint32_t>(s.inputs[3].elem_count()) - 2u;
+    if (kvh == 0 || bs == 0 || width == 0 || t == 0 || stride == 0 || most > t ||
+        static_cast<std::uint32_t>(src.dim(1)) != kvh ||
+        static_cast<std::uint32_t>(src.dim(3)) != width ||
+        static_cast<std::uint32_t>(s.iattrs[0]) != bs || !is_pow2(bs))
+      return {};
+    kir::KernelBody k(s.types, *s.intrinsics);
+    k.set_store(s.store);
+    KvPageWriteRowsArgs<env::Emit, Storage> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto i = e.thread_id();
+    (void)e.ret_if(i >= most * kvh * width);
+    const auto w = e.let(i % width);
+    const auto j = e.let((i / width) % most);
+    const auto h = e.let(i / (width * most));
+    (void)e.ret_if(j >= kir::cast<kir::u32>(a.path[0u]));
+    const auto row = e.let(kir::cast<kir::u32>(a.path[e.let(j + 2u)]));
+    const auto abs = e.let(kir::cast<kir::u32>(a.path[1u]) + j);
+    const auto blk = e.let(kv_block_index<Storage>(a.table[abs / bs]));
+    const auto dest = e.let(((blk * kvh + h) * bs + abs % bs) * width + w);
+    const auto from = e.let((h * t + row) * width + w);
+    if constexpr (Storage == kv::CacheDType::kF32) a.out[dest] = a.src[from];
+    else a.out[dest] = kir::cast<KvElement<Storage>>(a.src[from]);
+    return k.str();
+  }
+
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 4) return LSE_ERROR(kInvalidArgument, "kv_page_write.rows.v1 takes 4 inputs");
+    return in[0];
+  }
+  DType infer_dtype(std::span<const DType> in) const override {
+    return in.empty() ? DType::kF32 : in[0];
+  }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    const std::uint32_t threads = dispatch::scalar_threads(s);
+    const auto most = s.inputs.size() == 4 ? static_cast<std::uint32_t>(s.inputs[3].elem_count()) - 2u : 1u;
+    const auto elems = s.inputs.size() == 4
+        ? most * static_cast<std::uint32_t>(s.inputs[1].dim(1) * s.inputs[1].dim(3)) : 1u;
+    tp.workgroup_size[0] = threads;
+    tp.workgroup_count[0] = elems == 0 ? 1u : (elems + threads - 1) / threads;
+    return tp;
+  }
+};
+LSE_REGISTER_PRIMITIVE(KvPageWriteRowsKernel);
 
 }  // namespace lse::kernels

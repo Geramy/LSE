@@ -54,6 +54,7 @@ struct Options {
   bool no_mtp = false;
   bool dflash2 = false;
   bool adaptive_dflash2 = true;
+  int dflash2_tree = -1;  // negative: the device's default
   bool adaptive_mtp = true;
   // Empty: the draft the companion registry pairs with the model.
   std::string dflash2_model;
@@ -129,6 +130,9 @@ void usage() {
       "      --adaptive-dflash2=off  verify every DFlash2 proposal each step\n"
       "                         (on/off; default on: verify the prefix expected\n"
       "                         to decode fastest)\n"
+      "      --dflash2-tree=on  verify draft trees, several candidate paths per pass\n"
+      "                         (on/off; default: on where the GPU's tuning\n"
+      "                         measured trees faster)\n"
       "      --no-mtp           decode one token per pass, ignoring any\n"
       "                         multi-token-prediction module\n"
       "      --list-models      print the registered model kernels and exit\n"
@@ -304,6 +308,17 @@ bool parse(int argc, char** argv, Options* opt) {
         return false;
       }
       opt->adaptive_dflash2 = v == "on";
+    } else if (a == "--dflash2-tree" || a.starts_with("--dflash2-tree=")) {
+      if (a == "--dflash2-tree") {
+        if (!take_value(argc, argv, i, "--dflash2-tree", &v)) return false;
+      } else {
+        v = a.substr(std::string("--dflash2-tree=").size());
+      }
+      if (v != "on" && v != "off") {
+        std::fputs("lse: --dflash2-tree must be on or off\n", stderr);
+        return false;
+      }
+      opt->dflash2_tree = v == "on" ? 1 : 0;
     } else if (a == "--no-mtp") {
       opt->no_mtp = true;
     } else if (a == "--pull") {
@@ -908,7 +923,9 @@ int main(int argc, char** argv) {
   runtime::Generator gen(*lm, opt.sampling, opt.prefill);
   runtime::DraftWidthPolicy widths;
   if (mtp != nullptr) gen.use_mtp(*mtp, opt.adaptive_mtp ? &widths : nullptr);
-  if (dflash2 != nullptr) gen.use_dflash2(*dflash2, opt.adaptive_dflash2 ? &widths : nullptr);
+  if (dflash2 != nullptr)
+    gen.use_dflash2(*dflash2, opt.adaptive_dflash2 ? &widths : nullptr,
+                    runtime::draft_trees_enabled(opt.dflash2_tree));
   auto stream = tok->stream();
 
   // Streamed through DecodeStream so a multi-byte character is never cut in

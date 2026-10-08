@@ -921,8 +921,11 @@ Status eval_rope(Node& n) {
   const std::size_t rows_per_batch = batch == 0 ? rows : rows / batch;
   // A step descriptor carries one origin per row; a 1-element input is the
   // single-sequence form. Same rule as RopeKernel.
+  const bool per_row = n.inputs.size() >= 4 && n.iattrs[2] == 1;
+  if (per_row && n.inputs[3]->element_count() < seq)
+    return LSE_ERROR(kInvalidArgument, "rope needs one position per row");
   const bool ragged =
-      n.inputs.size() >= 4 && batch > 0 &&
+      n.inputs.size() >= 4 && batch > 0 && !per_row &&
       n.inputs[3]->element_count() >=
           static_cast<std::size_t>(kv::step_meta_elems(
               static_cast<std::int32_t>(batch)));
@@ -938,7 +941,9 @@ Status eval_rope(Node& n) {
                          (r / rows_per_batch) *
                              static_cast<std::size_t>(kv::kStepMetaPerRow)))
                : offset;
-    const std::size_t t = row_off + (r % seq);
+    const std::size_t t =
+        per_row ? static_cast<std::size_t>(load_element(*n.inputs[3], r % seq))
+                : row_off + (r % seq);
     for (std::size_t d = 0; d + 1 < rot; d += 2) {
       const float c = load_element(cos, t * rot + d);
       const float s = load_element(sin, t * rot + d);
@@ -1133,6 +1138,13 @@ Status eval_sdpa(Node& n) {
                             : static_cast<std::size_t>(n.iattrs[2]);
   const std::size_t rows =
       paged ? static_cast<std::size_t>(load_element(*n.inputs[3], 2)) : batch;
+  if (mask == 3 && (!paged || batch != 1 ||
+                    n.inputs[3]->element_count() <
+                        static_cast<std::size_t>(kv::tree_meta_elems(
+                            1, static_cast<std::int32_t>(tq))))) {
+    return LSE_ERROR(kInvalidArgument, "a tree mask needs one paged sequence and its ",
+                     std::to_string(tq), "-row ancestor mask");
+  }
   if (paged && n.inputs[3]->element_count() <
                    static_cast<std::size_t>(kv::step_meta_elems(
                        static_cast<std::int32_t>(batch)))) {
@@ -1187,6 +1199,9 @@ Status eval_sdpa(Node& n) {
           bool allowed = true;
           if (mask != 0) allowed = j <= abs_i;
           if (allowed && mask == 2 && window > 0) allowed = (abs_i - j) < window;
+          if (allowed && mask == 3 && j >= offset)
+            allowed = load_element(*n.inputs[3],
+                static_cast<std::size_t>(kv::tree_mask_offset(1)) + i * tq + (j - offset)) != 0.0f;
           if (!allowed) {
             logits[j] = -std::numeric_limits<float>::infinity();
             continue;

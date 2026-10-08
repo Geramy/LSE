@@ -130,6 +130,13 @@ struct AttentionCache {
   PagedKvLayer* paged = nullptr;
   std::int64_t capacity = 0;
   std::int32_t used = 0;
+  // A draft tree's verify pass (AttentionExecutionPhase::kTree): the absolute
+  // position of each row, f32 [T]. The pass's rotated keys and its values,
+  // [1, Hkv, T, Dh], come back in tree_keys/tree_values: the tree commit
+  // writes its accepted path's rows from them (graph::kv_page_write_rows).
+  Array tree_positions;
+  Array tree_keys;
+  Array tree_values;
 };
 
 // Tops each row's block list up to cover what `layer.row_tokens` asks for —
