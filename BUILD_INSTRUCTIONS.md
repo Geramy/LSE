@@ -194,8 +194,61 @@ The API, in order of use:
 | `lse_set_log_callback(cb, user)` | Receive the log lines `lse-server` prints |
 | `lse_close(engine)`, `lse_free(p)` | Release the engine; release every string the library returned |
 
-[README: Use LSE as a library](README.md#use-lse-as-a-library) has a complete
-example. `lse-server --model-info` and `--estimate` print the two planning
+Example:
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <lse/lse.h>
+
+static void on_response(void *user, lse_request_id id, lse_event event,
+                        int status, const char *data, size_t len) {
+  if (event == LSE_EVENT_CHUNK) printf("%.*s\n", (int)len, data);   /* one SSE chunk */
+  if (event == LSE_EVENT_RESPONSE || event == LSE_EVENT_ERROR)
+    printf("%d %.*s\n", status, (int)len, data);
+}
+
+int main(void) {
+  char *info = NULL, *err = NULL;
+  if (lse_model_info("/models/qwen38-27b-q4", &info, &err) == LSE_OK) {
+    puts(info);                      /* architecture, KV layers, KV bytes per token, ... */
+    lse_free(info);
+  }
+
+  lse_config cfg;
+  lse_config_init(&cfg);             /* the lse-server defaults */
+  cfg.model = "/models/qwen38-27b-q4";
+  cfg.dflash2 = 1;
+  cfg.dflash2_model = "/models/qwen38-27b-dflash2-q8";
+  cfg.kv_len = 32768;
+  cfg.kv_cache_dtype = "bf16";
+  cfg.pool = "hrx:0";                /* cfg.dialect NULL: Loom, the default */
+
+  char *plan = NULL;                 /* what lse_open(&cfg) would allocate */
+  if (lse_estimate(&cfg, "{\"device_memory_bytes\": 34359738368}", &plan, &err) == LSE_OK) {
+    puts(plan);
+    lse_free(plan);
+  }
+
+  lse_engine *engine = lse_open(&cfg, &err);   /* blocks until the model is ready */
+  if (engine == NULL) { fprintf(stderr, "%s\n", err); lse_free(err); return 1; }
+
+  const char *body =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],"
+      "\"max_tokens\":64,\"stream\":true}";
+  lse_request_id id;
+  lse_request(engine, "POST", "/v1/chat/completions", body, strlen(body),
+              on_response, NULL, &id);
+  /* ... wait for LSE_EVENT_DONE or LSE_EVENT_ERROR; lse_cancel(engine, id) stops it ... */
+
+  /* Optional: serve the same engine over HTTP as well, until lse_http_stop. */
+  if (lse_http_start(engine, "127.0.0.1", 8080, &err) == LSE_OK) lse_http_wait(engine, &err);
+  lse_close(engine);
+  return 0;
+}
+```
+
+`lse-server --model-info` and `--estimate` print the two planning
 answers from the command line.
 
 ---
