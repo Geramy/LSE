@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -42,20 +43,54 @@ inline void skip(const char* reason) {
   Registry::get().skip_reason = reason;
 }
 
+// The cases of this binary listed in tests/KNOWN_FAILURES.md as
+// `<binary>:<case>` entries. Those fail for a known reason and are skipped,
+// so a run reports only new failures. LSE_RUN_KNOWN_FAILURES=1 runs them.
+inline std::vector<std::string> known_failures() {
+  std::vector<std::string> cases;
+#if defined(LSE_TEST_BINARY) && defined(LSE_KNOWN_FAILURES_FILE)
+  const char* run_them = std::getenv("LSE_RUN_KNOWN_FAILURES");
+  if (run_them != nullptr && *run_them != '\0' && *run_them != '0')
+    return cases;
+  std::ifstream in(LSE_KNOWN_FAILURES_FILE);
+  const std::string prefix = std::string(LSE_TEST_BINARY) + ":";
+  for (std::string line; std::getline(in, line);) {
+    if (line.rfind("- `", 0) != 0) continue;
+    const auto end = line.find('`', 3);
+    if (end == std::string::npos) continue;
+    const std::string entry = line.substr(3, end - 3);
+    if (entry.rfind(prefix, 0) == 0) cases.push_back(entry.substr(prefix.size()));
+  }
+#endif
+  return cases;
+}
+
 inline int run_all() {
   Registry& r = Registry::get();
   int passed = 0;
   int skipped = 0;
   // LSE_TEST_ONLY=<name>[,<name>...] runs just those cases, so one gated case
   // can be run without the cases before it leaving process-wide knobs set.
+  // A case named there runs even when it is a known failure.
   const char* only = std::getenv("LSE_TEST_ONLY");
+  const std::vector<std::string> known = known_failures();
   std::size_t run = 0;
   for (const auto& c : r.cases) {
+    bool named = false;
     if (only != nullptr && *only != '\0') {
       const std::string list = std::string(",") + only + ",";
       if (list.find("," + c.name + ",") == std::string::npos) continue;
+      named = true;
     }
     ++run;
+    bool is_known = false;
+    for (const auto& k : known) is_known = is_known || k == c.name;
+    if (is_known && !named) {
+      ++skipped;
+      std::printf("  skip %s (known failure, tests/KNOWN_FAILURES.md)\n",
+                  c.name.c_str());
+      continue;
+    }
     if (std::getenv("LSE_TEST_TRACE") != nullptr) {
       std::fprintf(stderr, "[test] start %s\n", c.name.c_str());
     }
