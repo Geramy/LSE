@@ -61,10 +61,16 @@ cc="${CC:-$default_cc}"
 export PATH="$(dirname "$cc"):$PATH"
 cxx="${CXX:-${cc}++}"
 # Build the runtime and compiler together for the native K/V address API.
+# HSA headers come from hrx-system's pinned hsa-runtime-headers, not ROCm: the
+# AMDGPU HAL uses hsa_amd_queue_create's descriptor, which ROCm 7.13's headers
+# lack. ROCm still supplies the device toolchain. At run time HRX needs an HSA
+# runtime with hsa_amd_queue_create (ROCr 1.21 or newer), which the release
+# archive bundles.
 cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DLIBHRX_BUILD=ON \
   -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" \
-  -DIREE_ROCM_PATH="$rocm" -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF \
+  -DIREE_ROCM_PATH="$rocm" -DIREE_ROCM_DEPENDENCY_MODE=pinned \
+  -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
   -DIREE_ENABLE_LIBBACKTRACE=OFF -DIREE_HAL_DRIVER_DEFAULTS=OFF \
   -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_HIP=OFF \

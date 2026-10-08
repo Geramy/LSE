@@ -7,6 +7,11 @@ option(LSE_ENABLE_HRX     "Build the HRX backend"           ON)
 option(LSE_ENABLE_CPU     "Build the CPU reference backend" ON)
 option(LSE_WERROR         "Treat warnings as errors"        OFF)
 option(LSE_ASAN           "Build with AddressSanitizer"     OFF)
+# amd_comgr links ROCm's LLVM (hundreds of MB). Without it the engine reads
+# code-object resources from the ELF note itself, as on macOS; only the legacy
+# HIP dialect and the disassembly census need it. The Linux release builds
+# without it so the archive needs no ROCm install.
+option(LSE_WITH_COMGR     "Link amd_comgr when ROCm provides it" ON)
 
 # gfx1151 = Radeon 8060S (Strix Halo, this machine)
 # gfx1201 = RDNA4 discrete
@@ -62,7 +67,7 @@ find_library(LSE_COMGR_LIBRARY
   HINTS ${LSE_ROCM_LIB_HINTS}
   NO_DEFAULT_PATH)
 set(LSE_HAVE_COMGR OFF)
-if(LSE_COMGR_INCLUDE_DIR AND LSE_COMGR_LIBRARY)
+if(LSE_WITH_COMGR AND LSE_COMGR_INCLUDE_DIR AND LSE_COMGR_LIBRARY)
   set(LSE_HAVE_COMGR ON)
 endif()
 
@@ -87,8 +92,9 @@ endif()
 
 set(LSE_HRX_ROOT "" CACHE PATH "HRX install root (libhrx.so + headers)")
 
-# libhrx dlopens libhsa-runtime64 by soname, so the loader must reach the 7.13
-# component's copy: the distro one in /lib is older and lacks symbols HRX needs.
+# libhrx dlopens libhsa-runtime64 by soname, so the loader must reach a copy
+# with hsa_amd_queue_create (ROCr 1.21 or newer, e.g. TheRock): the distro one in
+# /lib and ROCm 7.13's are older and lack symbols HRX needs.
 # dlopen consults LD_LIBRARY_PATH as captured at process start, which nothing
 # inside the process can change, so this is recorded and reported rather than
 # baked into an RPATH.

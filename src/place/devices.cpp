@@ -611,6 +611,19 @@ void preload_gpu_runtime() {
   }
 #endif
   std::vector<std::string> roots;
+#if !defined(__APPLE__)
+  // The Linux release bundles the HSA runtime HRX needs in its own lib/, next
+  // to libexec/ where the binaries live, so a machine needs no ROCm install.
+  // That copy comes first; ROCM_PATH and the system installs follow.
+  {
+    std::error_code ec;
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && exe.has_parent_path()) {
+      roots.emplace_back(exe.parent_path().parent_path().string());
+      roots.emplace_back(exe.parent_path().string());
+    }
+  }
+#endif
   if (const char* env = std::getenv("ROCM_PATH"); env != nullptr && *env != 0) {
     roots.emplace_back(env);
   }

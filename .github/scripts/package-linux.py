@@ -66,11 +66,89 @@ def verify(binaries, library, env):
     return closure
 
 
+# Component licenses of TheRock's rocm_sysdeps libraries, which the tree does
+# not ship as files. The libraries are dynamically linked and replaceable.
+SYSDEPS_LICENSES = {
+    'drm': 'libdrm: MIT',
+    'drm_amdgpu': 'libdrm_amdgpu: MIT',
+    'numa': 'libnuma (numactl): LGPL-2.1',
+    'elf': 'libelf (elfutils): LGPL-3.0-or-later or GPL-2.0-or-later',
+    'z': 'zlib: Zlib',
+    'zstd': 'zstd: BSD-3-Clause',
+    'liblzma': 'liblzma (xz): 0BSD',
+    'bz2': 'libbz2 (bzip2): bzip2-1.0.6',
+}
+
+
+def bundle_hsa_runtime(root, package):
+    """Copy an HSA runtime with hsa_amd_queue_create and its ROCm-owned closure.
+
+    The runtime finds its dependencies through RUNPATH $ORIGIN and
+    $ORIGIN/rocm_sysdeps/lib, so it keeps that layout under lib/ and its
+    RUNPATH is left in place.
+    """
+    lib = root / 'lib'
+    hsa = (lib / 'libhsa-runtime64.so.1').resolve(strict=True)
+    if 'hsa_amd_queue_create' not in run('readelf', '--dyn-syms', '--wide', str(hsa)):
+        raise RuntimeError(f'{hsa} lacks hsa_amd_queue_create; HRX needs ROCr 1.21 or newer')
+    clean = runtime_env([], inherit=False)
+    clean.pop('LD_LIBRARY_PATH', None)
+    closure = dependencies(lib / 'libhsa-runtime64.so.1', clean)
+    files = {'libhsa-runtime64.so.1': hsa}
+    for name, path in closure.items():
+        if path.is_relative_to(lib.resolve()):
+            files[name] = path
+    bundled = []
+    for name, source in files.items():
+        relative = Path('rocm_sysdeps/lib') if source.parent.name == 'lib' and \
+            source.parent.parent.name == 'rocm_sysdeps' else Path('.')
+        destination = package / 'lib' / relative / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            raise RuntimeError(f'Conflicting bundled HSA runtime file: {destination}')
+        shutil.copy2(source, destination)
+        destination.chmod(destination.stat().st_mode | 0o200)
+        bundled.append({'soname': name, 'file': str(Path('lib') / relative / name),
+                        'source': str(source), 'source_sha256': digest(source),
+                        'sha256': digest(destination)})
+    alias = package / 'lib' / 'libhsa-runtime64.so'
+    if not alias.exists():
+        alias.symlink_to('libhsa-runtime64.so.1')
+    licenses = package / 'licenses' / 'hsa-runtime'
+    licenses.mkdir(parents=True, exist_ok=True)
+    for component in ('rocr', 'rocprofiler-register'):
+        notice = root / 'share/doc' / component / 'LICENSE.md'
+        if notice.is_file():
+            shutil.copy2(notice, licenses / f'{component}-LICENSE.md')
+    names = sorted({item['soname'] for item in bundled if 'rocm_sysdeps' in item['file']})
+    lines = [SYSDEPS_LICENSES[key] for key in SYSDEPS_LICENSES
+             if any(n.startswith(f'librocm_sysdeps_{key}.so') for n in names)]
+    (licenses / 'rocm_sysdeps.txt').write_text(
+        'TheRock rocm_sysdeps libraries bundled with the HSA runtime:\n' +
+        ''.join(f'  {n}\n' for n in names) + '\nComponent licenses:\n' +
+        ''.join(f'  {line}\n' for line in lines))
+    return bundled
+
+
+def verify_hsa_runtime(package_lib):
+    """The bundled runtime must resolve every ROCm dependency inside the package."""
+    clean = runtime_env([], inherit=False)
+    clean.pop('LD_LIBRARY_PATH', None)
+    links = dependencies(package_lib / 'libhsa-runtime64.so.1', clean)
+    for name, path in links.items():
+        if name.startswith(('librocm_sysdeps_', 'librocprofiler-register')) and \
+                not path.is_relative_to(package_lib.resolve()):
+            raise RuntimeError(f'Bundled HSA runtime loads {name} from outside the package: {path}')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--loom-manifest', type=Path, required=True)
     parser.add_argument('--package-dir', type=Path)
+    parser.add_argument('--hsa-runtime', type=Path,
+                        help='ROCm or TheRock root whose lib/ holds the HSA runtime to bundle '
+                             '(ROCr 1.21 or newer, with hsa_amd_queue_create); required with --package-dir')
     args = parser.parse_args()
     build = args.build.resolve(strict=True)
     manifest_path = args.loom_manifest.resolve(strict=True)
@@ -95,6 +173,8 @@ def main():
         (manifest_path.parent / 'LINKED.json').write_text(json.dumps(closure, indent=2) + '\n')
         return
 
+    if args.hsa_runtime is None:
+        raise RuntimeError('--hsa-runtime is required to package: the archive bundles its HSA runtime')
     package_arg = args.package_dir.absolute()
     if package_arg.is_symlink():
         raise RuntimeError('Package directory must not be a symlink')
@@ -141,6 +221,9 @@ def main():
         run('cmake', '-P', str(script))
     for item in bundled:
         item['sha256'] = digest(package / 'lib' / item['file'])
+    # The HSA runtime goes in after the RPATH strip: it keeps RUNPATH $ORIGIN.
+    hsa_bundled = bundle_hsa_runtime(args.hsa_runtime.resolve(strict=True), package)
+    verify_hsa_runtime(package / 'lib')
 
     work = manifest_path.parent
     shutil.copy2(work / 'source/LICENSE', package / 'licenses/HRX-Loom.txt')
@@ -156,16 +239,19 @@ def main():
         'lse_revision': run('git', '-C', str(Path(__file__).resolve().parents[2]), 'rev-parse', 'HEAD').strip(),
         'loom_compiler': compiler,
         'bundled_libraries': bundled,
+        'bundled_hsa_runtime': {'source_root': str(args.hsa_runtime.resolve()), 'files': hsa_bundled},
         'hrx_runtime_source_revision': compiler['hrx_revision'],
-        'external_runtime_requirements': ['Compatible Linux C/C++ system runtime', 'ROCm 7.x and HSA'],
+        'external_runtime_requirements': ['Compatible Linux C/C++ system runtime',
+                                          'amdgpu kernel driver with KFD and access to /dev/kfd'],
         'gpu_execution_tested_by_packager': False,
     }, indent=2) + '\n')
     (package / 'QUICKSTART.txt').write_text(
         'Run ./lse or ./lse-server; bin/ contains equivalent launchers.\n'
-        'The archive includes its selected HRX runtime and patched Loom compiler.\n'
-        'A compatible Linux C/C++ runtime, ROCm 7.x, HSA and GPU driver remain required.\n'
-        'If ROCm is outside the system loader paths, add its matching runtime directory\n'
-        'to LD_LIBRARY_PATH. The launchers put the bundled libraries first.\n'
+        'The archive includes its selected HRX runtime, patched Loom compiler and the\n'
+        'HSA runtime (ROCr) HRX needs, in lib/. No ROCm install is required: the system\n'
+        'needs a compatible Linux C/C++ runtime and the amdgpu kernel driver with KFD,\n'
+        'and the user needs access to /dev/kfd and /dev/dri (usually the render and\n'
+        'video groups). The launchers put the bundled libraries first.\n'
         'BUILD.json records source pins, patch hashes and bundled library hashes.\n')
 
     # A different directory, including spaces, catches paths accidentally retained by the package.
@@ -176,6 +262,7 @@ def main():
             shutil.copytree(package / directory, relocated / directory, symlinks=True)
         for name in ('lse', 'lse-server'):
             shutil.copy2(package / name, relocated / name)
+        verify_hsa_runtime(relocated / 'lib')
         relocated_env = runtime_env([relocated / 'lib', runtime])
         selected = relocated / 'lib' / library.name
         relocated_closure = verify([relocated / 'libexec' / name for name in ('lse', 'lse-server')],
@@ -187,7 +274,7 @@ def main():
             for name in sources:
                 if links.get(name) != str((relocated / 'lib' / sources[name].name).resolve()):
                     raise RuntimeError(f'Relocated binary loads an external bundled dependency: {name}')
-    print('Relocated Linux launchers and bundled compiler/HRX closure passed --help and ldd checks.')
+    print('Relocated Linux launchers and bundled compiler/HRX/HSA closure passed --help and ldd checks.')
 
 
 if __name__ == '__main__':

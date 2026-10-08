@@ -38,7 +38,11 @@ jobs:
     runs-on: [self-hosted, lse]
     timeout-minutes: 180
     env:
+      # HRX main needs ROCm headers and an HSA runtime with hsa_amd_queue_create
+      # (ROCr 1.21 or newer): point LSE_ROCM_PATH at a TheRock root. The Linux
+      # archive bundles that root's HSA runtime (LSE_HSA_RUNTIME_ROOT overrides).
       ROCM_PATH: ${{ vars.LSE_ROCM_PATH || '/opt/rocm' }}
+      HSA_RUNTIME_ROOT: ${{ vars.LSE_HSA_RUNTIME_ROOT || vars.LSE_ROCM_PATH || '/opt/rocm' }}
       # hrx-system is not vendored -- reference/ is ignored -- so a fresh
       # checkout does not contain it. The runner keeps a built install and
       # names it here; without one the HRX backend is left out and the
@@ -153,6 +157,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-16 \
             -DLSE_GPU_TARGETS="${{ steps.targets.outputs.gpu_targets }}" \
             -DLSE_ROCM_PATH="$ROCM_PATH" \
+            -DLSE_WITH_COMGR=OFF \
             "${hrx_args[@]}" \
             -DLSE_HRX_INCLUDE_DIR="$LSE_HRX_INCLUDE_DIR" \
             -DLSE_HRX_LIBRARY="$LSE_HRX_LIBRARY" \
@@ -229,7 +234,7 @@ jobs:
           cp docs/benchmarks/weight-slab-memory-2026-09-29.md "dist/$name/docs/benchmarks/"
           python3 .github/scripts/package-linux.py \
             --build "$PWD/build" --loom-manifest "$LSE_LOOMC_MANIFEST" \
-            --package-dir "$PWD/dist/$name"
+            --package-dir "$PWD/dist/$name" --hsa-runtime "$HSA_RUNTIME_ROOT"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
 
