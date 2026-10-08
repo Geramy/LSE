@@ -98,14 +98,16 @@ git -C "$work/hrx-source" init -q
 #   creation.
 # - loom-vmem-load-latency: loomc's scheduler gives a global load its real
 #   latency, so loads issue ahead of the math that waits on them.
-# - loom-live-in-preamble-split: loomc splits a fixed live-in after the whole
-#   entry live-in preamble, not between two live-ins, where spill traffic could
-#   take a later live-in's register (the workitem id's v0) before it is read.
+# - loom-allocation-entry-preamble: upstream #1377 backported. loomc's
+#   fixed-input splits and VOPD source replicas go after the whole entry
+#   live-in/resource preamble, not between two live-ins, where spill traffic
+#   could take a later live-in's register (the workitem id's v0) before it is
+#   read.
 hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
   gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
   loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
   gfx120x-hdp-kernarg-publication hsa-bar-write-bracket loom-vmem-load-latency
-  loom-live-in-preamble-split)
+  loom-allocation-entry-preamble)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"

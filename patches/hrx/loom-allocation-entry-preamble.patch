@@ -1,0 +1,825 @@
+From b371d8549545b9a13fa262faa480b0c43cb0db3a Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Wed, 7 Oct 2026 18:44:17 -0700
+Subject: [PATCH] [Loom] Preserve ABI preambles during allocation rewrites
+
+Fixed-input splitting and profitable source replication must place their
+transfers after every entry live-in and resource declaration, not
+immediately after an individual definition. Retain the preamble boundary
+in the existing function inventory and carry that borrowed anchor into
+allocation so both rewrite paths preserve the same invariant without
+another IR traversal.
+
+Keep preamble operands on the original input while rewriting later body
+operands to the split result. Ordinary definitions and nonentry block
+arguments retain their existing insertion points, and the change leaves
+register budgets, profitability decisions, and repair convergence policy
+intact.
+
+Backport of upstream 5443bf71813735e0c6add08f162672dfaa96ecfc (#1377)
+onto 5927b0e0. This revision has no function requirements inventory, so
+the function model records the entry preamble end from the entry block's
+leading live-in/resource prefix, which Low verification keeps contiguous.
+The split path keeps this revision's single-split result. loom-check
+verifies the module again after a successful provider emission.
+entry_preamble.loom-test drops its two with-checks allocation-json cases,
+which this loom-check cannot run, and its split expectations are this
+revision's allocator output. low_allocation.loom-test keeps the
+live_in_split_follows_entry_preamble case, which splits a fixed live-in
+under SGPR pressure at this revision.
+---
+ loom/src/loom/codegen/low/BUILD.bazel         |   1 +
+ loom/src/loom/codegen/low/CMakeLists.txt      |   1 +
+ loom/src/loom/codegen/low/allocation.c        |   2 +
+ loom/src/loom/codegen/low/allocation/table.h  |   3 +
+ .../low/allocation_live_range_splitting.c     |  52 ++-
+ .../low/allocation_live_range_splitting.h     |  10 +-
+ loom/src/loom/codegen/low/function_model.c    |  12 +
+ loom/src/loom/codegen/low/function_model.h    |   2 +
+ .../test/source_low/low_allocation.loom-test  | 169 ++++++++++
+ .../target/emit/native/amdgpu/BUILD.bazel     |   1 +
+ .../target/emit/native/amdgpu/CMakeLists.txt  |   1 +
+ .../amdgpu/test/entry_preamble.loom-test      | 309 ++++++++++++++++++
+ loom/src/loom/tools/loom-check/README.md      |   4 +
+ loom/src/loom/tools/loom-check/emit.c         |   6 +
+ 14 files changed, 553 insertions(+), 20 deletions(-)
+ create mode 100644 loom/src/loom/target/emit/native/amdgpu/test/entry_preamble.loom-test
+
+diff --git a/loom/src/loom/codegen/low/BUILD.bazel b/loom/src/loom/codegen/low/BUILD.bazel
+index 60e32da1b..9728c7c31 100644
+--- a/loom/src/loom/codegen/low/BUILD.bazel
++++ b/loom/src/loom/codegen/low/BUILD.bazel
+@@ -211,6 +211,7 @@ loom_cc_library(
+         ":target_binding",
+         "//loom/src/loom/error:emitter",
+         "//loom/src/loom/ir",
++        "//loom/src/loom/ops/low",
+         "//loom/src/loom/util:cfg_graph",
+         "//runtime/src/iree/base",
+         "//runtime/src/iree/base/internal:arena",
+diff --git a/loom/src/loom/codegen/low/CMakeLists.txt b/loom/src/loom/codegen/low/CMakeLists.txt
+index 5798171c9..511435157 100644
+--- a/loom/src/loom/codegen/low/CMakeLists.txt
++++ b/loom/src/loom/codegen/low/CMakeLists.txt
+@@ -201,6 +201,7 @@ loom_cc_library(
+     iree::base::internal::arena
+     loom::error::emitter
+     loom::ir
++    loom::ops::low
+     loom::util::cfg_graph
+   PUBLIC
+ )
+diff --git a/loom/src/loom/codegen/low/allocation.c b/loom/src/loom/codegen/low/allocation.c
+index 569e63a35..2509b0b14 100644
+--- a/loom/src/loom/codegen/low/allocation.c
++++ b/loom/src/loom/codegen/low/allocation.c
+@@ -97,6 +97,7 @@ iree_status_t loom_low_allocate_function(
+   *out_table = (loom_low_allocation_table_t){
+       .module = model->module,
+       .function_op = model->function_op,
++      .entry_preamble_end = model->entry_preamble_end,
+       .target = model->target,
+       .error_count = model->error_count,
+       .cfg_graph = model->cfg_graph,
+@@ -266,6 +267,7 @@ iree_status_t loom_low_allocate_function(
+     table = (loom_low_allocation_table_t){
+         .module = model->module,
+         .function_op = model->function_op,
++        .entry_preamble_end = model->entry_preamble_end,
+         .target = state.target,
+         .liveness = state.liveness,
+         .placement = state.placement,
+diff --git a/loom/src/loom/codegen/low/allocation/table.h b/loom/src/loom/codegen/low/allocation/table.h
+index 9832fb296..67e4546ab 100644
+--- a/loom/src/loom/codegen/low/allocation/table.h
++++ b/loom/src/loom/codegen/low/allocation/table.h
+@@ -251,6 +251,9 @@ typedef struct loom_low_allocation_table_t {
+   loom_module_t* module;
+   // Target-low function operation allocated by this table.
+   const loom_op_t* function_op;
++  // Last entry live-in/resource declaration retained for body rewrite anchors.
++  // NULL for an empty preamble; borrows the unchanged source declarations.
++  const loom_op_t* entry_preamble_end;
+   // Resolved target context selected by |function_op|.
+   loom_low_resolved_target_t target;
+   // Liveness analysis that produced the allocated intervals.
+diff --git a/loom/src/loom/codegen/low/allocation_live_range_splitting.c b/loom/src/loom/codegen/low/allocation_live_range_splitting.c
+index 322f29f3f..35dabdb2e 100644
+--- a/loom/src/loom/codegen/low/allocation_live_range_splitting.c
++++ b/loom/src/loom/codegen/low/allocation_live_range_splitting.c
+@@ -84,8 +84,9 @@ static bool loom_low_allocation_split_use_is_eligible(
+ }
+ 
+ static bool loom_low_allocation_value_can_split_after_definition(
+-    const loom_module_t* module, loom_value_id_t value_id,
+-    loom_block_t** out_insertion_block, loom_op_t** out_insertion_anchor) {
++    const loom_module_t* module, const loom_low_allocation_table_t* table,
++    loom_value_id_t value_id, loom_block_t** out_insertion_block,
++    loom_op_t** out_insertion_anchor) {
+   *out_insertion_block = NULL;
+   *out_insertion_anchor = NULL;
+   const loom_value_t* value = loom_module_value(module, value_id);
+@@ -95,6 +96,10 @@ static bool loom_low_allocation_value_can_split_after_definition(
+       return false;
+     }
+     *out_insertion_block = defining_block;
++    if (table->entry_preamble_end != NULL &&
++        defining_block == table->entry_preamble_end->parent_block) {
++      *out_insertion_anchor = (loom_op_t*)table->entry_preamble_end;
++    }
+     return true;
+   }
+   loom_op_t* defining_op = loom_value_def_op(value);
+@@ -104,7 +109,10 @@ static bool loom_low_allocation_value_can_split_after_definition(
+     return false;
+   }
+   *out_insertion_block = defining_op->parent_block;
+-  *out_insertion_anchor = defining_op;
++  *out_insertion_anchor =
++      loom_low_live_in_isa(defining_op) || loom_low_resource_isa(defining_op)
++          ? (loom_op_t*)table->entry_preamble_end
++          : defining_op;
+   return true;
+ }
+ 
+@@ -462,7 +470,7 @@ iree_status_t loom_low_allocation_replicate_pair_sources(
+     loom_block_t* insertion_block = NULL;
+     loom_op_t* insertion_anchor = NULL;
+     if (!loom_low_allocation_value_can_split_after_definition(
+-            module, candidate->source_value_id, &insertion_block,
++            module, table, candidate->source_value_id, &insertion_block,
+             &insertion_anchor)) {
+       continue;
+     }
+@@ -562,18 +570,20 @@ static iree_status_t loom_low_allocation_try_split_fixed_value(
+   loom_block_t* insertion_block = NULL;
+   loom_op_t* insertion_anchor = NULL;
+   if (!loom_low_allocation_value_can_split_after_definition(
+-          module, fixed_value->value_id, &insertion_block, &insertion_anchor)) {
++          module, table, fixed_value->value_id, &insertion_block,
++          &insertion_anchor)) {
+     return iree_ok_status();
+   }
+ 
+-  const uint32_t original_use_count = value->use_count;
++  uint32_t rewritten_operand_count = 0;
+   const loom_use_t* original_uses = loom_value_uses(value);
+-  for (uint32_t i = 0; i < original_use_count; ++i) {
+-    if (!loom_low_allocation_split_use_is_eligible(
+-            fixed_value->value_id, insertion_block, insertion_anchor,
+-            original_uses[i])) {
+-      return iree_ok_status();
+-    }
++  for (uint32_t i = 0; i < value->use_count; ++i) {
++    rewritten_operand_count += loom_low_allocation_split_use_is_eligible(
++        fixed_value->value_id, insertion_block, insertion_anchor,
++        original_uses[i]);
++  }
++  if (rewritten_operand_count == 0) {
++    return iree_ok_status();
+   }
+ 
+   loom_rewriter_t rewriter = {0};
+@@ -597,16 +607,26 @@ static iree_status_t loom_low_allocation_try_split_fixed_value(
+     const loom_value_id_t split_value_id = loom_low_copy_result(copy_op);
+     status = loom_rewriter_try_set_derived_value_name(
+         &rewriter, fixed_value->value_id, split_value_id, IREE_SV("split"));
+-    if (iree_status_is_ok(status)) {
+-      status = loom_rewriter_replace_all_uses_except(
+-          &rewriter, fixed_value->value_id, split_value_id, copy_op);
++    // Preamble operands keep the original input. Walk backwards because
++    // replacing an operand swap-removes its entry from the source use list.
++    value = loom_module_value(module, fixed_value->value_id);
++    for (uint32_t i = value->use_count; i != 0 && iree_status_is_ok(status);) {
++      const loom_use_t use = loom_value_uses(value)[--i];
++      loom_op_t* user_op = loom_use_user_op(use);
++      if (user_op == copy_op ||
++          !loom_low_allocation_split_use_is_eligible(
++              fixed_value->value_id, insertion_block, insertion_anchor, use)) {
++        continue;
++      }
++      status = loom_rewriter_set_operand(
++          &rewriter, user_op, loom_use_operand_index(use), split_value_id);
+     }
+     if (iree_status_is_ok(status)) {
+       result->source_value_id = fixed_value->value_id;
+       result->split_value_id = split_value_id;
+       result->source_assignment_index = source_assignment_index;
+       result->copy_packet_count = 1;
+-      result->rewritten_operand_count = original_use_count;
++      result->rewritten_operand_count = rewritten_operand_count;
+     }
+   }
+   loom_rewriter_deinitialize(&rewriter);
+diff --git a/loom/src/loom/codegen/low/allocation_live_range_splitting.h b/loom/src/loom/codegen/low/allocation_live_range_splitting.h
+index 36ba357c0..6e8cb97c5 100644
+--- a/loom/src/loom/codegen/low/allocation_live_range_splitting.h
++++ b/loom/src/loom/codegen/low/allocation_live_range_splitting.h
+@@ -8,10 +8,12 @@
+ //
+ // Fixed values model ABI or target locations that must occupy a particular
+ // physical slot while live. When such a value stays live long enough to force a
+-// spill, this utility can insert one low.copy immediately after the fixed
+-// source is materialized and rewrite later users to the copy result. The fixed
+-// physical location then dies at the copy while the ordinary virtual copy
+-// remains allocatable by normal rules.
++// spill, this utility can insert one low.copy after the fixed source is
++// materialized and rewrite later users to the copy result. Entry sources are
++// copied after the complete live-in/resource preamble; other sources are copied
++// immediately after their definition. Preamble uses retain the original input.
++// The fixed physical location then dies at the copy while the ordinary virtual
++// copy remains allocatable by normal rules.
+ 
+ #ifndef LOOM_CODEGEN_LOW_ALLOCATION_LIVE_RANGE_SPLITTING_H_
+ #define LOOM_CODEGEN_LOW_ALLOCATION_LIVE_RANGE_SPLITTING_H_
+diff --git a/loom/src/loom/codegen/low/function_model.c b/loom/src/loom/codegen/low/function_model.c
+index 1b6937600..977ec3bbe 100644
+--- a/loom/src/loom/codegen/low/function_model.c
++++ b/loom/src/loom/codegen/low/function_model.c
+@@ -7,6 +7,7 @@
+ #include "loom/codegen/low/function_model.h"
+ 
+ #include "loom/codegen/low/function.h"
++#include "loom/ops/low/ops.h"
+ 
+ iree_status_t loom_low_function_model_initialize(
+     loom_module_t* module, const loom_op_t* low_func_op,
+@@ -60,6 +61,17 @@ iree_status_t loom_low_function_model_initialize(
+   loom_region_for_each_block(out_model->body, block) {
+     out_model->node_count += block->op_count;
+   }
++  // Low verification keeps live-in/resource declarations contiguous at the top
++  // of the entry block, so the preamble ends at the last op of that prefix.
++  if (out_model->body->block_count != 0) {
++    const loom_op_t* op = NULL;
++    loom_block_for_each_op(loom_region_const_entry_block(out_model->body), op) {
++      if (!loom_low_live_in_isa(op) && !loom_low_resource_isa(op)) {
++        break;
++      }
++      out_model->entry_preamble_end = op;
++    }
++  }
+   return iree_ok_status();
+ }
+ 
+diff --git a/loom/src/loom/codegen/low/function_model.h b/loom/src/loom/codegen/low/function_model.h
+index 384ec3f9b..2132ef7d8 100644
+--- a/loom/src/loom/codegen/low/function_model.h
++++ b/loom/src/loom/codegen/low/function_model.h
+@@ -47,6 +47,8 @@ typedef struct loom_low_function_model_t {
+   loom_cfg_graph_t cfg_graph;
+   // Number of top-level operations in |body|.
+   iree_host_size_t node_count;
++  // Last entry live-in/resource declaration, or NULL for an empty preamble.
++  const loom_op_t* entry_preamble_end;
+   // Number of user-facing errors emitted while constructing the model.
+   uint32_t error_count;
+ } loom_low_function_model_t;
+diff --git a/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test b/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test
+index f5b50065e..8b0e54b76 100644
+--- a/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test
++++ b/loom/src/loom/target/arch/amdgpu/test/source_low/low_allocation.loom-test
+@@ -413,3 +413,172 @@ low.func.def target<amdgpu.rdna3.core>(@target) @loaded_chained_destructive_sgpr
+   %active_block_count = low.op<amdgpu.s_lshr_b32.rhs_inline>(%padded_active_row_count) {imm32 = 6} : (reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
+   low.return %active_block_count : reg<amdgpu.sgpr>
+ }
++
++// ====
++
++// Fixed live-ins are live in their ABI registers from kernel entry. Splitting
++// %kernarg and %group under SGPR pressure must place the split copies, and the
++// spill traffic that follows them, after the whole live-in preamble: placed
++// before %lane, the spill traffic's temporary VGPR could take v0 and overwrite
++// the workitem id before it is read.
++// RUN: emit amdgpu-assembly @live_in_split_follows_entry_preamble strategy=source amdgpu.sgpr=7 fixed=%kernarg:physical_register:0:2 fixed=%group:physical_register:2:1 fixed=%lane:physical_register:0:1
++amdgpu.target<gfx1151> @target
++
++low.kernel.def target<amdgpu.rdna3_5.core>(@target) abi_layout({constant_count = 0, direct_arg_count = 0, direct_arg_names = {}, direct_arg_offsets = [], direct_arg_parameter_indices = [], direct_arg_sizes = [], parameter_count = 1, resource_count = 1, resource_offsets = [0], resource_parameter_indices = [0], uses_kernarg_segment_ptr = true}) workgroup_size(64, 1, 1) @live_in_split_follows_entry_preamble() {
++  %kernarg = low.live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %group = low.live_in<amdgpu.workgroup_id.x> : reg<amdgpu.sgpr>
++  %lane = low.live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  %x0 = low.op<amdgpu.s_load_dword_offset_only>(%kernarg) {offset = 8} : (reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr>
++  %y0 = low.op<amdgpu.s_mul_i32>(%x0, %x0) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %x1 = low.op<amdgpu.s_load_dword_offset_only>(%kernarg) {offset = 12} : (reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr>
++  %y1 = low.op<amdgpu.s_mul_i32>(%x1, %x1) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %x2 = low.op<amdgpu.s_load_dword_offset_only>(%kernarg) {offset = 16} : (reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr>
++  %y2 = low.op<amdgpu.s_mul_i32>(%x2, %x2) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %x3 = low.op<amdgpu.s_load_dword_offset_only>(%kernarg) {offset = 20} : (reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr>
++  %y3 = low.op<amdgpu.s_mul_i32>(%x3, %x3) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %x4 = low.op<amdgpu.s_load_dword_offset_only>(%kernarg) {offset = 24} : (reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr>
++  %y4 = low.op<amdgpu.s_mul_i32>(%x4, %x4) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %s1 = low.op<amdgpu.s_add_u32>(%y0, %y1) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %s2 = low.op<amdgpu.s_add_u32>(%s1, %y2) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %s3 = low.op<amdgpu.s_add_u32>(%s2, %y3) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %s4 = low.op<amdgpu.s_add_u32>(%s3, %y4) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %sum = low.op<amdgpu.s_add_u32>(%s4, %group) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr>
++  %output = low.op<amdgpu.s_load_dwordx2_offset_only>(%kernarg) {offset = 0} : (reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  %value = low.op<amdgpu.v_mov_b32_copy>(%sum) : (reg<amdgpu.sgpr>) -> reg<amdgpu.vgpr>
++  %address = low.op<amdgpu.v_lshlrev_b32.src0_inline>(%lane) {imm32 = 2} : (reg<amdgpu.vgpr>) -> reg<amdgpu.vgpr>
++  low.op<amdgpu.global_store_b32_saddr>(%address, %value, %output) {offset = 0} : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>, reg<amdgpu.sgpr x2>)
++  low.return
++}
++
++// ----
++s_mov_b32 s4, s0
++  s_mov_b32 s5, s1
++  s_mov_b64_exec_read s[0:1]
++  s_mov_b64 exec, -1
++  v_mov_b32_copy v1, s4
++  scratch_store_b32 off, v1, off offset:16 glc:0 slc:0 dlc:0
++  v_mov_b32_copy v2, s5
++  scratch_store_b32 off, v2, off offset:20 glc:0 slc:0 dlc:0
++  s_mov_b64 exec, s[0:1]
++  s_waitcnt_vscnt vscnt(0)
++  s_mov_b64_exec_read s[0:1]
++  s_mov_b64 exec, -1
++  scratch_load_b32 v3, off, off offset:16 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s4, v3
++  scratch_load_b32 v3, off, off offset:20 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s5, v3
++  s_mov_b64 exec, s[0:1]
++  s_load_dword s0, s[4:5] offset:8
++  s_waitcnt vmcnt(63) lgkmcnt(0)
++  s_mul_i32 s0, s0, s0
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  v_mov_b32_copy v3, s0
++  scratch_store_b32 off, v3, off offset:4 glc:0 slc:0 dlc:0
++  s_mov_b64 exec, s[4:5]
++  s_mov_b64_exec_read s[0:1]
++  s_mov_b64 exec, -1
++  s_waitcnt_vscnt vscnt(0)
++  scratch_load_b32 v4, off, off offset:16 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s4, v4
++  scratch_load_b32 v4, off, off offset:20 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s5, v4
++  s_mov_b64 exec, s[0:1]
++  s_load_dword s0, s[4:5] offset:12
++  s_waitcnt vmcnt(63) lgkmcnt(0)
++  s_mul_i32 s0, s0, s0
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  v_mov_b32_copy v4, s0
++  scratch_store_b32 off, v4, off offset:8 glc:0 slc:0 dlc:0
++  s_mov_b64 exec, s[4:5]
++  s_mov_b64_exec_read s[0:1]
++  s_mov_b64 exec, -1
++  s_waitcnt_vscnt vscnt(0)
++  scratch_load_b32 v5, off, off offset:16 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s4, v5
++  scratch_load_b32 v5, off, off offset:20 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s5, v5
++  s_mov_b64 exec, s[0:1]
++  s_load_dword s0, s[4:5] offset:16
++  s_waitcnt vmcnt(63) lgkmcnt(0)
++  s_mul_i32 s0, s0, s0
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  v_mov_b32_copy v5, s0
++  scratch_store_b32 off, v5, off offset:0 glc:0 slc:0 dlc:0
++  s_mov_b64 exec, s[4:5]
++  s_mov_b64_exec_read s[0:1]
++  s_mov_b64 exec, -1
++  s_waitcnt_vscnt vscnt(0)
++  scratch_load_b32 v6, off, off offset:16 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s4, v6
++  scratch_load_b32 v6, off, off offset:20 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s5, v6
++  s_mov_b64 exec, s[0:1]
++  s_load_dword s0, s[4:5] offset:20
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  scratch_load_b32 v6, off, off offset:16 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s1, v6
++  scratch_load_b32 v6, off, off offset:20 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s3, v6
++  s_mov_b64 exec, s[4:5]
++  s_delay_alu instid0(VALU_DEP_1)
++  s_mov_b32 s4, s1
++  s_mov_b32 s5, s3
++  s_load_dword s1, s[4:5] offset:24
++  s_waitcnt vmcnt(63) lgkmcnt(0)
++  s_mul_i32 s1, s1, s1
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  scratch_load_b32 v6, off, off offset:4 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s3, v6
++  s_mov_b64 exec, s[4:5]
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  scratch_load_b32 v6, off, off offset:8 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s6, v6
++  s_mov_b64 exec, s[4:5]
++  s_delay_alu instid0(VALU_DEP_1)
++  s_add_u32 s3, s3, s6
++  s_mov_b64_exec_read s[4:5]
++  s_mov_b64 exec, -1
++  scratch_load_b32 v6, off, off offset:0 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s6, v6
++  s_mov_b64 exec, s[4:5]
++  s_delay_alu instid0(VALU_DEP_1)
++  s_add_u32 s3, s3, s6
++  s_mul_i32 s0, s0, s0
++  s_add_u32 s0, s3, s0
++  s_add_u32 s0, s0, s1
++  s_add_u32 s0, s0, s2
++  s_mov_b64_exec_read s[2:3]
++  s_mov_b64 exec, -1
++  scratch_load_b32 v6, off, off offset:16 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s4, v6
++  scratch_load_b32 v6, off, off offset:20 glc:0 slc:0 dlc:0
++  s_waitcnt vmcnt(0) lgkmcnt(63)
++  v_readfirstlane_b32 s5, v6
++  s_mov_b64 exec, s[2:3]
++  s_load_dwordx2 s[2:3], s[4:5] offset:0
++  v_mov_b32_copy v6, s0
++  v_lshlrev_b32 v0, 2, v0
++  s_waitcnt vmcnt(63) lgkmcnt(0)
++  global_store_b32 v0, v6, s[2:3] offset:0
++  s_waitcnt_vscnt vscnt(0)
++  s_endpgm
+diff --git a/loom/src/loom/target/emit/native/amdgpu/BUILD.bazel b/loom/src/loom/target/emit/native/amdgpu/BUILD.bazel
+index f17446fbd..1474f5791 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/BUILD.bazel
++++ b/loom/src/loom/target/emit/native/amdgpu/BUILD.bazel
+@@ -113,6 +113,7 @@ loom_check_test_suite(
+         "test/assembly_q8.loom-test",
+         "test/assembly_vopd_profiles.loom-test",
+         "test/assembly_wmma.loom-test",
++        "test/entry_preamble.loom-test",
+         "test/gfx1201_native.loom-test",
+         "test/hal_kernel_library.loom-test",
+         "test/packet.loom-test",
+diff --git a/loom/src/loom/target/emit/native/amdgpu/CMakeLists.txt b/loom/src/loom/target/emit/native/amdgpu/CMakeLists.txt
+index 77562a4fd..c81c574ac 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/CMakeLists.txt
++++ b/loom/src/loom/target/emit/native/amdgpu/CMakeLists.txt
+@@ -94,6 +94,7 @@ loom_check_test_suite(
+     "test/assembly_q8.loom-test"
+     "test/assembly_vopd_profiles.loom-test"
+     "test/assembly_wmma.loom-test"
++    "test/entry_preamble.loom-test"
+     "test/gfx1201_native.loom-test"
+     "test/hal_kernel_library.loom-test"
+     "test/packet.loom-test"
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/entry_preamble.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/entry_preamble.loom-test
+new file mode 100644
+index 000000000..8d768438b
+--- /dev/null
++++ b/loom/src/loom/target/emit/native/amdgpu/test/entry_preamble.loom-test
+@@ -0,0 +1,309 @@
++// Fixed-input splits preserve the entry declarations and dominate body uses.
++// RUN: emit amdgpu-assembly @split_live_in strategy=source amdgpu.sgpr=4 fixed=%current:physical_register:0:2 fixed=%next:physical_register:0:2
++
++amdgpu.target<gfx1151> @target {subgroup_size = 64}
++
++low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@target) @split_live_in() -> (reg<amdgpu.sgpr x2>) asm {
++  %current = live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %value = live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  %first = slice %current[0] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %second = slice %current[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %swapped = concat(%second, %first) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x2>
++  %selected = v_cndmask_b32_src0_inline %value, %current {false_value = 0}
++  low.br ^exit(%swapped: reg<amdgpu.sgpr x2>)
++^exit(%next: reg<amdgpu.sgpr x2>):
++  return %next
++}
++
++// ----
++  s_mov_b32 s3, s0
++  s_mov_b32 s2, s1
++  v_cndmask_b32 v0, 0, v0, s[0:1]
++  s_mov_b32 s0, s2
++  s_mov_b32 s1, s3
++.Lbb1:
++  s_endpgm
++
++// ====
++
++// Fixed-input splits preserve the entry declarations and dominate body uses.
++// RUN: emit amdgpu-assembly @split_entry_argument strategy=source amdgpu.sgpr=4 fixed=%current:physical_register:0:2 fixed=%next:physical_register:0:2
++
++amdgpu.target<gfx1151> @target {subgroup_size = 64}
++
++low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@target) @split_entry_argument(%current: reg<amdgpu.sgpr x2>) -> (reg<amdgpu.sgpr x2>) asm {
++  %value = live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  %first = slice %current[0] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %second = slice %current[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %swapped = concat(%second, %first) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x2>
++  %selected = v_cndmask_b32_src0_inline %value, %current {false_value = 0}
++  low.br ^exit(%swapped: reg<amdgpu.sgpr x2>)
++^exit(%next: reg<amdgpu.sgpr x2>):
++  return %next
++}
++
++// ----
++  s_mov_b32 s3, s0
++  s_mov_b32 s2, s1
++  v_cndmask_b32 v0, 0, v0, s[0:1]
++  s_mov_b32 s0, s2
++  s_mov_b32 s1, s3
++.Lbb1:
++  s_endpgm
++
++// ====
++
++// Fixed-input splits preserve the entry declarations and dominate body uses.
++// RUN: emit amdgpu-assembly @split_ordinary_definition strategy=source amdgpu.sgpr=4 fixed=%current:physical_register:0:2 fixed=%next:physical_register:0:2
++
++amdgpu.target<gfx1151> @target {subgroup_size = 64}
++
++low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@target) @split_ordinary_definition() -> (reg<amdgpu.sgpr x2>) asm {
++  %seed = live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %value = live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  %current = copy %seed : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr x2>
++  %first = slice %current[0] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %second = slice %current[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %swapped = concat(%second, %first) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x2>
++  %selected = v_cndmask_b32_src0_inline %value, %current {false_value = 0}
++  low.br ^exit(%swapped: reg<amdgpu.sgpr x2>)
++^exit(%next: reg<amdgpu.sgpr x2>):
++  return %next
++}
++
++// ----
++  s_mov_b32 s3, s0
++  s_mov_b32 s2, s1
++  v_cndmask_b32 v0, 0, v0, s[0:1]
++  s_mov_b32 s0, s2
++  s_mov_b32 s1, s3
++.Lbb1:
++  s_endpgm
++
++// ====
++
++// Fixed-input splits preserve the entry declarations and dominate body uses.
++// RUN: emit amdgpu-assembly @split_successor_argument strategy=source amdgpu.sgpr=4 fixed=%current:physical_register:0:2 fixed=%next:physical_register:0:2
++
++amdgpu.target<gfx1151> @target {subgroup_size = 64}
++
++low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@target) @split_successor_argument() -> (reg<amdgpu.sgpr x2>) asm {
++  %seed = live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %value = live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  low.br ^body(%seed: reg<amdgpu.sgpr x2>)
++^body(%current: reg<amdgpu.sgpr x2>):
++  %first = slice %current[0] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %second = slice %current[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %swapped = concat(%second, %first) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x2>
++  %selected = v_cndmask_b32_src0_inline %value, %current {false_value = 0}
++  low.br ^exit(%swapped: reg<amdgpu.sgpr x2>)
++^exit(%next: reg<amdgpu.sgpr x2>):
++  return %next
++}
++
++// ----
++.Lbb1:
++  s_mov_b32 s3, s0
++  s_mov_b32 s2, s1
++  v_cndmask_b32 v0, 0, v0, s[0:1]
++  s_mov_b32 s0, s2
++  s_mov_b32 s1, s3
++.Lbb2:
++  s_endpgm
++
++// ====
++
++// Fixed-input splits preserve the entry declarations and dominate body uses.
++// RUN: emit amdgpu-assembly @split_empty_preamble strategy=source amdgpu.sgpr=4 fixed=%current:physical_register:0:2 fixed=%next:physical_register:0:2
++
++amdgpu.target<gfx1151> @target {subgroup_size = 64}
++
++low.func.def schedule(locked) target<amdgpu.rdna3_5.core>(@target) @split_empty_preamble(%current: reg<amdgpu.sgpr x2>, %value: reg<amdgpu.vgpr>) -> (reg<amdgpu.sgpr x2>) asm {
++  %first = slice %current[0] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %second = slice %current[1] : reg<amdgpu.sgpr x2> -> reg<amdgpu.sgpr>
++  %swapped = concat(%second, %first) : (reg<amdgpu.sgpr>, reg<amdgpu.sgpr>) -> reg<amdgpu.sgpr x2>
++  %selected = v_cndmask_b32_src0_inline %value, %current {false_value = 0}
++  low.br ^exit(%swapped: reg<amdgpu.sgpr x2>)
++^exit(%next: reg<amdgpu.sgpr x2>):
++  return %next
++}
++
++// ----
++  s_mov_b32 s3, s0
++  s_mov_b32 s2, s1
++  v_cndmask_b32 v0, 0, v0, s[0:1]
++  s_mov_b32 s0, s2
++  s_mov_b32 s1, s3
++.Lbb1:
++  s_endpgm
++
++// ====
++
++// Profitable VOPD replication also places its copy after the complete preamble.
++// RUN: emit amdgpu-assembly @replicate_entry_argument strategy=resource-stall
++
++amdgpu.target<gfx1100> @target
++
++low.func.def target<amdgpu.rdna3.core>(@target) @replicate_entry_argument(%lhs: reg<amdgpu.vgpr x8>, %shared: reg<amdgpu.vgpr>) asm {
++  %pointer = live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %lhs0 = slice %lhs[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product0 = v_mul_f32 %lhs0, %shared
++  %lhs1 = slice %lhs[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product1 = v_mul_f32 %lhs1, %shared
++  %lhs2 = slice %lhs[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product2 = v_mul_f32 %lhs2, %shared
++  %lhs3 = slice %lhs[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product3 = v_mul_f32 %lhs3, %shared
++  %lhs4 = slice %lhs[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product4 = v_mul_f32 %lhs4, %shared
++  %lhs5 = slice %lhs[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product5 = v_mul_f32 %lhs5, %shared
++  %lhs6 = slice %lhs[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product6 = v_mul_f32 %lhs6, %shared
++  %lhs7 = slice %lhs[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product7 = v_mul_f32 %lhs7, %shared
++  return
++}
++
++// ----
++  v_dual_mul_f32 v2, v8, v2 :: v_dual_mul_f32 v3, v3, v8
++  v_dual_mul_f32 v2, v8, v6 :: v_dual_mul_f32 v3, v7, v8
++  v_mov_b32 v2, v8
++  s_delay_alu instid0(VALU_DEP_1)
++  v_dual_mul_f32 v0, v0, v8 :: v_dual_mul_f32 v1, v1, v2
++  v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v2
++  s_endpgm
++
++// ====
++
++// Profitable VOPD replication also places its copy after the complete preamble.
++// RUN: emit amdgpu-assembly @replicate_live_in strategy=resource-stall
++
++amdgpu.target<gfx1100> @target
++
++low.func.def target<amdgpu.rdna3.core>(@target) @replicate_live_in(%lhs: reg<amdgpu.vgpr x8>) asm {
++  %shared = live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  %pointer = live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %lhs0 = slice %lhs[0] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product0 = v_mul_f32 %lhs0, %shared
++  %lhs1 = slice %lhs[1] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product1 = v_mul_f32 %lhs1, %shared
++  %lhs2 = slice %lhs[2] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product2 = v_mul_f32 %lhs2, %shared
++  %lhs3 = slice %lhs[3] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product3 = v_mul_f32 %lhs3, %shared
++  %lhs4 = slice %lhs[4] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product4 = v_mul_f32 %lhs4, %shared
++  %lhs5 = slice %lhs[5] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product5 = v_mul_f32 %lhs5, %shared
++  %lhs6 = slice %lhs[6] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product6 = v_mul_f32 %lhs6, %shared
++  %lhs7 = slice %lhs[7] : reg<amdgpu.vgpr x8> -> reg<amdgpu.vgpr>
++  %product7 = v_mul_f32 %lhs7, %shared
++  return
++}
++
++// ----
++  v_dual_mul_f32 v2, v8, v2 :: v_dual_mul_f32 v3, v3, v8
++  v_dual_mul_f32 v2, v8, v6 :: v_dual_mul_f32 v3, v7, v8
++  v_mov_b32 v2, v8
++  s_delay_alu instid0(VALU_DEP_1)
++  v_dual_mul_f32 v0, v0, v8 :: v_dual_mul_f32 v1, v1, v2
++  v_dual_mul_f32 v0, v4, v8 :: v_dual_mul_f32 v1, v5, v2
++  s_endpgm
++
++// ====
++
++// Public kernel emission retains a valid entry interface.
++// RUN: emit amdgpu-kernel-assembly
++
++amdgpu.target<gfx1151> @target {subgroup_size = 64}
++
++low.kernel.def schedule(locked) target<amdgpu.rdna3_5.core>(@target) workgroup_size(64, 1, 1) @retained_input() asm {
++  %mask = live_in<amdgpu.kernarg_segment_ptr> : reg<amdgpu.sgpr x2>
++  %value = live_in<amdgpu.workitem_id.x> : reg<amdgpu.vgpr>
++  %selected = v_cndmask_b32_src0_inline %value, %mask {false_value = 0}
++  return
++}
++
++// ----
++.text
++.amdgcn_target "amdgcn-amd-amdhsa--gfx1151"
++.amdhsa_code_object_version 6
++
++.protected retained_input
++.globl retained_input
++.p2align 8
++.type retained_input,@function
++retained_input:
++  v_cndmask_b32 v0, 0, v0, s[0:1]
++  s_endpgm
++.Lfunc_end0:
++.size retained_input, .Lfunc_end0-retained_input
++
++.rodata
++.p2align 6
++.amdhsa_kernel retained_input
++  .amdhsa_group_segment_fixed_size 0
++  .amdhsa_private_segment_fixed_size 0
++  .amdhsa_kernarg_size 0
++  .amdhsa_user_sgpr_count 2
++  .amdhsa_user_sgpr_dispatch_ptr 0
++  .amdhsa_user_sgpr_queue_ptr 0
++  .amdhsa_user_sgpr_kernarg_segment_ptr 1
++  .amdhsa_user_sgpr_dispatch_id 0
++  .amdhsa_user_sgpr_private_segment_size 0
++  .amdhsa_wavefront_size32 0
++  .amdhsa_uses_dynamic_stack 0
++  .amdhsa_enable_private_segment 0
++  .amdhsa_system_sgpr_workgroup_id_x 0
++  .amdhsa_system_sgpr_workgroup_id_y 0
++  .amdhsa_system_sgpr_workgroup_id_z 0
++  .amdhsa_system_sgpr_workgroup_info 0
++  .amdhsa_system_vgpr_workitem_id 0
++  .amdhsa_next_free_vgpr 1
++  .amdhsa_next_free_sgpr 2
++  .amdhsa_reserve_vcc 0
++  .amdhsa_float_round_mode_32 0
++  .amdhsa_float_round_mode_16_64 0
++  .amdhsa_float_denorm_mode_32 3
++  .amdhsa_float_denorm_mode_16_64 3
++  .amdhsa_dx10_clamp 1
++  .amdhsa_ieee_mode 1
++  .amdhsa_fp16_overflow 0
++  .amdhsa_workgroup_processor_mode 1
++  .amdhsa_memory_ordered 1
++  .amdhsa_forward_progress 1
++  .amdhsa_shared_vgpr_count 0
++  .amdhsa_inst_pref_size 0
++  .amdhsa_exception_fp_ieee_invalid_op 0
++  .amdhsa_exception_fp_denorm_src 0
++  .amdhsa_exception_fp_ieee_div_zero 0
++  .amdhsa_exception_fp_ieee_overflow 0
++  .amdhsa_exception_fp_ieee_underflow 0
++  .amdhsa_exception_fp_ieee_inexact 0
++  .amdhsa_exception_int_div_zero 0
++.end_amdhsa_kernel
++
++.amdgpu_metadata
++  amdhsa.version:
++    - 1
++    - 2
++  amdhsa.target: 'amdgcn-amd-amdhsa--gfx1151'
++  amdhsa.kernels:
++    - .name: 'retained_input'
++      .symbol: 'retained_input.kd'
++      .kernarg_segment_size: 0
++      .group_segment_fixed_size: 0
++      .private_segment_fixed_size: 0
++      .kernarg_segment_align: 8
++      .wavefront_size: 64
++      .sgpr_count: 2
++      .vgpr_count: 1
++      .max_flat_workgroup_size: 64
++      .reqd_workgroup_size:
++        - 64
++        - 1
++        - 1
++      .args: []
++.end_amdgpu_metadata
+diff --git a/loom/src/loom/tools/loom-check/README.md b/loom/src/loom/tools/loom-check/README.md
+index f5cd298d1..943b04ca3 100644
+--- a/loom/src/loom/tools/loom-check/README.md
++++ b/loom/src/loom/tools/loom-check/README.md
+@@ -39,3 +39,7 @@ iree-bazel-run //loom/src/loom/tools/loom-check -- --agents_md
+ Emit-mode JSON targets should stay small. When a case only needs structured
+ diagnostics from the emitter, use `output=none` and check the `ERROR@` or
+ `REMARK@` annotations instead of checking in a large JSON blob.
++
++Emit providers receiving a parsed module run with verification before emission
++and again after successful emission. Their scheduling and allocation rewrites
++must leave valid IR even when the selected output is native assembly or a report.
+diff --git a/loom/src/loom/tools/loom-check/emit.c b/loom/src/loom/tools/loom-check/emit.c
+index 01d7c8807..8b277ee0a 100644
+--- a/loom/src/loom/tools/loom-check/emit.c
++++ b/loom/src/loom/tools/loom-check/emit.c
+@@ -1919,6 +1919,12 @@ iree_status_t loom_check_execute_emit(
+         result->actual_output.size != actual_output_size) {
+       result->has_actual_output = true;
+     }
++    if (iree_status_is_ok(status) &&
++        !loom_check_diagnostic_collector_has_error(&diagnostic_collector)) {
++      status = loom_check_emit_verify_provider_module(
++          module, &low_registry, source_resolver,
++          environment->low_verify_provider_list, &diagnostic_collector);
++    }
+     loom_module_free(module);
+     diagnostic_collector.module = NULL;
+     if (!iree_status_is_ok(status)) {
+-- 
+2.51.0
+
