@@ -18,7 +18,6 @@
 #   HSA_HEADERS_SOURCE   hsa-runtime-headers checkout (hsa/ and aqlprofile-sdk/).
 #                        Default: fetched into $LSE_IOS_WORK/deps/hsa-headers.
 #   HSA_IOS_LIBRARY      static libhsa-runtime64.a built for iOS arm64.
-#   FLATCC_SOURCE        flatcc source tree; fetched by CMake when missing.
 #   LOOM_AMDGPU_ISA_XML  directory holding amdgpu_isa_*.xml; fetched when
 #                        missing.
 #   IOS_DEPLOYMENT_TARGET  minimum iOS version (default 26.0).
@@ -42,7 +41,6 @@ hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 hrx_source="${HRX_SOURCE:-$work/deps/hrx}"
 hsa_headers="${HSA_HEADERS_SOURCE:-$work/deps/hsa-headers}"
 hsa_library="${HSA_IOS_LIBRARY:-$dev/mac_linuxgpu-worktrees/hsa-ios/build/hsa-ios/libhsa-runtime64.a}"
-flatcc_source="${FLATCC_SOURCE:-}"
 isa_xml="${LOOM_AMDGPU_ISA_XML:-}"
 deployment="${IOS_DEPLOYMENT_TARGET:-26.0}"
 jobs="${LSE_BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
@@ -115,9 +113,6 @@ archive_args=("-DCMAKE_AR=$ar" "-DCMAKE_RANLIB=$ranlib"
 # The HSA and aqlprofile headers reach the build through the hsa-runtime64
 # package written below, so no hsa-runtime-headers FetchContent is involved.
 fetch_args=()
-if [[ -f "$flatcc_source/include/flatcc/flatcc.h" ]]; then
-  fetch_args+=("-DFETCHCONTENT_SOURCE_DIR_FLATCC=$flatcc_source")
-fi
 
 src="$work/hrx-source"
 host="$work/hrx-host-tools"
@@ -140,23 +135,28 @@ for patch in "${hrx_patches[@]}"; do
   git -C "$src" apply "$root/patches/hrx/$patch.patch"
 done
 
-# 2. Generators that run during the build (embed_data, flatcc) must run on the
-# Mac, not on the device. Build them for macOS and point the iOS build at them.
+# 2. Generators that run during the build (embed_data, and the Loom linker and
+# compiler that build Loom's own kernel modules) must run on the Mac, not on the
+# device. Build them for macOS and point the iOS build at them.
 echo "== building macOS host tools"
 cmake -S "$src" -B "$host" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" "${archive_args[@]}" \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
-  -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_LOCAL_SYNC=OFF \
-  -DIREE_HAL_DRIVER_LOCAL_TASK=OFF -DIREE_HAL_DRIVER_NULL=OFF \
-  -DIREE_HAL_EXECUTABLE_LOADER_DEFAULTS=OFF \
-  -DIREE_HAL_EXECUTABLE_PLUGIN_DEFAULTS=OFF \
-  -DLOOM_BUILD=OFF -DLIBHRX_BUILD=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
+  -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_EXECUTABLE_LOADER_DEFAULTS=OFF \
+  -DLOOM_BUILD=ON -DLOOM_TARGET_DEFAULTS=OFF \
+  -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=gfx1201 \
+  -DLIBHRX_BUILD=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
   ${fetch_args[@]+"${fetch_args[@]}"} > "$work/hrx-host-tools-configure.log"
-cmake --build "$host" --target iree-c-embed-data iree-flatcc-cli \
+cmake --build "$host" --target iree-c-embed-data loom-link loom-compile \
   --parallel "$jobs" > "$work/hrx-host-tools-build.log"
 mkdir -p "$host/bin"
-cp "$host/build_tools/iree-c-embed-data" "$host/tools/iree-flatcc-cli" \
-  "$host/bin/"
+cp "$host/build_tools/iree-c-embed-data" \
+  "$host/loom/src/loom/tools/loom-link/loom-link" \
+  "$host/loom/src/loom/tools/loom-compile/loom-compile" "$host/bin/"
+# The host build fetched the AMDGPU ISA XML; the iOS build reuses it.
+if [[ -z "$isa_xml" && -f "$host/_deps/amdgpu_isa_xml-src/amdgpu_isa_rdna4.xml" ]]; then
+  isa_xml="$host/_deps/amdgpu_isa_xml-src"
+fi
 
 # 3. hrx-system links static HSA through an hsa-runtime64 CMake package. The
 # iOS runtime is a bare archive, so describe it as one.
@@ -182,8 +182,9 @@ if [[ -f "$isa_xml/amdgpu_isa_rdna4.xml" ]]; then
 fi
 
 # 4. The link probe. hrx's exports come from its macOS export list; loomc's
-# from the public headers, minus the SPIR-V and LLVM IR targets that are not
-# built here. The probe references every one of them, so linking it proves the
+# from the public headers, minus the targets that are not built here (SPIR-V,
+# LLVM IR, VM, WebAssembly, XDNA, CPU, command programs, configured environments)
+# and the C++ importer. The probe references every one of them, so linking it proves the
 # archive set is complete. It is also how the archive closure is taken from
 # CMake below instead of being maintained by hand.
 mkdir -p "$probe"
@@ -194,7 +195,7 @@ import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 names = set()
 for header in sorted(root.rglob('*.h')):
-    if re.match(r'target/(spirv|llvmir)', header.relative_to(root).as_posix()):
+    if re.match(r'(target/(spirv|llvmir|vm|wasm|amd/xdna|cmd|configured|cpu)|import/)', header.relative_to(root).as_posix()):
         continue
     text = re.sub(r'//[^\n]*|/\*.*?\*/', '', header.read_text(), flags=re.S)
     for m in re.finditer(r'LOOMC_API_EXPORT\b[^;{]*?\b(loomc_\w+)\s*\(', text):
@@ -258,8 +259,10 @@ add_executable(hrx_ios_link_probe
 target_link_libraries(hrx_ios_link_probe PRIVATE
   libhrx_src_libhrx_hrx_static
   loom_binding_c_loomc
+  loom_binding_c_task_pool
+  loom_binding_c_task_queue
   loom_binding_c_target_amdgpu_amdgpu
-  loom_binding_c_target_amdgpu_iree_hal_iree_hal
+  loom_binding_c_target_amdgpu_iree_hal
   loom_binding_c_target_iree_hal_iree_hal
   "-framework IOKit" "-framework CoreFoundation" c++)
 EOF
@@ -340,7 +343,7 @@ done < "$inputs"
 # One archive per component: loomc (Loom and its C binding, including the
 # ALWAYSLINK binding objects, which carry no static initialisers and are all
 # reached through the public API) and hrx (libhrx with the IREE runtime, the
-# AMDGPU HAL and flatcc). loomc depends on the IREE base libraries inside
+# AMDGPU HAL). loomc depends on the IREE base libraries inside
 # libhrx_ios.a, so it comes first.
 echo "== merging archives"
 rm -rf "$libs"
