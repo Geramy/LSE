@@ -259,17 +259,26 @@ class HsaRuntime {
 #else
     constexpr const char* soname = "libhsa-runtime64.so.1";
 #endif
+#if defined(__APPLE__)
+    // A release archive's own runtime, which the preload named for HRX's
+    // loader, is the copy HRX uses; open the same one.
+    if (const char* bundled = std::getenv("IREE_HAL_AMDGPU_LIBHSA_PATH");
+        bundled != nullptr && *bundled != 0) {
+      lib_ = dlopen(bundled, RTLD_LAZY);
+    }
+    if (lib_ == nullptr) lib_ = detail::open_loaded_library(soname, "hsa_init");
+#else
     lib_ = detail::open_loaded_library(soname, "hsa_init");
+#endif
     if (lib_ == nullptr && load_if_missing) {
       lib_ = dlopen(soname, RTLD_LAZY);
     }
 #if defined(__APPLE__)
     // The soname dlopen uses the process DYLD search path, which a driver
     // installer cannot set for an already-running binary. If it came up empty,
-    // try the standard installed-runtime location directly. (We do NOT set
-    // IREE_HAL_AMDGPU_LIBHSA_PATH here: that variable is read by the IREE HSA
-    // loader, which looks for the *Linux* .so soname and would not find the
-    // macOS .dylib in the same directory.)
+    // try the standard installed-runtime location directly. (A directory in
+    // IREE_HAL_AMDGPU_LIBHSA_PATH would not work here: the IREE HSA loader
+    // appends the Linux .so soname. The preload names a whole file instead.)
     if (lib_ == nullptr) {
       lib_ = dlopen(kInstalledHsaLib,
                     RTLD_LAZY);

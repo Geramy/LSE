@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#include <mach-o/dyld.h>
 #endif
 #include <sys/resource.h>
 
@@ -604,6 +605,39 @@ void preload_gpu_runtime() {
     if (ok) return;
   }
 
+  // The release archives bundle the HSA runtime HRX needs in their own lib/,
+  // next to libexec/ where the binaries live: Linux so a machine needs no
+  // ROCm install, macOS so a driver whose runtime predates the current HRX
+  // queue API still works. That copy comes first.
+  {
+    std::error_code ec;
+    fs::path exe;
+#if defined(__APPLE__)
+    char buffer[4096];
+    std::uint32_t size = sizeof(buffer);
+    if (_NSGetExecutablePath(buffer, &size) == 0) exe = fs::weakly_canonical(buffer, ec);
+#else
+    exe = fs::read_symlink("/proc/self/exe", ec);
+#endif
+    if (!ec && exe.has_parent_path()) {
+      for (const fs::path& dir : {exe.parent_path().parent_path() / "lib", exe.parent_path() / "lib"}) {
+        const fs::path candidate = dir / kHsaSoname;
+        std::error_code exists_ec;
+        if (!fs::exists(candidate, exists_ec)) continue;
+        void* h = dlopen(candidate.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (h == nullptr) continue;
+        if (hsa_runtime_is_new_enough(h)) {
+#if defined(__APPLE__)
+          // HRX's loader opens the runtime by name, and dyld does not match a
+          // leaf name to an image loaded by path; name this copy for it.
+          setenv("IREE_HAL_AMDGPU_LIBHSA_PATH", candidate.c_str(), 0);
+#endif
+          return;
+        }
+      }
+    }
+  }
+
 #if defined(__APPLE__)
   // Honor dyld's configured library search, matching the HRX adapter's name.
   if (void* native = dlopen(kHsaSoname, RTLD_NOW | RTLD_GLOBAL); native != nullptr) {
@@ -611,19 +645,6 @@ void preload_gpu_runtime() {
   }
 #endif
   std::vector<std::string> roots;
-#if !defined(__APPLE__)
-  // The Linux release bundles the HSA runtime HRX needs in its own lib/, next
-  // to libexec/ where the binaries live, so a machine needs no ROCm install.
-  // That copy comes first; ROCM_PATH and the system installs follow.
-  {
-    std::error_code ec;
-    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    if (!ec && exe.has_parent_path()) {
-      roots.emplace_back(exe.parent_path().parent_path().string());
-      roots.emplace_back(exe.parent_path().string());
-    }
-  }
-#endif
   if (const char* env = std::getenv("ROCM_PATH"); env != nullptr && *env != 0) {
     roots.emplace_back(env);
   }

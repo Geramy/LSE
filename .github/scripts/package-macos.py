@@ -31,6 +31,9 @@ def main():
     parser = argparse.ArgumentParser()
     for name in ('root', 'work', 'llvm', 'tag'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--hsa-runtime', required=True,
+                        help='directory holding the mac_linuxgpu libhsa-runtime64.0.1.0.dylib to bundle '
+                             '(it must export hsa_amd_queue_create)')
     args = parser.parse_args()
     root, work, llvm = (Path(x).resolve() for x in (args.root, args.work, args.llvm))
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', args.tag):
@@ -61,10 +64,23 @@ def main():
     for binary in ('lse', 'lse-server', 'compile_loom_matrix'):
         add(work / 'lse-build' / ('tests/' + binary if binary == 'compile_loom_matrix' else binary),
             package / 'libexec' / binary)
-    # The HSA runtime belongs to the installed GPU driver and must match its
-    # DriverKit extension, so the archive does not bundle one. HRX opens it by
-    # basename (found in /usr/local/lib) and LSE falls back to the driver's
-    # /Library/MacAMDGPU/runtime copy.
+    # HRX main opens its queues with hsa_amd_queue_create, which mac_linuxgpu
+    # runtimes before build 267 lack. The archive carries a runtime that has
+    # it, built from mac_linuxgpu against the build-266 driver interface, in
+    # lib/ where the launchers' DYLD_LIBRARY_PATH and LSE's preload find it.
+    hsa_dir = Path(args.hsa_runtime).resolve(strict=True)
+    hsa_src = (hsa_dir / 'libhsa-runtime64.0.1.0.dylib').resolve(strict=True)
+    if not re.search(r'\b_hsa_amd_queue_create\b', run('nm', '-gU', str(hsa_src))):
+        raise RuntimeError(f'{hsa_src} lacks hsa_amd_queue_create')
+    hsa_dst = package / 'lib' / 'libhsa-runtime64.0.1.0.dylib'
+    shutil.copy2(hsa_src, hsa_dst)
+    hsa_dst.chmod(hsa_dst.stat().st_mode | 0o200)
+    for dep in dependencies(hsa_dst):
+        if not dep.startswith(('/System/', '/usr/lib/', '@rpath/libhsa-runtime64')):
+            raise RuntimeError(f'Nonportable dependency in the bundled HSA runtime: {dep}')
+    subprocess.run(['codesign', '--force', '--sign', '-', str(hsa_dst)], check=True)
+    (package / 'lib' / 'libhsa-runtime64.1.dylib').symlink_to('libhsa-runtime64.0.1.0.dylib')
+    (package / 'lib' / 'libhsa-runtime64.dylib').symlink_to('libhsa-runtime64.1.dylib')
     for dst in pending:
         src = sources[dst]
         own_id = run('otool', '-D', str(src)).splitlines()[1:]
@@ -201,13 +217,14 @@ def main():
         'hrx_adapter_patch_sha256': build_inputs['hrx_patches']['macos-coarse-host-adapter'],
         'kv_fragment_patch_sha256': build_inputs['hrx_patches']['kv-fragment-addressing'],
         'loom_vopd_patch_sha256': build_inputs['hrx_patches']['gfx12-vopd-identical-source'],
+        'bundled_hsa_runtime': {'source': str(hsa_src), 'sha256': hashlib.sha256(hsa_src.read_bytes()).hexdigest()},
     }
     (package / 'BUILD.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (package / 'QUICKSTART.txt').write_text(
         'Binary deployment target: Apple Silicon macOS 15 or newer.\n'
         'External AMD GPU use requires the driver-supported macOS version\n'
         '(currently macOS Tahoe 26.2+); gfx1201/R9700 qualification target.\n'
-        'Install and activate the mac_linuxgpu driver separately:\n'
+        'Install and activate the mac_linuxgpu driver (build 266 or later) separately:\n'
         'https://github.com/lemonade-sdk/mac_linuxgpu\n'
         'The driver is not bundled or installed by this archive.\n\n'
         './bin/lse --help\n'
@@ -216,8 +233,9 @@ def main():
         'Describe a model, or size a configuration, without loading it:\n'
         './bin/lse-server --model /path/to/model --model-info\n'
         './bin/lse-server --model /path/to/model --kv-len 32768 --estimate\n\n'
-        'The HSA runtime is installed by the GPU driver, not this archive;\n'
-        'LSE loads it from /usr/local/lib or /Library/MacAMDGPU/runtime.\n'
+        'The archive carries the mac_linuxgpu HSA runtime it needs (lib/), with\n'
+        'hsa_amd_queue_create, so it also runs on driver build 266; build 267\n'
+        '(0.1.163) and later provide that runtime system-wide.\n'
         'Default JIT cache: ~/.lse/cache (created automatically).\n'
         'Cache entries validate the loaded compiler, device and emitted source.\n'
         'Use --cache-dir PATH to select another kernel cache directory.\n'
@@ -239,10 +257,9 @@ def main():
         output = Path(tmp) / 'matrix'
         output.mkdir()
         subprocess.run([str(relocated / 'libexec/compile_loom_matrix'), str(output)], env=env, check=True)
-        # A bundled HSA runtime would shadow the driver's and fail to open it.
         bundled = sorted(p.name for p in (relocated / 'lib').glob('libhsa-runtime64*'))
-        if bundled:
-            raise RuntimeError(f'package must not bundle the HSA runtime: {bundled}')
+        if bundled != ['libhsa-runtime64.0.1.0.dylib', 'libhsa-runtime64.1.dylib', 'libhsa-runtime64.dylib']:
+            raise RuntimeError(f'unexpected bundled HSA runtime files: {bundled}')
     # The compiler fixture is a build check, not a public inference command.
     (package / 'libexec/compile_loom_matrix').unlink()
     archive = dist / (name + '.tar.gz')
