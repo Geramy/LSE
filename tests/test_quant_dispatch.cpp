@@ -513,9 +513,10 @@ LSE_TEST(arch_tuning_hands_each_part_only_its_own_rows) {
     LSE_EXPECT(!t->quant_matrix_ranges.empty() &&
                t->quant_matrix_ranges.back().arch.empty());
   }
-  // gfx1201's measured rows, unchanged by the move into its header.
+  // gfx1201's measured rows: the six from the move into its header plus the
+  // sixteen draft-tree verify shapes (15 and 31 rows).
   LSE_EXPECT_EQ(r9700.quant_matrix_shapes.size(), 4u);
-  LSE_EXPECT_EQ(r9700.q4_matrix_panel_shapes.size(), 6u);
+  LSE_EXPECT_EQ(r9700.q4_matrix_panel_shapes.size(), 22u);
   LSE_EXPECT_EQ(r9700.q8_matrix_rules.size(), 2u);
   LSE_EXPECT_EQ(r9700.q8_panel_rules.size(), 2u);
   // gfx1151 runs the 8-bit decode panel but not wmma_q8_linear's tiles.

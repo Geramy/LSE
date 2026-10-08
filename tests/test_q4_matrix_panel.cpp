@@ -452,8 +452,10 @@ LSE_TEST(q4_matrix_panel_typed_codec_pads_sixteen_rows_and_refreshes_replay) {
   LSE_EXPECT(primitive && primitive->has_typed_host_impl());
   if (!primitive)
     return;
+  // Nine rows is a draft-tree verify pass, which the 16-row panel now takes
+  // (kQuantVerifyRows), so it is no longer among the refused extents.
   for (const auto shape :
-       {Shape{9, 64}, Shape{16, 64}, Shape{8, 65}, Shape{1024, 128},
+       {Shape{16, 64}, Shape{8, 65}, Shape{1024, 128},
         Shape{8, INT64_MAX}, Shape{INT64_MAX, 8, 64}}) {
     const std::array inputs{shape};
     LSE_EXPECT(!primitive->infer_shape(inputs).ok());

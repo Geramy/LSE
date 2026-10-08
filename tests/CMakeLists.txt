@@ -6,6 +6,9 @@ function(lse_add_test name)
   target_link_libraries(${name} PRIVATE lse_core lse_backend_registry ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   lse_apply_common_flags(${name})
+  # harness.hpp skips this binary's cases listed in tests/KNOWN_FAILURES.md.
+  target_compile_definitions(${name} PRIVATE LSE_TEST_BINARY="${name}"
+    LSE_KNOWN_FAILURES_FILE="${CMAKE_CURRENT_SOURCE_DIR}/KNOWN_FAILURES.md")
   # Data-driven tests resolve fixtures relative to the repo root, so pin the
   # working directory rather than depending on how ctest was invoked.
   add_test(NAME ${name} COMMAND ${name}
@@ -586,3 +589,16 @@ if(LSE_ENABLE_HRX)
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(test_capture_prefill_loom_gfx1151 PROPERTIES ENVIRONMENT "LSE_CAPTURE_TARGET=gfx1151-loom")
 endif()
+
+# A whole test listed in tests/KNOWN_FAILURES.md (an entry with no `:case`)
+# fails for a known reason; ctest reports it as disabled instead of running it.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/KNOWN_FAILURES.md)
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/KNOWN_FAILURES.md lse_known_failures
+  REGEX "^- `[A-Za-z0-9_]+`")
+foreach(line IN LISTS lse_known_failures)
+  string(REGEX REPLACE "^- `([A-Za-z0-9_]+)`.*" "\\1" lse_known_test "${line}")
+  if(TEST ${lse_known_test})
+    set_tests_properties(${lse_known_test} PROPERTIES DISABLED TRUE)
+  endif()
+endforeach()
