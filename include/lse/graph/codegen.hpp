@@ -201,6 +201,12 @@ class IKernelEmitter {
                                                const backend::DeviceInfo&) const {
     return 1;
   }
+  // KernelPrimitiveBase::variant_reassociates for the group's primitive.
+  [[nodiscard]] virtual bool variant_reassociates(const FusionGroup&,
+                                                  const backend::DeviceInfo&,
+                                                  std::uint32_t) const {
+    return false;
+  }
   [[nodiscard]] virtual std::uint64_t cache_key(
       const FusionGroup& group, const backend::DeviceInfo& device) const;
 

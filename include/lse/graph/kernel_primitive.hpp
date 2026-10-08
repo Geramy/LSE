@@ -164,6 +164,15 @@ class KernelPrimitiveBase : public Primitive {
   // fastest it measures. 1 means there is nothing to choose.
   virtual std::uint32_t variants(const KernelShapes&) const { return 1; }
 
+  // Whether variant `v` sums an output's terms in a different order than
+  // variant 0 (a K split whose slices' partial sums are added at the end).
+  // Such a variant is a candidate only for a kernel whose every node is a
+  // draft's (Node::proposal_only), and is checked against variant 0 within
+  // a numeric tolerance instead of byte for byte.
+  virtual bool variant_reassociates(const KernelShapes&, std::uint32_t) const {
+    return false;
+  }
+
   // Whether the primitive maps threads to work itself instead of computing one
   // output element per thread.
   //

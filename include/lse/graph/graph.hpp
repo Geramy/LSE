@@ -107,6 +107,20 @@ using NodePtr = std::shared_ptr<Node>;
 // and only the first one pins a tensor-split branch.
 [[nodiscard]] std::uint16_t stamped_member() noexcept;
 
+// Nodes built while a ProposalScope is open are marked Node::proposal_only:
+// a draft model's graph, whose outputs are proposals the target verifies.
+[[nodiscard]] bool stamped_proposal() noexcept;
+class ProposalScope {
+ public:
+  ProposalScope() noexcept;
+  ~ProposalScope();
+  ProposalScope(const ProposalScope&) = delete;
+  ProposalScope& operator=(const ProposalScope&) = delete;
+
+ private:
+  bool previous_;
+};
+
 // A group-affine weight is three tensors, but every op that consumes a weight
 // takes one Array. The packed plane carries the other two and its geometry
 // here, so linear() and embedding() can dispatch on the storage format without
@@ -189,6 +203,12 @@ class Node {
   // the node: two branches of one layer are otherwise indistinguishable.
   static constexpr std::uint16_t kAnyMember = 0xFFFF;
   std::uint16_t member = kAnyMember;
+
+  // Built under a ProposalScope: the node's value only steers which tokens a
+  // draft proposes, and verification against the target decides what is
+  // emitted. The variant optimizer may then choose a variant that sums in a
+  // different order for a kernel made only of such nodes.
+  bool proposal_only = false;
 
   // Keeps kind and fclass in sync; setting kind alone silently makes a node
   // look like a leaf to the partitioner.

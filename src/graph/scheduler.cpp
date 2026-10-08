@@ -189,7 +189,15 @@ struct Scheduler::Impl {
     std::uint64_t key = 0;
     // Not yet decided: measure every variant after this launch.
     bool trial = false;
+    // Every node is a draft's (Node::proposal_only).
+    bool proposal = false;
   };
+  static bool proposal_only(const FusionGroup& group) {
+    if (group.nodes.empty()) return false;
+    for (const NodePtr& n : group.nodes)
+      if (!n || !n->proposal_only) return false;
+    return true;
+  }
   VariantPick pick_variant(const IKernelEmitter& emitter,
                            const IKernelCompiler* compiler,
                            const FusionGroup& group,
@@ -201,7 +209,11 @@ struct Scheduler::Impl {
     auto [it, fresh] = compiler_ids.try_emplace(compiler);
     if (fresh) it->second = compiler->identity();
     const EmissionVariantScope base(0);
-    pick.key = detail::VariantBook::key(emitter.cache_key(group, info),
+    // A draft's kernel may take variants a target's may not, so the two keep
+    // separate decisions even where their kernels are otherwise one.
+    pick.proposal = proposal_only(group);
+    pick.key = detail::VariantBook::key(emitter.cache_key(group, info) ^
+                                            (pick.proposal ? 0x70726f706f73616cull : 0ull),
                                         pick.offered, it->second);
     if (const auto chosen = variants.decided(pick.key)) {
       if (*chosen < pick.offered) pick.variant = *chosen;
@@ -546,7 +558,33 @@ struct VariantTrial {
   backend::DeviceBuffer& output;
   std::size_t output_bytes;
   std::uint32_t offered;
+  // A draft's kernel whose f32 output may come from a variant that sums in
+  // another order, checked within kProposalTolerance of variant 0.
+  bool proposal;
+  DType output_dtype;
 };
+
+// How far a reassociated variant's output may stray from variant 0's, as a
+// fraction of the largest magnitude variant 0 wrote. A different order of
+// f32 sums moves an output by a few ulps of the terms (~1e-6 relative); a
+// wrong kernel moves it by its own size.
+constexpr double kProposalTolerance = 1e-3;
+
+// Whether `got` is variant 0's `want` up to reordered f32 sums.
+bool within_tolerance(std::span<const std::byte> want, std::span<const std::byte> got) {
+  const std::size_t count = want.size() / sizeof(float);
+  double peak = 0.0, worst = 0.0;
+  for (std::size_t i = 0; i < count; ++i) {
+    float a, b;
+    std::memcpy(&a, want.data() + i * sizeof(float), sizeof(float));
+    std::memcpy(&b, got.data() + i * sizeof(float), sizeof(float));
+    if (std::isnan(a) != std::isnan(b) || std::isinf(a) != std::isinf(b)) return false;
+    if (!std::isfinite(a)) continue;
+    peak = std::max(peak, std::abs(static_cast<double>(a)));
+    worst = std::max(worst, std::abs(static_cast<double>(a) - static_cast<double>(b)));
+  }
+  return worst <= kProposalTolerance * std::max(peak, 1e-30);
+}
 
 Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note) {
   struct Candidate {
@@ -562,6 +600,8 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
   std::vector<Candidate> candidates{{0, t.base_handle, t.base.dims, 0.0}};
   const backend::DeviceInfo& info = t.be.device_info();
   for (std::uint32_t v = 1; v < t.offered; ++v) {
+    const bool reassociates = t.emitter.variant_reassociates(t.group, info, v);
+    if (reassociates && (!t.proposal || t.output_dtype != DType::kF32)) continue;
     const EmissionVariantScope scope(v);
     const std::uint64_t ident = t.emitter.cache_key(t.group, info);
     auto written = t.emitter.emit(t.group, info);
@@ -585,7 +625,10 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
     LSE_RETURN_IF_ERROR(t.be.launch(*built, k.dims, t.args, t.target));
     LSE_RETURN_IF_ERROR(t.be.synchronize());
     LSE_RETURN_IF_ERROR(t.be.copy_d2h(t.output, got.data(), t.output_bytes, 0));
-    if (std::memcmp(got.data(), reference.data(), t.output_bytes) != 0) {
+    const bool same = reassociates
+        ? within_tolerance(reference, got)
+        : std::memcmp(got.data(), reference.data(), t.output_bytes) == 0;
+    if (!same) {
       note += " " + std::to_string(v) + "=differs";
       continue;
     }
@@ -615,6 +658,7 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
   }
   const Candidate* best = &candidates[0];
   for (const Candidate& c : candidates) {
+    if (candidates.size() < 2) break;
     char part[48];
     std::snprintf(part, sizeof(part), " %u=%.1fus", c.variant, c.best_us);
     note += part;
@@ -1064,7 +1108,8 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       const VariantTrial trial{be, *impl_->jit, member, *emitter, group, *emitted,
                                launched, args,
                                backend::DispatchTarget{stream, devices_.residency(member), {}},
-                               out->buffer, out_bytes, pick.offered};
+                               out->buffer, out_bytes, pick.offered,
+                               pick.proposal, out->dtype};
       LSE_ASSIGN_OR(chosen, run_variant_trial(trial, why));
     }
     const std::uint64_t trial_ns = elapsed_ns(t_trial, SpanClock::now());
@@ -1072,8 +1117,19 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     trace_.spans.host_wait.add(trial_ns);
     if (why == "unmeasurable") impl_->variants.hold(pick.key, 0);
     else impl_->variants.record(pick.key, chosen, why);
-    std::fprintf(stderr, "lse: variants of %s:%s -> %u (%.1f ms)\n",
-                 emitted->entry_name.c_str(), why.c_str(), chosen,
+    // Named by what it computes, so a reader can tell the shapes apart.
+    std::string what;
+    for (const NodePtr& n : group.nodes) {
+      if (n && dynamic_cast<const KernelPrimitiveBase*>(n->prim) != nullptr) {
+        what = std::string(n->prim->name());
+        for (const NodePtr& in : n->inputs) what += " " + in->shape.to_string();
+        what += " -> " + n->shape.to_string();
+        break;
+      }
+    }
+    std::fprintf(stderr, "lse: variants of %s [%s%s]:%s -> %u (%.1f ms)\n",
+                 emitted->entry_name.c_str(), what.c_str(),
+                 pick.proposal ? "; draft" : "", why.c_str(), chosen,
                  static_cast<double>(trial_ns) / 1e6);
     // The step's retained emission is the one later replays launch.
     if (chosen != 0 && replay != nullptr) {
@@ -2423,6 +2479,13 @@ namespace {
 // to whatever allocates underneath it. Nothing else writes it.
 std::size_t g_preferred_member = static_cast<std::size_t>(-1);
 }  // namespace
+
+namespace {
+thread_local bool g_proposal = false;
+}  // namespace
+bool stamped_proposal() noexcept { return g_proposal; }
+ProposalScope::ProposalScope() noexcept : previous_(g_proposal) { g_proposal = true; }
+ProposalScope::~ProposalScope() { g_proposal = previous_; }
 
 std::uint16_t stamped_member() noexcept {
   return g_preferred_member == static_cast<std::size_t>(-1)

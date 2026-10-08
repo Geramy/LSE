@@ -311,27 +311,91 @@ std::uint32_t matrix_unroll(std::uint32_t groups,
     unroll /= 2u;
   return unroll;
 }
-// The groups loaded together, as variants (they change when loads issue,
-// never the order products accumulate in): the part's tune or the
-// generation's default first, then every other count the slice divides by.
-std::vector<std::uint32_t> matrix_unroll_menu(const KernelShapes &s, std::uint32_t bits,
-                                              std::uint32_t n, std::uint32_t k) {
-  const auto groups = k / 64u / matrix_ksplits(s, bits, n, k);
+// The layouts the decode panel can take, as variants (each changes when
+// loads issue and which wave does what, never the order an output's terms
+// are summed in):
+//  - the groups one wave loads per round: the part's tune or the
+//    generation's default first, then every other count the slice divides;
+//  - an exact split of K across adjacent waves, when the part's tune does
+//    not already split it: the slices load a round's groups in turn, and the
+//    tile's first wave applies every group of the round to the outputs in
+//    group order, on each group's exact integer product, exactly as one wave
+//    would have.
+// Variant 0 is the part's tune as it stands (a tuned split sums its slices'
+// partial outputs, which the exact splits cannot reproduce, so a tuned split
+// offers no exact ones).
+struct MatrixChoice {
+  std::uint32_t unroll = 1;
+  std::uint32_t ks = 1;
+  bool exact = false;
+};
+std::vector<MatrixChoice> matrix_menu(const KernelShapes &s, std::uint32_t bits,
+                                      std::uint32_t n, std::uint32_t k) {
+  const auto groups = k / 64u;
+  const auto tuned_ks = matrix_ksplits(s, bits, n, k);
   const auto *tune = matrix_tune(s, bits, n, k);
   const bool split_k = s.device && matrix_target(*s.device) == math::MatrixTarget::kRdna4;
-  std::vector<std::uint32_t> menu{matrix_unroll(
-      groups, tune && tune->unroll ? tune->unroll
-              : split_k ? kMatrixUnroll : kMatrixUnroll / 2u)};
-  for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u, 1u}) {
-    const auto u = matrix_unroll(groups, most);
-    if (std::find(menu.begin(), menu.end(), u) == menu.end()) menu.push_back(u);
+  std::vector<MatrixChoice> menu{{matrix_unroll(
+      groups / tuned_ks, tune && tune->unroll ? tune->unroll
+                         : split_k ? kMatrixUnroll : kMatrixUnroll / 2u), tuned_ks, false}};
+  const auto add = [&](const MatrixChoice &c) {
+    for (const auto &m : menu)
+      if (m.unroll == c.unroll && m.ks == c.ks && m.exact == c.exact) return;
+    menu.push_back(c);
+  };
+  for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u, 1u})
+    add({matrix_unroll(groups / tuned_ks, most), tuned_ks, false});
+  if (tuned_ks == 1 && s.device) {
+    const auto waves = matrix_waves(s, n);
+    const auto budget = backend::workgroup_lds_bytes(s.device);
+    for (const std::uint32_t ks : {2u, 4u}) {
+      if (waves % ks != 0u || groups % ks != 0u) continue;
+      for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u}) {
+        const auto u = matrix_unroll(groups / ks, most);
+        if (waves * u * 8u * 32u * 4u <= budget) add({u, ks, true});
+      }
+    }
+    // Splits whose slices each sum their own contiguous run of groups, then
+    // add the slices' partial outputs in slice order: cheaper than the exact
+    // chain, but a different order of sums (variant_reassociates), so only a
+    // draft's kernels may take them.
+    for (const std::uint32_t ks : {2u, 4u}) {
+      if (waves % ks != 0u || groups % ks != 0u ||
+          waves * 8u * 32u * 4u > budget) continue;
+      for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u})
+        add({matrix_unroll(groups / ks, most), ks, false});
+    }
   }
   return menu;
+}
+// The order an output's terms are summed in: one sequence (no split, or an
+// exact one), or the slices' partial sums of a split of `ks`.
+std::uint32_t matrix_sum_order(const MatrixChoice &c) {
+  return c.ks > 1u && !c.exact ? c.ks : 1u;
+}
+bool matrix_reassociates(const KernelShapes &s, std::uint32_t bits, std::uint32_t variant) {
+  const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+  const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  const auto menu = matrix_menu(s, bits, n, k);
+  return variant < menu.size() &&
+         matrix_sum_order(menu[variant]) != matrix_sum_order(menu[0]);
 }
 std::uint32_t matrix_variants(const KernelShapes &s, std::uint32_t bits) {
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
   const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
-  return static_cast<std::uint32_t>(matrix_unroll_menu(s, bits, n, k).size());
+  return static_cast<std::uint32_t>(matrix_menu(s, bits, n, k).size());
+}
+// The variant's choice, or nothing for a variant the shape does not offer.
+std::optional<MatrixChoice> matrix_choice(const KernelShapes &s, std::uint32_t bits) {
+  const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+  const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  const auto menu = matrix_menu(s, bits, n, k);
+  if (s.variant >= menu.size()) return std::nullopt;
+  return menu[s.variant];
+}
+std::uint32_t matrix_lds_bytes(const MatrixChoice &c, std::uint32_t waves) {
+  if (c.ks <= 1u) return 0u;
+  return waves * (c.exact ? c.unroll : 1u) * 8u * 32u * 4u;
 }
 // `Bits` is the weight width: 4-bit words widen to matrix operands by nibble
 // plane, 8-bit words already are operands, four codes to a register.
@@ -365,11 +429,12 @@ std::string emit_matrix(const KernelShapes &s) {
   // A part's tune may cut K into slices walked by adjacent waves (summed in
   // slice order at the end) and set the groups loaded together; without one
   // the kernel is exactly the single-slice form.
-  const auto ks = matrix_ksplits(s, Bits, n, k);
-  const auto unrolls = matrix_unroll_menu(s, Bits, n, k);
-  if (s.variant >= unrolls.size())
+  const auto choice = matrix_choice(s, Bits);
+  if (!choice)
     return {};
-  const auto unroll = unrolls[s.variant];
+  const auto ks = choice->ks;
+  const auto unroll = choice->unroll;
+  const bool exact = choice->exact;
   const auto tiles_n = (n + 15u) / 16u;
   const auto tile_waves = waves / ks;
   const auto nblocks = (tiles_n + tile_waves - 1u) / tile_waves;
@@ -389,9 +454,12 @@ std::string emit_matrix(const KernelShapes &s) {
   // The single-slice form emits exactly what it always has; only a split
   // names its waves' slices.
   std::optional<kir::Val<kir::u32>> wave_index, kslice;
+  std::optional<kir::Tile<kir::f32>> products;
   if (ks > 1) {
     wave_index = e.let(lid / 32u);
     kslice = e.let(*wave_index % ks);
+    if (exact)
+      products = e.lds<kir::f32>(waves * unroll * kSlots * 32u);
   }
   const auto ntile = ks == 1 ? e.let((wg % nblocks) * waves + lid / 32u)
                              : e.let((wg % nblocks) * tile_waves + *wave_index / ks);
@@ -420,7 +488,9 @@ std::string emit_matrix(const KernelShapes &s) {
     std::vector<Loaded> loaded;
     loaded.reserve(unroll);
     for (std::uint32_t u = 0; u < unroll; ++u) {
-      const auto g = e.let(g0 + u);
+      // An exact split's waves take every ks-th group of a round, so the
+      // round's groups, in order, are the slices' in turn.
+      const auto g = exact ? e.let(g0 + u * ks + *kslice) : e.let(g0 + u);
       const auto sa = e.let(safe_col * groups + g);
       Loaded l{e.let(a.scales[sa]), e.let(a.biases[sa]), {}, {}, {}};
       if constexpr (geo.split_k) {
@@ -486,6 +556,13 @@ std::string emit_matrix(const KernelShapes &s) {
         }
         acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
       }
+      if (exact) {
+        for (int z = 0; z < kSlots; ++z)
+          (*products)[e.let(((*wave_index * unroll + u) * kSlots +
+                             static_cast<std::uint32_t>(z)) * 32u + lane)] =
+              kir::cast<kir::f32>(acc[z].read());
+        continue;
+      }
       for (int z = 0; z < kSlots; ++z) {
         const auto pair = static_cast<std::size_t>(geo.split_k ? z / 2 : z);
         const int lane_pair = geo.split_k ? (z % 2) * 2 : 0;
@@ -500,15 +577,57 @@ std::string emit_matrix(const KernelShapes &s) {
             bias * sum;
       }
     }
+    if (exact) {
+      // The tile's first wave applies the round's groups to its outputs in
+      // group order: the same scale, step and sum, the same fma and add, on
+      // each group's exact product, as the single-wave loop.
+      e.barrier();
+      if (auto first = e.when(*kslice == 0u)) {
+        for (std::uint32_t i = 0; i < unroll * ks; ++i) {
+          const std::uint32_t u = i / ks, j = i % ks;
+          const auto g = e.let(g0 + i);
+          const auto sa = e.let(safe_col * groups + g);
+          const auto scale = e.let(math::widen(e.let(a.scales[sa])));
+          const auto bias = e.let(math::widen(e.let(a.biases[sa])));
+          std::vector<kir::Pack<kir::u32>> metadata;
+          if constexpr (geo.split_k) {
+            for (std::uint32_t z = 0; z < 8u; z += 2u)
+              metadata.push_back(e.load(
+                  a.panel, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u), 16u));
+          } else {
+            for (std::uint32_t z = 0; z < 8u; ++z)
+              metadata.push_back(e.load(
+                  a.panel, e.let(g * kGroupWords + 256u + hi * 2u + z * 4u), 8u));
+          }
+          for (int z = 0; z < kSlots; ++z) {
+            const auto pair = static_cast<std::size_t>(geo.split_k ? z / 2 : z);
+            const int lane_pair = geo.split_k ? (z % 2) * 2 : 0;
+            const auto step = e.let(math::from_bits<lse::f32>(metadata[pair][lane_pair]));
+            const auto sum = e.let(math::from_bits<lse::f32>(metadata[pair][lane_pair + 1]));
+            const auto term = e.let(scale * step);
+            const auto product = (*products)[e.let(
+                (((*wave_index + j) * unroll + u) * kSlots +
+                 static_cast<std::uint32_t>(z)) * 32u + lane)].read();
+            out[static_cast<std::size_t>(z)] =
+                math::fma(term, product, out[static_cast<std::size_t>(z)].read()) +
+                bias * sum;
+          }
+        }
+      }
+      // The next round's products overwrite this one's.
+      e.barrier();
+    }
   };
   if (ks == 1) {
     for (auto g0 : e.range(0u, groups, unroll)) groups_body(g0);
+  } else if (exact) {
+    for (auto g0 : e.range(0u, groups, unroll * ks)) groups_body(g0);
   } else {
     const auto g_begin = e.let(*kslice * (groups / ks));
     for (auto g0 : e.range(g_begin, e.let(g_begin + groups / ks), unroll))
       groups_body(g0);
   }
-  if (ks > 1) {
+  if (ks > 1 && !exact) {
     // Each tile's slices are adjacent waves; the first adds the others in
     // slice order.
     const auto partial = e.lds<kir::f32>(waves * kSlots * 32u);
@@ -737,6 +856,9 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
       return 1;
     return matrix_variants(s, 4);
   }
+  bool variant_reassociates(const KernelShapes &s, std::uint32_t variant) const override {
+    return variants(s) > 1 && matrix_reassociates(s, 4, variant);
+  }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     ThreadPlan tp;
     if (!valid_matrix_panel(s))
@@ -756,13 +878,14 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
         ((m + rule->rows - 1u) / rule->rows) * ((n + 127u) / 128u);
     if (rule->rows == kRows) {
       const auto waves = matrix_waves(s, n);
-      const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
-      const auto ks = matrix_ksplits(s, 4, n, k);
+      const auto choice = matrix_choice(s, 4);
+      if (!choice) return ThreadPlan{};
+      const auto ks = choice->ks;
       const auto tiles = (n + 15u) / 16u;
       tp.workgroup_size[0] = waves * 32u;
       tp.workgroup_count[0] = ((m + rule->rows - 1u) / rule->rows) *
                               ((tiles + waves / ks - 1u) / (waves / ks));
-      if (ks > 1) tp.lds_bytes = waves * 8u * 32u * 4u;
+      if (ks > 1) tp.lds_bytes = matrix_lds_bytes(*choice, waves);
     }
     return tp;
   }
@@ -818,6 +941,9 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
       return 1;
     return matrix_variants(s, 8);
   }
+  bool variant_reassociates(const KernelShapes &s, std::uint32_t variant) const override {
+    return variants(s) > 1 && matrix_reassociates(s, 8, variant);
+  }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     ThreadPlan tp;
     if (!valid_q8_matrix_panel(s))
@@ -828,12 +954,13 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
       return kernel ? kernel->plan(original) : tp;
     }
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
-    const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
     const auto waves = matrix_waves(s, n);
-    const auto ks = matrix_ksplits(s, 8, n, k);
+    const auto choice = matrix_choice(s, 8);
+    if (!choice) return ThreadPlan{};
+    const auto ks = choice->ks;
     tp.workgroup_size[0] = waves * 32u;
     tp.workgroup_count[0] = ((n + 15u) / 16u + waves / ks - 1u) / (waves / ks);
-    if (ks > 1) tp.lds_bytes = waves * 8u * 32u * 4u;
+    if (ks > 1) tp.lds_bytes = matrix_lds_bytes(*choice, waves);
     return tp;
   }
 };
