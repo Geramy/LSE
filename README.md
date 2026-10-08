@@ -91,7 +91,7 @@ Prefill with the DFlash2 server, FlashPrefill V2 on (the gfx1151 default):
 | 1K | 2.020 s | 507 tok/s |
 | 2K | 4.111 s | 498 tok/s |
 | 4K | 8.364 s | 490 tok/s |
-| 32K | 47.73 s | 687 tok/s |
+| 32K | 77.36 s | 424 tok/s |
 
 Load with the kernel cache on disk: 4.6 s plain, 6.1 s with MTP. The first launch with an empty kernel cache takes 110.9 s.
 
