@@ -355,8 +355,30 @@ std::vector<MatrixChoice> matrix_menu(const KernelShapes &s, std::uint32_t bits,
         if (waves * u * 8u * 32u * 4u <= budget) add({u, ks, true});
       }
     }
+    // Splits whose slices each sum their own contiguous run of groups, then
+    // add the slices' partial outputs in slice order: cheaper than the exact
+    // chain, but a different order of sums (variant_reassociates), so only a
+    // draft's kernels may take them.
+    for (const std::uint32_t ks : {2u, 4u}) {
+      if (waves % ks != 0u || groups % ks != 0u ||
+          waves * 8u * 32u * 4u > budget) continue;
+      for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u})
+        add({matrix_unroll(groups / ks, most), ks, false});
+    }
   }
   return menu;
+}
+// The order an output's terms are summed in: one sequence (no split, or an
+// exact one), or the slices' partial sums of a split of `ks`.
+std::uint32_t matrix_sum_order(const MatrixChoice &c) {
+  return c.ks > 1u && !c.exact ? c.ks : 1u;
+}
+bool matrix_reassociates(const KernelShapes &s, std::uint32_t bits, std::uint32_t variant) {
+  const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
+  const auto k = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  const auto menu = matrix_menu(s, bits, n, k);
+  return variant < menu.size() &&
+         matrix_sum_order(menu[variant]) != matrix_sum_order(menu[0]);
 }
 std::uint32_t matrix_variants(const KernelShapes &s, std::uint32_t bits) {
   const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
@@ -834,6 +856,9 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
       return 1;
     return matrix_variants(s, 4);
   }
+  bool variant_reassociates(const KernelShapes &s, std::uint32_t variant) const override {
+    return variants(s) > 1 && matrix_reassociates(s, 4, variant);
+  }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     ThreadPlan tp;
     if (!valid_matrix_panel(s))
@@ -915,6 +940,9 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
         !dispatch::q8_matrix_panel_row(original_shapes(s)))
       return 1;
     return matrix_variants(s, 8);
+  }
+  bool variant_reassociates(const KernelShapes &s, std::uint32_t variant) const override {
+    return variants(s) > 1 && matrix_reassociates(s, 8, variant);
   }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     ThreadPlan tp;

@@ -94,6 +94,7 @@ Array Array::from_buffer(backend::DeviceBuffer buf, Shape shape, DType dtype) {
   n->shape = shape;
   n->dtype = dtype;
   n->member = stamped_member();
+  n->proposal_only = stamped_proposal();
   n->buffer = buf;
   n->device_dirty = buf.ptr == nullptr;
   n->materialized = true;
@@ -108,6 +109,7 @@ Array Array::full(Shape shape, DType dtype, float value) {
   n->shape = shape;
   n->dtype = dtype;
   n->member = stamped_member();
+  n->proposal_only = stamped_proposal();
   n->attrs[0] = value;
   return Array(n);
 }

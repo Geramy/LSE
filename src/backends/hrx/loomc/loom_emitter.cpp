@@ -393,11 +393,14 @@ std::uint64_t LoomEmitter::cache_key(const FusionGroup& group,
   return emission_identity(group, device);
 }
 
-std::uint32_t LoomEmitter::variants(const FusionGroup& group,
-                                    const DeviceInfo& device) const {
+namespace {
+// The group's self-indexed primitive and its shapes, handed to `use`; `none`
+// when the group has none (and so no variants).
+template <class R, class F>
+R with_self_indexed(const FusionGroup& group, const DeviceInfo& device, R none, F&& use) {
   if (group.nodes.empty() || group.is_phase || group.outputs.size() != 1 ||
-      group.anchor_class == FusionClass::kCollective) return 1;
-  const DialectSourceTable spellings = sources();
+      group.anchor_class == FusionClass::kCollective) return none;
+  const DialectSourceTable spellings = loom_sources();
   const kir::TypeTable type_table = loom_types();
   for (const NodePtr& n : group.nodes) {
     const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
@@ -420,9 +423,27 @@ std::uint32_t LoomEmitter::variants(const FusionGroup& group,
     s.intrinsics = &spellings;
     const KernelPrimitiveBase* chosen = kp->specialize(s);
     if (chosen == nullptr || !chosen->owns_indexing()) continue;
-    return std::max<std::uint32_t>(1, chosen->variants(s));
+    return use(*chosen, s);
   }
-  return 1;
+  return none;
+}
+}  // namespace
+
+std::uint32_t LoomEmitter::variants(const FusionGroup& group,
+                                    const DeviceInfo& device) const {
+  return with_self_indexed<std::uint32_t>(
+      group, device, 1u, [](const KernelPrimitiveBase& p, const KernelShapes& s) {
+        return std::max<std::uint32_t>(1, p.variants(s));
+      });
+}
+
+bool LoomEmitter::variant_reassociates(const FusionGroup& group,
+                                       const DeviceInfo& device,
+                                       std::uint32_t variant) const {
+  return with_self_indexed<bool>(
+      group, device, false, [&](const KernelPrimitiveBase& p, const KernelShapes& s) {
+        return p.variant_reassociates(s, variant);
+      });
 }
 
 bool LoomEmitter::joins_run(std::span<const NodePtr> run,

@@ -309,6 +309,8 @@ void MtpModule::reset() {
 }
 
 Result<Array> MtpModule::record(std::int64_t rows) {
+  // The MTP head's graph only steers its proposals.
+  const graph::ProposalScope proposal;
   const auto hidden = static_cast<std::int64_t>(config_.hidden_size);
   LSE_ASSIGN_OR(pass_.hidden, device_slot(Shape{1, rows, hidden}));
   LSE_ASSIGN_OR(pass_.tokens, device_slot(Shape{1, rows}));

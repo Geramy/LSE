@@ -46,6 +46,9 @@ class LoomEmitter final : public graph::IKernelEmitter {
       const DeviceInfo& device) const override;
   [[nodiscard]] std::uint32_t variants(const graph::FusionGroup& group,
                                        const DeviceInfo& device) const override;
+  [[nodiscard]] bool variant_reassociates(const graph::FusionGroup& group,
+                                          const DeviceInfo& device,
+                                          std::uint32_t variant) const override;
 
   // Every description emit() writes is kept under cache_key(), so one read
   // back from the JIT's launch index stands in for writing the source.

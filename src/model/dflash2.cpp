@@ -368,6 +368,8 @@ Status DFlash2Module::Impl::load(WeightBinder& binder) {
 }
 
 Result<DFlash2Module::Impl::ContextPass> DFlash2Module::Impl::context_pass(std::int64_t rows) {
+  // Everything the draft computes only steers its proposals.
+  const graph::ProposalScope proposal;
   ContextPass p;
   LSE_ASSIGN_OR(p.features, slot(Shape{1, rows, static_cast<std::int64_t>(config.hidden_size) * static_cast<std::int64_t>(config.target_layers.size())}));
   LSE_ASSIGN_OR(p.offset, slot(Shape{1}));
@@ -412,6 +414,7 @@ Result<Array> DFlash2Module::Impl::attention(Array x, Layer& l, const DraftPass&
 }
 Result<DFlash2Module::Impl::DraftPass> DFlash2Module::Impl::draft_pass(
     std::uint32_t head_rows, std::uint32_t proposals, bool sampled) {
+  const graph::ProposalScope proposal;
   DraftPass p;
   const auto rows = static_cast<std::int64_t>(config.block_size);
   LSE_ASSIGN_OR(p.inputs, slot(Shape{rows + 5}));
