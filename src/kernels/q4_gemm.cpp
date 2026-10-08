@@ -302,7 +302,7 @@ bool b_double_fits(const Dims& d, const Tile& t) {
 }
 
 std::uint32_t variant_lds_bytes(const Tile& t, std::uint32_t variant) {
-  if (variant == 0u) return lds_bytes(t);
+  if (variant == 0u || variant >= 3u) return lds_bytes(t);
   return (kDirectAHalves + t.bn * kRowHalves * (variant == 2u ? 2u : 1u)) * 2u;
 }
 
@@ -348,11 +348,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   env::Emit e{&kb};
   // Variants (Q4GemmKernel::variants): 1 reads each A fragment straight
   // from the panel instead of through workgroup memory; 2 does that and
-  // double-buffers B, so a K step waits at one barrier instead of two. Each
+  // double-buffers B, so a K step waits at one barrier instead of two; 3
+  // keeps A in workgroup memory and reads it a fragment at a time. Each
   // feeds the matrix instructions the same halves in the same order.
-  const bool a_direct = kFrag == 16 && s.variant >= 1u;
+  const bool a_direct = kFrag == 16 && (s.variant == 1u || s.variant == 2u);
   const bool b_double = a_direct && s.variant == 2u;
-  if (s.variant > 2u || (s.variant != 0u && !a_direct) ||
+  if (s.variant > 3u || ((s.variant == 1u || s.variant == 2u) && !a_direct) ||
       (b_double && !b_double_fits(d, t)))
     return {};
   const auto As = e.lds<lse::f16>(a_direct ? kDirectAHalves : t.bm * kRowHalves);
@@ -528,7 +529,26 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       a_glob_base.push_back(e.let(select(grow < M, grow, e.u32(M - 1u)) * K));
     }
   std::optional<kir::Val<kir::u32>> cur_k;
+  // Variant 3 reads a step's B fragments first and then each A fragment
+  // just before its row of matrix instructions, so a wave holds one A
+  // fragment at a time instead of all of them. Each accumulator still takes
+  // the same instructions in the same K order.
+  const auto compute_streamed = [&]() {
+    for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
+      std::vector<kir::Val<FragVec>> bf;
+      for (std::uint32_t fn = 0; fn < FN; ++fn)
+        bf.push_back(fragment(Bs, e.let(b_frag_base[fn] + kk * 16u)));
+      for (std::uint32_t fm = 0; fm < FM; ++fm) {
+        const auto af = fragment(As, e.let(a_frag_base[fm] + kk * 16u));
+        for (std::uint32_t fn = 0; fn < FN; ++fn) {
+          auto& c = acc[fm * FN + fn];
+          c = math::mma<Op>(af, bf[fn], c.value());
+        }
+      }
+    }
+  };
   const auto compute = [&]() {
+    if (s.variant == 3u) return compute_streamed();
     for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
       std::vector<kir::Val<FragVec>> af, bf;
       for (std::uint32_t fm = 0; fm < FM; ++fm) {
@@ -1174,16 +1194,18 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
   }
 
   // A from workgroup memory (0), A from the panel (1), and that with B
-  // double-buffered (2), on a part whose fragments are whole 16-half loads.
+  // double-buffered (2), and A from workgroup memory a fragment at a time
+  // (3), on a part whose fragments are whole 16-half loads. Measured on the
+  // 8060S (test_q4_gemm --gpu, M 1024, us): N17408 K5120 5196 -> 4957
+  // (variant 3), N10240 K5120 2862 -> 2743, N12288 K5120 3604 -> 3472; the
+  // down and output projections keep variant 0.
   std::uint32_t variants(const KernelShapes& s) const override {
     const Dims d = dims_of(s, Sliced);
     if (!d.valid || !device_fits(s, d)) return 1;
     const auto* row = f16_row(s);
     if (row == nullptr || row->a_len != 16) return 1;
-    const Tile t = tile_for(s, d);
-    const bool pairs = b_double_fits(d, t) &&
-        backend::workgroup_lds_bytes(s.device) >= variant_lds_bytes(t, 2u);
-    return pairs ? 3u : 2u;
+    // Variant 2 declines where its two B buffers do not fit.
+    return 4u;
   }
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
