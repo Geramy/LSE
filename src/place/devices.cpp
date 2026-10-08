@@ -559,6 +559,16 @@ void raise_fd_limit() {
   if (next.rlim_cur > lim.rlim_cur) (void)::setrlimit(RLIMIT_NOFILE, &next);
 }
 
+#if !(defined(__APPLE__) && TARGET_OS_IOS)
+// A runtime HRX can drive exports both of these: the virtual-memory reservation
+// the allocator uses and the descriptor queue creation the AMDGPU HAL opens its
+// queues with. ROCm 7.13's ROCr has the first and not the second.
+bool hsa_runtime_is_new_enough(void* handle) {
+  return dlsym(handle, "hsa_amd_vmem_address_reserve_align") != nullptr &&
+         dlsym(handle, "hsa_amd_queue_create") != nullptr;
+}
+#endif
+
 void preload_gpu_runtime() {
 #if defined(__APPLE__) && TARGET_OS_IOS
   // The HSA runtime is linked into the app: there is nothing to find or load,
@@ -589,7 +599,7 @@ void preload_gpu_runtime() {
   // Already in the process under some other name, and new enough: nothing to
   // do. A build linked directly against a good one lands here.
   if (void* self = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL); self != nullptr) {
-    const bool ok = dlsym(self, "hsa_amd_vmem_address_reserve_align") != nullptr;
+    const bool ok = hsa_runtime_is_new_enough(self);
     dlclose(self);
     if (ok) return;
   }
@@ -597,7 +607,7 @@ void preload_gpu_runtime() {
 #if defined(__APPLE__)
   // Honor dyld's configured library search, matching the HRX adapter's name.
   if (void* native = dlopen(kHsaSoname, RTLD_NOW | RTLD_GLOBAL); native != nullptr) {
-    if (dlsym(native, "hsa_amd_vmem_address_reserve_align") != nullptr) return;
+    if (hsa_runtime_is_new_enough(native)) return;
   }
 #endif
   std::vector<std::string> roots;
@@ -632,7 +642,7 @@ void preload_gpu_runtime() {
     if (!fs::exists(path, ec)) continue;
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (h == nullptr) continue;
-    if (dlsym(h, "hsa_amd_vmem_address_reserve_align") != nullptr) return;
+    if (hsa_runtime_is_new_enough(h)) return;
     // Held open on purpose when it is wrong: closing it can unload something
     // a later candidate already pulled in. The process keeps one either way.
   }
