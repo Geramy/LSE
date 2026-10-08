@@ -15,6 +15,33 @@ static_assert(kFlashPrefillSelectorThreads % 32 == 0 &&
               kFlashPrefillSelectorThreads >= 32 && kFlashPrefillSelectorThreads <= 1024);
 inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;
 
+// A draft tree's verify pass takes the flash tile of 16 query rows over a
+// share of the key windows per workgroup; the split merge combines the
+// shares. The flash kernel alone has a workgroup per head and tile walk every
+// window (24 workgroups for 15 rows of the 27B), and the split kernel's rows
+// are scalar: at 4K context on gfx1201, 8 rows take 0.40 ms split, 15 rows
+// 0.26 ms flash, against 0.17 ms for 15 rows here.
+inline constexpr std::uint32_t kFlashSplitMinRows = 2, kFlashSplitMaxRows = 64;
+inline constexpr std::uint64_t kFlashSplitMinKeys = 1024;
+// Shares of a rung's windows: enough that the live half of the rung (a KV
+// rung doubles as it grows) still gives every compute unit four workgroups.
+[[nodiscard]] constexpr std::uint32_t flash_split_parts(std::uint64_t capacity,
+    std::uint32_t heads, std::uint32_t rows, std::uint32_t compute_units) noexcept {
+  const auto windows = (capacity + kFlashKeyWindow - 1u) / kFlashKeyWindow;
+  const std::uint64_t per_part =
+      std::uint64_t{heads} * ((rows + kFlashQueryTile - 1u) / kFlashQueryTile);
+  if (windows == 0 || per_part == 0) return 1;
+  const auto want = (8u * std::uint64_t{compute_units} + per_part - 1u) / per_part;
+  const auto parts = want == 0 ? 1u : want < windows ? want : windows;
+  const auto share = (windows + parts - 1u) / parts;
+  return static_cast<std::uint32_t>((windows + share - 1u) / share);
+}
+[[nodiscard]] constexpr std::uint32_t flash_split_share(std::uint64_t capacity,
+                                                        std::uint32_t parts) noexcept {
+  const auto windows = (capacity + kFlashKeyWindow - 1u) / kFlashKeyWindow;
+  return parts == 0 ? 0u : static_cast<std::uint32_t>((windows + parts - 1u) / parts);
+}
+
 struct FlashWmmaRule {
   std::string_view arch;
   std::uint32_t wave, threads, min_rows, max_head_dim;
@@ -66,13 +93,8 @@ struct SplitShortRule {
 struct ShortTileRule {
   std::uint32_t min_rows, max_rows, query_tile;
 };
-// A draft tree's verify pass (mask kTree) takes the split kernel up to this
-// many rows, a tile of four query rows per workgroup past eight: its rows read
-// the context's keys once per tile rather than once per row.
-inline constexpr std::uint32_t kTreeSplitMaxRows = 32;
 inline constexpr std::array kShortTileRules{
     ShortTileRule{4, 8, 4},
-    ShortTileRule{9, kTreeSplitMaxRows, 4},
 };
 
 [[nodiscard]] constexpr std::uint64_t split_partitions(std::uint64_t capacity) noexcept {
@@ -141,8 +163,6 @@ struct ShortDefaultRule {
 };
 inline constexpr std::array kShortDefaults{
     ShortDefaultRule{1, 24, 4, 16, 1024, 512, 1, 0},
-    // A draft tree's verify pass (graph::MaskKind::kTree) at the same shapes.
-    ShortDefaultRule{1, 24, 4, 16, 1024, 512, 3, 0},
 };
 
 struct WaveL2Rule {

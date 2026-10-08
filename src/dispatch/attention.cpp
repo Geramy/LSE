@@ -24,9 +24,7 @@ bool short_default_shape(const Shape& query, std::int64_t capacity,
   // Shape scope, before the device is known: any part's rule.
   return arch::any_rule<&arch::Tuning::split_short>([&](const auto& rule) {
     return query.dim(0) == geometry.batch && query.dim(1) == geometry.query_heads &&
-           query.dim(2) >= rule.min_rows &&
-           (query.dim(2) <= rule.max_rows ||
-            (geometry.mask == 3 && query.dim(2) <= shapes::kTreeSplitMaxRows)) &&
+           query.dim(2) >= rule.min_rows && query.dim(2) <= rule.max_rows &&
            query.dim(3) == rule.head_dim && capacity >= geometry.min_keys &&
            capacity <= UINT32_MAX;
   });
@@ -209,11 +207,24 @@ bool split_decode_merge_supported(const KernelShapes& s) {
   return false;
 }
 
-bool split_short_scope(const Shape& query, std::int64_t offset, std::int64_t capacity,
-                       bool tree) {
+bool flash_split_scope(const KernelShapes& s) {
+  if (!paged_inputs(s) || !s.device || s.iattrs[0] != 3) return false;
+  const auto d = flash_dimensions(s);
+  if (!d.valid || d.bsz != 1 || d.tq < shapes::kFlashSplitMinRows ||
+      d.tq > shapes::kFlashSplitMaxRows || d.dv != shapes::kSplitRecord - 2u ||
+      std::uint64_t{d.stride} * d.ts < shapes::kFlashSplitMinKeys) return false;
+  for (const auto& rule : arch::tuning(s.device->arch).flash_wmma)
+    if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
+        s.device->max_threads_per_workgroup >= rule.threads && d.tq >= rule.min_rows &&
+        d.dh <= rule.max_head_dim && d.dv <= rule.max_head_dim &&
+        backend::workgroup_lds_bytes(s.device) >= shapes::flash_wmma_lds_bytes(d.dh, d.dv))
+      return true;
+  return false;
+}
+
+bool split_short_scope(const Shape& query, std::int64_t offset, std::int64_t capacity) {
   for (const auto& rule : shapes::kShortDefaults)
-    if ((rule.mask == 3) == tree && offset >= rule.min_offset &&
-        short_default_shape(query, capacity, rule)) return true;
+    if (offset >= rule.min_offset && short_default_shape(query, capacity, rule)) return true;
   return false;
 }
 
@@ -239,9 +250,7 @@ bool split_short_supported(const KernelShapes& s) {
   const auto units = static_cast<std::uint32_t>(s.device->compute_units);
   for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
-        s.inputs[0].dim(2) >= rule.min_rows &&
-        (s.inputs[0].dim(2) <= rule.max_rows ||
-         (s.iattrs[0] == 3 && s.inputs[0].dim(2) <= shapes::kTreeSplitMaxRows)) &&
+        s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.inputs[0].dim(3) == rule.head_dim &&
         shapes::split_merge_lds_bytes(shapes::split_partitions(capacity)) <=
@@ -265,7 +274,9 @@ bool split_short_merge_supported(const KernelShapes& s) {
   for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows &&
-        s.inputs[0].dim(2) <= std::max<std::int64_t>(rule.max_rows, shapes::kTreeSplitMaxRows) &&
+        // A tree pass's flash split merges up to its own row bound.
+        (s.inputs[0].dim(2) <= rule.max_rows ||
+         s.inputs[0].dim(2) <= shapes::kFlashSplitMaxRows) &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2), rule.head_dim} &&

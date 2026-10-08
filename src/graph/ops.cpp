@@ -1,4 +1,5 @@
 #include "lse/dispatch/attention.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/dispatch/quant.hpp"
 #include "lse/dispatch/q8_matrix.hpp"
 #include "lse/graph/ops.hpp"
@@ -662,15 +663,21 @@ Array sdpa(const Array& q, const Array& k, const Array& v, float scale,
 }
 
 namespace {
-Array split_paged_attention(const NodePtr& baseline, bool blasst=false) {
-  const auto* partial_prim = find_primitive(blasst ? "attention.blasst.partial1024.v2" : "attention.split_partial128.wg128c2.v1");
+// `flash_parts`: a tree pass's flash split into that many shares of the key
+// windows (dispatch::attention_shapes::flash_split_parts).
+Array split_paged_attention(const NodePtr& baseline, bool blasst=false,
+                            std::uint32_t flash_parts = 0) {
+  const auto* partial_prim = find_primitive(
+      flash_parts ? "attention.flash_split.wmma16.v1"
+      : blasst ? "attention.blasst.partial1024.v2" : "attention.split_partial128.wg128c2.v1");
   const auto* merge_prim = find_primitive("attention.split_merge128.wg128c2.v1");
   if (!partial_prim || !merge_prim) return Array(baseline);
   const auto& q = baseline->inputs[0]->shape;
   const bool short_query = q.dim(2) > 1;
   const auto capacity = baseline->inputs[1]->shape.dim(2) * baseline->inputs[4]->shape.dim(1);
   const auto partition_keys=blasst?1024:128;
-  const auto parts = (capacity + partition_keys - 1) / partition_keys;
+  const auto parts = flash_parts ? static_cast<std::int64_t>(flash_parts)
+                                 : (capacity + partition_keys - 1) / partition_keys;
   const Shape shape = short_query ? Shape{q.dim(0), q.dim(1), q.dim(2), parts, 258}
                                   : Shape{q.dim(0), q.dim(1), parts, 258};
   auto partial = make(OpKind::kCustom, shape, DType::kF32, baseline->inputs);
@@ -752,6 +759,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     if (dispatch::split_short_default_supported(request) ||
         dispatch::split_decode_supported(request))
       return split_paged_attention(n);
+    if (mask == MaskKind::kTree && dispatch::flash_split_scope(request))
+      return split_paged_attention(n, false, dispatch::attention_shapes::flash_split_parts(
+          static_cast<std::uint64_t>(table.shape().dim(1)) * static_cast<std::uint64_t>(block_size),
+          static_cast<std::uint32_t>(sq.dim(1)), static_cast<std::uint32_t>(sq.dim(2)),
+          static_cast<std::uint32_t>(device->compute_units)));
   }
   return Array(n);
 }

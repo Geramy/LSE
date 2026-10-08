@@ -215,18 +215,16 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
       }
 }
 // Tiled workgroups over the keys a rung certainly holds (half of it) must
-// cover the compute units; head tiles pair with four-row query tiles. Past
-// eight rows only a draft tree's pass takes the split kernel, tiled the same.
+// cover the compute units; head tiles pair with four-row query tiles.
 std::uint32_t expected_short_tile(std::uint32_t queries, std::uint32_t capacity,
                                   std::uint32_t units) {
-  if (queries < 4 || queries > dispatch::attention_shapes::kTreeSplitMaxRows || units == 0)
-    return 1;
+  if (queries < 4 || queries > 8 || units == 0) return 1;
   const std::uint64_t tiled = std::uint64_t{capacity / 2u / 128u} * (24u / 2u) * ((queries + 3u) / 4u);
   return tiled >= units ? 4u : 1u;
 }
 LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
   for (std::uint32_t units : {0u, 16u, 64u, 96u, 256u})
-    for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 32, 33})
+    for (int queries : {1, 2, 3, 4, 5, 6, 7, 8, 9})
       for (int capacity : {512, 1024, 2048, 4096, 8192, 8208, 16384, 32768, 65536, 69632, 262144}) {
         const auto tile = dispatch::attention_shapes::short_query_tile(
             static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity), units);

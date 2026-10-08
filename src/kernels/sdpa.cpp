@@ -455,22 +455,6 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
         }();
         const auto key = e.let(kir::cast<std::int64_t>(j));
         if (s.iattrs[0] == 1) return key <= position;
-        if (s.iattrs[0] == 3) {
-          if constexpr (ShortQuery) {
-            // A tree pass (kv::tree_meta_elems): its own rows by the ancestor mask.
-            const auto before = e.let(j < offset);
-            const auto column = e.let(kir::cast<kir::u32>(select(before, kir::cast<std::int64_t>(e.u32(0)),
-                  kir::cast<std::int64_t>(j) - kir::cast<std::int64_t>(offset))));
-            // A tile's rows past the pass read the last row's mask entry: the
-            // load stays inside the descriptor, and row_live drops the row.
-            const auto query_row = e.let(select(q0 + r % token_tile < queries, q0 + r % token_tile,
-                                                e.u32(queries - 1u)));
-            const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
-                                                 query_row * queries + column)]);
-            return key <= position && (before || seen != 0.0f);
-          }
-          return key <= position;
-        }
         return key <= position && position - key < kir::cast<std::int64_t>(e.u32(static_cast<std::uint32_t>(s.iattrs[1])));
       };
       auto valid_rows = [&](auto j) {
@@ -641,14 +625,6 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
                                        kir::cast<std::int64_t>(query));
           const auto key = e.let(kir::cast<std::int64_t>(j));
           if (s.iattrs[0] == 1) return key <= position;
-          if (s.iattrs[0] == 3) {
-            const auto before = e.let(j < offset);
-            const auto column = e.let(kir::cast<kir::u32>(select(before, kir::cast<std::int64_t>(e.u32(0)),
-                  kir::cast<std::int64_t>(j) - kir::cast<std::int64_t>(offset))));
-            const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
-                                                 query * queries + column)]);
-            return key <= position && (before || seen != 0.0f);
-          }
           return key <= position && position - key < kir::cast<std::int64_t>(e.u32(static_cast<std::uint32_t>(s.iattrs[1])));
         } else {
           if (s.iattrs[0] == 1) return j <= offset;

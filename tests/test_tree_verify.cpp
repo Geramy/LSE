@@ -178,10 +178,12 @@ LSE_TEST(tree_mask_takes_the_split_and_flash_paths) {
       auto table = leaf({1, capacity / 16});
       auto o = sdpa_paged(q, k, v, 0.0625f, MaskKind::kTree, 0, meta, table, 16, &gpu,
                           kv::CacheDType::kBF16);
-      // A tree takes the split kernel at a context it serves (up to 32 rows).
-      const bool split = capacity >= 1024 && n <= 32;
+      // A tree takes the flash split at a context of 1024 keys or more.
+      const bool split = capacity >= 1024;
       LSE_EXPECT(o.node()->prim->name() ==
                  (split ? "attention.split_merge128.wg128c2.v1" : "attention"));
+      if (split)
+        LSE_EXPECT(o.node()->inputs[0]->prim->name() == "attention.flash_split.wmma16.v1");
       const NodePtr roots[]{o.node()};
       backend::LoomEmitter emitter;
       for (const auto& group : Partitioner::partition(roots, &gpu)) {
@@ -509,6 +511,66 @@ int time_kernels() {
     timed(label, [&] { return gated_delta_tree(aq, ak, av, aa, ab, as, ad); });
     std::snprintf(label, sizeof label, "path state, %u of %lld rows", tree.main_rows, static_cast<long long>(n));
     timed(label, [&] { return gated_delta_path(ak, av, aa, ab, as, desc); });
+  }
+  // Attention at a long context: the tree mask against the causal one, the
+  // kernel each takes, at the 27B's full-attention geometry.
+  for (const std::int64_t n : {8, 15, 31}) {
+    const runtime::DraftTree tree = make_tree(static_cast<std::uint32_t>(n - 1), 11);
+    const std::int64_t kvh = 4, qh = 24, hd = 256, bs = 16, capacity = 8192, blocks = capacity / bs;
+    const std::int32_t first = 4000, live = first + static_cast<std::int32_t>(n);
+    std::vector<std::uint16_t> pool(blocks * kvh * bs * hd);
+    for (auto& e : pool) e = to_bf16(uni(rng));
+    std::vector<float> table(blocks), qv(qh * n * hd);
+    for (std::int64_t b = 0; b < blocks; ++b) table[b] = static_cast<float>(b);
+    for (auto& e : qv) e = uni(rng);
+    std::vector<float> meta(kv::tree_meta_elems(1, static_cast<std::int32_t>(n)), 0.0f);
+    meta[0] = static_cast<float>(first);
+    meta[1] = static_cast<float>(live);
+    meta[2] = 1;
+    meta[3] = static_cast<float>(first);
+    meta[4] = static_cast<float>(live);
+    for (std::uint32_t r = 0; r < tree.rows(); ++r)
+      for (std::uint32_t c = 0; c < tree.rows(); ++c)
+        meta[kv::tree_mask_offset(1) + r * n + c] = tree.sees(r, c) ? 1.0f : 0.0f;
+    auto aqq = filled(Shape{1, qh, n, hd}, DType::kF32, qv);
+    auto akp = filled(Shape{blocks, kvh, bs, hd}, DType::kBF16, pool);
+    auto avp = filled(Shape{blocks, kvh, bs, hd}, DType::kBF16, pool);
+    auto ameta = filled(Shape{static_cast<std::int64_t>(meta.size())}, DType::kF32, meta);
+    auto atable = filled(Shape{1, blocks}, DType::kF32, table);
+    const std::size_t member = preferred_member();
+    const auto* device = member < scheduler->devices().size()
+        ? &scheduler->devices().device(member).device_info() : nullptr;
+    for (const MaskKind mask : {MaskKind::kTree, MaskKind::kCausal}) {
+      const auto make = [&] {
+        return sdpa_paged(aqq, akp, avp, 0.0625f, mask, 0, ameta, atable, static_cast<int>(bs), device,
+                          kv::CacheDType::kBF16);
+      };
+      char label[96];
+      std::snprintf(label, sizeof label, "%s attention %lld rows at 4000 (%s)",
+                    mask == MaskKind::kTree ? "tree" : "causal", static_cast<long long>(n),
+                    std::string(make().node()->prim->name()).c_str());
+      timed(label, make);
+    }
+  }
+  // The FFN projections at the tree pass widths.
+  for (const std::int64_t m : {8, 15, 31}) {
+    for (const auto& [n, k] : std::array<std::array<std::int64_t, 2>, 2>{{{17408, 5120}, {5120, 17408}}}) {
+      std::vector<float> x(static_cast<std::size_t>(m * k));
+      for (auto& e : x) e = uni(rng);
+      std::vector<std::uint32_t> words(static_cast<std::size_t>(n * k / 8));
+      for (auto& w : words) w = static_cast<std::uint32_t>(rng());
+      std::vector<bfloat16_t> scales(static_cast<std::size_t>(n * k / 64), bfloat16_t(0.01f));
+      auto ax = filled(Shape{1, m, k}, DType::kF32, x);
+      auto aw = filled(Shape{n, k / 8}, DType::kU32, words);
+      auto asc = filled(Shape{n, k / 64}, DType::kBF16, scales);
+      auto abi = filled(Shape{n, k / 64}, DType::kBF16, scales);
+      const auto make = [&] { return quant_linear(ax, aw, asc, abi, 4, 64); };
+      char label[96];
+      std::snprintf(label, sizeof label, "q4 linear M%lld N%lld K%lld (%s)", static_cast<long long>(m),
+                    static_cast<long long>(n), static_cast<long long>(k),
+                    std::string(make().node()->prim->name()).c_str());
+      timed(label, make);
+    }
   }
   return lse::test::Registry::get().failures ? 1 : 0;
 }

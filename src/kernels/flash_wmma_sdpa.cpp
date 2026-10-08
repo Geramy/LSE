@@ -51,10 +51,18 @@ struct FlashMeanArgs {
 
 // Q/P and decoded KV use F16 operands for F16 storage, BF16 otherwise.
 // Both matrix accumulators, softmax state and output remain FP32.
-template <bool MeanCorrection>
-struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
-  static constexpr std::string_view kName = MeanCorrection ? "attention.flashprefill.wmma.v1" : "attention.flash.wmma16.v3";
-  static constexpr std::string_view kEntry = MeanCorrection ? "lse_flashprefill_wmma_v1" : "lse_flash_wmma16_v3";
+//
+// `Split`: a draft tree's pass (dispatch::flash_split_scope). Each workgroup
+// takes one share of the key windows and writes, per query row, the share's
+// running maximum, sum and unnormalized output as one split record
+// [B, H, T, parts, 258] for attention.split_merge128.wg128c2.v1.
+template <bool MeanCorrection, bool Split = false>
+struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split>> {
+  static_assert(!(MeanCorrection && Split));
+  static constexpr std::string_view kName = MeanCorrection ? "attention.flashprefill.wmma.v1"
+      : Split ? "attention.flash_split.wmma16.v1" : "attention.flash.wmma16.v3";
+  static constexpr std::string_view kEntry = MeanCorrection ? "lse_flashprefill_wmma_v1"
+      : Split ? "lse_flash_split_wmma16_v1" : "lse_flash_wmma16_v3";
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return MeanCorrection ? 7 : 5; }
@@ -81,9 +89,18 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
       if(s.inputs.size()>=5) dense.inputs=s.inputs.first(5);
       if(s.input_dtypes.size()>=5) dense.input_dtypes=s.input_dtypes.first(5);
     }
+    if constexpr (Split) {
+      if (s.output.rank() == 5 && s.output.dim(4) == dispatch::attention_shapes::kSplitRecord)
+        dense.output = Shape{s.output.dim(0), s.output.dim(1), s.output.dim(2),
+                             dispatch::attention_shapes::kSplitRecord - 2};
+      else
+        dense.output = Shape{};
+    }
     return dense;
   }
   std::string emit_kernel(const KernelShapes& s) const override {
+    if constexpr (Split)
+      if (!dispatch::flash_split_scope(dense_request(s))) return {};
     if (s.input_dtypes.size() != (MeanCorrection ? 7 : 5) || !dispatch::flash_wmma_supported(dense_request(s)) || !s.store ||
         (s.attrs[3] == 1.0f && (!std::isfinite(s.attrs[2]) || s.attrs[2] < 0)))
       return {};
@@ -194,9 +211,27 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
 
     const auto lid = e.let(math::local_id());
     const auto wg = e.let(math::workgroup_id_x());
-    const auto qt = e.let(wg % ntiles);
-    const auto h = e.let((wg / ntiles) % d.qh);
-    const auto b = e.let(wg / (ntiles * d.qh));
+    // A split's workgroups are its shares of each tile's windows.
+    const std::uint32_t parts = Split ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
+    const std::uint32_t share = Split ? dispatch::attention_shapes::flash_split_share(
+        std::uint64_t{d.stride} * d.ts, parts) : 0u;
+    const auto tile_wg = [&] {
+      if constexpr (Split) return e.let(wg / parts);
+      else return wg;
+    }();
+    const auto part = [&] {
+      if constexpr (Split) return e.let(wg % parts);
+      else return wg;
+    }();
+    (void)part;
+    const auto qt = e.let(tile_wg % ntiles);
+    const auto h = e.let((tile_wg / ntiles) % d.qh);
+    const auto b = e.let(tile_wg / (ntiles * d.qh));
+    // Row r's record of this share.
+    const auto record = [&](const kir::Val<kir::u32>& qrow) {
+      return e.let((((b * d.qh + h) * d.tq + qrow) * parts + part) *
+                   dispatch::attention_shapes::kSplitRecord);
+    };
     const auto kh = e.let(h / d.group);
     const auto q0 = e.let(qt * QTile);
     const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
@@ -209,7 +244,17 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
           const auto qrow = e.let(q0 + r);
           const auto dd = e.let(lid + p * kThreads);
           if (auto g = e.when(qrow < d.tq && dd < d.dv)) {
-            e.store(obase + qrow * d.dv + dd, e.f32(0.0f));
+            if constexpr (Split) {
+              // An empty share: zero sum and output, never read for its maximum.
+              const auto rec = record(qrow);
+              e.store(e.let(rec + 2u + dd), e.f32(0.0f));
+              if (auto lead = e.when(dd == 0u)) {
+                e.store(rec, e.f32(0.0f));
+                e.store(e.let(rec + 1u), e.f32(0.0f));
+              }
+            } else {
+              e.store(obase + qrow * d.dv + dd, e.f32(0.0f));
+            }
           }
         }
       }
@@ -282,7 +327,15 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
       if constexpr (MeanCorrection) return e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
       else return nwin;
     }();
-    for (auto w : e.range(loop_windows)) {
+    auto windows = [&] {
+      if constexpr (Split) {
+        const auto first_window = e.let(part * share);
+        return e.range(first_window, e.let(first_window + share), 1u);
+      } else {
+        return e.range(loop_windows);
+      }
+    }();
+    for (auto w : windows) {
       const auto wbase = e.let(w * kKWin);
 
       const auto signed_start = e.let(kir::cast<std::int64_t>(wbase));
@@ -738,6 +791,21 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
       }
     }
 
+    if constexpr (Split) {
+      for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+        const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
+        for (auto f : e.unroll(8u)) {
+          const auto qrow = e.let(q0 + acc_row(f));
+          if (auto live_query = e.when(qrow < d.tq && dimension < d.dv))
+            e.store(e.let(record(qrow) + 2u + dimension), o[column_tile][f].read());
+        }
+      }
+      if (auto lead = e.when(lid < QTile && q0 + lid < d.tq)) {
+        const auto rec = record(e.let(q0 + lid));
+        e.store(rec, mrow[lid].read());
+        e.store(e.let(rec + 1u), drow[lid].read());
+      }
+    } else {
     for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
       const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
       for (auto f : e.unroll(8u)) {
@@ -748,6 +816,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
         if (auto live_query = e.when(qrow < d.tq && dimension < d.dv))
           e.store(obase + qrow * d.dv + dimension, o[column_tile][f].read() / inv);
       }
+    }
     }
     if (!k.lds().ok()) return {};
     return k.str();
@@ -766,7 +835,9 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
     const Dims d = dispatch::flash_dimensions(dense_request(s));
     const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
     tp.workgroup_size[0] = kThreads;
-    tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles : 1u;
+    const std::uint32_t parts =
+        Split && s.output.rank() == 5 ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
+    tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles * parts : 1u;
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
     return tp;
@@ -774,8 +845,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
 };
 using FlashWmma=FlashWmmaImpl<false>;
 using FlashMean=FlashWmmaImpl<true>;
+using FlashSplit=FlashWmmaImpl<false, true>;
 LSE_REGISTER_PRIMITIVE(FlashWmma);
 LSE_REGISTER_PRIMITIVE(FlashMean);
+LSE_REGISTER_PRIMITIVE(FlashSplit);
 const FlashWmma kFlashWmma{};
 }  // namespace
 
