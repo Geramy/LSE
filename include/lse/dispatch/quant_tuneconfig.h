@@ -139,6 +139,12 @@ struct Q4MatrixPanelLayout {
 };
 inline constexpr std::array kQ4MatrixPanelLayouts{
     Q4MatrixPanelLayout{1, 8, 0, 16},
+    // A draft tree's verify pass of 9 to 15 rows (runtime::DraftTree): one
+    // 16-row tile, as the 8-row passes use. No prompt pass has these widths
+    // (prefill passes are powers of two), so prefill keeps its kernels.
+    Q4MatrixPanelLayout{9, 15, 0, 16},
+    // ... and of 17 to 31 rows: two 16-row tiles.
+    Q4MatrixPanelLayout{17, 31, 0, 16},
     Q4MatrixPanelLayout{1024, 1024, 17408, 64},
     Q4MatrixPanelLayout{1024, 1024, 5120, 64},
 };

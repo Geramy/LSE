@@ -60,6 +60,18 @@ inline constexpr std::array kQuantVerifyRows{
     QuantVerifyRows{kArch, 2, 4}, QuantVerifyRows{kArch, 3, 4},
     QuantVerifyRows{kArch, 5, 8}, QuantVerifyRows{kArch, 6, 8},
     QuantVerifyRows{kArch, 7, 8},
+    // Draft-tree verify passes of 9 to 14 rows take the 15-row kernels.
+    QuantVerifyRows{kArch, 9, 15}, QuantVerifyRows{kArch, 10, 15},
+    QuantVerifyRows{kArch, 11, 15}, QuantVerifyRows{kArch, 12, 15},
+    QuantVerifyRows{kArch, 13, 15}, QuantVerifyRows{kArch, 14, 15},
+    // ... and of 17 to 30 rows the 31-row ones.
+    QuantVerifyRows{kArch, 17, 31}, QuantVerifyRows{kArch, 18, 31},
+    QuantVerifyRows{kArch, 19, 31}, QuantVerifyRows{kArch, 20, 31},
+    QuantVerifyRows{kArch, 21, 31}, QuantVerifyRows{kArch, 22, 31},
+    QuantVerifyRows{kArch, 23, 31}, QuantVerifyRows{kArch, 24, 31},
+    QuantVerifyRows{kArch, 25, 31}, QuantVerifyRows{kArch, 26, 31},
+    QuantVerifyRows{kArch, 27, 31}, QuantVerifyRows{kArch, 28, 31},
+    QuantVerifyRows{kArch, 29, 31}, QuantVerifyRows{kArch, 30, 31},
 };
 inline constexpr std::array kQuantPanelDevices{
     QuantPanelDevice{kArch, 32, 4, 64, 256},
@@ -71,6 +83,26 @@ inline constexpr std::array kQ4SwiGluShapes{
 };
 inline constexpr std::array kQ4MatrixPanelShapes{
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 8, 5120, 17408},
+    // A draft tree's 9- to 15-row verify pass (kQuantVerifyRows), every
+    // projection on the 16-row matrix panel: the weights read once, as at
+    // eight rows.
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 17408, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 5120, 17408},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 10240, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 6144, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 12288, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 5120, 6144},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 1024, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 15, 248320, 5120},
+    // ... and its 17- to 31-row pass, two 16-row tiles.
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 17408, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 5120, 17408},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 10240, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 6144, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 12288, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 5120, 6144},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 1024, 5120},
+    Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 31, 248320, 5120},
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 1024, 5120, 17408, 64},
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 1024, 17408, 5120, 64, 2304},
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 1024, 10240, 5120, 64, 1152},

@@ -197,10 +197,13 @@ struct Q4MatrixPanelKernel final : KernelPrimitive<Q4MatrixPanelKernel> {
       const auto total = e.let(((local_sum + sum1) + sum2) + sum3);
       const auto step = e.let(maximum * (1.0f / 127.0f));
       const auto inverse = e.let(127.0f / math::max(maximum, e.f32(1e-30f)));
-      const auto row16 = layout->rows == kRows ? row : e.let(row % kRows);
+      // 16-row tiles past the first (a pass of more than 16 rows) follow it.
+      const bool tiles = layout->rows == kRows && padded_rows > kRows;
+      const auto row16 = layout->rows == kRows && !tiles ? row : e.let(row % kRows);
       const auto dst =
           layout->rows == kRows
-              ? e.let(group * kGroupWords)
+              ? (tiles ? e.let(((row / kRows) * groups + group) * kGroupWords)
+                       : e.let(group * kGroupWords))
               : e.let(((row / layout->rows) * groups + group) * tile_words +
                       ((row % layout->rows) / kRows) * kGroupWords);
       for (std::uint32_t word_index = 0; word_index < 4; ++word_index) {
@@ -451,6 +454,11 @@ std::string emit_matrix(const KernelShapes &s) {
   const auto hi = e.let(lane / 16u);
   const auto wg = e.let(math::workgroup_id_x());
   const auto m0 = e.let((wg / nblocks) * 16u);
+  // A pass of more than 16 rows reads its tile of the panel; one tile is the
+  // whole panel.
+  const auto panel_tile = [&](const kir::Val<kir::u32>& index) {
+    return input_rows > 16u ? e.let((m0 / 16u) * (groups * kGroupWords) + index) : index;
+  };
   // The single-slice form emits exactly what it always has; only a split
   // names its waves' slices.
   std::optional<kir::Val<kir::u32>> wave_index, kslice;
@@ -500,10 +508,10 @@ std::string emit_matrix(const KernelShapes &s) {
         l.weight.push_back(e.load(a.packed, e.let(wbase + w), 16u));
       for (std::uint32_t t = 0; t < 4u; ++t)
         l.acts.push_back(e.load(
-            a.panel, e.let(g * kGroupWords + act_lane + (t / 2u) * 64u + (t % 2u) * 32u), 8u));
+            a.panel, panel_tile(e.let(g * kGroupWords + act_lane + (t / 2u) * 64u + (t % 2u) * 32u)), 8u));
       for (std::uint32_t z = 0; z < 8u; z += 2u)
         l.metadata.push_back(e.load(
-            a.panel, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u), 16u));
+            a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 16u + z * 2u)), 16u));
       } else {
         // The whole group's weight words; for product t the activation
         // words of both halves (acts[2t + half]); and the step and sum of
@@ -514,11 +522,11 @@ std::string emit_matrix(const KernelShapes &s) {
         for (std::uint32_t t = 0; t < 4u; ++t)
           for (std::uint32_t h = 0; h < 2u; ++h)
             l.acts.push_back(e.load(
-                a.panel, e.let(g * kGroupWords + act_lane + h * 128u +
-                               (t / 2u) * 64u + (t % 2u) * 32u), 8u));
+                a.panel, panel_tile(e.let(g * kGroupWords + act_lane + h * 128u +
+                                          (t / 2u) * 64u + (t % 2u) * 32u)), 8u));
         for (std::uint32_t z = 0; z < 8u; ++z)
           l.metadata.push_back(e.load(
-              a.panel, e.let(g * kGroupWords + 256u + hi * 2u + z * 4u), 8u));
+              a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 2u + z * 4u)), 8u));
       }
       loaded.push_back(std::move(l));
     }
@@ -593,11 +601,11 @@ std::string emit_matrix(const KernelShapes &s) {
           if constexpr (geo.split_k) {
             for (std::uint32_t z = 0; z < 8u; z += 2u)
               metadata.push_back(e.load(
-                  a.panel, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u), 16u));
+                  a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 16u + z * 2u)), 16u));
           } else {
             for (std::uint32_t z = 0; z < 8u; ++z)
               metadata.push_back(e.load(
-                  a.panel, e.let(g * kGroupWords + 256u + hi * 2u + z * 4u), 8u));
+                  a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 2u + z * 4u)), 8u));
           }
           for (int z = 0; z < kSlots; ++z) {
             const auto pair = static_cast<std::size_t>(geo.split_k ? z / 2 : z);

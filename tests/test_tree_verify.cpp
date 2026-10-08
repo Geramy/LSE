@@ -11,6 +11,7 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/core/dtype.hpp"
 #include "lse/graph/program.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/kv/cache_dtype.hpp"
@@ -509,8 +510,61 @@ int time_kernels() {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
+// `--gemm M`: every 27B projection at M rows through whichever kernel the
+// graph picks, against a double reference over sampled output columns.
+int gemm_accuracy(std::int64_t m) {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  const std::array<std::array<std::int64_t, 2>, 8> shapes{{{17408, 5120}, {5120, 17408},
+      {10240, 5120}, {6144, 5120}, {12288, 5120}, {5120, 6144}, {1024, 5120}, {248320, 5120}}};
+  std::mt19937 rng(17);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  for (const auto& [n, k] : shapes) {
+    std::vector<float> x(static_cast<std::size_t>(m * k));
+    for (auto& e : x) e = uni(rng);
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(n * k / 8));
+    for (auto& w : words) w = static_cast<std::uint32_t>(rng());
+    std::vector<bfloat16_t> scales(static_cast<std::size_t>(n * k / 64)), biases(scales.size());
+    for (std::size_t i = 0; i < scales.size(); ++i) {
+      scales[i] = bfloat16_t(0.01f + 0.005f * std::abs(uni(rng)));
+      biases[i] = bfloat16_t(-0.08f * std::abs(uni(rng)));
+    }
+    auto y = quant_linear(filled(Shape{1, m, k}, DType::kF32, x),
+                          filled(Shape{n, k / 8}, DType::kU32, words),
+                          filled(Shape{n, k / 64}, DType::kBF16, scales),
+                          filled(Shape{n, k / 64}, DType::kBF16, biases), 4, 64);
+    const std::string kernel(y.node()->prim ? y.node()->prim->name() : "?");
+    LSE_EXPECT_OK(run({y}));
+    const auto got = read<float>(y);
+    double worst = 0, scale = 0;
+    for (std::int64_t c = 0; c < n; c += std::max<std::int64_t>(1, n / 512)) {
+      for (std::int64_t r = 0; r < m; ++r) {
+        double acc = 0;
+        for (std::int64_t i = 0; i < k; ++i) {
+          const std::uint32_t word = words[static_cast<std::size_t>(c * (k / 8) + i / 8)];
+          const double code = static_cast<double>((word >> (4 * (i % 8))) & 15u);
+          const auto g = static_cast<std::size_t>(c * (k / 64) + i / 64);
+          acc += x[static_cast<std::size_t>(r * k + i)] *
+                 (static_cast<float>(scales[g]) * code + static_cast<float>(biases[g]));
+        }
+        worst = std::max(worst, std::abs(acc - got[static_cast<std::size_t>(r * n + c)]));
+        scale = std::max(scale, std::abs(acc));
+      }
+    }
+    std::printf("gemm M%lld N%lld K%lld %-34s worst %.4g of %.4g (%.2e relative)\n",
+                static_cast<long long>(m), static_cast<long long>(n), static_cast<long long>(k),
+                kernel.c_str(), worst, scale, worst / scale);
+    LSE_EXPECT(worst / scale < 2e-2);
+  }
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--gpu") return gpu();
+  if (argc == 3 && std::string_view(argv[1]) == "--gemm")
+    return gemm_accuracy(std::strtoll(argv[2], nullptr, 10));
   if (argc == 2 && std::string_view(argv[1]) == "--time") return time_kernels();
   return lse::test::run_all();
 }

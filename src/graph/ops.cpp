@@ -291,7 +291,14 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
   const backend::DeviceInfo* device = nullptr;
   if (Scheduler* scheduler = default_scheduler())
     device = &scheduler->backend().device_info();
-  if (dispatch::q4_gemm_shape(geometry) &&
+  // A shape the matrix panel names (an 8-row or a draft tree's verify pass)
+  // takes it ahead of the tiled GEMM that prompt passes of nine rows and more
+  // run.
+  const bool matrix_panel =
+      dispatch::q4_matrix_panel_shape(geometry, device ? std::string_view(device->arch)
+                                                       : std::string_view{}) ||
+      dispatch::q8_matrix_panel_shape(geometry);
+  if (!matrix_panel && dispatch::q4_gemm_shape(geometry) &&
       (device == nullptr || dispatch::q4_gemm_device(*device))) {
     // The tiled GEMM reads an f16 copy of the activation, made once and
     // shared by every contraction over the same activation.

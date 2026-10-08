@@ -669,7 +669,7 @@ LSE_TEST(draft_width_policy_sizes_trees_by_measured_cost) {
   LSE_EXPECT_EQ(fresh.tree_nodes(prefix), 7u);
   // Rows that cost nothing: the widest tree.
   DraftWidthPolicy flat = measured_tree_policy(40e6, 0.0, 8e6);
-  LSE_EXPECT_EQ(flat.tree_nodes(prefix), 31u);
+  LSE_EXPECT_EQ(flat.tree_nodes(prefix), DraftWidthPolicy::kMaxTreeNodes);
   // Rows that cost a lot: the narrowest.
   DraftWidthPolicy steep = measured_tree_policy(40e6, 8e6, 8e6);
   LSE_EXPECT_EQ(steep.tree_nodes(prefix), 3u);

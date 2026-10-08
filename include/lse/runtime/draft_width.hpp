@@ -128,8 +128,11 @@ class DraftWidthPolicy {
 
   // Draft trees (runtime::DraftTree). A tree pass's rows come in rungs, the
   // widths whose costs the policy measures; a tree of b nodes takes b + 1 rows.
-  static constexpr std::array<std::uint32_t, 5> kTreeRows{4, 8, 16, 24, 32};
-  static constexpr std::uint32_t kMaxTreeNodes = 31;
+  // 15 and 31 rather than 16 and 32 rows: draft-tree verify widths that no
+  // prompt pass takes, with one and two 16-row tiles of kernels of their own
+  // (the 16-row matrix panel, kQuantVerifyRows).
+  static constexpr std::array<std::uint32_t, 4> kTreeRows{4, 8, 15, 31};
+  static constexpr std::uint32_t kMaxTreeNodes = 30;
   // The chance the target answers a candidate the draft gives conditional
   // probability q, learned from every candidate of every row a tree walk
   // reaches (the draft's own probability until it has data).

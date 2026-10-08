@@ -277,10 +277,14 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   const auto* rule = q4_matrix_panel_layout(input);
   if (!rule) return {};
   const auto groups = input.dim(input.rank() - 1) / 64;
-  if (rule->rows == kQ4MatrixPanelRows)
-    return Shape{groups, kQ4MatrixPanelGroupWords};
   const auto m = static_cast<std::int64_t>(
       input.elem_count() / static_cast<std::uint64_t>(input.dim(input.rank() - 1)));
+  // One 16-row tile, or (a draft tree's wider verify pass) a tile per 16 rows.
+  if (rule->rows == kQ4MatrixPanelRows)
+    return m <= kQ4MatrixPanelRows
+               ? Shape{groups, kQ4MatrixPanelGroupWords}
+               : Shape{(m + kQ4MatrixPanelRows - 1) / kQ4MatrixPanelRows, groups,
+                       kQ4MatrixPanelGroupWords};
   return Shape{(m + rule->rows - 1) / rule->rows, groups,
                (rule->rows / kQ4MatrixPanelRows) * kQ4MatrixPanelGroupWords};
 }

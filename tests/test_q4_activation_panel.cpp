@@ -14,6 +14,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string_view>
@@ -731,6 +732,14 @@ int main(int argc, char **argv) {
     return gpu_panel(7, kM7Head);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m6")
     return gpu_panel(6, kWidePanelProjections);
+  if (argc == 3 && std::string_view(argv[1]) == "--gpu-panel-verify") {
+    // Every projection of the 27B model at a draft tree's verify width.
+    const std::array measured{Projection{17408, 5120}, Projection{5120, 17408},
+                              Projection{10240, 5120}, Projection{6144, 5120},
+                              Projection{12288, 5120}, Projection{5120, 6144},
+                              Projection{1024, 5120},  Projection{248320, 5120}};
+    return gpu_panel(std::strtoul(argv[2], nullptr, 10), measured);
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--gpu-panel-m8-rowpairs") {
     const std::array measured{Projection{17408, 5120}, Projection{10240, 5120}};
     return gpu_panel(8, measured);
