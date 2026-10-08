@@ -67,8 +67,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
 
   std::size_t arity() const noexcept override { return MeanCorrection ? 7 : 5; }
   // Variant 1 stages values 16 keys at a time where 32 fit (emit_storage),
-  // on a contiguous-fragment generation. The keys are summed in the same
-  // order either way.
+  // and variant 2 takes two query tiles per workgroup (emit_two_tiles), on a
+  // contiguous-fragment generation; a split pass, whose records the two-tile
+  // form does not write, offers only the first two. Each output is the same
+  // value either way.
   std::uint32_t variants(const KernelShapes& s) const override {
     if (s.device == nullptr || !matrix_target(*s.device)) return 1;
     const auto* row = [&]() -> const math::MatrixCoreRow* {
@@ -78,7 +80,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
           return &r;
       return nullptr;
     }();
-    return row != nullptr && row->a_len == 16 ? 2u : 1u;
+    if (row == nullptr || row->a_len != 16) return 1u;
+    return Split ? 2u : 3u;
   }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
@@ -126,10 +129,447 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
                                          16, 16).wave != 32) {
                   return {};
                 } else {
-                  return emit_storage<Storage, G>(s);
+                  return s.variant == 2u ? emit_two_tiles<Storage, G>(s)
+                                         : emit_storage<Storage, G>(s);
                 }
               });
         });
+  }
+
+  // Variant 2: two 16-query tiles of one head per workgroup, on a
+  // contiguous-fragment generation with 16-bit values. Each key and value
+  // fragment the workgroup reads feeds both tiles, and each barrier serves
+  // both. Every tile keeps its own FlashPrefill V2 selection and retention
+  // vote: a tile that would have skipped a block sees -inf scores (no
+  // selection) or skips its rows' softmax (no retention), which leaves its
+  // rows exactly as skipping did. Each row's scores, softmax and products
+  // are the single-tile kernel's, value for value and in the same order.
+  // Scratch is tight for 32 rows, so the probabilities are narrowed into
+  // scratch a quarter window at a time, from the kept scores and each row's
+  // maximum.
+  template <kv::CacheDType Storage, math::MatrixTarget G>
+  std::string emit_two_tiles(const KernelShapes& s) const {
+    constexpr auto operand = Storage == kv::CacheDType::kF16
+                                 ? math::MatrixElem::kF16 : math::MatrixElem::kBF16;
+    using Mma = math::op::Mma<G, math::MatrixElem::kF32, operand, 16, 16, 16>;
+    using Narrow = math::matrix_scalar_t<Mma::kRow.a_elem>;
+    constexpr TileGeometry kGeo = geometry_of(Mma::kRow);
+    constexpr std::uint32_t kFrag = kGeo.lane_k;
+    constexpr int kSlots = Mma::kRow.c_len;
+    constexpr bool kWideKv =
+        Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16;
+    if constexpr (kGeo.split_k || !kWideKv || kFrag != 16u) {
+      return {};
+    } else {
+    // Sixteen waves: one 16-key column tile of each window and one 16-wide
+    // value tile each, two rows each in the row passes.
+    constexpr std::uint32_t kTiles = 2, QR = QTile * kTiles, kW = 16, kT = kW * 32u;
+    constexpr std::uint32_t kColTiles = kKWin / 16u / kW, kRowsPerWave = QR / kW;
+    constexpr std::uint32_t kQuarter = 64, kProbRow = kQuarter + 8u, kVsub = 16;
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    if (d.dh % 16u != 0 || d.dv % 16u != 0 || d.dv > 256u ||
+        s.device->max_threads_per_workgroup < kT) return {};
+    const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
+    // A draft tree's ancestor mask (mask 3) stays with the single-tile form.
+    if (mask == 3) return {};
+    const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
+    const std::uint32_t npairs = (ntiles + kTiles - 1u) / kTiles;
+    const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    const std::uint32_t qchunks = (QR * padded_depth + kT - 1u) / kT;
+    const std::uint32_t dpt = (d.dv + kT - 1u) / kT;
+    const std::uint32_t value_tiles = (d.dv / 16u + kW - 1u) / kW;
+    const std::uint32_t vrow = d.dv;
+    const std::uint64_t bytes = std::uint64_t{QR} * padded_depth * 2u +
+        std::uint64_t{QR} * kKWin * 4u + 4u * QR * 4u + kVsub * vrow * 2u +
+        std::uint64_t{QR} * kProbRow * 2u + 256u;
+    if (bytes > workgroup_lds_bytes(s.device)) return {};
+    const bool sparse = s.attrs[3] == 1.0f;
+
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    std::conditional_t<MeanCorrection, FlashMeanArgs<env::Emit, Storage>,
+                       FlashArgs<env::Emit, Storage>> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto qs = e.lds<Narrow>(QR * padded_depth);
+    const auto sc = e.lds<kir::f32>(QR * kKWin);
+    const auto mrow = e.lds<kir::f32>(QR);
+    const auto drow = e.lds<kir::f32>(QR);
+    const auto arow = e.lds<kir::f32>(QR);
+    const auto smax = e.lds<kir::f32>(QR);
+    const auto vs = e.lds<Narrow>(kVsub * vrow);
+    const auto pb = e.lds<Narrow>(QR * kProbRow);
+
+    const auto lid = e.let(math::local_id());
+    const auto wg = e.let(math::workgroup_id_x());
+    const auto qp = e.let(wg % npairs);
+    const auto h = e.let((wg / npairs) % d.qh);
+    const auto b = e.let(wg / (npairs * d.qh));
+    const auto kh = e.let(h / d.group);
+    const auto qt0 = e.let(qp * kTiles);
+    const auto q0 = e.let(qt0 * QTile);
+    const auto has1 = e.let(qt0 + 1u < ntiles);
+    const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
+
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
+    if (auto pad = e.when(b >= rows)) {
+      for (std::uint32_t r = 0; r < QR; ++r)
+        for (std::uint32_t p = 0; p < dpt; ++p) {
+          const auto qrow = e.let(q0 + r);
+          const auto dd = e.let(lid + p * kT);
+          if (auto g = e.when(qrow < d.tq && dd < d.dv))
+            e.store(obase + qrow * d.dv + dd, e.f32(0.0f));
+        }
+    }
+    (void)e.ret_if(b >= rows);
+
+    const auto mb =
+        e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
+              b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
+    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto capacity = e.u32(d.stride * d.ts);
+    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
+    const auto tb = e.let(b * d.stride);
+
+    for (std::uint32_t c = 0; c < qchunks; ++c) {
+      const auto idx = e.let(lid + c * kT);
+      if (auto inb = e.when(idx < QR * padded_depth)) {
+        const auto r = e.let(idx / padded_depth);
+        const auto dd = e.let(idx % padded_depth);
+        const auto qrow = e.let(q0 + r);
+        qs[idx] = math::narrow<Narrow>(e.f32(0.0f));
+        if (auto g = e.when(qrow < d.tq && dd < d.dh)) {
+          const auto qvalue = e.let(a.q[e.let(((b * d.qh + h) * d.tq + qrow) * d.dh + dd)]);
+          qs[idx] = math::narrow<Narrow>(qvalue);
+        }
+      }
+    }
+    if (auto g = e.when(lid < QR)) {
+      mrow[lid] = math::neg_inf();
+      drow[lid] = e.f32(0.0f);
+    }
+
+    const auto wave = e.let(lid / 32u);
+    const auto lane = e.let(lid % 32u);
+    const auto lane_lo = e.let(lane % 16u);
+    const auto lane_hi = e.let(lane / 16u);
+    // Rows a wave owns in the row passes, all in one tile.
+    const auto wave_tile = e.let(wave * kRowsPerWave / QTile);
+    const auto acc_row = [&](std::uint32_t f) {
+      return e.let(f * kGeo.slot_step + lane_hi * kGeo.half_rows);
+    };
+    std::vector<decltype(e.local<kir::f32, kSlots>())> o;
+    for (std::uint32_t i = 0; i < kTiles * value_tiles; ++i) {
+      o.push_back(e.local<kir::f32, kSlots>());
+      for (auto f : e.unroll(8u)) o.back()[f] = e.f32(0.0f);
+    }
+    const auto position_of = [&](std::uint32_t last_row) {
+      const auto last = e.let(select(q0 + last_row < d.tq, q0 + last_row, e.u32(d.tq - 1u)));
+      return e.let(kir::cast<std::int64_t>(offset) + kir::cast<std::int64_t>(last));
+    };
+    const auto last_position0 = position_of(QTile - 1u);
+    const auto last_position = position_of(QR - 1u);
+    e.barrier();
+
+    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
+    const auto kv_len = e.runtime_extent(
+        "kv_len", select(loaded_max < capacity, loaded_max, capacity));
+    const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
+    const auto loop_windows = [&] {
+      if constexpr (MeanCorrection) return e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+      else return nwin;
+    }();
+    for (auto w : e.range(loop_windows)) {
+      const auto wbase = e.let(w * kKWin);
+      const auto signed_start = e.let(kir::cast<std::int64_t>(wbase));
+      // Whether the window is one each tile, as its own workgroup, visits.
+      const auto useful1 = mask == 0 ? wbase < row_len
+                                     : wbase < row_len && signed_start <= last_position;
+      const auto useful0 = mask == 0 ? wbase < row_len
+                                     : wbase < row_len && signed_start <= last_position0;
+      if (auto live_window = e.when(useful1 && w < nwin)) {
+        const auto visits0 = e.let(useful0);
+        const auto visits1 = e.let(has1);
+        const auto sel0 = [&] {
+          if constexpr (MeanCorrection) {
+            const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+            return e.let(select(visits0, a.selected[((b * d.qh + h) * ntiles + qt0) * blocks + w],
+                                e.f32(0.0f)));
+          } else {
+            return e.let(select(visits0, e.f32(1.0f), e.f32(0.0f)));
+          }
+        }();
+        const auto sel1 = [&] {
+          if constexpr (MeanCorrection) {
+            const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+            const auto qt1 = e.let(select(has1, qt0 + 1u, qt0));
+            return e.let(select(visits1, a.selected[((b * d.qh + h) * ntiles + qt1) * blocks + w],
+                                e.f32(0.0f)));
+          } else {
+            return e.let(select(visits1, e.f32(1.0f), e.f32(0.0f)));
+          }
+        }();
+        if (auto exact_block = e.when(sel0 != 0.0f || sel1 != 0.0f)) {
+          auto write_score = [&](std::uint32_t tile, const kir::Val<kir::u32>& row,
+                                 const kir::Val<kir::u32>& key,
+                                 const kir::Val<kir::f32>& value) {
+            const auto position = e.let(kir::cast<std::int64_t>(offset) +
+                                        kir::cast<std::int64_t>(q0) + kir::cast<std::int64_t>(row));
+            const auto signed_key = e.let(kir::cast<std::int64_t>(key));
+            const auto slot = e.let(row * kKWin + key - wbase);
+            const auto chosen = tile == 0 ? sel0 : sel1;
+            sc[slot] = math::neg_inf();
+            if (auto live_score = e.when(key < row_len && q0 + row < d.tq && chosen != 0.0f)) {
+              if (mask == 0) sc[slot] = value;
+              else if (mask == 1) {
+                if (auto causal = e.when(signed_key <= position)) sc[slot] = value;
+              } else {
+                const auto distance = e.let(position - signed_key);
+                if (auto sliding = e.when(signed_key <= position && distance < kir::cast<std::int64_t>(e.u32(d.window))))
+                  sc[slot] = value;
+              }
+            }
+          };
+          for (std::uint32_t column_tile = 0; column_tile < kColTiles; ++column_tile) {
+            const auto key = e.let(wbase + (wave + column_tile * kW) * 16u + lane_lo);
+            std::vector<decltype(e.local<kir::f32, 8>())> acc;
+            for (std::uint32_t t = 0; t < kTiles; ++t) {
+              acc.push_back(e.local<kir::f32, 8>());
+              for (auto f : e.unroll(8u)) acc.back()[f] = e.f32(0.0f);
+            }
+            const auto safe_key = e.let(select(key < row_len, key, wbase));
+            const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+            const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+            constexpr std::uint32_t kStepsPerBatch = 8;
+            const auto kbase = e.let(vector * d.dh);
+            const std::uint32_t steps = padded_depth / 16u;
+            using KeyFrag = lse::vec<Narrow, 16>;
+            for (std::uint32_t first = 0; first < steps; first += kStepsPerBatch) {
+              const std::uint32_t last = std::min(steps, first + kStepsPerBatch);
+              std::vector<kir::Pack<KvElement<Storage>>> keys;
+              for (std::uint32_t step = first; step < last; ++step)
+                keys.push_back(k.load_elems<KvElement<Storage>>(
+                    a.k.b.id(), e.let(kbase + step * 16u), 16u));
+              for (std::uint32_t step = first; step < last; ++step) {
+                const kir::Val<KeyFrag> kf(&k.types(), &k.ir(), keys[step - first].id());
+                for (std::uint32_t t = 0; t < kTiles; ++t) {
+                  const auto qbase = e.let((t * QTile + lane_lo) * padded_depth + step * 16u);
+                  const auto qlo = qs.load(qbase, 16u);
+                  const auto qhi = qs.load(e.let(qbase + 8u), 16u);
+                  auto qa = e.local<Narrow, 16>();
+                  for (int j = 0; j < 8; ++j) {
+                    qa[j] = qlo[j];
+                    qa[8 + j] = qhi[j];
+                  }
+                  acc[t] = math::mma<Mma>(qa.value(), kf, acc[t].value());
+                }
+              }
+            }
+            for (std::uint32_t t = 0; t < kTiles; ++t)
+              for (std::uint32_t f = 0; f < 8u; ++f)
+                write_score(t, e.let(acc_row(f) + t * QTile), key,
+                            e.let(acc[t][static_cast<int>(f)].read() * d.scale));
+          }
+          e.barrier();
+
+          // Per tile: whether its rows take this block (its vote).
+          auto retain0 = e.var(1.0f);
+          auto retain1 = e.var(1.0f);
+          if (sparse) {
+            for (std::uint32_t wr = 0; wr < kRowsPerWave; ++wr) {
+              const auto row = e.let(wave * kRowsPerWave + wr);
+              auto block_max = e.var(math::neg_inf());
+              for (auto f : e.unroll(8u))
+                block_max = math::max(block_max.read(), sc[e.let(row * kKWin + lane + f * 32u)].read());
+              for (std::uint32_t bit = 16; bit; bit /= 2)
+                block_max = math::max(block_max.read(), math::shfl_xor(block_max.read(), e.u32(bit)));
+              const auto running = e.let(math::max(mrow[row].read(), block_max.read()));
+              const auto length = e.let(select(row_len > 0u, row_len, e.u32(1)));
+              const auto raw_lambda = e.let(e.f32(s.attrs[2]) / kir::cast<kir::f32>(length));
+              const auto lambda = e.let(select(raw_lambda < 1.0f, raw_lambda, e.f32(1)));
+              const auto keep = e.let(block_max.read() != math::neg_inf() &&
+                  math::exp(block_max.read() - running) >= lambda);
+              if (auto leader = e.when(lane == 0u))
+                arow[row] = select(keep, e.f32(1.0f), e.f32(0.0f));
+            }
+            e.barrier();
+            retain0 = e.f32(0);
+            retain1 = e.f32(0);
+            for (auto row : e.range(QTile))
+              if (auto votes = e.when(arow[row].read() != 0.0f)) retain0 = e.f32(1);
+            for (auto row : e.range(QTile))
+              if (auto votes = e.when(arow[e.let(row + QTile)].read() != 0.0f)) retain1 = e.f32(1);
+            e.barrier();
+          }
+          // A tile's rows take the softmax where the tile would have: its
+          // selection (else its scores are all -inf, which changes nothing)
+          // and its vote.
+          const auto row_retains = e.let(select(wave_tile == 0u, retain0.read(), retain1.read()));
+          for (std::uint32_t wr = 0; wr < kRowsPerWave; ++wr) {
+            const auto row = e.let(wave * kRowsPerWave + wr);
+            if (auto softmax = e.when(row_retains != 0.0f)) {
+              auto maximum = e.var(math::neg_inf());
+              for (auto f : e.unroll(8u))
+                maximum = math::max(maximum.read(), sc[e.let(row * kKWin + lane + f * 32u)].read());
+              for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
+                maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
+              const auto old_max = e.let(mrow[row].read());
+              const auto new_max = e.let(math::max(old_max, maximum.read()));
+              const auto empty = e.let(new_max == math::neg_inf());
+              const auto safe_max = e.let(select(empty, e.f32(0.0f), new_max));
+              const auto alpha = e.let(select(empty, e.f32(1.0f), math::exp(old_max - safe_max)));
+              auto total = e.var(0.0f);
+              for (auto f : e.unroll(8u)) {
+                const auto index = e.let(row * kKWin + lane + f * 32u);
+                const auto probability = e.let(math::exp(sc[index].read() - safe_max));
+                total = total.read() + probability;
+              }
+              for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
+                total = total.read() + math::shfl_xor(total.read(), e.u32(shift));
+              if (auto leader = e.when(lane == 0u)) {
+                mrow[row] = new_max;
+                arow[row] = alpha;
+                smax[row] = safe_max;
+                drow[row] = math::fma(drow[row].read(), alpha, total.read());
+              }
+            }
+          }
+          e.barrier();
+          const auto any_retains = e.let(retain0.read() != 0.0f || retain1.read() != 0.0f);
+          if (auto voted = e.when(any_retains)) {
+            for (std::uint32_t t = 0; t < kTiles; ++t) {
+              const auto tile_retains = t == 0 ? retain0.read() : retain1.read();
+              if (auto rescale = e.when(tile_retains != 0.0f))
+                for (std::uint32_t vt = 0; vt < value_tiles; ++vt)
+                  for (std::uint32_t f = 0; f < 8u; ++f) {
+                    const auto row = e.let(acc_row(f) + t * QTile);
+                    auto& acc = o[t * value_tiles + vt];
+                    acc[static_cast<int>(f)] = acc[static_cast<int>(f)].read() * arow[row].read();
+                  }
+            }
+          }
+          const std::uint32_t pieces_per_key = d.dv / 8u;
+          const std::uint32_t pieces = kVsub * pieces_per_key;
+          for (std::uint32_t quarter = 0; quarter < kKWin; quarter += kQuarter) {
+            // The quarter's probabilities, narrowed: zero for a tile that
+            // does not take the block.
+            if (auto voted = e.when(any_retains)) {
+              for (std::uint32_t c = 0; c < QR * kQuarter / kT; ++c) {
+                const auto idx = e.let(lid + c * kT);
+                const auto row = e.let(idx / kQuarter);
+                const auto key = e.let(idx % kQuarter);
+                const auto takes = e.let(select(row < QTile, retain0.read(), retain1.read()));
+                const auto probability = e.let(math::exp(
+                    sc[e.let(row * kKWin + quarter + key)].read() - smax[row].read()));
+                pb[e.let(row * kProbRow + key)] = math::narrow<Narrow>(
+                    select(takes != 0.0f, probability, e.f32(0.0f)));
+              }
+            }
+            e.barrier();
+            for (std::uint32_t sub = 0; sub < kQuarter; sub += kVsub) {
+              if (auto voted = e.when(any_retains)) {
+                for (std::uint32_t c = 0; c * kT < pieces; ++c) {
+                  const auto piece = e.let(select(lid + c * kT < pieces,
+                                                  lid + c * kT, e.u32(pieces - 1u)));
+                  const auto slot_key = e.let(piece / pieces_per_key);
+                  const auto part = e.let(piece % pieces_per_key);
+                  const auto key = e.let(wbase + quarter + sub + slot_key);
+                  const auto safe_key = e.let(select(key < row_len, key, wbase));
+                  const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+                  const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+                  const auto row_v = e.load(a.v, e.let(vector * d.dv + part * 8u), 16u);
+                  k.store_pack<Narrow>(vs.id(), e.let(slot_key * vrow + part * 8u), row_v, 16u);
+                }
+              }
+              e.barrier();
+              if (auto voted = e.when(any_retains)) {
+                using Frag = lse::vec<Narrow, 16>;
+                std::vector<kir::Val<Frag>> pf;
+                for (std::uint32_t t = 0; t < kTiles; ++t) {
+                  const auto ap = pb.load_elems(e.let((t * QTile + lane_lo) * kProbRow + sub), 16u);
+                  pf.push_back(kir::Val<Frag>(&k.types(), &k.ir(), ap.id()));
+                }
+                for (std::uint32_t vt = 0; vt < value_tiles; ++vt) {
+                  const auto dimension = e.let((wave + vt * kW) * 16u + lane_lo);
+                  const auto safe_dim = e.let(select(dimension < d.dv, dimension, e.u32(d.dv - 1u)));
+                  auto bf = e.local<Narrow, 16>();
+                  for (auto f : e.unroll(16u)) bf[f] = vs[e.let(f * vrow + safe_dim)].read();
+                  for (std::uint32_t t = 0; t < kTiles; ++t) {
+                    auto& acc = o[t * value_tiles + vt];
+                    acc = math::mma<Mma>(pf[t], bf.value(), acc.value());
+                  }
+                }
+              }
+              e.barrier();
+            }
+          }
+        }  // exact block
+        if constexpr (MeanCorrection) {
+          const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+          const auto pool = e.let(((b * d.kvh + kh) * blocks + w) * 513u);
+          // Per tile, as its own workgroup would have: a block it visits and
+          // did not select takes the pooled correction.
+          const auto corrects0 = e.let(visits0 && sel0 == 0.0f);
+          const auto corrects1 = e.let(visits1 && sel1 == 0.0f);
+          const auto row_corrects = e.let(select(wave_tile == 0u, corrects0, corrects1));
+          for (std::uint32_t wr = 0; wr < kRowsPerWave; ++wr) {
+            const auto row = e.let(wave * kRowsPerWave + wr);
+            if (auto correction = e.when(row_corrects)) {
+              auto score = e.var(0.0f);
+              if (auto live = e.when(q0 + row < d.tq)) {
+                const auto qb = e.let(((b * d.qh + h) * d.tq + q0 + row) * d.dh);
+                for (std::uint32_t c = 0; c < 8; ++c)
+                  score = math::fma(a.q[qb + lane + c * 32u], a.pooled[pool + lane + c * 32u], score.read());
+              }
+              for (std::uint32_t bit = 16; bit; bit /= 2)
+                score = score.read() + math::shfl_xor(score.read(), e.u32(bit));
+              const auto logit = e.let(score.read() * d.scale + e.f32(std::log(256.0f)));
+              const auto old = e.let(mrow[row].read());
+              const auto updated = e.let(math::max(old, logit));
+              const auto alpha = e.let(math::exp(old - updated));
+              const auto weight = e.let(math::exp(logit - updated));
+              if (auto leader = e.when(lane == 0u)) {
+                mrow[row] = updated; arow[row] = alpha;
+                sc[row] = weight; drow[row] = math::fma(drow[row].read(), alpha, weight);
+              }
+            }
+          }
+          e.barrier();
+          for (std::uint32_t t = 0; t < kTiles; ++t) {
+            if (auto correction_values = e.when(t == 0 ? corrects0 : corrects1)) {
+              for (std::uint32_t vt = 0; vt < value_tiles; ++vt) {
+                const auto dimension = e.let((wave + vt * kW) * 16u + lane_lo);
+                const auto value = e.let(a.pooled[pool + 256u + dimension]);
+                auto& acc = o[t * value_tiles + vt];
+                for (std::uint32_t f = 0; f < 8u; ++f) {
+                  const auto row = e.let(acc_row(f) + t * QTile);
+                  acc[static_cast<int>(f)] = math::fma(sc[row].read(), value,
+                      acc[static_cast<int>(f)].read() * arow[row].read());
+                }
+              }
+            }
+          }
+          e.barrier();
+        }
+      }
+    }
+
+    for (std::uint32_t t = 0; t < kTiles; ++t)
+      for (std::uint32_t vt = 0; vt < value_tiles; ++vt) {
+        const auto dimension = e.let((wave + vt * kW) * 16u + lane_lo);
+        for (std::uint32_t f = 0; f < 8u; ++f) {
+          const auto row = e.let(acc_row(f) + t * QTile);
+          const auto qrow = e.let(q0 + row);
+          const auto den = e.let(drow[row].read());
+          const auto inv = e.let(select(den == 0.0f, e.f32(1.0f), den));
+          if (auto live_query = e.when(qrow < d.tq && dimension < d.dv))
+            e.store(obase + qrow * d.dv + dimension, o[t * value_tiles + vt][static_cast<int>(f)].read() / inv);
+        }
+      }
+    if (!k.lds().ok()) return {};
+    return k.str();
+    }
   }
 
   // One body for every wave32 WMMA generation. What differs between them is
@@ -834,10 +1274,12 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     ThreadPlan tp;
     const Dims d = dispatch::flash_dimensions(dense_request(s));
     const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
-    tp.workgroup_size[0] = kThreads;
     const std::uint32_t parts =
         Split && s.output.rank() == 5 ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
-    tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * ntiles * parts : 1u;
+    // Variant 2 takes two query tiles per workgroup, on sixteen waves.
+    const std::uint32_t tiles = s.variant == 2u ? (ntiles + 1u) / 2u : ntiles;
+    tp.workgroup_size[0] = s.variant == 2u ? 2u * kThreads : kThreads;
+    tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * tiles * parts : 1u;
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
     return tp;
