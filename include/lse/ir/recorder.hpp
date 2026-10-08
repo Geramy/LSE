@@ -708,6 +708,26 @@ class KernelBody {
   [[nodiscard]] bool has_store() const noexcept { return static_cast<bool>(store_); }
   void store(const Val<u32>& index, const Val<f32>& value);
 
+  // The same epilogue in two parts: everything up to the output's store
+  // (input loads and arithmetic), and the store itself. An emitter that can
+  // split its epilogue installs this beside the plain hook.
+  struct SplitStore {
+    std::string compute;
+    std::string store;
+  };
+  using SplitStoreFn =
+      std::function<SplitStore(std::string_view index, std::string_view value)>;
+  void set_split_store(SplitStoreFn fn) { split_store_ = std::move(fn); }
+
+  // Several outputs stored together: every element's epilogue computation
+  // (its input loads included) is emitted before any element's store. A
+  // compiler that cannot prove a later element's input load disjoint from an
+  // earlier element's output store waits for that store to complete before
+  // the load issues; with the loads first, no load follows a store. The
+  // values stored are the same, element for element. Without a split hook
+  // the outputs are stored one at a time.
+  void store_group(std::span<const std::pair<Val<u32>, Val<f32>>> items);
+
   [[nodiscard]] const TypeTable& types() const noexcept { return *types_; }
 
   // One id sequence per body, shared by every generator layered on it, so
@@ -757,6 +777,7 @@ class KernelBody {
   const DialectSourceTable* intrinsics_;
   Body ir_;
   StoreFn store_;
+  SplitStoreFn split_store_;
   Lds lds_;
 
   template <typename T> friend class LValue;

@@ -247,6 +247,11 @@ struct Emit {
   void store(const ir::Val<ir::u32>& index, const ir::Val<ir::f32>& v) {
     k->store(index, v);
   }
+  // Several outputs at once, every epilogue's loads ahead of every store
+  // (ir::KernelBody::store_group).
+  void store_group(std::span<const std::pair<ir::Val<ir::u32>, ir::Val<ir::f32>>> items) {
+    k->store_group(items);
+  }
 
   class [[nodiscard]] Guard {
    public:

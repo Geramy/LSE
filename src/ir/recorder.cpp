@@ -173,6 +173,48 @@ Val<u32> KernelBody::begin_for(std::string_view var, const Val<u32>& lo,
 
 void KernelBody::end_block() { ir_.pop(); }
 
+void KernelBody::store_group(std::span<const std::pair<Val<u32>, Val<f32>>> items) {
+  if (!store_) return;
+  if (!split_store_ || items.size() < 2) {
+    for (const auto& [index, value] : items) store(index, value);
+    return;
+  }
+  Operation scope;
+  scope.kind = OpKind::kScope;
+  const OpId sid = ir_.add(std::move(scope));
+  ir_.push(ir_.open_region(sid));
+  const auto append = [&](const std::string& text, std::vector<ValueId> operands) {
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+      const std::size_t nl = text.find('\n', pos);
+      const std::string line =
+          text.substr(pos, nl == std::string::npos ? text.size() - pos : nl - pos);
+      if (!line.empty()) {
+        Operation o;
+        o.kind = OpKind::kRawStmt;
+        o.text = line;
+        // As in store(): the text names the index and the value, so they are
+        // this statement's operands and no pass deletes their definitions.
+        o.operands = std::move(operands);
+        operands.clear();
+        ir_.add(std::move(o));
+      }
+      if (nl == std::string::npos) break;
+      pos = nl + 1;
+    }
+  };
+  std::vector<std::string> stores;
+  stores.reserve(items.size());
+  for (const auto& [index, value] : items) {
+    SplitStore part = split_store_(index.text(), value.text());
+    append(part.compute, {index.id(), value.id()});
+    stores.push_back(std::move(part.store));
+  }
+  for (std::size_t i = 0; i < stores.size(); ++i)
+    append(stores[i], {items[i].first.id(), items[i].second.id()});
+  ir_.pop();
+}
+
 void KernelBody::store(const Val<u32>& index, const Val<f32>& value) {
   if (!store_) return;  // emit_kernel declines when the emitter set no hook
   // Braced so the epilogue's own locals are scoped to this store: a kernel
