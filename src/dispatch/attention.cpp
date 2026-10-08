@@ -209,9 +209,11 @@ bool split_decode_merge_supported(const KernelShapes& s) {
   return false;
 }
 
-bool split_short_scope(const Shape& query, std::int64_t offset, std::int64_t capacity) {
+bool split_short_scope(const Shape& query, std::int64_t offset, std::int64_t capacity,
+                       bool tree) {
   for (const auto& rule : shapes::kShortDefaults)
-    if (offset >= rule.min_offset && short_default_shape(query, capacity, rule)) return true;
+    if ((rule.mask == 3) == tree && offset >= rule.min_offset &&
+        short_default_shape(query, capacity, rule)) return true;
   return false;
 }
 

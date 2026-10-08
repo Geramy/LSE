@@ -24,8 +24,9 @@ struct FlashDims {
                                        std::int64_t capacity);
 [[nodiscard]] bool split_decode_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_merge_supported(const graph::KernelShapes&);
+// `tree`: a draft tree's verify pass (graph::MaskKind::kTree).
 [[nodiscard]] bool split_short_scope(const Shape& query, std::int64_t offset,
-                                    std::int64_t capacity);
+                                    std::int64_t capacity, bool tree = false);
 [[nodiscard]] bool split_short_default_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_short_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_short_merge_supported(const graph::KernelShapes&);
