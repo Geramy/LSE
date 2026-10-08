@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <string_view>
 #include <vector>
@@ -653,7 +654,44 @@ int gemm_accuracy(std::int64_t m) {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
+// `--trial M N K [reps]`: one Q4 contraction of M rows run `reps` times in a
+// process; with no recorded variant decision (an empty variants file in the
+// cache directory) its first run measures every variant the kernel offers.
+int trial(std::int64_t m, std::int64_t n, std::int64_t k, int reps) {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  std::mt19937 rng(23);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  std::vector<float> x(static_cast<std::size_t>(m * k));
+  for (auto& e : x) e = uni(rng);
+  std::vector<std::uint32_t> words(static_cast<std::size_t>(n * k / 8));
+  for (auto& w : words) w = static_cast<std::uint32_t>(rng());
+  std::vector<bfloat16_t> scales(static_cast<std::size_t>(n * k / 64), bfloat16_t(0.01f));
+  auto ax = filled(Shape{1, m, k}, DType::kF32, x);
+  auto aw = filled(Shape{n, k / 8}, DType::kU32, words);
+  auto asc = filled(Shape{n, k / 64}, DType::kBF16, scales);
+  auto abi = filled(Shape{n, k / 64}, DType::kBF16, scales);
+  std::vector<float> first;
+  std::optional<TreePassScope> tree_pass;
+  if (std::getenv("TRIAL_TREE") != nullptr) tree_pass.emplace();
+  for (int r = 0; r < reps; ++r) {
+    auto y = quant_linear(ax, aw, asc, abi, 4, 64);
+    LSE_EXPECT_OK(run({y}));
+    const auto got = read<float>(y);
+    if (r == 0) first = got;
+    LSE_EXPECT(got == first);
+  }
+  std::printf("trial M%lld N%lld K%lld: %d runs agree\n", static_cast<long long>(m),
+              static_cast<long long>(n), static_cast<long long>(k), reps);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 5 && std::string_view(argv[1]) == "--trial")
+    return trial(std::strtoll(argv[2], nullptr, 10), std::strtoll(argv[3], nullptr, 10),
+                 std::strtoll(argv[4], nullptr, 10), argc > 5 ? std::atoi(argv[5]) : 3);
   if (argc == 2 && std::string_view(argv[1]) == "--gpu") return gpu();
   if (argc == 3 && std::string_view(argv[1]) == "--gemm")
     return gemm_accuracy(std::strtoll(argv[2], nullptr, 10));
