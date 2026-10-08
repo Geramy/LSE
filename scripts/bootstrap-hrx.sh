@@ -13,7 +13,7 @@ repo="${LSE_HRX_REPO:-https://github.com/ROCm/hrx-system.git}"
 # this within a fortnight -- and the patches below are cut against this base.
 # Raise it deliberately, with a build and a test run, not by cloning whatever
 # main happens to be.
-ref="${LSE_HRX_REF:-5927b0e0}"
+ref="${LSE_HRX_REF:-631c0b7854b51a593b89761cc6dcae88f2ec3940}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # `python` is not a command on a stock Ubuntu 26.04; dev.py wants an interpreter
 # by name, so pick one that exists rather than the one its docs happen to spell.
@@ -76,11 +76,13 @@ if [[ -z "$cc" ]]; then
 fi
 echo "host compiler: $cc"
 
-# Patches this tree carries against hrx-system. Each one is a fix we need and
-# have sent upstream; applying is idempotent, so a checkout that already has
-# them (or an upstream that has taken them) is left alone.
-shopt -s nullglob
-for patch in "$root"/patches/*.patch; do
+# LSE's HRX patch series (patches/hrx), the Linux list of
+# .github/scripts/build-linux-loom.sh, in its order. Applying is idempotent, so
+# a checkout that already has them is left alone.
+for name in loom-concat-destination-reserved-once stream-queue-affinity kv-fragment-addressing \
+            gpu-device-group-and-device-import gfx120x-hdp-kernarg-publication \
+            gfx12-vopd-identical-source; do
+  patch="$root/patches/hrx/$name.patch"
   if git -C "$dir" apply --check --reverse "$patch" 2>/dev/null; then
     echo "already applied: $(basename "$patch")"
   elif git -C "$dir" apply "$patch" 2>/dev/null; then
@@ -90,7 +92,6 @@ for patch in "$root"/patches/*.patch; do
     exit 1
   fi
 done
-shopt -u nullglob
 
 cd "$dir"
 "$py" dev.py cmake configure -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_ROCM_PATH="$rocm" \

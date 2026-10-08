@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: geramyloveless <gloveless@jqluv.com>
+Date: Wed, 7 Oct 2026 19:28:02 -0700
+Subject: [PATCH] [HRX] One GPU device spanning several GPUs; import device
+ allocations
+
+hrx_gpu_initialize_over initializes the GPU accelerator as one logical
+device over the GPUs named by a driver device path (ordinals, GPU UUIDs or
+`*`) instead of one device per GPU, so a buffer allocated by it is bindable
+by a dispatch on any of its GPUs. NULL or an empty path is
+hrx_gpu_initialize.
+
+hrx_allocator_import_buffer imports a device-local, non-host-visible
+request as a device allocation at that address rather than as a host
+allocation, which is how a peer's memory is brought into an allocator so a
+queue may copy out of it.
+---
+ libhrx/include/hrx_runtime.h  | 19 ++++++++++++++++++
+ libhrx/src/libhrx/allocator.c | 20 ++++++++++++++++---
+ libhrx/src/libhrx/runtime.c   | 36 +++++++++++++++++++++++++++++++----
+ 3 files changed, 68 insertions(+), 7 deletions(-)
+
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+index 051834efc..5a20ed77d 100644
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -484,6 +484,25 @@ hrx_runtime_set_device_event_sink(hrx_device_event_sink_t sink);
+ //===----------------------------------------------------------------------===//
+ 
+ HRX_API hrx_status_t hrx_gpu_initialize(uint32_t flags);
++
++// Initializes the GPU accelerator as ONE device spanning the GPUs named by
++// |topology_path|, rather than one device per GPU.
++//
++// The HAL allows a logical device to be composed of several physical ones,
++// with a unified address space across them: a buffer allocated from such a
++// device is reachable by any of its GPUs, dispatches are placed on one of them
++// by queue affinity, and semaphores order work between them. Enumerating
++// ordinals gives a separate logical device per GPU, and two of those share no
++// allocator, so a buffer one allocates cannot be bound by the other and
++// everything crossing between them becomes a copy the hardware did not need.
++//
++// |topology_path| takes the driver's device-path syntax: a comma separated list
++// of GPU ordinals or `GPU-...` UUIDs, or `*` for every visible GPU. On success
++// hrx_gpu_device_count() is 1 and hrx_gpu_device_get(0) is the spanning device.
++//
++// Passing NULL or an empty path is exactly hrx_gpu_initialize().
++HRX_API hrx_status_t hrx_gpu_initialize_over(const char* topology_path,
++                                             uint32_t flags);
+ HRX_API hrx_status_t hrx_gpu_shutdown(void);
+ HRX_API hrx_status_t hrx_gpu_device_count(int* count);
+ HRX_API hrx_status_t hrx_gpu_device_get(int index, hrx_device_t* device);
+diff --git a/libhrx/src/libhrx/allocator.c b/libhrx/src/libhrx/allocator.c
+index 4c37b0c87..e7e12e290 100644
+--- a/libhrx/src/libhrx/allocator.c
++++ b/libhrx/src/libhrx/allocator.c
+@@ -85,7 +85,7 @@ hrx_status_t hrx_allocator_import_buffer(hrx_allocator_t allocator,
+   if (!allocator || !host_ptr || !buffer) {
+     HRX_RETURN_AND_END_ZONE(
+         z0, hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
+-                            "allocator, host_ptr, or buffer is NULL"));
++                            "allocator, ptr, or buffer is NULL"));
+   }
+ 
+   iree_hal_queue_family_affinity_t queue_family_affinity = 0;
+@@ -102,12 +102,26 @@ hrx_status_t hrx_allocator_import_buffer(hrx_allocator_t allocator,
+       .queue_family_affinity = queue_family_affinity,
+   };
+ 
++  // A device-local request is describing another allocation on this platform,
++  // not a host pointer: that is how a peer's memory is brought into this
++  // allocator so a queue may copy out of it. Importing it as a host allocation
++  // instead is rejected, and there is no other way to name it.
++  const bool device_allocation =
++      iree_all_bits_set((iree_hal_memory_type_t)params.type,
++                        IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL) &&
++      !iree_any_bit_set((iree_hal_memory_type_t)params.type,
++                        IREE_HAL_MEMORY_TYPE_HOST_VISIBLE);
+   iree_hal_external_buffer_t ext = {
+-      .type = IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION,
++      .type = device_allocation ? IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION
++                                : IREE_HAL_EXTERNAL_BUFFER_TYPE_HOST_ALLOCATION,
+       .flags = 0,
+       .size = (iree_device_size_t)size,
+-      .handle.host_allocation.ptr = host_ptr,
+   };
++  if (device_allocation) {
++    ext.handle.device_allocation.ptr = (uint64_t)(uintptr_t)host_ptr;
++  } else {
++    ext.handle.host_allocation.ptr = host_ptr;
++  }
+ 
+   iree_hal_buffer_t* hal_buffer = NULL;
+   status = iree_hal_allocator_import_buffer(
+diff --git a/libhrx/src/libhrx/runtime.c b/libhrx/src/libhrx/runtime.c
+index fd993fd7e..667fb3b59 100644
+--- a/libhrx/src/libhrx/runtime.c
++++ b/libhrx/src/libhrx/runtime.c
+@@ -904,6 +904,10 @@ hrx_status_t hrx_cpu_device_get(int index, hrx_device_t* device) {
+ // GPU accelerator
+ //===----------------------------------------------------------------------===//
+ 
++// Set by hrx_gpu_initialize_over for the duration of initialization; NULL when
++// the caller wants the usual device-per-GPU enumeration.
++static const char* g_gpu_topology_path = NULL;
++
+ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+     uint32_t flags,
+     const iree_hal_device_create_params_extension_t* device_extensions) {
+@@ -1030,14 +1034,29 @@ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+       continue;
+     }
+ 
+-    iree_status = iree_hal_driver_create_device_by_ordinal(
+-        driver, info_index, /*param_count=*/0, /*params=*/NULL, &create_params,
+-        alloc, &hal_devices[created_device_count]);
+-    hrx_debug_print_iree_status("create device by ordinal", iree_status);
++    const bool spanning = g_gpu_topology_path && g_gpu_topology_path[0];
++    if (spanning) {
++      // One logical device over the named GPUs. The driver resolves the path
++      // into the topology the device is built on, so its allocator spans them
++      // and its queues address them individually.
++      iree_status = iree_hal_driver_create_device_by_path(
++          driver, iree_make_cstring_view("amdgpu"),
++          iree_make_cstring_view(g_gpu_topology_path), /*param_count=*/0,
++          /*params=*/NULL, &create_params, alloc,
++          &hal_devices[created_device_count]);
++      hrx_debug_print_iree_status("create device by path", iree_status);
++    } else {
++      iree_status = iree_hal_driver_create_device_by_ordinal(
++          driver, info_index, /*param_count=*/0, /*params=*/NULL,
++          &create_params, alloc, &hal_devices[created_device_count]);
++      hrx_debug_print_iree_status("create device by ordinal", iree_status);
++    }
+     if (iree_status_is_ok(iree_status)) {
+       device_info_indices[created_device_count] = info_index;
+       ++created_device_count;
+     }
++    // A spanning device IS the accelerator; there is no second one to make.
++    if (spanning) break;
+   }
+ 
+   // Assign every device to one topology before selecting queues. AMDGPU queue
+@@ -1132,6 +1151,15 @@ hrx_status_t hrx_gpu_initialize_with_device_extensions(
+ #endif  // HRX_HAS_IREE_AMDGPU_DRIVER
+ }
+ 
++hrx_status_t hrx_gpu_initialize_over(const char* topology_path,
++                                     uint32_t flags) {
++  g_gpu_topology_path = topology_path;
++  hrx_status_t status = hrx_gpu_initialize_with_device_extensions(
++      flags, /*device_extensions=*/NULL);
++  g_gpu_topology_path = NULL;
++  return status;
++}
++
+ hrx_status_t hrx_gpu_initialize(uint32_t flags) {
+   return hrx_gpu_initialize_with_device_extensions(flags,
+                                                    /*device_extensions=*/NULL);

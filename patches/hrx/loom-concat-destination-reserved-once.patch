@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: geramyloveless <gloveless@jqluv.com>
+Date: Thu, 8 Oct 2026 14:32:34 -0700
+Subject: [PATCH] [Loom] Reserve a concat edge destination only once
+
+When a low.concat result flows through a single whole-value edge and one
+of its sources is retained after the edge, the first such source reserves
+the edge destination and defers. A later, non-retained source of the same
+concat tries to alias its unit of that destination. If the alias fails,
+for example because another value is still live in that unit, the
+reservation block ran again and appended a second assignment for the
+already assigned destination.
+
+The assignment table is sized to the allocatable interval count, so the
+extra entry made the last published assignment land past the end of the
+array, where later arena allocations overwrote it. On AMDGPU this surfaced
+as AMDGPU/035 with register class '<unknown>' for a bf16 attention kernel
+after licm.
+
+Skip the destination reservation when the destination already has an
+assignment, so the source falls through to the ordinary concat placement.
+---
+ .../loom/codegen/low/allocation/coalescing.c  |  6 ++++-
+ .../low/test/allocation_concat.loom-test      | 23 +++++++++++++++++++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/loom/src/loom/codegen/low/allocation/coalescing.c b/loom/src/loom/codegen/low/allocation/coalescing.c
+index 88a44522b..769361910 100644
+--- a/loom/src/loom/codegen/low/allocation/coalescing.c
++++ b/loom/src/loom/codegen/low/allocation/coalescing.c
+@@ -1423,7 +1423,11 @@ loom_low_allocation_coalescing_assign_concat_source_relation(
+     *out_result = LOOM_LOW_ALLOCATION_CONCAT_SOURCE_RESULT_DEFERRED;
+     return iree_ok_status();
+   }
+-  if (can_reserve_destination && has_retained_source) {
++  // An earlier source of the same assembly may already have reserved the
++  // destination. Appending it again would publish a second assignment for the
++  // destination value.
++  if (can_reserve_destination && has_retained_source &&
++      destination_assignment == NULL) {
+     loom_low_allocation_class_capacity_t capacity = {0};
+     IREE_RETURN_IF_ERROR(
+         loom_low_allocation_target_constraints_interval_capacity(
+diff --git a/loom/src/loom/codegen/low/test/allocation_concat.loom-test b/loom/src/loom/codegen/low/test/allocation_concat.loom-test
+index 731ec59ce..7ad397dd3 100644
+--- a/loom/src/loom/codegen/low/test/allocation_concat.loom-test
++++ b/loom/src/loom/codegen/low/test/allocation_concat.loom-test
+@@ -177,3 +177,26 @@ CHECK: *"spill_count":0,*
+ CHECK: *"name":"tuple"*"base":2,"count":4}*
+ CHECK: *"name":"low"*"base":0,"count":2}*
+ CHECK: *"name":"result"*"base":2,"count":4}*
++
++// ====
++
++// RUN: with-checks emit low-allocation-json @retained_source_reserves_edge_destination_once
++
++test.target<low_core> @target
++
++// The retained source reserves the edge destination first. The other source
++// cannot alias its destination unit while lhs is live, and must not reserve the
++// already assigned destination again.
++low.func.def target<test.low.core>(@target) @retained_source_reserves_edge_destination_once(%lhs: reg<test.i32>, %rhs: reg<test.i32>) -> (reg<test.i32 x2>, reg<test.i32>, reg<test.i32>) asm {
++  %keep = test.add.i32 %lhs, %lhs
++  %part = test.mul.i32 %rhs, %rhs
++  %sum = test.add.i32 %lhs, %rhs
++  %pair = concat(%part, %keep) : (reg<test.i32>, reg<test.i32>) -> reg<test.i32 x2>
++  low.br ^join(%pair: reg<test.i32 x2>)
++^join(%state: reg<test.i32 x2>):
++  return %state, %keep, %sum
++}
++
++// ----
++CHECK: *"assignment_count":7,*"name":"state"*"location":{"kind":"target_id","base":0,"count":2}*
++CHECK-NOT: *"name":"state"*"name":"state"*

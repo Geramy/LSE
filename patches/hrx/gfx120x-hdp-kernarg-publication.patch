@@ -1,4 +1,4 @@
-From cfa88848ba63555c6601a83445baf256c67eb2c4 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: geramyloveless <gloveless@jqluv.com>
 Date: Tue, 6 Oct 2026 17:53:32 -0700
 Subject: [PATCH] [HAL/AMDGPU] Allow HDP kernarg publication on gfx120x
@@ -71,6 +71,3 @@ index 5ca4e82de..4d5f0a727 100644
    EXPECT_TRUE(
        iree_hal_amdgpu_gfxip_allows_hdp_kernarg_publication(GfxIp(12, 5, 0)));
  }
--- 
-2.51.0
-

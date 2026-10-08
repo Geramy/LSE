@@ -37,7 +37,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 dev="$HOME/Documents/Development"
 work="${LSE_IOS_WORK:-$root/build/ios}"
 # The same hrx-system and hsa-runtime-headers pins as .github/scripts/build-macos.sh.
-hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
+hrx_rev=631c0b7854b51a593b89761cc6dcae88f2ec3940
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 hrx_source="${HRX_SOURCE:-$work/deps/hrx}"
 hsa_headers="${HSA_HEADERS_SOURCE:-$work/deps/hsa-headers}"
@@ -46,16 +46,14 @@ flatcc_source="${FLATCC_SOURCE:-}"
 isa_xml="${LOOM_AMDGPU_ISA_XML:-}"
 deployment="${IOS_DEPLOYMENT_TARGET:-26.0}"
 jobs="${LSE_BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
-# LSE's HRX patch series, in the order build-macos.sh applies it, with the
-# iOS static runtime ahead of the last loomc fix. The macOS coarse host
-# adapter stays on: the iPad reaches the GPU through the same transport.
-# loom-grow-arrays-only-when-full matters most here: loomc arrays that grew
-# on every append asked for 16 GiB on a 1024-token prefill kernel, which
-# macOS maps lazily and iOS refuses.
-hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
-  gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
-  loop-invariant-motion rdna4-prefetch-address-span ios-static-runtime
-  loom-grow-arrays-only-when-full)
+# LSE's HRX patch series, in the order build-macos.sh applies it, without the
+# Linux multi-GPU device, the RDNA4 VRAM kernarg path and its macOS BAR-write
+# bracket, and with the iOS static runtime last. The
+# macOS coarse host adapter stays on: the iPad reaches the GPU through the
+# same transport.
+hrx_patches=(loom-concat-destination-reserved-once stream-queue-affinity
+  macos-coarse-host-adapter kv-fragment-addressing gfx12-vopd-identical-source
+  ios-static-runtime)
 
 die() { echo "$*" >&2; exit 1; }
 
