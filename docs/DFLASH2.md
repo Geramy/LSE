@@ -97,14 +97,15 @@ second (`src/runtime/draft_width.cpp`):
 - **Acceptance estimate.** Proposal j's chance of acceptance, given the ones
   before it were accepted, comes from the draft's own conditional
   distribution at j: its largest probability, mapped through a calibration
-  table (20 bins) that learns from every proposal the target checks how often
+  table (24 bins) that learns from every proposal the target checks how often
   proposals of that confidence are accepted. Old observations fade (half
   weight after 512 more checks, about one 640-token request), so the table
   follows the text.
 - **Costs.** The wall time of each verify width (1 to 8 rows) and of a draft
   is measured on the device for this model; the first steps of a process
-  visit every width twice, and each width is measured again every 4,096
-  steps. A shared level follows the context length, and a per-width offset
+  visit every width twice, and a width unmeasured for 512 steps is measured
+  again on a step where that costs little (after 2,048 steps, whatever it
+  costs). A shared level follows the context length, and a per-width offset
   holds what the extra rows cost. A step that recorded a program (a width's
   first pass in a request) or compiled a kernel is left out. Nothing is
   hard-coded, so each GPU tunes itself: on the R9700 the step costs of 1 to 8
@@ -120,10 +121,15 @@ second (`src/runtime/draft_width.cpp`):
   proposal is still a sample of the draft's conditional and rejection
   sampling keeps the target's distribution exactly.
   `a_draft_side_stopping_rule_keeps_the_target_distribution` in
-  `tests/test_runtime.cpp` checks this on a two-position example.
+  `tests/test_runtime.cpp` checks this on a two-position example, and
+  `dflash2_adaptive_verify_width_keeps_the_target_distribution` in
+  `tests/test_dflash2.cpp` runs the generator itself, with policies that
+  take every width and skip drafts, and tests the emitted transitions of a
+  target with known probabilities against them (chi-square), beside a plain
+  decode and the fixed width.
 - **Skipping the draft.** When drafting is expected to lose to a plain
-  one-row step, the next steps skip the draft, with a probing draft every
-  eight plain steps. The draft keeps no state between drafts beyond its
+  one-row step, the next steps skip the draft, with a probing draft after
+  every four plain steps. The draft keeps no state between drafts beyond its
   context ring, and every verify pass, plain or not, appends its verified
   rows to that ring, so a skipped draft leaves nothing to repair.
 
@@ -142,7 +148,8 @@ this, every width change rebuilt the pass (about 25 ms).
 Timings report `spec_proposed` (proposals the passes carried), `spec_tested`
 (proposals the target checked before the first rejection), `spec_accepted`,
 `spec_mean_width` (rows per pass), `spec_plain_steps` (passes with no
-proposals) and `dflash2_adaptive`. Acceptance rate is accepted over tested;
+proposals) and `spec_adaptive`; `/health` reports `dflash2_adaptive` and
+`mtp_adaptive`. Acceptance rate is accepted over tested;
 with a shorter prefix fewer of the doubtful proposals are tested at all, so
 compare accepted over proposed as well.
 

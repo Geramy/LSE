@@ -1483,7 +1483,7 @@ Status evaluate(const NodePtr& node, backend::IBackend& backend) {
   }
   if (n.prim != nullptr && n.prim->has_host_impl()) {
     const auto* kernel = dynamic_cast<const KernelPrimitiveBase*>(n.prim);
-    const bool raw_inputs = kernel != nullptr && kernel->owns_indexing();
+    const bool raw_inputs = kernel != nullptr && kernel->host_reads_whole_inputs();
     std::vector<std::vector<float>> staged(n.inputs.size());
     std::vector<const float*> ptrs(n.inputs.size());
     for (std::size_t i = 0; i < n.inputs.size(); ++i) {
