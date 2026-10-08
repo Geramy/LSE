@@ -75,7 +75,7 @@ The server listens on `http://127.0.0.1:8080/v1` (Chat Completions and Completio
 | `--session-memory-budget BYTES` | `0` (no limit) | KV and state all sessions may hold before idle ones are evicted. |
 | `--shutdown-grace-seconds N` | `30` | Time to drain requests on shutdown, 1 to 600. |
 | `--pool LIST` | `$LSE_POOL`, else first backend | Devices to use, for example `hrx:0` or `cpu:0`. |
-| `--dialect NAME` | `loom` | Kernel source dialect: `loom`, or `hip` in a Linux source build with ROCm comgr. |
+| `--dialect NAME` | `loom` | Kernel source dialect. |
 | `--no-cpu-fallback` | off | Fail instead of running any operation on the CPU. |
 | `--cache-dir PATH` | `~/.lse/cache` | Compiled kernel cache. |
 | `--kv-len N` | model, 2048 to 4096 | KV cache capacity in tokens. |
