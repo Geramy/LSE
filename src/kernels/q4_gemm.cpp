@@ -301,6 +301,21 @@ bool b_double_fits(const Dims& d, const Tile& t) {
   return burst_steps(d, t) <= 1u && (d.k / kBK / d.slices) % 2u == 0u;
 }
 
+// A variant is a layout (0-3, see device_fits) and an epilogue order. The
+// variants from gemm_layouts(s) on store each unguarded tile's outputs as
+// one group, every epilogue load ahead of every store
+// (env::Emit::store_group). loomc cannot prove an element's input load
+// disjoint from the previous element's output store, so it waits for that
+// store to complete before the load; grouped, no load follows a store.
+// Which order is faster depends on the part, so it is measured.
+struct GemmVariant {
+  std::uint32_t layout = 0;
+  bool grouped = false;
+};
+GemmVariant gemm_variant(std::uint32_t variant, std::uint32_t layouts) {
+  return {variant % layouts, variant >= layouts};
+}
+
 std::uint32_t variant_lds_bytes(const Tile& t, std::uint32_t variant) {
   if (variant == 0u || variant >= 3u) return lds_bytes(t);
   return (kDirectAHalves + t.bn * kRowHalves * (variant == 2u ? 2u : 1u)) * 2u;
@@ -319,6 +334,12 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
     if (s.intrinsics->find(symbol).empty()) return false;
   return backend::workgroup_lds_bytes(s.device) >= lds_bytes(tile_for(s, d)) &&
          f16_row(s) != nullptr;
+}
+
+// The layouts a part's fragments allow (Q4GemmKernel::variants).
+std::uint32_t gemm_layouts(const KernelShapes& s) {
+  const auto* row = f16_row(s);
+  return row != nullptr && row->a_len == 16 ? 4u : 1u;
 }
 
 template <class S, math::MatrixTarget G>
@@ -342,7 +363,9 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
 
   kir::KernelBody kb(s.types, *s.intrinsics,
                      backend::workgroup_lds_bytes(s.device));
+  const GemmVariant variant = gemm_variant(s.variant, gemm_layouts(s));
   kb.set_store(s.store);
+  if (variant.grouped) kb.set_split_store(s.split_store);
   Args<S> a;
   if (!env::bind(kb, a, s)) return {};
   env::Emit e{&kb};
@@ -351,9 +374,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // double-buffers B, so a K step waits at one barrier instead of two; 3
   // keeps A in workgroup memory and reads it a fragment at a time. Each
   // feeds the matrix instructions the same halves in the same order.
-  const bool a_direct = kFrag == 16 && (s.variant == 1u || s.variant == 2u);
-  const bool b_double = a_direct && s.variant == 2u;
-  if (s.variant > 3u || ((s.variant == 1u || s.variant == 2u) && !a_direct) ||
+  const std::uint32_t layout = variant.layout;
+  const bool a_direct = kFrag == 16 && (layout == 1u || layout == 2u);
+  const bool b_double = a_direct && layout == 2u;
+  if (layout > 3u || ((layout == 1u || layout == 2u) && !a_direct) ||
       (b_double && !b_double_fits(d, t)))
     return {};
   const auto As = e.lds<lse::f16>(a_direct ? kDirectAHalves : t.bm * kRowHalves);
@@ -548,7 +572,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     }
   };
   const auto compute = [&]() {
-    if (s.variant == 3u) return compute_streamed();
+    if (layout == 3u) return compute_streamed();
     for (std::uint32_t kk = 0; kk < kBK / 16u; ++kk) {
       std::vector<kir::Val<FragVec>> af, bf;
       for (std::uint32_t fm = 0; fm < FM; ++fm) {
@@ -622,6 +646,10 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
     }
   }
 
+  // A grouped variant stores a tile no extent can overrun as one group
+  // (GemmVariant); the others store each output where it is computed. The
+  // down projection's tile takes 192 registers either way.
+  std::vector<std::pair<kir::Val<kir::u32>, kir::Val<kir::f32>>> group;
   for (std::uint32_t fm = 0; fm < FM; ++fm) {
     for (std::uint32_t fn = 0; fn < FN; ++fn) {
       const auto col = e.let(n0 + wave_n * TN + fn * 16u + lane_lo);
@@ -633,7 +661,8 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
         // wait: emit one only for the extents a tile can overrun.
         const auto value = acc[fm * FN + fn][z].read();
         if (M % t.bm == 0 && N % t.bn == 0) {
-          e.store(plane + row * N + col, value);
+          if (variant.grouped) group.emplace_back(e.let(plane + row * N + col), e.let(value));
+          else e.store(plane + row * N + col, value);
         } else if (N % t.bn == 0) {
           if (auto in = e.when(row < M)) e.store(plane + row * N + col, value);
         } else {
@@ -643,6 +672,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       }
     }
   }
+  e.store_group(group);
   if (!kb.lds().ok()) return {};
   return kb.str();
 }
@@ -1202,10 +1232,12 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
   std::uint32_t variants(const KernelShapes& s) const override {
     const Dims d = dims_of(s, Sliced);
     if (!d.valid || !device_fits(s, d)) return 1;
-    const auto* row = f16_row(s);
-    if (row == nullptr || row->a_len != 16) return 1;
+    // Each layout, then each again with the grouped epilogue (GemmVariant)
+    // where every tile is unguarded; a guarded tile stores as it always did.
     // Variant 2 declines where its two B buffers do not fit.
-    return 4u;
+    const Tile t = tile_for(s, d);
+    const bool unguarded = d.m % t.bm == 0u && d.n % t.bn == 0u;
+    return (unguarded ? 2u : 1u) * gemm_layouts(s);
   }
 
   static ThreadPlan plan_impl(const KernelShapes& s) {
@@ -1222,7 +1254,7 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
     tp.workgroup_size[0] = t.wm * t.wn * 32u;
     tp.workgroup_count[0] =
         ((d.m + t.bm - 1u) / t.bm) * ((d.n + t.bn - 1u) / t.bn) * d.slices;
-    tp.lds_bytes = variant_lds_bytes(t, s.variant);
+    tp.lds_bytes = variant_lds_bytes(t, gemm_variant(s.variant, gemm_layouts(s)).layout);
     return tp;
   }
 };

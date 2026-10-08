@@ -99,6 +99,9 @@ struct KernelShapes {
   // that writes the output buffer itself cannot be given an epilogue.
   std::function<std::string(std::string_view index, std::string_view value)>
       store;
+  // The same epilogue split before its store, for kir::KernelBody::store_group;
+  // empty where the emitter does not split it.
+  kir::KernelBody::SplitStoreFn split_store;
 
   // The panel the emitter has already staged for this body, matching what
   // `staged_row()` asked for. Empty name means it staged nothing and the

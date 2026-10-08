@@ -783,8 +783,10 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
     Status epilogue_error;
     bool stored = false;
     Mint hook_mint;
-    auto epilogue_store = [&](std::string_view index,
-                              std::string_view value) -> std::string {
+    // The epilogue for one output element, in two parts: the input loads and
+    // arithmetic, and the output's store.
+    auto epilogue_parts = [&](std::string_view index,
+                              std::string_view value) -> kir::KernelBody::SplitStore {
       stored = true;
       std::string s;
       std::unordered_map<const Node*, std::string> value_of;
@@ -887,13 +889,19 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
           narrow_from_f32(it->second, sink->dtype, hook_mint, s);
       const std::string dst =
           bounded(idx, sink->element_count(), hook_mint, s);
-      s += "  view.store " + narrowed + ", %out_view[" + dst + "] : " +
-           std::string(loom_storage_type(elem_of(sink->dtype))) + ", " +
-           loom_view_type(elem_of(sink->dtype), sink->element_count()) + "\n";
-      return s;
+      return {std::move(s),
+              "  view.store " + narrowed + ", %out_view[" + dst + "] : " +
+                  std::string(loom_storage_type(elem_of(sink->dtype))) + ", " +
+                  loom_view_type(elem_of(sink->dtype), sink->element_count()) + "\n"};
+    };
+    auto epilogue_store = [&](std::string_view index,
+                              std::string_view value) -> std::string {
+      kir::KernelBody::SplitStore parts = epilogue_parts(index, value);
+      return parts.compute + parts.store;
     };
 
     si_shapes.store = epilogue_store;
+    si_shapes.split_store = epilogue_parts;
     si_shapes.types = type_table;
     si_shapes.intrinsics = &spellings;
 
