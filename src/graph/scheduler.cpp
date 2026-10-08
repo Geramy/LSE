@@ -1085,15 +1085,26 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
   if (pick.trial && fresh_emission && !serial && impl_->variants.has_budget()) {
     // Measured only where a launch can be repeated on the same operands and
     // its whole effect read back: one output, written in place of nothing,
-    // aliasing no input.
+    // aliasing no input. Inputs that share storage are only read, so only
+    // the output's overlap with a binding makes a repeat see its own writes.
     const NodePtr& out = group.outputs.size() == 1 ? group.outputs[0] : NodePtr{};
+    const auto output_may_alias = [&] {
+      const auto overlaps = [&](const NodePtr& other) {
+        return other && other != out && buffer_bindings_may_alias(*out, *other);
+      };
+      return std::ranges::any_of(group.inputs, overlaps) ||
+             std::ranges::any_of(emitted->binding_order, overlaps);
+    };
     std::string why;
     if (!out || emitted->pointer_table || emitted->persist_grid ||
-        group_bindings_may_alias(group) || foreign_to(out->buffer, member) ||
+        output_may_alias() || foreign_to(out->buffer, member) ||
         !std::ranges::count(emitted->binding_order, out)) {
       why = "unmeasurable";
     }
-    for (const NodePtr& n : emitted->binding_order) {
+    // A node this kernel computes in place rewrites its input on every
+    // launch. A bound input some earlier kernel wrote in place (a cache
+    // append) is only read here.
+    for (const NodePtr& n : group.nodes) {
       if (n && n->prim != nullptr && n->prim->inplace_input() >= 0) why = "unmeasurable";
     }
     const std::size_t out_bytes =
