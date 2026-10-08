@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string_view>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,20 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return MeanCorrection ? 7 : 5; }
+  // Variant 1 stages values 16 keys at a time where 32 fit (emit_storage),
+  // on a contiguous-fragment generation. The keys are summed in the same
+  // order either way.
+  std::uint32_t variants(const KernelShapes& s) const override {
+    if (s.device == nullptr || !matrix_target(*s.device)) return 1;
+    const auto* row = [&]() -> const math::MatrixCoreRow* {
+      for (const auto& r : math::matrix_core_table())
+        if (r.target == *matrix_target(*s.device) && r.wave == 32 && r.m == 16 &&
+            r.n == 16 && r.k_step == 16 && r.acc == math::MatrixElem::kF32)
+          return &r;
+      return nullptr;
+    }();
+    return row != nullptr && row->a_len == 16 ? 2u : 1u;
+  }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
 
@@ -155,12 +170,25 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
     const std::uint32_t vrow = d.dv + 8u;
     std::uint32_t vsub = 0;
     if (stage_values) {
-      const std::uint64_t used = dispatch::attention_shapes::flash_wmma_lds_bytes(d.dh, 0u) + 512u;
+      const std::uint64_t used = dispatch::attention_shapes::flash_wmma_lds_bytes(d.dh, 0u) + 512u +
+          (kGeo.split_k ? 0u : std::uint64_t{QTile} * (kKWin + 8u) * 2u);
       const std::uint64_t budget = workgroup_lds_bytes(s.device);
+      // Variant 1 stages 16 keys where 32 fit: less scratch per workgroup,
+      // so more of them resident, for twice the staging rounds.
       for (std::uint32_t keys : {32u, 16u})
-        if (vsub == 0 && used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
+        if (vsub == 0 && !(s.variant == 1u && keys == 32u) &&
+            used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
     }
     const auto vs = e.lds<Narrow>(stage_values && vsub ? vsub * vrow : 8u);
+    // On a contiguous-fragment generation (gfx11: a lane carries all sixteen
+    // K of an operand) the window's probabilities are also kept narrowed, in
+    // rows padded by 16 bytes so a fragment read's sixteen rows fall on
+    // distinct bank groups: a lane's P fragment is then two 16-byte reads
+    // instead of sixteen scalar reads and conversions, of the same values.
+    constexpr bool kContiguous = !kGeo.split_k;
+    constexpr std::uint32_t kProbRow = kKWin + 8u;
+    std::optional<kir::Tile<Narrow>> pb;
+    if constexpr (kContiguous) pb.emplace(e.lds<Narrow>(QTile * kProbRow));
     // Reuse alpha scratch for the uniform block-retention vote before softmax.
     const bool sparse = s.attrs[3] == 1.0f;
 
@@ -449,6 +477,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
             const auto index = e.let(row * kKWin + slot);
             const auto probability = e.let(math::exp(sc[index].read() - safe_max));
             sc[index] = probability;
+            if constexpr (kContiguous)
+              (*pb)[e.let(row * kProbRow + slot)] = math::narrow<Narrow>(probability);
             total = total.read() + probability;
           }
           for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
@@ -511,14 +541,15 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
                 if constexpr (kGeo.split_k) return e.let(lane_hi * 8u);
                 else return e.u32(0);
               }();
+              using Frag = lse::vec<Narrow, static_cast<int>(kFrag)>;
               auto af = e.local<Narrow, static_cast<int>(kFrag)>();
-              for (auto f : e.unroll(kFrag)) {
-                if constexpr (kGeo.split_k)
+              if constexpr (kContiguous) {
+                const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + sub + tile), kFrag);
+                af = kir::Val<Frag>(&k.types(), &k.ir(), ap.id());
+              } else {
+                for (auto f : e.unroll(kFrag))
                   af[f] = math::narrow<Narrow>(
                       sc[e.let(lane_lo * kKWin + sub + tile + key_half + f)].read());
-                else
-                  af[f] = math::narrow<Narrow>(
-                      sc[e.let(lane_lo * kKWin + sub + tile + f)].read());
               }
               for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
                 const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
@@ -576,14 +607,15 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection>> {
                 if constexpr (kGeo.split_k) return e.let(lane_hi * 8u);
                 else return e.u32(0);
               }();
+              using Frag = lse::vec<Narrow, static_cast<int>(kFrag)>;
               auto af = e.local<Narrow, static_cast<int>(kFrag)>();
-              for (auto f : e.unroll(kFrag)) {
-                if constexpr (kGeo.split_k)
+              if constexpr (kContiguous) {
+                const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + sub + tile), kFrag);
+                af = kir::Val<Frag>(&k.types(), &k.ir(), ap.id());
+              } else {
+                for (auto f : e.unroll(kFrag))
                   af[f] = math::narrow<Narrow>(
                       sc[e.let(lane_lo * kKWin + sub + tile + key_half + f)].read());
-                else
-                  af[f] = math::narrow<Narrow>(
-                      sc[e.let(lane_lo * kKWin + sub + tile + f)].read());
               }
               for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
                 const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
