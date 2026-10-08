@@ -3,6 +3,18 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.8: HRX System main, DFlash2 draft trees, gfx1151 prefill and decode, startup fault fix
+
+Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
+
+1. **Built on HRX System main** (ROCm/hrx-system 631c0b785). Two local HRX patches remain until upstream has them: gfx120x kernel arguments in VRAM (ROCm/hrx-system#1331) and a loomc register-allocation fix (#1443).
+2. **DFlash2 draft trees, on by default:** one target pass verifies a tree of draft candidates when the measured costs make that faster than a chain; `--dflash2-tree=on|off` forces either.
+3. **gfx1151 prefill and decode:** two query tiles per workgroup in prefill attention, vector loads for its probability fragments, the gate and up projections as one GEMM where registers allow.
+4. **Kernel variants:** the prefill GEMM's grouped epilogue is offered as a measured variant, and variant trials cover kernels whose inputs were written in place.
+5. **Startup GPU fault fix:** host DMA takes only whole-page ranges; other copies go through the staging buffer.
+6. **Binding checker:** `LSE_CHECK_BINDINGS=1` checks every launch's buffers for liveness, bounds and the kernel's declared signature.
+7. **Linux archive bundles the HSA runtime** (TheRock ROCr 1.21 with `librocprofiler-register` and its `rocm_sysdeps` libraries) and the GCC 16 C++ runtime, and links no `amd_comgr`; a system needs only the amdgpu kernel driver with KFD and access to `/dev/kfd`.
+
 ## v0.5.7: adaptive verify width, fast verify passes at every width, faster warm starts, perplexity scoring, gfx1151 prefill and decode
 
 Requires mac_linuxgpu v0.1.151 (build 255) or later on macOS; kernel arguments in VRAM need v0.1.161 (build 265).

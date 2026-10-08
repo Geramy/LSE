@@ -187,6 +187,12 @@ def main():
             path = Path(path_text)
             if path.is_relative_to(hrx.parent) and name not in sources:
                 sources[name] = path
+            # A GCC runtime from outside the system library directories (a
+            # toolchain newer than the build host's) is bundled, so the archive
+            # runs where the system libstdc++ is older.
+            if name.startswith(('libstdc++.so', 'libgcc_s.so')) and name not in sources and \
+                    not str(path).startswith(('/lib/', '/lib64/', '/usr/lib/', '/usr/lib64/')):
+                sources[name] = path
     bundled = []
     for name, source in sources.items():
         destination = package / 'lib' / source.name

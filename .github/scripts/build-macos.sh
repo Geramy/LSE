@@ -159,6 +159,10 @@ python3 "$work/source/tests/test_server_cli.py" "$work/lse-build/lse-server"
 mkdir -p "$work/native-fixtures"
 "$work/lse-build/tests/compile_loom_matrix" "$work/native-fixtures"
 "$work/lse-build/lse" --help > "$work/lse-build/help.txt"
+# The archive bundles a mac_linuxgpu HSA runtime with hsa_amd_queue_create:
+# HSA_RUNTIME_DIR names the directory holding its libhsa-runtime64.0.1.0.dylib
+# (mac_linuxgpu `make hsa`, build 267 or later sources).
 python3 "$root/.github/scripts/package-macos.py" \
-  --root "$root" --work "$work" --llvm "$llvm/.." --tag "${LSE_RELEASE_TAG:-snapshot}"
+  --root "$root" --work "$work" --llvm "$llvm/.." --tag "${LSE_RELEASE_TAG:-snapshot}" \
+  --hsa-runtime "${HSA_RUNTIME_DIR:?set HSA_RUNTIME_DIR to a mac_linuxgpu runtime build with hsa_amd_queue_create}"
 printf 'macOS arm64 host tests and native gfx1201 compilation passed; no GPU execution was attempted.\n'
