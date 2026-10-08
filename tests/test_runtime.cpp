@@ -4673,6 +4673,91 @@ LSE_TEST(an_accepted_draft_still_gives_the_decoders_own_tokens) {
   }
 }
 
+namespace {
+void expect_mtp_resident(const MtpFixture& fixture, Session& session, std::int32_t covered);
+}  // namespace
+
+LSE_TEST(adaptive_verify_widths_give_the_tokens_a_plain_decode_gives) {
+  if (graph::default_scheduler()->backend().emitter() == nullptr) {
+    LSE_SKIP("speculative rollback requires device replay");
+  }
+  // A sampled request whose sampler keeps only the top token decodes the
+  // argmax through the adaptive path: each step chains as deep as the width
+  // policy picks and verifies the prefix it keeps, so passes of every width
+  // from a plain step to a full chain alternate, swapping carried buffers
+  // between their programs. The tokens must be the plain decode's, and the
+  // MTP and session state must end where the text does. The target's logits
+  // are separated (a one-hot transition), so no width can flip a near-tie;
+  // over the filler fixture even a fixed MTP depth differs from a plain
+  // decode in the last bits. One module drafts the previous prediction
+  // (rejected), the other passes the right token through (accepted).
+  SamplingParams top_one;
+  top_one.temperature = 1.0f;
+  top_one.top_k = 1;
+  const std::vector<std::vector<std::uint32_t>> prompts{
+      {2, 11, 13}, {1, 5, 9, 17}, {7, 7, 7}, {20, 3}, {30, 1, 2, 3, 4}, {12, 24, 5, 6}};
+  std::uint64_t steps = 0, proposed = 0, plain_steps = 0, tested = 0, accepted = 0;
+  std::mt19937_64 rng(4171);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  for (const bool passthrough : {true, false}) {
+    MtpFixture fx = build_mtp_fixture(passthrough, 16, false, 64, false, true);
+    LSE_EXPECT(fx.ok);
+    if (!fx.ok) return;
+    for (const std::vector<std::uint32_t>& prompt : prompts) {
+      GenerationLimits limits;
+      limits.max_tokens = 23;
+      Generator plain(*fx.lm, greedy_params());
+      Session ps("plain", fx.lm->num_layers());
+      auto want = plain.generate(ps, prompt, limits);
+      LSE_EXPECT(want.ok());
+      if (!want.ok()) return;
+      for (int variant = 0; variant < 4; ++variant) {
+        using P = DraftWidthPolicy;
+        DraftWidthPolicy policy;
+        for (std::uint64_t i = 0; i < P::kWarmupSteps; ++i) policy.observe_verify(P::kMaxRows, 1);
+        const double base = 1e5 + 1e6 * unit(rng), per_row = 2e5 * unit(rng);
+        for (std::uint32_t pass = 0; pass < P::kExploreSamples; ++pass)
+          for (std::uint32_t rows = 1; rows <= P::kMaxRows; ++rows)
+            policy.observe_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 1)));
+        const double per_draft = 5e5 * unit(rng);
+        for (std::uint32_t d = 0; d <= P::kMaxProposals; ++d)
+          policy.observe_draft(static_cast<std::uint64_t>(1e5 + per_draft * d), d);
+        policy.observe_step(1, static_cast<std::uint64_t>(1e9 / (100.0 + 3000.0 * unit(rng))));
+        for (int i = 0; i < 200; ++i)
+          policy.observe_acceptance(unit(rng), static_cast<std::uint32_t>(i % 7), unit(rng) < 0.7);
+        Generator spec(*fx.lm, top_one);
+        spec.use_mtp(*fx.mtp, &policy);
+        Session sp("adaptive", fx.lm->state_slots());
+        limits.mtp_depth = 3;
+        auto got = spec.generate(sp, prompt, limits);
+        LSE_EXPECT(got.ok());
+        if (!got.ok()) { LSE_EXPECT_OK(got.status()); return; }
+        LSE_EXPECT(spec.stats().spec_adaptive);
+        LSE_EXPECT(*got == *want);
+        if (*got != *want)
+          std::printf("       [%s] plain %s  adaptive %s\n", ids_to_string(prompt).c_str(),
+                      ids_to_string(*want).c_str(), ids_to_string(*got).c_str());
+        expect_mtp_resident(fx, sp, static_cast<std::int32_t>(sp.history().size()) - 1);
+        const auto& st = spec.stats();
+        steps += st.spec_steps;
+        proposed += st.spec_proposed;
+        plain_steps += st.spec_plain_steps;
+        tested += st.spec_tested;
+        accepted += st.spec_accepted;
+      }
+    }
+  }
+  std::printf("       passes=%llu rows/pass=%.2f plain=%llu accepted=%llu/%llu\n",
+              static_cast<unsigned long long>(steps),
+              steps ? static_cast<double>(proposed + steps) / static_cast<double>(steps) : 0.0,
+              static_cast<unsigned long long>(plain_steps),
+              static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(tested));
+  // Narrow, wide and plain passes all happened.
+  LSE_EXPECT(plain_steps > 0);
+  LSE_EXPECT(accepted > 0 && accepted < tested);
+  LSE_EXPECT(proposed > steps);
+}
+
 LSE_TEST(generation_timing_excludes_prefill_token_and_early_stop) {
   MtpFixture fx = build_mtp_fixture();
   LSE_EXPECT(fx.ok);

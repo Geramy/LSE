@@ -16,12 +16,15 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unistd.h>
@@ -134,7 +137,11 @@ class ZeroFfn final : public model::IFeedForward {
 };
 struct Named { std::string name; std::vector<std::int64_t> shape; };
 enum class FixtureWeights {
-  kDefault, kConstantTokens, kStopTransition, kRejectedTokens, kRejectedStopTransition
+  kDefault, kConstantTokens, kStopTransition, kRejectedTokens, kRejectedStopTransition,
+  // kDefault's weights over an attention-only target: a target whose next
+  // token depends on the last one alone, with a spread-out distribution, and
+  // a draft whose confidence varies from position to position.
+  kMarkov
 };
 void write_weights(const std::filesystem::path& path, const std::vector<Named>& names,
                    FixtureWeights mode = FixtureWeights::kDefault) {
@@ -149,7 +156,7 @@ void write_weights(const std::filesystem::path& path, const std::vector<Named>& 
       float value = std::sin(static_cast<float>((i + 1) * (t + 3)) * 0.371f) * 0.13f;
       if (normalizer) value = 1.0f;
       if (tensor.name.ends_with("base_kernel")) value = (i / 8) % 2 == 0 ? 1.0f : 0.17f;
-      if (mode != FixtureWeights::kDefault) {
+      if (mode != FixtureWeights::kDefault && mode != FixtureWeights::kMarkov) {
         value = normalizer ? 1.0f : 0.0f;
         const bool constant = mode == FixtureWeights::kConstantTokens ||
                               mode == FixtureWeights::kRejectedTokens;
@@ -696,6 +703,168 @@ LSE_TEST(dflash2_sampled_generator_retains_only_verified_prefix_and_replays) {
       }
     }
   }
+}
+
+namespace {
+// The exact next-token distribution of a kMarkov target after each token, as
+// the generator's sampler shapes it.
+Result<std::array<std::array<double, 16>, 16>> markov_target(const runtime::SamplingParams& params) {
+  Fixture reference;
+  LSE_RETURN_IF_ERROR(reference.open(FixtureWeights::kMarkov, 8));
+  std::array<std::array<double, 16>, 16> p{};
+  for (std::uint32_t x = 0; x < 16; ++x) {
+    auto states = reference.target->make_states();
+    LSE_ASSIGN_OR(auto hidden, reference.target->hidden(filled({1, 1}, {static_cast<float>(x)}),
+                                                        &states, nullptr));
+    LSE_ASSIGN_OR(auto logits, reference.target->lm_head(hidden));
+    std::vector<float> row(16);
+    LSE_RETURN_IF_ERROR(logits.to_host(row.data(), row.size() * sizeof(float)));
+    runtime::Sampler sampler(params);
+    LSE_ASSIGN_OR(auto d, sampler.distribution(std::span<float>(row), {}));
+    for (std::size_t i = 0; i < d.ids.size(); ++i) p[x][d.ids[i]] = d.probabilities[i];
+  }
+  return p;
+}
+// Goodness of fit of transition counts to a chain, as a Wilson-Hilferty z
+// score of the chi-square statistic (about N(0, 1) when the counts come from
+// the chain). Cells expected fewer than five times are pooled per row.
+double transition_z(const std::array<std::array<double, 16>, 16>& counts,
+                    const std::array<std::array<double, 16>, 16>& p) {
+  double chi = 0.0, df = 0.0;
+  for (std::size_t a = 0; a < 16; ++a) {
+    double n = 0.0;
+    for (double c : counts[a]) n += c;
+    if (n == 0.0) continue;
+    double pooled_seen = 0.0, pooled_expected = 0.0;
+    int cells = 0;
+    for (std::size_t b = 0; b < 16; ++b) {
+      const double e = n * p[a][b];
+      if (e < 5.0) {
+        pooled_seen += counts[a][b];
+        pooled_expected += e;
+        continue;
+      }
+      chi += (counts[a][b] - e) * (counts[a][b] - e) / e;
+      ++cells;
+    }
+    if (pooled_expected > 0.0) {
+      chi += (pooled_seen - pooled_expected) * (pooled_seen - pooled_expected) / pooled_expected;
+      ++cells;
+    } else if (pooled_seen > 0.0) {
+      return std::numeric_limits<double>::infinity();  // a token the chain never emits
+    }
+    df += cells - 1;
+  }
+  if (df <= 0.0) return std::numeric_limits<double>::infinity();
+  const double v = 2.0 / (9.0 * df);
+  return (std::cbrt(chi / df) - (1.0 - v)) / std::sqrt(v);
+}
+}  // namespace
+
+LSE_TEST(dflash2_adaptive_verify_width_keeps_the_target_distribution) {
+  // Rejection sampling against DFlash2 drafts with the width policy choosing,
+  // step by step, how many proposals to verify (or to skip the draft) must
+  // emit exactly the target's chain: the policy reads the draft's own
+  // confidence and its history, never a proposal's fate. The target here
+  // depends on the last token alone, so its exact transition probabilities
+  // are known, and the emitted transitions are tested against them, beside
+  // a plain decode and the fixed full width. Policies start from varied
+  // costs, rates and draft values, so the passes take every width from a
+  // plain step to the whole block.
+  runtime::SamplingParams params;
+  params.temperature = 0.5f;
+  auto target = markov_target(params);
+  LSE_EXPECT_OK(target.status()); if (!target.ok()) return;
+  runtime::SamplingParams warmer = params;
+  warmer.temperature = 0.55f;
+  auto off_target = markov_target(warmer);
+  LSE_EXPECT_OK(off_target.status()); if (!off_target.ok()) return;
+
+  enum class Arm { kPlain, kFixed, kAdaptive };
+  constexpr int kTrials = 3000;
+  constexpr std::int32_t kTokens = 24;
+  std::array<std::array<std::array<double, 16>, 16>, 3> counts{};
+  std::array<std::uint64_t, 3> steps{}, proposed{}, plain_steps{}, accepted{}, tested{};
+  std::mt19937_64 rng(20261007);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  for (const Arm arm : {Arm::kPlain, Arm::kFixed, Arm::kAdaptive}) {
+    const auto a = static_cast<std::size_t>(arm);
+    Fixture fixture;
+    const auto opened = fixture.open(FixtureWeights::kMarkov, 8);
+    LSE_EXPECT_OK(opened); if (!opened.ok()) return;
+    for (int trial = 0; trial < kTrials; ++trial) {
+      runtime::DraftWidthPolicy policy;
+      if (arm == Arm::kAdaptive) {
+        using P = runtime::DraftWidthPolicy;
+        for (std::uint64_t i = 0; i < P::kWarmupSteps; ++i) policy.observe_verify(P::kMaxRows, 1);
+        const double base = 2e4 + 2e6 * unit(rng), per_row = 4e5 * unit(rng);
+        for (std::uint32_t pass = 0; pass < P::kExploreSamples; ++pass)
+          for (std::uint32_t rows = 1; rows <= P::kMaxRows; ++rows)
+            policy.observe_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 1)));
+        policy.observe_draft(static_cast<std::uint64_t>(1e4 + 1e6 * unit(rng)));
+        policy.observe_step(1, static_cast<std::uint64_t>(1e9 / (200.0 + 2800.0 * unit(rng))));
+        if (trial % 3 == 0) {
+          // Drafts that look unprofitable: plain steps, with probing drafts.
+          const std::array<double, 1> none{0.0};
+          for (int i = 0; i < 32; ++i) policy.observe_draft_value(none, 1);
+        } else {
+          // Drafts that look profitable, so the width choice is what varies.
+          const std::array<double, 7> sure{1, 1, 1, 1, 1, 1, 1};
+          for (int i = 0; i < 32; ++i) policy.observe_draft_value(sure, 7);
+          // And, for half of them, a calibration that believes in the draft
+          // until this request's checks pull it down.
+          if (trial % 3 == 1)
+            for (int i = 0; i < 400; ++i)
+              policy.observe_acceptance(unit(rng), static_cast<std::uint32_t>(i % 7), true);
+        }
+      }
+      runtime::SamplingParams request = params;
+      request.seed = 0x5eed0000ull + static_cast<std::uint64_t>(trial) * 7919ull;
+      runtime::Generator gen(*fixture.target, request);
+      if (arm == Arm::kFixed) gen.use_dflash2(*fixture.draft);
+      if (arm == Arm::kAdaptive) gen.use_dflash2(*fixture.draft, &policy);
+      runtime::Session session("markov", 1);
+      const std::vector<std::uint32_t> prompt{1, static_cast<std::uint32_t>(trial % 16)};
+      runtime::GenerationLimits limits;
+      limits.max_tokens = kTokens;
+      auto output = gen.generate(session, prompt, limits);
+      LSE_EXPECT(output.ok()); if (!output.ok()) { LSE_EXPECT_OK(output.status()); return; }
+      LSE_EXPECT_EQ(output->size(), static_cast<std::size_t>(kTokens));
+      std::uint32_t previous = prompt.back();
+      for (const std::uint32_t token : *output) {
+        if (token >= 16) { LSE_EXPECT(token < 16); return; }
+        counts[a][previous][token] += 1.0;
+        previous = token;
+      }
+      const auto& st = gen.stats();
+      LSE_EXPECT_EQ(st.spec_adaptive, arm == Arm::kAdaptive);
+      steps[a] += st.spec_steps;
+      proposed[a] += st.spec_proposed;
+      plain_steps[a] += st.spec_plain_steps;
+      accepted[a] += st.spec_accepted;
+      tested[a] += st.spec_tested;
+    }
+  }
+  const char* names[] = {"plain", "fixed", "adaptive"};
+  for (std::size_t a = 0; a < 3; ++a) {
+    const double z = transition_z(counts[a], *target);
+    std::printf("       %-8s z=%+.2f (vs T=0.55: z=%+.1f) passes=%llu rows/pass=%.2f plain=%llu "
+                "accepted=%llu/%llu\n", names[a], z, transition_z(counts[a], *off_target),
+                static_cast<unsigned long long>(steps[a]),
+                steps[a] ? static_cast<double>(proposed[a] + steps[a]) / static_cast<double>(steps[a]) : 0.0,
+                static_cast<unsigned long long>(plain_steps[a]),
+                static_cast<unsigned long long>(accepted[a]),
+                static_cast<unsigned long long>(tested[a]));
+    // About 1 in 30,000 to fail by chance.
+    LSE_EXPECT(z < 4.0);
+    // The test can tell a slightly different chain apart.
+    LSE_EXPECT(transition_z(counts[a], *off_target) > 6.0);
+  }
+  // The adaptive arm took narrow passes and plain steps as well as full ones.
+  const double adaptive_rows = static_cast<double>(proposed[2] + steps[2]) / static_cast<double>(steps[2]);
+  LSE_EXPECT(plain_steps[2] > steps[2] / 20);
+  LSE_EXPECT(adaptive_rows > 2.0 && adaptive_rows < 7.0);
+  LSE_EXPECT(accepted[2] > 0 && accepted[2] < tested[2]);
 }
 
 LSE_TEST(dflash2_generation_without_a_cap_stops_cleanly_at_a_full_context) {
