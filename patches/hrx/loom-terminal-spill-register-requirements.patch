@@ -1,0 +1,638 @@
+From a2d1d23209ddf991a2437f1456e5ef569b043db6 Mon Sep 17 00:00:00 2001
+From: Ben Vanik <ben.vanik@gmail.com>
+Date: Tue, 4 Aug 2026 22:25:02 -0700
+Subject: [PATCH] [Loom/AMDGPU] Preserve terminal spill register requirements
+ (#277)
+
+Terminal target spill lowering creates packet helpers that cannot
+themselves be represented as structural spills. Under extreme register
+pressure, final-frame repair previously treated those helpers and the
+spill sources they consume as ordinary allocation victims. Spilling that
+plumbing recreated more plumbing, allowing repair to cycle until its
+fixed iteration bound instead of converging.
+
+## Design
+
+AMDGPU spill lowering now returns the exact value IDs whose terminal
+representation requires register storage: existing values consumed by
+lowered spill stores and helper values created while rewriting
+structural spill and reload operations. The result list remains
+scratch-arena-owned and is consumed immediately by emission-frame
+repair.
+
+Frame repair accumulates those requirements in one bitmap indexed by
+module value ID. Allocation consults the bitmap both when assigning the
+current interval and when selecting an active spill victim. When repair
+rematerializes a required value, its generated descendants inherit the
+requirement, preserving the invariant across retries.
+
+The bitmap is the only new state retained across repair rounds. Failed
+frame allocations are still restored to their arena checkpoint, target
+result lists remain transient, and per-round scratch remains reset. The
+retained state therefore grows with the module value-ID space rather
+than with the number or size of failed frame attempts.
+
+## Impact
+
+Final-frame construction now makes monotonic progress when target spill
+lowering introduces register-only packet helpers. A production-scale
+access-sanitized kernel that previously reached the eight-round repair
+limit with two recurring spill plans now completes spill repair and
+proceeds to native branch encoding.
+
+The allocation API also gains a target-independent required-register
+bitmap. This keeps the ownership boundary clean: target lowering
+establishes which terminal values cannot be spilled, while generic
+allocation consumes that fact without recognizing AMDGPU operations or
+reconstructing target semantics.
+
+The regression constrains SGPR capacity enough to reproduce the
+recursive helper cycle and checks successful native emission. It
+deliberately avoids freezing register assignments or instruction
+schedules.
+
+Backport of upstream 4b1c67c7e7be171df888297f74cbab9d7521ae45 (#277) onto
+5927b0e0, as the prerequisite of #1398's convergence. This revision's
+frame builder has no schedule-failure value rematerialization, so the
+derived requirement is recorded on the two rematerialization paths it
+has: allocation-failure and spill-plan rematerialization, whose result
+names the rematerialized value directly.
+---
+ loom/src/loom/codegen/low/allocation.c        |   1 +
+ loom/src/loom/codegen/low/allocation.h        |   4 +
+ .../low/allocation/interval_assignment.c      |   4 +
+ .../low/allocation/interval_assignment.h      |   4 +
+ loom/src/loom/codegen/low/allocation/search.c |   5 +-
+ loom/src/loom/codegen/low/allocation/search.h |   4 +
+ loom/src/loom/codegen/low/frame.c             | 135 +++++++++++++++---
+ loom/src/loom/codegen/low/frame.h             |   5 +
+ .../emit/native/amdgpu/check/loom_check.c     |   3 +
+ .../emit/native/amdgpu/hal_kernel_library.c   |   3 +
+ .../emit/native/amdgpu/spill_lowering.c       |  51 ++++++-
+ .../emit/native/amdgpu/spill_lowering.h       |   5 +
+ .../amdgpu/test/spill_lowering.loom-test      |  30 ++++
+ 13 files changed, 233 insertions(+), 21 deletions(-)
+
+diff --git a/loom/src/loom/codegen/low/allocation.c b/loom/src/loom/codegen/low/allocation.c
+index 2509b0b14..0322fa2e3 100644
+--- a/loom/src/loom/codegen/low/allocation.c
++++ b/loom/src/loom/codegen/low/allocation.c
+@@ -170,6 +170,7 @@ iree_status_t loom_low_allocate_function(
+             .schedule = options->schedule,
+             .placement = &state.placement,
+             .target_constraints = &state.target_constraints,
++            .required_register_values = options->required_register_values,
+             .unit_liveness = &state.unit_liveness,
+             .residency_model = options->residency_model,
+             .storage_leases = &state.storage_leases,
+diff --git a/loom/src/loom/codegen/low/allocation.h b/loom/src/loom/codegen/low/allocation.h
+index f6339d10a..badaebb50 100644
+--- a/loom/src/loom/codegen/low/allocation.h
++++ b/loom/src/loom/codegen/low/allocation.h
+@@ -15,6 +15,7 @@
+ #define LOOM_CODEGEN_LOW_ALLOCATION_H_
+ 
+ #include "iree/base/api.h"
++#include "iree/base/bitmap.h"
+ #include "iree/base/internal/arena.h"
+ #include "loom/analysis/liveness.h"
+ #include "loom/codegen/low/allocation/assignment.h"
+@@ -63,6 +64,9 @@ typedef struct loom_low_allocation_options_t {
+   // Optional target residency model. Direct resources are dense by descriptor
+   // register-class ID for the resolved low target.
+   const struct loom_target_residency_model_t* residency_model;
++  // Borrowed bitmap indexed by module value ID. Set values require register
++  // storage throughout allocation.
++  iree_bitmap_t required_register_values;
+ } loom_low_allocation_options_t;
+ 
+ // Allocates one modeled target-low function body and writes an arena-owned
+diff --git a/loom/src/loom/codegen/low/allocation/interval_assignment.c b/loom/src/loom/codegen/low/allocation/interval_assignment.c
+index cc50e3662..93dd50103 100644
+--- a/loom/src/loom/codegen/low/allocation/interval_assignment.c
++++ b/loom/src/loom/codegen/low/allocation/interval_assignment.c
+@@ -88,6 +88,7 @@ loom_low_allocation_interval_assignment_search_context(
+       .placement = state->context->placement,
+       .active_set = &state->active,
+       .storage_leases = state->context->storage_leases,
++      .required_register_values = state->context->required_register_values,
+       .spill_traffic_by_value_ordinal = state->spill_traffic_by_value_ordinal,
+   };
+ }
+@@ -980,6 +981,9 @@ iree_status_t loom_low_allocation_interval_assignment_build(
+     const bool requires_register =
+         loom_low_allocation_storage_lease_state_value_has_records(
+             context->storage_leases, context->liveness, interval->value_id) ||
++        (interval->value_id < context->required_register_values.bit_count &&
++         iree_bitmap_test(context->required_register_values,
++                          interval->value_id)) ||
+         loom_low_allocation_spill_traffic_interval_requires_register_location(
+             context->module, interval);
+     if (!assigned && (capacity.is_spillable || requires_register)) {
+diff --git a/loom/src/loom/codegen/low/allocation/interval_assignment.h b/loom/src/loom/codegen/low/allocation/interval_assignment.h
+index f9dc5ea5a..226fa699f 100644
+--- a/loom/src/loom/codegen/low/allocation/interval_assignment.h
++++ b/loom/src/loom/codegen/low/allocation/interval_assignment.h
+@@ -10,6 +10,7 @@
+ #define LOOM_CODEGEN_LOW_ALLOCATION_INTERVAL_ASSIGNMENT_H_
+ 
+ #include "iree/base/api.h"
++#include "iree/base/bitmap.h"
+ #include "iree/base/internal/arena.h"
+ #include "loom/analysis/liveness.h"
+ #include "loom/codegen/low/allocation/assignment.h"
+@@ -57,6 +58,9 @@ typedef struct loom_low_allocation_interval_assignment_context_t {
+   const loom_cfg_graph_t* function_cfg_graph;
+   // Optional target residency model used for physical extent decisions.
+   const struct loom_target_residency_model_t* residency_model;
++  // Borrowed bitmap indexed by module value ID. Set values require register
++  // storage throughout allocation.
++  iree_bitmap_t required_register_values;
+ } loom_low_allocation_interval_assignment_context_t;
+ 
+ typedef struct loom_low_allocation_interval_assignment_result_t {
+diff --git a/loom/src/loom/codegen/low/allocation/search.c b/loom/src/loom/codegen/low/allocation/search.c
+index 4557d78d5..7966c9062 100644
+--- a/loom/src/loom/codegen/low/allocation/search.c
++++ b/loom/src/loom/codegen/low/allocation/search.c
+@@ -474,7 +474,10 @@ iree_status_t loom_low_allocation_search_assignment_spill_capacity(
+           context->storage_leases, context->liveness, assignment->value_id)) {
+     return iree_ok_status();
+   }
+-  if (loom_low_allocation_spill_traffic_value_requires_register_location(
++  if ((assignment->value_id < context->required_register_values.bit_count &&
++       iree_bitmap_test(context->required_register_values,
++                        assignment->value_id)) ||
++      loom_low_allocation_spill_traffic_value_requires_register_location(
+           context->module, assignment->value_id)) {
+     return iree_ok_status();
+   }
+diff --git a/loom/src/loom/codegen/low/allocation/search.h b/loom/src/loom/codegen/low/allocation/search.h
+index 9a90939d1..29b593ffa 100644
+--- a/loom/src/loom/codegen/low/allocation/search.h
++++ b/loom/src/loom/codegen/low/allocation/search.h
+@@ -10,6 +10,7 @@
+ #define LOOM_CODEGEN_LOW_ALLOCATION_SEARCH_H_
+ 
+ #include "iree/base/api.h"
++#include "iree/base/bitmap.h"
+ #include "iree/base/internal/arena.h"
+ #include "loom/analysis/liveness.h"
+ #include "loom/codegen/low/allocation/active_set.h"
+@@ -56,6 +57,9 @@ typedef struct loom_low_allocation_search_context_t {
+   loom_low_allocation_spill_plan_traffic_t* spill_traffic_by_value_ordinal;
+   // Optional target residency model used for physical extent decisions.
+   const struct loom_target_residency_model_t* residency_model;
++  // Borrowed bitmap indexed by module value ID. Set values require register
++  // storage throughout allocation.
++  iree_bitmap_t required_register_values;
+ } loom_low_allocation_search_context_t;
+ 
+ // Active assignment set selected for spilling before an interval is assigned.
+diff --git a/loom/src/loom/codegen/low/frame.c b/loom/src/loom/codegen/low/frame.c
+index 29eda9497..6337608e9 100644
+--- a/loom/src/loom/codegen/low/frame.c
++++ b/loom/src/loom/codegen/low/frame.c
+@@ -49,6 +49,73 @@ typedef struct loom_low_emission_frame_materialization_summary_t {
+   loom_low_allocation_materialized_spill_list_t spill_records;
+ } loom_low_emission_frame_materialization_summary_t;
+ 
++static iree_status_t loom_low_emission_frame_reserve_value_bitmap(
++    iree_host_size_t required_bit_count, iree_arena_allocator_t* arena,
++    iree_bitmap_t* inout_values) {
++  const iree_host_size_t required_word_count =
++      iree_bitmap_calculate_words(required_bit_count);
++  iree_host_size_t word_capacity =
++      iree_bitmap_calculate_words(inout_values->bit_count);
++  if (required_word_count > word_capacity) {
++    const iree_host_size_t old_word_count = word_capacity;
++    IREE_RETURN_IF_ERROR(
++        iree_arena_grow_array(arena, old_word_count, required_word_count,
++                              sizeof(*inout_values->words), &word_capacity,
++                              (void**)&inout_values->words));
++    memset(inout_values->words + old_word_count, 0,
++           (word_capacity - old_word_count) * sizeof(*inout_values->words));
++    inout_values->bit_count = word_capacity * IREE_BITMAP_BITS_PER_WORD;
++  }
++  return iree_ok_status();
++}
++
++static iree_status_t loom_low_emission_frame_record_value_span(
++    iree_host_size_t first_value_id, iree_host_size_t end_value_id,
++    iree_arena_allocator_t* arena, iree_bitmap_t* inout_values) {
++  if (first_value_id == end_value_id) return iree_ok_status();
++  IREE_RETURN_IF_ERROR(loom_low_emission_frame_reserve_value_bitmap(
++      end_value_id, arena, inout_values));
++  iree_bitmap_set_span(*inout_values, first_value_id,
++                       end_value_id - first_value_id);
++  return iree_ok_status();
++}
++
++static iree_status_t loom_low_emission_frame_record_value_list(
++    const loom_value_id_t* value_ids, iree_host_size_t value_count,
++    iree_arena_allocator_t* arena, iree_bitmap_t* inout_values) {
++  iree_host_size_t required_bit_count = 0;
++  for (iree_host_size_t i = 0; i < value_count; ++i) {
++    required_bit_count =
++        iree_max(required_bit_count, (iree_host_size_t)value_ids[i] + 1);
++  }
++  IREE_RETURN_IF_ERROR(loom_low_emission_frame_reserve_value_bitmap(
++      required_bit_count, arena, inout_values));
++  for (iree_host_size_t i = 0; i < value_count; ++i) {
++    iree_bitmap_set(*inout_values, value_ids[i]);
++  }
++  return iree_ok_status();
++}
++
++static bool loom_low_emission_frame_value_requires_register(
++    iree_bitmap_t required_register_values, loom_value_id_t value_id) {
++  return value_id < required_register_values.bit_count &&
++         iree_bitmap_test(required_register_values, value_id);
++}
++
++static iree_status_t
++loom_low_emission_frame_record_derived_register_requirement(
++    loom_value_id_t source_value_id, iree_host_size_t first_derived_value_id,
++    iree_host_size_t end_derived_value_id, iree_arena_allocator_t* repair_arena,
++    iree_bitmap_t* inout_required_register_values) {
++  if (!loom_low_emission_frame_value_requires_register(
++          *inout_required_register_values, source_value_id)) {
++    return iree_ok_status();
++  }
++  return loom_low_emission_frame_record_value_span(
++      first_derived_value_id, end_derived_value_id, repair_arena,
++      inout_required_register_values);
++}
++
+ static void loom_low_emission_frame_record_arena_high_water(
+     const iree_arena_allocator_t* arena, iree_host_size_t baseline_used_bytes,
+     iree_host_size_t baseline_owned_bytes,
+@@ -132,6 +199,7 @@ static iree_status_t loom_low_emission_frame_build_with_diagnostic_emitter(
+     loom_module_t* module, loom_op_t* low_func_op,
+     const loom_low_emission_frame_options_t* options,
+     loom_low_placement_pair_use_list_t preferred_pair_uses,
++    iree_bitmap_t required_register_values,
+     iree_diagnostic_emitter_t diagnostic_emitter, iree_arena_allocator_t* arena,
+     loom_low_planning_statistics_t* statistics,
+     loom_low_emission_frame_t* out_frame) {
+@@ -193,6 +261,7 @@ static iree_status_t loom_low_emission_frame_build_with_diagnostic_emitter(
+       .fixed_value_count = options->allocation_fixed_value_count,
+       .reserved_ranges = options->allocation_reserved_ranges,
+       .reserved_range_count = options->allocation_reserved_range_count,
++      .required_register_values = required_register_values,
+       .residency_model = options->residency_model,
+       .storage_leases = storage_leases,
+       .emitter = diagnostic_emitter,
+@@ -218,7 +287,7 @@ iree_status_t loom_low_emission_frame_build(
+   if (statistics == NULL) {
+     return loom_low_emission_frame_build_with_diagnostic_emitter(
+         module, low_func_op, options, loom_low_placement_pair_use_list_empty(),
+-        options->emitter, arena,
++        (iree_bitmap_t){0}, options->emitter, arena,
+         /*statistics=*/NULL, out_frame);
+   }
+   *statistics = (loom_low_planning_statistics_t){0};
+@@ -231,7 +300,7 @@ iree_status_t loom_low_emission_frame_build(
+ #endif  // IREE_STATISTICS_ENABLE
+   iree_status_t status = loom_low_emission_frame_build_with_diagnostic_emitter(
+       module, low_func_op, options, loom_low_placement_pair_use_list_empty(),
+-      options->emitter, arena, statistics, out_frame);
++      (iree_bitmap_t){0}, options->emitter, arena, statistics, out_frame);
+   loom_low_emission_frame_record_arena_high_water(
+       arena, frame_checkpoint.used_allocation_size,
+       frame_checkpoint.total_allocation_size, &statistics->memory.frame_arena);
+@@ -511,6 +580,7 @@ static iree_status_t loom_low_emission_frame_replay_diagnostics(
+     loom_module_t* module, loom_op_t* low_func_op,
+     const loom_low_emission_frame_options_t* frame_options,
+     loom_low_placement_pair_use_list_t preferred_pair_uses,
++    iree_bitmap_t required_register_values,
+     const iree_arena_checkpoint_t* frame_checkpoint,
+     iree_arena_allocator_t* repair_arena, iree_arena_allocator_t* scratch_arena,
+     iree_arena_allocator_t* arena, loom_low_planning_statistics_t* statistics,
+@@ -524,7 +594,8 @@ static iree_status_t loom_low_emission_frame_replay_diagnostics(
+   }
+   return loom_low_emission_frame_build_with_diagnostic_emitter(
+       module, low_func_op, frame_options, preferred_pair_uses,
+-      frame_options->emitter, arena, statistics, out_frame);
++      required_register_values, frame_options->emitter, arena, statistics,
++      out_frame);
+ }
+ 
+ static bool loom_low_emission_frame_diagnostics_requested(
+@@ -552,6 +623,9 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+   const loom_target_residency_model_t* residency_model =
+       frame_options->residency_model;
+ 
++  // Target-lowered spill helpers require registers. Rematerialized clones
++  // inherit that requirement so rematerialization cannot erase the fact.
++  iree_bitmap_t required_register_values = {0};
+   loom_low_emission_frame_lower_spill_traffic_result_t spill_lowering_result = {
+       0};
+   IREE_RETURN_IF_ERROR(loom_low_emission_frame_lower_spill_traffic(
+@@ -560,6 +634,10 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+   if (spill_lowering_result.error_count != 0) {
+     return iree_ok_status();
+   }
++  IREE_RETURN_IF_ERROR(loom_low_emission_frame_record_value_list(
++      spill_lowering_result.required_register_value_ids,
++      spill_lowering_result.required_register_value_count, repair_arena,
++      &required_register_values));
+   iree_host_size_t repair_iteration_count = 0;
+   iree_host_size_t last_repaired_spill_plan_count = IREE_HOST_SIZE_MAX;
+   bool restore_frame_before_build = false;
+@@ -585,7 +663,8 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+         pair_replication.edit_count != 0
+             ? pair_replication_preferred_pairs
+             : loom_low_placement_pair_use_list_empty(),
+-        (iree_diagnostic_emitter_t){0}, arena, statistics, &frame));
++        required_register_values, (iree_diagnostic_emitter_t){0}, arena,
++        statistics, &frame));
+     if (pair_replication.edit_count != 0) {
+       bool rejected =
+           frame.schedule.error_count != 0 ||
+@@ -627,8 +706,9 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+       if (frame_options->emitter.fn != NULL) {
+         IREE_RETURN_IF_ERROR(loom_low_emission_frame_replay_diagnostics(
+             module, low_func_op, frame_options,
+-            loom_low_placement_pair_use_list_empty(), frame_checkpoint,
+-            repair_arena, scratch_arena, arena, statistics, &frame));
++            loom_low_placement_pair_use_list_empty(), required_register_values,
++            frame_checkpoint, repair_arena, scratch_arena, arena, statistics,
++            &frame));
+       }
+       *out_frame = frame;
+       return iree_ok_status();
+@@ -637,13 +717,20 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+       if (repair_iteration_count <
+           LOOM_LOW_EMISSION_FRAME_MAX_REPAIR_ITERATIONS) {
+         loom_low_allocation_rematerialization_result_t result = {0};
++        const iree_host_size_t first_rematerialized_value_id =
++            module->values.count;
+         IREE_RETURN_IF_ERROR(loom_low_allocation_rematerialize_failure(
+             module, &frame.allocation, scratch_arena, &result));
+-        if (statistics != NULL) {
+-          statistics->repair.rematerialized_operand_count +=
+-              result.rewritten_operand_count;
+-        }
+         if (result.rewritten_operand_count != 0) {
++          IREE_RETURN_IF_ERROR(
++              loom_low_emission_frame_record_derived_register_requirement(
++                  result.value_id, first_rematerialized_value_id,
++                  module->values.count, repair_arena,
++                  &required_register_values));
++          if (statistics != NULL) {
++            statistics->repair.rematerialized_operand_count +=
++                result.rewritten_operand_count;
++          }
+           IREE_RETURN_IF_ERROR(
+               loom_low_emission_frame_emit_rematerialization_decision(
+                   frame_options, &frame.allocation,
+@@ -658,8 +745,9 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+       if (frame_options->emitter.fn != NULL) {
+         IREE_RETURN_IF_ERROR(loom_low_emission_frame_replay_diagnostics(
+             module, low_func_op, frame_options,
+-            loom_low_placement_pair_use_list_empty(), frame_checkpoint,
+-            repair_arena, scratch_arena, arena, statistics, &frame));
++            loom_low_placement_pair_use_list_empty(), required_register_values,
++            frame_checkpoint, repair_arena, scratch_arena, arena, statistics,
++            &frame));
+       }
+       *out_frame = frame;
+       return iree_ok_status();
+@@ -716,8 +804,8 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+             pair_replication.edit_count != 0
+                 ? pair_replication_preferred_pairs
+                 : loom_low_placement_pair_use_list_empty(),
+-            frame_checkpoint, repair_arena, scratch_arena, arena, statistics,
+-            &frame));
++            required_register_values, frame_checkpoint, repair_arena,
++            scratch_arena, arena, statistics, &frame));
+       }
+       IREE_RETURN_IF_ERROR(
+           loom_low_emission_frame_apply_materialization_summary(
+@@ -737,13 +825,20 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+         frame.allocation.spill_plan_count < last_repaired_spill_plan_count) {
+       loom_low_allocation_rematerialization_result_t rematerialization_result =
+           {0};
++      const iree_host_size_t first_rematerialized_value_id =
++          module->values.count;
+       IREE_RETURN_IF_ERROR(loom_low_allocation_rematerialize_spill_plan(
+           module, &frame.allocation, scratch_arena, &rematerialization_result));
+-      if (statistics != NULL) {
+-        statistics->repair.rematerialized_operand_count +=
+-            rematerialization_result.rewritten_operand_count;
+-      }
+       if (rematerialization_result.rewritten_operand_count != 0) {
++        IREE_RETURN_IF_ERROR(
++            loom_low_emission_frame_record_derived_register_requirement(
++                rematerialization_result.value_id,
++                first_rematerialized_value_id, module->values.count,
++                repair_arena, &required_register_values));
++        if (statistics != NULL) {
++          statistics->repair.rematerialized_operand_count +=
++              rematerialization_result.rewritten_operand_count;
++        }
+         IREE_RETURN_IF_ERROR(
+             loom_low_emission_frame_emit_rematerialization_decision(
+                 frame_options, &frame.allocation,
+@@ -826,6 +921,10 @@ static iree_status_t loom_low_emission_frame_build_spill_free_impl(
+     if (spill_lowering_result.error_count != 0) {
+       return iree_ok_status();
+     }
++    IREE_RETURN_IF_ERROR(loom_low_emission_frame_record_value_list(
++        spill_lowering_result.required_register_value_ids,
++        spill_lowering_result.required_register_value_count, repair_arena,
++        &required_register_values));
+     loom_low_emission_frame_advance_repair_iteration(&repair_iteration_count,
+                                                      statistics);
+     restore_frame_before_build = true;
+diff --git a/loom/src/loom/codegen/low/frame.h b/loom/src/loom/codegen/low/frame.h
+index b1219b5c1..36b8bf94e 100644
+--- a/loom/src/loom/codegen/low/frame.h
++++ b/loom/src/loom/codegen/low/frame.h
+@@ -114,6 +114,11 @@ typedef struct loom_low_emission_frame_t {
+ typedef struct loom_low_emission_frame_lower_spill_traffic_result_t {
+   // Number of user-facing diagnostics emitted while lowering spill traffic.
+   uint32_t error_count;
++  // Scratch-arena-owned value IDs that the lowered traffic requires in
++  // registers during subsequent allocation rounds.
++  const loom_value_id_t* required_register_value_ids;
++  // Number of entries in |required_register_value_ids|.
++  iree_host_size_t required_register_value_count;
+ } loom_low_emission_frame_lower_spill_traffic_result_t;
+ 
+ // Target callback that rewrites structural low.spill/low.reload traffic into
+diff --git a/loom/src/loom/target/emit/native/amdgpu/check/loom_check.c b/loom/src/loom/target/emit/native/amdgpu/check/loom_check.c
+index 67371828f..f7ccca47f 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/check/loom_check.c
++++ b/loom/src/loom/target/emit/native/amdgpu/check/loom_check.c
+@@ -352,6 +352,9 @@ static iree_status_t loom_amdgpu_loom_check_lower_spill_traffic(
+   IREE_RETURN_IF_ERROR(loom_amdgpu_lower_spill_traffic(
+       module, low_function_op, target.descriptor_set, emitter, &result, arena));
+   out_result->error_count = result.error_count;
++  out_result->required_register_value_ids = result.required_register_value_ids;
++  out_result->required_register_value_count =
++      result.required_register_value_count;
+   return iree_ok_status();
+ }
+ 
+diff --git a/loom/src/loom/target/emit/native/amdgpu/hal_kernel_library.c b/loom/src/loom/target/emit/native/amdgpu/hal_kernel_library.c
+index bb53d9d5f..6150640e0 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/hal_kernel_library.c
++++ b/loom/src/loom/target/emit/native/amdgpu/hal_kernel_library.c
+@@ -612,6 +612,9 @@ static iree_status_t loom_amdgpu_hal_kernel_library_lower_spill_traffic(
+       module, low_function_op, context->descriptor_set, emitter, &result,
+       table_arena));
+   out_result->error_count = result.error_count;
++  out_result->required_register_value_ids = result.required_register_value_ids;
++  out_result->required_register_value_count =
++      result.required_register_value_count;
+   return iree_ok_status();
+ }
+ 
+diff --git a/loom/src/loom/target/emit/native/amdgpu/spill_lowering.c b/loom/src/loom/target/emit/native/amdgpu/spill_lowering.c
+index 32da6feec..e12b8f019 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/spill_lowering.c
++++ b/loom/src/loom/target/emit/native/amdgpu/spill_lowering.c
+@@ -76,8 +76,34 @@ typedef struct loom_amdgpu_spill_lowering_context_t {
+   iree_diagnostic_emitter_t emitter;
+   // Mutable result receiving emitted diagnostic counts.
+   loom_amdgpu_spill_lowering_result_t* result;
++  // Scratch arena backing transient lowering state and result lists.
++  iree_arena_allocator_t* scratch_arena;
++  // Value IDs that the lowered traffic requires in registers.
++  loom_value_id_t* required_register_value_ids;
++  // Number of entries in |required_register_value_ids|.
++  iree_host_size_t required_register_value_count;
++  // Capacity of |required_register_value_ids|.
++  iree_host_size_t required_register_value_capacity;
+ } loom_amdgpu_spill_lowering_context_t;
+ 
++static iree_status_t loom_amdgpu_spill_lowering_record_required_register_value(
++    loom_amdgpu_spill_lowering_context_t* context, loom_value_id_t value_id) {
++  const iree_host_size_t minimum_capacity =
++      context->required_register_value_count + 1;
++  if (minimum_capacity > context->required_register_value_capacity) {
++    IREE_RETURN_IF_ERROR(iree_arena_grow_array(
++        context->scratch_arena, context->required_register_value_count,
++        iree_max(minimum_capacity, 8u),
++        sizeof(*context->required_register_value_ids),
++        &context->required_register_value_capacity,
++        (void**)&context->required_register_value_ids));
++  }
++  context
++      ->required_register_value_ids[context->required_register_value_count++] =
++      value_id;
++  return iree_ok_status();
++}
++
+ static const loom_low_descriptor_t* loom_amdgpu_spill_lowering_descriptor_ref(
+     const loom_low_descriptor_set_t* descriptor_set,
+     loom_amdgpu_descriptor_ref_t descriptor_ref) {
+@@ -995,6 +1021,7 @@ static iree_status_t loom_amdgpu_spill_lowering_initialize_context(
+       .descriptor_set = descriptor_set,
+       .emitter = emitter,
+       .result = result,
++      .scratch_arena = scratch_arena,
+   };
+   out_context->sgpr_class_id = LOOM_AMDGPU_REG_CLASS_ID_SGPR;
+   out_context->sgpr_unit_bytes =
+@@ -1049,16 +1076,36 @@ iree_status_t loom_amdgpu_lower_spill_traffic(
+   loom_rewriter_t rewriter = {0};
+   IREE_RETURN_IF_ERROR(
+       loom_rewriter_initialize(&rewriter, module, scratch_arena));
++  // This is terminal target lowering: no later structural spill layer can
++  // recursively spill its packet helpers. Preserve every created helper and
++  // every existing value consumed by a lowered spill store in registers.
++  const loom_value_id_t first_generated_value_id = module->values.count;
+   iree_status_t status = iree_ok_status();
+   for (iree_host_size_t i = 0; i < op_count && iree_status_is_ok(status); ++i) {
+     if (loom_low_spill_isa(ops[i])) {
+-      status =
+-          loom_amdgpu_spill_lowering_rewrite_spill(&context, &rewriter, ops[i]);
++      status = loom_amdgpu_spill_lowering_record_required_register_value(
++          &context, loom_low_spill_value(ops[i]));
++      if (iree_status_is_ok(status)) {
++        status = loom_amdgpu_spill_lowering_rewrite_spill(&context, &rewriter,
++                                                          ops[i]);
++      }
+     } else if (loom_low_reload_isa(ops[i])) {
+       status = loom_amdgpu_spill_lowering_rewrite_reload(&context, &rewriter,
+                                                          ops[i]);
+     }
+   }
++  for (loom_value_id_t value_id = first_generated_value_id;
++       value_id < module->values.count && iree_status_is_ok(status);
++       ++value_id) {
++    status = loom_amdgpu_spill_lowering_record_required_register_value(
++        &context, value_id);
++  }
+   loom_rewriter_deinitialize(&rewriter);
++  if (iree_status_is_ok(status)) {
++    out_result->required_register_value_ids =
++        context.required_register_value_ids;
++    out_result->required_register_value_count =
++        context.required_register_value_count;
++  }
+   return status;
+ }
+diff --git a/loom/src/loom/target/emit/native/amdgpu/spill_lowering.h b/loom/src/loom/target/emit/native/amdgpu/spill_lowering.h
+index 535d070be..f2a3e19bf 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/spill_lowering.h
++++ b/loom/src/loom/target/emit/native/amdgpu/spill_lowering.h
+@@ -27,6 +27,11 @@ extern "C" {
+ typedef struct loom_amdgpu_spill_lowering_result_t {
+   // Number of user-facing diagnostics emitted while lowering spill traffic.
+   uint32_t error_count;
++  // Scratch-arena-owned value IDs that the lowered traffic requires in
++  // registers during subsequent allocation rounds.
++  const loom_value_id_t* required_register_value_ids;
++  // Number of entries in |required_register_value_ids|.
++  iree_host_size_t required_register_value_count;
+ } loom_amdgpu_spill_lowering_result_t;
+ 
+ // Rewrites low.spill/low.reload in |function_op| into descriptor-backed AMDGPU
+diff --git a/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test b/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test
+index 067ff8a46..4e6958030 100644
+--- a/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test
++++ b/loom/src/loom/target/emit/native/amdgpu/test/spill_lowering.loom-test
+@@ -32,6 +32,36 @@ low.func.def target<amdgpu.gfx9_4.generic.core>(@gfx9_4_generic_target) @gfx9_4_
+ 
+ // ====
+ 
++// Repairing SGPR pressure lowers spill traffic through EXEC-save and
++// SGPR-to-VGPR copy values. Those repair-generated values must remain in
++// registers; spilling them recursively recreates the same helpers and prevents
++// frame construction from converging.
++// RUN: emit amdgpu-native @spill_repair_values_remain_in_registers waits=none strategy=source amdgpu.sgpr=6
++
++amdgpu.target<gfx1100> @gfx11_target
++
++low.func.def target<amdgpu.rdna3.core>(@gfx11_target) @spill_repair_values_remain_in_registers(
++    %lhs0: reg<amdgpu.vgpr>, %rhs0: reg<amdgpu.vgpr>,
++    %lhs1: reg<amdgpu.vgpr>, %rhs1: reg<amdgpu.vgpr>,
++    %lhs2: reg<amdgpu.vgpr>, %rhs2: reg<amdgpu.vgpr>,
++    %lhs3: reg<amdgpu.vgpr>, %rhs3: reg<amdgpu.vgpr>) -> (reg<amdgpu.sgpr x2>) {
++  %mask0 = low.op<amdgpu.v_cmp_ult_u32>(%lhs0, %rhs0) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.sgpr x2>
++  %mask1 = low.op<amdgpu.v_cmp_ult_u32>(%lhs1, %rhs1) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.sgpr x2>
++  %mask2 = low.op<amdgpu.v_cmp_ult_u32>(%lhs2, %rhs2) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.sgpr x2>
++  %mask3 = low.op<amdgpu.v_cmp_ult_u32>(%lhs3, %rhs3) : (reg<amdgpu.vgpr>, reg<amdgpu.vgpr>) -> reg<amdgpu.sgpr x2>
++  %and01 = low.op<amdgpu.s_and_b64>(%mask0, %mask1) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  %and23 = low.op<amdgpu.s_and_b64>(%mask2, %mask3) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  %and0123 = low.op<amdgpu.s_and_b64>(%and01, %and23) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  %and4 = low.op<amdgpu.s_and_b64>(%and0123, %mask0) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  %and5 = low.op<amdgpu.s_and_b64>(%and4, %mask1) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  %result = low.op<amdgpu.s_and_b64>(%and5, %mask2) : (reg<amdgpu.sgpr x2>, reg<amdgpu.sgpr x2>) -> reg<amdgpu.sgpr x2>
++  low.return %result : reg<amdgpu.sgpr x2>
++}
++
++// ----
++
++// ====
++
+ // RUN: emit amdgpu-assembly @gfx9_4_generic_sgpr_spill_reload_waits strategy=source
+ 
+ amdgpu.target<gfx9-4-generic> @gfx9_4_generic_target
+-- 
+2.51.0
+

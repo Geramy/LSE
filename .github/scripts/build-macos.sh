@@ -103,11 +103,18 @@ git -C "$work/hrx-source" init -q
 #   live-in/resource preamble, not between two live-ins, where spill traffic
 #   could take a later live-in's register (the workitem id's v0) before it is
 #   read.
+# - loom-terminal-spill-register-requirements, loom-spill-materialization-
+#   converges: upstream #277 and #1398 backported. Spill materialization keeps
+#   every spilled value and its spill traffic in registers in later rounds, so
+#   each round retires distinct values and repair runs until no spill plan
+#   remains, or fails with the register class's budget and peak, instead of
+#   stopping after eight rounds (ROCm/hrx-system#1391).
 hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
   gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
   loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
   gfx120x-hdp-kernarg-publication hsa-bar-write-bracket loom-vmem-load-latency
-  loom-allocation-entry-preamble)
+  loom-allocation-entry-preamble loom-terminal-spill-register-requirements
+  loom-spill-materialization-converges)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"
