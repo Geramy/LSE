@@ -10,11 +10,12 @@ Multi-GPU and multi-node support is in progress. `--pool` can already name sever
 
 Prefill, tok/s:
 
-| GPU | OS | 1K | 2K | 4K | 32K |
-| --- | --- | ---: | ---: | ---: | ---: |
-| Radeon AI PRO R9700 | macOS | 1,601 | 1,646 | 1,634 | 1,401 |
-| Radeon 8060S (gfx1151) | Linux | 496 | 510 | 517 | 462 |
-| Radeon AI PRO R9700 | Linux | Results pending | Results pending | Results pending | Results pending |
+| GPU | OS | 256 | 1K | 2K | 4K | 32K |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Radeon AI PRO R9700 | macOS | 1,400 | 1,601 | 1,646 | 1,634 | 1,401 |
+| Radeon 8060S (gfx1151) | Linux | 464 | 496 | 510 | 517 | 462 |
+| Radeon AI PRO R9700 | Linux | 1,140 | 1,386 | 1,417 | 1,418 | 1,226 |
+| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | Results pending | Results pending | Results pending | Results pending |
 
 Decode, code prompt, tok/s:
 
@@ -22,7 +23,8 @@ Decode, code prompt, tok/s:
 | --- | --- | ---: | ---: | ---: |
 | Radeon AI PRO R9700 | macOS | 32.2 | 111.9 | **159.4** |
 | Radeon 8060S (gfx1151) | Linux | 14.0 | 47.8 | **64.4** |
-| Radeon AI PRO R9700 | Linux | Results pending | Results pending | Results pending |
+| Radeon AI PRO R9700 | Linux | 32.0 | 111.0 | **144.6** |
+| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | Results pending | Results pending |
 
 Model: Qwen3.8-27B, 4-bit (MLX); drafts: MTP 8-bit, DFlash2 8-bit.
 
