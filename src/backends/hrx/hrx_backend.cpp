@@ -4,6 +4,7 @@
 #include "lse/backends/hrx/copy_route.hpp"
 
 #include <dlfcn.h>
+#include <unistd.h>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -16,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -1323,6 +1325,88 @@ std::optional<int> HrxBackend::resolve_stable_ref(std::string_view pci,
 }
 #endif  // LSE_HRX_LINKED
 
+namespace {
+// Whether [ptr, ptr + bytes) is a run of whole pages, so locking or importing
+// it registers memory no other allocation shares.
+bool host_range_is_whole_pages(const void* ptr, std::size_t bytes) noexcept {
+  static const std::size_t page = [] {
+    const long size = ::sysconf(_SC_PAGESIZE);
+    return size > 0 ? static_cast<std::size_t>(size) : std::size_t{4096};
+  }();
+  const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+  return bytes != 0 && address % page == 0 && bytes % page == 0;
+}
+
+// LSE_CHECK_BINDINGS=1, a debug check that names a bad buffer binding before
+// the GPU can fault on it. Every device allocation this backend hands out is
+// tracked by handle; one whose last reference drops is quarantined -- kept
+// allocated and never recycled -- so a binding that still names it reaches a
+// known freed buffer instead of memory handed to someone else. Before each
+// launch every binding is checked: a buffer this backend never allocated
+// (a host pointer, an import), a freed one, or a window past the end of its
+// allocation fails the launch with the kernel, the binding and the reason.
+struct BindingCheck {
+  struct Entry {
+    std::size_t size = 0;
+    bool live = true;
+    std::uint64_t freed_after = 0;  // launches before the free
+  };
+  std::mutex mu;
+  std::unordered_map<std::uint64_t, Entry> entries;
+  std::uint64_t launches = 0;
+  // Freed allocations held back from reuse, oldest first, up to a byte cap;
+  // past it the oldest is released for real (and its handle may come back).
+  std::deque<std::pair<std::uint64_t, std::size_t>> quarantine;
+  std::size_t quarantined = 0;
+  static constexpr std::size_t kCap = std::size_t{4} << 30;
+};
+bool binding_check_enabled() noexcept {
+  static const bool on = std::getenv("LSE_CHECK_BINDINGS") != nullptr;
+  return on;
+}
+BindingCheck& binding_check() {
+  static BindingCheck check;
+  return check;
+}
+void binding_check_allocated(std::uint64_t handle, std::size_t size) {
+  BindingCheck& c = binding_check();
+  const std::lock_guard lock(c.mu);
+  c.entries[handle] = BindingCheck::Entry{size, true, 0};
+}
+// Marks a buffer released for real at once (a mapped staging buffer).
+void binding_check_released(std::uint64_t handle) {
+  BindingCheck& c = binding_check();
+  const std::lock_guard lock(c.mu);
+  auto it = c.entries.find(handle);
+  if (it == c.entries.end()) return;
+  it->second.live = false;
+  it->second.freed_after = c.launches;
+}
+// Marks `handle` freed and quarantines it; returns the handles now released
+// for real (the oldest, past the cap), which the caller frees.
+std::vector<std::uint64_t> binding_check_freed(std::uint64_t handle) {
+  BindingCheck& c = binding_check();
+  const std::lock_guard lock(c.mu);
+  std::vector<std::uint64_t> release;
+  auto it = c.entries.find(handle);
+  if (it == c.entries.end()) {
+    release.push_back(handle);
+    return release;
+  }
+  it->second.live = false;
+  it->second.freed_after = c.launches;
+  c.quarantine.emplace_back(handle, it->second.size);
+  c.quarantined += it->second.size;
+  while (c.quarantined > BindingCheck::kCap && !c.quarantine.empty()) {
+    const auto [old, size] = c.quarantine.front();
+    c.quarantine.pop_front();
+    c.quarantined -= size;
+    release.push_back(old);
+  }
+  return release;
+}
+}  // namespace
+
 // A stream-ordered allocation flushes stream 0 and then waits for the queue
 // to reach it, so every fresh buffer a pass asks for waits on the work
 // already queued -- the host cannot build the next pass while the device
@@ -1599,10 +1683,16 @@ void HrxBackend::adopt(DeviceBuffer& buf, std::uint64_t handle,
                        std::size_t bytes) {
   buf.handle = handle;
   buf.size_bytes = bytes;
+  if (binding_check_enabled()) binding_check_allocated(handle, bytes);
   buf.storage = std::shared_ptr<void>(
       reinterpret_cast<void*>(handle),
       [this, recycler = recycler_, bytes](void* p) {
         const auto h = reinterpret_cast<std::uint64_t>(p);
+        if (binding_check_enabled()) {
+          // Quarantined, never recycled; released only once past the cap.
+          for (const std::uint64_t old : binding_check_freed(h)) release_buffer(old);
+          return;
+        }
         if (recycler && recycler->keep(h, bytes)) return;
         release_buffer(h);
       });
@@ -1797,9 +1887,11 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
     }
     out.ptr = mapped;
     out.handle = handle;
+    if (binding_check_enabled()) binding_check_allocated(handle, bytes);
     // Staging is not pooled: the mapping has to die with the buffer.
     out.storage = std::shared_ptr<void>(
         reinterpret_cast<void*>(handle), [](void* p) {
+          if (binding_check_enabled()) binding_check_released(reinterpret_cast<std::uint64_t>(p));
 #if LSE_HRX_LINKED
           auto* b = reinterpret_cast<hrx_buffer_t>(p);
           hrx_status_ignore(hrx_buffer_unmap(b));
@@ -2022,6 +2114,14 @@ Status HrxBackend::dma_host_transfer(void* host, const DeviceBuffer& device,
   }
   auto* dev = static_cast<std::byte*>(device_ptr) + device.offset + device_offset;
 
+  // Only whole pages the caller owns outright. Locking pins and maps every
+  // page the range touches, and unlocking unmaps them again for the GPU --
+  // including the part of a page some other GPU-visible host allocation
+  // shares with a heap block. Kernels then fault on their first launch at
+  // that page (their argument block, or the runtime's own host memory), at
+  // a host address. A range that is not whole pages takes the staging copy.
+  if (!host_range_is_whole_pages(host, bytes))
+    return LSE_ERROR(kUnimplemented, "host range is not whole pages");
   HsaAgent lock_agents[1] = {gpu};
   void* locked = hsa.lock_host(host, bytes, lock_agents, 1);
   if (locked == nullptr) return LSE_ERROR(kUnimplemented, "cannot pin the host range");
@@ -2173,6 +2273,10 @@ Status HrxBackend::copy_h2d_imported(const void* src, DeviceBuffer& dst,
   (void)src; (void)dst; (void)bytes; (void)dst_offset;
   return LSE_ERROR(kUnimplemented, "libhrx not linked");
 #else
+  // An import registers the pages the same way a lock does, with the same
+  // hazard for a range that shares a page (dma_host_transfer).
+  if (!host_range_is_whole_pages(src, bytes))
+    return LSE_ERROR(kUnimplemented, "host range is not whole pages");
   hrx_buffer_params_t params = {};
   params.type = HRX_MEMORY_TYPE_HOST_VISIBLE | HRX_MEMORY_TYPE_DEVICE_VISIBLE;
   params.access = HRX_MEMORY_ACCESS_ALL;
@@ -3026,6 +3130,66 @@ Status HrxBackend::launch_impl(const KernelHandle& kernel, const LaunchDims& dim
   }
   config.subgroup_size = dims.subgroup_size;
 
+  if (binding_check_enabled()) {
+    // The export the handle names must take these arguments: its name, its
+    // binding count and its constants length, as its code object declares.
+    hrx_executable_export_info_t info = {};
+    if (hrx_status_is_ok(hrx_executable_export_info(
+            reinterpret_cast<hrx_executable_t>(kernel.executable), kernel.export_ordinal, &info))) {
+      std::string why;
+      if (info.name != nullptr && kernel.name != info.name)
+        why = std::string("is export ") + info.name;
+      else if (info.binding_count != args.bindings.size())
+        why = "declares " + std::to_string(info.binding_count) + " bindings, given " +
+              std::to_string(args.bindings.size());
+      else if (info.constant_byte_length != args.constants.size())
+        why = "declares " + std::to_string(info.constant_byte_length) + " constant bytes, given " +
+              std::to_string(args.constants.size());
+      else if (info.workgroup_size[0] != 0 &&
+               (info.workgroup_size[0] != dims.workgroup_size[0] ||
+                info.workgroup_size[1] != dims.workgroup_size[1] ||
+                info.workgroup_size[2] != dims.workgroup_size[2]))
+        why = "declares workgroup " + std::to_string(info.workgroup_size[0]) + "x" +
+              std::to_string(info.workgroup_size[1]) + ", launched " +
+              std::to_string(dims.workgroup_size[0]) + "x" + std::to_string(dims.workgroup_size[1]);
+      if (!why.empty()) {
+        std::fprintf(stderr, "lse: binding check: %s (ordinal %u) %s\n", kernel.name.c_str(),
+                     kernel.export_ordinal, why.c_str());
+        return LSE_ERROR(kInternal, "binding check: ", kernel.name, " ", why);
+      }
+    } else {
+      std::fprintf(stderr, "lse: binding check: %s (ordinal %u) has no export info\n",
+                   kernel.name.c_str(), kernel.export_ordinal);
+    }
+    BindingCheck& c = binding_check();
+    const std::lock_guard lock(c.mu);
+    ++c.launches;
+    for (std::size_t i = 0; i < args.bindings.size(); ++i) {
+      const BufferRef& ref = args.bindings[i];
+      if (ref.buffer == nullptr || ref.buffer->handle == 0) continue;
+      const std::size_t begin = ref.buffer->offset + ref.offset;
+      const std::size_t length = ref.length != 0 ? ref.length : ref.buffer->size_bytes;
+      const auto it = c.entries.find(ref.buffer->handle);
+      std::string why;
+      if (it == c.entries.end()) {
+        why = "names a buffer this backend never allocated";
+      } else if (!it->second.live) {
+        why = "names a buffer freed " + std::to_string(c.launches - it->second.freed_after) +
+              " launches ago";
+      } else if (begin + length > it->second.size) {
+        why = "reaches " + std::to_string(begin + length) + " bytes into an allocation of " +
+              std::to_string(it->second.size);
+      }
+      if (!why.empty()) {
+        std::fprintf(stderr, "lse: binding check: %s binding %zu (handle %#llx, offset %zu, "
+                     "%zu bytes) %s\n", kernel.name.c_str(), i,
+                     static_cast<unsigned long long>(ref.buffer->handle), begin, length,
+                     why.c_str());
+        return LSE_ERROR(kInternal, "binding check: ", kernel.name, " binding ",
+                         std::to_string(i), " ", why);
+      }
+    }
+  }
   std::vector<hrx_buffer_ref_t> bindings;
   bindings.reserve(args.bindings.size());
   for (const BufferRef& ref : args.bindings) {

@@ -198,9 +198,10 @@ and off (essay, code, 2K and 4K prompts).
 A DFlash2 draft scores, for each of its seven proposal positions, its top 16
 candidates given each candidate of the position before: a first-order lattice
 of conditional distributions. A chain verifies one path through it. With
-draft trees (`--dflash2-tree=on|off`, `lse_config.dflash2_tree`; on by
-default where the part's tuning says trees measured faster, today gfx1201) a
-step can verify many paths in one target pass (`src/runtime/draft_tree.cpp`):
+draft trees (`--dflash2-tree=on|off`, `lse_config.dflash2_tree`; by default
+on whenever the adaptive policy runs, which then takes a tree or a chain
+each step from the device's measured costs) a step can verify many paths in
+one target pass (`src/runtime/draft_tree.cpp`):
 
 - **Construction** follows DDTree ([arXiv 2604.12989](https://arxiv.org/abs/2604.12989)):
   a node's value is the product of the conditional acceptance estimates along
@@ -286,6 +287,12 @@ On the Mac R9700 (macOS, 2 pairs, 8 requests per prompt and arm, the first
 compiles): essay +12.9% (+8.1 to +17.8), code +7.5% (-1.6 to +17.6), 2K
 +15.6% (+1.2 to +32.2), 4K +11.6% (+0.0 to +24.6); 66.4 against 75.0, 151.6
 against 162.3, 71.0 against 82.2 and 70.5 against 78.7 tok/s.
+
+On a Radeon 8060S (gfx1151), whose 15- and 31-row passes take the GEMM
+rather than the matrix panel, the policy keeps mostly to chains and trees
+of 4 and 8 rows; against `--dflash2-tree=off` (3 pairs, 12 requests per
+prompt and arm): essay -0.3% (-3.0 to +2.5), code -0.3% (-4.4 to +3.9), 2K
+-3.1% (-9.6 to +3.9), 4K +5.0% (-0.8 to +11.2).
 
 Greedy output is the target's greedy continuation up to near-ties. Each
 emitted token is the target's argmax at its row, but a tree row's logits come
