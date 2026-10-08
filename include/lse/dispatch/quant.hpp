@@ -226,7 +226,10 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   const auto m = verify_rows(arch, static_cast<std::int64_t>(count / static_cast<std::uint64_t>(k)), tree);
   const auto* rule = arch::first_rule<&arch::Tuning::q4_matrix_panel_shapes>(
       arch, [&](const Q4MatrixPanelShape& r) {
-        return (tree || !r.tree) && s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
+        // A tree-only row is a measurement on its own part: another part
+        // falling back to the shared rows never takes it.
+        return (!r.tree || (tree && r.arch == arch)) &&
+               s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
                s.iattrs[1] == static_cast<std::int32_t>(r.group) &&
                k == r.k && m == r.m &&
                s.inputs[1] == Shape{r.n, r.k / 8} &&
