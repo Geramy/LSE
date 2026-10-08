@@ -1,5 +1,8 @@
 #include "lse/runtime/draft_width.hpp"
 
+#include "lse/dispatch/arch/tuning.hpp"
+#include "lse/graph/graph.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -417,6 +420,17 @@ void DraftWidthPolicy::observe_tree_value(double gain, std::uint32_t rows) {
   } else {
     draft_value_ += kValueRate * (value - draft_value_);
   }
+}
+
+bool draft_trees_by_default(std::string_view arch) {
+  return !arch.empty() && dispatch::arch::tuning(arch).draft_trees;
+}
+
+bool draft_trees_enabled(int setting) {
+  if (setting >= 0) return setting > 0;
+  const graph::Scheduler* scheduler = graph::default_scheduler();
+  return scheduler != nullptr &&
+         draft_trees_by_default(scheduler->backend().device_info().arch);
 }
 
 }  // namespace lse::runtime

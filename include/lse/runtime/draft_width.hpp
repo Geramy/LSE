@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 
 namespace lse::runtime {
 
@@ -198,5 +199,11 @@ class DraftWidthPolicy {
   std::array<std::uint32_t, kTreeRows.size()> tree_samples_{};
   std::array<std::uint64_t, kTreeRows.size()> tree_last_seen_{};
 };
+
+// Whether DFlash2 steps verify draft trees when the configuration leaves it
+// to the device: the part's tuning (dispatch::arch::Tuning::draft_trees).
+[[nodiscard]] bool draft_trees_by_default(std::string_view arch);
+// `setting`: lse_config::dflash2_tree (negative: the device's default).
+[[nodiscard]] bool draft_trees_enabled(int setting);
 
 }  // namespace lse::runtime

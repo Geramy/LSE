@@ -153,6 +153,7 @@ inline constexpr Tuning kTuning{
     .split_short = kSplitShortRules,
     .wave_l2 = kWaveL2Rules,
     .flash_prefill = true,
+    .draft_trees = false,
     // 256 x 128 on 4 x 2 waves of 64 x 64 (q4_gemm_tile's comment has the
     // numbers): the generic wide tile, named here because it is this part's.
     .q4_gemm_wide = kQ4GemmWideTile,

@@ -334,7 +334,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
                                   !graph::device_kernels_required_by_environment());
   opt.session_memory_budget = static_cast<std::size_t>(c.session_memory_budget);
   opt.adaptive_dflash2 = c.adaptive_dflash2 != 0;
-  opt.dflash2_tree = c.dflash2_tree != 0;
+  opt.dflash2_tree = c.dflash2_tree;
   opt.adaptive_mtp = c.adaptive_mtp != 0;
   if (c.mtp_depth != 0) {
     opt.mtp_depth = c.mtp_depth;
@@ -846,7 +846,7 @@ void lse_config_init(lse_config* cfg) {
   cfg->max_sessions = 8;
   cfg->adaptive_dflash2 = 1;
   cfg->adaptive_mtp = 1;
-  cfg->dflash2_tree = 0;
+  cfg->dflash2_tree = -1;
 }
 
 void lse_set_log_callback(lse_log_cb cb, void* user) { log_capture().set(cb, user); }

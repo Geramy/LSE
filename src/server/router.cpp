@@ -388,7 +388,7 @@ struct Router::Impl {
                {"block_size", dflash2->block_size()},
                {"depth", runtime::dflash2_verify_depth(dflash2->block_size())},
                {"adaptive", opt.adaptive_dflash2},
-               {"tree", opt.dflash2_tree}};
+               {"tree", runtime::draft_trees_enabled(opt.dflash2_tree)}};
     return json{{"context_length", c.kv_capacity()},
                 {"max_position_embeddings", c.train_seq_len},
                 {"kv_len", c.kv_capacity()},
@@ -645,7 +645,7 @@ Result<Outcome> Router::Impl::generate(
   if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp, impl.opt.adaptive_mtp ? &impl.mtp_widths : nullptr);
   if (impl.dflash2 != nullptr)
     gen.use_dflash2(*impl.dflash2, impl.opt.adaptive_dflash2 ? &impl.widths : nullptr,
-                    impl.opt.dflash2_tree);
+                    runtime::draft_trees_enabled(impl.opt.dflash2_tree));
 
   // The request's session: a named one is found or created, and continues
   // its own prefix (the Generator checks the exact tokens before reusing
@@ -1158,7 +1158,7 @@ Status Router::prepare_kernels() {
     gen.use_mtp(*impl_->mtp, impl_->opt.adaptive_mtp ? &impl_->mtp_widths : nullptr);
   if (impl_->dflash2 != nullptr)
     gen.use_dflash2(*impl_->dflash2, impl_->opt.adaptive_dflash2 ? &impl_->widths : nullptr,
-                    impl_->opt.dflash2_tree);
+                    runtime::draft_trees_enabled(impl_->opt.dflash2_tree));
   return gen.prepare_kernels();
 }
 
