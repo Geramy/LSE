@@ -1,7 +1,11 @@
 # DFlash2 drafting
 
 Enable the separate DFlash2 drafter with `--dflash2=on` and select its checkpoint
-with `--dflash2-model`. This replaces native MTP for that process. The target
+with `--dflash2-model`. Without `--dflash2-model`, LSE uses the draft it pairs
+with the target (for Qwen3.8-27B, `incoai/Qwen3.8-27B-DFlash2` at the revision
+below) from the Hugging Face cache, downloading it first when it is not cached;
+`--offline` turns a missing draft into an error that names the `pull` command.
+See [Get a model](../README.md#get-a-model). This replaces native MTP for that process. The target
 model verifies proposals and determines every emitted token.
 
 ## HTTP server

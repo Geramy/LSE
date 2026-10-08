@@ -383,6 +383,27 @@ lse_apply_common_flags(lse_model)
 target_link_libraries(lse_runtime PUBLIC lse_core lse_graph lse_model lse_sampling)
 
 # ---------------------------------------------------------------------------
+# hub — Hugging Face model management: what the hub cache holds that this
+# build loads, companions (MTP heads, DFlash2 drafts), and downloads into the
+# huggingface_hub cache layout. HTTPS comes from the Rust shim (ureq/rustls),
+# so this is built wherever the tokenizer is.
+# ---------------------------------------------------------------------------
+if(TARGET fastokens_ffi)
+  add_library(lse_hub
+    src/hub/cache.cpp
+    src/hub/cli.cpp
+    src/hub/companions.cpp
+    src/hub/http.cpp
+    src/hub/pull.cpp
+  )
+  add_library(lse::hub ALIAS lse_hub)
+  target_link_libraries(lse_hub PUBLIC lse_core lse_model fastokens_ffi)
+  target_include_directories(lse_hub PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/hub)
+  target_compile_definitions(lse_hub PRIVATE "LSE_ENGINE_VERSION=\"${PROJECT_VERSION}\"")
+  lse_apply_common_flags(lse_hub)
+endif()
+
+# ---------------------------------------------------------------------------
 # place — the device SET: which devices this process holds, which of them holds
 # which bytes, and where work runs. Deliberately the TOP layer: it depends on
 # probe (to measure a pool) and on graph (to hand the set to a scheduler), and
@@ -431,7 +452,7 @@ if(TARGET lse_tokenizer)
   add_library(lse::api ALIAS lse_api)
   set_target_properties(lse_api PROPERTIES OUTPUT_NAME LSE)
   target_link_libraries(lse_api PUBLIC lse_server lse_runtime lse_model
-                                       lse_tokenizer lse_place lse_probe
+                                       lse_tokenizer lse_hub lse_place lse_probe
                                        lse_backends)
   target_compile_definitions(lse_api PRIVATE
     "LSE_ENGINE_VERSION=\"${PROJECT_VERSION}\"")
@@ -461,7 +482,7 @@ if(TARGET lse_tokenizer AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_compile_definitions(lse PRIVATE
       LSE_HSA_RUNTIME_DIR="${LSE_ROCM_RUNTIME_DIR}")
   endif()
-  target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer
+  target_link_libraries(lse PRIVATE lse_runtime lse_model lse_tokenizer lse_hub
                                     lse_place lse_probe lse_backends)
   lse_apply_common_flags(lse)
 

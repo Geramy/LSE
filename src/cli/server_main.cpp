@@ -19,6 +19,7 @@
 #include "nlohmann/json.hpp"
 #include "lse/graph/jit.hpp"
 #include "lse/graph/graph.hpp"
+#include "lse/hub/hub.hpp"
 #include "lse/kv/cache_dtype.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/runtime/prefill_batch.hpp"
@@ -36,9 +37,16 @@ void on_signal(int) { g_stopping.store(true, std::memory_order_relaxed); }
 void usage() {
   std::puts(
       "usage: lse-server [options]\n"
+      "       lse-server models [list|rm]   MLX models in the HF cache (models --help)\n"
+      "       lse-server pull ORG/NAME[@REV]  download into the HF cache (pull --help)\n"
       "\n"
       "  -m, --model NAME     checkpoint directory, .safetensors, or an HF repo\n"
-      "                       id (default: $LSE_MODEL)\n"
+      "                       id ORG/NAME[@REVISION] in the HF cache\n"
+      "                       (default: $LSE_MODEL)\n"
+      "      --pull           download --model, --mtp or --dflash2-model first\n"
+      "                       when it names a repo that is not in the HF cache\n"
+      "      --offline        never use the network (sets HF_HUB_OFFLINE=1): a\n"
+      "                       companion that is not cached is an error\n"
       "      --host ADDR      address to bind (default 127.0.0.1)\n"
       "      --port N         port to bind (default 8080)\n"
       "      --api-key KEY    require Authorization: Bearer KEY\n"
@@ -58,12 +66,15 @@ void usage() {
       "      --session-memory-budget BYTES  KV and state all sessions may hold\n"
       "                         before idle ones are evicted (default 0: no limit)\n"
       "      --mtp PATH       multi-token-prediction module (default: the one\n"
-      "                       beside the model, when the checkpoint has one)\n"
+      "                       beside the model, else the head LSE pairs with the\n"
+      "                       model, downloaded when not cached)\n"
       "      --mtp-depth N    draft proposals per verifier pass (1..7, default 3)\n"
       "      --adaptive-mtp=off  draft --mtp-depth proposals every step (on/off;\n"
       "                       default on: sampled requests draft as deep as pays, up to 7)\n"
       "      --dflash2=on     use the DFlash2 block drafter (default off)\n"
       "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
+      "                       (default: the draft LSE pairs with the model,\n"
+      "                       downloaded when not cached)\n"
       "      --adaptive-dflash2=off  verify every DFlash2 proposal each step (on/off;\n"
       "                       default on: verify the prefix expected to decode fastest)\n"
       "      --no-mtp         decode one token per pass, ignoring any\n"
@@ -113,13 +124,15 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc > 1 && hub::is_subcommand(argv[1])) return hub::run_cli("lse-server", argc - 1, argv + 1);
   lse_config cfg;
   lse_config_init(&cfg);
   std::string model = std::getenv("LSE_MODEL") ? std::getenv("LSE_MODEL") : "";
   std::string mtp_path;
   bool no_mtp = false;
   bool dflash2_on = false;
-  std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
+  std::string dflash2_model;  // empty: the companion the registry pairs with --model
+  bool pull_missing = false;
   std::string tokenizer_repo;
   std::string served_name;
   std::string host;
@@ -223,6 +236,8 @@ int main(int argc, char** argv) {
       cfg.adaptive_dflash2 = text == "on" ? 1 : 0;
     }
     else if (a == "--no-mtp") no_mtp = true;
+    else if (a == "--pull") pull_missing = true;
+    else if (a == "--offline") hub::set_offline();
     else if (a == "--tokenizer") tokenizer_repo = value("--tokenizer");
     else if (a == "--FlashPrefillV2" || a.starts_with("--FlashPrefillV2=")) {
       const auto text = a == "--FlashPrefillV2"
@@ -336,7 +351,7 @@ int main(int argc, char** argv) {
   if (!mtp_path.empty()) cfg.mtp_path = mtp_path.c_str();
   cfg.no_mtp = no_mtp;
   cfg.dflash2 = dflash2_on;
-  cfg.dflash2_model = dflash2_model.c_str();
+  if (!dflash2_model.empty()) cfg.dflash2_model = dflash2_model.c_str();
   cfg.flashprefill_v2 = flashprefill_toggle ? (*flashprefill_toggle ? 1 : 0) : -1;
   if (!attention_prefill.empty()) cfg.attention_prefill = attention_prefill.c_str();
   if (!attention_decode.empty()) cfg.attention_decode = attention_decode.c_str();
@@ -349,6 +364,22 @@ int main(int argc, char** argv) {
   if (!dialect.empty()) cfg.dialect = dialect.c_str();
   if (!cache_dir.empty()) cfg.cache_dir = cache_dir.c_str();
   cfg.shutdown_grace_seconds = shutdown_grace_seconds;
+
+  if (pull_missing) {
+    // Only what the command line names: a repo id not in the cache is pulled
+    // here, before anything else reads it.
+    const auto progress = hub::stderr_progress("  ");
+    const std::pair<const std::string*, hub::Kind> named[] = {
+        {&model, hub::Kind::kModel}, {&mtp_path, hub::Kind::kMtp}, {&dflash2_model, hub::Kind::kDFlash2}};
+    for (const auto& [name, kind] : named) {
+      if (name->empty()) continue;
+      const hub::Kind accept[] = {kind};
+      if (const Status s = hub::pull_if_missing(*name, accept, progress); !s.ok()) {
+        std::fprintf(stderr, "lse-server: %s\n", s.message().c_str());
+        return s.code() == StatusCode::kInvalidArgument ? 2 : 1;
+      }
+    }
+  }
 
   char* err = nullptr;
   if (model_info || estimate) {

@@ -59,6 +59,19 @@ void fk_stream_free(fk_decode_stream* stream);
 void fk_ids_free(fk_ids* ids);
 void fk_text_free(fk_text* text);
 
+// One HTTP(S) request (ureq + rustls). Redirects are not followed. on_head
+// receives the status and "name: value\n" header lines (names lowercased)
+// before any body; on_body receives the body in order. A callback returning
+// nonzero aborts the transfer. An HTTP error status is delivered, not failed.
+// Returns 0 when the whole response was delivered, -2 when a callback aborted
+// it, -1 on a transport failure (fk_last_error). Timeouts of 0 take 30 s to
+// connect and 120 s between reads.
+typedef int (*fk_http_head_fn)(void* ctx, int status, const char* headers);
+typedef int (*fk_http_body_fn)(void* ctx, const uint8_t* data, size_t len);
+int fk_http_request(const char* method, const char* url, const char* request_headers,
+                    uint32_t connect_timeout_ms, uint32_t read_timeout_ms,
+                    fk_http_head_fn on_head, fk_http_body_fn on_body, void* ctx);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

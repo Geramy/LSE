@@ -8,6 +8,8 @@ use std::ptr;
 
 use fastokens::{DecodeStream, Tokenizer};
 
+mod http;
+
 thread_local! {
     static LAST_ERROR: RefCell<std::ffi::CString> =
         RefCell::new(std::ffi::CString::new("").unwrap());
