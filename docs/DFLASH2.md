@@ -23,7 +23,8 @@ Conditional draft selection uses the request's sampling settings. The target
 verifies proposals with probability-ratio rejection and residual sampling; a
 sampled request verifies, each step, the prefix of the draft block expected to
 decode fastest (see [adaptive verify width](#adaptive-verify-width)). Greedy
-requests retain deterministic draft selection and verify all seven proposals.
+requests retain deterministic draft selection and verify all seven proposals,
+or with [draft trees](#draft-trees) the tree the policy picks.
 DFlash2 remains opt-in. Current matched results and limits are in the
 [final mode comparison](benchmarks/forward-modes-final-2026-09-29.md).
 
@@ -133,7 +134,8 @@ second (`src/runtime/draft_width.cpp`):
   context ring, and every verify pass, plain or not, appends its verified
   rows to that ring, so a skipped draft leaves nothing to repair.
 
-Greedy requests always verify all seven proposals. The target's logits differ
+Without draft trees, greedy requests always verify all seven proposals (with
+them, see [draft trees](#draft-trees)). The target's logits differ
 in their last bits between pass widths (the GEMM shape and the Gated DeltaNet
 chunking follow the rows of a pass), so a different width can flip a near-tie
 between two tokens; master's greedy DFlash2 output already differs from plain
@@ -190,6 +192,127 @@ close; on prose `--adaptive-mtp=off` is the faster setting today.
 
 Greedy requests produced byte-identical text to master with the policy on
 and off (essay, code, 2K and 4K prompts).
+
+## Draft trees
+
+A DFlash2 draft scores, for each of its seven proposal positions, its top 16
+candidates given each candidate of the position before: a first-order lattice
+of conditional distributions. A chain verifies one path through it. With
+draft trees (`--dflash2-tree=on|off`, `lse_config.dflash2_tree`; on by
+default where the part's tuning says trees measured faster, today gfx1201) a
+step can verify many paths in one target pass (`src/runtime/draft_tree.cpp`):
+
+- **Construction** follows DDTree ([arXiv 2604.12989](https://arxiv.org/abs/2604.12989)):
+  a node's value is the product of the conditional acceptance estimates along
+  its path, and the best nodes are popped from a heap in value order. A child
+  is never worth more than its parent, so the first B pops form the tree that
+  maximizes expected accepted nodes over all B-node trees, and the expected
+  value of every smaller budget is a prefix sum of the same order. Each
+  candidate's estimate is its draft probability mapped through a calibration
+  table that learns from every candidate of every row a walk reaches.
+- **Size.** The adaptive policy prices a tree step whole (draft, verify and
+  commit), per row rung (4, 8, 15 and 31 rows), measured on the device, and
+  each step takes the tree rung or chain prefix with the highest expected
+  tokens per second.
+- **Verification.** Rows are laid out in depth-first preorder, best child
+  first. Full-attention layers take the tree's ancestor mask (`MaskKind::kTree`,
+  positions per row); Gated DeltaNet layers propagate state along the tree,
+  each row from its parent's state, as SpecLA's state-resident serial form
+  ([arXiv 2607.16673](https://arxiv.org/abs/2607.16673)) does for a chain and
+  TreeWY's per-node recurrence ([arXiv 2608.20961](https://arxiv.org/abs/2608.20961))
+  writes for a tree (`gdn.tree_scan.v1`); the causal convolution reads each
+  row's ancestors (`causal_conv1d.tree.v1`).
+- **Acceptance.** The walk starts at the root: the target answers at a node
+  (its argmax, or a sample of its distribution at that node), and the walk
+  descends into the child holding that token or stops and emits the answer.
+  Every emitted token is the target's own answer at its context, so sampled
+  output keeps the target distribution exactly; for a candidate set fixed
+  before the target is consulted this is also the most a lossless rule can
+  accept (DDTree, SpecInfer [arXiv 2305.09781](https://arxiv.org/abs/2305.09781)).
+- **Commit.** Only the accepted path is kept: its K/V rows move into place
+  (`kv_page_write.rows.v1`), the Gated DeltaNet state is replayed along the
+  path (`gdn.path_state.v1`), the convolution tail takes the path's inputs,
+  and the path's features go to the DFlash2 context ring.
+
+Fast wide passes make trees pay. Every projection of a 9 to 31-row tree pass
+runs on the 16-row int8 matrix panel, one workgroup applying each weight load
+to every 16-row tile (9 to 14 rows run as 15, 17 to 30 as 31); attention takes
+`attention.flash_split.wmma16.v1`, the flash tile over a share of the key
+windows per workgroup, merged by the split merge. These are tree-only
+(`graph::TreePassScope`): chain and prompt passes keep their kernels and their
+output.
+
+Verify pass time on the Linux R9700 (gfx1201), ms, median of 7 per width
+after a warm request, master's chain passes against the same widths as tree
+passes:
+
+| Rows | Chain, short context | Tree, short context | Chain, 4K context | Tree, 4K context |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 34.1 | 34.1 | 35.4 | 35.3 |
+| 2 | 34.8 | 35.1 | 39.8 | 38.7 |
+| 3 | 35.3 | 35.3 | 42.5 | 38.6 |
+| 4 | 36.0 | 35.9 | 40.7 | 39.3 |
+| 5 | 38.7 | 39.3 | 46.3 | 42.3 |
+| 6 | 39.8 | 39.4 | 47.2 | 42.9 |
+| 7 | 41.4 | 41.0 | 49.1 | 44.4 |
+| 8 | 44.0 | 43.6 | 51.6 | 46.9 |
+| 9 | 55.3 | 41.9 | 60.4 | 45.2 |
+| 12 | 56.2 | 42.9 | 60.9 | 46.6 |
+| 15 | 57.1 | 43.7 | 62.3 | 47.2 |
+| 16 | 58.9 | 56.3 | 62.8 | 59.5 |
+| 20 | 59.7 | 52.8 | 67.3 | 58.6 |
+| 24 | 60.5 | 53.1 | 68.1 | 59.4 |
+| 31 | 62.9 | 54.9 | 70.3 | 61.0 |
+| 32 | 65.1 | 64.2 | 72.1 | 70.0 |
+
+One row is a plain step either way. A tree of 2 to 8 rows costs what a chain does at a short
+context and less at 4K (the flash split); trees use 15 and 31 rows, never
+16 or 32, which are prompt widths and keep the prompt kernels.
+
+Measured on the Linux R9700 (ROCm), 6 interleaved pairs of servers
+(`--dflash2-tree=off` then on), 4 seeds each, so 24 requests per prompt and
+arm at temperature 0.6. Changes are the geometric mean of per-seed ratios
+with a 95% t interval:
+
+| Prompt | Chain | Tree | Tokens/step chain / tree | Tree rows | Change (95% CI) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 640-token essay | 56.0 tok/s | 61.5 tok/s | 2.92 / 3.50 | 15.1 | +9.8% (+7.2 to +12.4) |
+| Code (640 tokens) | 127.0 tok/s | 131.1 tok/s | 7.04 / 7.47 | 10.8 | +3.4% (-1.3 to +8.4) |
+| 2K prompt, 256 tokens | 57.6 tok/s | 65.2 tok/s | 3.32 / 4.08 | 16.6 | +13.1% (+7.8 to +18.7) |
+| 4K prompt, 256 tokens | 58.0 tok/s | 65.6 tok/s | 3.44 / 4.15 | 15.7 | +12.9% (+8.0 to +18.0) |
+
+On the Mac R9700 (macOS, 2 pairs, 8 requests per prompt and arm, the first
+2K and 4K request of the first chain server left out for its kernel
+compiles): essay +12.9% (+8.1 to +17.8), code +7.5% (-1.6 to +17.6), 2K
++15.6% (+1.2 to +32.2), 4K +11.6% (+0.0 to +24.6); 66.4 against 75.0, 151.6
+against 162.3, 71.0 against 82.2 and 70.5 against 78.7 tok/s.
+
+Greedy output is the target's greedy continuation up to near-ties. Each
+emitted token is the target's argmax at its row, but a tree row's logits come
+from a different pass shape than a chain's or a plain step's (other kernels,
+other sums), so where the top two tokens are within rounding of each other
+the choice can flip, and the text diverges from there, as chain DFlash2
+output already differs from plain decoding. Scored afterwards by one prompt
+pass of the target (`--perplexity`, 384 generated tokens each), the tokens
+that pass does not rank first, and by how much (nats):
+
+| Prompt | Plain decode | Chain | Tree |
+| --- | --- | --- | --- |
+| Essay | 3, at most 0.08 | 3, at most 0.08 | 10, at most 0.29 |
+| Code | 1, 0.09 | 4, at most 0.18 | 5, at most 0.66 |
+| 2K prompt | 8, at most 1.15 | 8, at most 0.39 | 9, at most 0.55 |
+
+Every such token is a near-tie at the scale on which the scoring pass itself
+disagrees with plain decoding.
+
+`test_draft_tree` checks the pop order, optimality against brute force, the
+layout and the walk, and runs 300,000 sampled walks per budget against the
+target distribution (chi-square). `test_tree_verify --gpu` checks the tree
+scan, convolution and path state bit for bit against the chain kernels along
+every path, the tree attention against a double reference (to 1.3e-4 with
+the flash split), and the K/V row moves; `--gemm M` checks every projection
+at M rows of a tree pass against a double reference (5e-3 relative, as the
+8-row panel).
 
 ## Automatic Q8 conversion
 
