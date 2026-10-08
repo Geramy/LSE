@@ -94,7 +94,7 @@ std::string_view loom_storage_type(Scalar s) noexcept {
 
 std::string loom_view_type(Scalar s, std::uint64_t elements) {
   return "view<" + std::to_string(elements) + "x" +
-         std::string(loom_storage_type(s)) + ", #dense>";
+         std::string(loom_storage_type(s)) + ">";
 }
 
 std::string loom_vector_type(Scalar s, std::uint32_t lanes) {

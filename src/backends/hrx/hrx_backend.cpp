@@ -1776,7 +1776,7 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
 
   const bool staging = cls == MemoryClass::kStaging;
   const hrx_buffer_usage_t usage =
-      HRX_BUFFER_USAGE_DISPATCH_STORAGE | HRX_BUFFER_USAGE_TRANSFER |
+      HRX_BUFFER_USAGE_STORAGE | HRX_BUFFER_USAGE_TRANSFER |
       (staging ? (HRX_BUFFER_USAGE_MAPPING_SCOPED |
                   HRX_BUFFER_USAGE_MAPPING_PERSISTENT)
                : 0);

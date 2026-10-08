@@ -286,7 +286,7 @@ EmittedKernel artifact_source(std::string_view entry = "probe_a",
   out.source = "kernel.def export(\"" + out.entry_name + "\") @" + out.entry_name +
       "() {\n  %cfg = index.constant 256 : index\n} launch(%a: buffer) {\n" +
       "  %view = buffer.view %a[%zero] : buffer -> view<" + std::string(width) +
-      "x" + std::string(dtype) + ", #dense>\n  kernel.return\n}\n";
+      "x" + std::string(dtype) + ">\n  kernel.return\n}\n";
   return out;
 }
 }  // namespace

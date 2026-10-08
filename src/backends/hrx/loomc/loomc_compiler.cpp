@@ -167,10 +167,6 @@ struct Options {
   // Zero: the hot path wants the in-place module transform and the
   // diagnostics, not a serialized compile artifact beside them.
   loomc_compile_artifact_flags_t compile_artifacts = 0;
-  // LSE dispatches through the native HRX ABI and reads neither the
-  // feedback channel nor the ASAN config global.
-  loomc_amdgpu_runtime_global_flags_t runtime_globals =
-      LOOMC_AMDGPU_RUNTIME_GLOBAL_NONE;
 };
 
 constexpr Options kOptions{};
@@ -500,7 +496,7 @@ std::string LoomcCompiler::identity() const {
   id += control_flow_name(kOptions.control_flow);
   id += " max_errors=" + std::to_string(kOptions.source_to_low_max_errors);
   id += " compile_artifacts=" + std::to_string(kOptions.compile_artifacts);
-  id += " runtime_globals=" + std::to_string(kOptions.runtime_globals);
+  id += " runtime_globals=none";
   id += " format=";
   id += kArtifactFormat;
   id += " manifest=none";
@@ -640,17 +636,13 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
   }
 
   // Emission consumes the function-version facts the compile above retained, so
-  // nothing may compile this module again between the two calls.
-  loomc_amdgpu_emit_options_t amdgpu_options{};
-  amdgpu_options.type = LOOMC_STRUCTURE_TYPE_AMDGPU_EMIT_OPTIONS;
-  amdgpu_options.structure_size = sizeof(amdgpu_options);
-  amdgpu_options.runtime_globals = kOptions.runtime_globals;
-
+  // nothing may compile this module again between the two calls. No runtime
+  // globals are requested: LSE dispatches through the native HRX ABI and
+  // reads neither the feedback channel nor a sanitizer config global.
   const std::string artifact_id = symbols.front() + ".hsaco";
   loomc_emit_options_t emit_options{};
   emit_options.type = LOOMC_STRUCTURE_TYPE_EMIT_OPTIONS;
   emit_options.structure_size = sizeof(emit_options);
-  emit_options.next = &amdgpu_options;
   emit_options.artifact_format = loomc_make_cstring_view(kArtifactFormat);
   emit_options.identifier =
       loomc_make_string_view(artifact_id.data(), artifact_id.size());
@@ -670,9 +662,27 @@ Result<graph::CompiledKernel> LoomcCompiler::compile(
       const loomc_artifact_t* a = loomc_result_artifact_at(result.get(), i);
       if (a == nullptr || a->kind != LOOMC_ARTIFACT_KIND_EXECUTABLE) continue;
       // Artifact bytes are borrowed from the result, so they are copied out
-      // before it is released.
-      const auto* p = reinterpret_cast<const std::byte*>(a->contents.data);
-      code.assign(p, p + a->contents.data_length);
+      // before it is released. An HSACO is one contiguous segment; a
+      // segmented sequence is gathered in order.
+      loomc_byte_span_t span{};
+      if (loomc_byte_sequence_try_get_contiguous_span(a->contents, &span)) {
+        const auto* p = reinterpret_cast<const std::byte*>(span.data);
+        code.assign(p, p + span.data_length);
+      } else {
+        const loomc_byte_sequence_callback_t gather = {
+            +[](void* user_data, loomc_byte_span_t segment) -> loomc_status_t {
+              auto* out = static_cast<std::vector<std::byte>*>(user_data);
+              const auto* p = reinterpret_cast<const std::byte*>(segment.data);
+              out->insert(out->end(), p, p + segment.data_length);
+              return loomc_ok_status();
+            },
+            &code,
+        };
+        OwnedStatus gathered(loomc_byte_sequence_enumerate(a->contents, gather));
+        if (!gathered.ok()) {
+          return gathered.to_status("loomc_byte_sequence_enumerate");
+        }
+      }
       break;
     }
   }

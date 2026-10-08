@@ -17,7 +17,7 @@ namespace lse::backend {
 // unsigned word in memory is `i32` and stays 32 bits wide. See loom_types.cpp.
 [[nodiscard]] std::string_view loom_storage_type(graph::kir::Scalar s) noexcept;
 
-// `view<Nx<elem>, #dense>` — the flat one-dimensional view an LSE buffer is
+// `view<Nx<elem>>` — the flat one-dimensional view an LSE buffer is
 // seen through. Extents are real: LSE bakes every shape into the kernel, so
 // the number is known, and Loom needs it to bound the access.
 [[nodiscard]] std::string loom_view_type(graph::kir::Scalar s,

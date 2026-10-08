@@ -1045,8 +1045,8 @@ class Printer {
     // Body::workgroup_bytes charges for.
     line(depth, nbytes + " = index.constant " + std::to_string(bytes) +
                     " : offset");
-    line(depth, b + " = buffer.alloca " + nbytes +
-                    " {base_alignment = 16, memory_space = workgroup} : buffer");
+    line(depth, b + " = buffer.alloca<workgroup> align(16) " + nbytes +
+                    " : buffer");
     line(depth, off + " = index.constant 0 : offset");
     const std::string vt = loom_view_type(o.type.elem, count);
     line(depth, n + " = buffer.view " + b + "[" + off + "] : buffer -> " + vt);

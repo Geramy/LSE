@@ -297,7 +297,7 @@ constexpr std::array<graph::PrimitiveSource, 55> kLoomSources{{
      "$t2 = index.cast $t1 : index to i32\n"
      "$r, $t3 = kernel.subgroup.shuffle<xor> $0, $t0, $t2 : f32, i32, i32"},
 
-    {"barrier", "kernel.barrier<workgroup> {ordering = acq_rel, scope = workgroup}"},
+    {"barrier", "kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)"},
 
     // Eight consecutive f32 activations as an f16 matrix operand, lanes
     // ordered k0,k4,k1,k5,k2,k6,k3,k7: the order "q4x8.f16" produces for the
@@ -450,7 +450,7 @@ const std::vector<MatrixSpelling>& matrix_spellings() {
       auto schema = [&](int temporary, const std::string& format, int length,
                         ir::Scalar elem) {
         return "$t" + std::to_string(temporary) +
-            " = encoding.define #matrix_operand<element_format=" + format +
+            " = encoding.define #encoding.operand<element_format=" + format +
             ", payload_elements=" + std::to_string(length * r.pack) +
             ", payload_registers=" + std::to_string(static_cast<unsigned>(length) * ir::scalar_bytes(elem) / 4) +
             "> : encoding<schema>\n";

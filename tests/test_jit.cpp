@@ -122,9 +122,9 @@ std::string loom_matmul_source(int m, int k, int n, unsigned threads) {
   const std::string md = std::to_string(m);
   const std::string kd = std::to_string(k);
   const std::string nd = std::to_string(n);
-  const std::string xt = "view<" + md + "x" + kd + "xf32, #dense>";
-  const std::string yt = "view<" + kd + "x" + nd + "xf32, #dense>";
-  const std::string ot = "view<" + md + "x" + nd + "xf32, #dense>";
+  const std::string xt = "view<" + md + "x" + kd + "xf32>";
+  const std::string yt = "view<" + kd + "x" + nd + "xf32>";
+  const std::string ot = "view<" + md + "x" + nd + "xf32>";
   std::string s;
   s += "kernel.def export(\"lse_matmul_loom\") @lse_matmul_loom() {\n";
   s += "  %unit = index.constant 1 : index\n";
@@ -1753,8 +1753,8 @@ LSE_TEST(target_id_features_in_the_arch_string_reach_the_code_object) {
       "  %base = index.constant 0 : offset\n"
       "  %lane = kernel.workitem.id<x> : index\n"
       "  %v = scalar.constant 1.0 : f32\n"
-      "  %ov = buffer.view %out[%base] : buffer -> view<64xf32, #dense>\n"
-      "  view.store %v, %ov[%lane] : f32, view<64xf32, #dense>\n"
+      "  %ov = buffer.view %out[%base] : buffer -> view<64xf32>\n"
+      "  view.store %v, %ov[%lane] : f32, view<64xf32>\n"
       "  kernel.return\n"
       "}\n";
 
@@ -1876,8 +1876,8 @@ LSE_TEST(loom_compile_errors_name_the_problem_instead_of_crashing) {
       "  %base = index.constant 0 : offset\n"
       "  %zero = index.constant 0 : index\n"
       "  %v = scalar.constant 1.0 : f32\n"
-      "  %ov = buffer.view %out[%base] : buffer -> view<4xi32, #dense>\n"
-      "  view.store %v, %ov[%zero] : f32, view<4xi32, #dense>\n"
+      "  %ov = buffer.view %out[%base] : buffer -> view<4xi32>\n"
+      "  view.store %v, %ov[%zero] : f32, view<4xi32>\n"
       "  kernel.return\n"
       "}\n";
   auto typed = kLoom.compile(bad_type, "gfx1151");
