@@ -27,43 +27,101 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
 
 ## Performance on macOS (R9700)
 
-Qwen3.8-27B Q4 (MLX group-affine) on a Radeon AI PRO R9700 over Thunderbolt 5,
-Apple M5 Max, mac_linuxgpu v0.1.162 (build 266), LSE 0.5.6, measured 2026-10-07, with
-LSE 0.5.5 measured on the same driver. Server flags:
-`--pool hrx:0 --batch-size 1024 --ubatch-size 1024 --kv-cache-dtype bf16
---kv-len 262100 --temperature 0.6` (Loom, the default dialect; 0.5.5 with `--dialect loom`),
-with `LSE_REQUIRE_DEVICE_KERNELS=1` (no CPU fallback).
-DFlash2 uses the Q8 draft (`--dflash2=on --dflash2-model qwen38-27b-dflash2-q8`).
+**Code generation: 157.7 tok/s with DFlash2** on a Radeon AI PRO R9700. The prompt is HumanEval-style, 640 tokens are generated at temperature 0.6, and the draft acceptance is 98.4%.
 
-Time to first token over the HTTP API, 128 tokens out. Cold is the first request
-of that size after the server starts, with the kernel cache already on disk.
-Warm is the median of five requests that follow five more at the same size; the GPU
-lowers its clocks after light, intermittent work, and the first warm requests bring
-them back up.
+Setup:
+- Model: Qwen3.8-27B Q4 (MLX group-affine) with the Q8 DFlash2 draft (`--dflash2=on --dflash2-model qwen38-27b-dflash2-q8`).
+- GPU: R9700 over Thunderbolt 5 on an Apple M5 Max, mac_linuxgpu v0.1.162 (build 266), LSE 0.5.7, measured 2026-10-07.
+- Server flags: `--pool hrx:0 --batch-size 1024 --ubatch-size 1024 --kv-cache-dtype bf16 --kv-len 262100 --temperature 0.6`, with `LSE_REQUIRE_DEVICE_KERNELS=1` (no CPU fallback).
+- Adaptive verify width is on (the default).
+- Each mode runs in one server session. Timing starts after about 1.5 s of sustained decode, because the GPU lowers its clocks after light work.
 
-| Prompt tokens | Warm TTFT | Warm prefill | Cold TTFT | 0.5.5 warm TTFT | 0.5.5 cold TTFT |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 137 | 0.127 s | 1,079 tok/s | 0.188 s | 0.123 s | 0.188 s |
-| 271 | 0.206 s | 1,316 tok/s | 0.210 s | 0.205 s | 0.206 s |
-| 532 | 0.380 s | 1,400 tok/s | 0.386 s | 0.380 s | 0.385 s |
-| 646 | 0.442 s | 1,462 tok/s | 0.445 s | 0.442 s | 0.444 s |
-| 1060 | 0.674 s | 1,573 tok/s | 0.683 s | 0.675 s | 0.684 s |
-| 2118 | 1.315 s | 1,611 tok/s | 1.343 s | 1.316 s | 1.345 s |
-| 4230 | 2.637 s | 1,604 tok/s | 2.636 s | 2.636 s | 2.639 s |
+Decode at temperature 0.6, with draft acceptance in parentheses:
 
-Decode, sampled at temperature 0.6, median of five 640-token runs after one more:
+| Prompt | DFlash2 | MTP=3 | Plain |
+| --- | ---: | ---: | ---: |
+| **Code**: HumanEval-style, six functions to implement (302 prompt tokens, 640 out) | **157.7 tok/s** (98.4%) | 115.6 tok/s (97.2%) | 32.0 tok/s |
+| 2K prompt (2,406 tokens, 256 out) | 70.4 tok/s (74.6%) | 54.4 tok/s (69.8%) | 31.6 tok/s |
+| 4K prompt (4,786 tokens, 256 out) | 66.5 tok/s (75.1%) | 55.6 tok/s (73.6%) | 31.1 tok/s |
+| Essay (32 prompt tokens, 640 out) | 66.4 tok/s (70.2%) | 61.3 tok/s (70.1%) | 32.3 tok/s |
 
-| Mode | 640-token decode | Draft acceptance | 2K prompt (2406 tokens) | 4K prompt (4787 tokens) | 0.5.5, 640-token decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash2 | 58.7 tok/s | 65.5% | 60.2 tok/s, TTFT 1.50 s | 68.0 tok/s, TTFT 3.04 s | 57.8 tok/s |
-| MTP=3 (`--mtp qwen38-27b-mtp-q8 --mtp-depth 3`) | 58.8 tok/s | 68.9% | 61.7 tok/s | — | 56.2 tok/s |
-| Plain (`--dflash2=off`) | 31.9 tok/s | — | 31.5 tok/s, TTFT 1.50 s | — | 31.8 tok/s |
+Notes on the decode table:
+- DFlash2 (every prompt) and MTP=3 on code are medians of five runs. The other cells are medians of three.
+- MTP=3 runs with `--mtp qwen38-27b-mtp-q8 --mtp-depth 3`. Plain runs with `--dflash2=off`.
+- Mean verify width per pass (maximum 8): DFlash2 7.9 on code, 5.6 to 5.7 on the others; MTP=3 6.9 on code, 4.8 to 5.0 on the others.
 
-Model load, launch to ready with the checkpoint in the file cache and the kernel cache on disk: 10.0 s with DFlash2, 8.3 s plain, 3.9 s with MTP (0.5.5: 9.8, 8.1 and 4.0 s). As in 0.5.5, the server prepares every request shape's kernels before it reports ready. Host memory footprint at ready with DFlash2: 616 MB (0.5.5: 613 MB). The first launch of a new LSE build, with none of its kernels in the cache, compiles them before it reports ready: 111 s with DFlash2 on this machine.
+Time to first token over the HTTP API, DFlash2 server, 128 tokens out:
+- Cold is the first request of that size after the server starts, with the kernel cache on disk.
+- Warm is the median of three requests after a warm-up.
+
+| Prompt tokens | Warm TTFT | Warm prefill | Cold TTFT |
+| ---: | ---: | ---: | ---: |
+| 137 | 0.122 s | 1,127 tok/s | 0.182 s |
+| 271 | 0.201 s | 1,345 tok/s | 0.199 s |
+| 532 | 0.373 s | 1,425 tok/s | 0.375 s |
+| 646 | 0.436 s | 1,483 tok/s | 0.434 s |
+| 1,060 | 0.663 s | 1,599 tok/s | 0.672 s |
+| 2,118 | 1.292 s | 1,640 tok/s | 1.289 s |
+| 4,230 | 2.589 s | 1,634 tok/s | 2.596 s |
+| 33,799 | 23.91 s | 1,414 tok/s | 24.09 s |
+
+Model load, launch to ready, with the checkpoint in the file cache and the kernel cache on disk:
+- 4.9 s with DFlash2, 3.4 s with MTP, 3.8 s plain.
+- The server prepares every request shape's kernels before it reports ready.
+- Host memory footprint at ready with DFlash2: 422 MB.
+- The first launch of a new LSE build, with an empty kernel cache, compiles those kernels first: 110.8 s with DFlash2 on this machine.
+
+### RDNA3.5 (gfx1151)
+
+MS-S1 MAX with a Radeon 8060S (gfx1151), ROCm 7.13. Same model, flags and prompts, adaptive verify width on, temperature 0.6. Medians of three runs after a warm-up, with draft acceptance in parentheses:
+
+| Prompt | DFlash2 | MTP=3 | Plain |
+| --- | ---: | ---: | ---: |
+| **Code** (HumanEval-style, 640 out) | **55.5 tok/s** (99.1%) | 34.9 tok/s (96.9%) | 13.6 tok/s |
+| 2K prompt (256 out) | 23.2 tok/s (75.2%) | 20.8 tok/s (70.1%) | 13.5 tok/s |
+| 4K prompt (256 out) | 24.3 tok/s (77.9%) | 23.6 tok/s (83.3%) | 13.3 tok/s |
+| Essay (640 out) | 25.3 tok/s (72.0%) | 20.5 tok/s (65.4%) | 13.7 tok/s |
+
+Prefill with the DFlash2 server, FlashPrefill V2 on (the gfx1151 default):
+
+| Prompt | TTFT | Prefill |
+| ---: | ---: | ---: |
+| 256 | 0.636 s | 403 tok/s |
+| 512 | 1.205 s | 425 tok/s |
+| 1K | 2.020 s | 507 tok/s |
+| 2K | 4.111 s | 498 tok/s |
+| 4K | 8.364 s | 490 tok/s |
+| 32K | 47.73 s | 687 tok/s |
+
+Load with the kernel cache on disk: 4.6 s plain, 6.1 s with MTP. The first launch with an empty kernel cache takes 110.9 s.
 
 ### Linux (R9700)
 
-The packaged v0.5.6 Linux archive on a Radeon AI PRO R9700 runs with ROCm 7.13, the same model and flags, and the default dialect (Loom). A 640-token decode, median of five after one more, runs at 50.1 tok/s with DFlash2 (65.5% acceptance) and 27.9 tok/s plain. Loading with DFlash2 and the kernel cache on disk takes 21.5 s.
+The packaged v0.5.7 Linux archive on a Radeon AI PRO R9700 runs with ROCm 7.13, the same model and flags, and the default dialect (Loom). Decode at temperature 0.6, median of eight runs:
+- **Code: 126.5 tok/s with DFlash2** (98.4% acceptance), 95.2 tok/s with MTP=3, 26.3 tok/s plain.
+- Essay: 46.9 tok/s with DFlash2, 45.4 with MTP=3, 26.8 plain.
+
+That host is a shared server under CPU load, and individual runs varied widely. Loading with DFlash2 and the kernel cache on disk takes 19.9 s.
+
+**Optional kernel patch for RDNA4.**
+- Linux users with GFX12 (RDNA4) cards, such as the R9700 or RX 9070, can apply ["drm/amdkfd: Put GFX12 compute queue MQDs in VRAM"](https://github.com/lemonade-sdk/mac_linuxgpu/blob/main/patches/linux/kfd-v12-mqd-vram.patch) to the amdgpu driver.
+- What it changes:
+  - KFD compute-queue descriptors (MQDs) are allocated in CPU-visible VRAM instead of system memory.
+  - HDP is flushed at the end of `update_mqd`.
+  - Upstream already does both for GFX 9.4.3.
+- What was measured: the stall on a dispatch that exactly fills a shader engine (for example 253 to 256 workgroups of 256 threads).
+  - On the Mac driver, which runs the same amdgpu code, it dropped from 51 µs to 17 µs.
+  - Stock Linux measured 26 µs on the same dispatch.
+- It has not been measured on a patched Linux kernel.
+- It applies to GFX12 only. Graphics and Vulkan are unaffected.
+
+### Output quality
+
+Wikitext-2 perplexity with llama.cpp's method: 512-token chunks, 580 chunks, the same 297,193 token ids on both sides.
+- LSE scores **7.1467 ± 0.0464** with the MLX 4-bit checkpoint. The value is identical on the R9700 under macOS and Linux, and on gfx1151.
+- llama.cpp b11379 (Vulkan) scores 7.0759 ± 0.0461 with the GGUF Q4_0 file `unsloth/Qwen3.8-27B-Q4_0.gguf`.
+- The quantization formats differ.
+- See [Perplexity](docs/PERPLEXITY.md).
 
 ## HumanEval+ through 32K
 
@@ -180,7 +238,7 @@ Linux release targets include `gfx942`, `gfx1150`, `gfx1151`, `gfx1200`, and `gf
 The Linux archive bundles its selected HRX runtime and patched Loom compiler;
 root and `bin/` launchers load those libraries and forward the existing CLI arguments.
 A compatible Linux C/C++ runtime, ROCm 7.x, HSA and GPU driver remain required.
-The v0.5.6 binaries need glibc 2.43 or later and the GCC 16 libstdc++ (`GLIBCXX_3.4.35`,
+The v0.5.7 binaries need glibc 2.43 or later and the GCC 16 libstdc++ (`GLIBCXX_3.4.35`,
 `CXXABI_1.3.15`), with ROCm 7.x `libamd_comgr.so.3` and `libhsa-runtime64.so.1`: an
 Ubuntu 26.04-class system.
 `BUILD.json` records the compiler source pins, patch hashes and bundled library hashes.
@@ -189,7 +247,7 @@ Check each release for its build targets and runtime requirements.
 ## Install a release
 
 Use the archive for your operating system from [Releases](https://github.com/Geramy/LSE/releases).
-The examples below use `v0.5.6`.
+The examples below use `v0.5.7`.
 
 Each install procedure sets `LSE_BIN` for the later commands. Use the same terminal for those commands.
 
@@ -198,7 +256,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 1. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.5.6
+   lse_tag=v0.5.7
    lse_asset="lse-${lse_tag}-linux-x86_64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -231,7 +289,7 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
 2. Download the archive and checksum.
 
    ```bash
-   lse_tag=v0.5.6
+   lse_tag=v0.5.7
    lse_asset="lse-${lse_tag}-macos-arm64"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz"
    curl -fLO "https://github.com/Geramy/LSE/releases/download/${lse_tag}/${lse_asset}.tar.gz.sha256"
@@ -256,7 +314,7 @@ You do not need to set `DYLD_LIBRARY_PATH` yourself.
 
 ### iOS and iPadOS
 
-Download `lse-v0.5.6-ios-arm64.xcframework.zip` and its `.sha256` from the same
+Download `lse-v0.5.7-ios-arm64.xcframework.zip` and its `.sha256` from the same
 release, check it with `shasum -a 256 -c`, and unzip it to get `LSE.xcframework`.
 See [iOS and iPadOS](#ios-and-ipados) for how an app uses it.
 
@@ -692,14 +750,15 @@ app's `Library/Caches/lse/kernels`.
 Measured on an iPad Pro (M4) with a Radeon AI PRO R9700 over Thunderbolt,
 Qwen3.8-27B Q4 with the Q8 DFlash2 draft, warm:
 
-| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.5.6 |
+| | iPad Pro (M4), v0.5.0 | MacBook Pro (M5 Max), v0.5.7 |
 | --- | ---: | ---: |
-| Decode | 40.5 tok/s at 73% draft acceptance | 58.7 tok/s at 66% |
+| Decode | 40.5 tok/s at 73% draft acceptance | 66.4 tok/s at 70% (essay) |
 | Decode at 85–93% acceptance | 57–70 tok/s | — |
-| Model load | about 34 s | 10.0 s |
+| Code decode (HumanEval-style prompt) | — | 157.7 tok/s at 98% |
+| Model load | about 34 s | 4.9 s |
 | Operations that fell back to the CPU | 0 | 0 |
 
-The MacBook Pro column is the 640-token decode from
+The MacBook Pro column comes from
 [Performance on macOS](#performance-on-macos-r9700); the iPad figures are from v0.5.0.
 
 Build the XCFramework with
