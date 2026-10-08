@@ -347,19 +347,20 @@ std::uint32_t DraftWidthPolicy::tree_exploring() const noexcept {
 }
 
 std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
-                                           double chain_value, std::uint32_t chain_rows) {
+                                           std::span<const double> chain_prefix) {
   if (value_prefix.size() < 2) return 0;
   const auto most = static_cast<std::uint32_t>(value_prefix.size() - 1);
   const auto fit = [&](std::uint32_t rows) { return std::min(most, rows - 1); };
-  const bool chain = chain_value >= 0.0 && chain_rows >= 2 && chain_rows <= kMaxRows;
+  const auto chain_rows = static_cast<std::uint32_t>(
+      std::min<std::size_t>(chain_prefix.size(), kMaxRows));
+  const bool chain = chain_rows >= 2;
   // Warming up: the rung a chain would take.
   if (steps_ < kWarmupSteps) return fit(kTreeRows[1]);
   if (const std::uint32_t rows = tree_exploring(); rows != 0) return fit(rows);
-  if (chain && samples_[chain_rows] < kExploreSamples) return 0;
+  if (chain && exploring() != 0) return 0;
   // A rung unmeasured for long enough is measured again, whatever it costs.
   for (std::size_t r = 0; r < kTreeRows.size(); ++r)
     if (steps_ - tree_last_seen_[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
-  if (chain && steps_ - last_seen_[chain_rows] > kHardRefreshSteps) return 0;
   const double draft = draft_ns(kMaxProposals);
   std::uint32_t best = fit(kTreeRows[0]);
   double best_rate = -1.0;
@@ -374,9 +375,11 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
     }
     if (nodes == most) break;
   }
-  if (chain) {
-    const double cost = draft + verify_ns(chain_rows);
-    if (cost > 0.0 && (1.0 + chain_value) / cost > best_rate) return 0;
+  // The best chain prefix, priced as chain steps are.
+  for (std::uint32_t rows = 2; chain && rows <= chain_rows; ++rows) {
+    const double cost = draft + verify_ns(rows);
+    if (cost > 0.0 && verify_ns(rows) > 0.0 && (1.0 + chain_prefix[rows - 1]) / cost > best_rate)
+      return 0;
   }
   return best;
 }

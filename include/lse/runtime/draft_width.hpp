@@ -141,13 +141,13 @@ class DraftWidthPolicy {
   // Decided from the draft's distributions alone, never from any token the
   // target has not yet answered, so the walk stays exact.
   //
-  // `chain_value` is the expected accepted proposals of the draft's top path
-  // verified as a chain of `chain_rows` rows (its proposals and the anchor);
-  // 0 means that chain is expected to decode faster than any tree (or its
-  // width still has to be measured).
+  // `chain_prefix[k]` is the expected accepted proposals of the first k of
+  // the draft's top path verified as a chain (k + 1 rows). 0 means a chain
+  // is expected to decode faster than any tree, or a chain width still has
+  // to be measured: the step then drafts a chain and proposals() picks its
+  // width as it does without trees.
   [[nodiscard]] std::uint32_t tree_nodes(std::span<const double> value_prefix,
-                                         double chain_value = -1.0,
-                                         std::uint32_t chain_rows = 0);
+                                         std::span<const double> chain_prefix = {});
   // A tree step's whole wall time, draft and commit included: a tree's
   // commit runs on the device while the next draft waits for it, so the two
   // are priced together rather than split.

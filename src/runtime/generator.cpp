@@ -1021,16 +1021,17 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         LSE_ASSIGN_OR(expansion, expand_tree(lattice, temperature, nodes, calibrate));
         nodes = static_cast<std::uint32_t>(expansion.nodes.size());
         if (widths != nullptr) {
-          // The draft's top path verified as a chain, valued the same way.
-          double chain_value = 0.0, reach = 1.0;
-          std::vector<double> q(lattice.top);
+          // The draft's top path verified as a chain, valued the same way:
+          // chain_prefix[k] for its first k proposals.
+          std::vector<double> chain_prefix{0.0}, q(lattice.top);
+          double reach = 1.0;
           for (std::uint32_t p = 0, pred = 0; p < lattice.positions; ++p) {
             lattice.conditional(p, pred, temperature, q);
             pred = static_cast<std::uint32_t>(std::max_element(q.begin(), q.end()) - q.begin());
             reach *= widths->candidate(q[pred]);
-            chain_value += reach;
+            chain_prefix.push_back(chain_prefix.back() + reach);
           }
-          nodes = widths->tree_nodes(expansion.value_prefix, chain_value, lattice.positions + 1);
+          nodes = widths->tree_nodes(expansion.value_prefix, chain_prefix);
         }
       }
       if (nodes > 0) {
@@ -1045,16 +1046,39 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         tree_temperature = temperature;
         return out;
       }
-      // A chain through the same lattice.
+      // A chain through the same lattice: sampled from the draft's
+      // conditionals for a sampled request, its best path for a greedy one,
+      // and with the policy, trimmed to the prefix that pays as without trees.
+      std::vector<std::uint32_t> chain;
       if (sampled) {
         LSE_ASSIGN_OR(auto proposal, model::dflash2_sample_path(
             lattice.scores, lattice.ids, lattice.positions, lattice.top,
             static_cast<std::uint32_t>(model_.config().vocab_size),
             sampler_.params().temperature, speculative_sampler));
         proposal_distributions = std::move(proposal.conditionals);
-        return std::move(proposal.tokens);
+        chain = std::move(proposal.tokens);
+        for (const DiscreteDistribution& d : proposal_distributions)
+          confidence.push_back(d.probabilities.empty() ? 0.0
+              : *std::max_element(d.probabilities.begin(), d.probabilities.end()));
+      } else {
+        LSE_ASSIGN_OR(chain, model::dflash2_select_path(lattice.scores, lattice.ids,
+                                                       lattice.positions, lattice.top));
+        std::vector<double> q(lattice.top);
+        for (std::uint32_t p = 0, pred = 0; p < lattice.positions; ++p) {
+          lattice.conditional(p, pred, 1.0, q);
+          pred = static_cast<std::uint32_t>(std::max_element(q.begin(), q.end()) - q.begin());
+          confidence.push_back(q[pred]);
+        }
       }
-      return model::dflash2_select_path(lattice.scores, lattice.ids, lattice.positions, lattice.top);
+      if (widths != nullptr && !chain.empty()) {
+        estimates.assign(confidence.size(), 0.0);
+        const std::uint32_t k = widths->proposals(confidence, estimates);
+        widths->observe_draft_value(estimates, k);
+        chain.resize(k);
+        confidence.resize(k);
+        estimates.resize(k);
+      }
+      return chain;
     }
     if (dflash2_ != nullptr) {
       confidence.clear();

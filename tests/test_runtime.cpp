@@ -690,16 +690,24 @@ LSE_TEST(draft_width_policy_prefers_a_chain_that_decodes_faster) {
   std::vector<double> prefix{0.0};
   for (std::uint32_t b = 1; b <= DraftWidthPolicy::kMaxTreeNodes; ++b)
     prefix.push_back(prefix.back() + 0.8 * std::pow(0.85, b - 1));
+  // A top path's expected accepted proposals for its first k, k = 0..7.
+  const auto chain = [](double a) {
+    std::vector<double> c{0.0};
+    double reach = 1.0;
+    for (int k = 1; k <= 7; ++k) c.push_back(c.back() + (reach *= a));
+    return c;
+  };
   DraftWidthPolicy policy = measured_tree_policy(40e6, 1e6, 8e6);
-  // The chain's width is measured before it is compared.
-  LSE_EXPECT_EQ(policy.tree_nodes(prefix, 6.5, 8), 0u);
+  // The chain widths are measured before they are compared.
+  LSE_EXPECT_EQ(policy.tree_nodes(prefix, chain(0.98)), 0u);
   for (std::uint32_t i = 0; i < DraftWidthPolicy::kExploreSamples; ++i)
-    policy.observe_verify(8, static_cast<std::uint64_t>(42e6));
-  // A top path accepted almost whole (code): the chain, two rows cheaper per
-  // pass than the eight-row tree, wins.
-  LSE_EXPECT_EQ(policy.tree_nodes(prefix, 6.8, 8), 0u);
+    for (std::uint32_t rows = 2; rows <= DraftWidthPolicy::kMaxRows; ++rows)
+      policy.observe_verify(rows, static_cast<std::uint64_t>(40e6 + 0.3e6 * (rows - 1)));
+  // A top path accepted almost whole (code): the chain, cheaper per pass
+  // than the eight-row tree, wins.
+  LSE_EXPECT_EQ(policy.tree_nodes(prefix, chain(0.98)), 0u);
   // A doubtful top path (prose): a tree.
-  LSE_EXPECT(policy.tree_nodes(prefix, 1.9, 8) > 0u);
+  LSE_EXPECT(policy.tree_nodes(prefix, chain(0.6)) > 0u);
   // Without a chain to compare, always a tree.
   LSE_EXPECT(policy.tree_nodes(prefix) > 0u);
 }
