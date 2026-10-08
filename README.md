@@ -1,12 +1,10 @@
 # Lemon Seed Engine (LSE)
 
-A self-optimizing LLM inference engine for AMD GPUs on Linux, macOS and iPadOS.
+LLM inference engine for AMD GPUs on Linux, macOS and iPadOS.
 
-LSE writes and tunes its own GPU kernels for the device it runs on. It reads the GPU's registers, shared memory and matrix units, generates kernels for that architecture through Loom and HRX, measures every candidate layout on the real hardware, and keeps the fastest one whose output is bit-identical. Speculative decoding (MTP, DFlash2 and draft trees) picks how far to draft at every step from costs it measured on that GPU. Nothing is tuned by hand per card.
+LSE records a model's forward pass as a graph, fuses operations, and generates kernels for the GPU it runs on. Kernels are emitted in the Loom dialect, compiled by loomc for the device's gfx target, launched through HRX, and kept in an on-disk cache. Kernel shapes come from device facts (compute units, LDS, wave size, matrix units) and per-architecture tables for gfx1201 and gfx1151. Where a kernel has several layouts, LSE runs each on the GPU, drops any whose output does not match, keeps the fastest, and saves the choice. MTP and DFlash2 speculative decoding, with draft trees, pick how many draft tokens to verify at each step from measured acceptance and the verify cost measured on that GPU. FlashPrefill V2 makes long prompt prefill sparse. LSE runs Qwen3.5-family models from MLX 4-bit and 8-bit checkpoints, with FP16, BF16 or FP8 KV caches, on the amdgpu KFD driver on Linux and the mac_linuxgpu driver on macOS and iPadOS. It ships an OpenAI-compatible HTTP server, a CLI and a C library (libLSE).
 
-The same self-optimization is being extended across multiple GPUs and multiple machines: measuring links and devices, then placing and splitting the model where it runs fastest.
-
-OpenAI-compatible HTTP server, CLI, and C library (libLSE).
+Multi-GPU and multi-node support is in progress. `--pool` can already name several GPUs: the loader splits each layer across them, or gives each a run of layers, and the scheduler copies between them peer to peer. This path has no published results yet. TCP and Unix-socket transports exist and are tested, but do not carry inference traffic yet. The next step extends kernel generation and placement across several GPUs and machines, choosing how to split work from measured link latency and bandwidth so that adding devices never slows a single-device run.
 
 ## Performance
 
