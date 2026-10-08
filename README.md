@@ -1,6 +1,12 @@
 # Lemon Seed Engine (LSE)
 
-LLM inference engine for AMD GPUs on Linux and macOS, with an OpenAI-compatible HTTP server, a CLI and a C library (libLSE).
+A self-optimizing LLM inference engine for AMD GPUs on Linux, macOS and iPadOS.
+
+LSE writes and tunes its own GPU kernels for the device it runs on. It reads the GPU's registers, shared memory and matrix units, generates kernels for that architecture through Loom and HRX, measures every candidate layout on the real hardware, and keeps the fastest one whose output is bit-identical. Speculative decoding (MTP, DFlash2 and draft trees) picks how far to draft at every step from costs it measured on that GPU. Nothing is tuned by hand per card.
+
+The same self-optimization is being extended across multiple GPUs and multiple machines: measuring links and devices, then placing and splitting the model where it runs fastest.
+
+OpenAI-compatible HTTP server, CLI, and C library (libLSE).
 
 ## Performance
 
