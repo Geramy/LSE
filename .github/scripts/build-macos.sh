@@ -43,7 +43,7 @@ fetch() {
     echo "Dependency is modified: $path" >&2; exit 1;
   }
 }
-hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
+hrx_rev=631c0b7854b51a593b89761cc6dcae88f2ec3940
 hsa_headers_rev=4285513114a70f7cf4830c89279c8cfa57b901bb
 fetch https://github.com/ROCm/hrx-system.git "$hrx_rev" "$work/deps/hrx"
 fetch https://github.com/iree-org/hsa-runtime-headers.git "$hsa_headers_rev" "$work/deps/hsa-headers"
@@ -75,54 +75,32 @@ git -C "$work/hrx-source" init -q
 # handling, LSE_POLLER_SOURCE selection all in-tree since 79f39c0), so no
 # portability patch is applied to it. The fetched hrx dependency takes LSE's
 # own HRX patch series (patches/hrx), in this order:
-# - macos-coarse-host-adapter: the AMDGPU HAL over the macOS driver transport.
-# - symbolic-memo-touched-reset, gfx12-vopd-identical-source,
-#   loop-invariant-motion, rdna4-prefetch-address-span: Loom code generation
-#   fixes for gfx12.
+# - loom-concat-destination-reserved-once: loomc's register allocator no longer
+#   writes a second assignment for a concat destination, one past the end of
+#   the assignment array (it corrupted later arena memory). Upstream PR #1443;
+#   kept until main has it.
+# - stream-queue-affinity: hrx streams created on a chosen queue, the queue
+#   count property, and a dispatch barrier that orders only dispatch writes
+#   against later reads.
+# - macos-coarse-host-adapter: the AMDGPU HAL over the macOS driver transport;
+#   hrx_buffer_allocate suballocates from one stream-ordered pool per device.
 # - kv-fragment-addressing: the native K/V address API.
-# - cooperative-matrix-operands: matrix operand staging; its operand list
-#   grows only when full.
-# - loom-grow-arrays-only-when-full: the remaining loomc arrays that grew per
-#   append. Without it a kernel with more than about 30 matrix operands in one
-#   function asks for gigabytes and fails to compile, which rules out the
-#   prefill GEMM's 64x64 wave tiles.
-# - gfx120x-hdp-kernarg-publication: admits RDNA4 to HRX's VRAM kernel-
+# - gpu-device-group-and-device-import: one HRX device over several GPUs and
+#   import of device allocations (used on Linux; harmless on one GPU).
+# - gfx120x-hdp-kernarg-publication (upstream PR #1331, kept until main has
+#   it): admits RDNA4 to HRX's VRAM kernel-
 #   argument path. It turns on only when the HSA runtime reports the HDP flush
 #   registers and CPU access to the VRAM pool.
-# - hsa-bar-write-bracket: opts into the mac_linuxgpu runtime's BAR writes,
-#   which makes it report those, and brackets every submission's stores into
-#   the GPU's BARs (kernargs, HDP flush, doorbell) under the driver's gate,
-#   with aligned stores only (Apple silicon maps a BAR as device memory).
-#   Needs mac_linuxgpu build 265 (older runtimes lack the bracket and keep
-#   kernel arguments in host memory); a runtime that refuses fails device
-#   creation.
-# - loom-vmem-load-latency: loomc's scheduler gives a global load its real
-#   latency, so loads issue ahead of the math that waits on them.
-# - loom-allocation-entry-preamble: upstream #1377 backported. loomc's
-#   fixed-input splits and VOPD source replicas go after the whole entry
-#   live-in/resource preamble, not between two live-ins, where spill traffic
-#   could take a later live-in's register (the workitem id's v0) before it is
-#   read.
-# - loom-terminal-spill-register-requirements, loom-spill-materialization-
-#   converges: upstream #277 and #1398 backported. Spill materialization keeps
-#   every spilled value and its spill traffic in registers in later rounds, so
-#   each round retires distinct values and repair runs until no spill plan
-#   remains, or fails with the register class's budget and peak, instead of
-#   stopping after eight rounds (ROCm/hrx-system#1391).
-# - loom-vmem-sources-at-issue, loom-scalar-source-capture: upstream 30246a9d6
-#   and c07086aa1 backported. A VMEM store reads its VGPR address and data, and
-#   a memory instruction its scalar address inputs, when it issues, so loomc
-#   can reuse those registers without waiting for the access to complete.
-# - loom-issue-sources-gfx11: those two releases apply to the gfx11 (RDNA3/3.5)
-#   descriptor sets only. They measured faster decode on gfx1151 but slower MTP
-#   and DFlash2 decode on gfx1201, which keeps its previous leases.
-hrx_patches=(macos-coarse-host-adapter symbolic-memo-touched-reset
-  gfx12-vopd-identical-source kv-fragment-addressing cooperative-matrix-operands
-  loop-invariant-motion rdna4-prefetch-address-span loom-grow-arrays-only-when-full
-  gfx120x-hdp-kernarg-publication hsa-bar-write-bracket loom-vmem-load-latency
-  loom-allocation-entry-preamble loom-terminal-spill-register-requirements
-  loom-spill-materialization-converges loom-vmem-sources-at-issue
-  loom-scalar-source-capture loom-issue-sources-gfx11)
+# - hsa-bar-write-bracket: opts into the mac_linuxgpu runtime's BAR writes and
+#   brackets every submission's stores into the GPU's BARs (kernargs, HDP
+#   flush, doorbell) under the driver's gate, with aligned stores only.
+# - gfx12-vopd-identical-source: lets gfx12 VOPD components share a source.
+# This revision needs mac_linuxgpu build 267 or newer (hsa_amd_queue_create
+# and the agent queries the current AMDGPU HAL makes).
+hrx_patches=(loom-concat-destination-reserved-once
+  stream-queue-affinity macos-coarse-host-adapter kv-fragment-addressing
+  gpu-device-group-and-device-import gfx120x-hdp-kernarg-publication hsa-bar-write-bracket
+  gfx12-vopd-identical-source)
 for patch in "${hrx_patches[@]}"; do
   git -C "$work/hrx-source" apply --check "$root/patches/hrx/$patch.patch"
   git -C "$work/hrx-source" apply "$root/patches/hrx/$patch.patch"
@@ -132,11 +110,10 @@ cmake -S "$work/hrx-source" -B "$work/hrx-build" -G Ninja \
   "${darwin_archive_args[@]}" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_C_COMPILER="$llvm/clang" -DCMAKE_CXX_COMPILER="$llvm/clang++" \
   -DCMAKE_C_FLAGS=-DIREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER=1 \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
-  -DIREE_CLANG_BINARY="$llvm/clang" -DIREE_LLVM_LINK_BINARY="$llvm/llvm-link" -DIREE_LLD_BINARY="$lld" \
   -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_HAL_DRIVER_AMDGPU=ON \
   -DIREE_HAL_AMDGPU_TARGETS=gfx1201 -DLOOM_BUILD=ON \
   -DLOOM_TARGET_DEFAULTS=OFF -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=gfx1201 \
-  -DLOOM_TARGET_LLVMIR=ON -DLOOM_TARGET_IREE_VM=ON -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON \
+  -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON \
   -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF -DIREE_ENABLE_LIBBACKTRACE=OFF \
   -DFETCHCONTENT_SOURCE_DIR_HSA_RUNTIME_HEADERS="$work/deps/hsa-headers"
 cmake --build "$work/hrx-build" --target hrx loomc_shared --parallel "$jobs"

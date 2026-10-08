@@ -23,11 +23,11 @@ inline std::string kernel(const lse::backend::LoomBody& b) {
  kernel.launch.config workgroups(%one, %one, %one) workgroup_size(%lanes, %one, %one) : index
 } launch(%a: buffer, %b: buffer, %out: buffer) {
  %base = index.constant 0 : offset
- %a_view = buffer.view %a[%base] : buffer -> view<32xf32, #dense>
- %b_view = buffer.view %b[%base] : buffer -> view<32xf32, #dense>
- %out_view = buffer.view %out[%base] : buffer -> view<32xf32, #dense>
+ %a_view = buffer.view %a[%base] : buffer -> view<32xf32>
+ %b_view = buffer.view %b[%base] : buffer -> view<32xf32>
+ %out_view = buffer.view %out[%base] : buffer -> view<32xf32>
  %lane = kernel.workitem.id<x> : index
  %i = index.assume %lane [range(%lane, 0, 31)] : index
-)"+b.text+" view.store "+b.result+", %out_view[%i] : f32, view<32xf32, #dense>\n kernel.return\n}\n";
+)"+b.text+" view.store "+b.result+", %out_view[%i] : f32, view<32xf32>\n kernel.return\n}\n";
 }
 } // namespace float_compare_fixture

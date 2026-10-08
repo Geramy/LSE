@@ -53,17 +53,17 @@ inline std::string kernel(const backend::LoomBody& b) {
  kernel.launch.config workgroups(%groups, %one, %one) workgroup_size(%lanes, %one, %one) : index
 } launch(%x: buffer, %codes: buffer, %acc: buffer, %values: buffer, %out: buffer) {
  %base = index.constant 0 : offset
- %x_view = buffer.view %x[%base] : buffer -> view<128xi32, #dense>
- %codes_view = buffer.view %codes[%base] : buffer -> view<128xi32, #dense>
- %acc_view = buffer.view %acc[%base] : buffer -> view<128xi32, #dense>
- %values_view = buffer.view %values[%base] : buffer -> view<128xf32, #dense>
- %out_view = buffer.view %out[%base] : buffer -> view<128xf32, #dense>
+ %x_view = buffer.view %x[%base] : buffer -> view<128xi32>
+ %codes_view = buffer.view %codes[%base] : buffer -> view<128xi32>
+ %acc_view = buffer.view %acc[%base] : buffer -> view<128xi32>
+ %values_view = buffer.view %values[%base] : buffer -> view<128xf32>
+ %out_view = buffer.view %out[%base] : buffer -> view<128xf32>
  %group = kernel.workgroup.id<x> : index
  %lane = kernel.workitem.id<x> : index
  %lanes = index.constant 32 : index
  %flat = index.madd %group, %lanes, %lane : index
  %i = index.assume %flat [range(%flat, 0, 127)] : index
-)"+b.text+" view.store "+b.result+", %out_view[%i] : f32, view<128xf32, #dense>\n kernel.return\n}\n";
+)"+b.text+" view.store "+b.result+", %out_view[%i] : f32, view<128xf32>\n kernel.return\n}\n";
 }
 inline Result<graph::EmittedKernel> projection(const char* arch,int bits,bool disable_mixed=false) {
  using namespace graph;

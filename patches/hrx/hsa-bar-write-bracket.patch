@@ -1,6 +1,6 @@
-From c6ef968eda7cf14e18eab063d86ba1871900db08 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: geramyloveless <gloveless@jqluv.com>
-Date: Tue, 6 Oct 2026 19:09:05 -0700
+Date: Wed, 7 Oct 2026 19:30:35 -0700
 Subject: [PATCH] [HAL/AMDGPU] Bracket a submission's BAR stores on the macOS
  runtime
 
@@ -18,10 +18,11 @@ mac_hsa_bar_write_end. A physical device opts in before querying
 HSA_AMD_AGENT_INFO_HDP_FLUSH and fails creation if the runtime refuses,
 rather than silently keeping kernel arguments in host memory. The
 writer travels with the kernarg ring's HDP publication, and the host
-queue's submission lock opens one bracket per submission: every kernarg
-write, HDP publication and doorbell already happens under that lock.
-The ring's first-touch store is bracketed too. Profile event records,
-which the CPU writes outside a submission, stay in host memory.
+queue's submission lock, including the transfer transactions', opens one
+bracket per submission: every kernarg write, HDP publication and
+doorbell already happens under that lock. The ring's first-touch store
+is bracketed too. Profile event records, which the CPU writes outside a
+submission, stay in host memory.
 
 Apple silicon maps a BAR as device memory, where every access must be
 aligned to its size. Kernel-argument copies and fills go through
@@ -43,12 +44,14 @@ Builds without IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER are unchanged.
  .../drivers/amdgpu/device/support/common.h    |  4 ++
  .../src/iree/hal/drivers/amdgpu/host_queue.c  | 16 +++---
  .../src/iree/hal/drivers/amdgpu/host_queue.h  | 38 +++++++++++++
- .../iree/hal/drivers/amdgpu/host_queue_blit.c |  8 ++-
+ .../iree/hal/drivers/amdgpu/host_queue_blit.c | 10 ++--
  .../amdgpu/host_queue_command_buffer_replay.c |  4 +-
  .../iree/hal/drivers/amdgpu/host_queue_file.c |  4 +-
- .../hal/drivers/amdgpu/host_queue_pending.c   | 20 +++----
+ .../hal/drivers/amdgpu/host_queue_pending.c   | 16 +++---
  .../amdgpu/host_queue_profile_events.c        |  4 +-
  .../hal/drivers/amdgpu/host_queue_staging.c   |  8 +--
+ .../drivers/amdgpu/host_queue_submission.c    |  3 +-
+ .../hal/drivers/amdgpu/host_queue_transfer.c  | 14 ++---
  .../iree/hal/drivers/amdgpu/kernarg_layout.c  | 17 ++++--
  .../iree/hal/drivers/amdgpu/physical_device.c | 41 +++++++++++++
  .../iree/hal/drivers/amdgpu/physical_device.h |  5 ++
@@ -57,11 +60,11 @@ Builds without IREE_HAL_AMDGPU_MACOS_COARSE_HOST_ADAPTER are unchanged.
  .../hal/drivers/amdgpu/util/kernarg_ring.h    |  7 +++
  .../src/iree/hal/drivers/amdgpu/util/libhsa.c | 16 ++++++
  .../src/iree/hal/drivers/amdgpu/util/libhsa.h | 11 ++++
- 21 files changed, 265 insertions(+), 47 deletions(-)
+ 23 files changed, 272 insertions(+), 55 deletions(-)
  create mode 100644 runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h
 
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt b/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt
-index eaddd8e37..17e5191e1 100644
+index aa34f26e6..01eaa8fb9 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt
 +++ b/runtime/src/iree/hal/drivers/amdgpu/CMakeLists.txt
 @@ -7,6 +7,14 @@
@@ -80,10 +83,10 @@ index eaddd8e37..17e5191e1 100644
  
  if(IREE_HAL_DRIVER_AMDGPU)
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c
-index dc5d9d873..fc6e2f106 100644
+index 75435231c..21a015244 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c
-@@ -488,7 +488,7 @@ static inline void iree_hal_amdgpu_aql_block_processor_copy_dispatch_template(
+@@ -459,7 +459,7 @@ static inline void iree_hal_amdgpu_aql_block_processor_copy_dispatch_template(
    if (kernarg_length > 0) {
      const uint8_t* kernarg_template =
          (const uint8_t*)dispatch_command + dispatch_command->payload_reference;
@@ -92,7 +95,7 @@ index dc5d9d873..fc6e2f106 100644
    }
  }
  
-@@ -856,10 +856,11 @@ iree_hal_amdgpu_aql_block_processor_replay_update_packet_body(
+@@ -832,10 +832,11 @@ iree_hal_amdgpu_aql_block_processor_replay_update_packet_body(
    }
  
    uint8_t* staged_source_bytes = kernarg_data + source_payload_offset;
@@ -105,12 +108,12 @@ index dc5d9d873..fc6e2f106 100644
 +                     update_command->length);
    packet->dispatch.kernarg_address = kernarg_data;
    packet->dispatch.completion_signal = completion_signal;
-   *out_setup = packet->dispatch.setup;
+   return iree_ok_status();
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c
-index 7c3c50e9b..f07690c70 100644
+index 819a13cb0..79a5f4888 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/aql_block_processor_profile.c
-@@ -507,7 +507,7 @@ iree_hal_amdgpu_aql_block_processor_profile_copy_dispatch_template(
+@@ -481,7 +481,7 @@ iree_hal_amdgpu_aql_block_processor_profile_copy_dispatch_template(
    if (kernarg_length > 0) {
      const uint8_t* kernarg_template =
          (const uint8_t*)dispatch_command + dispatch_command->payload_reference;
@@ -119,7 +122,7 @@ index 7c3c50e9b..f07690c70 100644
    }
  }
  
-@@ -847,10 +847,11 @@ iree_hal_amdgpu_aql_block_processor_profile_replay_update_packet_body(
+@@ -827,10 +827,11 @@ iree_hal_amdgpu_aql_block_processor_profile_replay_update_packet_body(
    }
  
    uint8_t* staged_source_bytes = kernarg_data + source_payload_offset;
@@ -132,7 +135,7 @@ index 7c3c50e9b..f07690c70 100644
 +                     update_command->length);
    packet->dispatch.kernarg_address = kernarg_data;
    packet->dispatch.completion_signal = completion_signal;
-   *out_setup = packet->dispatch.setup;
+   return iree_ok_status();
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h b/runtime/src/iree/hal/drivers/amdgpu/device/support/aligned_store.h
 new file mode 100644
 index 000000000..8e1479d46
@@ -197,10 +200,10 @@ index 000000000..8e1479d46
 +
 +#endif  // IREE_HAL_DRIVERS_AMDGPU_DEVICE_SUPPORT_ALIGNED_STORE_H_
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h b/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h
-index e7b328ea7..d342c63aa 100644
+index ea0f85ced..20ed43f10 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h
 +++ b/runtime/src/iree/hal/drivers/amdgpu/device/support/common.h
-@@ -300,6 +300,10 @@ static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE void iree_amdgpu_memset(
+@@ -306,6 +306,10 @@ static inline IREE_AMDGPU_ATTRIBUTE_ALWAYS_INLINE void iree_amdgpu_memset(
    }
  }
  
@@ -212,10 +215,10 @@ index e7b328ea7..d342c63aa 100644
  
  #define iree_amdgpu_memcpy memcpy
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
-index 7538f1dd2..52a0be801 100644
+index 4f22188c0..40266e13d 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue.c
-@@ -46,7 +46,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
+@@ -52,7 +52,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
    iree_hal_amdgpu_host_queue_kernel_submission_t submission;
    bool ready = false;
    uint64_t submission_epoch = 0;
@@ -224,7 +227,7 @@ index 7538f1dd2..52a0be801 100644
    iree_status_t status = iree_hal_amdgpu_host_queue_try_begin_kernel_submission(
        queue, &resolution, iree_hal_semaphore_list_empty(),
        /*operation_resource_count=*/0, /*payload_packet_count=*/1,
-@@ -93,7 +93,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
+@@ -99,7 +99,7 @@ static iree_status_t iree_hal_amdgpu_host_queue_submit_tsan_state_initialize(
      iree_hal_amdgpu_aql_ring_doorbell(&queue->aql_ring,
                                        submission.first_packet_id);
    }
@@ -233,19 +236,19 @@ index 7538f1dd2..52a0be801 100644
    if (iree_status_is_ok(status)) {
      status = iree_hal_amdgpu_host_queue_wait_for_setup_epoch(queue,
                                                               submission_epoch);
-@@ -993,9 +993,9 @@ void iree_hal_amdgpu_host_queue_deinitialize(
-   IREE_ASSERT_ARGUMENT(queue);
-   IREE_TRACE_ZONE_BEGIN(z0);
- 
+@@ -512,9 +512,9 @@ static void iree_hal_amdgpu_host_queue_request_completion_thread_stop(
+ // a published epoch that can no longer advance.
+ static void iree_hal_amdgpu_host_queue_close_submission(
+     iree_hal_amdgpu_host_queue_t* queue) {
 -  iree_slim_mutex_lock(&queue->locks.submission_mutex);
 +  iree_hal_amdgpu_host_queue_lock_submission(queue);
    queue->is_shutting_down = true;
 -  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
 +  iree_hal_amdgpu_host_queue_unlock_submission(queue);
+ }
  
-   iree_hal_amdgpu_host_queue_wait_idle_before_teardown(queue);
- 
-@@ -1186,7 +1186,7 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_begin(
+ void iree_hal_amdgpu_host_queue_record_failure(
+@@ -1404,7 +1404,7 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_begin(
    out_submission->ready = true;
    out_submission->wait_for_capacity = false;
  
@@ -254,7 +257,7 @@ index 7538f1dd2..52a0be801 100644
    iree_hal_amdgpu_host_queue_resolve_waits(queue, wait_semaphore_list,
                                             &out_submission->resolution);
  }
-@@ -1203,7 +1203,7 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_defer_for_capacity(
+@@ -1421,7 +1421,7 @@ static inline void iree_hal_amdgpu_host_queue_op_submission_defer_for_capacity(
  static inline iree_status_t iree_hal_amdgpu_host_queue_op_submission_end(
      iree_hal_amdgpu_host_queue_op_submission_t* submission,
      iree_status_t status) {
@@ -263,7 +266,7 @@ index 7538f1dd2..52a0be801 100644
  
    if (iree_status_is_ok(status) && submission->deferred_op) {
      status = iree_hal_amdgpu_pending_op_start(submission->deferred_op,
-@@ -1298,12 +1298,12 @@ static iree_status_t iree_hal_amdgpu_host_queue_validate_buffer_state(
+@@ -1526,12 +1526,12 @@ static iree_status_t iree_hal_amdgpu_host_queue_validate_buffer_state(
  static iree_status_t iree_hal_amdgpu_host_queue_signal_empty_barrier(
      iree_hal_amdgpu_host_queue_t* queue,
      const iree_hal_semaphore_list_t signal_semaphore_list) {
@@ -279,10 +282,10 @@ index 7538f1dd2..52a0be801 100644
    if (iree_status_is_ok(status)) {
      // Signal outside submission_mutex: semaphore signaling dispatches satisfied
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue.h b/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
-index bd036be48..46705efee 100644
+index c17c4e3e1..a2f19d070 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue.h
-@@ -309,6 +309,11 @@ typedef struct iree_hal_amdgpu_host_queue_t {
+@@ -475,6 +475,11 @@ typedef struct iree_hal_amdgpu_host_queue_t {
      // Serializes the post-drain continuation list.
      iree_slim_mutex_t post_drain_mutex;
    } locks;
@@ -294,9 +297,9 @@ index bd036be48..46705efee 100644
  
    // Post-drain continuation queue for work that cannot run while notification
    // drain is still publishing or reclaiming ring state.
-@@ -699,6 +704,39 @@ iree_status_t iree_hal_amdgpu_host_queue_initialize(
-     uint32_t upload_capacity, iree_allocator_t host_allocator,
-     iree_hal_amdgpu_host_queue_t* out_queue);
+@@ -891,6 +896,39 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_write(
+     iree_hal_file_t* target_file, uint64_t target_offset,
+     iree_device_size_t length, iree_hal_write_flags_t flags);
  
 +// Acquires the submission lock. With kernel arguments in CPU-visible VRAM
 +// on the mac_linuxgpu runtime, every host store into the BARs a submission
@@ -335,26 +338,28 @@ index bd036be48..46705efee 100644
  //
  // This is called after queue creation when logical TSAN is enabled. The queue
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c
-index d4aaff95a..593e0eb8a 100644
+index 07e3c028b..cd66a9d08 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_blit.c
-@@ -652,7 +652,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_copy_with_action(
-       &profile_event_info, out_ready, &submission));
-   if (!*out_ready) return iree_ok_status();
+@@ -792,8 +792,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_copy_with_action(
+     return iree_ok_status();
+   }
  
--  memcpy(submission.kernel.kernargs.blocks->data, &kernargs, sizeof(kernargs));
+-  memcpy(submission.kernel.kernargs.blocks->data, &kernargs,
+-         IREE_HAL_AMDGPU_DEVICE_BUFFER_COPY_KERNARG_SIZE);
 +  iree_amdgpu_memcpy(submission.kernel.kernargs.blocks->data, &kernargs,
-+                     sizeof(kernargs));
++                     IREE_HAL_AMDGPU_DEVICE_BUFFER_COPY_KERNARG_SIZE);
    submission.dispatch_setup =
        iree_hal_amdgpu_host_queue_write_dispatch_packet_body(
            &submission.dispatch_slot->dispatch, &dispatch_packet,
-@@ -844,11 +845,12 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_update(
+@@ -1026,12 +1026,12 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_update_with_action(
  
    uint8_t* staged_source_bytes =
        (uint8_t*)submission.kernel.kernargs.blocks + source_payload_offset;
--  memcpy(submission.kernel.kernargs.blocks->data, &kernargs, sizeof(kernargs));
+-  memcpy(submission.kernel.kernargs.blocks->data, &kernargs,
+-         IREE_HAL_AMDGPU_DEVICE_BUFFER_COPY_KERNARG_SIZE);
 +  iree_amdgpu_memcpy(submission.kernel.kernargs.blocks->data, &kernargs,
-+                     sizeof(kernargs));
++                     IREE_HAL_AMDGPU_DEVICE_BUFFER_COPY_KERNARG_SIZE);
    ((iree_hal_amdgpu_device_buffer_copy_kernargs_t*)
         submission.kernel.kernargs.blocks->data)
        ->source_ptr = staged_source_bytes;
@@ -364,10 +369,10 @@ index d4aaff95a..593e0eb8a 100644
        iree_hal_amdgpu_host_queue_write_dispatch_packet_body(
            &submission.dispatch_slot->dispatch, &dispatch_packet,
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c
-index dd87c0700..2c607c6fb 100644
+index b4c570a92..62b500b52 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_command_buffer_replay.c
-@@ -374,11 +374,11 @@ static iree_status_t iree_hal_amdgpu_command_buffer_replay_resume_under_lock(
+@@ -384,11 +384,11 @@ static iree_status_t iree_hal_amdgpu_command_buffer_replay_resume_under_lock(
  static void iree_hal_amdgpu_command_buffer_replay_post_drain(void* user_data) {
    iree_hal_amdgpu_command_buffer_replay_t* replay =
        (iree_hal_amdgpu_command_buffer_replay_t*)user_data;
@@ -382,10 +387,10 @@ index dd87c0700..2c607c6fb 100644
      iree_hal_amdgpu_command_buffer_replay_fail_signals(replay, status);
    }
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c
-index 915153c5a..9eb04d3e3 100644
+index 197be994a..f45ee7951 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_file.c
-@@ -242,7 +242,7 @@ static iree_status_t iree_hal_amdgpu_file_action_submit_signal_barrier(
+@@ -184,7 +184,7 @@ static iree_status_t iree_hal_amdgpu_file_action_submit_signal_barrier(
    resolution.inline_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
    resolution.barrier_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
  
@@ -394,7 +399,7 @@ index 915153c5a..9eb04d3e3 100644
    bool ready = false;
    uint64_t submission_id = 0;
    iree_hal_amdgpu_host_queue_profile_event_info_t profile_event_info = {
-@@ -273,7 +273,7 @@ static iree_status_t iree_hal_amdgpu_file_action_submit_signal_barrier(
+@@ -215,7 +215,7 @@ static iree_status_t iree_hal_amdgpu_file_action_submit_signal_barrier(
          state->queue, &state->signal_capacity_retry,
          iree_hal_amdgpu_file_action_signal_capacity_post_drain, state);
    }
@@ -404,10 +409,10 @@ index 915153c5a..9eb04d3e3 100644
  }
  
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c
-index b50c44ddd..3881bcb18 100644
+index 10bbff764..bd7361b1e 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_pending.c
-@@ -957,7 +957,7 @@ iree_status_t iree_hal_amdgpu_pending_op_allocate(
+@@ -969,7 +969,7 @@ iree_status_t iree_hal_amdgpu_pending_op_allocate(
  // submission_mutex to emit AQL packets and commit signals.
  static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
    iree_hal_amdgpu_host_queue_t* queue = op->queue;
@@ -416,7 +421,7 @@ index b50c44ddd..3881bcb18 100644
  
    iree_status_t status = iree_ok_status();
    iree_hal_amdgpu_pending_op_payload_issue_t issue = {
-@@ -987,7 +987,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+@@ -1003,7 +1003,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
      resolution.barrier_acquire_scope = IREE_HSA_FENCE_SCOPE_NONE;
      status = iree_hal_amdgpu_pending_op_issue_payload(op, &resolution, &issue);
      if (iree_status_is_ok(status) && issue.memory_wait_op) {
@@ -425,7 +430,7 @@ index b50c44ddd..3881bcb18 100644
        iree_hal_amdgpu_pending_op_enqueue_alloca_memory_wait(
            issue.memory_wait_op);
        return;
-@@ -996,7 +996,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+@@ -1012,7 +1012,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
  
    if (iree_status_is_ok(status) && !issue.ready) {
      iree_hal_amdgpu_pending_op_enqueue_capacity_retry(op);
@@ -434,7 +439,7 @@ index b50c44ddd..3881bcb18 100644
      return;
    }
  
-@@ -1017,7 +1017,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
+@@ -1033,7 +1033,7 @@ static void iree_hal_amdgpu_pending_op_issue(iree_hal_amdgpu_pending_op_t* op) {
    iree_notification_deinitialize(&op->callback_notification);
    iree_arena_deinitialize(&op->arena);
  
@@ -443,7 +448,7 @@ index b50c44ddd..3881bcb18 100644
  }
  
  // Fails a deferred operation. Propagates the error to all signal semaphores
-@@ -1037,9 +1037,9 @@ static void iree_hal_amdgpu_pending_op_fail(iree_hal_amdgpu_pending_op_t* op,
+@@ -1053,9 +1053,9 @@ static void iree_hal_amdgpu_pending_op_fail(iree_hal_amdgpu_pending_op_t* op,
    iree_hal_amdgpu_pending_op_release_retained(op);
    // Release wait semaphores (separately retained by the clone).
    iree_hal_semaphore_list_release(op->wait_semaphore_list);
@@ -455,16 +460,8 @@ index b50c44ddd..3881bcb18 100644
    iree_notification_deinitialize(&op->callback_notification);
    iree_arena_deinitialize(&op->arena);
  }
-@@ -1051,13 +1051,13 @@ static void iree_hal_amdgpu_pending_op_fail(iree_hal_amdgpu_pending_op_t* op,
- void iree_hal_amdgpu_host_queue_cancel_pending(
-     iree_hal_amdgpu_host_queue_t* queue, iree_status_code_t status_code,
-     const char* status_message) {
--  iree_slim_mutex_lock(&queue->locks.submission_mutex);
-+  iree_hal_amdgpu_host_queue_lock_submission(queue);
-   queue->is_shutting_down = true;
--  iree_slim_mutex_unlock(&queue->locks.submission_mutex);
-+  iree_hal_amdgpu_host_queue_unlock_submission(queue);
- 
+@@ -1064,7 +1064,7 @@ void iree_hal_amdgpu_host_queue_cancel_pending(
+     iree_hal_amdgpu_host_queue_t* queue, const iree_status_t failure_status) {
    for (;;) {
      iree_hal_amdgpu_pending_op_t* op = NULL;
 -    iree_slim_mutex_lock(&queue->locks.submission_mutex);
@@ -472,7 +469,7 @@ index b50c44ddd..3881bcb18 100644
      for (iree_hal_amdgpu_pending_op_t* candidate = queue->pending_head;
           candidate != NULL; candidate = candidate->next) {
        int32_t expected_state = IREE_HAL_AMDGPU_PENDING_OP_LIFECYCLE_PENDING;
-@@ -1071,7 +1071,7 @@ void iree_hal_amdgpu_host_queue_cancel_pending(
+@@ -1078,7 +1078,7 @@ void iree_hal_amdgpu_host_queue_cancel_pending(
        }
      }
      bool has_pending_ops = queue->pending_head != NULL;
@@ -480,12 +477,12 @@ index b50c44ddd..3881bcb18 100644
 +    iree_hal_amdgpu_host_queue_unlock_submission(queue);
  
      if (op == NULL) {
-       if (!has_pending_ops) break;
+       if (!has_pending_ops) {
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
-index 2b6dead38..5ef806063 100644
+index a9732739e..c83c85393 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_profile_events.c
-@@ -90,7 +90,7 @@ iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
+@@ -93,7 +93,7 @@ iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
    iree_hal_amdgpu_wait_resolution_t resolution;
    bool ready = false;
    uint64_t submission_epoch = 0;
@@ -494,7 +491,7 @@ index 2b6dead38..5ef806063 100644
    iree_hal_amdgpu_host_queue_resolve_waits(
        queue, iree_hal_semaphore_list_empty(), &resolution);
    iree_status_t status = iree_hal_amdgpu_host_queue_submit_dispatch_packet(
-@@ -100,7 +100,7 @@ iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
+@@ -103,7 +103,7 @@ iree_hal_amdgpu_host_queue_initialize_profiling_completion_signals(
        IREE_HSA_FENCE_SCOPE_SYSTEM, /*profile_queue_event_info=*/NULL,
        IREE_HAL_AMDGPU_HOST_QUEUE_SUBMISSION_FLAG_NONE, &ready,
        &submission_epoch);
@@ -504,10 +501,10 @@ index 2b6dead38..5ef806063 100644
      status = iree_make_status(
          IREE_STATUS_RESOURCE_EXHAUSTED,
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c
-index ba2b3f882..f0167dfd7 100644
+index 8db0ff3ae..8e59da3a4 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_staging.c
-@@ -658,7 +658,7 @@ static iree_status_t iree_hal_amdgpu_staging_transfer_submit_signal_barrier(
+@@ -681,7 +681,7 @@ static iree_status_t iree_hal_amdgpu_staging_transfer_submit_signal_barrier(
    resolution.inline_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
    resolution.barrier_acquire_scope = IREE_HSA_FENCE_SCOPE_SYSTEM;
  
@@ -516,7 +513,7 @@ index ba2b3f882..f0167dfd7 100644
    bool ready = false;
    uint64_t submission_id = 0;
    iree_hal_amdgpu_host_queue_profile_event_info_t profile_event_info = {
-@@ -690,7 +690,7 @@ static iree_status_t iree_hal_amdgpu_staging_transfer_submit_signal_barrier(
+@@ -718,7 +718,7 @@ static iree_status_t iree_hal_amdgpu_staging_transfer_submit_signal_barrier(
          transfer->queue, &transfer->signal_capacity_retry,
          iree_hal_amdgpu_staging_signal_capacity_post_drain, transfer);
    }
@@ -525,7 +522,7 @@ index ba2b3f882..f0167dfd7 100644
    return status;
  }
  
-@@ -846,7 +846,7 @@ static iree_status_t iree_hal_amdgpu_staging_chunk_submit_copy(
+@@ -885,7 +885,7 @@ static iree_status_t iree_hal_amdgpu_staging_chunk_submit_copy(
    }
  
    iree_hal_resource_t* extra_resources[1] = {&transfer->resource};
@@ -534,7 +531,7 @@ index ba2b3f882..f0167dfd7 100644
    bool ready = false;
    iree_status_t status = iree_hal_amdgpu_host_queue_submit_copy_with_action(
        transfer->queue, &resolution, iree_hal_semaphore_list_empty(),
-@@ -864,7 +864,7 @@ static iree_status_t iree_hal_amdgpu_staging_chunk_submit_copy(
+@@ -903,7 +903,7 @@ static iree_status_t iree_hal_amdgpu_staging_chunk_submit_copy(
          transfer->queue, &chunk->post_drain_action,
          iree_hal_amdgpu_staging_copy_capacity_post_drain, chunk);
    }
@@ -543,8 +540,83 @@ index ba2b3f882..f0167dfd7 100644
    return status;
  }
  
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_submission.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_submission.c
+index dfea378dd..5951a4566 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_submission.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_submission.c
+@@ -1336,7 +1336,8 @@ iree_status_t iree_hal_amdgpu_host_queue_submit_dispatch_packet_with_action(
+     return iree_ok_status();
+   }
+ 
+-  memcpy(submission.kernel.kernargs.blocks->data, kernargs, kernarg_length);
++  iree_amdgpu_memcpy(submission.kernel.kernargs.blocks->data, kernargs,
++                     kernarg_length);
+   submission.dispatch_setup =
+       iree_hal_amdgpu_host_queue_write_dispatch_packet_body(
+           &submission.dispatch_slot->dispatch, dispatch_packet_template,
+diff --git a/runtime/src/iree/hal/drivers/amdgpu/host_queue_transfer.c b/runtime/src/iree/hal/drivers/amdgpu/host_queue_transfer.c
+index d42d43cc7..62c4e0214 100644
+--- a/runtime/src/iree/hal/drivers/amdgpu/host_queue_transfer.c
++++ b/runtime/src/iree/hal/drivers/amdgpu/host_queue_transfer.c
+@@ -369,7 +369,7 @@ static void iree_hal_amdgpu_transfer_publish_signals(
+ 
+   iree_hal_amdgpu_wait_resolution_t resolution;
+   memset(&resolution, 0, sizeof(resolution));
+-  iree_slim_mutex_lock(&transaction->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(transaction->queue);
+   bool ready = false;
+   status = iree_hal_amdgpu_host_queue_try_submit_barrier(
+       transaction->queue, &resolution, transaction->signal_semaphore_list,
+@@ -386,7 +386,7 @@ static void iree_hal_amdgpu_transfer_publish_signals(
+         transaction->queue, &transaction->signal_post_drain,
+         iree_hal_amdgpu_transfer_signal_post_drain, transaction);
+   }
+-  iree_slim_mutex_unlock(&transaction->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(transaction->queue);
+   if (!iree_status_is_ok(status)) {
+     iree_hal_amdgpu_transfer_fail_signals(transaction, status);
+   }
+@@ -505,7 +505,7 @@ static void iree_hal_amdgpu_transfer_child_capacity_post_drain(
+   iree_hal_amdgpu_transfer_child_t* child =
+       (iree_hal_amdgpu_transfer_child_t*)user_data;
+   iree_hal_amdgpu_transfer_transaction_t* transaction = child->transaction;
+-  iree_slim_mutex_lock(&transaction->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(transaction->queue);
+   bool ready = false;
+   // A recorded failure outranks the closed admission observed by a capacity
+   // retry resumed from the terminal transition's post-drain flush.
+@@ -521,7 +521,7 @@ static void iree_hal_amdgpu_transfer_child_capacity_post_drain(
+         transaction->queue, &child->capacity_post_drain,
+         iree_hal_amdgpu_transfer_child_capacity_post_drain, child);
+   }
+-  iree_slim_mutex_unlock(&transaction->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(transaction->queue);
+   if (!iree_status_is_ok(status)) {
+     iree_hal_amdgpu_transfer_child_finish(child, status);
+   }
+@@ -538,9 +538,9 @@ static void iree_hal_amdgpu_transfer_enqueue_capacity_retry(
+ 
+ static iree_status_t iree_hal_amdgpu_transfer_start(
+     iree_hal_amdgpu_transfer_transaction_t* transaction) {
+-  iree_slim_mutex_lock(&transaction->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_lock_submission(transaction->queue);
+   if (IREE_UNLIKELY(transaction->queue->is_shutting_down)) {
+-    iree_slim_mutex_unlock(&transaction->queue->locks.submission_mutex);
++    iree_hal_amdgpu_host_queue_unlock_submission(transaction->queue);
+     return iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
+   }
+   for (iree_host_size_t i = 0; i < transaction->operation_count; ++i) {
+@@ -561,7 +561,7 @@ static iree_status_t iree_hal_amdgpu_transfer_start(
+       iree_hal_amdgpu_transfer_enqueue_capacity_retry(child);
+     }
+   }
+-  iree_slim_mutex_unlock(&transaction->queue->locks.submission_mutex);
++  iree_hal_amdgpu_host_queue_unlock_submission(transaction->queue);
+ 
+   for (iree_host_size_t i = 0; i < transaction->operation_count; ++i) {
+     iree_hal_amdgpu_transfer_child_t* child = &transaction->children[i];
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c b/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c
-index 75f567dde..bd0376a49 100644
+index 8eb034580..adff2c0b0 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/kernarg_layout.c
 @@ -6,6 +6,8 @@
@@ -556,7 +628,7 @@ index 75f567dde..bd0376a49 100644
  #include <string.h>
  
  //===----------------------------------------------------------------------===//
-@@ -387,7 +389,7 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
+@@ -411,7 +413,7 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
    if (iree_any_bit_set(
            layout->flags,
            IREE_HAL_AMDGPU_KERNARG_LAYOUT_FLAG_REQUIRES_ZERO_FILL)) {
@@ -565,7 +637,7 @@ index 75f567dde..bd0376a49 100644
    }
  
    const iree_hal_amdgpu_kernarg_binding_slot_t* binding_slots =
-@@ -395,11 +397,13 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
+@@ -419,11 +421,13 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
    if (iree_any_bit_set(
            layout->flags,
            IREE_HAL_AMDGPU_KERNARG_LAYOUT_FLAG_PACKED_BINDING_PREFIX)) {
@@ -582,7 +654,7 @@ index 75f567dde..bd0376a49 100644
      }
    }
  
-@@ -407,7 +411,8 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
+@@ -431,7 +435,8 @@ void iree_hal_amdgpu_kernarg_layout_emplace_explicit_args(
        iree_hal_amdgpu_kernarg_layout_constant_spans(layout);
    for (iree_host_size_t i = 0; i < layout->constant_span_count; ++i) {
      const iree_hal_amdgpu_kernarg_constant_span_t span = constant_spans[i];
@@ -594,10 +666,10 @@ index 75f567dde..bd0376a49 100644
    }
  }
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device.c b/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
-index 60007355d..8e0acf86b 100644
+index f64e98344..08b3b1d9c 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device.c
-@@ -945,6 +945,26 @@ iree_status_t iree_hal_amdgpu_physical_device_initialize(
+@@ -1140,6 +1140,26 @@ iree_status_t iree_hal_amdgpu_physical_device_initialize(
      status = iree_hal_amdgpu_query_workgroup_cluster_capabilities(
          libhsa, device_agent, &out_physical_device->workgroup_cluster);
    }
@@ -624,7 +696,7 @@ index 60007355d..8e0acf86b 100644
    if (iree_status_is_ok(status)) {
      out_physical_device->hdp_flush =
          iree_hal_amdgpu_physical_device_query_hdp_flush_registers(libhsa,
-@@ -1028,6 +1048,21 @@ iree_status_t iree_hal_amdgpu_physical_device_initialize(
+@@ -1223,6 +1243,21 @@ iree_status_t iree_hal_amdgpu_physical_device_initialize(
              &system->topology,
              &out_physical_device->cpu_visible_device_coarse_memory);
    }
@@ -646,7 +718,7 @@ index 60007355d..8e0acf86b 100644
    if (iree_status_is_ok(status)) {
      status =
          iree_hal_amdgpu_physical_device_initialize_memory_system_capabilities(
-@@ -1189,8 +1224,14 @@ iree_status_t iree_hal_amdgpu_physical_device_assign_frontier(
+@@ -1380,8 +1415,14 @@ static void iree_hal_amdgpu_physical_device_initialize_host_queue_construction(
    // without fine-grained memory can still profile. Otherwise fall back to
    // shared host-fine memory, which remains CPU-writable and device-visible on
    // platforms where fine device memory is not directly host-accessible.
@@ -662,10 +734,10 @@ index 60007355d..8e0acf86b 100644
          physical_device->cpu_visible_device_coarse_memory.memory_pool;
      profiling_memory.event_access_agents =
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/physical_device.h b/runtime/src/iree/hal/drivers/amdgpu/physical_device.h
-index 8cdec46f1..9c1f61b33 100644
+index 167874746..b7e31506b 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/physical_device.h
 +++ b/runtime/src/iree/hal/drivers/amdgpu/physical_device.h
-@@ -226,6 +226,11 @@ typedef struct iree_hal_amdgpu_physical_device_t {
+@@ -246,6 +246,11 @@ typedef struct iree_hal_amdgpu_physical_device_t {
    uint64_t timestamp_frequency_hz;
    // HDP flush register descriptor reported by HSA for this GPU agent.
    hsa_amd_hdp_flush_t hdp_flush;
@@ -678,10 +750,10 @@ index 8cdec46f1..9c1f61b33 100644
    iree_hal_amdgpu_host_memory_pools_t host_memory_pools;
    // Cold memory-system facts used to derive conservative topology flags.
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
-index 4b863b01f..2d2dd7428 100644
+index b2337675a..66f0e59e3 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/profile_counters.c
-@@ -2233,7 +2233,7 @@ iree_status_t iree_hal_amdgpu_host_queue_start_profile_counter_ranges(
+@@ -2247,7 +2247,7 @@ iree_status_t iree_hal_amdgpu_host_queue_start_profile_counter_ranges(
    IREE_RETURN_IF_ERROR(
        iree_hal_amdgpu_host_queue_profile_counter_range_start_packet_count(
            queue, &packet_count));
@@ -690,7 +762,7 @@ index 4b863b01f..2d2dd7428 100644
    iree_status_t status = iree_ok_status();
    if (IREE_UNLIKELY(queue->is_shutting_down)) {
      status = iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
-@@ -2248,7 +2248,7 @@ iree_status_t iree_hal_amdgpu_host_queue_start_profile_counter_ranges(
+@@ -2262,7 +2262,7 @@ iree_status_t iree_hal_amdgpu_host_queue_start_profile_counter_ranges(
                                        first_packet_id + packet_count - 1u);
      queue->profiling.counters.ranges.is_active = true;
    }
@@ -699,7 +771,7 @@ index 4b863b01f..2d2dd7428 100644
    return status;
  }
  
-@@ -2691,7 +2691,7 @@ iree_status_t iree_hal_amdgpu_host_queue_flush_profile_counter_ranges(
+@@ -2705,7 +2705,7 @@ iree_status_t iree_hal_amdgpu_host_queue_flush_profile_counter_ranges(
        &completion_signal));
  
    uint32_t stopped_bank = 0;
@@ -708,7 +780,7 @@ index 4b863b01f..2d2dd7428 100644
    iree_status_t status = iree_ok_status();
    if (IREE_UNLIKELY(queue->is_shutting_down)) {
      status = iree_make_status(IREE_STATUS_CANCELLED, "queue shutting down");
-@@ -2718,7 +2718,7 @@ iree_status_t iree_hal_amdgpu_host_queue_flush_profile_counter_ranges(
+@@ -2732,7 +2732,7 @@ iree_status_t iree_hal_amdgpu_host_queue_flush_profile_counter_ranges(
      iree_hal_amdgpu_aql_ring_doorbell(&queue->aql_ring,
                                        first_packet_id + packet_count - 1u);
    }
@@ -770,7 +842,7 @@ index f2a751649..724fbc764 100644
  
  // Memory backing policy for a queue-owned kernarg ring.
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
-index ab1d3837c..30c25d8ec 100644
+index 5fa955939..90b19ccb4 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
 +++ b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.c
 @@ -245,6 +245,22 @@ static iree_status_t iree_hal_amdgpu_libhsa_load_symbols(
@@ -797,7 +869,7 @@ index ab1d3837c..30c25d8ec 100644
  }
  
 diff --git a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h
-index a906f3574..5ff054fc1 100644
+index 272ec0a3b..a606e24c8 100644
 --- a/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h
 +++ b/runtime/src/iree/hal/drivers/amdgpu/util/libhsa.h
 @@ -129,6 +129,17 @@ typedef struct iree_hal_amdgpu_libhsa_t {
@@ -818,6 +890,3 @@ index a906f3574..5ff054fc1 100644
  } iree_hal_amdgpu_libhsa_t;
  
  // Initializes |out_libhsa| in-place with dynamically loaded HSA symbols.
--- 
-2.51.0
-

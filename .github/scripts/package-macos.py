@@ -106,16 +106,13 @@ def main():
         'lse': run('git', '-C', str(root), 'rev-parse', 'HEAD').strip(),
         # LSE's HRX patch series, in the order build-macos.sh applies it.
         'hrx_patches': {name: hashlib.sha256((root / 'patches/hrx' / f'{name}.patch').read_bytes()).hexdigest()
-                        for name in ('macos-coarse-host-adapter', 'symbolic-memo-touched-reset',
-                                     'gfx12-vopd-identical-source', 'kv-fragment-addressing',
-                                     'cooperative-matrix-operands', 'loop-invariant-motion',
-                                     'rdna4-prefetch-address-span', 'loom-grow-arrays-only-when-full',
-                                     'gfx120x-hdp-kernarg-publication', 'hsa-bar-write-bracket',
-                                     'loom-vmem-load-latency', 'loom-allocation-entry-preamble',
-                                     'loom-terminal-spill-register-requirements',
-                                     'loom-spill-materialization-converges',
-                                     'loom-vmem-sources-at-issue', 'loom-scalar-source-capture',
-                                     'loom-issue-sources-gfx11')},
+                        for name in ('loom-concat-destination-reserved-once', 'stream-queue-affinity',
+                                     'macos-coarse-host-adapter',
+                                     'kv-fragment-addressing',
+                                     'gpu-device-group-and-device-import',
+                                     'gfx120x-hdp-kernarg-publication',
+                                     'hsa-bar-write-bracket',
+                                     'gfx12-vopd-identical-source')},
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
     }
@@ -202,7 +199,6 @@ def main():
         'jit_cache_build_inputs': build_inputs,
         'hrx_patch_directory': 'patches/hrx',
         'hrx_adapter_patch_sha256': build_inputs['hrx_patches']['macos-coarse-host-adapter'],
-        'loom_symbolic_memo_patch_sha256': build_inputs['hrx_patches']['symbolic-memo-touched-reset'],
         'kv_fragment_patch_sha256': build_inputs['hrx_patches']['kv-fragment-addressing'],
         'loom_vopd_patch_sha256': build_inputs['hrx_patches']['gfx12-vopd-identical-source'],
     }

@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: geramyloveless <gloveless@jqluv.com>
+Date: Wed, 7 Oct 2026 19:23:56 -0700
+Subject: [PATCH] [HRX] Stream queue affinity and a narrower dispatch barrier
+
+A stream now carries the hardware queue its submissions run on.
+hrx_stream_create_on_queue takes a queue affinity bitmask and resolves it
+to one provisioned HAL queue with transfer and dispatch roles; that
+stream's command buffers, flushes, timeline barriers and stream-ordered
+allocations are all issued there. Affinity is fixed at creation because a
+command buffer is recorded for the queue family it later runs on. A bit
+naming a queue the device does not have returns HRX_STATUS_OUT_OF_RANGE.
+hrx_stream_create passes zero, which keeps the device's dispatch queue.
+
+HRX_DEVICE_PROPERTY_QUEUE_COUNT reports how many queues a device can name
+individually: the provisioned queues of every family, flattened
+family-major, which is the bit space hrx_hal_device_select_queue reads.
+
+hrx_stream_dispatch records a dispatch to dispatch barrier carrying write
+to read visibility in place of the full ordering barrier. The ordering
+barrier drained the pipeline between every kernel, and a decode pass
+issues hundreds of them.
+---
+ libhrx/cmake/hrx_exports_macos.txt |  2 +
+ libhrx/include/hrx_runtime.h       | 22 +++++++++
+ libhrx/src/libhrx/buffer.c         |  2 +-
+ libhrx/src/libhrx/device.c         | 25 +++++++++++
+ libhrx/src/libhrx/hrx_internal.h   | 11 +++++
+ libhrx/src/libhrx/stream.c         | 71 ++++++++++++++++++++++++++++--
+ 6 files changed, 128 insertions(+), 5 deletions(-)
+
+diff --git a/libhrx/cmake/hrx_exports_macos.txt b/libhrx/cmake/hrx_exports_macos.txt
+index 98ee7c9cd..27af862e4 100644
+--- a/libhrx/cmake/hrx_exports_macos.txt
++++ b/libhrx/cmake/hrx_exports_macos.txt
+@@ -39,6 +39,8 @@ _hrx_semaphore_query
+ _hrx_semaphore_wait
+ _hrx_semaphore_signal
+ _hrx_stream_create
++_hrx_stream_create_on_queue
++_hrx_stream_get_queue_affinity
+ _hrx_stream_retain
+ _hrx_stream_release
+ _hrx_stream_synchronize
+diff --git a/libhrx/include/hrx_runtime.h b/libhrx/include/hrx_runtime.h
+index 3ab724db8..6168bf0da 100644
+--- a/libhrx/include/hrx_runtime.h
++++ b/libhrx/include/hrx_runtime.h
+@@ -187,6 +187,9 @@ typedef enum hrx_device_property_t {
+   HRX_DEVICE_PROPERTY_MAX_SHARED_MEMORY,
+   HRX_DEVICE_PROPERTY_CLOCK_RATE,
+   HRX_DEVICE_PROPERTY_PCI_BUS_ID,
++  // uint32_t. Hardware queues that can be named individually; defines the
++  // valid bit range of a hrx_queue_affinity_t on this device.
++  HRX_DEVICE_PROPERTY_QUEUE_COUNT,
+ } hrx_device_property_t;
+ 
+ // Memory type bitfield. Values match iree_hal_memory_type_t.
+@@ -571,6 +574,21 @@ HRX_API hrx_status_t hrx_semaphore_signal(hrx_semaphore_t semaphore,
+ HRX_API hrx_status_t hrx_stream_create(hrx_device_t device, uint32_t flags,
+                                        hrx_stream_t* stream);
+ 
++// Creates a stream whose every submission is issued on |queue_affinity|: its
++// command buffers, flushes, timeline barriers and stream-ordered allocations.
++// Zero is what hrx_stream_create() passes and leaves the queue to the
++// implementation.
++//
++// The affinity is fixed at creation because a command buffer is recorded for
++// the queue it will later run on; a stream that recorded on one queue and
++// submitted on another would be recorded against the wrong physical device.
++//
++// Returns HRX_STATUS_OUT_OF_RANGE if a bit names a queue the device does not
++// have.
++HRX_API hrx_status_t hrx_stream_create_on_queue(
++    hrx_device_t device, uint32_t flags, hrx_queue_affinity_t queue_affinity,
++    hrx_stream_t* stream);
++
+ HRX_API void hrx_stream_retain(hrx_stream_t stream);
+ HRX_API void hrx_stream_release(hrx_stream_t stream);
+ 
+@@ -593,6 +611,10 @@ HRX_API hrx_status_t hrx_stream_get_semaphore(hrx_stream_t stream,
+ HRX_API hrx_status_t hrx_stream_get_device(hrx_stream_t stream,
+                                            hrx_device_t* device);
+ 
++// Returns the affinity the stream was created with; zero means any queue.
++HRX_API hrx_status_t hrx_stream_get_queue_affinity(
++    hrx_stream_t stream, hrx_queue_affinity_t* queue_affinity);
++
+ HRX_API hrx_status_t hrx_stream_get_timeline_position(
+     hrx_stream_t stream, hrx_timeline_point_t* position);
+ 
+diff --git a/libhrx/src/libhrx/buffer.c b/libhrx/src/libhrx/buffer.c
+index 8cdb57efe..6dfb08b1b 100644
+--- a/libhrx/src/libhrx/buffer.c
++++ b/libhrx/src/libhrx/buffer.c
+@@ -130,7 +130,7 @@ hrx_status_t hrx_buffer_allocate(hrx_stream_t stream, size_t size,
+         .allocation_size = (iree_device_size_t)size,
+     };
+     status = iree_hal_queue_alloca(
+-        stream->device->transfer_queue, wait_list, signal_list, buf->hal_pool,
++        stream->hal_queue, wait_list, signal_list, buf->hal_pool,
+         /*request_count=*/1, &request, &buf->hal_buffer);
+   }
+   if (iree_status_is_ok(status)) {
+diff --git a/libhrx/src/libhrx/device.c b/libhrx/src/libhrx/device.c
+index 83174a33d..c269786aa 100644
+--- a/libhrx/src/libhrx/device.c
++++ b/libhrx/src/libhrx/device.c
+@@ -39,6 +39,24 @@ hrx_status_t hrx_device_query_total_memory_from_spec(
+   return hrx_ok_status();
+ }
+ 
++hrx_status_t hrx_device_query_queue_count(hrx_device_t device,
++                                          uint32_t* out_count) {
++  if (!device || !out_count) {
++    return hrx_make_status(HRX_STATUS_INVALID_ARGUMENT, "NULL argument");
++  }
++  const iree_hal_device_queue_spec_t* queues =
++      iree_hal_device_spec_queues(iree_hal_device_spec(device->hal_device));
++  uint64_t total = 0;
++  for (iree_host_size_t i = 0; queues && i < queues->family_count; ++i) {
++    total += queues->families[i].provisioned_queue_count;
++  }
++  // A queue past the width of an affinity mask cannot be named at all.
++  const uint64_t affinity_bits = sizeof(hrx_queue_affinity_t) * 8;
++  if (total > affinity_bits) total = affinity_bits;
++  *out_count = total > 0 ? (uint32_t)total : 1u;
++  return hrx_ok_status();
++}
++
+ static hrx_status_t hrx_device_sample_memory(
+     hrx_device_t device, iree_device_size_t* out_total,
+     iree_device_size_t* out_available) {
+@@ -121,6 +139,13 @@ hrx_status_t hrx_device_get_property(hrx_device_t device,
+       *(uint64_t*)value = (uint64_t)total_bytes;
+       return status;
+     }
++    case HRX_DEVICE_PROPERTY_QUEUE_COUNT: {
++      if (value_size < sizeof(uint32_t)) {
++        return hrx_make_status(HRX_STATUS_OUT_OF_RANGE,
++                               "buffer too small for uint32_t");
++      }
++      return hrx_device_query_queue_count(device, (uint32_t*)value);
++    }
+     case HRX_DEVICE_PROPERTY_COMPUTE_UNITS:
+     case HRX_DEVICE_PROPERTY_MAX_WORKGROUP_SIZE: {
+       if (value_size < sizeof(uint32_t)) {
+diff --git a/libhrx/src/libhrx/hrx_internal.h b/libhrx/src/libhrx/hrx_internal.h
+index 72648f689..279a104b6 100644
+--- a/libhrx/src/libhrx/hrx_internal.h
++++ b/libhrx/src/libhrx/hrx_internal.h
+@@ -289,6 +289,9 @@ typedef struct hrx_stream_s {
+   iree_hal_command_buffer_t* pending_cb;
+   bool has_pending_work;
+   uint32_t flags;
++  // Fixed at creation and used by every submission the stream makes; recording
++  // and submitting must name the same queue. Zero means any.
++  hrx_queue_affinity_t queue_affinity;
+ } hrx_stream_s;
+ 
+ //===----------------------------------------------------------------------===//
+@@ -631,6 +634,14 @@ iree_status_t hrx_hal_device_select_queue(
+     const iree_hal_queue_family_t* required_family,
+     iree_hal_queue_t** out_queue);
+ 
++// Queues the device declares, flattened family-major into the queue-affinity
++// bit space that hrx_hal_device_select_queue() reads.
++//
++// Returns 1 when the HAL spec declares no queue families: every device services
++// at least one queue, and hrx will not hand out a bit it cannot vouch for.
++hrx_status_t hrx_device_query_queue_count(hrx_device_t device,
++                                          uint32_t* out_count);
++
+ // Convert iree_status_t to hrx_status_t.
+ hrx_status_t hrx_status_from_iree(iree_status_t iree_status);
+ 
+diff --git a/libhrx/src/libhrx/stream.c b/libhrx/src/libhrx/stream.c
+index cc5551d54..7cbbb6b39 100644
+--- a/libhrx/src/libhrx/stream.c
++++ b/libhrx/src/libhrx/stream.c
+@@ -43,13 +43,51 @@ static iree_status_t hrx_stream_record_ordering_barrier(hrx_stream_t stream) {
+       IREE_HAL_EXECUTION_BARRIER_FLAG_NONE, 1, &memory_barrier, 0, NULL);
+ }
+ 
++// Resolves the HAL queue a stream with |affinity| records and submits on. Zero
++// (any) is the device's dispatch queue. Bits naming a queue the device lacks
++// are rejected rather than ignored.
++static hrx_status_t hrx_stream_select_queue(hrx_device_t device,
++                                            hrx_queue_affinity_t affinity,
++                                            iree_hal_queue_t** out_queue) {
++  *out_queue = device->dispatch_queue;
++  if (affinity == 0) return hrx_ok_status();
++  uint32_t queue_count = 0;
++  hrx_status_t status = hrx_device_query_queue_count(device, &queue_count);
++  if (!hrx_status_is_ok(status)) return status;
++  const hrx_queue_affinity_t supported =
++      queue_count >= sizeof(hrx_queue_affinity_t) * 8
++          ? ~(hrx_queue_affinity_t)0
++          : (((hrx_queue_affinity_t)1 << queue_count) - 1);
++  if ((affinity & ~supported) != 0) {
++    return hrx_make_status(HRX_STATUS_OUT_OF_RANGE,
++                           "queue affinity names a queue the device lacks");
++  }
++  return hrx_status_from_iree(hrx_hal_device_select_queue(
++      device->hal_device, affinity,
++      IREE_HAL_QUEUE_FAMILY_ROLE_FLAG_TRANSFER |
++          IREE_HAL_QUEUE_FAMILY_ROLE_FLAG_DISPATCH,
++      /*required_family=*/NULL, out_queue));
++}
++
+ hrx_status_t hrx_stream_create(hrx_device_t device, uint32_t flags,
+                                hrx_stream_t* stream) {
++  return hrx_stream_create_on_queue(device, flags, /*queue_affinity=*/0,
++                                    stream);
++}
++
++hrx_status_t hrx_stream_create_on_queue(hrx_device_t device, uint32_t flags,
++                                        hrx_queue_affinity_t queue_affinity,
++                                        hrx_stream_t* stream) {
+   if (!device || !stream) {
+     return hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
+                            "device or stream is NULL");
+   }
+ 
++  iree_hal_queue_t* hal_queue = NULL;
++  hrx_status_t queue_status =
++      hrx_stream_select_queue(device, queue_affinity, &hal_queue);
++  if (!hrx_status_is_ok(queue_status)) return queue_status;
++
+   hrx_stream_s* s = (hrx_stream_s*)calloc(1, sizeof(hrx_stream_s));
+   if (!s) {
+     return hrx_make_status(HRX_STATUS_OUT_OF_MEMORY,
+@@ -59,7 +97,8 @@ hrx_status_t hrx_stream_create(hrx_device_t device, uint32_t flags,
+   iree_atomic_ref_count_init(&s->ref_count);
+   s->device = device;
+   hrx_device_retain(s->device);
+-  s->hal_queue = device->dispatch_queue;
++  s->hal_queue = hal_queue;
++  s->queue_affinity = queue_affinity;
+   s->flags = flags;
+   s->timepoint = 0;
+   s->has_pending_work = false;
+@@ -226,6 +265,16 @@ hrx_status_t hrx_stream_get_device(hrx_stream_t stream, hrx_device_t* device) {
+   return hrx_ok_status();
+ }
+ 
++hrx_status_t hrx_stream_get_queue_affinity(
++    hrx_stream_t stream, hrx_queue_affinity_t* queue_affinity) {
++  if (!stream || !queue_affinity) {
++    return hrx_make_status(HRX_STATUS_INVALID_ARGUMENT,
++                           "stream or queue_affinity is NULL");
++  }
++  *queue_affinity = stream->queue_affinity;
++  return hrx_ok_status();
++}
++
+ hrx_status_t hrx_stream_get_timeline_position(hrx_stream_t stream,
+                                               hrx_timeline_point_t* position) {
+   if (!stream || !position) {
+@@ -486,9 +535,23 @@ hrx_status_t hrx_stream_dispatch(hrx_stream_t stream,
+     HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(iree_status));
+   }
+ 
+-  iree_status = hrx_stream_record_ordering_barrier(stream);
+-  if (!iree_status_is_ok(iree_status)) {
+-    HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(iree_status));
++  // Dispatch to dispatch with write to read visibility, not retire to issue
++  // over every access: the ordering barrier drained the pipeline between
++  // every kernel, and a decode pass issues hundreds of them. This is the
++  // visibility the next kernel needs.
++  {
++    iree_hal_memory_barrier_t memory_barrier = {
++        .source_scope = IREE_HAL_ACCESS_SCOPE_DISPATCH_WRITE,
++        .target_scope = IREE_HAL_ACCESS_SCOPE_DISPATCH_READ |
++                        IREE_HAL_ACCESS_SCOPE_CONSTANT_READ,
++    };
++    iree_status = iree_hal_command_buffer_execution_barrier(
++        stream->pending_cb, IREE_HAL_EXECUTION_STAGE_DISPATCH,
++        IREE_HAL_EXECUTION_STAGE_DISPATCH, IREE_HAL_EXECUTION_BARRIER_FLAG_NONE,
++        1, &memory_barrier, 0, NULL);
++    if (!iree_status_is_ok(iree_status)) {
++      HRX_RETURN_AND_END_ZONE(z0, hrx_status_from_iree(iree_status));
++    }
+   }
+ 
+   stream->has_pending_work = true;

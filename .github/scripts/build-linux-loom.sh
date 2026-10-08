@@ -6,7 +6,7 @@ deps="$root/build/deps/linux-loom"
 [[ "$(uname -s)" == Linux ]] || {
   echo 'This compiler build requires Linux.' >&2; exit 1;
 }
-hrx_rev=5927b0e0fafdefb5c8b41aa71bca8fd28791ad7c
+hrx_rev=631c0b7854b51a593b89761cc6dcae88f2ec3940
 fetch() {
   local url="$1" rev="$2" path="$3"
   if [[ ! -d "$path/.git" ]]; then
@@ -34,29 +34,17 @@ source.mkdir()
 PY
 git -C "$deps/hrx-$hrx_rev" archive HEAD | tar -x -C "$work/source"
 git -C "$work/source" init -q
-# LSE's Loom patches (patches/hrx), then its HRX runtime patches (patches/).
-# loom-grow-arrays-only-when-full keeps loomc from asking for gigabytes on a
-# kernel with many matrix operands, such as the prefill GEMM's 64x64 tiles.
-# gfx120x-hdp-kernarg-publication lets RDNA4 keep kernel arguments in VRAM.
-# loom-vmem-load-latency schedules global loads with their real latency.
-# loom-allocation-entry-preamble (upstream #1377) keeps allocation's split and
-# replica copies after the entry live-in/resource preamble.
-# loom-terminal-spill-register-requirements and
-# loom-spill-materialization-converges (upstream #277 and #1398) let spill
-# repair run until no spill plan remains instead of stopping after eight rounds.
-# loom-vmem-sources-at-issue and loom-scalar-source-capture (upstream 30246a9d6,
-# c07086aa1) release a memory instruction's sources at issue;
-# loom-issue-sources-gfx11 limits that to the gfx11 descriptor sets, where it
-# measured faster (gfx1201 speculative decode measured slower).
-patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch gfx120x-hdp-kernarg-publication.patch loom-vmem-load-latency.patch loom-allocation-entry-preamble.patch loom-terminal-spill-register-requirements.patch loom-spill-materialization-converges.patch loom-vmem-sources-at-issue.patch loom-scalar-source-capture.patch loom-issue-sources-gfx11.patch)
+# LSE's HRX patch series (patches/hrx), without the macOS adapter and the
+# macOS BAR-write bracket: loomc's concat-destination allocator fix, stream queue affinity, the native K/V address API,
+# one HRX device over several GPUs with device-allocation import, RDNA4 VRAM
+# kernel arguments, and the gfx12 Loom code generation fixes.
+patches=(loom-concat-destination-reserved-once stream-queue-affinity kv-fragment-addressing
+  gpu-device-group-and-device-import gfx120x-hdp-kernarg-publication
+  gfx12-vopd-identical-source)
 for patch in "${patches[@]}"; do
-  path="$root/patches/hrx/$patch"
+  path="$root/patches/hrx/$patch.patch"
   git -C "$work/source" apply --check "$path"
   git -C "$work/source" apply "$path"
-done
-for patch in "$root"/patches/*.patch; do
-  git -C "$work/source" apply --check "$patch"
-  git -C "$work/source" apply "$patch"
 done
 rocm="${ROCM_PATH:-/opt/rocm}"
 if [[ ! -f "$rocm/include/hsa/hsa.h" ]]; then
@@ -73,19 +61,22 @@ cc="${CC:-$default_cc}"
 export PATH="$(dirname "$cc"):$PATH"
 cxx="${CXX:-${cc}++}"
 # Build the runtime and compiler together for the native K/V address API.
-# The upstream loom-compile configuration requires the VM execution target when
-# its VM emitter is enabled.
+# HSA headers come from hrx-system's pinned hsa-runtime-headers, not ROCm: the
+# AMDGPU HAL uses hsa_amd_queue_create's descriptor, which ROCm 7.13's headers
+# lack. ROCm still supplies the device toolchain. At run time HRX needs an HSA
+# runtime with hsa_amd_queue_create (ROCr 1.21 or newer), which the release
+# archive bundles.
 cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DLIBHRX_BUILD=ON \
   -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" \
-  -DIREE_ROCM_PATH="$rocm" -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF \
+  -DIREE_ROCM_PATH="$rocm" -DIREE_ROCM_DEPENDENCY_MODE=pinned \
+  -DLIBHRX_BUILD_HIP_BINDING=OFF -DLIBHRX_BUILD_CTS=OFF \
   -DIREE_BUILD_TESTS=OFF -DIREE_BUILD_BENCHMARKS=OFF \
   -DIREE_ENABLE_LIBBACKTRACE=OFF -DIREE_HAL_DRIVER_DEFAULTS=OFF \
   -DIREE_HAL_DRIVER_AMDGPU=ON -DIREE_HAL_DRIVER_HIP=OFF \
   -DIREE_HAL_DRIVER_HIP_RCCL=OFF -DIREE_HAL_DRIVER_VULKAN=OFF \
-  -DLOOM_BUILD=ON -DLOOM_TARGET_DEFAULTS=OFF -DLOOM_EXECUTE_DEFAULTS=OFF \
+  -DLOOM_BUILD=ON -DLOOM_TARGET_DEFAULTS=OFF \
   -DLOOM_TARGET_AMDGPU=ON -DLOOM_TARGET_AMDGPU_TARGETS=loom_defaults \
-  -DLOOM_TARGET_IREE_VM=ON -DLOOM_EXECUTE_IREE_VM=ON -DLOOM_TARGET_LLVMIR=ON \
   -DLOOM_TARGET_SPIRV=ON -DLOOM_TARGET_X86=ON
 cmake --build "$work/build" --target hrx loomc_shared --parallel "${LSE_BUILD_JOBS:-3}"
 python3 - "$work" "$deps" "$hrx_rev" <<'PY'
@@ -100,11 +91,9 @@ if not version.is_file() or not (include / 'loomc/loomc.h').is_file():
     raise SystemExit('Missing built Loom C API headers or version metadata')
 digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 patches = []
-for name in ('symbolic-memo-touched-reset.patch', 'gfx12-vopd-identical-source.patch', 'cooperative-matrix-operands.patch', 'loop-invariant-motion.patch', 'rdna4-prefetch-address-span.patch', 'loom-grow-arrays-only-when-full.patch'):
-    path = work.parents[1] / 'patches/hrx' / name
-    patches.append({'path': f'patches/hrx/{name}', 'sha256': digest(path)})
-for path in sorted((work.parents[1] / 'patches').glob('*.patch')):
-    patches.append({'path': 'patches/' + path.name, 'sha256': digest(path)})
+for name in ('loom-concat-destination-reserved-once', 'stream-queue-affinity', 'kv-fragment-addressing', 'gpu-device-group-and-device-import', 'gfx120x-hdp-kernarg-publication', 'gfx12-vopd-identical-source'):
+    path = work.parents[1] / 'patches/hrx' / f'{name}.patch'
+    patches.append({'path': f'patches/hrx/{name}.patch', 'sha256': digest(path)})
 cache = {}
 for line in (work / 'build/CMakeCache.txt').read_text().splitlines():
     if match := re.match(r'([^/#:][^:]*):[^=]+=(.*)', line):

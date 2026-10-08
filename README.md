@@ -15,7 +15,7 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
   including an XCFramework for iOS and iPadOS.
 - **Model info and memory estimates:** inspect a checkpoint and size a context before loading it.
 - **GPU execution:** HRX with Loom kernel source, the default on every platform. On Linux the
-  legacy HIP dialect remains selectable with `--dialect hip`.
+  legacy HIP dialect remains selectable with `--dialect hip` in a source build with ROCm's comgr.
 - **CPU backend:** Reference execution and a fallback when available GPU backends cannot start.
   CPU fallback is always reported; `--no-cpu-fallback` turns it into an error.
 
@@ -218,7 +218,7 @@ remain available for reuse.
 
 | Platform | GPU requirements | Kernel source |
 |---|---|---|
-| Linux x86_64 | ROCm 7.x and [HRX](https://github.com/ROCm/hrx-system) | Loom (legacy HIP with `--dialect hip`) |
+| Linux x86_64 | The amdgpu kernel driver with KFD; the release bundles [HRX](https://github.com/ROCm/hrx-system) and its HSA runtime | Loom (legacy HIP with `--dialect hip` in a source build with ROCm's comgr) |
 | macOS on Apple Silicon | An external AMD GPU and the installed [mac_linuxgpu driver](https://github.com/lemonade-sdk/mac_linuxgpu) | Loom |
 | iPadOS on an M-series iPad | An external AMD GPU over Thunderbolt and an app that embeds the mac_linuxgpu driver and links `LSE.xcframework` | Loom, in process |
 | CPU | A build with the CPU backend | CPU reference execution |
@@ -235,9 +235,15 @@ See the driver instructions for that requirement.
 amdgpu_mtopg monitoring an AMD Radeon AI PRO R9700 over Thunderbolt 5 on an Apple M5 Max while LSE runs Qwen3.8-27B through mac_linuxgpu.
 
 Linux release targets include `gfx942`, `gfx1150`, `gfx1151`, `gfx1200`, and `gfx1201`.
-The Linux archive bundles its selected HRX runtime and patched Loom compiler;
-root and `bin/` launchers load those libraries and forward the existing CLI arguments.
-A compatible Linux C/C++ runtime, ROCm 7.x, HSA and GPU driver remain required.
+The Linux archive bundles its selected HRX runtime, patched Loom compiler and the HSA
+runtime HRX needs (TheRock ROCr 1.21 with `librocprofiler-register` and its
+`rocm_sysdeps` libraries, in `lib/`); root and `bin/` launchers load those libraries and
+forward the existing CLI arguments. No ROCm install is required. The system needs a
+compatible Linux C/C++ runtime and the amdgpu kernel driver with KFD, and the user needs
+read/write access to `/dev/kfd` and `/dev/dri/renderD*` (usually the `render` and
+`video` groups). HRX's current AMDGPU driver needs `hsa_amd_queue_create`, which ROCm
+7.13's HSA runtime does not have; the bundled one does, and LSE loads it before any
+system copy.
 The v0.5.7 binaries need glibc 2.43 or later and the GCC 16 libstdc++ (`GLIBCXX_3.4.35`,
 `CXXABI_1.3.15`), with ROCm 7.x `libamd_comgr.so.3` and `libhsa-runtime64.so.1`: an
 Ubuntu 26.04-class system.
@@ -276,11 +282,12 @@ Each install procedure sets `LSE_BIN` for the later commands. Use the same termi
    LSE_BIN="$PWD"
    ```
 
-4. If ROCm is outside the system loader paths, add the runtime directory from
-   your matching ROCm installation. The launchers select the bundled HRX and Loom.
+4. Check that your user can open the GPU. The archive carries its own HRX, Loom and
+   HSA runtime, so no ROCm install or `LD_LIBRARY_PATH` setting is needed.
 
    ```bash
-   export LD_LIBRARY_PATH="/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+   ls -l /dev/kfd /dev/dri/renderD*   # the render (or video) group must have rw
+   id -nG | grep -wE 'render|video'   # if missing: sudo usermod -aG render,video "$USER", then log in again
    ```
 
 ### macOS on Apple Silicon
@@ -458,7 +465,8 @@ Start ordinary decoding first:
 
 Confirm that startup reports `device hrx` and `generates loom`.
 Loom is the default kernel dialect on every platform, so `--dialect` can be left out.
-On Linux, `--dialect hip` selects the legacy HIP dialect instead.
+On Linux, `--dialect hip` selects the legacy HIP dialect instead. It needs a source build
+linked with ROCm's `amd_comgr`; the release archive is built without it.
 A dialect request is a preference. If unavailable, LSE reports the change and selects an available toolchain.
 
 In another terminal, check the server:

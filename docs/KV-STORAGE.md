@@ -41,8 +41,8 @@ within a bucket does not create a kernel variant for each fragment.
 ## Backend requirements
 
 This path needs the Loom `buffer.from_address` operation and an HRX native
-device-address export. Release builds supply these through the pinned HRX patches. The Linux
-bootstrap also applies `patches/0004-hrx-kv-fragment-addressing.patch`. Other toolchains retain their
+device-address export. Release builds and the Linux bootstrap supply these through the pinned HRX
+patch `patches/hrx/kv-fragment-addressing.patch`. Other toolchains retain their
 existing contiguous storage implementation. Fragment tables execute on their
 owning device; copying a table to another device is not a K/V migration.
 
