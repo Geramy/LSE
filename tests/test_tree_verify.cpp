@@ -211,7 +211,10 @@ int gpu() {
   scheduler->set_dialect(Dialect::kLoom);
   std::mt19937 rng(91);
   std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-  const runtime::DraftTree tree = make_tree(24, 5);
+  // TREE_NODES sets the tree's size (24 by default; 30 makes a 31-row pass).
+  const char* nodes_env = std::getenv("TREE_NODES");
+  const runtime::DraftTree tree =
+      make_tree(nodes_env ? static_cast<std::uint32_t>(std::strtoul(nodes_env, nullptr, 10)) : 24u, 5);
   const auto n = static_cast<std::int64_t>(tree.rows());
   std::printf("tree: %lld rows, depth %u, top path %u rows\n", static_cast<long long>(n),
               tree.max_depth(), tree.main_rows);
@@ -343,12 +346,12 @@ int gpu() {
   // (split for a tree of up to eight rows, flash for more).
   const runtime::DraftTree small = make_tree(7, 9);
   for (const runtime::DraftTree* shape : {&tree, &small})
-  for (const std::int32_t first : {40, 1500}) {
+  for (const std::int32_t first : {40, 1500, 2600}) {
     const runtime::DraftTree& tree = *shape;
     const auto n = static_cast<std::int64_t>(tree.rows());
     const std::int64_t kvh = 4, qh = 24, hd = 256, bs = 16;
     const std::int32_t live = first + static_cast<std::int32_t>(n);
-    const std::int64_t capacity = live <= 256 ? 256 : 2048;
+    const std::int64_t capacity = live <= 256 ? 256 : live <= 2048 ? 2048 : 4096;
     const std::int64_t blocks = capacity / bs;
     std::vector<std::uint16_t> kpool(blocks * kvh * bs * hd), vpool(kpool.size());
     for (auto& e : kpool) e = to_bf16(uni(rng));
