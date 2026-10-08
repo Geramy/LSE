@@ -41,9 +41,9 @@ std::pair<float, float> chunk_mass(const float* x, std::int64_t n) {
   float top = -std::numeric_limits<float>::infinity();
   for (std::int64_t i = 0; i < n; ++i) top = std::max(top, x[i]);
   const float shift = top == -std::numeric_limits<float>::infinity() ? 0.0f : top;
-  float sum = 0.0f;
-  for (std::int64_t i = 0; i < n; ++i) sum += std::exp(x[i] - shift);
-  return {top, sum};
+  double sum = 0.0;
+  for (std::int64_t i = 0; i < n; ++i) sum += std::exp(static_cast<double>(x[i]) - shift);
+  return {top, static_cast<float>(sum)};
 }
 
 template <class E>
@@ -175,6 +175,8 @@ struct SoftmaxTopFinalKernel final : KernelPrimitive<SoftmaxTopFinalKernel> {
   std::size_t arity() const noexcept override { return 1; }
   bool supports_epilogue() const noexcept override { return false; }
   bool has_host_impl() const noexcept override { return true; }
+  // One value per row, folded from the row's [chunks, 2] partials.
+  bool host_reads_whole_inputs() const noexcept override { return true; }
 
   std::string emit_kernel(const KernelShapes& s) const override {
     if (s.inputs.size() != 1 || s.types.scalar == nullptr || s.intrinsics == nullptr ||
@@ -212,11 +214,11 @@ struct SoftmaxTopFinalKernel final : KernelPrimitive<SoftmaxTopFinalKernel> {
       const float* x = in[0] + r * nchunks * 2;
       float top = -std::numeric_limits<float>::infinity();
       for (std::size_t c = 0; c < nchunks; ++c) top = std::max(top, x[c * 2]);
-      float sum = 0.0f;
+      double sum = 0.0;
       for (std::size_t c = 0; c < nchunks; ++c)
         if (x[c * 2] > -std::numeric_limits<float>::infinity())
-          sum += x[c * 2 + 1] * std::exp(x[c * 2] - top);
-      out[r] = 1.0f / sum;
+          sum += static_cast<double>(x[c * 2 + 1]) * std::exp(static_cast<double>(x[c * 2]) - top);
+      out[r] = static_cast<float>(1.0 / sum);
     }
   }
 

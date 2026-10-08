@@ -181,6 +181,13 @@ class KernelPrimitiveBase : public Primitive {
   // In scope for such a body: `i` (the flat thread id) and `k.count`.
   virtual bool owns_indexing() const noexcept { return false; }
 
+  // Whether eval_cpu reads its operands whole, in their own layout, rather
+  // than one element per output element broadcast to the output's shape. A
+  // primitive that owns its indexing always does; one that returns a value
+  // per output element but reads a whole row of its operand to make it (a
+  // reduction's final fold) says so here.
+  virtual bool host_reads_whole_inputs() const noexcept { return owns_indexing(); }
+
   // The activation panel this primitive puts in workgroup scratch when it owns
   // the launch: `count` f32 elements of operand `input`, holding row
   // `workgroup_id_y` of it, for a launch covering `rows` rows. `count == 0`
