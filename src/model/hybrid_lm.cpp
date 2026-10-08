@@ -536,6 +536,222 @@ Status PrefixStateCommit::commit(std::size_t rows, graph::Scheduler& scheduler) 
   return OkStatus();
 }
 
+Status TreeLayout::validate() const {
+  const auto n = depth.size();
+  if (n < 2 || parent.size() != n || depth[0] != 0 || parent[0] != -1 || main_rows < 1 ||
+      static_cast<std::size_t>(main_rows) > n)
+    return LSE_ERROR(kInvalidArgument, "a tree layout needs a root and at least one node");
+  std::vector<std::int32_t> last_at(static_cast<std::size_t>(kMaxDepth) + 1, -1);
+  last_at[0] = 0;
+  for (std::size_t r = 1; r < n; ++r) {
+    const std::int32_t p = parent[r];
+    const std::int32_t d = depth[r];
+    if (d < 1 || d > kMaxDepth || p < 0 || static_cast<std::size_t>(p) >= r ||
+        depth[static_cast<std::size_t>(p)] != d - 1 || last_at[static_cast<std::size_t>(d - 1)] != p)
+      return LSE_ERROR(kInvalidArgument, "tree layout row ", std::to_string(r),
+                       " is not in depth-first preorder within depth ",
+                       std::to_string(kMaxDepth));
+    last_at[static_cast<std::size_t>(d)] = static_cast<std::int32_t>(r);
+    for (std::size_t x = static_cast<std::size_t>(d) + 1; x < last_at.size(); ++x) last_at[x] = -1;
+  }
+  for (std::int32_t r = 1; r < main_rows; ++r)
+    if (parent[static_cast<std::size_t>(r)] != r - 1)
+      return LSE_ERROR(kInvalidArgument, "tree layout top path is not rows 0..", std::to_string(main_rows - 1));
+  if (static_cast<std::size_t>(main_rows) < n && parent[static_cast<std::size_t>(main_rows)] == main_rows - 1)
+    return LSE_ERROR(kInvalidArgument, "tree layout top path stops before its last row's child");
+  if (main_rows > static_cast<std::int32_t>(TreeStateCommit::kMaxPath))
+    return LSE_ERROR(kInvalidArgument, "tree layout top path is longer than a commit");
+  return OkStatus();
+}
+
+Status TreeStateCommit::retain(std::span<const MixerState> states, std::int64_t rows,
+                               std::vector<graph::NodePtr>& roots) {
+  if (rows <= 1) return LSE_ERROR(kInvalidArgument, "a tree pass needs multiple rows");
+  const auto prim_is = [](const graph::NodePtr& n, std::string_view name, std::size_t inputs) {
+    return n && n->kind == graph::OpKind::kCustom && n->prim != nullptr &&
+           n->prim->name() == name && n->inputs.size() == inputs;
+  };
+  std::vector<Entry> entries;
+  for (const MixerState& state : states) {
+    if (state.gdn_state.valid()) {
+      const auto& out = state.gdn_state.node();
+      if (!prim_is(out, "gdn.path_state.v1", 6))
+        return LSE_ERROR(kUnimplemented, "this model's recurrence did not run as a tree");
+      entries.push_back({Entry::Kind::kRecurrent, out,
+                         {out->inputs[0], out->inputs[1], out->inputs[2], out->inputs[3],
+                          out->inputs[4]}});
+      if (state.gdn_conv_q.valid() || state.gdn_conv_k.valid() || state.gdn_conv_v.valid())
+        return LSE_ERROR(kUnimplemented, "a tree pass needs a fused q/k/v conv tail");
+      if (state.gdn_conv_qkv.valid()) {
+        const auto& tail = state.gdn_conv_qkv.node();
+        if (!prim_is(tail, "conv_tail.rows.v1", 3))
+          return LSE_ERROR(kUnimplemented, "this model's convolution did not run as a tree");
+        entries.push_back({Entry::Kind::kConvTail, tail, {tail->inputs[0], tail->inputs[1]}});
+      }
+    }
+    if (state.key_cache.valid() || state.value_cache.valid()) {
+      if (!state.paged.valid() || !state.tree_keys.valid() || !state.tree_values.valid() ||
+          state.tree_keys.shape().rank() != 4 || state.tree_keys.shape().dim(2) != rows)
+        return LSE_ERROR(kUnimplemented, "this model's attention did not run as a tree");
+      entries.push_back({Entry::Kind::kKeysValues, state.key_cache.node(),
+                         {state.tree_keys.node(), state.paged.table.node()}, state.paged.storage});
+      entries.push_back({Entry::Kind::kKeysValues, state.value_cache.node(),
+                         {state.tree_values.node(), state.paged.table.node()}, state.paged.storage});
+    }
+  }
+  for (const Entry& entry : entries)
+    for (std::size_t i = 0; i < entry.sources.size(); ++i) {
+      const auto& source = entry.sources[i];
+      if (source->dtype != DType::kF32)
+        return LSE_ERROR(kUnimplemented, "tree commit inputs must be FP32");
+      // The block table is a leaf the pass reads; everything else is an
+      // activation the pass must keep.
+      if (entry.kind == Entry::Kind::kKeysValues && i == 1) continue;
+      roots.push_back(source);
+    }
+  rows_ = rows;
+  entries_ = std::move(entries);
+  program_ = graph::Program{};
+  inputs_.clear();
+  outputs_.clear();
+  path_ = {};
+  built_ = false;
+  return OkStatus();
+}
+
+Status TreeStateCommit::build_replay(graph::Scheduler& scheduler) {
+  const auto capacity = std::min<std::int64_t>(rows_, static_cast<std::int64_t>(kMaxPath));
+  const backend::ScopedAllocationSite site(backend::AllocationSite::kState);
+  path_ = Array::zeros(Shape{2 + capacity}, DType::kF32);
+  LSE_RETURN_IF_ERROR(graph::interpreter::ensure_output_buffer(*path_.node(), scheduler.backend()));
+  inputs_.clear();
+  outputs_.clear();
+  const auto leaf_of = [&](const graph::NodePtr& source) {
+    auto node = std::make_shared<graph::Node>();
+    node->kind = graph::OpKind::kBuffer;
+    node->fclass = graph::FusionClass::kLeaf;
+    node->shape = source->shape;
+    node->dtype = source->dtype;
+    node->member = source->member;
+    node->kv_fragments = source->kv_fragments;
+    inputs_.emplace_back(node);
+    return Array(node);
+  };
+  for (const Entry& entry : entries_) {
+    const auto member = entry.output->member != graph::Node::kAnyMember
+        ? static_cast<std::size_t>(entry.output->member)
+        : scheduler.devices().member_of(entry.output->buffer.residency);
+    const graph::ScopedMember on(member < scheduler.devices().size()
+                                    ? member : scheduler.devices().primary());
+    switch (entry.kind) {
+      case Entry::Kind::kRecurrent: {
+        const Array k = leaf_of(entry.sources[0]), v = leaf_of(entry.sources[1]),
+                    alpha = leaf_of(entry.sources[2]), beta = leaf_of(entry.sources[3]),
+                    s_in = leaf_of(entry.sources[4]);
+        outputs_.push_back(graph::gated_delta_path(k, v, alpha, beta, s_in, path_));
+        break;
+      }
+      case Entry::Kind::kConvTail: {
+        const Array prev = leaf_of(entry.sources[0]), input = leaf_of(entry.sources[1]);
+        outputs_.push_back(graph::conv_tail_rows(prev, input, path_));
+        break;
+      }
+      case Entry::Kind::kKeysValues: {
+        const Array pool = leaf_of(entry.output);
+        const Array src = leaf_of(entry.sources[0]), table = leaf_of(entry.sources[1]);
+        outputs_.push_back(graph::kv_page_write_rows(pool, src, table, path_, kv::kBlockSize,
+                                                     entry.storage));
+        break;
+      }
+    }
+    if (!outputs_.back().valid() || outputs_.back().node()->prim == nullptr)
+      return LSE_ERROR(kInternal, "tree commit primitive is not registered");
+  }
+  built_ = true;
+  return OkStatus();
+}
+
+Status TreeStateCommit::prepare(graph::Scheduler& scheduler) {
+  if (!ready()) return LSE_ERROR(kInvalidArgument, "no tree pass to prepare a commit for");
+  if (!built_) LSE_RETURN_IF_ERROR(build_replay(scheduler));
+  std::vector<graph::NodePtr> roots;
+  for (Array& input : inputs_) input.node()->materialized = true;
+  path_.node()->materialized = true;
+  for (const Array& output : outputs_) roots.push_back(output.node());
+  return roots.empty() ? OkStatus() : scheduler.prepare(roots);
+}
+
+Status TreeStateCommit::commit(std::span<const std::uint32_t> path, std::int32_t first,
+                               graph::Scheduler& scheduler) {
+  const auto capacity = std::min<std::int64_t>(rows_, static_cast<std::int64_t>(kMaxPath));
+  if (!ready() || path.empty() || static_cast<std::int64_t>(path.size()) > capacity || first < 0)
+    return LSE_ERROR(kInvalidArgument, "tree commit path outside the retained pass");
+  for (const std::uint32_t row : path)
+    if (static_cast<std::int64_t>(row) >= rows_)
+      return LSE_ERROR(kInvalidArgument, "tree commit row ", std::to_string(row),
+                       " outside a pass of ", std::to_string(rows_));
+  if (!built_) LSE_RETURN_IF_ERROR(build_replay(scheduler));
+  LSE_RETURN_IF_ERROR(scheduler.drain());
+  // The pass's sources, bound to the replay's leaves.
+  std::size_t at = 0;
+  const auto bind = [&](const graph::NodePtr& source) -> Status {
+    graph::Node& leaf = *inputs_[at++].node();
+    const bool is_leaf = source->fclass == graph::FusionClass::kLeaf;
+    if ((!source->materialized && !is_leaf) || !source->buffer.valid() ||
+        (!source->kv_fragments &&
+         source->buffer.size_bytes < dtype_storage_bytes(source->dtype, source->element_count())))
+      return LSE_ERROR(kInvalidArgument, "tree commit source ", graph::to_string(source->kind),
+                       " ", source->shape.to_string(), " has not finished verification");
+    const auto member = scheduler.devices().member_of(source->buffer.residency);
+    auto& owner = member < scheduler.devices().size() ? scheduler.devices().device(member)
+                                                      : scheduler.backend();
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(*source, owner));
+    leaf.buffer = source->buffer;
+    leaf.kv_fragments = source->kv_fragments;
+    leaf.materialized = true;
+    leaf.device_dirty = source->buffer.ptr == nullptr;
+    leaf.host_dirty = false;
+    leaf.host_mirror.clear();
+    return OkStatus();
+  };
+  std::vector<graph::NodePtr> roots;
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    const Entry& entry = entries_[i];
+    if (entry.kind == Entry::Kind::kKeysValues) LSE_RETURN_IF_ERROR(bind(entry.output));
+    for (const auto& source : entry.sources) LSE_RETURN_IF_ERROR(bind(source));
+    auto& output = *outputs_[i].node();
+    output.buffer = entry.output->buffer;
+    output.materialized = false;
+    output.device_dirty = false;
+    output.host_dirty = false;
+    roots.push_back(outputs_[i].node());
+  }
+  std::vector<float> descriptor(static_cast<std::size_t>(2 + capacity), 0.0f);
+  descriptor[0] = static_cast<float>(path.size());
+  descriptor[1] = static_cast<float>(first);
+  for (std::size_t j = 0; j < path.size(); ++j) descriptor[2 + j] = static_cast<float>(path[j]);
+  LSE_RETURN_IF_ERROR(poke_values(path_, descriptor));
+  program_.reset_compute();
+  if (!roots.empty()) LSE_RETURN_IF_ERROR(scheduler.eval(roots, false, &program_));
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    const Entry& entry = entries_[i];
+    if (entry.kind == Entry::Kind::kKeysValues) {
+      // Written in place; the pool keeps its own bookkeeping.
+      entry.output->materialized = true;
+      continue;
+    }
+    auto& output = *outputs_[i].node();
+    const auto member = scheduler.devices().member_of(output.buffer.residency);
+    auto& owner = member < scheduler.devices().size() ? scheduler.devices().device(member)
+                                                      : scheduler.backend();
+    LSE_RETURN_IF_ERROR(graph::interpreter::sync_to_device(output, owner));
+    entry.output->device_dirty = entry.output->buffer.ptr == nullptr;
+    entry.output->host_dirty = false;
+    entry.output->materialized = true;
+  }
+  return OkStatus();
+}
+
 Status HybridLM::prepare_prefix_commits() {
   graph::Scheduler* scheduler = graph::default_scheduler();
   if (!scheduler) return LSE_ERROR(kInternal, "no scheduler for prefix state");
@@ -591,6 +807,70 @@ Status HybridLM::commit_prefix(std::vector<MixerState>& states, std::size_t rows
   return LSE_ERROR(kInvalidArgument, "there is no verifier pass to commit");
 }
 
+Status HybridLM::commit_tree(std::vector<MixerState>& states,
+                             std::span<const std::uint32_t> path) {
+  for (ForwardCache& cache : caches_) {
+    if (cache.pass_id == 0 || cache.pass_id != last_pass_id_) continue;
+    if (!cache.tree || cache.states != &states || cache.state_stamp.size() != states.size() ||
+        cache.prefix_committed || !cache.tree_commit.ready())
+      return LSE_ERROR(kInvalidArgument, "the latest pass is not an uncommitted tree pass");
+    const auto rows = cache.seq;
+    if (states.empty() || states.front().position != cache.prefix_end ||
+        states.front().position < rows)
+      return LSE_ERROR(kInvalidArgument, "the tree pass's cursor has moved");
+    if (path.empty() || path[0] != 0 ||
+        path.size() > std::min<std::size_t>(static_cast<std::size_t>(rows), TreeStateCommit::kMaxPath))
+      return LSE_ERROR(kInvalidArgument, "a tree path starts at the root and fits a commit");
+    bool top = path.size() <= static_cast<std::size_t>(cache.tree_main_rows);
+    for (std::size_t j = 1; j < path.size(); ++j) {
+      if (static_cast<std::int64_t>(path[j]) >= rows ||
+          cache.tree_parent[path[j]] != static_cast<std::int32_t>(path[j - 1]))
+        return LSE_ERROR(kInvalidArgument, "tree path row ", std::to_string(path[j]),
+                         " is not a child of the row before it");
+      top = top && path[j] == j;
+    }
+    const auto after = states.front().position;
+    for (std::size_t i = 0; i < states.size(); ++i) {
+      const auto& s = states[i];
+      const auto& saved = cache.state_stamp[i];
+      if (s.position != after || s.gdn_state.node() != saved.gdn.node() ||
+          s.gdn_conv_qkv.node() != saved.cqkv.node())
+        return LSE_ERROR(kInvalidArgument, "tree state no longer matches verification");
+    }
+    graph::Scheduler* scheduler = graph::default_scheduler();
+    if (!scheduler) return LSE_ERROR(kInternal, "no scheduler for tree state");
+    const auto first = after - static_cast<std::int32_t>(rows);
+    const auto cursor = first + static_cast<std::int32_t>(path.size());
+    // The whole top path is what the pass carried and where it wrote: nothing
+    // moves. Anything else is replayed from the pass's retained inputs.
+    if (!(top && path.size() == static_cast<std::size_t>(cache.tree_main_rows)))
+      LSE_RETURN_IF_ERROR(cache.tree_commit.commit(path, first, *scheduler));
+    if (!cache.meta.valid() || cache.meta.node()->element_count() < 5)
+      return LSE_ERROR(kInvalidArgument, "tree step descriptor is unavailable");
+    const float meta[] = {static_cast<float>(first), static_cast<float>(cursor), 1.0f,
+                          static_cast<float>(first), static_cast<float>(cursor)};
+    LSE_RETURN_IF_ERROR(poke_values(cache.meta, meta));
+    for (MixerState& state : states) {
+      state.position = cursor;
+      if (state.paged.valid()) state.paged.row_tokens.assign(1, cursor);
+    }
+    cache.prefix_committed = true;
+    return OkStatus();
+  }
+  return LSE_ERROR(kInvalidArgument, "there is no tree pass to commit");
+}
+
+Status HybridLM::prepare_tree_commit() {
+  graph::Scheduler* scheduler = graph::default_scheduler();
+  if (!scheduler) return LSE_ERROR(kInternal, "no scheduler for tree state");
+  for (ForwardCache& cache : caches_) {
+    if (cache.pass_id == 0 || cache.pass_id != last_pass_id_) continue;
+    if (!cache.tree) return LSE_ERROR(kInvalidArgument, "the latest pass is not a tree pass");
+    return cache.tree_commit.prepare(*scheduler);
+  }
+  return LSE_ERROR(kInvalidArgument, "no tree pass has been built");
+}
+
 void HybridLM::rewind(std::vector<MixerState>& states,
                       std::int32_t position) const {
   for (MixerState& s : states) {
@@ -605,7 +885,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
                                FeatureCapture* capture,
                                bool retain_prefix_state,
                                ops::AttentionExecutionPhase attention_phase,
-                               std::int32_t valid_tokens) {
+                               std::int32_t valid_tokens, const TreeLayout* tree) {
   if (blocks_.empty()) {
     return LSE_ERROR(kInternal, "HybridLM::hidden before load()");
   }
@@ -650,6 +930,17 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   if (retain_prefix_state && (states == nullptr || !tokens.valid() ||
                               tokens.shape().dim(0) != 1 || t_now <= 1 || rows != nullptr)) {
     return LSE_ERROR(kInvalidArgument, "prefix retention needs one multi-token sequence");
+  }
+  // A tree verify pass: one sequence, its own phase, every row a tree node.
+  if ((tree != nullptr) != (attention_phase == ops::AttentionExecutionPhase::kTree))
+    return LSE_ERROR(kInvalidArgument, "a tree layout goes with the tree phase and only with it");
+  if (tree != nullptr) {
+    LSE_RETURN_IF_ERROR(tree->validate());
+    if (states == nullptr || !tokens.valid() || tokens.shape().dim(0) != 1 ||
+        tree->rows() != t_now || t_live != t_now || rows != nullptr || replaces_previous ||
+        retain_prefix_state || state_shards() != 1)
+      return LSE_ERROR(kInvalidArgument, "a tree pass needs one unsharded sequence of ",
+                       std::to_string(tree->rows()), " rows");
   }
   // A replacement must keep the original roots and carry inputs. Check before
   // allocating state, extending pools or changing any retention slot.
@@ -804,7 +1095,9 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   std::int32_t kv_pos = 0;
   std::int32_t kv_len = 0;
   std::vector<float> meta(
-      static_cast<std::size_t>(kv::step_meta_elems(bucket)), 0.0f);
+      static_cast<std::size_t>(tree != nullptr
+          ? kv::tree_meta_elems(bucket, static_cast<std::int32_t>(t_now))
+          : kv::step_meta_elems(bucket)), 0.0f);
   std::vector<std::int32_t> row_tokens(static_cast<std::size_t>(bucket), 0);
   for (std::size_t r = 0; r < first.size(); ++r) {
     const std::size_t at = static_cast<std::size_t>(kv::kStepMetaHeader) +
@@ -829,6 +1122,40 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   meta[0] = static_cast<float>(kv_pos);
   meta[1] = static_cast<float>(kv_len);
   meta[2] = static_cast<float>(live_rows);
+  // A tree pass's ancestor mask (kv::tree_meta_elems) and per-pass inputs:
+  // each row's depth, its conv ancestors (b levels up, or -1 - c for tail
+  // column c past the root), its position and the top path descriptor.
+  std::vector<float> tree_values;
+  if (tree != nullptr) {
+    const auto n = static_cast<std::size_t>(t_now);
+    const std::size_t base = static_cast<std::size_t>(kv::tree_mask_offset(bucket));
+    for (std::size_t q = 0; q < n; ++q)
+      for (auto a = static_cast<std::int32_t>(q); a >= 0; a = tree->parent[static_cast<std::size_t>(a)])
+        meta[base + q * n + static_cast<std::size_t>(a)] = 1.0f;
+    const auto taps = static_cast<std::size_t>(std::max(1, config_.gdn_conv_kernel - 1));
+    const auto path = std::min<std::size_t>(n, TreeStateCommit::kMaxPath);
+    tree_values.assign(n + n * taps + n + 2 + path, 0.0f);
+    float* depth = tree_values.data();
+    float* ancestors = depth + n;
+    float* positions = ancestors + n * taps;
+    float* top = positions + n;
+    for (std::size_t r = 0; r < n; ++r) {
+      const std::int32_t d = tree->depth[r];
+      depth[r] = static_cast<float>(d);
+      positions[r] = static_cast<float>(shared_pos + d);
+      auto a = static_cast<std::int32_t>(r);
+      for (std::size_t b = 1; b <= taps; ++b) {
+        if (a >= 0) a = tree->parent[static_cast<std::size_t>(a)];
+        const auto back = static_cast<std::int32_t>(b);
+        ancestors[r * taps + b - 1] = a >= 0
+            ? static_cast<float>(a)
+            : -1.0f - static_cast<float>(static_cast<std::int32_t>(taps) - (back - d));
+      }
+    }
+    top[0] = static_cast<float>(tree->main_rows);
+    top[1] = static_cast<float>(shared_pos);
+    for (std::int32_t r = 0; r < tree->main_rows; ++r) top[2 + r] = static_cast<float>(r);
+  }
 
   // Blocks first, on both paths: the retained decode program is not re-recorded,
   // yet it crosses a block boundary every kv::kBlockSize tokens and needs the
@@ -892,10 +1219,53 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   // The descriptor is one float array per bucket width, so a batch that changes
   // rung gets a new slot and the program that pointed at the old one cannot be
   // replayed. Sized here, before the reuse test, so that answer is part of it.
-  const auto meta_elems = static_cast<std::int64_t>(kv::step_meta_elems(bucket));
+  const auto meta_elems = static_cast<std::int64_t>(meta.size());
   const bool meta_moved =
       !cache_.meta.valid() ||
       static_cast<std::int64_t>(cache_.meta.shape().elem_count()) != meta_elems;
+
+  // The tree pass's per-pass inputs live in one device buffer per slot, poked
+  // every pass like the step descriptor and read through four views.
+  bool tree_moved = false;
+  if (tree != nullptr) {
+    const auto elems = static_cast<std::int64_t>(tree_values.size());
+    if (!cache_.tree_inputs.valid() ||
+        static_cast<std::int64_t>(cache_.tree_inputs.shape().elem_count()) != elems) {
+      graph::Scheduler* sched = graph::default_scheduler();
+      if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for the tree inputs");
+      auto buf = sched->backend().allocate(
+          dtype_storage_bytes(DType::kF32, static_cast<std::size_t>(elems)),
+          backend::MemoryClass::kDevice);
+      if (!buf.ok()) return buf.status();
+      cache_.tree_inputs = Array::from_buffer(buf.release(), Shape{elems}, DType::kF32);
+      const auto n = t_now;
+      const auto taps = static_cast<std::int64_t>(std::max(1, config_.gdn_conv_kernel - 1));
+      const auto view = [&](Shape shape, std::int64_t begin) {
+        auto b = cache_.tree_inputs.node()->buffer;
+        b.offset += static_cast<std::size_t>(begin) * sizeof(float);
+        b.size_bytes = shape.elem_count() * sizeof(float);
+        return Array::from_buffer(std::move(b), std::move(shape), DType::kF32);
+      };
+      cache_.tree_depth = view(Shape{n}, 0);
+      cache_.tree_ancestors = view(Shape{n, taps}, n);
+      cache_.tree_positions = view(Shape{n}, n + n * taps);
+      cache_.tree_path = view(Shape{elems - (2 * n + n * taps)}, 2 * n + n * taps);
+      tree_moved = true;
+    }
+    cache_.tree_parent = tree->parent;
+    cache_.tree_main_rows = tree->main_rows;
+  }
+  const auto poke_tree = [&]() -> Status {
+    if (tree == nullptr) return OkStatus();
+    LSE_RETURN_IF_ERROR(poke_values(cache_.tree_inputs, tree_values));
+    for (Array* v : {&cache_.tree_depth, &cache_.tree_ancestors, &cache_.tree_positions,
+                     &cache_.tree_path}) {
+      v->node()->materialized = true;
+      v->node()->host_dirty = false;
+      v->node()->device_dirty = true;
+    }
+    return OkStatus();
+  };
 
   bool at_sequence_start = true;
   if (states != nullptr) {
@@ -937,7 +1307,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       (chain_ok || handoff != nullptr) && split_scope_ok && feature_layers_match(cache_) &&
       cache_.retains_prefix_state == retain_prefix_state &&
       (capture == nullptr || cache_.features.valid()) &&
-      aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved &&
+      aux_loss == nullptr && trace == nullptr && !pool_moved && !meta_moved && !tree_moved &&
+      cache_.tree == (tree != nullptr) &&
       cache_.hidden.valid() && cache_.tokens.valid() && tokens.valid() &&
       tokens.shape().elem_count() == cache_.tokens.shape().elem_count() &&
       cache_.states == states && !cache_.program.empty() && cache_.valid == t_live &&
@@ -997,6 +1368,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     // nodes and were just written by its eval — nothing to fold.
     LSE_RETURN_IF_ERROR(poke_tokens(cache_.tokens, tokens));
     LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
+    LSE_RETURN_IF_ERROR(poke_tree());
     if (graph::Scheduler* sched = graph::default_scheduler()) {
       LSE_RETURN_IF_ERROR(
           sched->eval(cache_.program.roots(), false, &cache_.program));
@@ -1052,6 +1424,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
         Array::from_buffer(buf.release(), Shape{meta_elems}, DType::kF32);
   }
   LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
+  LSE_RETURN_IF_ERROR(poke_tree());
   if (states != nullptr) {
     // Assigned every rebuild, not only the first: a bucket change replaces the
     // slot, and a layer still pointing at the old one would read another
@@ -1091,6 +1464,12 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       st.pad_mask = mask;
       st.pad_unmask = unmask;
       st.pad_tail_rows = tail_rows;
+      st.tree_depth = tree != nullptr ? cache_.tree_depth : Array{};
+      st.tree_ancestors = tree != nullptr ? cache_.tree_ancestors : Array{};
+      st.tree_positions = tree != nullptr ? cache_.tree_positions : Array{};
+      st.tree_path = tree != nullptr ? cache_.tree_path : Array{};
+      st.tree_conv_input = st.tree_k = st.tree_v = st.tree_alpha = st.tree_beta = Array{};
+      st.tree_keys = st.tree_values = Array{};
     }
   }
 
@@ -1199,6 +1578,10 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.prefix_committed = false;
   if (retain_prefix_state)
     LSE_RETURN_IF_ERROR(cache_.prefix.retain(*states, t_now, roots));
+  cache_.tree = tree != nullptr;
+  cache_.tree_commit = TreeStateCommit{};
+  if (tree != nullptr)
+    LSE_RETURN_IF_ERROR(cache_.tree_commit.retain(*states, t_now, roots));
   std::vector<graph::NodePtr> carried;
   if (states != nullptr) {
     auto add = [&](const Array& a, bool is_carry) {
@@ -1315,7 +1698,7 @@ Status HybridLM::retire_prefill(std::vector<MixerState>& states) {
   const bool wide = std::any_of(caches_.begin(), caches_.end(),
       [&](const ForwardCache& cache) {
         return cache.states == &states && cache.t_key > 8 &&
-               !cache.retains_prefix_state;
+               !cache.retains_prefix_state && !cache.tree;
       });
   if (!wide) return OkStatus();
   return retire_completed_passes(states);

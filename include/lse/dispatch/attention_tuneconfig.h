@@ -136,6 +136,8 @@ struct ShortDefaultRule {
 };
 inline constexpr std::array kShortDefaults{
     ShortDefaultRule{1, 24, 4, 16, 1024, 512, 1, 0},
+    // A draft tree's verify pass (graph::MaskKind::kTree) at the same shapes.
+    ShortDefaultRule{1, 24, 4, 16, 1024, 512, 3, 0},
 };
 
 struct WaveL2Rule {

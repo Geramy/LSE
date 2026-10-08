@@ -660,6 +660,38 @@ Result<std::vector<std::uint32_t>> DFlash2Module::draft(
   path.resize(proposals);
   return path;
 }
+Result<runtime::DraftLattice> DFlash2Module::draft_lattice(std::uint32_t anchor,
+                                                          std::int32_t first) {
+  const auto positions = impl_->config.block_size - 1;
+  LSE_ASSIGN_OR(auto ready, impl_->run_draft(anchor, first, positions, true));
+  const auto top = static_cast<std::uint32_t>(impl_->config.selector_top_k);
+  const auto score_count = ready->scores.shape().elem_count();
+  const auto id_count = ready->indices.shape().elem_count();
+  if (score_count < static_cast<std::size_t>(positions) * top * top ||
+      id_count < static_cast<std::size_t>(positions) * top ||
+      ready->lattice.shape().elem_count() != score_count + id_count)
+    return LSE_ERROR(kInternal, "DFlash2 lattice does not hold every candidate");
+  std::vector<float> lattice(score_count + id_count);
+  {
+    DraftProfile profile("lattice-readback");
+    LSE_RETURN_IF_ERROR(ready->lattice.to_host(lattice.data(), lattice.size() * sizeof(float)));
+  }
+  runtime::DraftLattice out;
+  out.positions = positions;
+  out.top = top;
+  out.scores.assign(lattice.begin(),
+      lattice.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(positions) * top * top));
+  out.ids.resize(static_cast<std::size_t>(positions) * top);
+  for (std::size_t i = 0; i < out.ids.size(); ++i) {
+    const float raw = lattice[score_count + i];
+    if (!std::isfinite(raw) || raw < 0 || raw >= impl_->config.vocab_size || std::floor(raw) != raw)
+      return LSE_ERROR(kInternal, "invalid DFlash2 candidate token");
+    out.ids[i] = static_cast<std::uint32_t>(raw);
+  }
+  LSE_RETURN_IF_ERROR(out.validate(static_cast<std::uint32_t>(impl_->config.vocab_size)));
+  return out;
+}
+
 Result<DFlash2Proposal> DFlash2Module::draft_sampled(
     std::uint32_t anchor, std::int32_t first, std::uint32_t proposals,
     float temperature, runtime::SpeculativeSampler& sampler) {

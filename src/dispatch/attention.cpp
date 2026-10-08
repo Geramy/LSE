@@ -72,7 +72,8 @@ bool paged_inputs(const KernelShapes& s) {
       !kv::valid_storage(s.input_dtypes[1], s.attrs[1]) ||
       s.inputs[0].rank() != 4 || s.inputs[1].rank() != 4 ||
       s.inputs[2].rank() != 4 || s.inputs[4].rank() != 2 ||
-      (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0)) return false;
+      (s.iattrs[0] != 0 && s.iattrs[0] != 1 && s.iattrs[1] < 0) ||
+      s.iattrs[0] < 0 || s.iattrs[0] > 3) return false;
   for (const auto& shape : s.inputs)
     if (!positive_shape(shape)) return false;
   const auto& q = s.inputs[0];
@@ -87,6 +88,11 @@ bool paged_inputs(const KernelShapes& s) {
       s.iattrs[3] != k.dim(2) || table.dim(1) > UINT32_MAX / k.dim(2) ||
       s.inputs[3].elem_count() < static_cast<std::size_t>(
           kv::step_meta_elems(static_cast<std::int32_t>(q.dim(0))))) return false;
+  // A tree pass is one sequence and carries its ancestor mask.
+  if (s.iattrs[0] == 3 &&
+      (q.dim(0) != 1 || q.dim(2) > 64 ||
+       s.inputs[3].elem_count() < static_cast<std::size_t>(kv::tree_meta_elems(
+           1, static_cast<std::int32_t>(q.dim(2)))))) return false;
   if (kv::packed_cache(storage)) {
     for (const auto* pool : {&k, &v}) {
       const auto width = kv::logical_width(storage, pool->dim(3));

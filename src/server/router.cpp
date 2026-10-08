@@ -185,6 +185,7 @@ struct Outcome {
   std::uint32_t dflash2_depth = 0;
   std::uint32_t spec_steps = 0, spec_tested = 0, spec_accepted = 0;
   std::uint32_t spec_proposed = 0, spec_plain_steps = 0;
+  std::uint32_t tree_steps = 0, tree_rows = 0;
   double spec_mean_width = 0.0;
   bool spec_adaptive = false;
   std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
@@ -386,7 +387,8 @@ struct Router::Impl {
       draft = {{"kind", "dflash2"},
                {"block_size", dflash2->block_size()},
                {"depth", runtime::dflash2_verify_depth(dflash2->block_size())},
-               {"adaptive", opt.adaptive_dflash2}};
+               {"adaptive", opt.adaptive_dflash2},
+               {"tree", opt.dflash2_tree}};
     return json{{"context_length", c.kv_capacity()},
                 {"max_position_embeddings", c.train_seq_len},
                 {"kv_len", c.kv_capacity()},
@@ -642,7 +644,8 @@ Result<Outcome> Router::Impl::generate(
   runtime::Generator gen(impl.model, r.sampling, impl.opt.prefill);
   if (impl.mtp != nullptr) gen.use_mtp(*impl.mtp, impl.opt.adaptive_mtp ? &impl.mtp_widths : nullptr);
   if (impl.dflash2 != nullptr)
-    gen.use_dflash2(*impl.dflash2, impl.opt.adaptive_dflash2 ? &impl.widths : nullptr);
+    gen.use_dflash2(*impl.dflash2, impl.opt.adaptive_dflash2 ? &impl.widths : nullptr,
+                    impl.opt.dflash2_tree);
 
   // The request's session: a named one is found or created, and continues
   // its own prefix (the Generator checks the exact tokens before reusing
@@ -771,6 +774,8 @@ Result<Outcome> Router::Impl::generate(
   out.spec_accepted = st.spec_accepted;
   out.spec_proposed = st.spec_proposed;
   out.spec_plain_steps = st.spec_plain_steps;
+  out.tree_steps = st.tree_steps;
+  out.tree_rows = st.tree_rows;
   out.spec_mean_width = st.mean_verify_width();
   out.spec_adaptive = st.spec_adaptive;
   out.spec_tested_by_position = st.spec_tested_by_position;
@@ -870,6 +875,8 @@ json timings_of(const Outcome& o) {
     t["spec_accepted"] = o.spec_accepted;
     t["spec_proposed"] = o.spec_proposed;
     t["spec_plain_steps"] = o.spec_plain_steps;
+    t["tree_steps"] = o.tree_steps;
+    t["tree_rows"] = o.tree_rows;
     t["spec_mean_width"] = o.spec_mean_width;
     t["spec_tested_by_position"] = o.spec_tested_by_position;
     t["spec_accepted_by_position"] = o.spec_accepted_by_position;
@@ -1150,7 +1157,8 @@ Status Router::prepare_kernels() {
   if (impl_->mtp != nullptr)
     gen.use_mtp(*impl_->mtp, impl_->opt.adaptive_mtp ? &impl_->mtp_widths : nullptr);
   if (impl_->dflash2 != nullptr)
-    gen.use_dflash2(*impl_->dflash2, impl_->opt.adaptive_dflash2 ? &impl_->widths : nullptr);
+    gen.use_dflash2(*impl_->dflash2, impl_->opt.adaptive_dflash2 ? &impl_->widths : nullptr,
+                    impl_->opt.dflash2_tree);
   return gen.prepare_kernels();
 }
 

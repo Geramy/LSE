@@ -336,7 +336,7 @@ add_library(lse::ops ALIAS lse_ops)
 target_link_libraries(lse_ops PUBLIC lse_core lse_graph lse_kv)
 lse_apply_common_flags(lse_ops)
 
-add_library(lse_sampling src/runtime/sampler.cpp)
+add_library(lse_sampling src/runtime/sampler.cpp src/runtime/draft_tree.cpp)
 add_library(lse::sampling ALIAS lse_sampling)
 target_link_libraries(lse_sampling PUBLIC lse_core)
 lse_apply_common_flags(lse_sampling)

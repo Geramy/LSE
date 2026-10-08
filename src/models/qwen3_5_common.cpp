@@ -264,10 +264,13 @@ class Qwen35Attention final : public IMixer {
     cache.paged = &st.paged;
     cache.capacity = spec_[m].kv_length;
     cache.used = st.position;
+    cache.tree_positions = st.tree_positions;
     LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_[m], spec_[m], rope_[m],
                                                 st.position, &cache, phase));
     st.key_cache = cache.keys;
     st.value_cache = cache.values;
+    st.tree_keys = cache.tree_keys;
+    st.tree_values = cache.tree_values;
     return y;
   }
 
@@ -445,6 +448,9 @@ class Qwen35GatedDeltaNet final : public IMixer {
         carried.step_mask = st->pad_mask;
         carried.step_unmask = st->pad_unmask;
         carried.tail_rows = st->pad_tail_rows;
+        carried.tree_depth = st->tree_depth;
+        carried.tree_ancestors = st->tree_ancestors;
+        carried.tree_path = st->tree_path;
       }
       LSE_ASSIGN_OR(Array part,
                     ops::gated_delta_net(x, w_[m], spec_[m],
@@ -452,6 +458,11 @@ class Qwen35GatedDeltaNet final : public IMixer {
       if (st != nullptr) {
         st->gdn_state = carried.recurrent;
         st->gdn_conv_qkv = carried.conv_qkv;
+        st->tree_conv_input = carried.tree_conv_input;
+        st->tree_k = carried.tree_k;
+        st->tree_v = carried.tree_v;
+        st->tree_alpha = carried.tree_alpha;
+        st->tree_beta = carried.tree_beta;
       }
       return part;
   }

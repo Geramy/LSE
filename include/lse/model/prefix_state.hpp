@@ -5,6 +5,7 @@
 #include <span>
 #include <vector>
 
+#include "lse/kv/cache_dtype.hpp"
 #include "lse/model/layer.hpp"
 #include "lse/graph/program.hpp"
 
@@ -36,6 +37,41 @@ class PrefixStateCommit {
   std::int64_t sequence_rows_ = 0;
   std::vector<Entry> entries_;
   std::vector<Replay> replays_;
+};
+
+// A draft tree's verify pass (TreeLayout) keeps what its accepted path is
+// replayed from: every GDN layer's k, v, alpha, beta and starting state, its
+// conv input rows and starting conv tail, and every attention layer's rotated
+// keys and values. commit() writes the path's recurrent state and conv tail
+// into the pass's carried outputs and its keys and values to the positions
+// that follow the pass's start, one small program for the whole stack.
+class TreeStateCommit {
+ public:
+  // Path rows a commit can name: a tree's depth bound plus its root.
+  static constexpr std::size_t kMaxPath = 9;
+  Status retain(std::span<const MixerState> states, std::int64_t rows,
+                std::vector<graph::NodePtr>& roots);
+  // `path` holds pass rows, root first; `first` is the pass's first position.
+  Status commit(std::span<const std::uint32_t> path, std::int32_t first,
+                graph::Scheduler& scheduler);
+  Status prepare(graph::Scheduler& scheduler);
+  [[nodiscard]] bool ready() const noexcept { return rows_ > 1; }
+
+ private:
+  struct Entry {
+    enum class Kind : std::uint8_t { kRecurrent, kConvTail, kKeysValues } kind;
+    graph::NodePtr output;                 // carried output, or the pool
+    std::vector<graph::NodePtr> sources;   // as the replay reads them
+    kv::CacheDType storage = kv::CacheDType::kF32;
+  };
+  Status build_replay(graph::Scheduler& scheduler);
+  std::int64_t rows_ = 0;
+  std::vector<Entry> entries_;
+  graph::Program program_;
+  std::vector<graph::Array> inputs_;
+  std::vector<graph::Array> outputs_;
+  graph::Array path_;
+  bool built_ = false;
 };
 
 }  // namespace lse::model

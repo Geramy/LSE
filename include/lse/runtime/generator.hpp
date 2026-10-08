@@ -23,6 +23,7 @@
 #include "lse/model/hybrid_lm.hpp"
 #include "lse/model/mtp.hpp"
 #include "lse/model/dflash2.hpp"
+#include "lse/runtime/draft_tree.hpp"
 #include "lse/runtime/draft_width.hpp"
 #include "lse/runtime/perplexity.hpp"
 #include "lse/runtime/sampler.hpp"
@@ -150,6 +151,9 @@ struct GenerationStats {
   std::uint32_t spec_tested = 0;
   std::uint32_t spec_proposed = 0;
   std::uint32_t spec_plain_steps = 0;
+  // Steps that verified a draft tree, and the rows those passes carried.
+  std::uint32_t tree_steps = 0;
+  std::uint32_t tree_rows = 0;
   std::array<std::uint32_t, 7> spec_tested_by_position{}, spec_accepted_by_position{};
   std::array<double, 7> spec_overlap_sum{}, spec_candidate_mass_sum{}, spec_deterministic_mass_sum{};
   std::uint32_t mtp_depth = 0;
@@ -235,8 +239,12 @@ class Generator {
   // With `widths`, each step of a sampled request verifies the prefix of the
   // draft's block that policy chooses (and may skip the draft); without, and
   // for greedy requests, the whole block.
-  void use_dflash2(model::DFlash2Module& draft, DraftWidthPolicy* widths = nullptr) noexcept {
-    dflash2_ = &draft; mtp_ = nullptr; widths_ = widths;
+  // With `tree`, a step may verify a draft tree built from the draft's whole
+  // candidate lattice (runtime::DraftTree) instead of a chain; with `widths`
+  // the policy picks the tree's size or a chain from measured costs.
+  void use_dflash2(model::DFlash2Module& draft, DraftWidthPolicy* widths = nullptr,
+                   bool tree = false) noexcept {
+    dflash2_ = &draft; mtp_ = nullptr; widths_ = widths; tree_ = tree;
   }
 
   // One forward pass of a prompt: `width` rows, the first `valid` of them
@@ -366,6 +374,11 @@ class Generator {
   model::MtpModule* mtp_ = nullptr;
   model::DFlash2Module* dflash2_ = nullptr;
   DraftWidthPolicy* widths_ = nullptr;
+  bool tree_ = false;
+  // Appends the draft context for a tree path's rows of the last verify pass
+  // (row 0 at position `first`), copied together into tree_rows_.
+  Status append_draft_path(std::span<const std::uint32_t> path, std::int32_t first);
+  graph::Array tree_rows_;
   graph::Array spec_features_;
   Status append_draft_context(std::size_t rows, std::int32_t first);
   // The prompt's last pass's target features, for the DFlash2 context. The
@@ -384,7 +397,10 @@ class Generator {
   // decoder's carried state is re-derived from the same starting point with
   // the corrected tokens in place.
   Status verify(Session& session, std::span<const std::uint32_t> rows,
-                bool replaces_previous);
+                bool replaces_previous, const model::TreeLayout* tree = nullptr);
+  // spec_by_m_ keys: a pass's width, plus this for a tree pass.
+  static constexpr std::size_t kTreeHeadKey = std::size_t{1} << 20;
+  std::size_t spec_key_ = 0;
   Status mtp_prefill_chunk(const graph::Array& hidden,
                            std::span<const std::uint32_t> tokens,
                            std::int32_t first, graph::Array* carry);

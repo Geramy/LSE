@@ -107,6 +107,14 @@ struct GatedDeltaNetState {
   // real step left it. tail_rows names the conv-input rows the conv tail
   // takes (the last kernel-1 real ones) instead of the pass's last rows.
   Array step_mask, step_unmask, tail_rows;
+  // A draft tree's verify pass (model::TreeLayout): each row's depth [T], its
+  // conv ancestors [T, K-1] (graph::causal_conv1d_tree) and the top path
+  // descriptor (graph::gated_delta_path). Set, the recurrence runs over the
+  // tree and the carried state and conv tail are the top path's.
+  Array tree_depth, tree_ancestors, tree_path;
+  // Out: what the tree commit replays the accepted path from -- the conv
+  // input rows, and k, v, alpha, beta as the recurrence read them.
+  Array tree_conv_input, tree_k, tree_v, tree_alpha, tree_beta;
 };
 
 Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,

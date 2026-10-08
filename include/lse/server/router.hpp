@@ -52,6 +52,8 @@ struct ServerOptions {
   // DFlash2 verifies the prefix of each draft block that DraftWidthPolicy
   // picks (true), or the whole block every step (false).
   bool adaptive_dflash2 = true;
+  // DFlash2 steps may verify a draft tree (runtime::DraftTree).
+  bool dflash2_tree = false;
   // A sampled MTP request chains as deep as DraftWidthPolicy picks, up to
   // runtime::kMaxMtpDepth (true), or mtp_depth every step (false).
   bool adaptive_mtp = true;

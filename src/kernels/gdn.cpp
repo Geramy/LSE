@@ -6,6 +6,8 @@
 #include "lse/math.hpp"
 #include "lse/backends/hrx/device_info.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <array>
 #include <string>
@@ -602,5 +604,357 @@ LinkedBinding gdn_pair_bindings(const FusionGroup& group) {
   b.ok = true;
   return b;
 }
+
+
+// ---------------------------------------------------------------------------
+// Draft trees (runtime::DraftTree).
+//
+// A tree verify pass carries its nodes as rows in depth-first preorder, so a
+// row's parent is the most recent row one level up. The scan keeps one state
+// per depth -- level 0 the state the pass starts from, level d + 1 the state
+// after the latest row at depth d -- and each row continues from its parent's
+// level and leaves its own result one level down. That is the state-resident
+// serial form SpecLA (arXiv 2607.16673) uses for chains, applied to a tree, and
+// the per-node recurrence TreeWY (arXiv 2608.20961) writes in closed form: no
+// per-node state is stored. A row's arithmetic is the wave-per-row scan's
+// (emit_gdn) step for step, so a node's output is bit-identical to the chain
+// scan over its path.
+//
+// Path descriptors (gdn.path_state, conv_tail.rows, kv_page_write.rows):
+// f32 [2 + rows]: {count, first position, row 0, row 1, ...}.
+
+namespace {
+
+// Depth levels the tree scan keeps: the starting state and one per depth,
+// rows of depth 0..8 (model::TreeLayout::kMaxDepth).
+constexpr std::uint32_t kTreeLevels = 10;
+
+template <class E>
+struct GdnTreeArgs {
+  env::In<kir::f32, E> q;
+  env::In<kir::f32, E> k;
+  env::In<kir::f32, E> v;
+  env::In<kir::f32, E> alpha;
+  env::In<kir::f32, E> beta;
+  env::In<kir::f32, E> s;
+  env::In<kir::f32, E> tree;   // [T] depth of each row
+  env::Out<kir::f32, E> out;
+};
+
+template <class E>
+struct GdnPathArgs {
+  env::In<kir::f32, E> k;
+  env::In<kir::f32, E> v;
+  env::In<kir::f32, E> alpha;
+  env::In<kir::f32, E> beta;
+  env::In<kir::f32, E> s;
+  env::In<kir::f32, E> path;   // {count, first, rows...}
+  env::Out<kir::f32, E> out;
+};
+
+bool gdn_tree_shapes(const KernelShapes& s, std::size_t q_index) {
+  if (!s.device || !s.types.scalar || !s.intrinsics || !s.store ||
+      s.inputs.size() != q_index + 6 || s.intrinsics->find("wave.shfl_xor").empty())
+    return false;
+  for (const DType dtype : s.input_dtypes)
+    if (dtype != DType::kF32) return false;
+  const Shape& k = s.inputs[q_index];
+  const Shape& v = s.inputs[q_index + 1];
+  const Shape& st = s.inputs[q_index + 4];
+  if (k.rank() != 4 || v.rank() != 4 || st.rank() != 4 || k.dim(0) != 1 || v.dim(0) != 1 ||
+      k.dim(1) != v.dim(1) || k.dim(3) != v.dim(3) || k.dim(2) == 0 || v.dim(2) % k.dim(2) != 0 ||
+      st != Shape{1, v.dim(2), v.dim(3), v.dim(3)} ||
+      s.inputs[q_index + 2] != Shape{1, v.dim(1), v.dim(2)} ||
+      s.inputs[q_index + 3] != Shape{1, v.dim(1), v.dim(2)})
+    return false;
+  const auto D = static_cast<std::uint32_t>(v.dim(3));
+  return D % wave_of(s.device) == 0 && D / wave_of(s.device) <= 4;
+}
+
+std::string emit_gdn_tree(const KernelShapes& s) {
+  if (!gdn_tree_shapes(s, 1) || s.inputs[0] != s.inputs[1]) return {};
+  const Shape& q = s.inputs[0];
+  const auto seq = static_cast<std::uint32_t>(q.dim(1));
+  const auto heads = static_cast<std::uint32_t>(s.inputs[2].dim(2));
+  const auto key_heads = static_cast<std::uint32_t>(q.dim(2));
+  const auto D = static_cast<std::uint32_t>(q.dim(3));
+  const auto share = heads / key_heads;
+  if (s.inputs[6].elem_count() < seq || s.output != s.inputs[2]) return {};
+  const std::uint32_t wave = wave_of(s.device);
+  const std::uint32_t tile = D / wave;
+
+  kir::KernelBody k(s.types, *s.intrinsics);
+  k.set_store(s.store);
+  GdnTreeArgs<env::Emit> a;
+  if (!env::bind(k, a, s)) return {};
+  env::Emit e{&k};
+  const auto i = e.thread_id();
+  const auto lane = e.let(i % wave);
+  const auto wid = e.let(i / wave);
+  (void)e.ret_if(wid >= heads * D);
+  const auto row = e.let(wid % D);
+  const auto h = e.let(wid / D);
+
+  std::vector<std::vector<kir::LValue<kir::f32>>> level(kTreeLevels);
+  for (std::uint32_t l = 0; l < kTreeLevels; ++l)
+    for (std::uint32_t ei = 0; ei < tile; ++ei) level[l].emplace_back(e.var(0.0f));
+  for (std::uint32_t ei = 0; ei < tile; ++ei)
+    level[0][ei] = a.s[e.let((h * D + row) * D + lane + ei * wave)];
+  auto reduce = [&](kir::Val<kir::f32> acc) {
+    for (std::uint32_t m = 1; m < wave; m <<= 1) acc = e.let(acc + math::shfl_xor(acc, e.u32(m)));
+    return acc;
+  };
+  // A step's inputs do not depend on the state, so a block of steps loads
+  // them all before the first update and pays their latency once (emit_gdn
+  // does the same).
+  struct StepIn {
+    kir::Val<kir::u32> depth, sc;
+    kir::Val<kir::f32> al, bt, vt;
+    std::vector<kir::Val<kir::f32>> kj, qj;
+  };
+  const auto load_step = [&](const kir::Val<kir::u32>& t) {
+    StepIn in{e.let(kir::cast<kir::u32>(a.tree[t])), e.let(t * heads + h), {}, {}, {}, {}, {}};
+    const auto kvec = e.let((t * key_heads + h / share) * D);
+    in.al = e.let(a.alpha[in.sc]);
+    in.bt = e.let(a.beta[in.sc]);
+    in.vt = e.let(a.v[in.sc * D + row]);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      in.kj.push_back(e.let(a.k[kvec + lane + ei * wave]));
+      in.qj.push_back(e.let(a.q[kvec + lane + ei * wave]));
+    }
+    return in;
+  };
+  const auto run_step = [&](const StepIn& in) {
+    const auto& depth = in.depth;
+    const auto& sc = in.sc;
+    const auto& al = in.al;
+    const auto& bt = in.bt;
+    const auto& vt = in.vt;
+    const auto& kj = in.kj;
+    const auto& qj = in.qj;
+    // The parent's state: the level of this row's depth.
+    std::vector<kir::LValue<kir::f32>> srow;
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      srow.emplace_back(e.var(level[0][ei].read()));
+      for (std::uint32_t l = 1; l < kTreeLevels; ++l)
+        srow[ei] = select(depth == l, level[l][ei].read(), srow[ei].read());
+    }
+    auto skp = e.var(0.0f);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      srow[ei] = srow[ei].read() * al;
+      skp = math::fma(srow[ei].read(), kj[ei], skp);
+    }
+    const auto sk = reduce(skp);
+    const auto delta = e.let((vt - sk) * bt);
+    auto accp = e.var(0.0f);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      srow[ei] = math::fma(delta, kj[ei], srow[ei].read());
+      accp = math::fma(srow[ei].read(), qj[ei], accp);
+    }
+    const auto acc = reduce(accp);
+    if (auto first = e.when(lane == 0u)) e.store(e.let(sc * D + row), acc);
+    // This row's state is where its children continue from.
+    for (std::uint32_t l = 1; l < kTreeLevels; ++l)
+      for (std::uint32_t ei = 0; ei < tile; ++ei)
+        level[l][ei] = select(depth + 1u == l, srow[ei].read(), level[l][ei].read());
+  };
+  const auto block = [&](const kir::Val<kir::u32>& t0, std::uint32_t steps) {
+    std::vector<StepIn> ins;
+    ins.reserve(steps);
+    for (std::uint32_t u = 0; u < steps; ++u) ins.push_back(load_step(e.let(t0 + u)));
+    for (std::uint32_t u = 0; u < steps; ++u) run_step(ins[u]);
+  };
+  const std::uint32_t blocks = seq / kStepBlock;
+  if (blocks > 1) {
+    for (auto tb : e.range(0u, blocks, 1u)) block(e.let(tb * kStepBlock), kStepBlock);
+  } else if (blocks == 1) {
+    block(e.u32(0), kStepBlock);
+  }
+  if (const std::uint32_t tail = seq - blocks * kStepBlock; tail != 0)
+    block(e.u32(blocks * kStepBlock), tail);
+  return k.str();
+}
+
+std::string emit_gdn_path(const KernelShapes& s) {
+  if (!gdn_tree_shapes(s, 0)) return {};
+  const Shape& kk = s.inputs[0];
+  const auto seq = static_cast<std::uint32_t>(kk.dim(1));
+  const auto heads = static_cast<std::uint32_t>(s.inputs[1].dim(2));
+  const auto key_heads = static_cast<std::uint32_t>(kk.dim(2));
+  const auto D = static_cast<std::uint32_t>(kk.dim(3));
+  const auto share = heads / key_heads;
+  const auto most = static_cast<std::uint32_t>(s.inputs[5].elem_count()) - 2u;
+  if (s.inputs[5].elem_count() < 3 || most > seq || s.output != s.inputs[4]) return {};
+  const std::uint32_t wave = wave_of(s.device);
+  const std::uint32_t tile = D / wave;
+
+  kir::KernelBody k(s.types, *s.intrinsics);
+  k.set_store(s.store);
+  GdnPathArgs<env::Emit> a;
+  if (!env::bind(k, a, s)) return {};
+  env::Emit e{&k};
+  const auto i = e.thread_id();
+  const auto lane = e.let(i % wave);
+  const auto wid = e.let(i / wave);
+  (void)e.ret_if(wid >= heads * D);
+  const auto row = e.let(wid % D);
+  const auto h = e.let(wid / D);
+  const auto count = e.let(kir::cast<kir::u32>(a.path[0u]));
+  std::vector<kir::LValue<kir::f32>> srow;
+  for (std::uint32_t ei = 0; ei < tile; ++ei)
+    srow.emplace_back(e.var(a.s[e.let((h * D + row) * D + lane + ei * wave)]));
+  auto reduce = [&](kir::Val<kir::f32> acc) {
+    for (std::uint32_t m = 1; m < wave; m <<= 1) acc = e.let(acc + math::shfl_xor(acc, e.u32(m)));
+    return acc;
+  };
+  for (std::uint32_t step = 0; step < most; ++step) {
+    if (auto live = e.when(count > step)) {
+      const auto t = e.let(kir::cast<kir::u32>(a.path[2u + step]));
+      const auto sc = e.let(t * heads + h);
+      const auto kvec = e.let((t * key_heads + h / share) * D);
+      const auto al = e.let(a.alpha[sc]);
+      const auto bt = e.let(a.beta[sc]);
+      const auto vt = e.let(a.v[sc * D + row]);
+      std::vector<kir::Val<kir::f32>> kj;
+      for (std::uint32_t ei = 0; ei < tile; ++ei) kj.push_back(e.let(a.k[kvec + lane + ei * wave]));
+      auto skp = e.var(0.0f);
+      for (std::uint32_t ei = 0; ei < tile; ++ei) {
+        srow[ei] = srow[ei].read() * al;
+        skp = math::fma(srow[ei].read(), kj[ei], skp);
+      }
+      const auto sk = reduce(skp);
+      const auto delta = e.let((vt - sk) * bt);
+      for (std::uint32_t ei = 0; ei < tile; ++ei)
+        srow[ei] = math::fma(delta, kj[ei], srow[ei].read());
+    }
+  }
+  for (std::uint32_t ei = 0; ei < tile; ++ei)
+    e.store(e.let((h * D + row) * D + lane + ei * wave), srow[ei].read());
+  return k.str();
+}
+
+ThreadPlan gdn_wave_rows_plan(const KernelShapes& s, std::size_t value_index) {
+  ThreadPlan tp;
+  tp.workgroup_size[0] = kBlock;
+  const std::uint32_t wave = wave_of(s.device);
+  const auto rows = s.inputs.size() > value_index && s.inputs[value_index].rank() == 4
+      ? static_cast<std::uint32_t>(s.inputs[value_index].dim(2) * s.inputs[value_index].dim(3))
+      : 1u;
+  tp.workgroup_count[0] = (rows * wave + kBlock - 1) / kBlock;
+  return tp;
+}
+
+// The host references, step for step: the device reduces each dot with a
+// shuffle tree, so these agree with it to rounding, not bit for bit.
+void host_gdn_step(float* srow, const float* k, const float* q, float v, float al,
+                   float bt, std::size_t D, float* out) {
+  float sk = 0;
+  for (std::size_t j = 0; j < D; ++j) {
+    srow[j] *= al;
+    sk = std::fma(srow[j], k[j], sk);
+  }
+  const float delta = (v - sk) * bt;
+  float acc = 0;
+  for (std::size_t j = 0; j < D; ++j) {
+    srow[j] = std::fma(delta, k[j], srow[j]);
+    if (q) acc = std::fma(srow[j], q[j], acc);
+  }
+  if (out) *out = acc;
+}
+
+const float* host_f32(const HostTensorView& v) {
+  return reinterpret_cast<const float*>(v.bytes.data());
+}
+
+}  // namespace
+
+struct GdnTreeKernel final : KernelPrimitive<GdnTreeKernel> {
+  static constexpr std::string_view kName = "gdn.tree_scan.v1";
+  static constexpr std::string_view kEntry = "lse_gdn_tree_scan_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 7; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  std::string emit_kernel(const KernelShapes& s) const override { return emit_gdn_tree(s); }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 7) return LSE_ERROR(kInvalidArgument, "gdn.tree_scan.v1 takes 7 inputs");
+    return in[2];
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) { return gdn_wave_rows_plan(s, 2); }
+  bool has_typed_host_impl() const noexcept override { return true; }
+  Status eval_cpu_typed(std::span<const HostTensorView> in, HostOutputView out,
+                        const std::array<float, 4>&,
+                        const std::array<std::int32_t, 4>&) const override {
+    if (in.size() != 7) return LSE_ERROR(kInvalidArgument, "gdn.tree_scan.v1 takes 7 inputs");
+    const Shape& q = in[0].shape;
+    const auto T = static_cast<std::size_t>(q.dim(1)), KH = static_cast<std::size_t>(q.dim(2)),
+               D = static_cast<std::size_t>(q.dim(3)), H = static_cast<std::size_t>(in[2].shape.dim(2));
+    const float *qq = host_f32(in[0]), *kk = host_f32(in[1]), *vv = host_f32(in[2]),
+                *al = host_f32(in[3]), *bt = host_f32(in[4]), *s0 = host_f32(in[5]),
+                *depth = host_f32(in[6]);
+    auto* o = reinterpret_cast<float*>(out.bytes.data());
+    std::vector<float> levels(kTreeLevels * D);
+    for (std::size_t h = 0; h < H; ++h)
+      for (std::size_t r = 0; r < D; ++r) {
+        std::copy_n(s0 + (h * D + r) * D, D, levels.begin());
+        for (std::size_t t = 0; t < T; ++t) {
+          const auto d = static_cast<std::size_t>(depth[t]);
+          if (d + 1 >= kTreeLevels) return LSE_ERROR(kInvalidArgument, "tree deeper than the scan's levels");
+          std::vector<float> srow(levels.begin() + d * D, levels.begin() + (d + 1) * D);
+          const std::size_t kv = (t * KH + h / (H / KH)) * D;
+          host_gdn_step(srow.data(), kk + kv, qq + kv, vv[(t * H + h) * D + r], al[t * H + h],
+                        bt[t * H + h], D, &o[(t * H + h) * D + r]);
+          std::copy(srow.begin(), srow.end(), levels.begin() + (d + 1) * D);
+        }
+      }
+    return OkStatus();
+  }
+};
+LSE_REGISTER_PRIMITIVE(GdnTreeKernel);
+
+struct GdnPathKernel final : KernelPrimitive<GdnPathKernel> {
+  static constexpr std::string_view kName = "gdn.path_state.v1";
+  static constexpr std::string_view kEntry = "lse_gdn_path_state_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 6; }
+  bool owns_indexing() const noexcept override { return true; }
+  bool supports_epilogue() const noexcept override { return false; }
+  std::string emit_kernel(const KernelShapes& s) const override { return emit_gdn_path(s); }
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() != 6) return LSE_ERROR(kInvalidArgument, "gdn.path_state.v1 takes 6 inputs");
+    return in[4];
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) { return gdn_wave_rows_plan(s, 1); }
+  bool has_typed_host_impl() const noexcept override { return true; }
+  Status eval_cpu_typed(std::span<const HostTensorView> in, HostOutputView out,
+                        const std::array<float, 4>&,
+                        const std::array<std::int32_t, 4>&) const override {
+    if (in.size() != 6) return LSE_ERROR(kInvalidArgument, "gdn.path_state.v1 takes 6 inputs");
+    const Shape& kshape = in[0].shape;
+    const auto KH = static_cast<std::size_t>(kshape.dim(2)), D = static_cast<std::size_t>(kshape.dim(3)),
+               H = static_cast<std::size_t>(in[1].shape.dim(2));
+    const float *kk = host_f32(in[0]), *vv = host_f32(in[1]), *al = host_f32(in[2]),
+                *bt = host_f32(in[3]), *s0 = host_f32(in[4]), *path = host_f32(in[5]);
+    const auto count = static_cast<std::size_t>(path[0]);
+    if (count + 2 > in[5].shape.elem_count())
+      return LSE_ERROR(kInvalidArgument, "gdn.path_state.v1 path longer than its descriptor");
+    auto* o = reinterpret_cast<float*>(out.bytes.data());
+    for (std::size_t h = 0; h < H; ++h)
+      for (std::size_t r = 0; r < D; ++r) {
+        float* srow = o + (h * D + r) * D;
+        std::copy_n(s0 + (h * D + r) * D, D, srow);
+        for (std::size_t step = 0; step < count; ++step) {
+          const auto t = static_cast<std::size_t>(path[2 + step]);
+          const std::size_t kv = (t * KH + h / (H / KH)) * D;
+          host_gdn_step(srow, kk + kv, nullptr, vv[(t * H + h) * D + r], al[t * H + h],
+                        bt[t * H + h], D, nullptr);
+        }
+      }
+    return OkStatus();
+  }
+};
+LSE_REGISTER_PRIMITIVE(GdnPathKernel);
 
 }  // namespace lse::kernels

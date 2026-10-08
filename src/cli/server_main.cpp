@@ -77,6 +77,8 @@ void usage() {
       "                       downloaded when not cached)\n"
       "      --adaptive-dflash2=off  verify every DFlash2 proposal each step (on/off;\n"
       "                       default on: verify the prefix expected to decode fastest)\n"
+      "      --dflash2-tree=on  verify draft trees, several candidate paths per pass\n"
+      "                       (on/off; default off)\n"
       "      --no-mtp         decode one token per pass, ignoring any\n"
       "                       multi-token-prediction module\n"
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
@@ -234,6 +236,16 @@ int main(int argc, char** argv) {
         return 2;
       }
       cfg.adaptive_dflash2 = text == "on" ? 1 : 0;
+    }
+    else if (a == "--dflash2-tree" || a.starts_with("--dflash2-tree=")) {
+      const std::string text = a == "--dflash2-tree"
+                                  ? value("--dflash2-tree")
+                                  : a.substr(std::string("--dflash2-tree=").size());
+      if (text != "on" && text != "off") {
+        std::fputs("lse-server: --dflash2-tree must be on or off\n", stderr);
+        return 2;
+      }
+      cfg.dflash2_tree = text == "on" ? 1 : 0;
     }
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--pull") pull_missing = true;

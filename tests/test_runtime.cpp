@@ -643,6 +643,59 @@ LSE_TEST(draft_width_policy_calibrates_confidence_to_acceptance) {
   LSE_EXPECT_NEAR(policy.acceptance(0.9999), 1.0 - std::pow(10.0, -4.125), 1e-3);
 }
 
+// A tree policy past warm-up that has measured every tree rung: `base` ns
+// at four rows and `per_row` more for each row past four.
+DraftWidthPolicy measured_tree_policy(double base, double per_row, double draft) {
+  DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_tree_verify(DraftWidthPolicy::kTreeRows[0], 1);
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
+    policy.observe_verify(1, static_cast<std::uint64_t>(base));
+    for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
+      policy.observe_tree_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 4)));
+  }
+  policy.observe_draft(static_cast<std::uint64_t>(draft));
+  policy.observe_step(3, static_cast<std::uint64_t>(60e6));
+  return policy;
+}
+
+LSE_TEST(draft_width_policy_sizes_trees_by_measured_cost) {
+  // Expected accepted nodes of the best b-node tree: strongly diminishing.
+  std::vector<double> prefix{0.0};
+  for (std::uint32_t b = 1; b <= DraftWidthPolicy::kMaxTreeNodes; ++b)
+    prefix.push_back(prefix.back() + 0.8 * std::pow(0.85, b - 1));
+  // While warming up, the chain's rung; then every rung is measured first.
+  DraftWidthPolicy fresh;
+  LSE_EXPECT_EQ(fresh.tree_nodes(prefix), 7u);
+  // Rows that cost nothing: the widest tree.
+  DraftWidthPolicy flat = measured_tree_policy(40e6, 0.0, 8e6);
+  LSE_EXPECT_EQ(flat.tree_nodes(prefix), 31u);
+  // Rows that cost a lot: the narrowest.
+  DraftWidthPolicy steep = measured_tree_policy(40e6, 8e6, 8e6);
+  LSE_EXPECT_EQ(steep.tree_nodes(prefix), 3u);
+  // In between, the rung with the most tokens per second.
+  DraftWidthPolicy mid = measured_tree_policy(40e6, 0.5e6, 8e6);
+  std::uint32_t best = 0;
+  double best_rate = 0;
+  for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows) {
+    const double rate = (1.0 + prefix[rows - 1]) / (8e6 + 40e6 + 0.5e6 * (rows - 4));
+    if (rate > best_rate) best_rate = rate, best = rows - 1;
+  }
+  LSE_EXPECT_EQ(mid.tree_nodes(prefix), best);
+  // A short expansion caps the tree.
+  LSE_EXPECT_EQ(flat.tree_nodes(std::span(prefix).first(6)), 5u);
+}
+
+LSE_TEST(draft_width_policy_calibrates_tree_candidates) {
+  DraftWidthPolicy policy;
+  // Unobserved, a candidate is believed at its own probability.
+  LSE_EXPECT_NEAR(policy.candidate(0.37), 0.37, 1e-12);
+  // A draft whose 0.5 candidates are answered one time in five.
+  for (int i = 0; i < 4000; ++i) policy.observe_candidate(0.52, i % 5 == 0);
+  LSE_EXPECT_NEAR(policy.candidate(0.52), 0.2, 0.02);
+  LSE_EXPECT_NEAR(policy.candidate(0.07), 0.07, 1e-12);
+}
+
 LSE_TEST(a_draft_side_stopping_rule_keeps_the_target_distribution) {
   // Two positions over a three-token vocabulary. The draft's second
   // conditional depends on its first token; the verifier checks proposal 2

@@ -127,6 +127,14 @@ typedef struct lse_config {
    * verify costs, and verify the prefix worth its rows; greedy requests and
    * 0 use mtp_depth every step. Output is unchanged. */
   int32_t adaptive_mtp;
+
+  /* --dflash2-tree=on|off. With DFlash2, nonzero lets a step verify a draft
+   * tree, the most probable paths through the draft's candidates, in one
+   * target pass instead of a single chain; with adaptive_dflash2 the tree's
+   * size (or a chain) is chosen each step from measured costs. Every emitted
+   * token is the target's own answer, so sampled output keeps the target
+   * distribution and greedy output is the target's greedy continuation. */
+  int32_t dflash2_tree;
 } lse_config;
 
 LSE_API void lse_config_init(lse_config *cfg);

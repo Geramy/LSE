@@ -79,6 +79,25 @@ struct StepRows {
   }
 };
 
+// A draft tree laid out for one verify pass (runtime::DraftTree): row r holds
+// a tree node, rows are in depth-first preorder (every row after its parent,
+// and the latest row one level up is the parent), row 0 is the root at depth
+// 0, and rows 0..main_rows-1 are the top path (each the first child of the
+// one before). Row r sits at position first + depth[r]; its keys are written
+// at first + r until the commit moves the accepted path into place.
+struct TreeLayout {
+  std::vector<std::int32_t> depth;
+  std::vector<std::int32_t> parent;
+  std::int32_t main_rows = 1;
+  // Deepest depth a verify pass takes (the GDN tree scan's levels).
+  static constexpr std::int32_t kMaxDepth = 8;
+
+  [[nodiscard]] std::int32_t rows() const noexcept {
+    return static_cast<std::int32_t>(depth.size());
+  }
+  [[nodiscard]] Status validate() const;
+};
+
 struct HybridLMSpec {
   std::string embed_name = "embed.weight";
   std::string final_norm_name = "final_norm.weight";
@@ -166,7 +185,8 @@ class HybridLM {
                        bool retain_prefix_state = false,
                        ops::AttentionExecutionPhase attention_phase =
                            ops::AttentionExecutionPhase::kDecode,
-                       std::int32_t valid_tokens = 0);
+                       std::int32_t valid_tokens = 0,
+                       const TreeLayout* tree = nullptr);
 
   // Puts every mixer's sequence cursor back to `position`. The paged
   // pool is overwritten in place by the pass that follows, so this plus a
@@ -175,6 +195,12 @@ class HybridLM {
 
   // Commit valid input rows from the latest retained verifier, without its FFNs.
   Status commit_prefix(std::vector<MixerState>& states, std::size_t rows);
+  // Commit the accepted path of the latest pass, a tree verify pass: `path`
+  // holds its rows, root first, each the child of the one before. The states
+  // end at the pass's first position plus the path's length.
+  Status commit_tree(std::vector<MixerState>& states, std::span<const std::uint32_t> path);
+  // The kernels commit_tree of the latest pass launches, made resident.
+  Status prepare_tree_commit();
   // The kernels every commit_prefix of the latest pass can launch, made
   // resident (graph::Scheduler::prepare). The pass need not have run.
   Status prepare_prefix_commits();
@@ -277,13 +303,22 @@ class HybridLM {
     bool retains_prefix_state = false;
     bool prefix_committed = false;
     std::int32_t prefix_end = 0;
+    // A tree verify pass: its per-pass descriptors (TreeLayout), one device
+    // buffer poked every pass and viewed as the MixerState tree arrays, the
+    // layout's parents for checking a commit, and what the commit replays.
+    bool tree = false;
+    Array tree_inputs, tree_depth, tree_ancestors, tree_positions, tree_path;
+    std::vector<std::int32_t> tree_parent;
+    std::int32_t tree_main_rows = 0;
+    TreeStateCommit tree_commit;
   };
   // One slot per execution phase and pass shape, so decode (T=1) cannot reuse
   // a prompt tail or evict the
   // prefill program (T=N). Eviction is round-robin among full slots.
   // Wide enough for the deepest prefill ladder a 256-chunk plan can produce
   // (a 511-token prompt uses widths 1..256 = nine passes) plus decode.
-  std::array<ForwardCache, 12> caches_;
+  // Four more for a draft tree's verify widths (DraftWidthPolicy::kTreeRows).
+  std::array<ForwardCache, 16> caches_;
   // Chain bookkeeping across passes, build or replay. Folding a slot's
   // carries is only correct when that same pass ran immediately before; at a
   // ladder handoff the in-node IS the previous chunk's out node and already
