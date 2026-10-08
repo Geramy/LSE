@@ -113,7 +113,9 @@ def main():
                                      'gfx120x-hdp-kernarg-publication', 'hsa-bar-write-bracket',
                                      'loom-vmem-load-latency', 'loom-allocation-entry-preamble',
                                      'loom-terminal-spill-register-requirements',
-                                     'loom-spill-materialization-converges')},
+                                     'loom-spill-materialization-converges',
+                                     'loom-vmem-sources-at-issue', 'loom-scalar-source-capture',
+                                     'loom-issue-sources-gfx11')},
         'hrx': run('git', '-C', str(work / 'deps/hrx'), 'rev-parse', 'HEAD').strip(),
         'llvm': run(str(llvm / 'bin/llvm-config'), '--version').strip(),
     }

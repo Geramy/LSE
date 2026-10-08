@@ -44,7 +44,11 @@ git -C "$work/source" init -q
 # loom-terminal-spill-register-requirements and
 # loom-spill-materialization-converges (upstream #277 and #1398) let spill
 # repair run until no spill plan remains instead of stopping after eight rounds.
-patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch gfx120x-hdp-kernarg-publication.patch loom-vmem-load-latency.patch loom-allocation-entry-preamble.patch loom-terminal-spill-register-requirements.patch loom-spill-materialization-converges.patch)
+# loom-vmem-sources-at-issue and loom-scalar-source-capture (upstream 30246a9d6,
+# c07086aa1) release a memory instruction's sources at issue;
+# loom-issue-sources-gfx11 limits that to the gfx11 descriptor sets, where it
+# measured faster (gfx1201 speculative decode measured slower).
+patches=(symbolic-memo-touched-reset.patch gfx12-vopd-identical-source.patch cooperative-matrix-operands.patch loop-invariant-motion.patch rdna4-prefetch-address-span.patch loom-grow-arrays-only-when-full.patch gfx120x-hdp-kernarg-publication.patch loom-vmem-load-latency.patch loom-allocation-entry-preamble.patch loom-terminal-spill-register-requirements.patch loom-spill-materialization-converges.patch loom-vmem-sources-at-issue.patch loom-scalar-source-capture.patch loom-issue-sources-gfx11.patch)
 for patch in "${patches[@]}"; do
   path="$root/patches/hrx/$patch"
   git -C "$work/source" apply --check "$path"
