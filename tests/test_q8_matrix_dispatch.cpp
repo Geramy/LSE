@@ -72,7 +72,7 @@ LSE_TEST(q8_matrix_dispatch_selects_measured_small_shapes_and_prefill_boundary) 
       Case{7, 1280, 5120, 0}, Case{8, 1280, 5120, 16},
       Case{1, 5120, 25600, 0}, Case{2, 5120, 25600, 0},
       Case{3, 5120, 25600, 16}, Case{7, 5120, 25600, 16},
-      Case{8, 5120, 25600, 0},
+      Case{8, 5120, 25600, 16},
       Case{64, 127, 128, 0}, Case{64, 128, 128, 64},
   };
   for (const auto& c : cases) {

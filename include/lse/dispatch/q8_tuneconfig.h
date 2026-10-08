@@ -22,7 +22,7 @@ inline constexpr std::array kShapes{
     ShapeRule{8, 8, 5120, 4096, 16},
     ShapeRule{8, 8, 1024, 5120, 16},
     ShapeRule{8, 8, 1280, 5120, 16},
-    ShapeRule{3, 7, 5120, 25600, 16},
+    ShapeRule{3, 8, 5120, 25600, 16},
 };
 
 struct PackedShape { std::uint32_t n, k; };

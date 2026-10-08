@@ -311,7 +311,8 @@ LSE_TEST(flash_wmma_takes_each_generations_fragment_width) {
       LSE_EXPECT(line.find(gfx11 ? wide : narrow) != std::string::npos);
       LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-      LSE_EXPECT_EQ(emitted->lds_bytes,41664u);
+      // gfx11 also keeps the window's probabilities narrowed in scratch.
+      LSE_EXPECT_EQ(emitted->lds_bytes, gfx11 ? 50112u : 41664u);
     }
   }
 }

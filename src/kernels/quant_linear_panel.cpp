@@ -494,6 +494,55 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
       schedule.rows = Rows;
     return schedule;
   }
+  // How a wave's work is laid out: the columns it owns and how many of a
+  // lane's weight chunks it loads together. Neither changes a lane's chunks,
+  // their order or the reduction (see emit_panel_columns and emit_run_dot),
+  // so every layout writes the same bits. Variant 0 is the part's measured
+  // shape rule (Q4PanelShape); the others are measured on the device.
+  struct Layout {
+    std::uint32_t columns = 1, load_chunks = 1;
+  };
+  static std::vector<Layout> layouts(const KernelShapes &original,
+                                     const Dot4Schedule &schedule) {
+    const Layout table{dispatch::q4_shared_panel_columns(original),
+                       dispatch::q4_shared_panel_load_chunks(original)};
+    std::vector<Layout> out{table};
+    const auto same = [](const Layout &a, const Layout &b) {
+      return a.columns == b.columns && (a.columns > 1 || a.load_chunks == b.load_chunks);
+    };
+    const auto cpl = schedule.chunks_per_lane;
+    for (const Layout l : {Layout{1, 1}, Layout{1, 2}, Layout{1, 4}, Layout{2, 1},
+                           Layout{4, 1}}) {
+      const auto values = schedule.rows * l.columns;
+      if (l.columns > 1 && (values > schedule.wave || (values & (values - 1)) != 0 ||
+                            (cpl != 1 && cpl != 2 && cpl != 4)))
+        continue;
+      if (l.columns == 1 && l.load_chunks == 4 && !(cpl == 4 && schedule.rows >= 2))
+        continue;
+      if (l.columns == 1 && l.load_chunks == 2 && cpl % 2 != 0)
+        continue;
+      bool seen = false;
+      for (const Layout &have : out) seen |= same(have, l);
+      if (!seen) out.push_back(l);
+    }
+    return out;
+  }
+  static Layout layout_for(const KernelShapes &s, const KernelShapes &original,
+                           const Dot4Schedule &schedule) {
+    const auto all = layouts(original, schedule);
+    return s.variant < all.size() ? all[s.variant] : Layout{0, 0};
+  }
+  std::uint32_t variants(const KernelShapes &s) const override {
+    if (!valid_panel(s) || !s.intrinsics)
+      return 1;
+    const auto original = original_shapes(s);
+    if (!dispatch::quant_plan(original).shared_activation_panel)
+      return 1;
+    const auto schedule = schedule_for(original);
+    if (!schedule.valid())
+      return 1;
+    return static_cast<std::uint32_t>(layouts(original, schedule).size());
+  }
   std::string emit_kernel(const KernelShapes &s) const override {
     if (!valid_panel(s) || !s.types.scalar || !s.store || !s.intrinsics)
       return {};
@@ -505,11 +554,12 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
     const auto schedule = schedule_for(original);
     if (!schedule.valid())
       return {};
-    if (const auto columns = dispatch::q4_shared_panel_columns(original);
-        columns > 1)
-      return emit_panel_columns(s, schedule, columns);
-    return emit_panel(s, schedule,
-                      dispatch::q4_shared_panel_load_chunks(original));
+    const Layout layout = layout_for(s, original, schedule);
+    if (layout.columns == 0)
+      return {};
+    if (layout.columns > 1)
+      return emit_panel_columns(s, schedule, layout.columns);
+    return emit_panel(s, schedule, layout.load_chunks);
   }
   static ThreadPlan plan_impl(const KernelShapes &s) {
     if (!valid_panel(s))
@@ -523,8 +573,10 @@ struct Q4GlobalPanelKernel final : KernelPrimitive<Q4GlobalPanelKernel<Rows>> {
     if (!schedule.valid())
       return {};
     ThreadPlan plan;
-    const auto columns =
-        kBlock / schedule.wave * dispatch::q4_shared_panel_columns(original);
+    const Layout layout = layout_for(s, original, schedule);
+    if (layout.columns == 0)
+      return {};
+    const auto columns = kBlock / schedule.wave * layout.columns;
     const auto n = static_cast<std::uint32_t>(s.inputs[1].dim(0));
     plan.workgroup_size[0] = kBlock;
     plan.workgroup_count[0] = (n + columns - 1) / columns;
