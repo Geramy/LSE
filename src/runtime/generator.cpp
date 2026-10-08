@@ -918,40 +918,17 @@ Status Generator::append_draft_context(std::size_t rows, std::int32_t first) {
   return OkStatus();
 }
 
-Status Generator::append_draft_path(std::span<const std::uint32_t> path, std::int32_t first) {
+Status Generator::append_draft_path(std::span<const std::uint32_t> path, std::int32_t first,
+                                    const Array& gathered) {
   if (dflash2_ == nullptr) return OkStatus();
   bool prefix = true;
   for (std::size_t j = 0; j < path.size(); ++j) prefix = prefix && path[j] == j;
   if (prefix) return append_draft_context(path.size(), first);
-  if (!spec_features_.valid() || spec_features_.shape().rank() != 3 || path.empty() ||
-      !spec_features_.node()->materialized || !spec_features_.node()->buffer.valid())
-    return LSE_ERROR(kInternal, "invalid verified draft features for a tree path");
-  graph::Scheduler* sched = graph::default_scheduler();
-  if (sched == nullptr) return LSE_ERROR(kInternal, "no backend for the draft context");
+  if (!gathered.valid() || gathered.shape().rank() != 3 ||
+      gathered.shape().dim(1) != static_cast<std::int64_t>(path.size()))
+    return LSE_ERROR(kInternal, "the tree commit gathered no features for its path");
   const auto started = now_ns();
-  const auto width = spec_features_.shape().dim(2);
-  const std::size_t row_bytes = static_cast<std::size_t>(width) * sizeof(float);
-  const auto most = static_cast<std::int64_t>(model::TreeStateCommit::kMaxPath);
-  if (!tree_rows_.valid() || tree_rows_.shape().dim(2) != width) {
-    auto buf = sched->backend().allocate(static_cast<std::size_t>(most) * row_bytes,
-                                         backend::MemoryClass::kDevice);
-    if (!buf.ok()) return buf.status();
-    tree_rows_ = Array::from_buffer(buf.release(), Shape{1, most, width}, DType::kF32);
-  }
-  if (path.size() > static_cast<std::size_t>(most))
-    return LSE_ERROR(kInvalidArgument, "a tree path longer than the draft context copy");
-  LSE_RETURN_IF_ERROR(sched->drain());
-  const graph::Node& from = *spec_features_.node();
-  graph::Node& to = *tree_rows_.node();
-  for (std::size_t j = 0; j < path.size(); ++j)
-    LSE_RETURN_IF_ERROR(sched->backend().copy(backend::MemRef(to.buffer, j * row_bytes),
-                                              backend::MemRef(from.buffer, path[j] * row_bytes),
-                                              row_bytes));
-  to.materialized = true;
-  to.device_dirty = true;
-  to.host_dirty = false;
-  LSE_ASSIGN_OR(Array rows, materialized_feature_prefix(tree_rows_, path.size()));
-  LSE_RETURN_IF_ERROR(dflash2_->append_context(rows, first));
+  LSE_RETURN_IF_ERROR(dflash2_->append_context(gathered, first));
   stats_.spec_draft_ns += now_ns() - started;
   return OkStatus();
 }
@@ -1037,12 +1014,26 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       if (static_cast<std::int64_t>(nodes) + 1 > room)
         nodes = room > 1 ? static_cast<std::uint32_t>(room - 1) : 0u;
       const double temperature = sampled ? sampler_.params().temperature : 1.0;
+      TreeExpansion expansion;
       if (nodes > 0) {
         std::function<double(double)> calibrate;
         if (widths != nullptr) calibrate = [widths](double q) { return widths->candidate(q); };
-        LSE_ASSIGN_OR(TreeExpansion expansion, expand_tree(lattice, temperature, nodes, calibrate));
+        LSE_ASSIGN_OR(expansion, expand_tree(lattice, temperature, nodes, calibrate));
         nodes = static_cast<std::uint32_t>(expansion.nodes.size());
-        if (widths != nullptr) nodes = widths->tree_nodes(expansion.value_prefix);
+        if (widths != nullptr) {
+          // The draft's top path verified as a chain, valued the same way.
+          double chain_value = 0.0, reach = 1.0;
+          std::vector<double> q(lattice.top);
+          for (std::uint32_t p = 0, pred = 0; p < lattice.positions; ++p) {
+            lattice.conditional(p, pred, temperature, q);
+            pred = static_cast<std::uint32_t>(std::max_element(q.begin(), q.end()) - q.begin());
+            reach *= widths->candidate(q[pred]);
+            chain_value += reach;
+          }
+          nodes = widths->tree_nodes(expansion.value_prefix, chain_value, lattice.positions + 1);
+        }
+      }
+      if (nodes > 0) {
         LSE_ASSIGN_OR(DraftTree tree, layout_tree(lattice, tokens.back(), expansion, nodes));
         if (tree.rows() < 2) return std::vector<std::uint32_t>{};
         if (widths != nullptr)
@@ -1261,10 +1252,8 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
         const bool warm = step_counters == counters;
         if (warm && step_tree) {
-          widths->observe_tree_verify(static_cast<std::uint32_t>(step_rows), verify_ns);
+          widths->observe_tree_step(static_cast<std::uint32_t>(step_rows), period);
           widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
-          if (last_draft_depth >= 0)
-            widths->observe_draft(last_draft_ns, static_cast<std::uint32_t>(last_draft_depth));
         }
         if (warm && !step_tree) {
           widths->observe_verify(static_cast<std::uint32_t>(step_rows), verify_ns);
@@ -1354,10 +1343,12 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         }
       }
       const auto commit_started = now_ns();
-      LSE_RETURN_IF_ERROR(model_.commit_tree(session.states(), walk.path));
+      Array path_features;
+      LSE_RETURN_IF_ERROR(model_.commit_tree(session.states(), walk.path,
+                                             dflash2_ != nullptr ? &path_features : nullptr));
       const auto commit_done = now_ns();
       stats_.spec_verify_ns += commit_done - commit_started;
-      LSE_RETURN_IF_ERROR(append_draft_path(walk.path, at));
+      LSE_RETURN_IF_ERROR(append_draft_path(walk.path, at, path_features));
       if (lse::debug())
         std::fprintf(stderr, "[tree-step] position=%d rows=%zu top=%u path=%zu verify_walk_ms=%.3f "
                      "commit_ms=%.3f context_ms=%.3f built=%d\n", at, m, tree.main_rows,

@@ -16,7 +16,9 @@
 #include "lse/kv/cache_dtype.hpp"
 #include "lse/runtime/draft_tree.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -175,8 +177,8 @@ LSE_TEST(tree_mask_takes_the_split_and_flash_paths) {
       auto table = leaf({1, capacity / 16});
       auto o = sdpa_paged(q, k, v, 0.0625f, MaskKind::kTree, 0, meta, table, 16, &gpu,
                           kv::CacheDType::kBF16);
-      // Rows the split covers at a context it serves take it; the rest flash.
-      const bool split = capacity >= 1024 && n <= 8;
+      // A tree takes the split kernel at a context it serves (up to 32 rows).
+      const bool split = capacity >= 1024 && n <= 32;
       LSE_EXPECT(o.node()->prim->name() ==
                  (split ? "attention.split_merge128.wg128c2.v1" : "attention"));
       const NodePtr roots[]{o.node()};
@@ -455,7 +457,60 @@ int gpu() {
 
 }  // namespace
 
+// `--time`: device time of the Gated DeltaNet kernels a tree pass and its
+// commit run, against the chain scan, at the model's geometry.
+int time_kernels() {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  const std::int64_t H = 48, KH = 16, D = 128;
+  const auto timed = [&](const char* what, const std::function<Array()>& make) {
+    Array warm = make();
+    LSE_EXPECT_OK(run({warm}));
+    constexpr int kReps = 200;
+    std::vector<NodePtr> roots;
+    std::vector<Array> keep;
+    for (int i = 0; i < kReps; ++i) {
+      keep.push_back(make());
+      roots.push_back(keep.back().node());
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    LSE_EXPECT_OK(scheduler->eval(roots, false));
+    LSE_EXPECT_OK(scheduler->drain());
+    const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("%-40s %8.1f us per launch\n", what, us / kReps);
+  };
+  for (const std::int64_t n : {8, 16, 32}) {
+    const runtime::DraftTree tree = make_tree(static_cast<std::uint32_t>(n - 1), 11);
+    std::vector<float> q(n * KH * D), k(q.size()), v(n * H * D), al(n * H), bt(n * H), s0(H * D * D), depth;
+    for (auto* x : {&q, &k, &v, &s0}) for (auto& e : *x) e = 0.05f * uni(rng);
+    for (auto& e : al) e = 0.95f;
+    for (auto& e : bt) e = 0.3f;
+    for (std::uint32_t r = 0; r < tree.rows(); ++r) depth.push_back(static_cast<float>(tree.depth[r]));
+    auto aq = filled(Shape{1, n, KH, D}, DType::kF32, q), ak = filled(Shape{1, n, KH, D}, DType::kF32, k);
+    auto av = filled(Shape{1, n, H, D}, DType::kF32, v), aa = filled(Shape{1, n, H}, DType::kF32, al);
+    auto ab = filled(Shape{1, n, H}, DType::kF32, bt), as = filled(Shape{1, H, D, D}, DType::kF32, s0);
+    auto ad = filled(Shape{n}, DType::kF32, depth);
+    const auto cap = std::min<std::int64_t>(n, 9);
+    std::vector<std::uint32_t> main;
+    for (std::uint32_t r = 0; r < tree.main_rows; ++r) main.push_back(r);
+    auto desc = filled(Shape{2 + cap}, DType::kF32, descriptor(main, 0, static_cast<std::size_t>(cap)));
+    char label[64];
+    std::snprintf(label, sizeof label, "chain scan, %lld rows", static_cast<long long>(n));
+    timed(label, [&] { Array st; auto o = gated_delta_step(aq, ak, av, aa, ab, as, &st); return o; });
+    std::snprintf(label, sizeof label, "tree scan, %lld rows", static_cast<long long>(n));
+    timed(label, [&] { return gated_delta_tree(aq, ak, av, aa, ab, as, ad); });
+    std::snprintf(label, sizeof label, "path state, %u of %lld rows", tree.main_rows, static_cast<long long>(n));
+    timed(label, [&] { return gated_delta_path(ak, av, aa, ab, as, desc); });
+  }
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--gpu") return gpu();
+  if (argc == 2 && std::string_view(argv[1]) == "--time") return time_kernels();
   return lse::test::run_all();
 }

@@ -376,9 +376,10 @@ class Generator {
   DraftWidthPolicy* widths_ = nullptr;
   bool tree_ = false;
   // Appends the draft context for a tree path's rows of the last verify pass
-  // (row 0 at position `first`), copied together into tree_rows_.
-  Status append_draft_path(std::span<const std::uint32_t> path, std::int32_t first);
-  graph::Array tree_rows_;
+  // (row 0 at position `first`); `gathered` holds those rows' features, which
+  // the tree commit gathered (HybridLM::commit_tree).
+  Status append_draft_path(std::span<const std::uint32_t> path, std::int32_t first,
+                           const graph::Array& gathered);
   graph::Array spec_features_;
   Status append_draft_context(std::size_t rows, std::int32_t first);
   // The prompt's last pass's target features, for the DFlash2 context. The

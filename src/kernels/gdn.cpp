@@ -628,6 +628,8 @@ namespace {
 // Depth levels the tree scan keeps: the starting state and one per depth,
 // rows of depth 0..8 (model::TreeLayout::kMaxDepth).
 constexpr std::uint32_t kTreeLevels = 10;
+// Waves per tree-scan workgroup: each holds kTreeLevels state rows in scratch.
+constexpr std::uint32_t kTreeWaves = 4;
 
 template <class E>
 struct GdnTreeArgs {
@@ -671,6 +673,23 @@ bool gdn_tree_shapes(const KernelShapes& s, std::size_t q_index) {
   return D % wave_of(s.device) == 0 && D / wave_of(s.device) <= 4;
 }
 
+std::uint32_t gdn_tree_lds_bytes(const KernelShapes& s) {
+  const auto D = s.inputs.size() > 2 && s.inputs[2].rank() == 4
+      ? static_cast<std::uint32_t>(s.inputs[2].dim(3)) : 0u;
+  return kTreeWaves * kTreeLevels * D * 4u;
+}
+
+ThreadPlan gdn_tree_plan(const KernelShapes& s) {
+  ThreadPlan tp;
+  const std::uint32_t wave = wave_of(s.device);
+  tp.workgroup_size[0] = kTreeWaves * wave;
+  const auto rows = s.inputs.size() > 2 && s.inputs[2].rank() == 4
+      ? static_cast<std::uint32_t>(s.inputs[2].dim(2) * s.inputs[2].dim(3)) : 1u;
+  tp.workgroup_count[0] = (rows + kTreeWaves - 1) / kTreeWaves;
+  tp.lds_bytes = gdn_tree_lds_bytes(s);
+  return tp;
+}
+
 std::string emit_gdn_tree(const KernelShapes& s) {
   if (!gdn_tree_shapes(s, 1) || s.inputs[0] != s.inputs[1]) return {};
   const Shape& q = s.inputs[0];
@@ -683,7 +702,8 @@ std::string emit_gdn_tree(const KernelShapes& s) {
   const std::uint32_t wave = wave_of(s.device);
   const std::uint32_t tile = D / wave;
 
-  kir::KernelBody k(s.types, *s.intrinsics);
+  if (backend::workgroup_lds_bytes(s.device) < gdn_tree_lds_bytes(s)) return {};
+  kir::KernelBody k(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
   k.set_store(s.store);
   GdnTreeArgs<env::Emit> a;
   if (!env::bind(k, a, s)) return {};
@@ -694,12 +714,15 @@ std::string emit_gdn_tree(const KernelShapes& s) {
   (void)e.ret_if(wid >= heads * D);
   const auto row = e.let(wid % D);
   const auto h = e.let(wid / D);
-
-  std::vector<std::vector<kir::LValue<kir::f32>>> level(kTreeLevels);
-  for (std::uint32_t l = 0; l < kTreeLevels; ++l)
-    for (std::uint32_t ei = 0; ei < tile; ++ei) level[l].emplace_back(e.var(0.0f));
+  // Each wave keeps its state row at every depth level in workgroup scratch:
+  // level 0 the starting state, level d + 1 the state after the latest row at
+  // depth d. A row reads its parent's level and writes its own; a wave's
+  // scratch reads and writes complete in order, so no barrier is needed.
+  const auto levels = e.lds<kir::f32>(kTreeWaves * kTreeLevels * D);
+  if (!levels) return {};
+  const auto mine = e.let((math::local_id() / wave) * (kTreeLevels * D) + lane);
   for (std::uint32_t ei = 0; ei < tile; ++ei)
-    level[0][ei] = a.s[e.let((h * D + row) * D + lane + ei * wave)];
+    levels[e.let(mine + ei * wave)] = a.s[e.let((h * D + row) * D + lane + ei * wave)];
   auto reduce = [&](kir::Val<kir::f32> acc) {
     for (std::uint32_t m = 1; m < wave; m <<= 1) acc = e.let(acc + math::shfl_xor(acc, e.u32(m)));
     return acc;
@@ -713,7 +736,11 @@ std::string emit_gdn_tree(const KernelShapes& s) {
     std::vector<kir::Val<kir::f32>> kj, qj;
   };
   const auto load_step = [&](const kir::Val<kir::u32>& t) {
-    StepIn in{e.let(kir::cast<kir::u32>(a.tree[t])), e.let(t * heads + h), {}, {}, {}, {}, {}};
+    // Reduced modulo the levels (a valid depth is below them), so the level's
+    // scratch address is provably in range.
+    const auto raw = e.let(kir::cast<kir::u32>(a.tree[t]));
+    StepIn in{e.let(raw % (kTreeLevels - 1u)), e.let(t * heads + h),
+              {}, {}, {}, {}, {}};
     const auto kvec = e.let((t * key_heads + h / share) * D);
     in.al = e.let(a.alpha[in.sc]);
     in.bt = e.let(a.beta[in.sc]);
@@ -733,12 +760,10 @@ std::string emit_gdn_tree(const KernelShapes& s) {
     const auto& kj = in.kj;
     const auto& qj = in.qj;
     // The parent's state: the level of this row's depth.
+    const auto parent = e.let(mine + depth * D);
     std::vector<kir::LValue<kir::f32>> srow;
-    for (std::uint32_t ei = 0; ei < tile; ++ei) {
-      srow.emplace_back(e.var(level[0][ei].read()));
-      for (std::uint32_t l = 1; l < kTreeLevels; ++l)
-        srow[ei] = select(depth == l, level[l][ei].read(), srow[ei].read());
-    }
+    for (std::uint32_t ei = 0; ei < tile; ++ei)
+      srow.emplace_back(e.var(levels[e.let(parent + ei * wave)].read()));
     auto skp = e.var(0.0f);
     for (std::uint32_t ei = 0; ei < tile; ++ei) {
       srow[ei] = srow[ei].read() * al;
@@ -754,9 +779,8 @@ std::string emit_gdn_tree(const KernelShapes& s) {
     const auto acc = reduce(accp);
     if (auto first = e.when(lane == 0u)) e.store(e.let(sc * D + row), acc);
     // This row's state is where its children continue from.
-    for (std::uint32_t l = 1; l < kTreeLevels; ++l)
-      for (std::uint32_t ei = 0; ei < tile; ++ei)
-        level[l][ei] = select(depth + 1u == l, srow[ei].read(), level[l][ei].read());
+    for (std::uint32_t ei = 0; ei < tile; ++ei)
+      levels[e.let(parent + D + ei * wave)] = srow[ei].read();
   };
   const auto block = [&](const kir::Val<kir::u32>& t0, std::uint32_t steps) {
     std::vector<StepIn> ins;
@@ -764,14 +788,10 @@ std::string emit_gdn_tree(const KernelShapes& s) {
     for (std::uint32_t u = 0; u < steps; ++u) ins.push_back(load_step(e.let(t0 + u)));
     for (std::uint32_t u = 0; u < steps; ++u) run_step(ins[u]);
   };
-  const std::uint32_t blocks = seq / kStepBlock;
-  if (blocks > 1) {
-    for (auto tb : e.range(0u, blocks, 1u)) block(e.let(tb * kStepBlock), kStepBlock);
-  } else if (blocks == 1) {
-    block(e.u32(0), kStepBlock);
-  }
-  if (const std::uint32_t tail = seq - blocks * kStepBlock; tail != 0)
-    block(e.u32(blocks * kStepBlock), tail);
+  // A tree pass is a few dozen rows at most: straight-line code, a block at a
+  // time, which keeps every level address a constant offset from the wave's.
+  for (std::uint32_t t0 = 0; t0 < seq; t0 += kStepBlock)
+    block(e.u32(t0), std::min(kStepBlock, seq - t0));
   return k.str();
 }
 
@@ -800,6 +820,9 @@ std::string emit_gdn_path(const KernelShapes& s) {
   const auto row = e.let(wid % D);
   const auto h = e.let(wid / D);
   const auto count = e.let(kir::cast<kir::u32>(a.path[0u]));
+  // An empty path writes nothing: a tree pass's own carried state is left
+  // for its commit, which always writes the accepted path's.
+  (void)e.ret_if(count == 0u);
   std::vector<kir::LValue<kir::f32>> srow;
   for (std::uint32_t ei = 0; ei < tile; ++ei)
     srow.emplace_back(e.var(a.s[e.let((h * D + row) * D + lane + ei * wave)]));
@@ -807,26 +830,36 @@ std::string emit_gdn_path(const KernelShapes& s) {
     for (std::uint32_t m = 1; m < wave; m <<= 1) acc = e.let(acc + math::shfl_xor(acc, e.u32(m)));
     return acc;
   };
+  // Every step's inputs load before the first update (a step past the path
+  // reads row 0 and runs with decay 1 and beta 0, which leaves the state
+  // exactly as it was), so their latency is paid once rather than per step.
+  struct StepIn {
+    kir::Val<kir::f32> al, bt, vt;
+    std::vector<kir::Val<kir::f32>> kj;
+  };
+  std::vector<StepIn> ins;
   for (std::uint32_t step = 0; step < most; ++step) {
-    if (auto live = e.when(count > step)) {
-      const auto t = e.let(kir::cast<kir::u32>(a.path[2u + step]));
-      const auto sc = e.let(t * heads + h);
-      const auto kvec = e.let((t * key_heads + h / share) * D);
-      const auto al = e.let(a.alpha[sc]);
-      const auto bt = e.let(a.beta[sc]);
-      const auto vt = e.let(a.v[sc * D + row]);
-      std::vector<kir::Val<kir::f32>> kj;
-      for (std::uint32_t ei = 0; ei < tile; ++ei) kj.push_back(e.let(a.k[kvec + lane + ei * wave]));
-      auto skp = e.var(0.0f);
-      for (std::uint32_t ei = 0; ei < tile; ++ei) {
-        srow[ei] = srow[ei].read() * al;
-        skp = math::fma(srow[ei].read(), kj[ei], skp);
-      }
-      const auto sk = reduce(skp);
-      const auto delta = e.let((vt - sk) * bt);
-      for (std::uint32_t ei = 0; ei < tile; ++ei)
-        srow[ei] = math::fma(delta, kj[ei], srow[ei].read());
+    const auto live = e.let(count > step);
+    // A row index bounded by the pass keeps the addresses provably narrow.
+    const auto raw = e.let(kir::cast<kir::u32>(a.path[2u + step]));
+    const auto t = e.let(select(live, raw % seq, e.u32(0)));
+    const auto sc = e.let(t * heads + h);
+    const auto kvec = e.let((t * key_heads + h / share) * D);
+    StepIn in{e.let(select(live, a.alpha[sc], e.f32(1.0f))),
+              e.let(select(live, a.beta[sc], e.f32(0.0f))), e.let(a.v[sc * D + row]), {}};
+    for (std::uint32_t ei = 0; ei < tile; ++ei) in.kj.push_back(e.let(a.k[kvec + lane + ei * wave]));
+    ins.push_back(std::move(in));
+  }
+  for (const StepIn& in : ins) {
+    auto skp = e.var(0.0f);
+    for (std::uint32_t ei = 0; ei < tile; ++ei) {
+      srow[ei] = srow[ei].read() * in.al;
+      skp = math::fma(srow[ei].read(), in.kj[ei], skp);
     }
+    const auto sk = reduce(skp);
+    const auto delta = e.let((in.vt - sk) * in.bt);
+    for (std::uint32_t ei = 0; ei < tile; ++ei)
+      srow[ei] = math::fma(delta, in.kj[ei], srow[ei].read());
   }
   for (std::uint32_t ei = 0; ei < tile; ++ei)
     e.store(e.let((h * D + row) * D + lane + ei * wave), srow[ei].read());
@@ -881,7 +914,7 @@ struct GdnTreeKernel final : KernelPrimitive<GdnTreeKernel> {
     return in[2];
   }
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
-  static ThreadPlan plan_impl(const KernelShapes& s) { return gdn_wave_rows_plan(s, 2); }
+  static ThreadPlan plan_impl(const KernelShapes& s) { return gdn_tree_plan(s); }
   bool has_typed_host_impl() const noexcept override { return true; }
   Status eval_cpu_typed(std::span<const HostTensorView> in, HostOutputView out,
                         const std::array<float, 4>&,

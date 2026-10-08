@@ -164,7 +164,7 @@ std::string DraftWidthPolicy::describe() const {
   out += " tree_ms=";
   for (std::size_t r = 0; r < kTreeRows.size(); ++r) {
     std::snprintf(item, sizeof item, "%s%u:%.1f", r == 0 ? "" : ",", kTreeRows[r],
-                  tree_verify_ns(kTreeRows[r]) / 1e6);
+                  tree_step_ns(kTreeRows[r]) / 1e6);
     out += item;
   }
   out += " candidate=";
@@ -330,10 +330,10 @@ std::size_t DraftWidthPolicy::tree_rung(std::uint32_t rows) noexcept {
   return kTreeRows.size();
 }
 
-double DraftWidthPolicy::tree_verify_ns(std::uint32_t rows) const noexcept {
+double DraftWidthPolicy::tree_step_ns(std::uint32_t rows) const noexcept {
   const std::size_t r = tree_rung(rows);
   if (r >= kTreeRows.size() || tree_samples_[r] == 0) return 0.0;
-  return std::max(0.0, base_ + tree_offset_[r]);
+  return std::max(0.0, tree_base_ + tree_offset_[r]);
 }
 
 std::uint32_t DraftWidthPolicy::tree_exploring() const noexcept {
@@ -346,22 +346,26 @@ std::uint32_t DraftWidthPolicy::tree_exploring() const noexcept {
   return fewest < kTreeRows.size() ? kTreeRows[fewest] : 0;
 }
 
-std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix) {
+std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
+                                           double chain_value, std::uint32_t chain_rows) {
   if (value_prefix.size() < 2) return 0;
   const auto most = static_cast<std::uint32_t>(value_prefix.size() - 1);
   const auto fit = [&](std::uint32_t rows) { return std::min(most, rows - 1); };
+  const bool chain = chain_value >= 0.0 && chain_rows >= 2 && chain_rows <= kMaxRows;
   // Warming up: the rung a chain would take.
   if (steps_ < kWarmupSteps) return fit(kTreeRows[1]);
   if (const std::uint32_t rows = tree_exploring(); rows != 0) return fit(rows);
+  if (chain && samples_[chain_rows] < kExploreSamples) return 0;
   // A rung unmeasured for long enough is measured again, whatever it costs.
   for (std::size_t r = 0; r < kTreeRows.size(); ++r)
     if (steps_ - tree_last_seen_[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
+  if (chain && steps_ - last_seen_[chain_rows] > kHardRefreshSteps) return 0;
   const double draft = draft_ns(kMaxProposals);
   std::uint32_t best = fit(kTreeRows[0]);
   double best_rate = -1.0;
   for (const std::uint32_t rows : kTreeRows) {
     const std::uint32_t nodes = fit(rows);
-    const double cost = draft + tree_verify_ns(rows);
+    const double cost = tree_step_ns(rows);
     if (cost <= 0.0) continue;
     const double rate = (1.0 + value_prefix[nodes]) / cost;
     if (rate > best_rate) {
@@ -370,34 +374,39 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix)
     }
     if (nodes == most) break;
   }
+  if (chain) {
+    const double cost = draft + verify_ns(chain_rows);
+    if (cost > 0.0 && (1.0 + chain_value) / cost > best_rate) return 0;
+  }
   return best;
 }
 
-void DraftWidthPolicy::observe_tree_verify(std::uint32_t rows, std::uint64_t ns) {
+void DraftWidthPolicy::observe_tree_step(std::uint32_t rows, std::uint64_t ns) {
   const std::size_t r = tree_rung(rows);
   if (r >= kTreeRows.size()) return;
   if (steps_++ < kWarmupSteps) return;
+  // A level of its own that follows the context, and per-rung offsets, as
+  // the chain widths have.
   const auto t = static_cast<double>(ns);
   bool any = false;
-  for (std::uint32_t m = 1; m <= kMaxRows; ++m) any = any || samples_[m] != 0;
   for (const auto s : tree_samples_) any = any || s != 0;
   if (!any) {
-    base_ = t;
+    tree_base_ = t;
     tree_offset_[r] = 0.0;
   } else if (tree_samples_[r] == 0) {
-    tree_offset_[r] = t - base_;
+    tree_offset_[r] = t - tree_base_;
   } else {
-    const double predicted = base_ + tree_offset_[r];
-    base_ += kBaseRate * clamp_step(t - predicted, predicted);
+    const double predicted = tree_base_ + tree_offset_[r];
+    tree_base_ += kBaseRate * clamp_step(t - predicted, predicted);
     const double rate = std::max(kOffsetRate, 1.0 / static_cast<double>(tree_samples_[r] + 1));
-    tree_offset_[r] += rate * clamp_step(t - base_ - tree_offset_[r], predicted);
+    tree_offset_[r] += rate * clamp_step(t - tree_base_ - tree_offset_[r], predicted);
   }
   ++tree_samples_[r];
   tree_last_seen_[r] = steps_;
 }
 
 void DraftWidthPolicy::observe_tree_value(double gain, std::uint32_t rows) {
-  const double cost = tree_verify_ns(rows) - verify_ns(1) + draft_ns(kMaxProposals);
+  const double cost = tree_step_ns(rows) - verify_ns(1);
   const double value = gain - rate() * cost;
   if (!draft_value_known_) {
     draft_value_ = value;

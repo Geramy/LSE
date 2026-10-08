@@ -648,11 +648,11 @@ LSE_TEST(draft_width_policy_calibrates_confidence_to_acceptance) {
 DraftWidthPolicy measured_tree_policy(double base, double per_row, double draft) {
   DraftWidthPolicy policy;
   for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
-    policy.observe_tree_verify(DraftWidthPolicy::kTreeRows[0], 1);
+    policy.observe_tree_step(DraftWidthPolicy::kTreeRows[0], 1);
   for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
     policy.observe_verify(1, static_cast<std::uint64_t>(base));
     for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
-      policy.observe_tree_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 4)));
+      policy.observe_tree_step(rows, static_cast<std::uint64_t>(draft + base + per_row * (rows - 4)));
   }
   policy.observe_draft(static_cast<std::uint64_t>(draft));
   policy.observe_step(3, static_cast<std::uint64_t>(60e6));
@@ -684,6 +684,24 @@ LSE_TEST(draft_width_policy_sizes_trees_by_measured_cost) {
   LSE_EXPECT_EQ(mid.tree_nodes(prefix), best);
   // A short expansion caps the tree.
   LSE_EXPECT_EQ(flat.tree_nodes(std::span(prefix).first(6)), 5u);
+}
+
+LSE_TEST(draft_width_policy_prefers_a_chain_that_decodes_faster) {
+  std::vector<double> prefix{0.0};
+  for (std::uint32_t b = 1; b <= DraftWidthPolicy::kMaxTreeNodes; ++b)
+    prefix.push_back(prefix.back() + 0.8 * std::pow(0.85, b - 1));
+  DraftWidthPolicy policy = measured_tree_policy(40e6, 1e6, 8e6);
+  // The chain's width is measured before it is compared.
+  LSE_EXPECT_EQ(policy.tree_nodes(prefix, 6.5, 8), 0u);
+  for (std::uint32_t i = 0; i < DraftWidthPolicy::kExploreSamples; ++i)
+    policy.observe_verify(8, static_cast<std::uint64_t>(42e6));
+  // A top path accepted almost whole (code): the chain, two rows cheaper per
+  // pass than the eight-row tree, wins.
+  LSE_EXPECT_EQ(policy.tree_nodes(prefix, 6.8, 8), 0u);
+  // A doubtful top path (prose): a tree.
+  LSE_EXPECT(policy.tree_nodes(prefix, 1.9, 8) > 0u);
+  // Without a chain to compare, always a tree.
+  LSE_EXPECT(policy.tree_nodes(prefix) > 0u);
 }
 
 LSE_TEST(draft_width_policy_calibrates_tree_candidates) {

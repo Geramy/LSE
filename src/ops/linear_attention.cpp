@@ -170,8 +170,11 @@ Result<Array> gated_delta_net(const Array& x, const GatedDeltaNetWeights& w,
   // straight from the conv output in one dispatch each (gdn.silu_l2norm.v1),
   // computing what the separate slice/silu and l2_normalize kernels did. One
   // row (wave-level norm) and long prefill chunks keep the separate ops.
+  // A tree pass of any width takes it too: its scans read every row's q and k
+  // more than once, and a normalization fused into their loads would be
+  // recomputed at each read.
   const bool fused_prep = qkv.valid() && spec.conv_activation && batch == 1 &&
-                          seq > 1 && seq <= kFusedPrepRows;
+                          seq > 1 && (seq <= kFusedPrepRows || tree);
   auto silu_l2norm = [&](std::int64_t offset, float scale) -> Result<Array> {
     LSE_ASSIGN_OR(Array out, graph::custom("gdn.silu_l2norm.v1", {qkv},
         {static_cast<float>(offset), spec.eps, scale, 0.0f}));

@@ -565,7 +565,7 @@ Status TreeLayout::validate() const {
 }
 
 Status TreeStateCommit::retain(std::span<const MixerState> states, std::int64_t rows,
-                               std::vector<graph::NodePtr>& roots) {
+                               std::vector<graph::NodePtr>& roots, const Array& features) {
   if (rows <= 1) return LSE_ERROR(kInvalidArgument, "a tree pass needs multiple rows");
   const auto prim_is = [](const graph::NodePtr& n, std::string_view name, std::size_t inputs) {
     return n && n->kind == graph::OpKind::kCustom && n->prim != nullptr &&
@@ -609,14 +609,35 @@ Status TreeStateCommit::retain(std::span<const MixerState> states, std::int64_t 
       if (entry.kind == Entry::Kind::kKeysValues && i == 1) continue;
       roots.push_back(source);
     }
+  features_ = {};
+  if (features.valid()) {
+    if (features.dtype() != DType::kF32 || features.shape().rank() != 3 ||
+        features.shape().dim(0) != 1 || features.shape().dim(1) != rows)
+      return LSE_ERROR(kInvalidArgument, "tree pass features are not [1, rows, width] FP32");
+    features_ = features.node();
+  }
   rows_ = rows;
   entries_ = std::move(entries);
   program_ = graph::Program{};
   inputs_.clear();
   outputs_.clear();
   path_ = {};
+  feature_leaf_ = gathered_ = {};
+  gathered_rows_ = 0;
   built_ = false;
   return OkStatus();
+}
+
+Array TreeStateCommit::path_features() const {
+  if (!gathered_.valid() || gathered_rows_ == 0 || !gathered_.node()->buffer.valid()) return {};
+  const graph::Node& out = *gathered_.node();
+  const auto width = out.shape.dim(1);
+  auto buffer = out.buffer;
+  buffer.size_bytes = gathered_rows_ * static_cast<std::size_t>(width) * sizeof(float);
+  Array view = Array::from_buffer(std::move(buffer),
+      Shape{1, static_cast<std::int64_t>(gathered_rows_), width}, DType::kF32);
+  view.node()->member = out.member;
+  return view;
 }
 
 Status TreeStateCommit::build_replay(graph::Scheduler& scheduler) {
@@ -667,6 +688,21 @@ Status TreeStateCommit::build_replay(graph::Scheduler& scheduler) {
     if (!outputs_.back().valid() || outputs_.back().node()->prim == nullptr)
       return LSE_ERROR(kInternal, "tree commit primitive is not registered");
   }
+  if (features_) {
+    // The path's feature rows, gathered by the rows of the path descriptor.
+    auto leaf = std::make_shared<graph::Node>();
+    leaf->kind = graph::OpKind::kBuffer;
+    leaf->fclass = graph::FusionClass::kLeaf;
+    leaf->shape = Shape{features_->shape.dim(1), features_->shape.dim(2)};
+    leaf->dtype = DType::kF32;
+    leaf->member = features_->member;
+    feature_leaf_ = Array(leaf);
+    auto rows_buffer = path_.node()->buffer;
+    rows_buffer.offset += 2 * sizeof(float);
+    rows_buffer.size_bytes = static_cast<std::size_t>(capacity) * sizeof(float);
+    Array rows = Array::from_buffer(std::move(rows_buffer), Shape{capacity}, DType::kF32);
+    gathered_ = graph::gather_rows(feature_leaf_, rows);
+  }
   built_ = true;
   return OkStatus();
 }
@@ -678,6 +714,11 @@ Status TreeStateCommit::prepare(graph::Scheduler& scheduler) {
   for (Array& input : inputs_) input.node()->materialized = true;
   path_.node()->materialized = true;
   for (const Array& output : outputs_) roots.push_back(output.node());
+  if (gathered_.valid()) {
+    feature_leaf_.node()->materialized = true;
+    for (const auto& input : gathered_.node()->inputs) input->materialized = true;
+    roots.push_back(gathered_.node());
+  }
   return roots.empty() ? OkStatus() : scheduler.prepare(roots);
 }
 
@@ -726,6 +767,22 @@ Status TreeStateCommit::commit(std::span<const std::uint32_t> path, std::int32_t
     output.host_dirty = false;
     roots.push_back(outputs_[i].node());
   }
+  if (features_) {
+    graph::Node& leaf = *feature_leaf_.node();
+    if (!features_->materialized || !features_->buffer.valid())
+      return LSE_ERROR(kInvalidArgument, "tree pass features have not finished verification");
+    leaf.buffer = features_->buffer;
+    leaf.materialized = true;
+    leaf.device_dirty = features_->buffer.ptr == nullptr;
+    leaf.host_dirty = false;
+    for (const auto& input : gathered_.node()->inputs)
+      if (input->kind == graph::OpKind::kBuffer) {
+        input->materialized = true;
+        input->host_dirty = false;
+      }
+    gathered_.node()->materialized = false;
+    roots.push_back(gathered_.node());
+  }
   std::vector<float> descriptor(static_cast<std::size_t>(2 + capacity), 0.0f);
   descriptor[0] = static_cast<float>(path.size());
   descriptor[1] = static_cast<float>(first);
@@ -733,6 +790,7 @@ Status TreeStateCommit::commit(std::span<const std::uint32_t> path, std::int32_t
   LSE_RETURN_IF_ERROR(poke_values(path_, descriptor));
   program_.reset_compute();
   if (!roots.empty()) LSE_RETURN_IF_ERROR(scheduler.eval(roots, false, &program_));
+  gathered_rows_ = features_ ? path.size() : 0;
   for (std::size_t i = 0; i < entries_.size(); ++i) {
     const Entry& entry = entries_[i];
     if (entry.kind == Entry::Kind::kKeysValues) {
@@ -808,7 +866,7 @@ Status HybridLM::commit_prefix(std::vector<MixerState>& states, std::size_t rows
 }
 
 Status HybridLM::commit_tree(std::vector<MixerState>& states,
-                             std::span<const std::uint32_t> path) {
+                             std::span<const std::uint32_t> path, Array* path_features) {
   for (ForwardCache& cache : caches_) {
     if (cache.pass_id == 0 || cache.pass_id != last_pass_id_) continue;
     if (!cache.tree || cache.states != &states || cache.state_stamp.size() != states.size() ||
@@ -821,13 +879,11 @@ Status HybridLM::commit_tree(std::vector<MixerState>& states,
     if (path.empty() || path[0] != 0 ||
         path.size() > std::min<std::size_t>(static_cast<std::size_t>(rows), TreeStateCommit::kMaxPath))
       return LSE_ERROR(kInvalidArgument, "a tree path starts at the root and fits a commit");
-    bool top = path.size() <= static_cast<std::size_t>(cache.tree_main_rows);
     for (std::size_t j = 1; j < path.size(); ++j) {
       if (static_cast<std::int64_t>(path[j]) >= rows ||
           cache.tree_parent[path[j]] != static_cast<std::int32_t>(path[j - 1]))
         return LSE_ERROR(kInvalidArgument, "tree path row ", std::to_string(path[j]),
                          " is not a child of the row before it");
-      top = top && path[j] == j;
     }
     const auto after = states.front().position;
     for (std::size_t i = 0; i < states.size(); ++i) {
@@ -841,10 +897,10 @@ Status HybridLM::commit_tree(std::vector<MixerState>& states,
     if (!scheduler) return LSE_ERROR(kInternal, "no scheduler for tree state");
     const auto first = after - static_cast<std::int32_t>(rows);
     const auto cursor = first + static_cast<std::int32_t>(path.size());
-    // The whole top path is what the pass carried and where it wrote: nothing
-    // moves. Anything else is replayed from the pass's retained inputs.
-    if (!(top && path.size() == static_cast<std::size_t>(cache.tree_main_rows)))
-      LSE_RETURN_IF_ERROR(cache.tree_commit.commit(path, first, *scheduler));
+    // The pass carried no recurrent state of its own (see hidden()): the
+    // accepted path's is always replayed from its retained inputs.
+    LSE_RETURN_IF_ERROR(cache.tree_commit.commit(path, first, *scheduler));
+    if (path_features != nullptr) *path_features = cache.tree_commit.path_features();
     if (!cache.meta.valid() || cache.meta.node()->element_count() < 5)
       return LSE_ERROR(kInvalidArgument, "tree step descriptor is unavailable");
     const float meta[] = {static_cast<float>(first), static_cast<float>(cursor), 1.0f,
@@ -1152,9 +1208,12 @@ Result<Array> HybridLM::hidden(const Array& tokens,
             : -1.0f - static_cast<float>(static_cast<std::int32_t>(taps) - (back - d));
       }
     }
-    top[0] = static_cast<float>(tree->main_rows);
+    // The pass computes no carried recurrent state of its own (an empty path):
+    // commit_tree always writes the accepted path's, which costs one path
+    // scan per step instead of one in the pass and another on most commits.
+    // The conv tail is the top path's, and commit_tree replaces it likewise.
+    top[0] = 0.0f;
     top[1] = static_cast<float>(shared_pos);
-    for (std::int32_t r = 0; r < tree->main_rows; ++r) top[2 + r] = static_cast<float>(r);
   }
 
   // Blocks first, on both paths: the retained decode program is not re-recorded,
@@ -1581,7 +1640,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
   cache_.tree = tree != nullptr;
   cache_.tree_commit = TreeStateCommit{};
   if (tree != nullptr)
-    LSE_RETURN_IF_ERROR(cache_.tree_commit.retain(*states, t_now, roots));
+    LSE_RETURN_IF_ERROR(cache_.tree_commit.retain(*states, t_now, roots, features));
   std::vector<graph::NodePtr> carried;
   if (states != nullptr) {
     auto add = [&](const Array& a, bool is_carry) {

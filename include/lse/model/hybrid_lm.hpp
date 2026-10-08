@@ -198,7 +198,10 @@ class HybridLM {
   // Commit the accepted path of the latest pass, a tree verify pass: `path`
   // holds its rows, root first, each the child of the one before. The states
   // end at the pass's first position plus the path's length.
-  Status commit_tree(std::vector<MixerState>& states, std::span<const std::uint32_t> path);
+  // `path_features`, when non-null, receives the path's rows of the pass's
+  // captured features ([1, path, F]; valid until the next commit).
+  Status commit_tree(std::vector<MixerState>& states, std::span<const std::uint32_t> path,
+                     Array* path_features = nullptr);
   // The kernels commit_tree of the latest pass launches, made resident.
   Status prepare_tree_commit();
   // The kernels every commit_prefix of the latest pass can launch, made

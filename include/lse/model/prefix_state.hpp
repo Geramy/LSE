@@ -49,11 +49,16 @@ class TreeStateCommit {
  public:
   // Path rows a commit can name: a tree's depth bound plus its root.
   static constexpr std::size_t kMaxPath = 9;
+  // `features`, when valid, is the pass's captured target features [1, T, F]:
+  // the commit also gathers the path's rows of them (path_features()).
   Status retain(std::span<const MixerState> states, std::int64_t rows,
-                std::vector<graph::NodePtr>& roots);
+                std::vector<graph::NodePtr>& roots, const graph::Array& features = {});
   // `path` holds pass rows, root first; `first` is the pass's first position.
   Status commit(std::span<const std::uint32_t> path, std::int32_t first,
                 graph::Scheduler& scheduler);
+  // The last commit's path rows of the features, [1, path, F] (invalid when
+  // the pass captured none). Valid until the next commit.
+  [[nodiscard]] graph::Array path_features() const;
   Status prepare(graph::Scheduler& scheduler);
   [[nodiscard]] bool ready() const noexcept { return rows_ > 1; }
 
@@ -71,6 +76,9 @@ class TreeStateCommit {
   std::vector<graph::Array> inputs_;
   std::vector<graph::Array> outputs_;
   graph::Array path_;
+  graph::NodePtr features_;
+  graph::Array feature_leaf_, gathered_;
+  std::size_t gathered_rows_ = 0;
   bool built_ = false;
 };
 

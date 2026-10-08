@@ -24,7 +24,9 @@ bool short_default_shape(const Shape& query, std::int64_t capacity,
   // Shape scope, before the device is known: any part's rule.
   return arch::any_rule<&arch::Tuning::split_short>([&](const auto& rule) {
     return query.dim(0) == geometry.batch && query.dim(1) == geometry.query_heads &&
-           query.dim(2) >= rule.min_rows && query.dim(2) <= rule.max_rows &&
+           query.dim(2) >= rule.min_rows &&
+           (query.dim(2) <= rule.max_rows ||
+            (geometry.mask == 3 && query.dim(2) <= shapes::kTreeSplitMaxRows)) &&
            query.dim(3) == rule.head_dim && capacity >= geometry.min_keys &&
            capacity <= UINT32_MAX;
   });
@@ -235,7 +237,9 @@ bool split_short_supported(const KernelShapes& s) {
   const auto units = static_cast<std::uint32_t>(s.device->compute_units);
   for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
-        s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
+        s.inputs[0].dim(2) >= rule.min_rows &&
+        (s.inputs[0].dim(2) <= rule.max_rows ||
+         (s.iattrs[0] == 3 && s.inputs[0].dim(2) <= shapes::kTreeSplitMaxRows)) &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.inputs[0].dim(3) == rule.head_dim &&
         shapes::split_merge_lds_bytes(shapes::split_partitions(capacity)) <=
@@ -258,7 +262,8 @@ bool split_short_merge_supported(const KernelShapes& s) {
       !s.device || !attention_ops(s)) return false;
   for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
-        s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
+        s.inputs[0].dim(2) >= rule.min_rows &&
+        s.inputs[0].dim(2) <= std::max<std::int64_t>(rule.max_rows, shapes::kTreeSplitMaxRows) &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2), rule.head_dim} &&

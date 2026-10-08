@@ -66,8 +66,13 @@ struct SplitShortRule {
 struct ShortTileRule {
   std::uint32_t min_rows, max_rows, query_tile;
 };
+// A draft tree's verify pass (mask kTree) takes the split kernel up to this
+// many rows, a tile of four query rows per workgroup past eight: its rows read
+// the context's keys once per tile rather than once per row.
+inline constexpr std::uint32_t kTreeSplitMaxRows = 32;
 inline constexpr std::array kShortTileRules{
     ShortTileRule{4, 8, 4},
+    ShortTileRule{9, kTreeSplitMaxRows, 4},
 };
 
 [[nodiscard]] constexpr std::uint64_t split_partitions(std::uint64_t capacity) noexcept {

@@ -84,7 +84,7 @@ class DraftWidthPolicy {
 
   // Whether the next step drafts at all. False means a plain step: one row,
   // no proposals, no draft.
-  // `tree`: the drafts are trees (observe_tree_verify measures them).
+  // `tree`: the drafts are trees (observe_tree_step measures them).
   [[nodiscard]] bool draft_next(bool tree = false);
 
   // What the target said about a proposal of this confidence.
@@ -140,9 +140,19 @@ class DraftWidthPolicy {
   // rung that maximizes expected tokens per second, b + 1 <= the rung's rows.
   // Decided from the draft's distributions alone, never from any token the
   // target has not yet answered, so the walk stays exact.
-  [[nodiscard]] std::uint32_t tree_nodes(std::span<const double> value_prefix);
-  void observe_tree_verify(std::uint32_t rows, std::uint64_t ns);
-  [[nodiscard]] double tree_verify_ns(std::uint32_t rows) const noexcept;
+  //
+  // `chain_value` is the expected accepted proposals of the draft's top path
+  // verified as a chain of `chain_rows` rows (its proposals and the anchor);
+  // 0 means that chain is expected to decode faster than any tree (or its
+  // width still has to be measured).
+  [[nodiscard]] std::uint32_t tree_nodes(std::span<const double> value_prefix,
+                                         double chain_value = -1.0,
+                                         std::uint32_t chain_rows = 0);
+  // A tree step's whole wall time, draft and commit included: a tree's
+  // commit runs on the device while the next draft waits for it, so the two
+  // are priced together rather than split.
+  void observe_tree_step(std::uint32_t rows, std::uint64_t ns);
+  [[nodiscard]] double tree_step_ns(std::uint32_t rows) const noexcept;
   // After a tree of `rows` rows with expected accepted nodes `gain`: what
   // drafting was worth (draft_next).
   void observe_tree_value(double gain, std::uint32_t rows);
@@ -180,6 +190,7 @@ class DraftWidthPolicy {
   [[nodiscard]] std::uint32_t tree_exploring() const noexcept;
   static constexpr std::size_t kCandidateBins = 20;
   std::array<Bin, kCandidateBins> candidates_{};
+  double tree_base_ = 0;
   std::array<double, kTreeRows.size()> tree_offset_{};
   std::array<std::uint32_t, kTreeRows.size()> tree_samples_{};
   std::array<std::uint64_t, kTreeRows.size()> tree_last_seen_{};
