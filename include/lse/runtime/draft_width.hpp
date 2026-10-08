@@ -42,7 +42,6 @@
 #include <cstdint>
 #include <span>
 #include <string>
-#include <string_view>
 
 namespace lse::runtime {
 
@@ -200,10 +199,13 @@ class DraftWidthPolicy {
   std::array<std::uint64_t, kTreeRows.size()> tree_last_seen_{};
 };
 
-// Whether DFlash2 steps verify draft trees when the configuration leaves it
-// to the device: the part's tuning (dispatch::arch::Tuning::draft_trees).
-[[nodiscard]] bool draft_trees_by_default(std::string_view arch);
-// `setting`: lse_config::dflash2_tree (negative: the device's default).
-[[nodiscard]] bool draft_trees_enabled(int setting);
+// Whether DFlash2 steps may verify draft trees. `setting` is
+// lse_config::dflash2_tree: positive always, zero never, negative (the
+// default) whenever the adaptive policy runs, since it prices every tree rung
+// against every chain prefix from this device's measured step costs and
+// takes a chain wherever wide passes cost more than they return.
+[[nodiscard]] constexpr bool draft_trees_enabled(int setting, bool adaptive) noexcept {
+  return setting > 0 || (setting < 0 && adaptive);
+}
 
 }  // namespace lse::runtime

@@ -198,9 +198,10 @@ and off (essay, code, 2K and 4K prompts).
 A DFlash2 draft scores, for each of its seven proposal positions, its top 16
 candidates given each candidate of the position before: a first-order lattice
 of conditional distributions. A chain verifies one path through it. With
-draft trees (`--dflash2-tree=on|off`, `lse_config.dflash2_tree`; on by
-default where the part's tuning says trees measured faster, today gfx1201) a
-step can verify many paths in one target pass (`src/runtime/draft_tree.cpp`):
+draft trees (`--dflash2-tree=on|off`, `lse_config.dflash2_tree`; by default
+on whenever the adaptive policy runs, which then takes a tree or a chain
+each step from the device's measured costs) a step can verify many paths in
+one target pass (`src/runtime/draft_tree.cpp`):
 
 - **Construction** follows DDTree ([arXiv 2604.12989](https://arxiv.org/abs/2604.12989)):
   a node's value is the product of the conditional acceptance estimates along

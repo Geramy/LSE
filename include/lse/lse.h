@@ -134,8 +134,9 @@ typedef struct lse_config {
    * size (or a chain) is chosen each step from measured costs. Every emitted
    * token is the target's own answer, so sampled output keeps the target
    * distribution and greedy output is the target's greedy continuation.
-   * Zero keeps chains; negative (the default) takes the device's own
-   * default, on where trees measured faster. */
+   * Zero keeps chains; negative (the default) allows trees whenever
+   * adaptive_dflash2 is on, which then takes a tree or a chain each step
+   * from this device's measured costs. */
   int32_t dflash2_tree;
 } lse_config;
 
