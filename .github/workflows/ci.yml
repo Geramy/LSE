@@ -1,10 +1,9 @@
 name: CI
 
+# Runs on demand only: its self-hosted GPU runner (lse-strix-halo-1) is
+# offline, and push or pull_request runs queued without a runner until the
+# next push cancelled them.
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
   workflow_dispatch:
 
 # One GPU. Stacked runs would contend and time out rather than queue cleanly,
