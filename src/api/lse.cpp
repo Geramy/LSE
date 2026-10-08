@@ -44,6 +44,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/model/layer.hpp"
 #include "lse/graph/jit.hpp"
+#include "lse/hub/hub.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/dflash2.hpp"
 #include "lse/model/inspect.hpp"
@@ -364,8 +365,9 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   const bool no_mtp = c.no_mtp != 0;
   const bool dflash2_on = c.dflash2 != 0;
   const std::string mtp_path = str(c.mtp_path);
-  const std::string dflash2_model =
-      c.dflash2_model != nullptr ? std::string(c.dflash2_model) : "incoai/Qwen3.8-27B-DFlash2";
+  // Unnamed: the draft the companion registry pairs with the target, fetched
+  // into the HF cache when it is not there (unless HF_HUB_OFFLINE is set).
+  std::string dflash2_model = c.dflash2_model != nullptr ? std::string(c.dflash2_model) : std::string();
   const std::string tokenizer_repo = c.tokenizer_repo != nullptr
                                          ? std::string(c.tokenizer_repo)
                                          : std::string(tokenizer::kQwen36TokenizerRepo);
@@ -570,9 +572,29 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   e.cfg.emplace(cfg.release());
   model::Config& config = *e.cfg;
 
-  const std::string mtp_where =
+  std::string mtp_where =
       (no_mtp || dflash2_on) ? std::string()
              : (mtp_path.empty() ? model::MtpModule::find_beside(model) : mtp_path);
+  {
+    // A companion the run asked for without naming: the one the registry
+    // pairs with this target, from the HF cache or downloaded into it. A
+    // known companion that cannot be had is an error, never a quiet downgrade.
+    hub::EnsureOptions companion;
+    companion.progress = hub::stderr_progress("lse-server: ");
+    if (dflash2_on && dflash2_model.empty()) {
+      progress::begin("resolving_dflash2", model);
+      auto found = hub::ensure_companion(model, hub::Kind::kDFlash2, companion);
+      if (!found.ok()) return fail(found.status(), "choosing the DFlash2 draft");
+      dflash2_model = found.release();
+      std::fprintf(stderr, "lse-server: DFlash2 draft for %s: %s\n", model.c_str(), dflash2_model.c_str());
+    }
+    if (!no_mtp && !dflash2_on && mtp_path.empty() && mtp_where.empty() && config.mtp_layers > 0) {
+      progress::begin("resolving_mtp", model);
+      auto found = hub::ensure_companion(model, hub::Kind::kMtp, companion);
+      if (!found.ok()) return fail(found.status(), "choosing the MTP head");
+      mtp_where = found.release();
+    }
+  }
   if (automatic_flashprefill) {
     auto arch = model::detect_architecture(config, *e.weights);
     bool supported = arch.ok() && (*arch)->name == "qwen3.5" &&
@@ -762,8 +784,15 @@ Result<model::MemoryPlanRequest> plan_request(const lse_config& c, const char* o
   }
   if (c.dflash2 != 0) {
     r.draft = model::DraftKind::kDFlash2;
-    r.draft_path = c.dflash2_model != nullptr ? std::string(c.dflash2_model)
-                                              : "incoai/Qwen3.8-27B-DFlash2";
+    if (c.dflash2_model != nullptr) {
+      r.draft_path = c.dflash2_model;
+    } else {
+      // The draft lse_open would pick, from the cache only: an estimate never
+      // downloads.
+      hub::EnsureOptions offline;
+      offline.allow_network = false;
+      LSE_ASSIGN_OR(r.draft_path, hub::ensure_companion(r.model, hub::Kind::kDFlash2, offline));
+    }
   } else if (c.no_mtp == 0) {
     r.draft = model::DraftKind::kMtp;
     r.draft_path = str(c.mtp_path);
@@ -1212,6 +1241,112 @@ lse_result lse_estimate(const lse_config* cfg, const char* options_json, char** 
     return answer(model::estimate_memory(*request), json_out, err);
   } catch (const std::exception& ex) {
     if (err != nullptr) *err = dup_string(std::string("estimating: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
+}
+
+lse_result lse_models_list(const char* options_json, char** json_out, char** err) {
+  if (err != nullptr) *err = nullptr;
+  if (json_out == nullptr) return LSE_ERR_INVALID_ARGUMENT;
+  *json_out = nullptr;
+  try {
+    std::vector<std::string> dirs;
+    if (options_json != nullptr && *options_json) {
+      const json o = json::parse(options_json, nullptr, false);
+      if (o.is_discarded() || !o.is_object() || (o.contains("dirs") && !o["dirs"].is_array()))
+        return answer(LSE_ERROR(kInvalidArgument, "options must be a JSON object; \"dirs\" an array of paths"),
+                      json_out, err);
+      if (o.contains("dirs"))
+        for (const json& d : o["dirs"]) dirs.push_back(d.get<std::string>());
+    }
+    return answer(json::parse(hub::listing_json(hub::scan(dirs))), json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("listing models: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
+}
+
+lse_result lse_model_resolve(const char* model, char** json_out, char** err) {
+  if (err != nullptr) *err = nullptr;
+  if (json_out == nullptr) return LSE_ERR_INVALID_ARGUMENT;
+  *json_out = nullptr;
+  if (model == nullptr || *model == '\0') {
+    if (err != nullptr) *err = dup_string("no model name");
+    return LSE_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    auto paths = model::resolve_model(model);
+    if (!paths.ok()) return answer(paths.status(), json_out, err);
+    auto c = hub::classify(std::filesystem::path(paths->config).parent_path().string());
+    if (!c.ok()) return answer(Status(c.status().code(), std::string(model) + ": " + c.status().message()),
+                               json_out, err);
+    json out{{"path", c->path},
+             {"weights", paths->weights},
+             {"config", paths->config},
+             {"name", c->name()},
+             {"kind", std::string(hub::to_string(c->kind))},
+             {"repo_id", c->repo_id.empty() ? json(nullptr) : json(c->repo_id)},
+             {"revision", c->commit.empty() ? json(nullptr) : json(c->commit)},
+             {"architecture", c->architecture},
+             {"quant", c->quant},
+             {"bytes", c->bytes}};
+    return answer(out, json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("resolving the model: ") + ex.what());
+    return LSE_ERR_FAILED;
+  }
+}
+
+lse_result lse_model_pull(const char* repo, const char* options_json, lse_pull_progress_cb progress,
+                          void* user, char** json_out, char** err) {
+  if (err != nullptr) *err = nullptr;
+  if (json_out == nullptr) return LSE_ERR_INVALID_ARGUMENT;
+  *json_out = nullptr;
+  try {
+    auto spec = hub::parse_repo_spec(repo != nullptr ? repo : "");
+    if (!spec.ok()) return answer(spec.status(), json_out, err);
+    hub::PullOptions options;
+    bool with_dflash2 = false, with_mtp = false;
+    if (options_json != nullptr && *options_json) {
+      const json o = json::parse(options_json, nullptr, false);
+      if (o.is_discarded() || !o.is_object())
+        return answer(LSE_ERROR(kInvalidArgument, "pull options must be a JSON object"), json_out, err);
+      try {
+        if (o.contains("include")) options.include = o["include"].get<std::vector<std::string>>();
+        if (o.contains("exclude")) options.exclude = o["exclude"].get<std::vector<std::string>>();
+        with_dflash2 = o.value("with_dflash2", false);
+        with_mtp = o.value("with_mtp", false);
+      } catch (const json::exception& ex) {
+        return answer(LSE_ERROR(kInvalidArgument, "invalid pull option: ", ex.what()), json_out, err);
+      }
+    }
+    hub::ProgressFn forward;
+    if (progress != nullptr) {
+      forward = [progress, user](const hub::Progress& p) {
+        progress(user, p.file.c_str(), p.file_done, p.file_total, p.done, p.total);
+      };
+    }
+    options.progress = forward;
+    auto got = hub::pull(*spec, options);
+    if (!got.ok()) return answer(got.status(), json_out, err);
+    json out{{"repo_id", got->repo_id},     {"revision", got->commit}, {"path", got->snapshot},
+             {"name", got->checkpoint.name()}, {"files", got->files},   {"bytes", got->bytes},
+             {"downloaded", got->downloaded}, {"companions", json::object()}};
+    for (const auto& [wanted, kind] : {std::pair{with_mtp, hub::Kind::kMtp}, std::pair{with_dflash2, hub::Kind::kDFlash2}}) {
+      if (!wanted) continue;
+      hub::EnsureOptions e;
+      e.progress = forward;
+      auto c = hub::ensure_companion(got->checkpoint.name(), kind, e);
+      if (!c.ok()) return answer(c.status(), json_out, err);
+      if (c->empty())
+        return answer(LSE_ERROR(kInvalidArgument, "no ", kind == hub::Kind::kMtp ? "MTP head" : "DFlash2 draft",
+                                " is known for ", got->checkpoint.name()),
+                      json_out, err);
+      out["companions"][std::string(hub::to_string(kind))] = *c;
+    }
+    return answer(out, json_out, err);
+  } catch (const std::exception& ex) {
+    if (err != nullptr) *err = dup_string(std::string("pulling: ") + ex.what());
     return LSE_ERR_FAILED;
   }
 }

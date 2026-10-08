@@ -154,6 +154,13 @@ add_test(NAME test_server_shutdown COMMAND test_server_shutdown)
 set_tests_properties(test_server_shutdown PROPERTIES TIMEOUT 15)
 
 lse_add_test(test_model lse_model lse_backends)
+# Hugging Face model management against a fake hub cache and a loopback mock
+# of the Hub API (no network, no device).
+if(TARGET lse_hub)
+  lse_add_test(test_hub lse_hub lse_model lse_backends)
+  target_include_directories(test_hub PRIVATE ${CMAKE_SOURCE_DIR}/src/hub)
+  set_tests_properties(test_hub PROPERTIES TIMEOUT 120)
+endif()
 lse_add_test(test_gdn_rate lse_ops lse_kernels lse_backends)
 set_tests_properties(test_gdn_rate PROPERTIES ENVIRONMENT "LSE_BACKEND=cpu;LSE_POOL=cpu")
 lse_add_test(test_prefix_commit lse_model lse_backends)

@@ -547,6 +547,14 @@ Result<ModelPaths> from_directory(const fs::path& dir) {
   return out;
 }
 
+bool dir_has_extension(const fs::path& dir, std::string_view ext) {
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(dir, ec)) {
+    if (e.path().extension() == ext) return true;
+  }
+  return false;
+}
+
 constexpr std::string_view kRepoPrefix = "models--";
 
 // hub/models--<org>--<name>: the separator is DOUBLED. A single dash here meant
@@ -633,8 +641,71 @@ Result<fs::path> repo_snapshot(const fs::path& repo) {
   return LSE_ERROR(kInvalidArgument, "'", repo_id_from_dir(repo.filename().string()),
                    "' has ", std::to_string(found.size()),
                    " revisions in the cache and no refs/main to choose between "
-                   "them; name a snapshot path instead (tried: ", join(names),
-                   ")");
+                   "them; name one as REPO@REVISION or give a snapshot path "
+                   "(tried: ", join(names), ")");
+}
+
+bool is_hex(std::string_view s) {
+  return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) {
+    return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+  });
+}
+
+// A revision as huggingface_hub names one: a ref (refs/<revision>, e.g. main
+// or a tag), a commit hash (snapshots/<hash>), or — here only — a unique
+// prefix of at least seven hex digits of a cached commit.
+Result<fs::path> repo_snapshot_at(const fs::path& repo, const std::string& revision) {
+  if (revision.empty()) return repo_snapshot(repo);
+  const std::string repo_id = repo_id_from_dir(repo.filename().string());
+  std::error_code ec;
+  const fs::path snapshots = repo / "snapshots";
+  if (revision.find("..") != std::string::npos) {
+    return LSE_ERROR(kInvalidArgument, "'", revision, "' is not a revision name");
+  }
+  std::ifstream ref(repo / "refs" / revision);
+  std::string commit;
+  if (ref && std::getline(ref, commit) && !commit.empty()) {
+    const fs::path snap = snapshots / commit;
+    if (fs::is_directory(snap, ec)) return snap;
+    return LSE_ERROR(kNotFound, "'", repo_id, "' refs/", revision, " names commit ", commit,
+                     " but snapshots/", commit, " is missing; the download did not finish");
+  }
+  if (fs::is_directory(snapshots / revision, ec) && revision.find('/') == std::string::npos) {
+    return snapshots / revision;
+  }
+  std::vector<fs::path> found;
+  std::vector<std::string> cached;
+  for (const auto& e : fs::directory_iterator(snapshots, ec)) {
+    if (!fs::is_directory(e.path(), ec)) continue;
+    const std::string name = e.path().filename().string();
+    cached.push_back(name);
+    if (revision.size() >= 7 && is_hex(revision) && name.starts_with(revision)) {
+      found.push_back(e.path());
+    }
+  }
+  std::sort(cached.begin(), cached.end());
+  if (found.size() == 1) return found.front();
+  if (found.size() > 1) {
+    return LSE_ERROR(kInvalidArgument, "'", revision, "' is a prefix of ",
+                     std::to_string(found.size()), " cached commits of '", repo_id,
+                     "'; give more digits (tried: ", join(cached), ")");
+  }
+  return LSE_ERROR(kNotFound, "'", repo_id, "' has no revision '", revision,
+                   "' in the HF cache (cached: ",
+                   cached.empty() ? std::string("none") : join(cached),
+                   "); download it with `lse-server pull ", repo_id, "@", revision, "`");
+}
+
+// "org/name": the shape of a hub repo id, which is what a not-found message
+// may suggest pulling. A path that merely does not exist is not one.
+bool repo_id_shaped(std::string_view s) {
+  const std::size_t slash = s.find('/');
+  if (slash == std::string_view::npos || slash == 0 || slash + 1 >= s.size()) return false;
+  if (s.find('/', slash + 1) != std::string_view::npos) return false;
+  return std::all_of(s.begin(), s.end(), [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '-' || c == '_' ||
+           c == '.' || c == '/';
+  }) && !s.starts_with(".");
 }
 
 }  // namespace
@@ -660,39 +731,54 @@ Result<ModelPaths> resolve_model(const std::string& name_or_path) {
   // Treat it as an HF repo id and look in the local cache. A bare model name
   // resolves too, but only when it picks out exactly one repo: silently
   // choosing between two organizations' builds of the same model would load
-  // something other than what was asked for.
+  // something other than what was asked for. "REPO@REVISION" names one
+  // cached revision; without it refs/main (or the only snapshot) decides.
+  std::string name = name_or_path;
+  std::string revision;
+  if (const std::size_t at = name.rfind('@'); at != std::string::npos && at > 0) {
+    revision = name.substr(at + 1);
+    name.resize(at);
+    if (revision.empty()) {
+      return LSE_ERROR(kInvalidArgument, "'", name_or_path,
+                       "' names no revision after '@'");
+    }
+  }
   const std::string root = hf_cache_root();
   const auto repos = cache_repos();
   std::vector<std::string> ids;
   ids.reserve(repos.size());
-  const fs::path* exact = nullptr;
+  const std::pair<std::string, fs::path>* exact = nullptr;
   std::vector<const std::pair<std::string, fs::path>*> partial;
   for (const auto& entry : repos) {
     ids.push_back(entry.first);
-    if (entry.first == name_or_path) {
-      exact = &entry.second;
+    if (entry.first == name) {
+      exact = &entry;
       continue;
     }
     const std::size_t slash = entry.first.find('/');
     if (slash != std::string::npos &&
-        entry.first.substr(slash + 1) == name_or_path) {
+        entry.first.substr(slash + 1) == name) {
       partial.push_back(&entry);
     }
   }
 
-  if (exact != nullptr) {
-    LSE_ASSIGN_OR(const fs::path snap, repo_snapshot(*exact));
-    return from_directory(snap);
-  }
-  if (partial.size() == 1) {
-    LSE_ASSIGN_OR(const fs::path snap, repo_snapshot(partial.front()->second));
-    return from_directory(snap);
-  }
+  const auto open_repo = [&](const std::pair<std::string, fs::path>& repo) -> Result<ModelPaths> {
+    LSE_ASSIGN_OR(const fs::path snap, repo_snapshot_at(repo.second, revision));
+    Result<ModelPaths> paths = from_directory(snap);
+    if (!paths.ok() && dir_has_extension(snap, ".gguf")) {
+      return LSE_ERROR(kInvalidArgument, "'", repo.first,
+                       "' is a GGUF repository; LSE loads MLX safetensors checkpoints "
+                       "(an mlx-community build of the model is the usual source)");
+    }
+    return paths;
+  };
+  if (exact != nullptr) return open_repo(*exact);
+  if (partial.size() == 1) return open_repo(*partial.front());
   if (partial.size() > 1) {
     std::vector<std::string> names;
     names.reserve(partial.size());
     for (const auto* e : partial) names.push_back(e->first);
-    return LSE_ERROR(kInvalidArgument, "'", name_or_path, "' names ",
+    return LSE_ERROR(kInvalidArgument, "'", name, "' names ",
                      std::to_string(partial.size()),
                      " models in the HF cache at ", root,
                      "; give the full repo id (tried: ", join(names), ")");
@@ -700,9 +786,26 @@ Result<ModelPaths> resolve_model(const std::string& name_or_path) {
 
   return LSE_ERROR(kNotFound, "'", name_or_path,
                    "' is not a path, and the HF cache at ", root, " has no ",
-                   repo_dir_name(name_or_path),
+                   repo_dir_name(name),
                    ids.empty() ? " (tried: the cache holds no models)"
-                               : " (tried: " + join(ids) + ")");
+                               : " (tried: " + join(ids) + ")",
+                   repo_id_shaped(name)
+                       ? "; download it with `lse-server pull " + name_or_path +
+                             "` or add --pull"
+                       : std::string());
+}
+
+std::string repo_cache_dir_name(std::string_view repo_id) { return repo_dir_name(repo_id); }
+
+Result<std::string> cached_snapshot(const std::string& repo_id, const std::string& revision) {
+  const fs::path repo = fs::path(hf_cache_root()) / repo_dir_name(repo_id);
+  std::error_code ec;
+  if (!fs::is_directory(repo, ec)) {
+    return LSE_ERROR(kNotFound, "the HF cache at ", hf_cache_root(), " has no ",
+                     repo_dir_name(repo_id));
+  }
+  LSE_ASSIGN_OR(const fs::path snap, repo_snapshot_at(repo, revision));
+  return snap.string();
 }
 
 std::string_view to_string(Loadable l) noexcept {
@@ -748,14 +851,6 @@ std::string read_file(const fs::path& p) {
   std::ostringstream ss;
   ss << in.rdbuf();
   return ss.str();
-}
-
-bool dir_holds_extension(const fs::path& dir, std::string_view ext) {
-  std::error_code ec;
-  for (const auto& e : fs::directory_iterator(dir, ec)) {
-    if (e.path().extension() == ext) return true;
-  }
-  return false;
 }
 
 std::int64_t last_dim(const Shape& s) {
@@ -869,7 +964,7 @@ CacheModel inspect_model_dir(const std::string& dir, std::string_view repo_id) {
 
   const Result<ModelPaths> paths = from_directory(dir);
   if (!paths.ok()) {
-    if (dir_holds_extension(dir, ".gguf")) {
+    if (dir_has_extension(dir, ".gguf")) {
       m.loadable = Loadable::kNo;
       m.reason =
           "GGUF container; this engine reads safetensors and has no GGUF "

@@ -303,6 +303,40 @@ LSE_API lse_result lse_model_info(const char *model, char **json_out, char **err
 LSE_API lse_result lse_estimate(const lse_config *cfg, const char *options_json,
                                 char **json_out, char **err);
 
+/* Model management: the Hugging Face hub cache ($HF_HUB_CACHE, else
+ * $HF_HOME/hub, else ~/.cache/huggingface/hub), in huggingface_hub's layout.
+ *
+ * lse_models_list lists the MLX models in the cache that this build loads,
+ * each with the state of its MTP head and DFlash2 draft (present, missing
+ * with the pull command, or none known), plus the companions themselves:
+ * the JSON `lse-server models --json` prints. `options_json` may be NULL or
+ * {"dirs": ["/path", ...]} to also list checkpoint directories outside the
+ * cache. Offline.
+ *
+ * lse_model_resolve answers what a model name (a directory, .safetensors,
+ * ORG/NAME or ORG/NAME@REVISION) resolves to, offline, as {"path", "weights",
+ * "config", "kind", "repo_id", "revision", ...}; a name LSE does not load is
+ * an error that says why, and a repo not in the cache one that says how to
+ * pull it.
+ *
+ * lse_model_pull downloads ORG/NAME[@REVISION] into the cache, resuming an
+ * interrupted download and verifying every file's hash; it checks from the
+ * config and safetensors headers that LSE loads the repo before fetching any
+ * weights. `options_json` may be NULL or an object with "include"/"exclude"
+ * (arrays of globs) and "with_dflash2"/"with_mtp" (booleans: also pull the
+ * target's recommended companions). `progress` (may be NULL) is called on
+ * the calling thread as bytes arrive. Blocks until done. Uses HF_TOKEN or
+ * $HF_HOME/token for gated repos and $HF_ENDPOINT when set; fails without
+ * touching the network when HF_HUB_OFFLINE is set. Returns {"repo_id",
+ * "revision", "path", "files", "bytes", "downloaded", "companions"}. */
+typedef void (*lse_pull_progress_cb)(void *user, const char *file, uint64_t file_done,
+                                     uint64_t file_total, uint64_t done, uint64_t total);
+LSE_API lse_result lse_models_list(const char *options_json, char **json_out, char **err);
+LSE_API lse_result lse_model_resolve(const char *model, char **json_out, char **err);
+LSE_API lse_result lse_model_pull(const char *repo, const char *options_json,
+                                  lse_pull_progress_cb progress, void *user, char **json_out,
+                                  char **err);
+
 /* Optional HTTP surface over the same engine. host NULL and port <= 0 take
  * the config's. Returns once the socket is bound and listening. */
 LSE_API lse_result lse_http_start(lse_engine *engine, const char *host,

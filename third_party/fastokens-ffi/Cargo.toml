@@ -10,6 +10,9 @@ crate-type = ["staticlib"]
 
 [dependencies]
 fastokens = { path = "../../reference/fastokens" }
+# The hub client's transport (src/http.rs). fastokens already resolves ureq 2
+# with rustls through hf-hub, so this adds no crate to the build.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [profile.release]
 opt-level = 3

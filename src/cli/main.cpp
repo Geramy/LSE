@@ -18,6 +18,7 @@
 #include "lse/core/debug.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/jit.hpp"
+#include "lse/hub/hub.hpp"
 #include "lse/ir/pass/pass.hpp"
 #include "lse/model/config.hpp"
 #include "lse/model/mtp.hpp"
@@ -54,7 +55,10 @@ struct Options {
   bool dflash2 = false;
   bool adaptive_dflash2 = true;
   bool adaptive_mtp = true;
-  std::string dflash2_model = "incoai/Qwen3.8-27B-DFlash2";
+  // Empty: the draft the companion registry pairs with the model.
+  std::string dflash2_model;
+  // --pull: fetch a named repo that is not in the HF cache.
+  bool pull = false;
   // Empty means $LSE_POOL, and empty again means one device.
   std::string pool;
   // Which source dialect this run would rather its kernels were written in.
@@ -86,11 +90,17 @@ struct Options {
 void usage() {
   std::puts(
       "usage: lse [options] [prompt]\n"
+      "       lse models [list|rm]      MLX models in the HF cache (models --help)\n"
+      "       lse pull ORG/NAME[@REV]   download into the HF cache (pull --help)\n"
       "\n"
       "  -m, --model NAME       checkpoint directory, .safetensors, or an HF\n"
-      "                         repo id such as mlx-community/Qwen3.5-4B-4bit;\n"
+      "                         repo id such as mlx-community/Qwen3.5-4B-4bit\n"
+      "                         (ORG/NAME@REVISION picks a cached revision);\n"
       "                         a bare model name resolves when it is unique\n"
       "                         (default: $LSE_MODEL)\n"
+      "      --pull             download --model, --mtp or --dflash2-model first\n"
+      "                         when it names a repo not in the HF cache\n"
+      "      --offline          never use the network (sets HF_HUB_OFFLINE=1)\n"
       "  -n, --max-tokens N     tokens to generate at most (default: the model's\n"
       "                         generation_config limit if it sets one, else no\n"
       "                         limit: a stop token or a full context ends it)\n"
@@ -106,13 +116,16 @@ void usage() {
       "      --arch NAME        force a model kernel instead of detecting one\n"
       "      --mtp PATH         multi-token-prediction module: a directory, a\n"
       "                         .safetensors or an HF repo id. Default: the one\n"
-      "                         beside the model, when the checkpoint has one\n"
+      "                         beside the model, else the head LSE pairs with\n"
+      "                         the model (downloaded when not cached)\n"
       "      --mtp-depth N      draft proposals per verifier pass (1..7, default 3)\n"
       "      --adaptive-mtp=off draft --mtp-depth proposals every step (on/off;\n"
       "                         default on: sampled runs draft as deep as pays,\n"
       "                         up to 7)\n"
       "      --dflash2=on       use the DFlash2 block drafter (default off)\n"
       "      --dflash2-model PATH  DFlash2 checkpoint directory or HF repo id\n"
+      "                         (default: the draft LSE pairs with the model,\n"
+      "                         downloaded when not cached)\n"
       "      --adaptive-dflash2=off  verify every DFlash2 proposal each step\n"
       "                         (on/off; default on: verify the prefix expected\n"
       "                         to decode fastest)\n"
@@ -293,6 +306,10 @@ bool parse(int argc, char** argv, Options* opt) {
       opt->adaptive_dflash2 = v == "on";
     } else if (a == "--no-mtp") {
       opt->no_mtp = true;
+    } else if (a == "--pull") {
+      opt->pull = true;
+    } else if (a == "--offline") {
+      hub::set_offline();
     } else if (a == "--arch") {
       if (!take_value(argc, argv, i, "--arch", &opt->arch)) return false;
     } else if (a == "--list-models") {
@@ -636,6 +653,7 @@ void report_pool(const Qualification& q) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc > 1 && hub::is_subcommand(argv[1])) return hub::run_cli("lse", argc - 1, argv + 1);
   Options opt;
   if (!parse(argc, argv, &opt)) return 2;
   if (opt.dflash2 && (opt.batch != 1 || !opt.prompts.empty())) {
@@ -661,6 +679,17 @@ int main(int argc, char** argv) {
   if (opt.model.empty()) {
     std::fputs("lse: no model given; pass --model or set LSE_MODEL\n", stderr);
     return 2;
+  }
+
+  if (opt.pull) {
+    const auto progress = hub::stderr_progress("  ");
+    const std::pair<const std::string*, hub::Kind> named[] = {
+        {&opt.model, hub::Kind::kModel}, {&opt.mtp, hub::Kind::kMtp}, {&opt.dflash2_model, hub::Kind::kDFlash2}};
+    for (const auto& [name, kind] : named) {
+      if (name->empty()) continue;
+      const hub::Kind accept[] = {kind};
+      if (const Status s = hub::pull_if_missing(*name, accept, progress); !s.ok()) return fail(s, "pulling");
+    }
   }
 
   const Status cache_status = graph::prepare_cache_dir(opt.cache_dir);
@@ -838,6 +867,16 @@ int main(int argc, char** argv) {
     opt.mtp.clear();
   } else if (opt.mtp.empty() && cfg->mtp_layers > 0) {
     opt.mtp = model::MtpModule::find_beside(opt.model);
+    if (opt.mtp.empty()) {
+      // The head the companion registry pairs with this model, from the HF
+      // cache or downloaded into it.
+      hub::EnsureOptions companion;
+      companion.progress = hub::stderr_progress("lse: ");
+      companion.prog = "lse";
+      auto found = hub::ensure_companion(opt.model, hub::Kind::kMtp, companion);
+      if (!found.ok()) return fail(found.status(), "choosing the MTP head");
+      opt.mtp = found.release();
+    }
   }
   if (!opt.mtp.empty()) {
     auto opened = model::MtpModule::open(opt.mtp, *cfg, *lm);
@@ -851,6 +890,14 @@ int main(int argc, char** argv) {
   }
 
   std::unique_ptr<model::DFlash2Module> dflash2;
+  if (opt.dflash2 && opt.dflash2_model.empty()) {
+    hub::EnsureOptions companion;
+    companion.progress = hub::stderr_progress("lse: ");
+    companion.prog = "lse";
+    auto found = hub::ensure_companion(opt.model, hub::Kind::kDFlash2, companion);
+    if (!found.ok()) return fail(found.status(), "choosing the DFlash2 draft");
+    opt.dflash2_model = found.release();
+  }
   if (opt.dflash2) {
     auto opened = model::DFlash2Module::open(opt.dflash2_model, *cfg, *lm);
     if (!opened.ok()) return fail(opened.status(), "loading DFlash2");

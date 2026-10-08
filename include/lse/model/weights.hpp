@@ -115,8 +115,11 @@ struct LegacyExpertKey {
 };
 Result<LegacyExpertKey> migrate_legacy_expert_name(std::string_view name);
 
-// Resolution order: existing path, then the HF cache, then a repo id.
-// Mirrors what mlx_lm and llama.cpp do, so `lse run org/name` just works.
+// Resolution order: an existing path, then a repo id in the local HF cache —
+// "org/name", "org/name@revision" (a ref such as main, a commit, or a unique
+// commit prefix of 7+ hex digits), or a bare name that picks out one repo.
+// Never touches the network: a repo that is not cached is an error that says
+// how to pull it.
 struct ModelPaths {
   std::string weights;  // .safetensors
   std::string config;   // sidecar .json
@@ -135,6 +138,14 @@ Result<ModelPaths> resolve_model(const std::string& name_or_path);
 // Python library expands them. TRANSFORMERS_CACHE does not appear in
 // huggingface_hub at all and is deliberately not read.
 std::string hf_cache_root();
+
+// "models--org--name": the directory a repo id occupies under the cache root.
+std::string repo_cache_dir_name(std::string_view repo_id);
+
+// The snapshot directory a cached repo resolves to at `revision` (empty: the
+// commit refs/main names, or the only snapshot). Offline.
+Result<std::string> cached_snapshot(const std::string& repo_id,
+                                    const std::string& revision = {});
 
 // $HF_HOME, or the default derived from XDG_CACHE_HOME / HOME.
 std::string hf_home();

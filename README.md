@@ -19,7 +19,7 @@ an HTTP server, a command-line program, or inside your own app through libLSE, i
 - **CPU backend:** Reference execution and a fallback when available GPU backends cannot start.
   CPU fallback is always reported; `--no-cpu-fallback` turns it into an error.
 
-[Install](#install-a-release) · [Start the server](#start-the-http-server) ·
+[Install](#install-a-release) · [Get a model](#get-a-model) · [Start the server](#start-the-http-server) ·
 [MTP and DFlash2](#select-a-decoding-mode) · [Client setup](#connect-a-client) ·
 [Memory estimates](#model-info-and-memory-estimates) · [libLSE](#use-lse-as-a-library) ·
 [iPadOS](#ios-and-ipados) · [Performance](#performance-on-macos-r9700) · [Benchmarks](#humaneval-through-32k) ·
@@ -269,16 +269,121 @@ See [iOS and iPadOS](#ios-and-ipados) for how an app uses it.
 Confirm that the output lists an HRX device before you load a model.
 The examples below select the first HRX device with `--pool hrx:0`.
 
+## Get a model
+
+LSE loads MLX checkpoints from the Hugging Face cache, the same directory
+`huggingface-cli`, transformers and mlx-lm use: `$HF_HUB_CACHE`, else
+`$HF_HOME/hub`, else `~/.cache/huggingface/hub`. A model downloaded by any of
+them is already visible to LSE, and one LSE downloads is visible to them.
+`lse` and `lse-server` take the same subcommands.
+
+List what the cache holds that this build loads:
+
+```bash
+"$LSE_BIN/lse-server" models
+```
+
+```text
+HF cache: /Users/me/.cache/huggingface/hub
+
+MODEL                           REVISION             ARCH     QUANT   PARAMS  SIZE      MTP      DFLASH2
+mlx-community/Qwen3.8-27B-8bit  815b83c0df8f (main)  qwen3.5  Q8 g64  27.4B   27.5 GiB  missing  cached
+    /Users/me/.cache/huggingface/hub/models--mlx-community--Qwen3.8-27B-8bit/snapshots/815b83c0df8ffd1d1b5244cf75fd6ef14fca9ef9
+
+Missing companions (fetched automatically when a run enables them, unless --offline):
+  lse-server pull mlx-community/Qwen3.8-27B-8bit --with-mtp
+      MTP head mlx-community/Qwen3.8-27B-MTP-8bit, 430.4 MiB of weights
+
+Companions:
+  incoai/Qwen3.8-27B-DFlash2  DFlash2 draft  BF16  3.6 GiB  dedf8df68adf (main), converted to Q8 on first use
+
+1 model, 1 companion. Load one with: lse-server --model NAME
+```
+
+Only MLX checkpoints (group-affine Q4, Q6 and Q8, and BF16/FP16/FP32 written
+by mlx-lm) of architectures this build loads are listed; GGUF files,
+transformers checkpoints and other architectures are left out. Each cached
+revision is a row. MTP and DFLASH2 say whether the target's companion is
+`cached`, `beside` the target, `local` (a directory found through `--dir`),
+`missing` (with the command that fetches it), or that none is known. Add
+`--json` for machine-readable output and `--dir PATH` (or
+`LSE_MODEL_DIRS=/a:/b`) to include checkpoint directories outside the cache.
+Listing reads `config.json` and the safetensors headers only and never uses
+the network.
+
+Download a model:
+
+```bash
+"$LSE_BIN/lse-server" pull mlx-community/Qwen3.5-0.8B-4bit
+```
+
+```text
+pulling mlx-community/Qwen3.5-0.8B-4bit from https://huggingface.co into /Users/me/.cache/huggingface/hub
+  checked before downloading: MLX model qwen3.5, Q4 g64, 596.3 MiB of weights
+  model.safetensors 621.8 MiB/621.8 MiB (100%), 26.0 MiB/s
+mlx-community/Qwen3.5-0.8B-4bit@da28692b5f13: 12 files, 621.8 MiB (621.8 MiB downloaded, 0 already cached) in 23.9 s
+  /Users/me/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-4bit/snapshots/da28692b5f139cb0ec58a356b437486b7dac7462
+run it: lse-server --model mlx-community/Qwen3.5-0.8B-4bit
+```
+
+- `ORG/NAME@REVISION` pulls a branch, tag or commit (default `main`).
+- Before any weights move, LSE reads the repository's `config.json` and
+  safetensors headers and refuses what it does not load, saying why: a GGUF
+  repository, a checkpoint not written by MLX, or an architecture this build
+  does not have.
+- An interrupted download resumes where it stopped. Every file is checked
+  against the hub's sha256 (or git blob hash) before it is moved into place.
+- `--include GLOB` and `--exclude GLOB` select files. `--with-dflash2` and
+  `--with-mtp` also pull the target's recommended companions.
+- Gated repositories need a token: `HF_TOKEN`, or the file `huggingface-cli
+  login` writes (`$HF_HOME/token`). `HF_ENDPOINT` selects a mirror.
+- `download` is an alias of `pull`. `models rm ORG/NAME[@REVISION] --yes`
+  removes a repository or one revision; without `--yes` it shows what would go.
+
+`--model`, `--mtp` and `--dflash2-model` accept `ORG/NAME` or
+`ORG/NAME@REVISION` (a ref, a commit or a unique commit prefix) from the cache.
+A repository that is not cached is an error naming the `pull` command; add
+`--pull` to download it first. Nothing else downloads a target model.
+
+### Companions: MTP heads and DFlash2 drafts
+
+LSE knows which draft and MTP head each supported target was validated with.
+For Qwen3.8-27B (any MLX quantization, matched by name and checked against
+the model's widths):
+
+| Companion | Repository | Pinned revision | Weights |
+|---|---|---|---|
+| DFlash2 draft | `incoai/Qwen3.8-27B-DFlash2` | `dedf8df68adf` | BF16, 3.6 GiB, sha256 `67fc76d6…`; converted to Q8 on first use |
+| MTP head (recommended) | `mlx-community/Qwen3.8-27B-MTP-8bit` | `e88e48d05573` | Q8, 430 MiB |
+| MTP head | `mlx-community/Qwen3.8-27B-MTP-4bit` | `b643c01b6d3b` | Q4, 228 MiB |
+
+With `--dflash2=on` and no `--dflash2-model`, the server uses the target's
+draft from the cache. When it is not cached, the server downloads it at the
+pinned revision, printing the repository, size and progress, and then converts
+it to Q8 once (see [DFlash2](#dflash2-with-a-q8-draft-model)). MTP works the same
+way when it is enabled (the default for a checkpoint that declares an MTP
+layer) and no `--mtp` is given: an `mtp/` directory beside the target or a
+cached `<name>-MTP-<quant>` repository is used first, then the pinned head is
+downloaded. A download whose weights do not hash to the pinned value is
+refused.
+
+`--offline` (or `HF_HUB_OFFLINE=1`) forbids all network access: a companion
+that is not cached then fails the start with the exact `pull` command (or
+`--no-mtp` for MTP). libLSE's `lse_open` behaves the same way and honours
+`HF_HUB_OFFLINE`; `lse_models_list`, `lse_model_resolve` and `lse_model_pull`
+expose the listing, resolution and downloads.
+
 ## Start the HTTP server
 
-Set the model location. Replace the example path with your Q4 checkpoint directory.
+Set the model location. Replace the example path with your Q4 checkpoint
+directory, or use a repository ID from `lse-server models`.
 
 ```bash
 LSE_MODEL="/absolute/path/to/qwen38-27b-q4"
 ```
 
-`--model` also accepts a Hugging Face repository ID or a supported `.safetensors` file.
-A repository ID can cause a model download.
+`--model` also accepts a supported `.safetensors` file or a Hugging Face
+repository ID in the cache (see [Get a model](#get-a-model)).
 
 Start ordinary decoding first:
 
@@ -343,7 +448,7 @@ Use a draft module that matches the target model.
 |---|---|---|
 | Ordinary decoding | `--no-mtp` | The target model generates each next token. |
 | MTP | `--mtp PATH --mtp-depth 3` | The MTP module proposes three tokens. The target verifies them. |
-| DFlash2 | `--dflash2=on --dflash2-model PATH` | A separate draft model proposes tokens. The target verifies them. |
+| DFlash2 | `--dflash2=on [--dflash2-model PATH]` | A separate draft model proposes tokens. The target verifies them. |
 
 Speculative decoding speed depends on draft cost, verification cost, context length, and accepted proposals.
 A larger proposal count does not always increase speed.
@@ -371,12 +476,16 @@ acceptance and draft and verify costs measured at run time, and verifies the pre
 proposals' own probabilities justify. Greedy requests, requests that name `mtp_depth`, and
 `--adaptive-mtp=off` use the fixed depth. See
 [adaptive verify width](docs/DFLASH2.md#adaptive-verify-width) for the policy.
-Without `--no-mtp`, LSE can use an MTP module found beside the target model.
+Without `--no-mtp`, LSE uses an MTP module found beside the target model, or
+the head it pairs with the target, from the cache or downloaded (see
+[Companions](#companions-mtp-heads-and-dflash2-drafts)).
 
 ### DFlash2 with a Q8 draft model
 
 `--dflash2-model` accepts the Q8 draft or the original BF16 checkpoint, as a
-directory or a Hugging Face repository ID. LSE converts a BF16 checkpoint to
+directory or a Hugging Face repository ID. Without it, the target's validated
+draft is taken from the cache or downloaded (see
+[Companions](#companions-mtp-heads-and-dflash2-drafts)). LSE converts a BF16 checkpoint to
 affine Q8/group64 once, bit-identical to `scripts/convert_dflash2_q8.py`, caches
 the result in `lse-q8g64/` beside the source (or under `$LSE_DFLASH2_CACHE_DIR`),
 and loads the cached copy afterwards. Conversion streams the source and needs
@@ -561,8 +670,13 @@ int main(void) {
 
 `lse_status` reports load progress (also while `lse_open` is running), request
 counters, the last generation's timings and the device bytes the engine holds.
-`lse_set_log_callback` receives the log lines `lse-server` prints. Every string
-the library returns is released with `lse_free`. Link `libLSE.a` from a CMake
+`lse_set_log_callback` receives the log lines `lse-server` prints.
+`lse_models_list`, `lse_model_resolve` and `lse_model_pull` list the MLX models
+in the Hugging Face cache, resolve `ORG/NAME[@REVISION]` and download a model
+(with a progress callback), as `lse-server models` and `pull` do; with
+`dflash2_model` or `mtp_path` left NULL, `lse_open` fetches the target's
+companion unless `HF_HUB_OFFLINE` is set. Every string the library returns is
+released with `lse_free`. Link `libLSE.a` from a CMake
 build (target `lse_api`); see [Build from source](#build-from-source).
 
 ## iOS and iPadOS

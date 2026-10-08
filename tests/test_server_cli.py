@@ -201,3 +201,37 @@ if len(sys.argv) == 3:
         if result.returncode != code or message not in output:
             raise SystemExit(f'FAIL CLI {args!r}: exit={result.returncode}\n{output}')
     print(f'PASS {len(cli_cases)} CLI MTP depth cases; no backend opened')
+
+# Model management: an empty hub cache and no network.
+hub_dir = tempfile.TemporaryDirectory()
+hub_env = dict(env, HF_HUB_CACHE=hub_dir.name, HF_HUB_OFFLINE='1')
+for name in ('HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'LSE_MODEL_DIRS', 'HUGGINGFACE_HUB_CACHE'):
+    hub_env.pop(name, None)
+binaries = [('lse-server', server)] + ([('lse', Path(sys.argv[2]))] if len(sys.argv) == 3 else [])
+hub_count = 0
+for prog, binary in binaries:
+    hub_cases = [
+        (['models', '--help'], 0, 'models rm ORG/NAME'),
+        (['pull', '--help'], 0, '--with-dflash2'),
+        (['models'], 0, 'No MLX model this build loads is in the cache'),
+        (['models', 'list'], 0, 'HF cache: ' + hub_dir.name),
+        (['models', '--json'], 0, '"models":[]'),
+        (['models', '--bogus'], 2, "unknown argument '--bogus'"),
+        (['pull'], 2, 'usage:'),
+        (['pull', 'not-a-repo'], 2, 'not a Hugging Face repo id'),
+        (['pull', 'mlx-community/Qwen3.5-0.8B-4bit'], 2, 'HF_HUB_OFFLINE is set'),
+        (['download', 'org/name', '--bogus'], 2, "unexpected argument '--bogus'"),
+        (['models', 'rm', 'org/absent'], 1, 'has no models--org--absent'),
+        (['--help'], 0, '--offline'),
+        (['--help'], 0, '--pull'),
+    ]
+    if prog == 'lse-server':
+        hub_cases.append((['--model', 'org/absent', '--model-info'], 2, '`lse-server pull org/absent` or add --pull'))
+    for args, code, message in hub_cases:
+        result = subprocess.run([str(binary), *args], env=hub_env, capture_output=True, text=True, timeout=10)
+        output = result.stdout + result.stderr
+        if result.returncode != code or message not in output:
+            raise SystemExit(f'FAIL {prog} {args!r}: exit={result.returncode}\n{output}')
+    hub_count += len(hub_cases)
+hub_dir.cleanup()
+print(f'PASS {hub_count} model-management cases; no network opened')

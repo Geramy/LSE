@@ -245,6 +245,7 @@ name = "fastokens-ffi"
 version = "0.1.0"
 dependencies = [
  "fastokens",
+ "ureq",
 ]
 
 [[package]]
