@@ -69,6 +69,18 @@ Array linear_indexed(const Array& x, const Array& w, const Array& idx,
 // are [out, in/group_size] in the checkpoint's own narrow float. The weight is
 // never widened in memory — that is the whole point of the op existing rather
 // than a dequantize pass feeding `linear`.
+// While one is alive, the contractions quant_linear builds on this thread
+// belong to a draft tree's verify pass (runtime::DraftTree): their widths may
+// take the part's tree-only rules (dispatch::QuantVerifyRows::tree), which a
+// prompt pass of the same width never does.
+class TreePassScope {
+ public:
+  TreePassScope() noexcept;
+  ~TreePassScope();
+  TreePassScope(const TreePassScope&) = delete;
+  TreePassScope& operator=(const TreePassScope&) = delete;
+  [[nodiscard]] static bool active() noexcept;
+};
 Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                    const Array& biases, int bits, int group_size);
 // The indexed form of the same: `packed` is [E, out, in*bits/32] and the

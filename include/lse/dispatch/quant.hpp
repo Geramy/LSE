@@ -128,17 +128,22 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
 }
 // The rows whose kernels an m-row pass runs on this part
 // (arch::Tuning::quant_verify_rows): m itself unless the part names another.
+// `tree`: the pass is a draft tree's (quant_tree_pass), which may take the
+// part's tree-only rules.
 [[nodiscard]] constexpr std::int64_t verify_rows(std::string_view arch,
-                                                 std::int64_t m) noexcept {
+                                                 std::int64_t m, bool tree = false) noexcept {
   if (!arch.empty())
     for (const auto& rule : arch::tuning(arch).quant_verify_rows)
-      if (rule.arch == arch && rule.m == m) return rule.rows;
+      if (rule.arch == arch && rule.m == m && (tree || !rule.tree)) return rule.rows;
   return m;
+}
+[[nodiscard]] constexpr bool quant_tree_pass(const graph::KernelShapes& s) noexcept {
+  return s.iattrs[3] == kQuantTreePass;
 }
 [[nodiscard]] inline std::int64_t verify_rows(const graph::KernelShapes& s,
                                               std::int64_t m) noexcept {
   return verify_rows(s.device ? std::string_view(s.device->arch)
-                              : std::string_view{}, m);
+                              : std::string_view{}, m, quant_tree_pass(s));
 }
 
 // `arch` adds that part's own rows (arch::Tuning::q4_panel_shapes) after the
@@ -160,7 +165,7 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   // takes that count's rule.
   const auto m = verify_rows(
       arch, static_cast<std::int64_t>(s.inputs[0].elem_count() /
-                                      static_cast<std::uint64_t>(k)));
+                                      static_cast<std::uint64_t>(k)), quant_tree_pass(s));
   // A part's own row is the measurement on that part and wins over the
   // shared one for the same shape.
   const Q4PanelShape* measured = nullptr;
@@ -217,10 +222,11 @@ inline constexpr std::uint32_t kQ4GemmMaxSlices = 8;
   const Shape& x = s.inputs[0];
   const auto k = x.dim(x.rank() - 1);
   if (count % static_cast<std::uint64_t>(k) != 0) return nullptr;
-  const auto m = verify_rows(arch, static_cast<std::int64_t>(count / static_cast<std::uint64_t>(k)));
+  const bool tree = quant_tree_pass(s);
+  const auto m = verify_rows(arch, static_cast<std::int64_t>(count / static_cast<std::uint64_t>(k)), tree);
   const auto* rule = arch::first_rule<&arch::Tuning::q4_matrix_panel_shapes>(
       arch, [&](const Q4MatrixPanelShape& r) {
-        return s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
+        return (tree || !r.tree) && s.iattrs[0] == static_cast<std::int32_t>(r.bits) &&
                s.iattrs[1] == static_cast<std::int32_t>(r.group) &&
                k == r.k && m == r.m &&
                s.inputs[1] == Shape{r.n, r.k / 8} &&

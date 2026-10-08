@@ -200,6 +200,26 @@ LSE_TEST(tree_mask_takes_the_flash_split_and_flash_paths) {
   }
 }
 
+// A prompt pass of a tree width keeps the tiled GEMM; only a tree pass
+// takes the part's tree-only matrix panel rows.
+LSE_TEST(tree_widths_take_the_matrix_panel_only_in_a_tree_pass) {
+  const auto* scheduler = default_scheduler();
+  const bool gfx1201 = scheduler && scheduler->backend().device_info().arch == "gfx1201";
+  for (const std::int64_t m : {12, 15, 20, 31}) {
+    const auto make = [&] {
+      return quant_linear(leaf({1, m, 5120}), leaf({17408, 640}, DType::kU32),
+                          leaf({17408, 80}, DType::kBF16), leaf({17408, 80}, DType::kBF16), 4, 64);
+    };
+    const Array prompt = make();
+    LSE_EXPECT(prompt.node()->prim == nullptr ||
+               prompt.node()->prim->name() != "quant_linear.q4_matrix_panel.v1");
+    const TreePassScope tree_pass;
+    const Array tree = make();
+    if (gfx1201)
+      LSE_EXPECT(tree.node()->prim && tree.node()->prim->name() == "quant_linear.q4_matrix_panel.v1");
+  }
+}
+
 namespace {
 
 double max_diff(const std::vector<float>& a, const std::vector<float>& b) {
@@ -556,6 +576,7 @@ int time_kernels() {
     }
   }
   // The FFN projections at the tree pass widths.
+  const TreePassScope tree_pass;
   for (const std::int64_t m : {8, 15, 31}) {
     for (const auto& [n, k] : std::array<std::array<std::int64_t, 2>, 2>{{{17408, 5120}, {5120, 17408}}}) {
       std::vector<float> x(static_cast<std::size_t>(m * k));
@@ -578,11 +599,14 @@ int time_kernels() {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
-// `--gemm M`: every 27B projection at M rows through whichever kernel the
-// graph picks, against a double reference over sampled output columns.
+// `--gemm M`: every 27B projection at M rows of a tree pass through whichever
+// kernel the graph picks, against a double reference over sampled output
+// columns.
 int gemm_accuracy(std::int64_t m) {
   auto* scheduler = default_scheduler();
   if (!scheduler) return 1;
+  // The widths a tree pass runs as; a prompt pass keeps the tiled GEMM.
+  const TreePassScope tree_pass;
   scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
   scheduler->set_dialect(Dialect::kLoom);
   const std::array<std::array<std::int64_t, 2>, 8> shapes{{{17408, 5120}, {5120, 17408},

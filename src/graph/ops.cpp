@@ -267,6 +267,13 @@ Array linear(const Array& x, const Array& w) {
   return Array(n);
 }
 
+namespace {
+thread_local int tree_pass_scopes = 0;
+}  // namespace
+TreePassScope::TreePassScope() noexcept { ++tree_pass_scopes; }
+TreePassScope::~TreePassScope() { --tree_pass_scopes; }
+bool TreePassScope::active() noexcept { return tree_pass_scopes > 0; }
+
 Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                    const Array& biases, int bits, int group_size) {
   const Shape& sx = x.shape();
@@ -279,6 +286,7 @@ Array quant_linear(const Array& x, const Array& packed, const Array& scales,
                 {x.node(), packed.node(), scales.node(), biases.node()});
   n->iattrs[0] = bits;
   n->iattrs[1] = group_size;
+  if (TreePassScope::active()) n->iattrs[3] = dispatch::kQuantTreePass;
   const std::array<Shape, 4> shapes{sx, packed.shape(), scales.shape(), biases.shape()};
   const std::array<DType, 4> dtypes{x.dtype(), packed.dtype(), scales.dtype(), biases.dtype()};
   KernelShapes geometry;

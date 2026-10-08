@@ -703,6 +703,9 @@ Status Generator::verify(Session& session,
     n.materialized = true;
   }
 
+  // A tree pass's contractions may take the part's tree-only widths.
+  std::optional<graph::TreePassScope> tree_pass;
+  if (tree != nullptr) tree_pass.emplace();
   const std::uint64_t started = now_ns();
   LSE_RETURN_IF_ERROR(begin_verify_burst());
   model::FeatureCapture capture;
