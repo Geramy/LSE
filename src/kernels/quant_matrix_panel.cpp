@@ -284,6 +284,13 @@ const dispatch::MatrixPanelTune *matrix_tune(const KernelShapes &s, std::uint32_
   return nullptr;
 }
 std::uint32_t matrix_waves(const KernelShapes &s, std::uint32_t n);
+// The 16-row tiles of a pass's panel. A workgroup takes every tile of its
+// columns, so the weights stream once for the whole pass.
+std::uint32_t matrix_mtiles(const KernelShapes &s) {
+  const auto k = static_cast<std::uint64_t>(s.inputs[0].dim(s.inputs[0].rank() - 1));
+  const auto rows = static_cast<std::uint32_t>(s.inputs[0].elem_count() / k);
+  return rows > 16u ? (rows + 15u) / 16u : 1u;
+}
 // K slices per tile: the part's tune, at most the workgroup's waves.
 std::uint32_t matrix_ksplits(const KernelShapes &s, std::uint32_t bits,
                              std::uint32_t n, std::uint32_t k) {
@@ -338,24 +345,30 @@ std::vector<MatrixChoice> matrix_menu(const KernelShapes &s, std::uint32_t bits,
   const auto tuned_ks = matrix_ksplits(s, bits, n, k);
   const auto *tune = matrix_tune(s, bits, n, k);
   const bool split_k = s.device && matrix_target(*s.device) == math::MatrixTarget::kRdna4;
+  // Each tile's activations are loaded with the round's weights; more tiles
+  // take fewer groups a round within the same registers.
+  const auto mtiles = matrix_mtiles(s);
+  const auto capped = [&](std::uint32_t most) {
+    return std::max(1u, std::min(most, kMatrixUnroll / mtiles));
+  };
   std::vector<MatrixChoice> menu{{matrix_unroll(
-      groups / tuned_ks, tune && tune->unroll ? tune->unroll
-                         : split_k ? kMatrixUnroll : kMatrixUnroll / 2u), tuned_ks, false}};
+      groups / tuned_ks, capped(tune && tune->unroll ? tune->unroll
+                         : split_k ? kMatrixUnroll : kMatrixUnroll / 2u)), tuned_ks, false}};
   const auto add = [&](const MatrixChoice &c) {
     for (const auto &m : menu)
       if (m.unroll == c.unroll && m.ks == c.ks && m.exact == c.exact) return;
     menu.push_back(c);
   };
   for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u, 1u})
-    add({matrix_unroll(groups / tuned_ks, most), tuned_ks, false});
+    add({matrix_unroll(groups / tuned_ks, capped(most)), tuned_ks, false});
   if (tuned_ks == 1 && s.device) {
     const auto waves = matrix_waves(s, n);
     const auto budget = backend::workgroup_lds_bytes(s.device);
     for (const std::uint32_t ks : {2u, 4u}) {
       if (waves % ks != 0u || groups % ks != 0u) continue;
       for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u}) {
-        const auto u = matrix_unroll(groups / ks, most);
-        if (waves * u * 8u * 32u * 4u <= budget) add({u, ks, true});
+        const auto u = matrix_unroll(groups / ks, capped(most));
+        if (mtiles * waves * u * 8u * 32u * 4u <= budget) add({u, ks, true});
       }
     }
     // Splits whose slices each sum their own contiguous run of groups, then
@@ -364,9 +377,9 @@ std::vector<MatrixChoice> matrix_menu(const KernelShapes &s, std::uint32_t bits,
     // draft's kernels may take them.
     for (const std::uint32_t ks : {2u, 4u}) {
       if (waves % ks != 0u || groups % ks != 0u ||
-          waves * 8u * 32u * 4u > budget) continue;
+          mtiles * waves * 8u * 32u * 4u > budget) continue;
       for (const std::uint32_t most : {kMatrixUnroll, kMatrixUnroll / 2u})
-        add({matrix_unroll(groups / ks, most), ks, false});
+        add({matrix_unroll(groups / ks, capped(most)), ks, false});
     }
   }
   return menu;
@@ -396,9 +409,10 @@ std::optional<MatrixChoice> matrix_choice(const KernelShapes &s, std::uint32_t b
   if (s.variant >= menu.size()) return std::nullopt;
   return menu[s.variant];
 }
-std::uint32_t matrix_lds_bytes(const MatrixChoice &c, std::uint32_t waves) {
+std::uint32_t matrix_lds_bytes(const MatrixChoice &c, std::uint32_t waves,
+                               std::uint32_t mtiles) {
   if (c.ks <= 1u) return 0u;
-  return waves * (c.exact ? c.unroll : 1u) * 8u * 32u * 4u;
+  return mtiles * waves * (c.exact ? c.unroll : 1u) * 8u * 32u * 4u;
 }
 // `Bits` is the weight width: 4-bit words widen to matrix operands by nibble
 // plane, 8-bit words already are operands, four codes to a register.
@@ -453,11 +467,11 @@ std::string emit_matrix(const KernelShapes &s) {
   const auto lo = e.let(lane % 16u);
   const auto hi = e.let(lane / 16u);
   const auto wg = e.let(math::workgroup_id_x());
-  const auto m0 = e.let((wg / nblocks) * 16u);
-  // A pass of more than 16 rows reads its tile of the panel; one tile is the
-  // whole panel.
-  const auto panel_tile = [&](const kir::Val<kir::u32>& index) {
-    return input_rows > 16u ? e.let((m0 / 16u) * (groups * kGroupWords) + index) : index;
+  // A pass of more than 16 rows has a panel tile per 16 rows; the workgroup
+  // applies each weight load to every tile. One tile is the whole panel.
+  const auto mtiles = matrix_mtiles(s);
+  const auto panel_tile = [&](std::uint32_t tile, const kir::Val<kir::u32>& index) {
+    return mtiles > 1u ? e.let(tile * (groups * kGroupWords) + index) : index;
   };
   // The single-slice form emits exactly what it always has; only a split
   // names its waves' slices.
@@ -467,15 +481,16 @@ std::string emit_matrix(const KernelShapes &s) {
     wave_index = e.let(lid / 32u);
     kslice = e.let(*wave_index % ks);
     if (exact)
-      products = e.lds<kir::f32>(waves * unroll * kSlots * 32u);
+      products = e.lds<kir::f32>(mtiles * waves * unroll * kSlots * 32u);
   }
   const auto ntile = ks == 1 ? e.let((wg % nblocks) * waves + lid / 32u)
                              : e.let((wg % nblocks) * tile_waves + *wave_index / ks);
   const auto col = e.let(ntile * 16u + lo);
   const auto live = e.let(ntile < tiles_n && col < n);
   const auto safe_col = e.let(select(col < n, col, e.u32(0)));
+  // Tile i's slot z is out[i * kSlots + z].
   std::vector<kir::LValue<kir::f32>> out;
-  for (int z = 0; z < kSlots; ++z)
+  for (std::uint32_t z = 0; z < mtiles * kSlots; ++z)
     out.push_back(e.var(0.0f));
   // A group's four K16 products sum exactly in i32, so the K order inside a
   // group is free as long as weights and activations agree. Lane half `hi`
@@ -506,12 +521,14 @@ std::string emit_matrix(const KernelShapes &s) {
                                hi * (kGroupWeightWords / 2u));
       for (std::uint32_t w = 0; w < kGroupWeightWords / 2u; w += 4u)
         l.weight.push_back(e.load(a.packed, e.let(wbase + w), 16u));
-      for (std::uint32_t t = 0; t < 4u; ++t)
-        l.acts.push_back(e.load(
-            a.panel, panel_tile(e.let(g * kGroupWords + act_lane + (t / 2u) * 64u + (t % 2u) * 32u)), 8u));
-      for (std::uint32_t z = 0; z < 8u; z += 2u)
-        l.metadata.push_back(e.load(
-            a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 16u + z * 2u)), 16u));
+      for (std::uint32_t tile = 0; tile < mtiles; ++tile) {
+        for (std::uint32_t t = 0; t < 4u; ++t)
+          l.acts.push_back(e.load(
+              a.panel, panel_tile(tile, e.let(g * kGroupWords + act_lane + (t / 2u) * 64u + (t % 2u) * 32u)), 8u));
+        for (std::uint32_t z = 0; z < 8u; z += 2u)
+          l.metadata.push_back(e.load(
+              a.panel, panel_tile(tile, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u)), 16u));
+      }
       } else {
         // The whole group's weight words; for product t the activation
         // words of both halves (acts[2t + half]); and the step and sum of
@@ -519,27 +536,33 @@ std::string emit_matrix(const KernelShapes &s) {
         const auto wbase = e.let(safe_col * lanes + g * kGroupWeightWords);
         for (std::uint32_t w = 0; w < kGroupWeightWords; w += 4u)
           l.weight.push_back(e.load(a.packed, e.let(wbase + w), 16u));
-        for (std::uint32_t t = 0; t < 4u; ++t)
-          for (std::uint32_t h = 0; h < 2u; ++h)
-            l.acts.push_back(e.load(
-                a.panel, panel_tile(e.let(g * kGroupWords + act_lane + h * 128u +
-                                          (t / 2u) * 64u + (t % 2u) * 32u)), 8u));
-        for (std::uint32_t z = 0; z < 8u; ++z)
-          l.metadata.push_back(e.load(
-              a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 2u + z * 4u)), 8u));
+        for (std::uint32_t tile = 0; tile < mtiles; ++tile) {
+          for (std::uint32_t t = 0; t < 4u; ++t)
+            for (std::uint32_t h = 0; h < 2u; ++h)
+              l.acts.push_back(e.load(
+                  a.panel, panel_tile(tile, e.let(g * kGroupWords + act_lane + h * 128u +
+                                                  (t / 2u) * 64u + (t % 2u) * 32u)), 8u));
+          for (std::uint32_t z = 0; z < 8u; ++z)
+            l.metadata.push_back(e.load(
+                a.panel, panel_tile(tile, e.let(g * kGroupWords + 256u + hi * 2u + z * 4u)), 8u));
+        }
       }
       loaded.push_back(std::move(l));
     }
+    constexpr std::uint32_t kActsPerTile = geo.split_k ? 4u : 8u;
+    constexpr std::uint32_t kMetaPerTile = geo.split_k ? 4u : 8u;
     for (std::uint32_t u = 0; u < unroll; ++u) {
       const auto &l = loaded[u];
       const auto scale = e.let(math::widen(l.raw_scale));
       const auto bias = e.let(math::widen(l.raw_bias));
-      const auto acc = e.local<kir::i32, kSlots>();
-      for (int z = 0; z < kSlots; ++z)
-        acc[z] = kir::cast<kir::i32>(e.u32(0));
+      std::vector<decltype(e.local<kir::i32, kSlots>())> accs;
+      for (std::uint32_t tile = 0; tile < mtiles; ++tile) {
+        accs.push_back(e.local<kir::i32, kSlots>());
+        for (int z = 0; z < kSlots; ++z)
+          accs.back()[z] = kir::cast<kir::i32>(e.u32(0));
+      }
       for (std::uint32_t t = 0; t < 4u; ++t) {
         const auto bf = e.local<kir::u32, kFrag>();
-        const auto af = e.local<kir::u32, kFrag>();
         for (int f = 0; f < kFrag; ++f) {
           // Which half of the product this register carries: the lane's own
           // on a split layout, half f / 2 on a contiguous one, whose
@@ -560,29 +583,38 @@ std::string emit_matrix(const KernelShapes &s) {
             const auto at = h * half_words + t * 2u + static_cast<std::uint32_t>(r);
             bf[f] = e.let(l.weight[at / 4u][static_cast<int>(at % 4u)]);
           }
-          af[f] = l.acts[geo.split_k ? t : t * 2u + h][r];
         }
-        acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
+        for (std::uint32_t tile = 0; tile < mtiles; ++tile) {
+          const auto af = e.local<kir::u32, kFrag>();
+          for (int f = 0; f < kFrag; ++f) {
+            const std::uint32_t h = geo.split_k ? 0u : static_cast<std::uint32_t>(f) / 2u;
+            const int r = geo.split_k ? f : f % 2;
+            af[f] = l.acts[tile * kActsPerTile + (geo.split_k ? t : t * 2u + h)][r];
+          }
+          accs[tile] = math::mma<Mma>(af.value(), bf.value(), accs[tile].value());
+        }
       }
-      if (exact) {
-        for (int z = 0; z < kSlots; ++z)
-          (*products)[e.let(((*wave_index * unroll + u) * kSlots +
-                             static_cast<std::uint32_t>(z)) * 32u + lane)] =
-              kir::cast<kir::f32>(acc[z].read());
-        continue;
-      }
-      for (int z = 0; z < kSlots; ++z) {
-        const auto pair = static_cast<std::size_t>(geo.split_k ? z / 2 : z);
-        const int lane_pair = geo.split_k ? (z % 2) * 2 : 0;
-        const auto step = e.let(math::from_bits<lse::f32>(
-            l.metadata[pair][lane_pair]));
-        const auto sum = e.let(math::from_bits<lse::f32>(
-            l.metadata[pair][lane_pair + 1]));
-        const auto term = e.let(scale * step);
-        out[static_cast<std::size_t>(z)] =
-            math::fma(term, kir::cast<kir::f32>(acc[z].read()),
-                      out[static_cast<std::size_t>(z)].read()) +
-            bias * sum;
+      for (std::uint32_t tile = 0; tile < mtiles; ++tile) {
+        const auto &acc = accs[tile];
+        if (exact) {
+          for (int z = 0; z < kSlots; ++z)
+            (*products)[e.let((((*wave_index * unroll + u) * mtiles + tile) * kSlots +
+                               static_cast<std::uint32_t>(z)) * 32u + lane)] =
+                kir::cast<kir::f32>(acc[z].read());
+          continue;
+        }
+        for (int z = 0; z < kSlots; ++z) {
+          const auto pair = tile * kMetaPerTile + static_cast<std::uint32_t>(geo.split_k ? z / 2 : z);
+          const int lane_pair = geo.split_k ? (z % 2) * 2 : 0;
+          const auto step = e.let(math::from_bits<lse::f32>(
+              l.metadata[pair][lane_pair]));
+          const auto sum = e.let(math::from_bits<lse::f32>(
+              l.metadata[pair][lane_pair + 1]));
+          const auto term = e.let(scale * step);
+          const auto slot = static_cast<std::size_t>(tile * kSlots + static_cast<std::uint32_t>(z));
+          out[slot] = math::fma(term, kir::cast<kir::f32>(acc[z].read()), out[slot].read()) +
+                      bias * sum;
+        }
       }
     }
     if (exact) {
@@ -597,15 +629,16 @@ std::string emit_matrix(const KernelShapes &s) {
           const auto sa = e.let(safe_col * groups + g);
           const auto scale = e.let(math::widen(e.let(a.scales[sa])));
           const auto bias = e.let(math::widen(e.let(a.biases[sa])));
+          for (std::uint32_t tile = 0; tile < mtiles; ++tile) {
           std::vector<kir::Pack<kir::u32>> metadata;
           if constexpr (geo.split_k) {
             for (std::uint32_t z = 0; z < 8u; z += 2u)
               metadata.push_back(e.load(
-                  a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 16u + z * 2u)), 16u));
+                  a.panel, panel_tile(tile, e.let(g * kGroupWords + 256u + hi * 16u + z * 2u)), 16u));
           } else {
             for (std::uint32_t z = 0; z < 8u; ++z)
               metadata.push_back(e.load(
-                  a.panel, panel_tile(e.let(g * kGroupWords + 256u + hi * 2u + z * 4u)), 8u));
+                  a.panel, panel_tile(tile, e.let(g * kGroupWords + 256u + hi * 2u + z * 4u)), 8u));
           }
           for (int z = 0; z < kSlots; ++z) {
             const auto pair = static_cast<std::size_t>(geo.split_k ? z / 2 : z);
@@ -614,11 +647,11 @@ std::string emit_matrix(const KernelShapes &s) {
             const auto sum = e.let(math::from_bits<lse::f32>(metadata[pair][lane_pair + 1]));
             const auto term = e.let(scale * step);
             const auto product = (*products)[e.let(
-                (((*wave_index + j) * unroll + u) * kSlots +
+                ((((*wave_index + j) * unroll + u) * mtiles + tile) * kSlots +
                  static_cast<std::uint32_t>(z)) * 32u + lane)].read();
-            out[static_cast<std::size_t>(z)] =
-                math::fma(term, product, out[static_cast<std::size_t>(z)].read()) +
-                bias * sum;
+            const auto slot = static_cast<std::size_t>(tile * kSlots + static_cast<std::uint32_t>(z));
+            out[slot] = math::fma(term, product, out[slot].read()) + bias * sum;
+          }
           }
         }
       }
@@ -638,26 +671,26 @@ std::string emit_matrix(const KernelShapes &s) {
   if (ks > 1 && !exact) {
     // Each tile's slices are adjacent waves; the first adds the others in
     // slice order.
-    const auto partial = e.lds<kir::f32>(waves * kSlots * 32u);
-    for (int z = 0; z < kSlots; ++z)
-      partial[e.let((*wave_index * kSlots + static_cast<std::uint32_t>(z)) * 32u + lane)] =
-          out[static_cast<std::size_t>(z)].read();
+    const auto slots = mtiles * kSlots;
+    const auto partial = e.lds<kir::f32>(waves * slots * 32u);
+    for (std::uint32_t z = 0; z < slots; ++z)
+      partial[e.let((*wave_index * slots + z) * 32u + lane)] = out[z].read();
     e.barrier();
     for (std::uint32_t j = 1; j < ks; ++j)
-      for (int z = 0; z < kSlots; ++z)
-        out[static_cast<std::size_t>(z)] =
-            out[static_cast<std::size_t>(z)].read() +
-            partial[e.let(((*wave_index + j) * kSlots + static_cast<std::uint32_t>(z)) * 32u + lane)].read();
+      for (std::uint32_t z = 0; z < slots; ++z)
+        out[z] = out[z].read() + partial[e.let(((*wave_index + j) * slots + z) * 32u + lane)].read();
   }
+  for (std::uint32_t tile = 0; tile < mtiles; ++tile)
   for (int z = 0; z < kSlots; ++z) {
     const auto output_row =
-        e.let(m0 + hi * geo.half_rows +
+        e.let(tile * 16u + hi * geo.half_rows +
               static_cast<std::uint32_t>(z) * geo.slot_step);
+    const auto slot = static_cast<std::size_t>(tile * kSlots + static_cast<std::uint32_t>(z));
     if (ks == 1) {
       if (auto valid = e.when(live && output_row < input_rows))
-        e.store(output_row * n + col, out[static_cast<std::size_t>(z)].read());
+        e.store(output_row * n + col, out[slot].read());
     } else if (auto valid = e.when(live && *kslice == 0u && output_row < input_rows)) {
-      e.store(output_row * n + col, out[static_cast<std::size_t>(z)].read());
+      e.store(output_row * n + col, out[slot].read());
     }
   }
   return kb.lds().ok() ? kb.str() : std::string{};
@@ -891,9 +924,9 @@ struct Q4MatrixPanelLinear final : KernelPrimitive<Q4MatrixPanelLinear> {
       const auto ks = choice->ks;
       const auto tiles = (n + 15u) / 16u;
       tp.workgroup_size[0] = waves * 32u;
-      tp.workgroup_count[0] = ((m + rule->rows - 1u) / rule->rows) *
-                              ((tiles + waves / ks - 1u) / (waves / ks));
-      if (ks > 1) tp.lds_bytes = matrix_lds_bytes(*choice, waves);
+      // Every 16-row tile of the pass is the same workgroup's.
+      tp.workgroup_count[0] = (tiles + waves / ks - 1u) / (waves / ks);
+      if (ks > 1) tp.lds_bytes = matrix_lds_bytes(*choice, waves, matrix_mtiles(s));
     }
     return tp;
   }
@@ -968,7 +1001,7 @@ struct Q8MatrixPanelLinear final : KernelPrimitive<Q8MatrixPanelLinear> {
     const auto ks = choice->ks;
     tp.workgroup_size[0] = waves * 32u;
     tp.workgroup_count[0] = ((n + 15u) / 16u + waves / ks - 1u) / (waves / ks);
-    if (ks > 1) tp.lds_bytes = matrix_lds_bytes(*choice, waves);
+    if (ks > 1) tp.lds_bytes = matrix_lds_bytes(*choice, waves, matrix_mtiles(s));
     return tp;
   }
 };
