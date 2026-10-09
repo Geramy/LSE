@@ -64,9 +64,103 @@ double DraftWidthPolicy::position_mean(std::uint32_t position) const noexcept {
   return (b.accepted + kPriorWeight * kPositionPrior) / (b.tested + kPriorWeight);
 }
 
+std::size_t DraftWidthPolicy::context_bucket(std::int64_t tokens) noexcept {
+  std::size_t bucket = 0;
+  for (std::int64_t at = 2048; tokens >= at && bucket + 1 < kContextBuckets; at *= 2) ++bucket;
+  return bucket;
+}
+
+void DraftWidthPolicy::set_context(std::int64_t tokens) noexcept {
+  const std::size_t bucket = context_bucket(tokens);
+  if (bucket == bucket_) return;
+  bucket_ = bucket;
+  Costs& here = costs_[bucket];
+  if (here.verify.live || here.tree.live) return;
+  // Nearest bucket holding costs, the shorter context on a tie.
+  const Costs* from = nullptr;
+  for (std::size_t d = 1; d < kContextBuckets && from == nullptr; ++d) {
+    if (bucket >= d && (costs_[bucket - d].verify.live || costs_[bucket - d].tree.live))
+      from = &costs_[bucket - d];
+    else if (bucket + d < kContextBuckets &&
+             (costs_[bucket + d].verify.live || costs_[bucket + d].tree.live))
+      from = &costs_[bucket + d];
+  }
+  if (from == nullptr) return;
+  here = *from;
+  auto seed = [](auto& ladder) {
+    if (!ladder.live) return;
+    ladder.seeded = true;
+    ladder.seed = ladder.offset;
+    ladder.seed_known = ladder.known;
+    ladder.samples.fill(0);
+  };
+  seed(here.verify);
+  seed(here.tree);
+  here.draft_seed = here.draft;
+  here.draft_samples.fill(0);
+  here.draft_seeded = true;
+}
+
+template <std::size_t N>
+bool DraftWidthPolicy::needs_sample(const Ladder<N>& ladder, std::size_t i) noexcept {
+  // A bucket started from another one measures only what that one never had.
+  return ladder.seeded ? !ladder.known[i] : ladder.samples[i] < kExploreSamples;
+}
+
+template <std::size_t N, class Rows>
+void DraftWidthPolicy::follow_growth(Ladder<N>& ladder, Rows rows_of) {
+  // How much each width measured here grew over its carried cost, fitted
+  // linear in rows; widths not measured here take their carried cost plus
+  // that growth.
+  double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (std::size_t i = 0; i < N; ++i) {
+    if (ladder.samples[i] == 0 || !ladder.seed_known[i]) continue;
+    const double x = rows_of(i), y = ladder.offset[i] - ladder.seed[i];
+    n += 1; sx += x; sy += y; sxx += x * x; sxy += x * y;
+  }
+  if (n == 0) return;
+  const double spread = n * sxx - sx * sx;
+  const double slope = n >= 2 && spread > 0 ? (n * sxy - sx * sy) / spread : 0.0;
+  const double intercept = (sy - slope * sx) / n;
+  for (std::size_t i = 0; i < N; ++i)
+    if (ladder.samples[i] == 0 && ladder.seed_known[i])
+      ladder.offset[i] = ladder.seed[i] + intercept + slope * rows_of(i);
+}
+
+template <std::size_t N, class Rows>
+void DraftWidthPolicy::observe_cost(Ladder<N>& ladder, std::size_t i, double t, Rows rows_of) {
+  bool any = false;
+  for (const auto count : ladder.samples) any = any || count != 0;
+  if (ladder.seeded && ladder.samples[i] == 0) {
+    // The first measurement of this width in a bucket started from another
+    // one: the first moves the level, each later one sets its own offset.
+    if (!any && ladder.known[i]) ladder.base = t - ladder.offset[i];
+    else ladder.offset[i] = t - ladder.base;
+  } else if (!any) {
+    ladder.base = t;
+    ladder.offset[i] = 0.0;
+  } else if (ladder.samples[i] == 0) {
+    ladder.offset[i] = t - ladder.base;
+  } else {
+    const double predicted = ladder.base + ladder.offset[i];
+    ladder.base += kBaseRate * clamp_step(t - predicted, predicted);
+    // A width's first observations average; one seen rarely (a refresh
+    // every kRefreshSteps) keeps moving fast, so a sample taken while the
+    // clocks ramped does not price it for good.
+    const double rate = std::max(kOffsetRate, 1.0 / static_cast<double>(ladder.samples[i] + 1));
+    ladder.offset[i] += rate * clamp_step(t - ladder.base - ladder.offset[i], predicted);
+  }
+  ladder.live = true;
+  ladder.known[i] = true;
+  ++ladder.samples[i];
+  ladder.last_seen[i] = steps_;
+  if (ladder.seeded) follow_growth(ladder, rows_of);
+}
+
 double DraftWidthPolicy::verify_ns(std::uint32_t rows) const noexcept {
-  if (rows == 0 || rows > kMaxRows || samples_[rows] == 0) return 0.0;
-  return std::max(0.0, base_ + offset_[rows]);
+  const auto& ladder = costs().verify;
+  if (rows == 0 || rows > kMaxRows || !ladder.known[rows]) return 0.0;
+  return std::max(0.0, ladder.base + ladder.offset[rows]);
 }
 
 double DraftWidthPolicy::rate() const noexcept {
@@ -75,9 +169,11 @@ double DraftWidthPolicy::rate() const noexcept {
 
 std::uint32_t DraftWidthPolicy::exploring() const noexcept {
   if (steps_ < kWarmupSteps) return 0;
+  const auto& ladder = costs().verify;
   std::uint32_t fewest = 0;
   for (std::uint32_t rows = 1; rows <= kMaxRows; ++rows)
-    if (samples_[rows] < kExploreSamples && (fewest == 0 || samples_[rows] < samples_[fewest]))
+    if (needs_sample(ladder, rows) &&
+        (fewest == 0 || ladder.samples[rows] < ladder.samples[fewest]))
       fewest = rows;
   return fewest;
 }
@@ -97,12 +193,13 @@ std::uint32_t DraftWidthPolicy::refresh(std::uint32_t max, bool chained) const n
     value[d] = gain - rate_now * ((chained ? draft_ns(d) : 0.0) + verify_ns(d + 1));
     best = std::max(best, value[d]);
   }
+  const auto& last_seen = costs().verify.last_seen;
   std::uint32_t stalest = 0;
   for (std::uint32_t rows = 1; rows <= max + 1; ++rows) {
-    const std::uint64_t age = steps_ - last_seen_[rows];
+    const std::uint64_t age = steps_ - last_seen[rows];
     if (age <= kRefreshSteps || (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps))
       continue;
-    if (stalest == 0 || last_seen_[rows] < last_seen_[stalest]) stalest = rows;
+    if (stalest == 0 || last_seen[rows] < last_seen[stalest]) stalest = rows;
   }
   return stalest;
 }
@@ -172,6 +269,8 @@ std::string DraftWidthPolicy::describe() const {
     std::snprintf(item, sizeof item, "%s%.2f", q == 0.05 ? "" : ",", candidate(q));
     out += item;
   }
+  std::snprintf(item, sizeof item, " ctx_bucket=%zu", bucket_);
+  out += item;
   std::snprintf(item, sizeof item, " bias=%.2f", bias_);
   out += item;
   std::snprintf(item, sizeof item, " rate_tps=%.1f", rate() * 1e9);
@@ -182,7 +281,7 @@ std::string DraftWidthPolicy::describe() const {
 bool DraftWidthPolicy::draft_next(bool tree) {
   if (tree) {
     // Trees take no chain widths: a plain step is the only one to measure.
-    if (steps_ >= kWarmupSteps && samples_[1] < kExploreSamples) return false;
+    if (steps_ >= kWarmupSteps && needs_sample(costs().verify, 1)) return false;
     if (tree_exploring() != 0) return true;
   } else if (const std::uint32_t rows = exploring(); rows != 0) {
     return rows > 1;
@@ -220,37 +319,31 @@ void DraftWidthPolicy::observe_verify(std::uint32_t rows, std::uint64_t ns) {
   if (rows == 0 || rows > kMaxRows) return;
   // Warm-up steps count toward the warm-up and price nothing.
   if (steps_++ < kWarmupSteps) return;
-  const auto t = static_cast<double>(ns);
-  bool any = false;
-  for (std::uint32_t m = 1; m <= kMaxRows; ++m) any = any || samples_[m] != 0;
-  if (!any) {
-    base_ = t;
-    offset_[rows] = 0.0;
-  } else if (samples_[rows] == 0) {
-    offset_[rows] = t - base_;
-  } else {
-    const double predicted = base_ + offset_[rows];
-    base_ += kBaseRate * clamp_step(t - predicted, predicted);
-    // A width's first observations average; one seen rarely (a refresh
-    // every kRefreshSteps) keeps moving fast, so a sample taken while the
-    // clocks ramped does not price it for good.
-    const double rate = std::max(kOffsetRate, 1.0 / static_cast<double>(samples_[rows] + 1));
-    offset_[rows] += rate * clamp_step(t - base_ - offset_[rows], predicted);
-  }
-  ++samples_[rows];
-  last_seen_[rows] = steps_;
+  observe_cost(costs().verify, rows, static_cast<double>(ns),
+               [](std::size_t i) { return static_cast<double>(i); });
 }
 
 void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
   if (depth > kMaxProposals || steps_ <= kWarmupSteps) return;
   const auto t = static_cast<double>(ns);
-  double& d = draft_ns_[depth];
-  if (draft_samples_[depth]++ == 0) d = t;
-  else d += kDraftRate * clamp_step(t - d, d);
+  Costs& c = costs();
+  double& d = c.draft[depth];
+  if (c.draft_samples[depth]++ == 0) {
+    d = t;
+    // A bucket started from another one: depths not yet measured here scale
+    // as this one did (an MTP chain's passes all attend over the context).
+    if (c.draft_seeded && c.draft_seed[depth] > 0.0) {
+      const double scale = t / c.draft_seed[depth];
+      for (std::uint32_t e = 0; e <= kMaxProposals; ++e)
+        if (c.draft_samples[e] == 0) c.draft[e] = c.draft_seed[e] * scale;
+    }
+  } else {
+    d += kDraftRate * clamp_step(t - d, d);
+  }
 }
 
 double DraftWidthPolicy::draft_ns(std::uint32_t depth) const noexcept {
-  return depth <= kMaxProposals ? draft_ns_[depth] : 0.0;
+  return depth <= kMaxProposals ? costs().draft[depth] : 0.0;
 }
 
 std::uint32_t DraftWidthPolicy::depth(std::uint32_t max, std::uint32_t initial) {
@@ -332,16 +425,18 @@ std::size_t DraftWidthPolicy::tree_rung(std::uint32_t rows) noexcept {
 
 double DraftWidthPolicy::tree_step_ns(std::uint32_t rows) const noexcept {
   const std::size_t r = tree_rung(rows);
-  if (r >= kTreeRows.size() || tree_samples_[r] == 0) return 0.0;
-  return std::max(0.0, tree_base_ + tree_offset_[r]);
+  const auto& ladder = costs().tree;
+  if (r >= kTreeRows.size() || !ladder.known[r]) return 0.0;
+  return std::max(0.0, ladder.base + ladder.offset[r]);
 }
 
 std::uint32_t DraftWidthPolicy::tree_exploring() const noexcept {
   if (steps_ < kWarmupSteps) return 0;
+  const auto& ladder = costs().tree;
   std::size_t fewest = kTreeRows.size();
   for (std::size_t r = 0; r < kTreeRows.size(); ++r)
-    if (tree_samples_[r] < kExploreSamples &&
-        (fewest == kTreeRows.size() || tree_samples_[r] < tree_samples_[fewest]))
+    if (needs_sample(ladder, r) &&
+        (fewest == kTreeRows.size() || ladder.samples[r] < ladder.samples[fewest]))
       fewest = r;
   return fewest < kTreeRows.size() ? kTreeRows[fewest] : 0;
 }
@@ -360,7 +455,7 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
   if (chain && exploring() != 0) return 0;
   // A rung unmeasured for long enough is measured again, whatever it costs.
   for (std::size_t r = 0; r < kTreeRows.size(); ++r)
-    if (steps_ - tree_last_seen_[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
+    if (steps_ - costs().tree.last_seen[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
   const double draft = draft_ns(kMaxProposals);
   std::uint32_t best = fit(kTreeRows[0]);
   double best_rate = -1.0;
@@ -390,22 +485,8 @@ void DraftWidthPolicy::observe_tree_step(std::uint32_t rows, std::uint64_t ns) {
   if (steps_++ < kWarmupSteps) return;
   // A level of its own that follows the context, and per-rung offsets, as
   // the chain widths have.
-  const auto t = static_cast<double>(ns);
-  bool any = false;
-  for (const auto s : tree_samples_) any = any || s != 0;
-  if (!any) {
-    tree_base_ = t;
-    tree_offset_[r] = 0.0;
-  } else if (tree_samples_[r] == 0) {
-    tree_offset_[r] = t - tree_base_;
-  } else {
-    const double predicted = tree_base_ + tree_offset_[r];
-    tree_base_ += kBaseRate * clamp_step(t - predicted, predicted);
-    const double rate = std::max(kOffsetRate, 1.0 / static_cast<double>(tree_samples_[r] + 1));
-    tree_offset_[r] += rate * clamp_step(t - tree_base_ - tree_offset_[r], predicted);
-  }
-  ++tree_samples_[r];
-  tree_last_seen_[r] = steps_;
+  observe_cost(costs().tree, r, static_cast<double>(ns),
+               [](std::size_t i) { return static_cast<double>(kTreeRows[i]); });
 }
 
 void DraftWidthPolicy::observe_tree_value(double gain, std::uint32_t rows) {

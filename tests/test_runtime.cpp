@@ -521,6 +521,38 @@ LSE_TEST(draft_width_policy_measures_every_width_first) {
   LSE_EXPECT_NEAR(policy.verify_ns(1), 31e6, 1.0);
 }
 
+LSE_TEST(draft_width_policy_costs_follow_the_context) {
+  // Measured at a short context: 32 ms for one row, 1 ms per further row.
+  DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
+  LSE_EXPECT_EQ(DraftWidthPolicy::context_bucket(0), 0u);
+  LSE_EXPECT_EQ(DraftWidthPolicy::context_bucket(2047), 0u);
+  LSE_EXPECT_EQ(DraftWidthPolicy::context_bucket(2048), 1u);
+  LSE_EXPECT_EQ(DraftWidthPolicy::context_bucket(65536), 6u);
+  LSE_EXPECT_EQ(DraftWidthPolicy::context_bucket(std::int64_t{1} << 40),
+                DraftWidthPolicy::kContextBuckets - 1);
+  policy.set_context(65536);
+  // A new bucket starts from the measured one and explores nothing.
+  LSE_EXPECT_NEAR(policy.verify_ns(8), 39e6, 1.0);
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_NEAR(policy.draft_ns(), 8e6, 1.0);
+  // At 64K one row costs 40 ms: the level moves.
+  policy.observe_verify(1, 40'000'000);
+  LSE_EXPECT_NEAR(policy.verify_ns(1), 40e6, 1.0);
+  LSE_EXPECT_NEAR(policy.verify_ns(8), 47e6, 1.0);
+  // Eight rows cost 61 ms: 14 ms more than carried, 2 ms per row past the
+  // first, and the widths not measured here follow that growth.
+  policy.observe_verify(8, 61'000'000);
+  LSE_EXPECT_NEAR(policy.verify_ns(8), 61e6, 1.0);
+  LSE_EXPECT_NEAR(policy.verify_ns(5), 52e6, 1.0);
+  // A draft measured here scales the depths not measured here.
+  policy.observe_draft(12'000'000, 3);
+  LSE_EXPECT_NEAR(policy.draft_ns(3), 12e6, 1.0);
+  // The short context keeps its own costs.
+  policy.set_context(1000);
+  LSE_EXPECT_NEAR(policy.verify_ns(8), 39e6, 1.0);
+  LSE_EXPECT_NEAR(policy.verify_ns(1), 32e6, 1.0);
+}
+
 LSE_TEST(draft_width_policy_verifies_what_pays_for_its_rows) {
   // 32 ms for one row, 1 ms per further row, an 8 ms draft, 50 tok/s.
   DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
