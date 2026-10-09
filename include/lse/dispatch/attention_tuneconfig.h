@@ -93,16 +93,22 @@ struct SplitShortRule {
 struct ShortTileRule {
   std::uint32_t min_rows, max_rows, query_tile;
 };
+// Two and three rows take the four-row tile with its spare rows masked: an
+// MTP draft's first pass (the accepted rows) and a short verify pass otherwise
+// gave every row and head a workgroup of its own, each reading the whole cache
+// (at 64K keys a three-row pass took 6.8 ms against 1.5 ms for four rows).
 inline constexpr std::array kShortTileRules{
-    ShortTileRule{4, 8, 4},
+    ShortTileRule{2, 8, 4},
 };
 
 [[nodiscard]] constexpr std::uint64_t split_partitions(std::uint64_t capacity) noexcept {
   return capacity / kShortKeyWindow + (capacity % kShortKeyWindow != 0);
 }
 
+// The merge's partition weights; before them, the same scratch holds one
+// partial maximum per lane (up to 128).
 [[nodiscard]] constexpr std::uint64_t split_merge_lds_bytes(std::uint64_t parts) noexcept {
-  return (parts * sizeof(float) + 15u) / 16u * 16u;
+  return ((parts < 128u ? 128u : parts) * sizeof(float) + 15u) / 16u * 16u;
 }
 
 struct ShortHeadRule {

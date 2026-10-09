@@ -84,7 +84,7 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], i == 0 ? 8u * parts : 48u);
       // The partial's scores for six rows, then four wave maxima per row.
-      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u + 4u * 6u * 4u : (parts * 4u + 15u) / 16u * 16u);
+      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u + 4u * 6u * 4u : (std::max(parts, 128u) * 4u + 15u) / 16u * 16u);
     }
   }
   LSE_EXPECT(find_primitive("attention.decode_shared") == nullptr);
@@ -151,7 +151,7 @@ LSE_TEST(decode_attention_merge_initializes_partitions_beyond_one_wavegroup) {
       const auto plan = merge->plan(request);
       LSE_EXPECT_EQ(plan.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(plan.workgroup_count[0], 24u);
-      LSE_EXPECT_EQ(plan.lds_bytes, static_cast<unsigned>(parts) * 4u);
+      LSE_EXPECT_EQ(plan.lds_bytes, (static_cast<unsigned>(std::max(parts, 128)) * 4u + 15u) / 16u * 16u);
     }
   }
 }
@@ -295,7 +295,7 @@ LSE_TEST(decode_attention_narrow_storage_uses_wave_qk_and_preserves_partial_abi)
       LSE_EXPECT(partial->source.find("scalar.fmaf") != std::string::npos);
       LSE_EXPECT(partial->source.find(storage == kv::CacheDType::kF16 ? "xf16" : "xbf16") != std::string::npos);
       LSE_EXPECT_EQ(merge->dims.workgroup_count[0], 24u);
-      LSE_EXPECT_EQ(merge->lds_bytes, parts * sizeof(float));
+      LSE_EXPECT_EQ(merge->lds_bytes, std::max(parts, 128u) * sizeof(float));
     }
   }
 }
