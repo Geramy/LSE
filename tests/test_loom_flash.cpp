@@ -133,7 +133,7 @@ LSE_TEST(split_decode_attention_orders_two_barriers_and_versions_both_kernels) {
             i == 0 ? 8u * static_cast<unsigned>((capacity + 127) / 128) : 48u);
         LSE_EXPECT_EQ(emitted->lds_bytes,
             i == 0 ? 3072u + 4u * 6u * 4u
-                   : (4u * static_cast<unsigned>((capacity + 127) / 128) + 15u) / 16u * 16u);
+                   : (4u * std::max(static_cast<unsigned>((capacity + 127) / 128), 128u) + 15u) / 16u * 16u);
         LSE_EXPECT(emitted->source.find("kernel.barrier") != std::string::npos);
       }
       auto baseline = sdpa_paged(q, k, v, 0.0625f, mask, 65, meta, table, 16);

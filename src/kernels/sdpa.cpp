@@ -406,10 +406,26 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       const auto lane = e.let(math::local_id());
       const auto wg = e.let(math::workgroup_id_x());
       const auto row_tiles = ShortQuery ? (queries + token_tile - 1u) / token_tile : 1u;
-      const auto part = e.let(wg % parts);
-      const auto q0 = e.let(((wg / parts) % row_tiles) * token_tile);
-      const auto h = e.let(((wg / (parts * row_tiles)) % (heads / head_tile)) * head_tile);
-      const auto b = e.let(wg / (parts * row_tiles * (heads / head_tile)));
+      // Several rows: the workgroups go partition by partition, and within
+      // one, key head by key head, so every tile of rows and query heads that
+      // reads one key head's partition runs beside the others and finds its
+      // keys and values in the cache. Partition-major they were a whole row
+      // of partitions apart, and each read the partition from memory: a pass
+      // of eight rows read the cache six times over. The records each
+      // workgroup writes are unchanged.
+      const auto group = heads / kvheads;
+      const bool shared_keys = ShortQuery && group % head_tile == 0u;
+      const auto per_key_head = row_tiles * (group / head_tile);
+      const auto part = shared_keys ? e.let((wg / (per_key_head * kvheads)) % parts)
+                                    : e.let(wg % parts);
+      const auto q0 = shared_keys ? e.let((wg % row_tiles) * token_tile)
+                                  : e.let(((wg / parts) % row_tiles) * token_tile);
+      const auto h = shared_keys
+          ? e.let(((wg / per_key_head) % kvheads) * group +
+                  ((wg / row_tiles) % (group / head_tile)) * head_tile)
+          : e.let(((wg / (parts * row_tiles)) % (heads / head_tile)) * head_tile);
+      const auto b = shared_keys ? e.let(wg / (per_key_head * kvheads * parts))
+                                 : e.let(wg / (parts * row_tiles * (heads / head_tile)));
       const auto kh = e.let(h / (heads / kvheads));
       const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
       const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
@@ -730,6 +746,21 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
 };
 
 
+// Workgroups per merged row. A pass of few rows (a decode step's 24 heads)
+// leaves most compute units without a row, and each row's merge walks every
+// partition; splitting a row's 256 columns over up to four workgroups of
+// fewer lanes puts as many workgroups as there are compute units to work.
+// Every column is still added up by one lane, in the same order.
+static std::uint32_t merge_slices(const KernelShapes& s) {
+  if (s.device == nullptr || s.output.rank() == 0) return 1;
+  const auto rows = s.output.elem_count() / 256u;
+  const auto units = static_cast<std::uint64_t>(s.device->compute_units);
+  const auto wave = std::max<std::uint32_t>(s.device->wavefront_size, 1u);
+  std::uint32_t slices = 1;
+  while (slices < 4u && 128u / (slices * 2u) >= wave && rows * slices < units) slices *= 2u;
+  return slices;
+}
+
 struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
   static constexpr std::string_view kName = "attention.split_merge128.wg128c2.v1";
   static constexpr std::string_view kEntry = "lse_sdpa_split_merge128_wg128c2_v1";
@@ -743,18 +774,31 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
         !s.types.scalar || !s.intrinsics || !s.store)
       return {};
     const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 2));
+    const auto slices = merge_slices(s);
+    const auto lanes = 128u / slices;
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     SplitMergeArgs<env::Emit> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
-    const auto weights = e.lds<kir::f32>(parts);
+    // One scratch array: first each lane's partial maximum, then the weights.
+    const auto weights = e.lds<kir::f32>(std::max(parts, 128u));
+    const auto& lane_max = weights;
     const auto lane = e.let(math::local_id()), wg = e.let(math::workgroup_id_x());
-    const auto base = e.let(wg * parts * kSplitRecord);
-    auto maximum = e.var(math::neg_inf());
-    for (auto p : e.range(parts))
+    const auto row = e.let(wg / slices), slice = e.let(wg % slices);
+    const auto base = e.let(row * parts * kSplitRecord);
+    // The largest partition maximum: each lane takes every lanes-th
+    // partition, then every lane reads the lane results. max is exact, so
+    // any order gives the serial scan's answer.
+    auto own = e.var(math::neg_inf());
+    for (auto p : e.range(lane, e.u32(parts), lanes))
       if (auto valid = e.when(a.partial[base + p * kSplitRecord + 1u] > 0.0f))
-        maximum = math::max(maximum.read(), a.partial[base + p * kSplitRecord]);
+        own = math::max(own.read(), a.partial[base + p * kSplitRecord]);
+    lane_max[lane] = own.read();
+    e.barrier();
+    auto maximum = e.var(math::neg_inf());
+    for (auto l : e.range(lanes)) maximum = math::max(maximum.read(), lane_max[l].read());
+    e.barrier();
     auto write_weight = [&](auto part) {
       const auto pb = e.let(base + part * kSplitRecord);
       auto weight = e.var(0.0f);
@@ -763,20 +807,44 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
         weight = math::exp(a.partial[pb] - maximum.read());
       weights[part] = weight.read();
     };
-    for (auto part : e.range(lane, e.u32(parts), 128u)) write_weight(part);
+    for (auto part : e.range(lane, e.u32(parts), lanes)) write_weight(part);
     e.barrier();
+    // Each lane owns two output columns and adds the partitions into them in
+    // partition order, as one lane always has. A batch of partitions' loads
+    // issues before the batch's additions, so the loop waits on memory once
+    // per batch rather than once per partition.
+    const auto column = e.let(slice * (256u / slices) + lane * 2u);
     auto denom = e.var(0.0f), acc0 = e.var(0.0f), acc1 = e.var(0.0f);
-    for (auto p : e.range(parts)) {
-      const auto pb = e.let(base + p * kSplitRecord);
-      const auto weight = e.let(weights[p].read());
-      denom = math::fma(weight, a.partial[pb + 1u], denom.read());
-      const auto values = e.load(a.partial, e.let(pb + 2u + lane * 2u), 8u);
+    constexpr std::uint32_t kBatch = 8;
+    const auto add = [&](const auto& weight, const auto& sum, const auto& values) {
+      denom = math::fma(weight, sum, denom.read());
       acc0 = math::fma(weight, values[0], acc0.read());
       acc1 = math::fma(values[1], weight, acc1.read());
+    };
+    const std::uint32_t whole = parts / kBatch * kBatch;
+    if (whole != 0) {
+      for (auto p0 : e.range(0u, whole, kBatch)) {
+        std::vector<kir::Val<kir::f32>> w, sums;
+        std::vector<kir::Pack<kir::f32>> values;
+        for (std::uint32_t u = 0; u < kBatch; ++u) {
+          const auto pb = e.let(base + (p0 + u) * kSplitRecord);
+          w.push_back(e.let(weights[e.let(p0 + u)].read()));
+          sums.push_back(e.let(a.partial[pb + 1u]));
+          values.push_back(e.load(a.partial, e.let(pb + 2u + column), 8u));
+        }
+        for (std::uint32_t u = 0; u < kBatch; ++u) add(w[u], sums[u], values[u]);
+      }
+    }
+    if (whole != parts) {
+      for (auto p : e.range(whole, parts)) {
+        const auto pb = e.let(base + p * kSplitRecord);
+        add(e.let(weights[p].read()), e.let(a.partial[pb + 1u]),
+            e.load(a.partial, e.let(pb + 2u + column), 8u));
+      }
     }
     const auto divisor = e.let(select(denom.read() == 0.0f, e.f32(1.0f), denom.read()));
-    e.store(wg * 256u + lane * 2u, acc0.read() / divisor);
-    e.store(wg * 256u + lane * 2u + 1u, acc1.read() / divisor);
+    e.store(row * 256u + column, acc0.read() / divisor);
+    e.store(row * 256u + column + 1u, acc1.read() / divisor);
     return k.lds().ok() ? k.str() : std::string{};
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
@@ -788,9 +856,11 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan tp;
-    tp.workgroup_size[0] = 128;
-    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / 256u);
-    tp.lds_bytes = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 2)) * sizeof(float);
+    const auto slices = merge_slices(s);
+    tp.workgroup_size[0] = 128u / slices;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / 256u) * slices;
+    tp.lds_bytes = static_cast<std::uint32_t>(dispatch::attention_shapes::split_merge_lds_bytes(
+        static_cast<std::uint64_t>(s.inputs[0].dim(s.inputs[0].rank() - 2))));
     return tp;
   }
 };

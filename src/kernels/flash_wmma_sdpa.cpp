@@ -86,6 +86,17 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
 
+  // Query heads of one key head that share a split pass's tile: the most
+  // that divide the group and whose rows fill at most the tile's sixteen.
+  static std::uint32_t split_heads_per_tile(const Dims& d) {
+    if constexpr (!Split) return 1u;
+    if (!d.valid || d.tq == 0 || d.group == 0) return 1u;
+    std::uint32_t pack = 1;
+    for (std::uint32_t n = 2; n <= d.group && n * d.tq <= QTile; ++n)
+      if (d.group % n == 0) pack = n;
+    return pack;
+  }
+
   static KernelShapes dense_request(const KernelShapes& s) {
     auto dense=s;
     if constexpr (MeanCorrection) {
@@ -655,25 +666,63 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const std::uint32_t parts = Split ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
     const std::uint32_t share = Split ? dispatch::attention_shapes::flash_split_share(
         std::uint64_t{d.stride} * d.ts, parts) : 0u;
+    // A split numbers its workgroups share by share, and within a share key
+    // head by key head: the tiles of every query head reading one key head's
+    // windows are neighbours, so they run together and the share's keys and
+    // values come from the cache after the first of them reads them. Ordered
+    // tile-major instead, the query heads of one key head were a whole row of
+    // shares apart and each read the share from memory: at 64K keys an 8-row
+    // tree pass read the cache six times over. Each workgroup computes what
+    // it did before; only the order they start in changes.
+    //
+    // A split pass of at most eight rows also packs the query heads of one
+    // key head into the sixteen rows of a tile (split_heads_per_tile): eight
+    // rows of two heads, four of three, two of six. Every row is computed by
+    // the same instructions on the same operands as in a tile of its own --
+    // a matrix product's element depends only on its row and column, the
+    // softmax runs per row -- so each record is the value it was; the keys
+    // and values of a window are read once per tile for several heads.
+    const std::uint32_t pack = split_heads_per_tile(d);
+    const std::uint32_t per_key_head = d.group / pack * ntiles;
     const auto tile_wg = [&] {
-      if constexpr (Split) return e.let(wg / parts);
+      if constexpr (Split) return e.let(wg % per_key_head);
       else return wg;
     }();
     const auto part = [&] {
-      if constexpr (Split) return e.let(wg % parts);
+      if constexpr (Split) return e.let((wg / (per_key_head * d.kvh)) % parts);
       else return wg;
     }();
     (void)part;
     const auto qt = e.let(tile_wg % ntiles);
-    const auto h = e.let((tile_wg / ntiles) % d.qh);
-    const auto b = e.let(tile_wg / (ntiles * d.qh));
-    // Row r's record of this share.
-    const auto record = [&](const kir::Val<kir::u32>& qrow) {
-      return e.let((((b * d.qh + h) * d.tq + qrow) * parts + part) *
-                   dispatch::attention_shapes::kSplitRecord);
-    };
+    const auto h = [&] {
+      if constexpr (Split)
+        return e.let(((wg / per_key_head) % d.kvh) * d.group + tile_wg / ntiles * pack);
+      else return e.let((tile_wg / ntiles) % d.qh);
+    }();
+    const auto b = [&] {
+      if constexpr (Split) return e.let(wg / (per_key_head * d.kvh * parts));
+      else return e.let(tile_wg / (ntiles * d.qh));
+    }();
     const auto kh = e.let(h / d.group);
     const auto q0 = e.let(qt * QTile);
+    // Tile row r: its query row, its head, and whether it holds one.
+    const auto row_query = [&](const auto& r) {
+      if (pack > 1u) return e.let(r % d.tq);
+      return e.let(q0 + r);
+    };
+    const auto row_head = [&](const auto& r) {
+      if (pack > 1u) return e.let(h + r / d.tq);
+      return e.let(h + 0u);
+    };
+    const auto row_live = [&](const auto& r) {
+      if (pack > 1u) return e.let(r < pack * d.tq);
+      return e.let(q0 + r < d.tq);
+    };
+    // Tile row r's record of this share.
+    const auto record = [&](const auto& r) {
+      return e.let((((b * d.qh + row_head(r)) * d.tq + row_query(r)) * parts + part) *
+                   dispatch::attention_shapes::kSplitRecord);
+    };
     const auto obase = e.let(((b * d.qh + h) * d.tq) * d.dv);
 
     const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
@@ -683,10 +732,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         for (std::uint32_t p = 0; p < dpt; ++p) {
           const auto qrow = e.let(q0 + r);
           const auto dd = e.let(lid + p * kThreads);
-          if (auto g = e.when(qrow < d.tq && dd < d.dv)) {
+          if (auto g = e.when(row_live(e.u32(r)) && dd < d.dv)) {
             if constexpr (Split) {
               // An empty share: zero sum and output, never read for its maximum.
-              const auto rec = record(qrow);
+              const auto rec = record(e.u32(r));
               e.store(e.let(rec + 2u + dd), e.f32(0.0f));
               if (auto lead = e.when(dd == 0u)) {
                 e.store(rec, e.f32(0.0f));
@@ -717,10 +766,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       if (auto inb = e.when(idx < QTile * padded_depth)) {
         const auto r = e.let(idx / padded_depth);
         const auto dd = e.let(idx % padded_depth);
-        const auto qrow = e.let(q0 + r);
+        const auto qrow = row_query(r);
         qs[idx] = math::narrow<Narrow>(e.f32(0.0f));
-        if (auto g = e.when(qrow < d.tq && dd < d.dh)) {
-          const auto qvalue = e.let(a.q[e.let(((b * d.qh + h) * d.tq + qrow) * d.dh + dd)]);
+        if (auto g = e.when(row_live(r) && dd < d.dh)) {
+          const auto qvalue = e.let(a.q[e.let(((b * d.qh + row_head(r)) * d.tq + qrow) * d.dh + dd)]);
           qs[idx] = math::narrow<Narrow>(qvalue);
         }
       }
@@ -792,12 +841,13 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         auto write_score = [&](const kir::Val<kir::u32>& row,
                                const kir::Val<kir::u32>& key,
                                const kir::Val<kir::f32>& value) {
+          const auto query_row = row_query(row);
           const auto position = e.let(kir::cast<std::int64_t>(offset) +
-                                      kir::cast<std::int64_t>(q0) + kir::cast<std::int64_t>(row));
+                                      kir::cast<std::int64_t>(query_row));
           const auto signed_key = e.let(kir::cast<std::int64_t>(key));
           const auto slot = e.let(row * kKWin + key - wbase);
           sc[slot] = math::neg_inf();
-          if (auto live_score = e.when(key < row_len && q0 + row < d.tq)) {
+          if (auto live_score = e.when(key < row_len && row_live(row))) {
             if (mask == 0) sc[slot] = value;
             else if (mask == 1) {
               if (auto causal = e.when(signed_key <= position)) sc[slot] = value;
@@ -808,7 +858,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               const auto column = e.let(kir::cast<kir::u32>(select(before, kir::cast<std::int64_t>(e.u32(0)),
                   kir::cast<std::int64_t>(key) - kir::cast<std::int64_t>(offset))));
               const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
-                                                   (q0 + row) * d.tq + column)]);
+                                                   query_row * d.tq + column)]);
               if (auto visible = e.when(signed_key <= position && (before || seen != 0.0f)))
                 sc[slot] = value;
             } else {
@@ -1235,13 +1285,13 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
         const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
         for (auto f : e.unroll(8u)) {
-          const auto qrow = e.let(q0 + acc_row(f));
-          if (auto live_query = e.when(qrow < d.tq && dimension < d.dv))
-            e.store(e.let(record(qrow) + 2u + dimension), o[column_tile][f].read());
+          const auto row = acc_row(f);
+          if (auto live_query = e.when(row_live(row) && dimension < d.dv))
+            e.store(e.let(record(row) + 2u + dimension), o[column_tile][f].read());
         }
       }
-      if (auto lead = e.when(lid < QTile && q0 + lid < d.tq)) {
-        const auto rec = record(e.let(q0 + lid));
+      if (auto lead = e.when(lid < QTile && row_live(lid))) {
+        const auto rec = record(lid);
         e.store(rec, mrow[lid].read());
         e.store(e.let(rec + 1u), drow[lid].read());
       }
@@ -1279,7 +1329,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     // Variant 2 takes two query tiles per workgroup, on sixteen waves.
     const std::uint32_t tiles = s.variant == 2u ? (ntiles + 1u) / 2u : ntiles;
     tp.workgroup_size[0] = s.variant == 2u ? 2u * kThreads : kThreads;
-    tp.workgroup_count[0] = d.valid ? d.bsz * d.qh * tiles * parts : 1u;
+    tp.workgroup_count[0] = d.valid ? d.bsz * (d.qh / split_heads_per_tile(d)) * tiles * parts : 1u;
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
     return tp;

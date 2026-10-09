@@ -59,7 +59,12 @@ LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
         LSE_EXPECT(emitted.ok());
         if (!emitted.ok()) return;
         const bool partial = i == 0;
-        LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
+        // The merge splits a row's columns over more workgroups while the
+        // rows leave compute units without one.
+        unsigned slices = 1;
+        while (!partial && slices < 4u && 24u * static_cast<unsigned>(queries) * slices < 64u)
+          slices *= 2u;
+        LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u / slices);
         const auto tile = dispatch::attention_shapes::short_query_tile(
             static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity),
             fx.gpu.compute_units);
@@ -68,10 +73,10 @@ LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
             fx.gpu.compute_units);
         LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], partial
                       ? (24u / head_tile) * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
-                      : 24u * static_cast<unsigned>(queries));
+                      : 24u * static_cast<unsigned>(queries) * slices);
         LSE_EXPECT_EQ(emitted->lds_bytes, partial
             ? (tile * head_tile > 1u ? tile * head_tile * 528u : 512u)
-            : static_cast<unsigned>(capacity / 32));
+            : static_cast<unsigned>(std::max(capacity / 32, 512)));
         LSE_EXPECT_EQ(emitted->binding_order.size(), partial ? 6u : 2u);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       }
@@ -145,7 +150,7 @@ LSE_TEST(short_split_merge_covers_more_partitions_than_weight_writers) {
     if (emitted.ok()) {
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u * 6u);
-      LSE_EXPECT_EQ(emitted->lds_bytes, static_cast<unsigned>(((partitions * 4 + 15) / 16) * 16));
+      LSE_EXPECT_EQ(emitted->lds_bytes, static_cast<unsigned>(((std::max(partitions, 128) * 4 + 15) / 16) * 16));
     }
   }
 }
@@ -179,7 +184,7 @@ LSE_TEST(short_split_large_declared_limit_uses_actual_table_geometry) {
   LSE_EXPECT(partial.ok() && merge.ok());
   if (!partial.ok() || !merge.ok()) return;
   LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 12u * 2u * 65u);
-  LSE_EXPECT_EQ(merge->lds_bytes, 272u);
+  LSE_EXPECT_EQ(merge->lds_bytes, 512u);
 }
 
 LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
@@ -218,7 +223,7 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
 // cover the compute units; head tiles pair with four-row query tiles.
 std::uint32_t expected_short_tile(std::uint32_t queries, std::uint32_t capacity,
                                   std::uint32_t units) {
-  if (queries < 4 || queries > 8 || units == 0) return 1;
+  if (queries < 2 || queries > 8 || units == 0) return 1;
   const std::uint64_t tiled = std::uint64_t{capacity / 2u / 128u} * (24u / 2u) * ((queries + 3u) / 4u);
   return tiled >= units ? 4u : 1u;
 }
