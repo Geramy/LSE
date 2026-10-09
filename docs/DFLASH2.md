@@ -107,7 +107,12 @@ second (`src/runtime/draft_width.cpp`):
   visit every width twice, and a width unmeasured for 512 steps is measured
   again on a step where that costs little (after 2,048 steps, whatever it
   costs). A shared level follows the context length, and a per-width offset
-  holds what the extra rows cost. A step that recorded a program (a width's
+  holds what the extra rows cost. Costs are kept per doubling of the context
+  (below 2K, 2K, 4K, ... 256K): a wide pass's extra rows cost more the
+  longer the context. A context first reached starts from the nearest one
+  measured; the first width measured there moves the level, every width
+  measured there takes its own cost at once, and the widths not yet measured
+  there follow the growth the measured ones show, linear in rows. A step that recorded a program (a width's
   first pass in a request) or compiled a kernel is left out. Nothing is
   hard-coded, so each GPU tunes itself: on the R9700 the step costs of 1 to 8
   rows measured 33.7, 35.3, 36.2, 35.9, 36.1, 36.5, 38.1 and 38.7 ms (verify
