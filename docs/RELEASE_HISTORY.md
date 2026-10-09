@@ -3,6 +3,15 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.5.9: cached device memory released before an allocation that would not fit
+
+Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
+
+1. **Memory pressure handled before the allocation:** a fresh device allocation the device cannot cover first trims every cache (freed buffers kept for reuse, scheduler constants, idle sessions, HRX's idle pool slabs on macOS). Before, the caches were trimmed only after an allocation had failed, and on HRX a failed allocation also failed the stream, so the server stopped serving until restarted.
+2. **Buffer reuse cache:** keeps the most recently freed sizes within an eighth of the device.
+3. **Clear out-of-memory errors:** an allocation that still cannot fit is refused before the runtime sees it where the runtime allocates from the driver (Linux), and the error states the bytes requested, free and cached.
+4. **K/V arenas** are reported under kv_cache.
+
 ## v0.5.8: HRX System main, DFlash2 draft trees, gfx1151 prefill and decode, startup fault fix
 
 Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.

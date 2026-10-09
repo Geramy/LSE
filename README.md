@@ -32,14 +32,14 @@ Model: Qwen3.8-27B, 4-bit (MLX); drafts: MTP 8-bit, DFlash2 8-bit.
 
 | OS | Requirements | Archive |
 | --- | --- | --- |
-| Linux x86_64 | amdgpu kernel driver with KFD, read/write access to `/dev/kfd` and `/dev/dri/renderD*`, glibc 2.38+ | `lse-v0.5.8-linux-x86_64.tar.gz` |
-| macOS 15+, Apple Silicon | [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu) driver build 266+ and an external AMD GPU | `lse-v0.5.8-macos-arm64.tar.gz` |
+| Linux x86_64 | amdgpu kernel driver with KFD, read/write access to `/dev/kfd` and `/dev/dri/renderD*`, glibc 2.38+ | `lse-v0.5.9-linux-x86_64.tar.gz` |
+| macOS 15+, Apple Silicon | [mac_linuxgpu](https://github.com/lemonade-sdk/mac_linuxgpu) driver build 266+ and an external AMD GPU | `lse-v0.5.9-macos-arm64.tar.gz` |
 
 Download from [Releases](https://github.com/Geramy/LSE/releases), check, extract and list devices:
 
 ```bash
-asset=lse-v0.5.8-linux-x86_64        # or lse-v0.5.8-macos-arm64
-url=https://github.com/Geramy/LSE/releases/download/v0.5.8
+asset=lse-v0.5.9-linux-x86_64        # or lse-v0.5.9-macos-arm64
+url=https://github.com/Geramy/LSE/releases/download/v0.5.9
 curl -fL -O "$url/$asset.tar.gz" -O "$url/$asset.tar.gz.sha256"
 shasum -a 256 -c "$asset.tar.gz.sha256"
 tar -xzf "$asset.tar.gz" && cd "$asset"
