@@ -126,6 +126,20 @@ class DraftWidthPolicy {
   // Everything the policy has learned, on one line (for LSE_DEBUG traces).
   [[nodiscard]] std::string describe() const;
 
+  // The KV length the next pass attends over. Every cost is kept per context
+  // bucket (a doubling of the context each): a verify pass's attention reads
+  // the whole cache once per row tile, so the extra rows of a wide pass cost
+  // more the longer the context, and costs measured at 2K priced a 64K pass's
+  // 31-row tree as if it cost what it did there. A bucket first entered
+  // starts from the nearest measured one; its first measured width moves its
+  // level, each width measured there takes its own cost at once, and widths
+  // not yet measured there follow the growth the measured ones show, linear
+  // in rows. Without a call every cost sits in the first bucket.
+  void set_context(std::int64_t tokens) noexcept;
+  static constexpr std::size_t kContextBuckets = 9;
+  // 0 below 2K tokens, then one per doubling: 2K, 4K, ... 128K, 256K and up.
+  [[nodiscard]] static std::size_t context_bucket(std::int64_t tokens) noexcept;
+
   // Draft trees (runtime::DraftTree). A tree pass's rows come in rungs, the
   // widths whose costs the policy measures; a tree of b nodes takes b + 1 rows.
   // 15 and 31 rather than 16 and 32 rows: draft-tree verify widths that no
@@ -173,14 +187,36 @@ class DraftWidthPolicy {
   std::array<Bin, kBins> bins_{};
   double bias_ = 0;
   std::array<Bin, kMaxProposals> positions_{};
-  // verify(m) = base_ + offset_[m]: one level that follows the context, and
-  // per-width offsets that hold what the extra rows cost.
-  double base_ = 0;
-  std::array<double, kMaxRows + 1> offset_{};
-  std::array<std::uint32_t, kMaxRows + 1> samples_{};
-  std::array<std::uint64_t, kMaxRows + 1> last_seen_{};
-  std::array<double, kMaxRows> draft_ns_{};
-  std::array<std::uint32_t, kMaxRows> draft_samples_{};
+  // cost(i) = base + offset[i]: one level that follows the context within a
+  // bucket, and per-width (or per-rung) offsets that hold what the extra
+  // rows cost.
+  template <std::size_t N>
+  struct Ladder {
+    bool live = false;    // holds a cost, measured here or carried over
+    bool seeded = false;  // started from another bucket's costs
+    double base = 0;
+    std::array<double, N> offset{}, seed{};
+    std::array<bool, N> known{}, seed_known{};
+    std::array<std::uint32_t, N> samples{};  // measured in this bucket
+    std::array<std::uint64_t, N> last_seen{};
+  };
+  struct Costs {
+    Ladder<kMaxRows + 1> verify;          // by rows
+    Ladder<kTreeRows.size()> tree;        // by rung
+    std::array<double, kMaxRows> draft{}, draft_seed{};
+    std::array<std::uint32_t, kMaxRows> draft_samples{};
+    bool draft_seeded = false;
+  };
+  template <std::size_t N, class Rows>
+  void observe_cost(Ladder<N>& ladder, std::size_t i, double t, Rows rows_of);
+  template <std::size_t N, class Rows>
+  static void follow_growth(Ladder<N>& ladder, Rows rows_of);
+  template <std::size_t N>
+  [[nodiscard]] static bool needs_sample(const Ladder<N>& ladder, std::size_t i) noexcept;
+  [[nodiscard]] Costs& costs() noexcept { return costs_[bucket_]; }
+  [[nodiscard]] const Costs& costs() const noexcept { return costs_[bucket_]; }
+  std::array<Costs, kContextBuckets> costs_{};
+  std::size_t bucket_ = 0;
   double rate_tokens_ = 0, rate_ns_ = 0;
   std::uint64_t steps_ = 0;
   // Expected tokens gained per drafted step minus what the draft and the
@@ -193,10 +229,6 @@ class DraftWidthPolicy {
   [[nodiscard]] std::uint32_t tree_exploring() const noexcept;
   static constexpr std::size_t kCandidateBins = 20;
   std::array<Bin, kCandidateBins> candidates_{};
-  double tree_base_ = 0;
-  std::array<double, kTreeRows.size()> tree_offset_{};
-  std::array<std::uint32_t, kTreeRows.size()> tree_samples_{};
-  std::array<std::uint64_t, kTreeRows.size()> tree_last_seen_{};
 };
 
 // Whether DFlash2 steps may verify draft trees. `setting` is

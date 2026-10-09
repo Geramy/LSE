@@ -1274,6 +1274,9 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     if (widths != nullptr) {
       const std::uint64_t now = now_ns();
       const StepWork counters = counters_now();
+      // Costs are kept by context: the finished step is priced at the
+      // context it attended over, the next one chosen at its own.
+      widths->set_context(step_at);
       if (step_top != 0) {
         const std::uint64_t period = now - step_top;
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
@@ -1302,6 +1305,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       step_rows = m;
       step_tree = tree_now.has_value();
       step_at = at;
+      widths->set_context(at);
       if (lse::debug()) {
         step_trace.clear();
         for (std::size_t j = 0; j < estimates.size(); ++j) {
