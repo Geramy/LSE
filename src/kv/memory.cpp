@@ -26,6 +26,9 @@ Result<backend::DeviceBuffer> MemoryManager::acquire(
     }
   }
   if (selected == arenas_.size()) {
+    // Charged to the K/V cache whoever grows it: a pass that extends resident
+    // fragments has no site of its own, and the arenas showed up as "other".
+    const backend::ScopedAllocationSite site(backend::AllocationSite::kKvCache);
     LSE_ASSIGN_OR(auto buffer, backend.allocate(kArenaBytes,
         backend::MemoryClass::kDevice, stream));
     Arena arena;

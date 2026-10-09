@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "lse/backend/backend.hpp"
+#include "lse/backend/memory_reclaim.hpp"
 #include "lse/backends/hrx/submission_tuneconfig.h"
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/backends/hrx/hipc/comgr_compiler.hpp"
@@ -304,9 +305,16 @@ class HrxBackend : public Backend<HrxBackend> {
   void adopt(DeviceBuffer& buf, std::uint64_t handle, std::size_t bytes);
   // Device-local buffers whose last reference has dropped, kept by size for
   // the next allocation of that size. See allocate_impl.
-  struct Recycler;
-  std::shared_ptr<Recycler> recycler_;
-  std::uint64_t recycle_trimmer_ = 0;
+  std::shared_ptr<BufferRecycler> recycler_;
+  // Free device memory as last sampled; trims every cache before a fresh
+  // allocation the device cannot cover. See allocate_impl.
+  std::shared_ptr<DeviceHeadroom> headroom_;
+  // A memory pool of this device that allocates nothing: trimming it hands
+  // the device's idle shared pool slabs back to the driver (hrx_mem_pool_trim
+  // trims the device-wide cache every pool of the device draws from).
+  void* trim_pool_ = nullptr;  // hrx_mem_pool_t
+  std::uint64_t runtime_trimmer_ = 0;
+  Status make_room(std::size_t bytes);
   bool single_stream() const;
   void release_buffer(std::uint64_t handle) noexcept;
 };

@@ -104,9 +104,14 @@ struct Charged {
 };
 
 struct Trimmers {
+  struct Entry {
+    MemoryTrimmer trim;
+    MemoryHeld held;
+    TrimStage stage = TrimStage::kCache;
+  };
   std::mutex mu;
   std::uint64_t next = 0;
-  std::map<std::uint64_t, MemoryTrimmer> all;
+  std::map<std::uint64_t, Entry> all;
 };
 Trimmers& trimmers() {
   // Never destroyed: a backend torn down by a static destructor at exit
@@ -199,11 +204,12 @@ std::string describe_device_allocations() {
   return parts.empty() ? text : text + ": " + parts;
 }
 
-std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer) {
+std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer, MemoryHeld held,
+                                      TrimStage stage) {
   Trimmers& t = trimmers();
   std::lock_guard lock(t.mu);
   const auto id = ++t.next;
-  t.all.emplace(id, std::move(trimmer));
+  t.all.emplace(id, Trimmers::Entry{std::move(trimmer), std::move(held), stage});
   return id;
 }
 
@@ -215,18 +221,51 @@ void unregister_memory_trimmer(std::uint64_t id) noexcept {
 
 std::size_t trim_device_memory() {
   // Copied out: a trimmer may release buffers whose owners unregister others.
+  // Caches first, then the backends' pools, which only then hold everything
+  // the caches let go.
   std::vector<MemoryTrimmer> run;
   {
     Trimmers& t = trimmers();
     std::lock_guard lock(t.mu);
-    for (const auto& [id, trimmer] : t.all) {
-      (void)id;
-      run.push_back(trimmer);
+    for (const TrimStage stage : {TrimStage::kCache, TrimStage::kRuntime}) {
+      for (const auto& [id, entry] : t.all) {
+        (void)id;
+        if (entry.stage == stage) run.push_back(entry.trim);
+      }
     }
   }
   std::size_t released = 0;
   for (const MemoryTrimmer& trimmer : run) released += trimmer();
   return released;
+}
+
+namespace {
+thread_local int t_pressure = 0;
+}  // namespace
+
+std::size_t trim_device_memory_under_pressure() {
+  struct Scope {
+    Scope() { ++t_pressure; }
+    ~Scope() { --t_pressure; }
+  } scope;
+  return trim_device_memory();
+}
+
+bool device_memory_pressure() noexcept { return t_pressure != 0; }
+
+std::size_t cached_device_memory() {
+  std::vector<MemoryHeld> ask;
+  {
+    Trimmers& t = trimmers();
+    std::lock_guard lock(t.mu);
+    for (const auto& [id, entry] : t.all) {
+      (void)id;
+      if (entry.held) ask.push_back(entry.held);
+    }
+  }
+  std::size_t held = 0;
+  for (const MemoryHeld& h : ask) held += h();
+  return held;
 }
 
 namespace {
@@ -318,15 +357,22 @@ Result<DevicePowerState> resume_device() {
   return power->resume();
 }
 
-Status out_of_device_memory(std::size_t bytes, const Status& cause) {
+Status out_of_device_memory(std::size_t bytes, const Status& cause,
+                            std::optional<std::size_t> free_bytes) {
   const std::string held = describe_device_allocations();
+  // Requested, free and still cached, so the report says whether the device
+  // was full or memory was left behind somewhere the trimmers do not reach.
+  const std::string sizes =
+      "requested " + std::to_string(bytes) + " bytes, " +
+      (free_bytes ? std::to_string(*free_bytes) + " bytes free" : std::string("free bytes unknown")) +
+      ", " + std::to_string(cached_device_memory()) + " bytes cached";
   // Also logged: a failure deep in a pass may surface only as a failed
   // request, and the runtime's own account says what the engine's does not.
-  std::fprintf(stderr, "lse: out of GPU memory allocating %zu bytes; the engine holds %s\n%s",
-               bytes, held.c_str(), runtime_memory_report().c_str());
+  std::fprintf(stderr, "lse: out of GPU memory (%s); the engine holds %s\n%s",
+               sizes.c_str(), held.c_str(), runtime_memory_report().c_str());
   return Status(StatusCode::kOutOfMemory,
-                "out of GPU memory allocating " + std::to_string(bytes) + " bytes; the engine holds " +
-                    held + "; " + std::string(cause.message()));
+                "out of GPU memory (" + sizes + "); the engine holds " + held + "; " +
+                    std::string(cause.message()));
 }
 
 void register_backend(std::string_view name, BackendFactory factory,

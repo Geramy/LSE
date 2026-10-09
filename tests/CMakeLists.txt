@@ -18,6 +18,7 @@ endfunction()
 lse_add_test(test_speculative_sampler lse_sampling)
 lse_add_test(test_draft_tree lse_sampling)
 lse_add_test(test_generation_stats)
+lse_add_test(test_memory_reclaim)
 lse_add_test(test_mtp_options)
 lse_add_test(test_http_timings)
 target_include_directories(test_http_timings PRIVATE

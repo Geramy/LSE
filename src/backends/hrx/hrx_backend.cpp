@@ -1419,56 +1419,43 @@ std::vector<std::uint64_t> binding_check_freed(std::uint64_t handle) {
 // A stream-ordered allocation flushes stream 0 and then waits for the queue
 // to reach it, so every fresh buffer a pass asks for waits on the work
 // already queued -- the host cannot build the next pass while the device
-// runs this one. A buffer whose last reference has dropped is kept here
-// instead and handed to the next allocation of the same size: with stream 0
-// the only stream, every launch that could still touch it runs before any
-// launch issued after the reuse, which is the same ordering the scheduler's
-// own slot reuse within a pass relies on. The memory trimmers empty it (a
-// one-shot request's end, and any allocation that runs out of memory), and
-// it holds at most an eighth of the device.
-struct HrxBackend::Recycler {
-  std::mutex mu;
-  std::unordered_map<std::size_t, std::vector<std::uint64_t>> bins;
-  std::size_t bytes = 0;
-  std::size_t cap = 0;
-  bool alive = true;
-  bool enabled = false;
+// runs this one. A buffer whose last reference has dropped is kept instead
+// (BufferRecycler) and handed to the next allocation of the same size: with
+// stream 0 the only stream, every launch that could still touch it runs
+// before any launch issued after the reuse, which is the same ordering the
+// scheduler's own slot reuse within a pass relies on. It holds at most an
+// eighth of the device, least recently kept going first, and the memory
+// trimmers empty it: a one-shot request's end, and any allocation the device
+// could not cover (make_room).
+//
+// Before a fresh allocation the device's free memory is checked against it
+// (DeviceHeadroom). A long prompt's pass buffers differ in size from every
+// shorter prompt's, and an allocation that fails here fails the stream with
+// it -- hrx_buffer_allocate signals the stream's timeline from the queued
+// alloca, and a failed alloca fails that timeline for good -- so the caches
+// have to give their memory back before it is asked for, not after.
+namespace {
+// Kept free beyond each fresh allocation: one slab of the device runtime's
+// shared pool (HRX_MEM_POOL_GPU_SLAB_LENGTH_DEFAULT), which a small buffer can
+// make it take on the macOS adapter, and room for the runtime's own growth.
+constexpr std::size_t kAllocationReserve = std::size_t{256} << 20;
+}  // namespace
 
-  std::size_t release_all() {
-    std::unordered_map<std::size_t, std::vector<std::uint64_t>> taken;
-    std::size_t released = 0;
-    {
-      std::lock_guard lock(mu);
-      taken.swap(bins);
-      released = bytes;
-      bytes = 0;
-    }
-#if LSE_HRX_LINKED
-    for (auto& [size, handles] : taken) {
-      (void)size;
-      for (std::uint64_t h : handles) hrx_buffer_release(reinterpret_cast<hrx_buffer_t>(h));
-    }
+Status HrxBackend::make_room(std::size_t bytes) {
+  DeviceHeadroom::Hooks hooks;
+  hooks.sample_free = [this] { return sample_free_memory_impl(); };
+  hooks.trim = [] { return backend::trim_device_memory_under_pressure(); };
+  hooks.settle = [this] { return synchronize_impl(); };
+#if defined(__APPLE__)
+  // The macOS adapter backs hrx_buffer_allocate with a pool that
+  // suballocates the slabs it already holds.
+  hooks.driver_backed = false;
+#else
+  // hrx_buffer_allocate takes every buffer from the driver (an exact pool).
+  hooks.driver_backed = true;
 #endif
-    return released;
-  }
-  // True when `handle` was kept; the caller releases it otherwise.
-  bool keep(std::uint64_t handle, std::size_t size) {
-    std::lock_guard lock(mu);
-    if (!alive || !enabled || bytes + size > cap) return false;
-    bins[size].push_back(handle);
-    bytes += size;
-    return true;
-  }
-  std::uint64_t take(std::size_t size) {
-    std::lock_guard lock(mu);
-    auto it = bins.find(size);
-    if (it == bins.end() || it->second.empty()) return 0;
-    const std::uint64_t h = it->second.back();
-    it->second.pop_back();
-    bytes -= size;
-    return h;
-  }
-};
+  return headroom_->make_room(bytes, hooks);
+}
 
 Status HrxBackend::init_impl(int device_ordinal) {
 #if !LSE_HRX_LINKED
@@ -1621,11 +1608,30 @@ Status HrxBackend::init_impl(int device_ordinal) {
 #endif
 
   initialized_ = true;
-  recycler_ = std::make_shared<Recycler>();
-  recycler_->enabled = true;
-  recycler_->cap = static_cast<std::size_t>(info_.total_memory / 8u);
-  recycle_trimmer_ = backend::register_memory_trimmer(
-      [recycler = recycler_] { return recycler->release_all(); });
+  recycler_ = std::make_shared<BufferRecycler>(
+      static_cast<std::size_t>(info_.total_memory / 8u), [](std::uint64_t h) {
+        hrx_buffer_release(reinterpret_cast<hrx_buffer_t>(h));
+      });
+  headroom_ = std::make_shared<DeviceHeadroom>(kAllocationReserve);
+  {
+    // Allocates nothing; trimming it trims the device's shared pool cache.
+    hrx_mem_pool_props_t props = {};
+    hrx_mem_pool_t pool = nullptr;
+    LSE_RETURN_IF_ERROR(from_hrx(
+        hrx_mem_pool_create(static_cast<hrx_device_t>(device_), &props, &pool),
+        "hrx_mem_pool_create (trim handle)"));
+    trim_pool_ = pool;
+  }
+  // The runtime stage: after the engine's caches have released their buffers
+  // into the recycler and the device pool, the recycler lets go of them and
+  // the pool's idle slabs go back to the driver.
+  runtime_trimmer_ = backend::register_memory_trimmer(
+      [recycler = recycler_, pool = static_cast<hrx_mem_pool_t>(trim_pool_)] {
+        const std::size_t released = recycler->release_all();
+        hrx_status_ignore(hrx_mem_pool_trim(pool, 0));
+        return released;
+      },
+      [recycler = recycler_] { return recycler->held(); }, TrimStage::kRuntime);
   // Once per process: the runtime is shared by every instance.
   static std::once_flag reporter;
   std::call_once(reporter, [] {
@@ -1695,8 +1701,9 @@ void HrxBackend::adopt(DeviceBuffer& buf, std::uint64_t handle,
   if (binding_check_enabled()) binding_check_allocated(handle, bytes);
   buf.storage = std::shared_ptr<void>(
       reinterpret_cast<void*>(handle),
-      [this, recycler = recycler_, bytes](void* p) {
+      [this, recycler = recycler_, headroom = headroom_, bytes](void* p) {
         const auto h = reinterpret_cast<std::uint64_t>(p);
+        if (headroom) headroom->note_release();
         if (binding_check_enabled()) {
           // Quarantined, never recycled; released only once past the cap.
           for (const std::uint64_t old : binding_check_freed(h)) release_buffer(old);
@@ -1739,12 +1746,13 @@ void HrxBackend::shutdown_impl() noexcept {
     graveyard_->retired.clear();
   }
   if (recycler_) {
-    backend::unregister_memory_trimmer(recycle_trimmer_);
-    {
-      std::lock_guard lock(recycler_->mu);
-      recycler_->alive = false;
-    }
-    (void)recycler_->release_all();
+    backend::unregister_memory_trimmer(runtime_trimmer_);
+    // A buffer whose last view drops after this is released, not kept.
+    (void)recycler_->disable();
+  }
+  if (trim_pool_ != nullptr) {
+    hrx_mem_pool_release(static_cast<hrx_mem_pool_t>(trim_pool_));
+    trim_pool_ = nullptr;
   }
   // Before the device: each executable retains it.
   for (void* e : loaded_executables_) {
@@ -1825,7 +1833,7 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
     // buffer inserts every buffer it dispatches against into its own resource
     // set at *record* time, so memory another stream still references cannot
     // be handed back to the pool here, flushed or not.
-    if (recycler_ && recycler_->enabled) {
+    if (recycler_ && recycler_->enabled()) {
       if (single_stream()) {
         if (const std::uint64_t h = recycler_->take(bytes); h != 0) {
           DeviceBuffer out;
@@ -1836,13 +1844,10 @@ Result<DeviceBuffer> HrxBackend::allocate_impl(std::size_t bytes,
       } else {
         // Another stream is in use now: what was kept may still be read
         // there, so none of it is handed out again.
-        {
-          std::lock_guard lock(recycler_->mu);
-          recycler_->enabled = false;
-        }
-        (void)recycler_->release_all();
+        (void)recycler_->disable();
       }
     }
+    LSE_RETURN_IF_ERROR(make_room(bytes));
     auto stream = stream_at(0);
     if (!stream.ok()) return stream.status();
     hrx_status_t allocated = hrx_buffer_allocate(

@@ -268,11 +268,27 @@ struct Router::Impl {
   Impl(model::HybridLM& m, tokenizer::Tokenizer& t, ServerOptions o)
       : model(m), tok(t), opt(std::move(o)) {
     stop_ids = chat_stop_tokens(tok);
-    // Under memory pressure an idle session is evicted: its next request
-    // prefills again instead of the engine running out of memory.
-    pressure_trimmer = backend::register_memory_trimmer([this] { return evict_idle(SIZE_MAX, 0); });
+    // Under memory pressure every idle session is evicted: its next request
+    // prefills again instead of the engine running out of memory. (Keep 0:
+    // the active and the bound session are never candidates.) A trim that
+    // is housekeeping -- a failed request, the last session closing -- keeps
+    // them.
+    pressure_trimmer = backend::register_memory_trimmer(
+        [this] { return backend::device_memory_pressure() ? evict_idle(0, 0) : 0; },
+        [this] { return idle_bytes(); });
   }
   ~Impl() { backend::unregister_memory_trimmer(pressure_trimmer); }
+
+  // What the sessions evict_idle could release hold.
+  std::size_t idle_bytes() const {
+    std::lock_guard held(sessions_lock);
+    std::size_t total = 0;
+    for (const auto& [id, e] : sessions) {
+      if ((active_live && id == active) || (bound_live && id == bound)) continue;
+      total += e->bytes;
+    }
+    return total;
+  }
 
   // Evicts least recently used idle sessions until at most `keep` remain and,
   // with a nonzero budget, the sessions together hold at most `budget` bytes.

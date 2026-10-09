@@ -162,13 +162,32 @@ struct SiteTotals {
 
 // Memory pressure. A trimmer releases device memory a cache holds but nobody
 // needs to keep (it is rebuilt on demand) and returns the bytes it let go.
-// When a device allocation fails for lack of memory, every trimmer runs and
-// the allocation is tried once more before the failure is reported.
+// When a device allocation would not fit in the device's free memory, or
+// fails for lack of it, every trimmer runs and the allocation is tried after
+// them, so an allocation never fails while a cache still holds memory.
+//
+// The stage orders them. Engine caches (constants, idle sessions) release
+// their buffers into the backend, and the backend's own pools (freed buffers
+// kept for reuse, the device runtime's slabs) can only hand those to the
+// driver after that, so kRuntime trimmers run after every kCache trimmer.
+enum class TrimStage : std::uint8_t { kCache, kRuntime };
 using MemoryTrimmer = std::function<std::size_t()>;
-std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer);
+// The bytes a cache holds right now that its trimmer would release. Read
+// when an allocation fails, to state what was still cached; must be cheap.
+using MemoryHeld = std::function<std::size_t()>;
+std::uint64_t register_memory_trimmer(MemoryTrimmer trimmer, MemoryHeld held = {},
+                                      TrimStage stage = TrimStage::kCache);
 void unregister_memory_trimmer(std::uint64_t id) noexcept;
-// Runs every trimmer; returns the bytes they report released.
+// Runs every trimmer, kCache before kRuntime; returns the bytes they report
+// released.
 std::size_t trim_device_memory();
+// The same, for an allocation the device could not cover. While it runs,
+// device_memory_pressure() is true on this thread, which is when a trimmer
+// may drop what is worth keeping otherwise (an idle session's K/V).
+std::size_t trim_device_memory_under_pressure();
+[[nodiscard]] bool device_memory_pressure() noexcept;
+// The bytes every registered cache reports holding (MemoryHeld), summed.
+[[nodiscard]] std::size_t cached_device_memory();
 // What the device runtime under a backend holds from its driver, by its own
 // account (for the mac_linuxgpu HSA runtime: buffer counts and bytes, a size
 // histogram and the callers holding the most). A backend whose runtime keeps
@@ -224,9 +243,11 @@ void clear_device_power();
 // kDeviceError naming the device lost when the device's memory is gone.
 [[nodiscard]] Result<DevicePowerState> resume_device();
 
-// The failure of a device allocation, stated as running out of GPU memory,
-// with what the engine holds by site.
-[[nodiscard]] Status out_of_device_memory(std::size_t bytes, const Status& cause);
+// The failure of a device allocation, stated as running out of GPU memory:
+// the bytes requested, the device's free bytes when it can say, the bytes
+// the caches still hold, and what the engine holds by site.
+[[nodiscard]] Status out_of_device_memory(std::size_t bytes, const Status& cause,
+                                          std::optional<std::size_t> free_bytes = std::nullopt);
 
 // Either side of a transfer: host memory, or a window into a device buffer.
 // Built implicitly so a caller writes copy(dst, src, n) with whatever it has.
@@ -732,8 +753,12 @@ class Backend {
     if (!buf.ok() && cls == MemoryClass::kDevice &&
         buf.status().code() == StatusCode::kOutOfMemory) {
       // Caches that rebuild on demand give their memory back first.
-      if (trim_device_memory() != 0) buf = derived().allocate_impl(bytes, cls, stream);
-      if (!buf.ok()) return out_of_device_memory(bytes, buf.status());
+      if (trim_device_memory_under_pressure() != 0) buf = derived().allocate_impl(bytes, cls, stream);
+      if (!buf.ok()) {
+        std::optional<std::size_t> free_bytes;
+        if (auto sampled = sample_free_memory(); sampled.ok()) free_bytes = *sampled;
+        return out_of_device_memory(bytes, buf.status(), free_bytes);
+      }
     }
     if (buf.ok()) {
       buf->residency = device_;

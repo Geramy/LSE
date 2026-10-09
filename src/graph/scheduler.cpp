@@ -161,17 +161,26 @@ struct Scheduler::Impl {
   // The constants are a cache: under memory pressure they are let go and the
   // next pass that needs one binds and fills a fresh buffer.
   std::mutex constants_mu;
-  std::uint64_t trimmer = backend::register_memory_trimmer([this] {
-    std::lock_guard lock(constants_mu);
-    std::size_t released = 0;
+  // Only bytes nothing else holds are actually returned.
+  std::size_t unshared_constant_bytes() {
+    std::size_t bytes = 0;
     for (const auto& [key, buffer] : constants) {
       (void)key;
-      // Only bytes nothing else holds are actually returned.
-      if (buffer.storage.use_count() == 1) released += buffer.size_bytes;
+      if (buffer.storage.use_count() == 1) bytes += buffer.size_bytes;
     }
-    constants.clear();
-    return released;
-  });
+    return bytes;
+  }
+  std::uint64_t trimmer = backend::register_memory_trimmer(
+      [this] {
+        std::lock_guard lock(constants_mu);
+        const std::size_t released = unshared_constant_bytes();
+        constants.clear();
+        return released;
+      },
+      [this] {
+        std::lock_guard lock(constants_mu);
+        return unshared_constant_bytes();
+      });
   ~Impl() { backend::unregister_memory_trimmer(trimmer); }
   // Streams still holding work from an earlier step. A plan covers one step,
   // so without this the first group a step puts on a stream would be ordered
