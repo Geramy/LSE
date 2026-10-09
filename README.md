@@ -12,21 +12,21 @@ Prefill, tok/s:
 
 | GPU | OS | 256 | 1K | 2K | 4K | 32K |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Radeon 8060S (gfx1151) | Linux | 464 | 496 | 510 | 517 | 462 |
+| Radeon 8060S (gfx1151) | Linux | 461 | 498 | 511 | 515 | 475 |
 | Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | 1,246 | 1,576 | 1,642 | 1,636 | 1,395 |
-| Radeon AI PRO R9700 | Linux | 1,140 | 1,386 | 1,417 | 1,418 | 1,226 |
-| Radeon AI PRO R9700 | macOS | 1,400 | 1,601 | 1,646 | 1,634 | 1,401 |
+| Radeon AI PRO R9700 | Linux | 1,151 | 1,399 | 1,449 | 1,438 | 1,239 |
+| Radeon AI PRO R9700 | macOS | 1,374 | 1,617 | 1,649 | 1,640 | 1,401 |
 
 Decode, code prompt, tok/s:
 
-| GPU | OS | Baseline | MTP=3 | DFlash2 |
+| GPU | OS | Baseline | dMTP | DFlash2 |
 | --- | --- | ---: | ---: | ---: |
-| Radeon 8060S (gfx1151) | Linux | 14.0 | 47.8 | **64.4** |
+| Radeon 8060S (gfx1151) | Linux | 14.0 | 48.0 | **68.0** |
 | Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | 31.2 | 108.7 | **158.5** |
-| Radeon AI PRO R9700 | Linux | 32.0 | 111.0 | **144.6** |
-| Radeon AI PRO R9700 | macOS | 32.2 | 111.9 | **159.4** |
+| Radeon AI PRO R9700 | Linux | 31.7 | 110.9 | **142.9** |
+| Radeon AI PRO R9700 | macOS | 32.4 | 107.8 | **159.1** |
 
-Model: Qwen3.8-27B, 4-bit (MLX); drafts: MTP 8-bit, DFlash2 8-bit.
+Model: Qwen3.8-27B, 4-bit (MLX); drafts: dMTP (dynamic MTP) 8-bit, DFlash2 8-bit.
 
 ## Install
 
