@@ -7,7 +7,7 @@ Use the current README and final mode report for the latest controlled compariso
 
 Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
 
-1. **Context-aware draft policy:** the adaptive dMTP and DFlash2 width keeps verify and draft costs per doubling of the context, so a long request no longer chooses wide trees priced at a short context.
+1. **Context-aware draft policy:** the adaptive dMTP and DFlash2 width keeps verify and draft costs per doubling of the context, so a long request no longer chooses wide trees priced at a short context. A cold first request (kernel compiles or variant trials in its passes) no longer holds the width down for the rest of the session.
 2. **Chain passes on the flash split:** dMTP and DFlash2 verify chains of 2 to 8 rows over FP16 or BF16 K/V take the WMMA flash split that tree passes take, so each window of keys and values is read once per key head. Chain-pass logits can differ from 0.5.9 in their last bits; perplexity is unchanged (7.1467). One-row decode keeps the scalar split, whose value loop no longer branches per row.
 3. **Fragment-ready V cache:** FP16 and BF16 value pools are stored dimension-major per 16-token block, so the flash tile reads each value fragment in one 16-byte read and the split decode kernels read four keys of a dimension at once.
 4. **Faster tree tile:** on RDNA4 the narrowed probabilities are kept in scratch and each P fragment is one read; a tree pass reads its ancestor mask only for its own keys. Output is byte-identical.
