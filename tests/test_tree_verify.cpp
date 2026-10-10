@@ -23,6 +23,7 @@
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 #include <cstring>
 #include <optional>
 #include <random>
@@ -695,7 +696,64 @@ int trial(std::int64_t m, std::int64_t n, std::int64_t k, int reps) {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
+// `--trials`: a tree pass's attention measured once is not measured again
+// when the KV pool grows: its variant decision is kept by shape class. Runs
+// with its own empty kernel cache, so the first pass is undecided.
+int trials() {
+  char dir[] = "/tmp/lse-trials-XXXXXX";
+  if (::mkdtemp(dir) == nullptr) return 1;
+  ::setenv("LSE_CACHE_DIR", dir, 1);
+  auto* scheduler = default_scheduler();
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  const std::uint32_t n = 15;
+  const runtime::DraftTree tree = make_tree(n, 5);
+  const std::int64_t kvh = 4, qh = 24, hd = 256, bs = 16;
+  std::vector<std::uint64_t> measured;
+  for (const std::int64_t capacity : {std::int64_t{4096}, std::int64_t{8192}, std::int64_t{16384}}) {
+    const std::int64_t blocks = capacity / bs;
+    const std::int32_t live = static_cast<std::int32_t>(capacity - 64);
+    const std::int32_t first = live - static_cast<std::int32_t>(n);
+    std::vector<std::uint16_t> kpool(blocks * kvh * bs * hd), vpool(kpool.size());
+    for (auto& e : kpool) e = to_bf16(uni(rng));
+    for (auto& e : vpool) e = to_bf16(uni(rng));
+    std::vector<float> table(blocks), qv(qh * n * hd);
+    for (std::int64_t b = 0; b < blocks; ++b) table[b] = static_cast<float>(blocks - 1 - b);
+    for (auto& e : qv) e = uni(rng);
+    std::vector<float> meta(kv::tree_meta_elems(1, static_cast<std::int32_t>(n)), 0.0f);
+    meta[0] = static_cast<float>(first);
+    meta[1] = static_cast<float>(live);
+    meta[2] = 1;
+    meta[3] = static_cast<float>(first);
+    meta[4] = static_cast<float>(live);
+    for (std::uint32_t r = 0; r < tree.rows(); ++r)
+      for (std::uint32_t c = 0; c < tree.rows(); ++c)
+        meta[kv::tree_mask_offset(1) + r * n + c] = tree.sees(r, c) ? 1.0f : 0.0f;
+    auto aqq = filled(Shape{1, qh, n, hd}, DType::kF32, qv);
+    auto akp = filled(Shape{blocks, kvh, bs, hd}, DType::kBF16, kpool);
+    auto avp = filled(Shape{blocks, kvh, hd, bs}, DType::kBF16, vpool);
+    auto ameta = filled(Shape{static_cast<std::int64_t>(meta.size())}, DType::kF32, meta);
+    auto atable = filled(Shape{1, blocks}, DType::kF32, table);
+    const std::size_t member = preferred_member();
+    const auto* device = member < scheduler->devices().size()
+        ? &scheduler->devices().device(member).device_info() : nullptr;
+    const std::uint64_t before = scheduler->jit_stats().variant_trials;
+    auto o = sdpa_paged(aqq, akp, avp, 0.0625f, MaskKind::kTree, 0, ameta, atable,
+                        static_cast<int>(bs), device, kv::CacheDType::kBF16);
+    LSE_EXPECT_OK(run({o}));
+    measured.push_back(scheduler->jit_stats().variant_trials - before);
+    std::printf("capacity %lld: %llu variant trials\n", static_cast<long long>(capacity),
+                static_cast<unsigned long long>(measured.back()));
+  }
+  // The first pool size is measured (where the device offers a choice); a
+  // grown pool is not.
+  for (std::size_t i = 1; i < measured.size(); ++i) LSE_EXPECT_EQ(measured[i], 0u);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--trials") return trials();
   if (argc >= 5 && std::string_view(argv[1]) == "--trial")
     return trial(std::strtoll(argv[2], nullptr, 10), std::strtoll(argv[3], nullptr, 10),
                  std::strtoll(argv[4], nullptr, 10), argc > 5 ? std::atoi(argv[5]) : 3);
