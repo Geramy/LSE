@@ -252,8 +252,9 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],768u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
     // 24768 for the query tile, scores and softmax state; 16896 to stage
-    // 32 keys of 256 f16 values in rows of 264.
-    LSE_EXPECT_EQ(emitted->lds_bytes,41664u);
+    // 32 keys of 256 f16 values in rows of 264; 8448 for the narrowed
+    // probabilities in rows of 264.
+    LSE_EXPECT_EQ(emitted->lds_bytes,50112u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf16>")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
@@ -311,8 +312,9 @@ LSE_TEST(flash_wmma_takes_each_generations_fragment_width) {
       LSE_EXPECT(line.find(gfx11 ? wide : narrow) != std::string::npos);
       LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-      // gfx11 also keeps the window's probabilities narrowed in scratch.
-      LSE_EXPECT_EQ(emitted->lds_bytes, gfx11 ? 50112u : 41664u);
+      // Both keep the window's probabilities narrowed in scratch.
+      LSE_EXPECT_EQ(emitted->lds_bytes, 50112u);
+      (void)gfx11;
     }
   }
 }

@@ -636,10 +636,19 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16;
     const bool stage_values = kWideKv && d.dv % 8u == 0u;
     const std::uint32_t vrow = d.dv + 8u;
+    // The window's probabilities are also kept narrowed, in rows padded by
+    // 16 bytes so a fragment read's sixteen rows fall on distinct bank
+    // groups: a lane's P fragment is then one or two 16-byte reads instead of
+    // eight or sixteen scalar reads and conversions, of the same values. On
+    // gfx11 (a lane carries all sixteen K of an operand) always; on RDNA4
+    // (eight per lane, K split across the half-waves) wherever values are
+    // staged, where those reads were a third of a draft tree pass's time.
+    constexpr bool kContiguous = !kGeo.split_k;
+    const bool narrow_probs = kContiguous || stage_values;
     std::uint32_t vsub = 0;
     if (stage_values) {
       const std::uint64_t used = dispatch::attention_shapes::flash_wmma_lds_bytes(d.dh, 0u) + 512u +
-          (kGeo.split_k ? 0u : std::uint64_t{QTile} * (kKWin + 8u) * 2u);
+          (narrow_probs ? std::uint64_t{QTile} * (kKWin + 8u) * 2u : 0u);
       const std::uint64_t budget = workgroup_lds_bytes(s.device);
       // Variant 1 stages 16 keys where 32 fit: less scratch per workgroup,
       // so more of them resident, for twice the staging rounds.
@@ -648,15 +657,9 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
     }
     const auto vs = e.lds<Narrow>(stage_values && vsub ? vsub * vrow : 8u);
-    // On a contiguous-fragment generation (gfx11: a lane carries all sixteen
-    // K of an operand) the window's probabilities are also kept narrowed, in
-    // rows padded by 16 bytes so a fragment read's sixteen rows fall on
-    // distinct bank groups: a lane's P fragment is then two 16-byte reads
-    // instead of sixteen scalar reads and conversions, of the same values.
-    constexpr bool kContiguous = !kGeo.split_k;
     constexpr std::uint32_t kProbRow = kKWin + 8u;
     std::optional<kir::Tile<Narrow>> pb;
-    if constexpr (kContiguous) pb.emplace(e.lds<Narrow>(QTile * kProbRow));
+    if (narrow_probs) pb.emplace(e.lds<Narrow>(QTile * kProbRow));
     // Reuse alpha scratch for the uniform block-retention vote before softmax.
     const bool sparse = s.attrs[3] == 1.0f;
 
@@ -854,13 +857,18 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             } else if (mask == 3) {
               // A tree pass: keys before it are visible, its own rows only
               // where the ancestor mask says so (kv::tree_meta_elems).
+              // The mask is read only for the pass's own keys, which the
+              // last window alone holds.
               const auto before = e.let(key < offset);
-              const auto column = e.let(kir::cast<kir::u32>(select(before, kir::cast<std::int64_t>(e.u32(0)),
-                  kir::cast<std::int64_t>(key) - kir::cast<std::int64_t>(offset))));
-              const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
-                                                   query_row * d.tq + column)]);
-              if (auto visible = e.when(signed_key <= position && (before || seen != 0.0f)))
-                sc[slot] = value;
+              if (auto prior = e.when(before)) {
+                if (auto visible = e.when(signed_key <= position)) sc[slot] = value;
+              }
+              if (auto own = e.when(key >= offset)) {
+                const auto column = e.let(key - offset);
+                const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
+                                                     query_row * d.tq + column)]);
+                if (auto visible = e.when(signed_key <= position && seen != 0.0f)) sc[slot] = value;
+              }
             } else {
               const auto distance = e.let(position - signed_key);
               if (auto sliding = e.when(signed_key <= position && distance < kir::cast<std::int64_t>(e.u32(d.window))))
@@ -1030,8 +1038,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             const auto index = e.let(row * kKWin + slot);
             const auto probability = e.let(math::exp(sc[index].read() - safe_max));
             sc[index] = probability;
-            if constexpr (kContiguous)
-              (*pb)[e.let(row * kProbRow + slot)] = math::narrow<Narrow>(probability);
+            if (pb) (*pb)[e.let(row * kProbRow + slot)] = math::narrow<Narrow>(probability);
             total = total.read() + probability;
           }
           for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
@@ -1096,8 +1103,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               }();
               using Frag = lse::vec<Narrow, static_cast<int>(kFrag)>;
               auto af = e.local<Narrow, static_cast<int>(kFrag)>();
-              if constexpr (kContiguous) {
-                const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + sub + tile), kFrag);
+              if (pb) {
+                const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + sub + tile + key_half), kFrag);
                 af = kir::Val<Frag>(&k.types(), &k.ir(), ap.id());
               } else {
                 for (auto f : e.unroll(kFrag))
@@ -1162,8 +1169,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               }();
               using Frag = lse::vec<Narrow, static_cast<int>(kFrag)>;
               auto af = e.local<Narrow, static_cast<int>(kFrag)>();
-              if constexpr (kContiguous) {
-                const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + sub + tile), kFrag);
+              if (pb) {
+                const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + sub + tile + key_half), kFrag);
                 af = kir::Val<Frag>(&k.types(), &k.ir(), ap.id());
               } else {
                 for (auto f : e.unroll(kFrag))
