@@ -646,7 +646,7 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
   }
   if (candidates.size() > 1) {
     // Enough launches per sample that a sample is ~2 ms of device time, then
-    // the best of three interleaved rounds: what is kept is each variant's
+    // the best of four interleaved rounds: what is kept is each variant's
     // speed, not the moment it happened to run in.
     auto sample = [&](Candidate& c, std::uint32_t reps) -> Result<double> {
       LSE_RETURN_IF_ERROR(t.be.synchronize());
@@ -659,8 +659,14 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
     LSE_ASSIGN_OR(const double once, sample(candidates[0], 1));
     const auto reps = static_cast<std::uint32_t>(
         std::clamp(2000.0 / std::max(once, 1.0), 1.0, 64.0));
-    for (int round = 0; round < 3; ++round) {
-      for (Candidate& c : candidates) {
+    // One untimed sample of each first, then rounds in alternating order:
+    // measured first in every round, variant 0 caught the clocks still
+    // settling after the host's gap and lost to an identical kernel by up
+    // to a fifth.
+    for (Candidate& c : candidates) LSE_RETURN_IF_ERROR(sample(c, reps).status());
+    for (int round = 0; round < 4; ++round) {
+      for (std::size_t i = 0; i < candidates.size(); ++i) {
+        Candidate& c = candidates[round % 2 == 0 ? i : candidates.size() - 1 - i];
         LSE_ASSIGN_OR(const double us, sample(c, reps));
         c.best_us = round == 0 ? us : std::min(c.best_us, us);
       }
