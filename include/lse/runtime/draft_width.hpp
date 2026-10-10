@@ -71,10 +71,9 @@ class DraftWidthPolicy {
   static constexpr std::uint64_t kHardRefreshSteps = 2048;
   // Until a cost rests on kTrustedSamples measurements in its context bucket,
   // a lower sample replaces it (early samples err high: a step whose wall
-  // time was mostly a first compile, clocks still ramping), and once it is
-  // kEarlyRefreshSteps old it is measured again whatever it is priced at --
-  // the widths a new bucket inherited from another start this way. One bad
-  // early sample cannot price a width out for good.
+  // time was mostly a first compile, clocks still ramping), and once a cost
+  // measured there is kEarlyRefreshSteps old it is measured again whatever
+  // it is priced at. One bad early sample cannot price a width out for good.
   static constexpr std::uint32_t kTrustedSamples = kExploreSamples;
   static constexpr std::uint64_t kEarlyRefreshSteps = 128;
   // Measured steps before the first measurements of every width: the GPU's
@@ -83,9 +82,11 @@ class DraftWidthPolicy {
   static constexpr std::uint64_t kWarmupSteps = 32;
   // A position's mean resting on fewer than kPositionTrusted checks, scaled
   // by the chance a chain reaches it (a chain shallower than it never does),
-  // has the next chain drafted to the full depth at most every
-  // kPositionProbeSteps steps until it holds that much evidence: a few
-  // unlucky early checks cannot price the deeper chains out for good.
+  // is doubtful: when pricing it at the last trusted position's mean makes
+  // a deeper chain worth more than the chosen one, that chain is drafted at
+  // most every kPositionProbeSteps steps until the evidence is in. A few
+  // unlucky early checks cannot price the deeper chains out for good, and a
+  // device where deeper passes cannot pay is not probed.
   static constexpr double kPositionTrusted = 8.0;
   static constexpr std::uint64_t kPositionProbeSteps = 16;
   // Skipped (draft-free) steps before a probing draft.

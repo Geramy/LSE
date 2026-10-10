@@ -223,7 +223,11 @@ std::uint32_t DraftWidthPolicy::refresh(std::uint32_t max, bool chained) const n
   std::uint32_t stalest = 0;
   for (std::uint32_t rows = 1; rows <= max + 1; ++rows) {
     const std::uint64_t age = steps_ - last_seen[rows];
-    const bool shaky = samples[rows] < kTrustedSamples && age > kEarlyRefreshSteps;
+    // Only a width measured here once: a bucket started from another one
+    // keeps the carried costs of widths it has not measured (they are
+    // refreshed as any width is), so entering it measures nothing again.
+    const bool shaky = samples[rows] != 0 && samples[rows] < kTrustedSamples &&
+                       age > kEarlyRefreshSteps;
     if (!shaky && (age <= kRefreshSteps ||
                    (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps)))
       continue;
@@ -401,16 +405,34 @@ std::uint32_t DraftWidthPolicy::depth(std::uint32_t max, std::uint32_t initial) 
       best = d;
     }
   }
-  // Evidence a position can be expected to hold scales with how often a
-  // chain reaches it: one behind weak positions is not probed for.
-  double reach = 1.0;
-  for (std::uint32_t p = 0; p < max; ++p) {
-    if (p >= best && positions_[p].tested < kPositionTrusted * reach) {
-      if (steps_ - position_probe_ < kPositionProbeSteps) break;
-      position_probe_ = steps_;
-      return max;
+  // A position holding less evidence than chains reaching it would give
+  // (one behind weak positions is not expected to hold much) may be priced
+  // low by a few unlucky checks. Priced instead at the mean of the last
+  // position that holds enough, the depth worth most is probed when it
+  // beats the chosen one; on a device where even that does not pay for the
+  // deeper passes there is no probe.
+  double reach = 1.0, trusted = kPositionPrior, hoped_chain = 1.0, hoped_gain = 0.0;
+  double probe_value = best_value;
+  std::uint32_t probe = best;
+  bool doubtful = false;
+  for (std::uint32_t d = 1; d <= max; ++d) {
+    const std::uint32_t p = d - 1;
+    const double mean = position_mean(p);
+    const bool shaky = positions_[p].tested < kPositionTrusted * reach;
+    if (!shaky) trusted = mean;
+    doubtful = doubtful || shaky;
+    reach *= mean;
+    hoped_chain *= shaky ? std::max(mean, trusted) : mean;
+    hoped_gain += hoped_chain;
+    const double value = hoped_gain - rate_now * (draft_ns(d) + verify_ns(d + 1));
+    if (doubtful && d > best && value > probe_value) {
+      probe_value = value;
+      probe = d;
     }
-    reach *= position_mean(p);
+  }
+  if (probe != best && steps_ - position_probe_ >= kPositionProbeSteps) {
+    position_probe_ = steps_;
+    return probe;
   }
   return best;
 }
@@ -504,7 +526,8 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
   for (std::size_t r = 0; r < kTreeRows.size(); ++r) {
     const std::uint64_t age = steps_ - costs().tree.last_seen[r];
     if (age > kHardRefreshSteps ||
-        (costs().tree.samples[r] < kTrustedSamples && age > kEarlyRefreshSteps))
+        (costs().tree.samples[r] != 0 && costs().tree.samples[r] < kTrustedSamples &&
+         age > kEarlyRefreshSteps))
       return fit(kTreeRows[r]);
   }
   const double draft = draft_ns(kMaxProposals);

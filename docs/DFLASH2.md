@@ -116,8 +116,9 @@ second (`src/runtime/draft_width.cpp`):
   that recorded a program (a width's first pass in a request), compiled or
   loaded a kernel, or tried a kernel's variants on the device is left out,
   and so is each width's first pass in a newly reached context. While a
-  cost rests on fewer than two samples a lower sample replaces it, and after
-  128 steps it is measured again whatever it is priced at; a slow outlier
+  cost rests on fewer than two samples a lower sample replaces it, and a
+  cost measured there once is measured again after 128 steps whatever it is
+  priced at (carried costs are refreshed as before); a slow outlier
   moves an estimate by at most a quarter, a fast one moves it whole. A cold
   first request (kernels compiling and variants being tried) therefore
   cannot price the wide widths or tree rungs out for good. Nothing is
@@ -203,10 +204,13 @@ below depth 3. An MTP chain's draft cost climbs in steps (about 3.6, 6.4,
 close; on prose `--adaptive-mtp=off` is the faster setting today.
 The chain depth is chosen from each position's mean acceptance. A position
 fades only when it is checked (half weight after 20 checks), one never
-checked starts at the mean of the position before it, and a position
-holding little evidence for how often chains reach it gets a full-depth
-chain at most every 16 steps; without this, a process whose first chains
-were 3 deep priced every deeper position at the prior and stayed at depth 3.
+checked starts at the mean of the position before it, and positions
+holding little evidence for how often chains reach them are probed at most
+every 16 steps: priced at the last well-measured position's mean, the
+deeper chain worth most is drafted when it beats the chosen depth on this
+device's costs, and not at all when it cannot. Without this, a process
+whose first chains were 3 deep priced every deeper position at the prior
+and stayed at depth 3.
 
 Greedy requests produced byte-identical text to master with the policy on
 and off (essay, code, 2K and 4K prompts).
