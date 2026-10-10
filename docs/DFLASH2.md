@@ -116,8 +116,7 @@ second (`src/runtime/draft_width.cpp`):
   that recorded a program (a width's first pass in a request), compiled or
   loaded a kernel, or tried a kernel's variants on the device is left out,
   and so is each width's first pass in a newly reached context. While a
-  cost rests on fewer than two samples a lower sample replaces it, and after
-  128 steps it is measured again whatever it is priced at; a slow outlier
+  cost rests on fewer than two samples a lower sample replaces it; a slow outlier
   moves an estimate by at most a quarter, a fast one moves it whole. A cold
   first request (kernels compiling and variants being tried) therefore
   cannot price the wide widths or tree rungs out for good. Nothing is
