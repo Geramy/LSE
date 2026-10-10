@@ -44,6 +44,10 @@ struct SparseDecodeCalibration {
   // Selection and descriptor, per key head workgroup set.
   double select_fixed_ns = 0.0;
   double select_ns_per_page = 0.0;
+  // The omitted far pages' mean correction, per (page, key head, query row
+  // of the group), and fixed.
+  double tail_ns_per_row_page = 0.0;
+  double tail_fixed_ns = 0.0;
   [[nodiscard]] bool valid() const noexcept {
     return exact_efficiency > 0.0 && score_ns_per_row_page > 0.0 && select_fixed_ns > 0.0;
   }

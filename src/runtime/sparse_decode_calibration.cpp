@@ -20,7 +20,7 @@ namespace {
 namespace sd = dispatch::sparse_decode;
 using graph::Array;
 using graph::NodePtr;
-constexpr int kFormat = 2;
+constexpr int kFormat = 3;
 // Contexts the exact and selection costs are fitted between (past every
 // last-level cache), and the replays each timing averages.
 constexpr std::int64_t kLong = 131072, kShort = 65536;
@@ -38,7 +38,8 @@ bool read_cached(const std::string& path, const std::string& key,
   std::string k;
   if (!(in >> format >> k) || format != kFormat || k != key) return false;
   return static_cast<bool>(in >> out->exact_efficiency >> out->exact_fixed_ns >> out->score_ns_per_row_page >>
-                           out->score_fixed_ns >> out->select_fixed_ns >> out->select_ns_per_page) &&
+                           out->score_fixed_ns >> out->select_fixed_ns >> out->select_ns_per_page >>
+                           out->tail_ns_per_row_page >> out->tail_fixed_ns) &&
          out->valid();
 }
 
@@ -52,7 +53,8 @@ void write_cached(const std::string& path, const std::string& key,
     out.precision(9);
     out << kFormat << ' ' << key << ' ' << c.exact_efficiency << ' ' << c.exact_fixed_ns << ' '
         << c.score_ns_per_row_page << ' '
-        << c.score_fixed_ns << ' ' << c.select_fixed_ns << ' ' << c.select_ns_per_page << '\n';
+        << c.score_fixed_ns << ' ' << c.select_fixed_ns << ' ' << c.select_ns_per_page << ' '
+        << c.tail_ns_per_row_page << ' ' << c.tail_fixed_ns << '\n';
   }
   std::filesystem::rename(tmp, path, ec);
 }
@@ -124,7 +126,7 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
   LSE_ASSIGN_OR(Array keys, bench.zeros(Shape{blocks, kvh, kv::kBlockSize, hd}, DType::kBF16));
   // The engine's value pool is dimension-major for 16-bit K/V.
   LSE_ASSIGN_OR(Array vals, bench.zeros(Shape{blocks, kvh, hd, kv::kBlockSize}, DType::kBF16));
-  LSE_ASSIGN_OR(Array summary, bench.zeros(Shape{blocks, kvh, 2, hd}, DType::kBF16));
+  LSE_ASSIGN_OR(Array summary, bench.zeros(Shape{blocks, kvh, sd::kSummaryRows, hd}, DType::kBF16));
   // A block table as long as the context, as the engine's KV rung is.
   auto table_for = [&](std::int64_t live) {
     const std::int64_t n = live / kv::kBlockSize;
@@ -144,7 +146,9 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
   // Exact split attention at both contexts.
   double exact[2] = {0, 0};
   const std::int64_t lives[2] = {kShort, kLong};
-  for (int i = 0; i < 2; ++i) {
+  // The long exact pass first, untimed, to bring the clocks up: the load
+  // before calibration leaves the device idle.
+  for (int i : {1, 0, 1}) {
     LSE_ASSIGN_OR(Array q, query(1));
     LSE_ASSIGN_OR(Array meta, meta_for(lives[i], 1));
     LSE_ASSIGN_OR(Array tab, table_for(lives[i]));
@@ -153,26 +157,37 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
     LSE_ASSIGN_OR(exact[i], bench.time({o.node()}));
   }
   // Score (1 and 8 rows) and score + selection, at both contexts for 1 row.
-  auto stages = [&](std::int64_t live, std::int64_t rows) -> Result<std::pair<NodePtr, NodePtr>> {
+  struct Stages { NodePtr scores, selected, tail; };
+  auto stages = [&](std::int64_t live, std::int64_t rows) -> Result<Stages> {
     LSE_ASSIGN_OR(Array q, query(rows));
     LSE_ASSIGN_OR(Array meta, meta_for(live, rows));
     LSE_ASSIGN_OR(Array tab, table_for(live));
     LSE_ASSIGN_OR(Array o, graph::sparse_decode_attention(q, keys, vals, scale, graph::MaskKind::kCausal,
                                                           meta, tab, kv::kBlockSize, &device, storage,
                                                           summary, g.budget, false));
-    const NodePtr selected = o.node()->inputs[0]->inputs[4];
-    return std::make_pair(selected->inputs[0], selected);
+    // merge <- concat(partial, tail); partial's fifth input is the selection.
+    const NodePtr records = o.node()->inputs[0];
+    const NodePtr selected = records->inputs[0]->inputs[4];
+    return Stages{selected->inputs[0], selected, records->inputs[1]};
   };
-  double score1[2] = {0, 0}, both1[2] = {0, 0}, score8 = 0;
+  double score1[2] = {0, 0}, both1[2] = {0, 0}, score8 = 0, tail1 = 0, select8 = 0, tail8 = 0;
   for (int i = 0; i < 2; ++i) {
     LSE_ASSIGN_OR(auto s, stages(lives[i], 1));
-    LSE_ASSIGN_OR(score1[i], bench.time({s.first}));
+    LSE_ASSIGN_OR(score1[i], bench.time({s.scores}));
     LSE_ASSIGN_OR(auto t, stages(lives[i], 1));
-    LSE_ASSIGN_OR(both1[i], bench.time({t.second}));
+    LSE_ASSIGN_OR(both1[i], bench.time({t.selected}));
   }
   {
     LSE_ASSIGN_OR(auto s, stages(kLong, 8));
-    LSE_ASSIGN_OR(score8, bench.time({s.first}));
+    LSE_ASSIGN_OR(score8, bench.time({s.scores}));
+    LSE_ASSIGN_OR(auto t, stages(kLong, 8));
+    LSE_ASSIGN_OR(select8, bench.time({t.selected}));
+    LSE_ASSIGN_OR(auto u, stages(kLong, 8));
+    LSE_ASSIGN_OR(tail8, bench.time({u.tail}));
+    tail8 -= select8;
+    LSE_ASSIGN_OR(auto v, stages(kLong, 1));
+    LSE_ASSIGN_OR(tail1, bench.time({v.tail}));
+    tail1 -= both1[1];
   }
   // What one replay costs beyond its kernels: the shifted-descriptor kernel
   // alone, less one launch. Taken out of every fixed term below.
@@ -184,7 +199,7 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
     LSE_ASSIGN_OR(Array o, graph::sparse_decode_attention(q, keys, vals, scale, graph::MaskKind::kCausal,
                                                           meta, tab, kv::kBlockSize, &device, storage,
                                                           summary, g.budget, false));
-    LSE_ASSIGN_OR(const double t, bench.time({o.node()->inputs[0]->inputs[3]}));
+    LSE_ASSIGN_OR(const double t, bench.time({o.node()->inputs[0]->inputs[0]->inputs[3]}));
     overhead = std::max(0.0, t - roof->launch_ns);
   }
   const double kv_token = 2.0 * static_cast<double>(kvh * hd) * 2.0;
@@ -199,14 +214,16 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
   cal.select_ns_per_page = std::max(0.0, (select_long - select_short) /
                                              static_cast<double>((kLong - kShort) / kv::kBlockSize));
   cal.select_fixed_ns = std::max(1.0, select_long - cal.select_ns_per_page * far_pages);
+  cal.tail_ns_per_row_page = std::max(0.0, (tail8 - tail1) / (far_pages * kvh * group * 7.0));
+  cal.tail_fixed_ns = std::max(0.0, tail1 - far_pages * kvh * group * cal.tail_ns_per_row_page);
   std::fprintf(stderr,
                "lse-server: sparse decode calibration %s: exact attention %.1f/%.1f us at %lldK/%lldK "
                "(%.0f%% of stream), score %.1f us (1 row) %.1f us (8 rows) at %lldK, "
-               "selection %.1f/%.1f us, replay overhead %.1f us\n",
+               "selection %.1f/%.1f us, mean correction %.1f us (1 row) %.1f us (8 rows), replay overhead %.1f us\n",
                device.arch.c_str(), exact[0] / 1e3, exact[1] / 1e3, static_cast<long long>(kShort / 1024),
                static_cast<long long>(kLong / 1024), cal.exact_efficiency * 100.0, score1[1] / 1e3,
                score8 / 1e3, static_cast<long long>(kLong / 1024), select_short / 1e3, select_long / 1e3,
-               overhead / 1e3);
+               tail1 / 1e3, tail8 / 1e3, overhead / 1e3);
   if (!cal.valid())
     return LSE_ERROR(kInternal, "sparse decode calibration measured no usable costs");
   write_cached(path, key, cal);

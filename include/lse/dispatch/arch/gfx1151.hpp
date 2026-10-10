@@ -197,6 +197,8 @@ inline constexpr Tuning kTuning{
     // 8192 442 -> 485, 16384 378 -> 467, 32768 533 -> 696; 1024 and 2048
     // unchanged (attention is a small share of a short prefill here).
     .flash_prefill = true,
+    // Sparse decode: test_sparse_decode --gpu reference cases pass here.
+    .sparse_decode = true,
     .q4_gemm_wide = kQ4GemmWide,
 };
 

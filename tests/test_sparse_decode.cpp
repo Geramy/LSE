@@ -13,6 +13,8 @@
 #include "lse/kv/block.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
+#include <span>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -24,14 +26,15 @@ namespace sd = lse::dispatch::sparse_decode;
 
 namespace {
 
-float bf16(float value) {
+float round_bf16(float value) {
   auto bits = std::bit_cast<std::uint32_t>(value);
   bits += 0x7fffu + ((bits >> 16) & 1u);
   return std::bit_cast<float>(bits & 0xffff0000u);
 }
 
-constexpr int kKvh = 4, kHeads = 24, kGroup = 6, kWidth = 256, kPages = 512, kBlocks = 520;
-constexpr int kCapacity = kPages * 16;
+constexpr int kKvh = 4, kHeads = 24, kGroup = 6, kWidth = 256;
+// LSE_SPARSE_TEST_PAGES widens the fixture (the long-context case).
+int kPages = 512, kBlocks = 520;
 constexpr int kBudget = 1024, kBudgetPages = kBudget / 16;
 constexpr float kScale = 0.0625f;
 
@@ -48,8 +51,8 @@ Fixture make_fixture(int rows) {
   for (auto& x : f.q) x = random();
   f.k.resize(std::size_t(kBlocks) * kKvh * 16 * kWidth);
   f.v.resize(f.k.size());
-  for (auto& x : f.k) x = bf16(random() * 0.25f);
-  for (auto& x : f.v) x = bf16(random());
+  for (auto& x : f.k) x = round_bf16(random() * 0.25f);
+  for (auto& x : f.v) x = round_bf16(random());
   f.table.resize(kPages);
   for (int p = 0; p < kPages; ++p) f.table[p] = float((p * 7 + 3) % kBlocks);
   // Ten far pages per key head whose keys follow one of its query heads.
@@ -63,7 +66,7 @@ Fixture make_fixture(int rows) {
       for (int slot = 0; slot < 16; ++slot)
         for (int c = 0; c < kWidth; ++c)
           f.k[((std::size_t(blk) * kKvh + g) * 16 + slot) * kWidth + c] =
-              bf16(f.q[(std::size_t(h) * rows + 0) * kWidth + c] * 0.8f);
+              round_bf16(f.q[(std::size_t(h) * rows + 0) * kWidth + c] * 0.8f);
     }
   return f;
 }
@@ -91,8 +94,8 @@ std::vector<double> host_scores(const Fixture& f, int rows, int live, int g) {
         lo = std::min(lo, key_at(f, g, p * 16 + s, c));
         hi = std::max(hi, key_at(f, g, p * 16 + s, c));
       }
-      summary[p][0][c] = bf16((lo + hi) * 0.5f);
-      summary[p][1][c] = bf16((hi - lo) * 0.5f);
+      summary[p][0][c] = round_bf16((lo + hi) * 0.5f);
+      summary[p][1][c] = round_bf16((hi - lo) * 0.5f);
     }
   }
   auto bound = [&](int p, int h, int t) {
@@ -139,6 +142,12 @@ int gpu_check() {
     return Array::from_buffer(std::move(buf), shape, DType::kF32);
   };
   unsigned cases = 0;
+  int long_live = 0;
+  if (const char* pages = std::getenv("LSE_SPARSE_TEST_PAGES"); pages && std::atoi(pages) > 512) {
+    kPages = std::atoi(pages);
+    kBlocks = kPages + 8;
+    long_live = kPages * 16 - 300;
+  }
   struct Case { const char* name; int rows; int live; MaskKind mask; };
   const Case cases_list[] = {
       {"decode", 1, 8000, MaskKind::kCausal},
@@ -148,7 +157,9 @@ int gpu_check() {
       {"identity", 1, 900, MaskKind::kCausal},
   };
   const int parent[8] = {-1, 0, 1, 2, 0, 4, 1, 6};
-  for (const Case& cs : cases_list) {
+  const Case long_case[] = {{"long-decode", 1, long_live, MaskKind::kCausal},
+                            {"long-chain", 8, long_live, MaskKind::kCausal}};
+  for (const Case& cs : long_live ? std::span<const Case>(long_case) : std::span<const Case>(cases_list)) {
     const int rows = cs.rows, live = cs.live, first = live - rows;
     Fixture f = make_fixture(rows);
     auto aq = upload({1, kHeads, rows, kWidth}, f.q);
@@ -168,13 +179,13 @@ int gpu_check() {
     auto am = upload({std::int64_t(meta.size())}, meta);
     auto at = upload({1, kPages}, f.table);
     // Summaries of every page: a refresh "pass" from position 0 over the whole context.
-    auto summary_pool = cast(upload({kBlocks, kKvh, 2, kWidth}, std::vector<float>(std::size_t(kBlocks) * kKvh * 2 * kWidth)), DType::kBF16);
+    auto summary_pool = cast(upload({kBlocks, kKvh, 4, kWidth}, std::vector<float>(std::size_t(kBlocks) * kKvh * 4 * kWidth)), DType::kBF16);
     auto refresh_meta = upload({5}, {0.0f, float(live), 1, 0.0f, float(live)});
-    auto summary = sparse_decode_summary(summary_pool, ak, refresh_meta, at, live, kv::CacheDType::kBF16);
+    auto summary = sparse_decode_summary(summary_pool, ak, av, refresh_meta, at, live, kv::CacheDType::kBF16);
     auto out = sparse_decode_attention(aq, ak, av, kScale, cs.mask, am, at, 16, &d, kv::CacheDType::kBF16,
                                        summary, kBudget, false);
     if (!out.ok()) { std::fprintf(stderr, "%s: %s\n", cs.name, out.status().to_string().c_str()); return 1; }
-    const NodePtr partial = out->node()->inputs[0];
+    const NodePtr partial = out->node()->inputs[0]->inputs[0];
     const NodePtr selected = partial->inputs[4];
     const NodePtr shifted = partial->inputs[3];
     const NodePtr roots[]{out->node(), selected, shifted};
@@ -205,8 +216,9 @@ int gpu_check() {
     double max_error = 0, max_dense_gap = 0;
     unsigned hot_missed = 0, rank_violations = 0;
     for (int g = 0; g < kKvh; ++g) {
-      // The positions each key head's rows read.
-      std::vector<int> positions;
+      // The positions each key head's rows read, and the far pages left
+      // out (their mean correction).
+      std::vector<int> positions, omitted;
       if (all) {
         for (int j = 0; j < live; ++j) positions.push_back(j);
       } else {
@@ -223,6 +235,8 @@ int gpu_check() {
           for (int s = 0; s < 16; ++s) if (page * 16 + s < live) positions.push_back(page * 16 + s);
         }
         for (int page : f.hot[g]) hot_missed += far.count(page) == 0;
+        for (int p = int(sd::kSinkPages); p < pages - int(sd::kRecentPages); ++p)
+          if (!far.count(p)) omitted.push_back(p);
         const auto scores = host_scores(f, rows, live, g);
         double kept_min = INFINITY, dropped_max = -INFINITY;
         for (int p = int(sd::kSinkPages); p < pages - int(sd::kRecentPages); ++p)
@@ -233,9 +247,24 @@ int gpu_check() {
       for (int hl = 0; hl < kGroup; ++hl) {
         const int h = g * kGroup + hl;
         for (int t = 0; t < rows; ++t) {
-          auto attend = [&](const std::vector<int>& keys) {
+          auto attend = [&](const std::vector<int>& keys, const std::vector<int>& means) {
             std::vector<double> logits;
             std::vector<int> used;
+            // Each omitted page: 16 * exp(q . bf16(key mean)), value bf16(value mean).
+            std::vector<double> mean_logits;
+            std::vector<std::vector<float>> mean_values;
+            for (int p : means) {
+              double dot = 0;
+              std::vector<float> vm(kWidth);
+              for (int c = 0; c < kWidth; ++c) {
+                float ks = 0, vs = 0;
+                for (int s2 = 0; s2 < 16; ++s2) { ks += key_at(f, g, p * 16 + s2, c); vs += value_at(f, g, p * 16 + s2, c); }
+                dot += double(f.q[(std::size_t(h) * rows + t) * kWidth + c]) * round_bf16(ks * (1.0f / 16));
+                vm[c] = round_bf16(vs * (1.0f / 16));
+              }
+              mean_logits.push_back(dot * kScale + std::log(16.0));
+              mean_values.push_back(std::move(vm));
+            }
             for (int j : keys) {
               if (j >= first) {  // the pass's own rows
                 if (!visible[t][j - first]) continue;
@@ -245,7 +274,8 @@ int gpu_check() {
               logits.push_back(dot * kScale);
               used.push_back(j);
             }
-            const double top = *std::max_element(logits.begin(), logits.end());
+            double top = *std::max_element(logits.begin(), logits.end());
+            for (double l : mean_logits) top = std::max(top, l);
             std::vector<double> o(kWidth, 0.0);
             double denom = 0;
             for (std::size_t i = 0; i < used.size(); ++i) {
@@ -253,13 +283,18 @@ int gpu_check() {
               denom += w;
               for (int c = 0; c < kWidth; ++c) o[c] += w * value_at(f, g, used[i], c);
             }
+            for (std::size_t i = 0; i < mean_logits.size(); ++i) {
+              const double w = std::exp(mean_logits[i] - top);
+              denom += w;
+              for (int c = 0; c < kWidth; ++c) o[c] += w * mean_values[i][c];
+            }
             for (auto& x : o) x /= denom;
             return o;
           };
-          const auto want = attend(positions);
+          const auto want = attend(positions, omitted);
           std::vector<int> every(live);
           for (int j = 0; j < live; ++j) every[j] = j;
-          const auto dense = attend(every);
+          const auto dense = attend(every, {});
           for (int c = 0; c < kWidth; ++c) {
             const double value = got[(std::size_t(h) * rows + t) * kWidth + c];
             LSE_EXPECT(std::isfinite(value));

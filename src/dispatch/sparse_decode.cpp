@@ -66,7 +66,8 @@ SparseDecodePlan sparse_decode_predict(const backend::DeviceInfo* device,
   const double select = cal->select_fixed_ns + pages * cal->select_ns_per_page;
   const double attend = cal->exact_fixed_ns +
                         static_cast<double>(shape.budget) * kv_token * 1e9 / bw;
-  plan.sparse_ns = score + select + attend;
+  const double tail = cal->tail_fixed_ns + pages * shape.key_heads * group_rows * cal->tail_ns_per_row_page;
+  plan.sparse_ns = score + select + tail + attend;
   plan.priced = true;
   plan.sparse = live > shape.budget && plan.sparse_ns <= (1.0 - sd::kMinSavedShare) * plan.exact_ns;
   return plan;

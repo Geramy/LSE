@@ -783,10 +783,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
   return Array(n);
 }
 
-Array sparse_decode_summary(const Array& summary, const Array& keys, const Array& meta,
-                            const Array& table, int pass_rows, kv::CacheDType storage) {
+Array sparse_decode_summary(const Array& summary, const Array& keys, const Array& values,
+                            const Array& meta, const Array& table, int pass_rows,
+                            kv::CacheDType storage) {
   auto n = make(OpKind::kCustom, summary.shape(), summary.dtype(),
-                {summary.node(), keys.node(), meta.node(), table.node()});
+                {summary.node(), keys.node(), values.node(), meta.node(), table.node()});
   n->iattrs[0] = pass_rows;
   n->attrs[1] = static_cast<float>(storage);
   n->prim = find_primitive("attention.sparse_decode.summary.v1");
@@ -807,6 +808,14 @@ struct SparseMetaMemo {
 SparseMetaMemo& sparse_meta_memo() {
   static thread_local SparseMetaMemo memo;
   return memo;
+}
+
+float sparse_decode_radius_weight() {
+  static const float weight = [] {
+    const char* v = std::getenv("LSE_SPARSE_DECODE_RADIUS");
+    return v && *v ? static_cast<float>(std::atof(v)) : 1.0f;
+  }();
+  return weight;
 }
 
 NodePtr sparse_meta(const Array& meta, int budget_pages, int batch) {
@@ -850,6 +859,8 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   auto scores = make(OpKind::kCustom, Shape{batch * kvh, table.shape().dim(1)}, DType::kF32,
                      {q.node(), summary.node(), meta.node(), table.node()});
   scores->attrs[0] = scale;
+  // Weight of the radius term in the page bound (1: Quest's bound).
+  scores->attrs[1] = sparse_decode_radius_weight();
   scores->iattrs[0] = budget_pages;
   // Many rows per key head (verify passes) take the matrix-core scores.
   const bool many_rows = sq.dim(1) / kvh * sq.dim(2) >= 16;
@@ -891,16 +902,65 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   request.attrs = n->attrs;
   request.iattrs = n->iattrs;
   request.device = device;
-  if (dispatch::split_decode_supported(request)) return split_paged_attention(n);
-  if (dispatch::flash_split_scope(request))
-    return split_paged_attention(n, false, dispatch::attention_shapes::flash_split_parts(
+  std::uint32_t flash_parts = 0;
+  // The order sdpa_paged takes: the 1-row split, the flash split for chains
+  // and trees, the short split for what is left (never a tree).
+  if (dispatch::split_decode_supported(request)) {
+    flash_parts = 0;
+  } else if (dispatch::flash_split_scope(request)) {
+    flash_parts = dispatch::attention_shapes::flash_split_parts(
         static_cast<std::uint64_t>(budget_pages) * static_cast<std::uint64_t>(block_size),
         dispatch::attention_shapes::flash_split_units(static_cast<std::uint32_t>(sq.dim(1)),
             static_cast<std::uint32_t>(kvh), static_cast<std::uint32_t>(sq.dim(2))),
-        static_cast<std::uint32_t>(device->compute_units)));
-  if (dispatch::split_short_supported(request)) return split_paged_attention(n);
-  return LSE_ERROR(kUnimplemented, "no exact attention kernel serves sparse decode for ",
-                   std::to_string(sq.dim(2)), " rows on ", device->arch);
+        static_cast<std::uint32_t>(device->compute_units));
+  } else if (mask != MaskKind::kTree && dispatch::split_short_supported(request)) {
+    flash_parts = 0;
+  } else {
+    return LSE_ERROR(kUnimplemented, "no exact attention kernel serves sparse decode for ",
+                     std::to_string(sq.dim(2)), " rows on ", device->arch);
+  }
+  // The selected pages' exact split records, the omitted far pages' mean
+  // correction records beside them, and one merge over both.
+  const auto* partial_prim = find_primitive(flash_parts ? "attention.flash_split.wmma16.v1"
+                                                        : "attention.split_partial128.wg128c2.v1");
+  const auto* merge_prim = find_primitive("attention.split_merge128.wg128c2.v1");
+  const auto* tail_prim = find_primitive("attention.sparse_decode.tail.v1");
+  if (!partial_prim || !merge_prim || !tail_prim)
+    return LSE_ERROR(kInternal, "sparse decode attention kernels are not registered");
+  const bool short_query = sq.dim(2) > 1;
+  const std::int64_t capacity = static_cast<std::int64_t>(budget_pages) * block_size;
+  const std::int64_t parts = flash_parts ? flash_parts : (capacity + 127) / 128;
+  const std::int64_t tiles = (table.shape().dim(1) + 255) / 256;
+  const Shape partial_shape = short_query ? Shape{sq.dim(0), sq.dim(1), sq.dim(2), parts, 258}
+                                          : Shape{sq.dim(0), sq.dim(1), parts, 258};
+  const Shape tail_shape = short_query ? Shape{sq.dim(0), sq.dim(1), sq.dim(2), tiles, 258}
+                                       : Shape{sq.dim(0), sq.dim(1), tiles, 258};
+  auto partial = make(OpKind::kCustom, partial_shape, DType::kF32, n->inputs);
+  partial->prim = partial_prim;
+  partial->fclass = partial_prim->fusion_class();
+  partial->attrs = n->attrs;
+  partial->iattrs = n->iattrs;
+  auto tail = make(OpKind::kCustom, tail_shape, DType::kF32,
+                   {q.node(), summary.node(), meta.node(), table.node(), selected});
+  tail->prim = tail_prim;
+  tail->fclass = tail_prim->fusion_class();
+  tail->attrs[0] = scale;
+  static const bool with_tail = [] {
+    const char* v = std::getenv("LSE_SPARSE_DECODE_TAIL");
+    return !(v && *v == '0');
+  }();
+  Array records = with_tail ? concat({Array(partial), Array(tail)}, static_cast<int>(partial_shape.rank()) - 2)
+                            : Array(partial);
+  if (!with_tail) --tail->inputs[0]->consumer_count, --tail->inputs[1]->consumer_count,
+                  --tail->inputs[2]->consumer_count, --tail->inputs[3]->consumer_count,
+                  --tail->inputs[4]->consumer_count;
+  auto merged = make(OpKind::kCustom, out, DType::kF32, {records.node()});
+  merged->prim = merge_prim;
+  merged->fclass = merge_prim->fusion_class();
+  for (std::size_t i = 0; i < n->inputs.size(); ++i)
+    if (std::find(n->inputs.begin(), n->inputs.begin() + static_cast<std::ptrdiff_t>(i), n->inputs[i]) ==
+        n->inputs.begin() + static_cast<std::ptrdiff_t>(i)) --n->inputs[i]->consumer_count;
+  return Array(merged);
 }
 
 Array kv_page_write(const Array& dst, const Array& src, const Array& meta,

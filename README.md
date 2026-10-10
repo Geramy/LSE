@@ -93,6 +93,8 @@ The server listens on `http://127.0.0.1:8080/v1` (Chat Completions and Completio
 | `--batch-size N` | `1024` | Prompt tokens per batch; power of two, 128 to 4096. |
 | `--ubatch-size N` | `1024` | Tokens per prefill pass; power of two, at most `--batch-size`. |
 | `--FlashPrefillV2=on\|off` | on where supported | Sparse prompt prefill; default on for Qwen3.5-family models on gfx1201 and gfx1151 with Loom and BF16 or FP32 KV. |
+| `--sparse-decode=auto\|on\|off` | `auto` | Block-sparse decode and verify attention at long context: reads the sink, the recent window and the highest-scoring KV pages up to the budget. `auto` uses it only above the context where this device's measured bandwidth and kernel times predict a gain; `off` keeps every pass exact. Approximate. |
+| `--sparse-decode-budget N` | `4096` | Tokens a sparse decode pass reads (multiple of 16). |
 | `--attention-prefill MODE` | `dense` | Experimental: `dense`, `blasst` or `flashprefill-v2`. |
 | `--attention-decode MODE` | `dense` | Experimental: `dense` or `blasst`. |
 | `--attention-calibration FILE` | none | JSON phase scales; required for `blasst`. |
@@ -112,6 +114,8 @@ The server listens on `http://127.0.0.1:8080/v1` (Chat Completions and Completio
 | `--perplexity-ctx N` | `512` | Tokens per chunk or window. |
 | `--perplexity-stride N` | ctx | Tokens between sliding windows. |
 | `--perplexity-chunks N` | all | Score only the first N chunks. |
+| `--perplexity-tail N` | all | Score only the last N tokens of each window. |
+| `--perplexity-step N` | prefill | Score through decode passes (`1`) or verify passes of N rows. |
 | `--perplexity-kld-base-out FILE` | none | Record a KL-divergence base. |
 | `--perplexity-kld-top-k K` | `32` | Token IDs per position in that base, 1 to 32. |
 | `--perplexity-kld FILE` | none | Compare against a recorded base. |

@@ -706,8 +706,10 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     else {
       const auto& info = devices->device(0).device_info();
       const auto* tc = sched->toolchain(0);
-      if (info.wavefront_size != 32 || info.max_threads_per_workgroup < sdt::kSelectThreads ||
-          tc == nullptr || tc->dialect != graph::Dialect::kLoom)
+      if (!dispatch::arch::tuning(info.arch).sparse_decode)
+        why = "sparse decode is not qualified on " + info.arch;
+      else if (info.wavefront_size != 32 || info.max_threads_per_workgroup < sdt::kSelectThreads ||
+               tc == nullptr || tc->dialect != graph::Dialect::kLoom)
         why = "the device is not a Wave32 Loom part";
     }
     if (c.sparse_decode == 0) {

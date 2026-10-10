@@ -14,6 +14,13 @@ namespace lse::dispatch::sparse_decode {
 
 // Tokens per page: the KV block size (kv::kBlockSize).
 inline constexpr std::uint32_t kPage = 16;
+// Summary rows per page and key head: the keys' center and radius (the
+// selection bound), their mean, and the values' mean (the omitted pages'
+// mean correction).
+inline constexpr std::uint32_t kSummaryRows = 4;
+inline constexpr std::uint32_t kRowCenter = 0, kRowRadius = 1, kRowKeyMean = 2, kRowValueMean = 3;
+// Split attention records: maximum, denominator, 256 numerators.
+inline constexpr std::uint32_t kSplitRecord = 258;
 // Always read exactly: the first pages (attention sinks) and the recent
 // window, which also holds every row of a verify pass (up to 64).
 inline constexpr std::uint32_t kSinkPages = 4;

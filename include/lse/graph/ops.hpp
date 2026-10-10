@@ -212,19 +212,21 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
 // pool: the write aliases it and touches only the positions it covers.
 // Block-sparse decode attention (kernels/sparse_decode.cpp).
 //
-// sparse_decode_summary refreshes, in place, the per-page key summaries
-// `summary` [blocks, Hkv, 2, Dh] (bf16 center and radius) of the pages a pass
-// of `pass_rows` rows wrote, from the key pool as written (`keys`, the
-// kv_page_write output). Every pass that writes keys runs it while sparse
+// sparse_decode_summary refreshes, in place, the per-page summaries
+// `summary` [blocks, Hkv, 4, Dh] (bf16 key center, key radius, key mean,
+// value mean) of the pages a pass of `pass_rows` rows wrote, from the pools as
+// written (`keys`, `values`: the kv_page_write outputs). Every pass that writes keys runs it while sparse
 // decode can engage, whatever attention the pass itself takes.
-Array sparse_decode_summary(const Array& summary, const Array& keys, const Array& meta,
-                            const Array& table, int pass_rows, kv::CacheDType storage);
+Array sparse_decode_summary(const Array& summary, const Array& keys, const Array& values,
+                            const Array& meta, const Array& table, int pass_rows,
+                            kv::CacheDType storage);
 
 // The attention of a decode or verify pass over the sink pages, the recent
 // window and the far pages whose summaries bound the pass's rows highest, up
 // to `budget_tokens`: scores, a selection per key head (or one shared by all
 // key heads when `joint_heads`), a step descriptor shifted onto the selected
-// pages, and the exact split or flash kernel over their block table. An
+// pages, the exact split or flash kernel over their block table, and the
+// omitted far pages' mean correction merged with it. An
 // error, never a dense pass, when no exact kernel serves the selected shape.
 Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Array& v,
                                       float scale, MaskKind mask, const Array& meta,

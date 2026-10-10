@@ -1,5 +1,6 @@
 #include "lse/ops/attention.hpp"
 #include "lse/dispatch/sparse_decode.hpp"
+#include "lse/dispatch/sparse_decode_tuneconfig.h"
 
 #include <algorithm>
 #include <cmath>
@@ -474,7 +475,7 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
         PagedKvLayer& layer = *cache->paged;
         if (!layer.summary.valid()) {
           const Shape shape{pool_ceiling(layer, rows, static_cast<std::int32_t>(cache->capacity)),
-                            kvh, 2, hd};
+                            kvh, static_cast<std::int64_t>(dispatch::sparse_decode::kSummaryRows), hd};
           const backend::ScopedAllocationSite site(backend::AllocationSite::kKvCache);
           LSE_ASSIGN_OR(layer.summary, alloc_zeroed(shape, DType::kBF16));
         }
@@ -482,7 +483,7 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
           return LSE_ERROR(kOutOfRange, "sparse decode summaries cover ",
                            std::to_string(layer.summary.shape().dim(0)), " KV blocks; the pool grew to ",
                            std::to_string(layer.keys.shape().dim(0)));
-        summary = graph::sparse_decode_summary(layer.summary, k_attn, cache->meta, cache->table,
+        summary = graph::sparse_decode_summary(layer.summary, k_attn, v_attn, cache->meta, cache->table,
                                                t, spec.kv_cache_dtype);
         *cache->summary_root = summary;
       }

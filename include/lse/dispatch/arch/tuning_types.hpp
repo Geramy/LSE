@@ -63,6 +63,12 @@ struct Tuning {
   // mean-corrected matrix kernels) is qualified on this part.
   bool flash_prefill = false;
 
+  // Block-sparse decode attention (page summaries, scores, selection; the
+  // exact split/flash kernels over the selected pages) is qualified on this
+  // part. Where it engages is the optimizer's prediction from the part's
+  // measured roofline and kernel times (dispatch::sparse_decode_plan).
+  bool sparse_decode = false;
+
   // The prefill GEMM's tile for wide passes (q4_gemm_tile, M >= 768); unset
   // takes the generic 256 x 128 tile of 64x64 wave tiles.
   Q4GemmTile q4_gemm_wide{};
