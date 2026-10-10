@@ -51,11 +51,14 @@ backend::DeviceDescriptor describe(
   return bare;
 }
 
-// With CPU fallback disallowed, a device with no code generator is refused as a
-// member: everything placed on it would run on the host interpreter. Empty when
-// the member is acceptable.
-std::string host_interpreter_refusal(const backend::IBackend& be) {
-  if (be.emitter() != nullptr || graph::cpu_fallback_allowed()) return {};
+// A device with no code generator runs everything placed on it on the host
+// interpreter. Reached by the default order, it is refused unless CPU
+// fallback is allowed (the run chose the CPU backend); named in the pool, the
+// naming is that choice, and only an option disabling fallback refuses it.
+// Empty when the member is acceptable.
+std::string host_interpreter_refusal(const backend::IBackend& be, bool named) {
+  if (be.emitter() != nullptr) return {};
+  if (named ? !graph::cpu_fallback_disabled() : graph::cpu_fallback_allowed()) return {};
   return "it has no device code generator, so every op would run on the host "
          "interpreter";
 }
@@ -284,7 +287,7 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
       }
       // The host backend is the last entry in that order; with CPU fallback
       // disallowed, reaching it is the failure, not the answer.
-      if (const std::string refusal = host_interpreter_refusal(*candidate);
+      if (const std::string refusal = host_interpreter_refusal(*candidate, false);
           !refusal.empty()) {
         if (!impl.declined.empty()) impl.declined += "; ";
         impl.declined += name + ": refused, " + refusal;
@@ -323,12 +326,11 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
                        std::to_string(named.size()),
                        " GPUs will not come up: ", init.to_string());
     }
-    if (const std::string refusal = host_interpreter_refusal(*candidate);
+    if (const std::string refusal = host_interpreter_refusal(*candidate, true);
         !refusal.empty()) {
       return LSE_ERROR(kDeviceError, "the device spanning ",
                        std::to_string(named.size()), " members is refused: ",
-                       refusal, ", and CPU fallback is refused (it runs only for a run that chooses "
-                       "the cpu backend, without --no-cpu-fallback)");
+                       refusal, ", and CPU fallback is disabled (--no-cpu-fallback)");
     }
     backend::IBackend* shared = candidate.get();
     impl.owned.push_back(std::move(candidate));
@@ -354,11 +356,10 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
                        " was asked for and will not come up: ",
                        init.to_string());
     }
-    if (const std::string refusal = host_interpreter_refusal(*candidate);
+    if (const std::string refusal = host_interpreter_refusal(*candidate, true);
         !refusal.empty()) {
       return LSE_ERROR(kDeviceError, "device ", id.str(), " is refused: ",
-                       refusal, ", and CPU fallback is refused (it runs only for a run that chooses "
-                       "the cpu backend, without --no-cpu-fallback)");
+                       refusal, ", and CPU fallback is disabled (--no-cpu-fallback)");
     }
     adopt(std::move(candidate), id);
   }

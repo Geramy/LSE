@@ -331,6 +331,8 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   // must not leave its choice behind. It is refused unless the run chose the
   // CPU backend (graph::cpu_fallback_default); --no-cpu-fallback and
   // LSE_REQUIRE_DEVICE_KERNELS=1 refuse it even then.
+  graph::set_cpu_fallback_disabled(c.disable_cpu_fallback != 0 ||
+                                   graph::device_kernels_required_by_environment());
   graph::set_cpu_fallback_allowed(
       c.disable_cpu_fallback == 0 &&
       graph::cpu_fallback_default(std::getenv("LSE_BACKEND"),

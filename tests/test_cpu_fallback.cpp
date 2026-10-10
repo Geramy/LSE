@@ -23,11 +23,15 @@ bool mentions(const Status& s, const char* text) {
   return s.to_string().find(text) != std::string::npos;
 }
 
-// Fallback disallowed for one scope, restored on every exit.
+// Fallback disabled by option for one scope, restored on every exit.
 struct NoCpuFallback {
   bool previous = cpu_fallback_allowed();
-  NoCpuFallback() { set_cpu_fallback_allowed(false); }
-  ~NoCpuFallback() { set_cpu_fallback_allowed(previous); }
+  bool previous_disabled = cpu_fallback_disabled();
+  NoCpuFallback() { set_cpu_fallback_disabled(true); }
+  ~NoCpuFallback() {
+    set_cpu_fallback_disabled(previous_disabled);
+    set_cpu_fallback_allowed(previous);
+  }
 };
 
 // Fallback allowed for one scope, as for a run that chose the CPU backend.
@@ -80,6 +84,16 @@ LSE_TEST(cpu_fallback_is_allowed_only_for_a_run_that_chose_the_cpu_backend) {
   LSE_EXPECT(!cpu_fallback_default(nullptr, "cpu:0"));
 }
 
+LSE_TEST(a_cpu_device_named_in_the_pool_opens_while_fallback_is_refused_by_default) {
+  // Naming it is choosing the CPU backend; only an option refuses it.
+  const bool previous = cpu_fallback_allowed();
+  set_cpu_fallback_allowed(false);
+  LSE_EXPECT(!cpu_fallback_disabled());
+  auto opened = place::Devices::open("cpu:0");
+  LSE_EXPECT_OK(opened.status());
+  set_cpu_fallback_allowed(previous);
+}
+
 LSE_TEST(a_cpu_pool_member_opens_while_cpu_fallback_is_allowed) {
   CpuBackendChosen chosen;
   auto opened = place::Devices::open("cpu:0");
@@ -93,10 +107,10 @@ LSE_TEST(a_cpu_pool_member_is_refused_when_cpu_fallback_is_disabled) {
   if (opened.ok()) return;
   std::printf("       %s\n", opened.status().to_string().c_str());
   LSE_EXPECT(opened.status().code() == StatusCode::kDeviceError);
-  // Names the member, the reason and how fallback is chosen.
+  // Names the member, the reason and the option that caused the refusal.
   LSE_EXPECT(mentions(opened.status(), "cpu:0"));
   LSE_EXPECT(mentions(opened.status(), "host interpreter"));
-  LSE_EXPECT(mentions(opened.status(), "CPU fallback is refused"));
+  LSE_EXPECT(mentions(opened.status(), "--no-cpu-fallback"));
 }
 
 LSE_TEST(the_default_device_never_falls_back_to_the_cpu_when_disabled) {
@@ -121,6 +135,7 @@ LSE_TEST(the_default_device_never_falls_back_to_the_cpu_when_disabled) {
 }
 
 LSE_TEST(a_scheduler_with_no_code_generator_refuses_a_step_when_disabled) {
+  ScopedEnv strict_unset("LSE_REQUIRE_DEVICE_KERNELS", nullptr);
   auto be = backend::create_backend("cpu");
   LSE_EXPECT(be.ok());
   if (!be.ok()) return;
@@ -138,6 +153,17 @@ LSE_TEST(a_scheduler_with_no_code_generator_refuses_a_step_when_disabled) {
     std::printf("       %s\n", refused.to_string().c_str());
     LSE_EXPECT(mentions(refused, "CPU fallback disabled"));
     LSE_EXPECT(mentions(refused, "host interpreter"));
+  }
+  // Refused only by default (no option), a scheduler its caller built on the
+  // cpu backend runs the step: building it was the choice.
+  {
+    const bool previous = cpu_fallback_allowed();
+    set_cpu_fallback_allowed(false);
+    LSE_EXPECT(!cpu_fallback_disabled());
+    Array y = x + x;
+    const NodePtr roots[] = {y.node()};
+    LSE_EXPECT_OK(sched.eval(roots, true));
+    set_cpu_fallback_allowed(previous);
   }
   // Allowed again, the same scheduler runs the step on the host.
   CpuBackendChosen chosen;
