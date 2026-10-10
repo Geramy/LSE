@@ -165,10 +165,10 @@ void usage() {
       "                         and best first: hrx:0,cpu:0 (default $LSE_POOL,\n"
       "                         else one device -- the first backend that comes\n"
       "                         up, at $LSE_DEVICE's ordinal)\n"
-      "      --no-cpu-fallback  never run on the CPU interpreter: fail at once\n"
-      "                         when no device backend comes up, when the pool\n"
-      "                         names a cpu device, or when an op has no device\n"
-      "                         kernel (default: allowed, logged and counted)\n"
+      "      --no-cpu-fallback  never run on the CPU interpreter, even with a cpu\n"
+      "                         pool member or LSE_BACKEND=cpu (default: refused\n"
+      "                         unless the run chose the cpu backend: no device\n"
+      "                         backend, or an op with no device kernel, fails)\n"
       "      --dialect NAME     source dialect to generate kernels in: loom or\n"
       "                         hip (default: loom). A device that does not\n"
       "                         declare it is given its own first choice instead\n"
@@ -679,7 +679,11 @@ int main(int argc, char** argv) {
   if (opt.list_cache) return list_cache();
   // Before anything opens a device: the device set reads it to refuse a
   // host-interpreter member.
-  if (opt.no_cpu_fallback) graph::set_cpu_fallback_allowed(false);
+  // Refused unless this run chose the CPU backend (graph::cpu_fallback_default).
+  graph::set_cpu_fallback_allowed(
+      !opt.no_cpu_fallback &&
+      graph::cpu_fallback_default(std::getenv("LSE_BACKEND"),
+                                  !opt.pool.empty() ? opt.pool.c_str() : std::getenv("LSE_POOL")));
   if (opt.debug) {
     lse::set_debug(true);
     const std::string dir = lse::graph::hip_dump_directory();

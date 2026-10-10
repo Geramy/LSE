@@ -292,8 +292,18 @@ defaulting to the model's value.
 
 ## CPU fallback
 
-An operation with no device kernel runs on the CPU interpreter. This is the only
-fallback LSE has, and it is reported every time:
+The CPU interpreter runs work only when the run chose the CPU backend itself:
+`LSE_BACKEND=cpu`, or a `--pool` (or `LSE_POOL`) entry `cpu` or `cpu:N`. Any
+other run refuses it:
+
+| Case | Default (no CPU backend chosen) | CPU backend chosen |
+|---|---|---|
+| No `--pool`, and no device backend comes up | Startup fails: `no device backend came up and CPU fallback is disabled (--no-cpu-fallback)`, followed by each backend and its reason | The CPU backend runs the model |
+| `--pool` names a CPU device (`cpu:0`) | (the CPU backend is chosen) | The CPU device is a pool member |
+| `--pool hrx:0` and that device does not come up | Startup fails, naming the device | The same |
+| An operation has no device kernel | The request fails with an error that starts with `CPU fallback disabled:` and names the operation group | It runs on the CPU and is reported as below |
+
+Where the CPU backend is chosen, every fallback is reported:
 
 - The server log prints `lse: CPU FALLBACK (N so far for this cause): <cause>` the
   first time a cause occurs and again at each power of two.
@@ -316,14 +326,10 @@ fallback LSE has, and it is reported every time:
 ### `--no-cpu-fallback`
 
 `lse-server --no-cpu-fallback`, `lse --no-cpu-fallback` and
-`lse_config.disable_cpu_fallback = 1` refuse the CPU interpreter instead:
-
-| Case | Without the option | With the option |
-|---|---|---|
-| No `--pool`, and no device backend comes up | The CPU backend runs the model, with a startup warning naming each backend that declined | Startup fails: `no device backend came up and CPU fallback is disabled (--no-cpu-fallback)`, followed by each backend and its reason |
-| `--pool` names a CPU device (`cpu:0`) | The CPU device is a pool member | Startup fails: `device cpu:0 is refused: it has no device code generator ...` |
-| `--pool hrx:0` and that device does not come up | Startup fails, naming the device | The same |
-| An operation has no device kernel | It runs on the CPU and is reported as above | The request fails with an error that starts with `CPU fallback disabled:` and names the operation group |
+`lse_config.disable_cpu_fallback = 1` refuse the CPU interpreter even for a run
+that chose the CPU backend: a `cpu:0` pool member is refused (`device cpu:0 is
+refused: it has no device code generator ...`) and an operation with no device
+kernel fails the request.
 
 A failed request gets HTTP 500 with `type: "server_error"`. If the reply is
 streamed, the error is sent in the stream. The engine stays loaded, and the next
@@ -331,5 +337,4 @@ request runs. `lse_open` returns NULL when startup fails, and `lse` exits with
 status 1.
 
 `LSE_REQUIRE_DEVICE_KERNELS=1` in the environment has the same effect as the
-option. It is the older qualification switch, kept for test runs. Leaving out the
-option does not override it.
+option. It is the older qualification switch, kept for test runs.

@@ -297,7 +297,8 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
                      graph::cpu_fallback_allowed()
                          ? "no backend came up"
                          : "no device backend came up and CPU fallback is "
-                           "disabled (--no-cpu-fallback)",
+                           "refused (it runs only for a run that chooses the cpu backend: "
+                           "LSE_BACKEND=cpu or a cpu pool entry, without --no-cpu-fallback)",
                      impl.declined.empty() ? "" : " (",
                      impl.declined, impl.declined.empty() ? "" : ")");
   }
@@ -326,7 +327,8 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
         !refusal.empty()) {
       return LSE_ERROR(kDeviceError, "the device spanning ",
                        std::to_string(named.size()), " members is refused: ",
-                       refusal, ", and CPU fallback is disabled (--no-cpu-fallback)");
+                       refusal, ", and CPU fallback is refused (it runs only for a run that chooses "
+                       "the cpu backend, without --no-cpu-fallback)");
     }
     backend::IBackend* shared = candidate.get();
     impl.owned.push_back(std::move(candidate));
@@ -355,7 +357,8 @@ Result<std::unique_ptr<Devices>> Devices::open(std::string_view selector) {
     if (const std::string refusal = host_interpreter_refusal(*candidate);
         !refusal.empty()) {
       return LSE_ERROR(kDeviceError, "device ", id.str(), " is refused: ",
-                       refusal, ", and CPU fallback is disabled (--no-cpu-fallback)");
+                       refusal, ", and CPU fallback is refused (it runs only for a run that chooses "
+                       "the cpu backend, without --no-cpu-fallback)");
     }
     adopt(std::move(candidate), id);
   }
