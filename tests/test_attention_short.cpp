@@ -1,4 +1,5 @@
 #include "harness.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
@@ -136,8 +137,16 @@ LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
 // A chain pass of one sequence over 16-bit K/V takes the flash split that
 // tree passes take; other storage keeps the short split.
 LSE_TEST(chain_passes_over_16_bit_kv_take_the_flash_split) {
+  // A described gfx1201, matrix generation included.
+  backend::AmdDeviceInfo amd;
+  const auto described = [&](Fixture& fx) {
+    backend::apply_arch_defaults(fx.gpu, amd);
+    fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    fx.gpu.extension = &amd;
+  };
   for (int queries : {2, 3, 4, 8}) {
     Fixture fx(queries, 4096);
+    described(fx);
     fx.k = leaf(fx.k.shape(), DType::kBF16);
     fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
     const auto out = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta,
@@ -146,10 +155,22 @@ LSE_TEST(chain_passes_over_16_bit_kv_take_the_flash_split) {
     LSE_EXPECT(out.node()->inputs[0]->prim->name() == "attention.flash_split.wmma16.v1");
   }
   Fixture fx(9, 4096);
+  described(fx);
   fx.k = leaf(fx.k.shape(), DType::kBF16);
   fx.v = leaf(fx.k.shape(), DType::kBF16);
   LSE_EXPECT(sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta, fx.table, 16,
                         &fx.gpu, kv::CacheDType::kBF16).node()->prim->name() != "attention.split_merge128.wg128c2.v1");
+}
+
+// Without a matrix generation the device keeps the short split.
+LSE_TEST(chain_passes_on_a_device_without_matrix_instructions_keep_the_short_split) {
+  Fixture fx(4, 4096);
+  fx.k = leaf(fx.k.shape(), DType::kBF16);
+  fx.v = leaf(fx.k.shape(), DType::kBF16);
+  const auto out = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta,
+                              fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+  LSE_EXPECT(out.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
+  LSE_EXPECT(out.node()->inputs[0]->prim->name() == "attention.split_partial128.wg128c2.v1");
 }
 
 LSE_TEST(short_split_merge_covers_more_partitions_than_weight_writers) {
