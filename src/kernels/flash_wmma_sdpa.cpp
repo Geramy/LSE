@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/graph/kernel_args.hpp"
@@ -30,6 +31,9 @@ namespace {
 constexpr std::uint32_t kThreads = dispatch::attention_shapes::kFlashThreads;
 constexpr std::uint32_t QTile = dispatch::attention_shapes::kFlashQueryTile;
 constexpr std::uint32_t kKWin = dispatch::attention_shapes::kFlashKeyWindow;
+// The split pair's probabilities are narrowed half a window at a time, into
+// rows padded by 16 bytes.
+constexpr std::uint32_t kSplitPairKeys = kKWin / 2u, kSplitPairProbRow = kSplitPairKeys + 8u;
 using Dims = dispatch::FlashDims;
 
 template <class E, kv::CacheDType Storage>
@@ -83,7 +87,12 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   //    tile's shape changes with every chunk the cache grows by, and each
   //    new shape's measurement (1.4 to 1.9 s at 1024 rows on the R9700)
   //    cost more than the variant ever won there.
-  enum class Variant { kBase, kStageHalf, kTwoTiles, kScoresInRegisters };
+  //  - kSplitPair: not a variant the trials choose but the part's rule
+  //    (FlashSplitPairRule): a split pass whose tiles read one key head
+  //    takes them two to a workgroup (emit_split_pair) from the rule's
+  //    context on, as variant 0. Its output is variant 0's bit for bit; it
+  //    is decided by the context, which a variant decision does not see.
+  enum class Variant { kBase, kStageHalf, kTwoTiles, kScoresInRegisters, kSplitPair };
   // Whether the device's 16x16x16 wave32 row carries a whole K step per
   // lane (gfx11), or nothing when the device has no such row.
   static std::optional<bool> contiguous_rows(const KernelShapes& s) {
@@ -95,7 +104,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     return std::nullopt;
   }
   static Variant variant_of(const KernelShapes& s) {
-    if (s.variant == 0u) return Variant::kBase;
+    if (s.variant == 0u) return split_pair_rule(s) ? Variant::kSplitPair : Variant::kBase;
     if (contiguous_rows(s).value_or(false)) {
       if (s.variant == 1u) return Variant::kStageHalf;
       return Split ? Variant::kScoresInRegisters : Variant::kTwoTiles;
@@ -139,6 +148,43 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   }
   // The checks emit_two_tiles makes before it writes anything; the other
   // variants emit wherever the default does.
+  // What emit_split_pair needs: a split pass on 16-bit K/V with a
+  // dimension-major value pool of 16-key blocks, a causal or tree mask, value
+  // rows of at most 256 (one 16-wide tile per wave), and its scratch.
+  static bool split_pair_fits(const KernelShapes& s, const Dims& d) {
+    if constexpr (!Split) {
+      return false;
+    } else {
+      if (!d.valid || s.device == nullptr || s.input_dtypes.size() < 2 ||
+          (s.input_dtypes[1] != DType::kF16 && s.input_dtypes[1] != DType::kBF16) ||
+          !d.dim_major_values || d.ts != 16u || d.dh % 16u != 0 || d.dv % 16u != 0 ||
+          d.dv > 256u || s.device->max_threads_per_workgroup < 512u ||
+          s.output.rank() != 5)
+        return false;
+      const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
+      if (mask != 1 && mask != 3) return false;
+      constexpr std::uint32_t QR = QTile * 2u;
+      const std::uint64_t bytes = std::uint64_t{QR} * ((d.dh + 15u) / 16u * 16u + 8u) * 2u +
+          std::uint64_t{QR} * kKWin * 4u + 4u * QR * 4u + std::uint64_t{QR} * kSplitPairProbRow * 2u;
+      return bytes <= workgroup_lds_bytes(s.device);
+    }
+  }
+  // Whether the part's FlashSplitPairRule takes this split pass in pairs.
+  static bool split_pair_rule(const KernelShapes& s) {
+    if constexpr (!Split) {
+      return false;
+    } else {
+      if (s.device == nullptr || !contiguous_rows(s).value_or(false)) return false;
+      const Dims d = dispatch::flash_dimensions(dense_request(s));
+      if (!d.valid || d.tq == 0 || d.group == 0) return false;
+      const std::uint32_t tiles = d.group / split_heads_per_tile(d) * ((d.tq + QTile - 1u) / QTile);
+      const std::uint64_t keys = std::uint64_t{d.stride} * d.ts;
+      for (const auto& rule : dispatch::arch::tuning(s.device->arch).flash_split_pair)
+        if (rule.arch == s.device->arch && tiles >= rule.min_tiles && keys >= rule.min_keys)
+          return split_pair_fits(s, d);
+      return false;
+    }
+  }
   bool variant_accepts(const KernelShapes& s, std::uint32_t v) const override {
     KernelShapes at = s;
     at.variant = v;
@@ -164,6 +210,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   std::uint32_t variants(const KernelShapes& s) const override {
     const auto contiguous = contiguous_rows(s);
     if (!contiguous) return 1u;
+    // A pass the pair rule takes has that form and no other.
+    if (split_pair_rule(s)) return 1u;
     if (*contiguous) return 3u;
     return Split ? 2u : 1u;
   }
@@ -221,6 +269,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
                                          16, 16).wave != 32) {
                   return {};
                 } else {
+                  if (variant_of(s) == Variant::kSplitPair) return emit_split_pair<Storage, G>(s);
                   return variant_of(s) == Variant::kTwoTiles ? emit_two_tiles<Storage, G>(s)
                                                              : emit_storage<Storage, G>(s);
                 }
@@ -661,6 +710,370 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             e.store(obase + qrow * d.dv + dimension, o[t * value_tiles + vt][static_cast<int>(f)].read() / inv);
         }
       }
+    if (!k.lds().ok()) return {};
+    return k.str();
+    }
+  }
+
+  // The pair form of a split pass (FlashSplitPairRule), on a
+  // contiguous-fragment generation with 16-bit K/V and a dimension-major
+  // value pool: two tiles of one key head's share per workgroup, on sixteen
+  // waves. Every key fragment and value
+  // fragment the workgroup reads feeds both tiles, so a share's keys and
+  // values are read once per pair of tiles where variant 0 reads them once
+  // per tile (a 15-row tree pass reads them six times, a 31-row one twelve).
+  // The pair is two consecutive tiles of the key head's split order: two
+  // query heads of a tree pass, a head's two row tiles of a 31-row one, the
+  // packed heads of a chain. A tile the key head has no partner for (an odd
+  // count) does nothing. A tile that does not visit a window (the causal
+  // edge, or the absent partner) skips it as its own workgroup would: no
+  // scores, no softmax, no value product. Each row's scores, softmax and
+  // products are variant 0's, value for value and in the same order; the
+  // probabilities are narrowed into scratch half a window at a time from the
+  // kept scores and each row's maximum, which is variant 0's narrowing of
+  // the same values.
+  template <kv::CacheDType Storage, math::MatrixTarget G>
+  std::string emit_split_pair(const KernelShapes& s) const {
+    constexpr auto operand = Storage == kv::CacheDType::kF16
+                                 ? math::MatrixElem::kF16 : math::MatrixElem::kBF16;
+    using Mma = math::op::Mma<G, math::MatrixElem::kF32, operand, 16, 16, 16>;
+    using Narrow = math::matrix_scalar_t<Mma::kRow.a_elem>;
+    constexpr TileGeometry kGeo = geometry_of(Mma::kRow);
+    constexpr std::uint32_t kFrag = kGeo.lane_k;
+    constexpr int kSlots = Mma::kRow.c_len;
+    constexpr bool kWideKv =
+        Storage == kv::CacheDType::kF16 || Storage == kv::CacheDType::kBF16;
+    if constexpr (!Split || kGeo.split_k || !kWideKv || kFrag != 16u) {
+      return {};
+    } else {
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    if (!split_pair_fits(s, d)) return {};
+    constexpr std::uint32_t kTiles = 2, QR = QTile * kTiles, kW = 16, kT = kW * 32u;
+    constexpr std::uint32_t kRowsPerWave = QR / kW;
+    const std::uint32_t mask = static_cast<std::uint32_t>(d.mask == 2 && d.window == 0u ? 1 : d.mask);
+    const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
+    const std::uint32_t pack = split_heads_per_tile(d);
+    const std::uint32_t per_key_head = d.group / pack * ntiles;
+    const std::uint32_t pairs = (per_key_head + kTiles - 1u) / kTiles;
+    const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    const std::uint32_t qrow_stride = padded_depth + 8u;
+    const std::uint32_t qchunks = (QR * padded_depth + kT - 1u) / kT;
+    const std::uint32_t value_tiles = (d.dv / 16u + kW - 1u) / kW;
+    const std::uint32_t parts = static_cast<std::uint32_t>(s.output.dim(3));
+    const std::uint32_t share = dispatch::attention_shapes::flash_split_share(
+        std::uint64_t{d.stride} * d.ts, parts);
+
+    kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
+    k.set_store(s.store);
+    FlashArgs<env::Emit, Storage> a;
+    if (!env::bind(k, a, s)) return {};
+    env::Emit e{&k};
+    const auto qs = e.lds<Narrow>(QR * qrow_stride);
+    const auto sc = e.lds<kir::f32>(QR * kKWin);
+    const auto mrow = e.lds<kir::f32>(QR);
+    const auto drow = e.lds<kir::f32>(QR);
+    const auto arow = e.lds<kir::f32>(QR);
+    const auto smax = e.lds<kir::f32>(QR);
+    const auto pb = e.lds<Narrow>(QR * kSplitPairProbRow);
+
+    const auto lid = e.let(math::local_id());
+    const auto wg = e.let(math::workgroup_id_x());
+    // Ordered as variant 0 orders its tiles: share by share, key head by key
+    // head, so the pairs reading one key head's share run together.
+    const auto pair = e.let(wg % pairs);
+    const auto kh = e.let((wg / pairs) % d.kvh);
+    const auto part = e.let((wg / (pairs * d.kvh)) % parts);
+    const auto b = e.let(wg / (pairs * d.kvh * parts));
+    const auto ti0 = e.let(pair * kTiles);
+    const auto has1 = e.let(ti0 + 1u < per_key_head);
+    const auto ti1 = e.let(select(has1, ti0 + 1u, ti0));
+    const auto h0 = e.let(kh * d.group + ti0 / ntiles * pack);
+    const auto h1 = e.let(kh * d.group + ti1 / ntiles * pack);
+    const auto q00 = e.let(ti0 % ntiles * QTile);
+    const auto q01 = e.let(ti1 % ntiles * QTile);
+    // Pair row R: tile R / 16, that tile's row R % 16.
+    const auto tile_head = [&](const auto& R) { return e.let(select(R < QTile, h0, h1)); };
+    const auto tile_q0 = [&](const auto& R) { return e.let(select(R < QTile, q00, q01)); };
+    const auto row_query = [&](const auto& R) {
+      if (pack > 1u) return e.let(R % QTile % d.tq);
+      return e.let(tile_q0(R) + R % QTile);
+    };
+    const auto row_head = [&](const auto& R) {
+      if (pack > 1u) return e.let(tile_head(R) + R % QTile / d.tq);
+      return tile_head(R);
+    };
+    const auto row_live = [&](const auto& R) {
+      const auto present = e.let(R < QTile || has1);
+      if (pack > 1u) return e.let(present && R % QTile < pack * d.tq);
+      return e.let(present && tile_q0(R) + R % QTile < d.tq);
+    };
+    const auto record = [&](const auto& R) {
+      return e.let((((b * d.qh + row_head(R)) * d.tq + row_query(R)) * parts + part) *
+                   dispatch::attention_shapes::kSplitRecord);
+    };
+
+    const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
+    if (auto pad = e.when(b >= rows)) {
+      for (std::uint32_t r = 0; r < QR; ++r) {
+        const auto dd = e.let(lid + 0u);
+        if (auto g = e.when(row_live(e.u32(r)) && dd < d.dv)) {
+          const auto rec = record(e.u32(r));
+          e.store(e.let(rec + 2u + dd), e.f32(0.0f));
+          if (auto lead = e.when(dd == 0u)) {
+            e.store(rec, e.f32(0.0f));
+            e.store(e.let(rec + 1u), e.f32(0.0f));
+          }
+        }
+      }
+    }
+    (void)e.ret_if(b >= rows);
+
+    const auto mb =
+        e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
+              b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
+    const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto capacity = e.u32(d.stride * d.ts);
+    const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
+    const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
+    const auto tb = e.let(b * d.stride);
+
+    for (std::uint32_t c = 0; c < qchunks; ++c) {
+      const auto idx = e.let(lid + c * kT);
+      if (auto inb = e.when(idx < QR * padded_depth)) {
+        const auto R = e.let(idx / padded_depth);
+        const auto dd = e.let(idx % padded_depth);
+        const auto qslot = e.let(R * qrow_stride + dd);
+        qs[qslot] = math::narrow<Narrow>(e.f32(0.0f));
+        if (auto g = e.when(row_live(R) && dd < d.dh)) {
+          const auto qvalue = e.let(a.q[e.let(((b * d.qh + row_head(R)) * d.tq + row_query(R)) * d.dh + dd)]);
+          qs[qslot] = math::narrow<Narrow>(qvalue);
+        }
+      }
+    }
+    if (auto g = e.when(lid < QR)) {
+      mrow[lid] = math::neg_inf();
+      drow[lid] = e.f32(0.0f);
+    }
+
+    const auto wave = e.let(lid / 32u);
+    const auto lane = e.let(lid % 32u);
+    const auto lane_lo = e.let(lane % 16u);
+    const auto lane_hi = e.let(lane / 16u);
+    const auto acc_row = [&](std::uint32_t f) {
+      return e.let(f * kGeo.slot_step + lane_hi * kGeo.half_rows);
+    };
+    std::vector<decltype(e.local<kir::f32, kSlots>())> o;
+    for (std::uint32_t i = 0; i < kTiles * value_tiles; ++i) {
+      o.push_back(e.local<kir::f32, kSlots>());
+      for (auto f : e.unroll(8u)) o.back()[f] = e.f32(0.0f);
+    }
+    const auto last_position = [&](const auto& q0) {
+      const auto last = e.let(select(q0 + (QTile - 1u) < d.tq, q0 + (QTile - 1u), e.u32(d.tq - 1u)));
+      return e.let(kir::cast<std::int64_t>(offset) + kir::cast<std::int64_t>(last));
+    };
+    const auto last_position0 = last_position(q00);
+    const auto last_position1 = last_position(q01);
+    e.barrier();
+
+    const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
+    const auto kv_len = e.runtime_extent(
+        "kv_len", select(loaded_max < capacity, loaded_max, capacity));
+    const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
+    const auto first_window = e.let(part * share);
+    for (auto w : e.range(first_window, e.let(first_window + share), 1u)) {
+      const auto wbase = e.let(w * kKWin);
+      const auto signed_start = e.let(kir::cast<std::int64_t>(wbase));
+      // Whether each tile visits the window, as its own workgroup would.
+      const auto visits0 = e.let(wbase < row_len && signed_start <= last_position0);
+      const auto visits1 = e.let(has1 && wbase < row_len && signed_start <= last_position1);
+      if (auto live_window = e.when((visits0 || visits1) && w < nwin)) {
+        const auto write_score = [&](std::uint32_t tile, const kir::Val<kir::u32>& R,
+                                     const kir::Val<kir::u32>& key,
+                                     const kir::Val<kir::f32>& value) {
+          (void)tile;
+          const auto query_row = row_query(R);
+          const auto position = e.let(kir::cast<std::int64_t>(offset) +
+                                      kir::cast<std::int64_t>(query_row));
+          const auto signed_key = e.let(kir::cast<std::int64_t>(key));
+          const auto slot = e.let(R * kKWin + key - wbase);
+          sc[slot] = math::neg_inf();
+          if (auto live_score = e.when(key < row_len && row_live(R))) {
+            if (mask == 1) {
+              if (auto causal = e.when(signed_key <= position)) sc[slot] = value;
+            } else {
+              const auto before = e.let(key < offset);
+              if (auto prior = e.when(before)) {
+                if (auto visible = e.when(signed_key <= position)) sc[slot] = value;
+              }
+              if (auto own = e.when(key >= offset)) {
+                const auto column = e.let(key - offset);
+                const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
+                                                     query_row * d.tq + column)]);
+                if (auto visible = e.when(signed_key <= position && seen != 0.0f)) sc[slot] = value;
+              }
+            }
+          }
+        };
+        {
+          // One 16-key column tile per wave; each key fragment feeds both tiles.
+          const auto key = e.let(wbase + wave * 16u + lane_lo);
+          std::vector<decltype(e.local<kir::f32, 8>())> acc;
+          for (std::uint32_t t = 0; t < kTiles; ++t) {
+            acc.push_back(e.local<kir::f32, 8>());
+            for (auto f : e.unroll(8u)) acc.back()[f] = e.f32(0.0f);
+          }
+          const auto safe_key = e.let(select(key < row_len, key, wbase));
+          const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+          const auto vector = e.let((page * d.kvh + kh) * d.ts + safe_key % d.ts);
+          constexpr std::uint32_t kStepsPerBatch = 8;
+          const auto kbase = e.let(vector * d.dh);
+          const std::uint32_t steps = padded_depth / 16u;
+          using KeyFrag = lse::vec<Narrow, 16>;
+          for (std::uint32_t first = 0; first < steps; first += kStepsPerBatch) {
+            const std::uint32_t last = std::min(steps, first + kStepsPerBatch);
+            std::vector<kir::Pack<KvElement<Storage>>> keys;
+            for (std::uint32_t step = first; step < last; ++step)
+              keys.push_back(k.load_elems<KvElement<Storage>>(
+                  a.k.b.id(), e.let(kbase + step * 16u), 16u));
+            for (std::uint32_t step = first; step < last; ++step) {
+              const kir::Val<KeyFrag> kf(&k.types(), &k.ir(), keys[step - first].id());
+              for (std::uint32_t t = 0; t < kTiles; ++t) {
+                // The second tile's products only where the key head has it.
+                std::optional<env::Emit::Guard> present;
+                if (t != 0) present.emplace(e.k, has1);
+                const auto qbase = e.let((t * QTile + lane_lo) * qrow_stride + step * 16u);
+                const auto qlo = qs.load(qbase, 16u);
+                const auto qhi = qs.load(e.let(qbase + 8u), 16u);
+                auto qa = e.local<Narrow, 16>();
+                for (int j = 0; j < 8; ++j) {
+                  qa[j] = qlo[j];
+                  qa[8 + j] = qhi[j];
+                }
+                acc[t] = math::mma<Mma>(qa.value(), kf, acc[t].value());
+              }
+            }
+          }
+          for (std::uint32_t t = 0; t < kTiles; ++t) {
+            if (auto visits = e.when(t == 0 ? visits0 : visits1)) {
+              // A window wholly before the pass's first position: every key
+              // in it lies inside each row and before each query position.
+              if (auto prior = e.when(wbase + kKWin <= offset)) {
+                for (std::uint32_t f = 0; f < 8u; ++f) {
+                  const auto R = e.let(acc_row(f) + t * QTile);
+                  sc[e.let(R * kKWin + key - wbase)] =
+                      select(row_live(R), e.let(acc[t][static_cast<int>(f)].read() * d.scale),
+                             math::neg_inf());
+                }
+              }
+              if (auto edge = e.when(wbase + kKWin > offset)) {
+                for (std::uint32_t f = 0; f < 8u; ++f)
+                  write_score(t, e.let(acc_row(f) + t * QTile), key,
+                              e.let(acc[t][static_cast<int>(f)].read() * d.scale));
+              }
+            }
+          }
+        }
+        e.barrier();
+
+        // The softmax of each row of a visiting tile; waves 0-7 own tile 0's
+        // rows, 8-15 tile 1's.
+        const auto wave_visits = e.let(select(wave < kW / kTiles, visits0, visits1));
+        for (std::uint32_t wr = 0; wr < kRowsPerWave; ++wr) {
+          const auto row = e.let(wave * kRowsPerWave + wr);
+          if (auto softmax = e.when(wave_visits)) {
+            auto maximum = e.var(math::neg_inf());
+            for (auto f : e.unroll(8u))
+              maximum = math::max(maximum.read(), sc[e.let(row * kKWin + lane + f * 32u)].read());
+            for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
+              maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
+            const auto old_max = e.let(mrow[row].read());
+            const auto new_max = e.let(math::max(old_max, maximum.read()));
+            const auto empty = e.let(new_max == math::neg_inf());
+            const auto safe_max = e.let(select(empty, e.f32(0.0f), new_max));
+            const auto alpha = e.let(select(empty, e.f32(1.0f), math::exp(old_max - safe_max)));
+            auto total = e.var(0.0f);
+            for (auto f : e.unroll(8u)) {
+              const auto index = e.let(row * kKWin + lane + f * 32u);
+              const auto probability = e.let(math::exp(sc[index].read() - safe_max));
+              total = total.read() + probability;
+            }
+            for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
+              total = total.read() + math::shfl_xor(total.read(), e.u32(shift));
+            if (auto leader = e.when(lane == 0u)) {
+              mrow[row] = new_max;
+              arow[row] = alpha;
+              smax[row] = safe_max;
+              drow[row] = math::fma(drow[row].read(), alpha, total.read());
+            }
+          }
+        }
+        e.barrier();
+        for (std::uint32_t t = 0; t < kTiles; ++t)
+          if (auto rescale = e.when(t == 0 ? visits0 : visits1))
+            for (std::uint32_t vt = 0; vt < value_tiles; ++vt)
+              for (std::uint32_t f = 0; f < 8u; ++f) {
+                const auto R = e.let(acc_row(f) + t * QTile);
+                auto& out = o[t * value_tiles + vt];
+                out[static_cast<int>(f)] = out[static_cast<int>(f)].read() * arow[R].read();
+              }
+        for (std::uint32_t half = 0; half < kKWin; half += kSplitPairKeys) {
+          // The half window's probabilities, narrowed: zero for a tile that
+          // does not visit the window.
+          for (std::uint32_t c = 0; c < QR * kSplitPairKeys / kT; ++c) {
+            const auto idx = e.let(lid + c * kT);
+            const auto R = e.let(idx / kSplitPairKeys);
+            const auto key = e.let(idx % kSplitPairKeys);
+            const auto takes = e.let(select(R < QTile, visits0, visits1));
+            const auto probability = e.let(math::exp(
+                sc[e.let(R * kKWin + half + key)].read() - smax[R].read()));
+            pb[e.let(R * kSplitPairProbRow + key)] = math::narrow<Narrow>(
+                select(takes, probability, e.f32(0.0f)));
+          }
+          e.barrier();
+          for (std::uint32_t step = 0; step < kSplitPairKeys; step += 16u) {
+            // A block past the row reads the window's first block: its
+            // probabilities are exactly zero, so only finiteness matters.
+            const auto key0 = e.let(wbase + half + step);
+            const auto safe_key = e.let(select(key0 < row_len, key0, wbase));
+            const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+            using Frag = lse::vec<Narrow, 16>;
+            std::vector<kir::Val<Frag>> pf;
+            for (std::uint32_t t = 0; t < kTiles; ++t) {
+              const auto ap = pb.load_elems(e.let((t * QTile + lane_lo) * kSplitPairProbRow + step), 16u);
+              pf.push_back(kir::Val<Frag>(&k.types(), &k.ir(), ap.id()));
+            }
+            for (std::uint32_t vt = 0; vt < value_tiles; ++vt) {
+              const auto dimension = e.let((wave + vt * kW) * 16u + lane_lo);
+              const auto safe_dim = e.let(select(dimension < d.dv, dimension, e.u32(d.dv - 1u)));
+              const auto base = e.let(((page * d.kvh + kh) * d.dv + safe_dim) * d.ts);
+              const auto values = k.load_elems<KvElement<Storage>>(a.v.b.id(), base, 16u);
+              const kir::Val<Frag> vf(&k.types(), &k.ir(), values.id());
+              for (std::uint32_t t = 0; t < kTiles; ++t)
+                if (auto takes = e.when(t == 0 ? visits0 : visits1)) {
+                  auto& out = o[t * value_tiles + vt];
+                  out = math::mma<Mma>(pf[t], vf, out.value());
+                }
+            }
+          }
+          e.barrier();
+        }
+      }
+    }
+
+    for (std::uint32_t t = 0; t < kTiles; ++t)
+      for (std::uint32_t vt = 0; vt < value_tiles; ++vt) {
+        const auto dimension = e.let((wave + vt * kW) * 16u + lane_lo);
+        for (std::uint32_t f = 0; f < 8u; ++f) {
+          const auto R = e.let(acc_row(f) + t * QTile);
+          if (auto live_query = e.when(row_live(R) && dimension < d.dv))
+            e.store(e.let(record(R) + 2u + dimension), o[t * value_tiles + vt][static_cast<int>(f)].read());
+        }
+      }
+    if (auto lead = e.when(lid < QR && row_live(lid))) {
+      const auto rec = record(lid);
+      e.store(rec, mrow[lid].read());
+      e.store(e.let(rec + 1u), drow[lid].read());
+    }
     if (!k.lds().ok()) return {};
     return k.str();
     }
@@ -1514,6 +1927,12 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const std::uint32_t tiles = two_tiles ? (ntiles + 1u) / 2u : ntiles;
     tp.workgroup_size[0] = two_tiles ? 2u * kThreads : kThreads;
     tp.workgroup_count[0] = d.valid ? d.bsz * (d.qh / split_heads_per_tile(d)) * tiles * parts : 1u;
+    if (variant_of(s) == Variant::kSplitPair && d.valid) {
+      // Pairs of each key head's tiles, an odd count's last pair half empty.
+      const std::uint32_t per_key_head = d.group / split_heads_per_tile(d) * ntiles;
+      tp.workgroup_size[0] = 2u * kThreads;
+      tp.workgroup_count[0] = d.bsz * d.kvh * ((per_key_head + 1u) / 2u) * parts;
+    }
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
     return tp;

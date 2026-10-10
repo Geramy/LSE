@@ -55,6 +55,7 @@ struct Tuning {
   // Attention (attention.cpp).
   std::span<const attention_shapes::FlashWmmaRule> flash_wmma;
   std::span<const attention_shapes::FlashCacheRule> flash_cache;
+  std::span<const attention_shapes::FlashSplitPairRule> flash_split_pair;
   std::span<const attention_shapes::DecodeRule> decode;
   std::span<const attention_shapes::SplitShortRule> split_short;
   std::span<const attention_shapes::WaveL2Rule> wave_l2;

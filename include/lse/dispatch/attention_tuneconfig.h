@@ -71,6 +71,17 @@ struct FlashWmmaRule {
 // The device rows of these rules live in the per-architecture headers
 // (lse/dispatch/arch/<gfx>.hpp) and are selected by dispatch::arch::tuning.
 
+// A split pass's tiles taken two to a workgroup (the flash split's pair
+// form), sharing every key and value read: where at least min_tiles of a
+// pass's tiles read one key head and the block table holds at least min_keys
+// keys. Below that the pass has too few windows per tile for the pair's
+// fewer, wider workgroups to fill the part.
+struct FlashSplitPairRule {
+  std::string_view arch;
+  std::uint32_t min_tiles;
+  std::uint64_t min_keys;
+};
+
 struct FlashCacheRule {
   std::string_view arch;
   std::uint32_t min_rows, min_capacity;
@@ -91,6 +102,14 @@ struct DecodeRule {
   std::string_view arch;
   std::uint32_t wave, threads, query_rows, head_dim;
   std::uint32_t max_block;
+  // Keys a wave's loop iteration of the split partial takes in its score
+  // pass, and value quads in its value pass, their loads issued together
+  // before any of their arithmetic. Each key's score and each value sum is
+  // computed by the same operations in the same order at any batch; a
+  // larger batch only keeps more of the cache's reads in flight.
+  std::uint32_t key_batch = 1;
+  // ... from a block table of this many keys on; shorter ones take one.
+  std::uint64_t key_batch_min_keys = 0;
 };
 
 struct DecodeHeadRule {

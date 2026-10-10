@@ -185,6 +185,17 @@ inline constexpr std::array kQ8PanelRules{
 inline constexpr std::array kFlashWmmaRules{
     attention_shapes::FlashWmmaRule{kArch, 32, 256, 2, 512},
 };
+// A draft tree's verify attention two tiles to a workgroup (the flash split's
+// pair form): a 15-row tree is six tiles of one key head, a 31-row one
+// twelve, and each tile read the key head's share on its own. Output bit for
+// bit the same. One layer, test_attention_long (single-tile -> pair, us):
+//   15 rows:  2K 62 -> 73,   4K 121 -> 108,  16K 641 -> 456,  64K 2518 -> 1700
+//   31 rows:  2K 110 -> 119, 4K 204 -> 198,  16K 1104 -> 937, 64K 4557 -> 3814
+// Chains (two or three tiles of a key head) gain under 3% at 64K and lose at
+// short contexts: not taken. 128K: 15 rows 4900 -> 3616, 31 rows 8783 -> 7779.
+inline constexpr std::array kFlashSplitPairRules{
+    attention_shapes::FlashSplitPairRule{kArch, 4, 4096},
+};
 
 // Decode-time attention (sdpa.cpp, attention.cpp). Without these rules a
 // decode step's attention runs as one workgroup per KV-head pair over the
@@ -194,8 +205,18 @@ inline constexpr std::array kFlashWmmaRules{
 // at the same wave, threads, head width and block bound, with scratch well
 // inside 64 KiB. The wave-per-row L2 normalization rides along at the same
 // geometry.
+//
+// From 8K keys, four keys (and four value quads) a wave per loop iteration,
+// their reads issued together (DecodeRule::key_batch; output unchanged bit
+// for bit). One layer's decode attention (split partial and merge),
+// test_attention_long:
+//   16K keys    488 ->  447 us
+//   64K keys   1628 -> 1469 us (165 -> 183 GB/s of K/V; batch 2: 1542)
+//   128K keys  3103 -> 2876 us (173 -> 187 GB/s; batch 8 no faster than 4)
+// against 235 GB/s for a plain streaming read on the part; at 4K keys
+// (98 -> 106 us) the batch is slower.
 inline constexpr std::array kDecodeRules{
-    attention_shapes::DecodeRule{kArch, 32, 128, 1, 256, 256},
+    attention_shapes::DecodeRule{kArch, 32, 128, 1, 256, 256, 4, 8192},
 };
 inline constexpr std::array kSplitShortRules{
     attention_shapes::SplitShortRule{kArch, 32, 2, 8, 128, 256},
@@ -216,6 +237,7 @@ inline constexpr Tuning kTuning{
     .q4_panel_shapes = kQ4DecodePanelShapes,
     .q8_panel_rules = kQ8PanelRules,
     .flash_wmma = kFlashWmmaRules,
+    .flash_split_pair = kFlashSplitPairRules,
     .decode = kDecodeRules,
     .split_short = kSplitShortRules,
     .wave_l2 = kWaveL2Rules,
@@ -240,6 +262,7 @@ static_assert(rows_name(kQuantInt8Rows, kArch) &&
               rows_name(kQ4DecodePanelShapes, kArch) &&
               rows_name(kQ8PanelRules, kArch) &&
               rows_name(kFlashWmmaRules, kArch) &&
+              rows_name(kFlashSplitPairRules, kArch) &&
               rows_name(kDecodeRules, kArch) &&
               rows_name(kSplitShortRules, kArch) &&
               rows_name(kWaveL2Rules, kArch));

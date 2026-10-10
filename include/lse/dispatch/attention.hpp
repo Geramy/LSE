@@ -32,6 +32,8 @@ struct FlashDims {
 [[nodiscard]] bool split_decode_scope(const Shape& query, std::int64_t offset,
                                        std::int64_t capacity);
 [[nodiscard]] bool split_decode_supported(const graph::KernelShapes&);
+// The decode rule's key batch for a pass split_decode_supported accepts.
+[[nodiscard]] std::uint32_t split_decode_key_batch(const graph::KernelShapes&);
 [[nodiscard]] bool split_decode_merge_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_short_scope(const Shape& query, std::int64_t offset,
                                     std::int64_t capacity);
