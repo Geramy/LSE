@@ -295,6 +295,9 @@ Status ensure_paged_kv(PagedKvLayer& layer, std::int32_t rows, std::int32_t toke
   }
 
   const Shape pool{want_blocks, kvh, kv::kBlockSize, pitch};
+  // Values dimension-major where the storage allows (kv::dimension_major_values).
+  const Shape value_pool = kv::dimension_major_values(format, kv::kBlockSize, pitch)
+      ? Shape{want_blocks, kvh, pitch, kv::kBlockSize} : pool;
   const bool resize = !layer.keys.valid() ||
                       layer.keys.shape().dim(0) != want_blocks;
   if (resize && layer.keys.valid()) {
@@ -319,10 +322,10 @@ Status ensure_paged_kv(PagedKvLayer& layer, std::int32_t rows, std::int32_t toke
           static_cast<std::size_t>(pool_ceiling(layer, rows, capacity)) *
           kv::block_plane_bytes(format, kvh, hd);
       LSE_ASSIGN_OR(layer.keys, grow_fragments(layer, layer.keys, pool, dtype, capacity_bytes));
-      LSE_ASSIGN_OR(layer.values, grow_fragments(layer, layer.values, pool, dtype, capacity_bytes));
+      LSE_ASSIGN_OR(layer.values, grow_fragments(layer, layer.values, value_pool, dtype, capacity_bytes));
     } else {
       LSE_ASSIGN_OR(layer.keys, regrow_pool(layer.keys, pool, dtype));
-      LSE_ASSIGN_OR(layer.values, regrow_pool(layer.values, pool, dtype));
+      LSE_ASSIGN_OR(layer.values, regrow_pool(layer.values, value_pool, dtype));
     }
     LSE_RETURN_IF_ERROR(layer.alloc.grow(want_blocks));
     layer.storage = format;

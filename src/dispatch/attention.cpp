@@ -81,9 +81,12 @@ bool paged_inputs(const KernelShapes& s) {
   const auto& v = s.inputs[2];
   const auto& table = s.inputs[4];
   const auto storage = kv::cache_dtype(s.input_dtypes[1], s.attrs[1]);
+  const bool dim_major = dimension_major_values(k, v);
+  if (dim_major && !kv::dimension_major_values(storage, k.dim(2), k.dim(3))) return false;
   if (q.dim(0) > (INT32_MAX - kv::kStepMetaHeader) / kv::kStepMetaPerRow ||
       q.dim(1) % k.dim(1) || q.dim(3) != kv::logical_width(storage, k.dim(3)) ||
-      k.dim(0) != v.dim(0) || k.dim(1) != v.dim(1) || k.dim(2) != v.dim(2) ||
+      k.dim(0) != v.dim(0) || k.dim(1) != v.dim(1) ||
+      (!dim_major && k.dim(2) != v.dim(2)) ||
       table.dim(0) < q.dim(0) || !power_of_two(k.dim(2)) ||
       s.iattrs[3] != k.dim(2) || table.dim(1) > UINT32_MAX / k.dim(2) ||
       s.inputs[3].elem_count() < static_cast<std::size_t>(
@@ -108,6 +111,12 @@ bool paged_inputs(const KernelShapes& s) {
 
 bool paged_attention_inputs_valid(const KernelShapes& s) { return paged_inputs(s); }
 
+bool dimension_major_values(const Shape& keys, const Shape& values) {
+  return keys.rank() == 4 && values.rank() == 4 && keys.dim(2) != keys.dim(3) &&
+         values.dim(0) == keys.dim(0) && values.dim(1) == keys.dim(1) &&
+         values.dim(2) == keys.dim(3) && values.dim(3) == keys.dim(2);
+}
+
 FlashDims flash_dimensions(const KernelShapes& s) {
   FlashDims d;
   if (!paged_inputs(s) || s.inputs[1].dim(2) > shapes::kFlashKeyWindow ||
@@ -120,8 +129,10 @@ FlashDims flash_dimensions(const KernelShapes& s) {
   d.dh = static_cast<std::uint32_t>(q.dim(3));
   d.kvh = static_cast<std::uint32_t>(k.dim(1));
   d.ts = static_cast<std::uint32_t>(k.dim(2));
+  d.dim_major_values = dimension_major_values(k, s.inputs[2]);
   d.dv = static_cast<std::uint32_t>(kv::logical_width(
-      kv::cache_dtype(s.input_dtypes[1], s.attrs[1]), s.inputs[2].dim(3)));
+      kv::cache_dtype(s.input_dtypes[1], s.attrs[1]),
+      d.dim_major_values ? s.inputs[2].dim(2) : s.inputs[2].dim(3)));
   d.group = d.qh / d.kvh;
   d.stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
   d.scale = s.attrs[0];
@@ -171,8 +182,8 @@ bool split_decode_scope(const Shape& query, std::int64_t offset, std::int64_t ca
 
 bool split_decode_supported(const KernelShapes& s) {
   if (!paged_inputs(s) || !s.device || !attention_ops(s) ||
-      s.inputs[1] != s.inputs[2] || !std::isfinite(s.attrs[0]) ||
-      s.attrs[0] <= 0.0f) return false;
+      (s.inputs[1] != s.inputs[2] && !dimension_major_values(s.inputs[1], s.inputs[2])) ||
+      !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return false;
   const auto& q = s.inputs[0];
   const auto block = s.inputs[1].dim(2);
   const auto capacity = s.inputs[4].dim(1) * block;
@@ -240,7 +251,8 @@ bool split_short_default_supported(const KernelShapes& s) {
 
 bool split_short_supported(const KernelShapes& s) {
   if (!paged_inputs(s) || !s.device || !attention_ops(s) ||
-      !has_ops(s, {"wave.shfl_xor"}) || s.inputs[1] != s.inputs[2] ||
+      !has_ops(s, {"wave.shfl_xor"}) ||
+      (s.inputs[1] != s.inputs[2] && !dimension_major_values(s.inputs[1], s.inputs[2])) ||
       !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return false;
   const auto capacity = s.inputs[4].dim(1) * s.inputs[1].dim(2);
   const auto rows = static_cast<std::uint32_t>(s.inputs[0].dim(2));

@@ -181,8 +181,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     if (d.dh % 16u != 0 || d.dv % 16u != 0 || d.dv > 256u ||
         s.device->max_threads_per_workgroup < kT) return {};
     const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
-    // A draft tree's ancestor mask (mask 3) stays with the single-tile form.
-    if (mask == 3) return {};
+    // A draft tree's ancestor mask (mask 3) stays with the single-tile form,
+    // and so does a dimension-major value pool, whose fragments that form
+    // reads from the cache directly.
+    if (mask == 3 || d.dim_major_values) return {};
     const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
     const std::uint32_t npairs = (ntiles + kTiles - 1u) / kTiles;
     const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
@@ -656,7 +658,12 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         if (vsub == 0 && !(s.variant == 1u && keys == 32u) &&
             used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
     }
-    const auto vs = e.lds<Narrow>(stage_values && vsub ? vsub * vrow : 8u);
+    // A dimension-major value pool (kv::dimension_major_values) holds each
+    // 16-key block's values for one dimension contiguously: a lane's value
+    // fragment is then one or two 16-byte reads straight from the cache,
+    // with no staging block or barriers.
+    const bool direct_values = stage_values && d.dim_major_values && d.ts == 16u;
+    const auto vs = e.lds<Narrow>(stage_values && vsub && !direct_values ? vsub * vrow : 8u);
     constexpr std::uint32_t kProbRow = kKWin + 8u;
     std::optional<kir::Tile<Narrow>> pb;
     if (narrow_probs) pb.emplace(e.lds<Narrow>(QTile * kProbRow));
@@ -1058,6 +1065,47 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         // fragment generation the staged loop runs unconditionally with only
         // its work under the vote (the barriers are then outside it); the
         // RDNA4 form keeps its branch, which its target accepts.
+        // One 16-key step of the value product from a dimension-major pool:
+        // the step's keys are one cache block, and a lane's fragment is its
+        // dimension's run of them. The products run in the staged order.
+        const auto value_step = [&](std::uint32_t step) {
+          const auto key_half = [&] {
+            if constexpr (kGeo.split_k) return e.let(lane_hi * 8u);
+            else return e.u32(0);
+          }();
+          using Frag = lse::vec<Narrow, static_cast<int>(kFrag)>;
+          auto af = e.local<Narrow, static_cast<int>(kFrag)>();
+          if (pb) {
+            const auto ap = pb->load_elems(e.let(lane_lo * kProbRow + step + key_half), kFrag);
+            af = kir::Val<Frag>(&k.types(), &k.ir(), ap.id());
+          } else {
+            for (auto f : e.unroll(kFrag))
+              af[f] = math::narrow<Narrow>(sc[e.let(lane_lo * kKWin + step + key_half + f)].read());
+          }
+          // A block past the row reads the window's first block: its
+          // probabilities are exactly zero, so only finiteness matters.
+          const auto key0 = e.let(wbase + step);
+          const auto safe_key = e.let(select(key0 < row_len, key0, wbase));
+          const auto page = e.let(kir::cast<kir::u32>(a.table[e.let(tb + safe_key / d.ts)]));
+          for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
+            const auto dimension = e.let((wave + column_tile * 8u) * 16u + lane_lo);
+            const auto safe_dim = e.let(select(dimension < d.dv, dimension, e.u32(d.dv - 1u)));
+            const auto base = e.let(((page * d.kvh + kh) * d.dv + safe_dim) * d.ts + key_half);
+            const auto values = k.load_elems<KvElement<Storage>>(a.v.b.id(), base, kFrag);
+            o[column_tile] = math::mma<Mma>(af.value(), kir::Val<Frag>(&k.types(), &k.ir(), values.id()),
+                                            o[column_tile].value());
+          }
+        };
+        if (sparse && stage_values && vsub != 0 && !kGeo.split_k && direct_values) {
+          if (auto voted = e.when(retain.read() != 0.0f)) {
+            for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile)
+              for (auto f : e.unroll(8u)) {
+                const auto row = acc_row(f);
+                o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
+              }
+            for (std::uint32_t step = 0; step < kKWin; step += 16u) value_step(step);
+          }
+        } else
         if (sparse && stage_values && vsub != 0 && !kGeo.split_k) {
           const std::uint32_t pieces_per_key = d.dv / 8u;
           const std::uint32_t pieces = vsub * pieces_per_key;
@@ -1129,6 +1177,14 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
           }
         } else
         if (auto retained_values = e.when(retain.read() != 0.0f)) {
+        if (stage_values && vsub != 0 && direct_values) {
+          for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile)
+            for (auto f : e.unroll(8u)) {
+              const auto row = acc_row(f);
+              o[column_tile][f] = o[column_tile][f].read() * arow[row].read();
+            }
+          for (std::uint32_t step = 0; step < kKWin; step += 16u) value_step(step);
+        } else
         if (stage_values && vsub != 0) {
           for (std::uint32_t column_tile = 0; column_tile < value_tiles; ++column_tile) {
             for (auto f : e.unroll(8u)) {
