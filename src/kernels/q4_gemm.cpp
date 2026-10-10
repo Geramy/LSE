@@ -317,6 +317,8 @@ GemmVariant gemm_variant(std::uint32_t variant, std::uint32_t layouts) {
 }
 
 std::uint32_t variant_lds_bytes(const Tile& t, std::uint32_t variant) {
+  // Layout 4: two buffers of each tile at half the step's K.
+  if (variant == 4u) return 2u * (t.bm + t.bn) * (dispatch::kQ4GemmStepK / 2u + kPad) * 2u;
   if (variant == 0u || variant >= 3u) return lds_bytes(t);
   return (kDirectAHalves + t.bn * kRowHalves * (variant == 2u ? 2u : 1u)) * 2u;
 }
@@ -573,6 +575,8 @@ std::string emit_halves_body(const KernelShapes& s, const Dims& d) {
 
 template <class S, math::MatrixTarget G>
 std::string emit_body(const KernelShapes& s, const Dims& d) {
+  // Layout 4 has its own body; dispatched before this one binds anything.
+  if (gemm_variant(s.variant, gemm_layouts(s)).layout == 4u) return emit_halves_body<S, G>(s, d);
   using Op = math::op::Mma<G, math::MatrixElem::kF32, math::MatrixElem::kF16,
                            16, 16, 16>;
   constexpr math::MatrixCoreRow kRow = Op::kRow;
@@ -606,7 +610,6 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // keeps A in workgroup memory and reads it a fragment at a time. Each
   // feeds the matrix instructions the same halves in the same order.
   const std::uint32_t layout = variant.layout;
-  if (layout == 4u) return emit_halves_body<S, G>(s, d);
   const bool a_direct = layout == 1u || layout == 2u;
   const bool b_double = a_direct && layout == 2u;
   if (layout > 3u || ((layout == 1u || layout == 2u) && !a_direct) ||

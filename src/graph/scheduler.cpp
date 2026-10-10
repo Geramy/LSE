@@ -611,6 +611,7 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
   LSE_RETURN_IF_ERROR(t.be.synchronize());
   std::vector<std::byte> reference(t.output_bytes);
   std::vector<std::byte> got(t.output_bytes);
+  const std::vector<std::byte> poison(t.output_bytes, std::byte{0xA5});
   LSE_RETURN_IF_ERROR(t.be.copy_d2h(t.output, reference.data(), t.output_bytes, 0));
   std::vector<Candidate> candidates{{0, t.base_handle, t.base.dims, 0.0}};
   const backend::DeviceInfo& info = t.be.device_info();
@@ -637,6 +638,10 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
       note += " " + std::to_string(v) + "=unbuilt";
       continue;
     }
+    // The output holds variant 0's answer from the launch before: overwrite
+    // it first, or a variant that wrote nothing (or only part of it) would
+    // compare equal byte for byte.
+    LSE_RETURN_IF_ERROR(t.be.copy_h2d(poison.data(), t.output, t.output_bytes, 0));
     LSE_RETURN_IF_ERROR(t.be.launch(*built, k.dims, t.args, t.target));
     LSE_RETURN_IF_ERROR(t.be.synchronize());
     LSE_RETURN_IF_ERROR(t.be.copy_d2h(t.output, got.data(), t.output_bytes, 0));

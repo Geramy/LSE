@@ -219,7 +219,10 @@ LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
     const std::uint32_t offered = emitter.variants(groups[0], device);
     for (std::uint32_t v = 0; v < offered; ++v) {
       const EmissionVariantScope scope(v);
-      out.accepts.push_back(emitter.emit(groups[0], device).ok());
+      auto em = emitter.emit(groups[0], device);
+      out.accepts.push_back(em.ok());
+      // An emitted variant is the GEMM, not an empty scaffold.
+      if (em.ok()) LSE_EXPECT(em->source.find("vector.mma") != std::string::npos);
     }
     return out;
   };
@@ -229,6 +232,14 @@ LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
   // Layout 2, the double-buffered one: declined at 544 rows, taken at 1024.
   LSE_EXPECT(!short_pass.accepts[2]);
   LSE_EXPECT(wide_pass.accepts[2]);
+  // Every other layout emits at both.
+  for (std::size_t v = 0; v < 5 && v < short_pass.accepts.size(); ++v) {
+    if (v == 2) continue;
+    if (!short_pass.accepts[v] || !wide_pass.accepts[v])
+      std::fprintf(stderr, "%s layout %zu: 544 %d 1024 %d\n", arch, v,
+                   static_cast<int>(short_pass.accepts[v]), static_cast<int>(wide_pass.accepts[v]));
+    LSE_EXPECT(short_pass.accepts[v] && wide_pass.accepts[v]);
+  }
   LSE_EXPECT(short_pass.cls != wide_pass.cls);
   // Another 544-row-class shape (the same tile) is the same class.
   LSE_EXPECT_EQ(at(528).cls, short_pass.cls);
