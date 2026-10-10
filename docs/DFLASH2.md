@@ -202,10 +202,13 @@ below depth 3. An MTP chain's draft cost climbs in steps (about 3.6, 6.4,
 close; on prose `--adaptive-mtp=off` is the faster setting today.
 The chain depth is chosen from each position's mean acceptance. A position
 fades only when it is checked (half weight after 20 checks), one never
-checked starts at the mean of the position before it, and a position
-holding little evidence for how often chains reach it gets a full-depth
-chain at most every 16 steps; without this, a process whose first chains
-were 3 deep priced every deeper position at the prior and stayed at depth 3.
+checked starts at the mean of the position before it, and positions
+holding little evidence for how often chains reach them are probed at most
+every 16 steps: priced at the last well-measured position's mean, the
+deeper chain worth most is drafted when it beats the chosen depth on this
+device's costs, and not at all when it cannot. Without this, a process
+whose first chains were 3 deep priced every deeper position at the prior
+and stayed at depth 3.
 
 Greedy requests produced byte-identical text to master with the policy on
 and off (essay, code, 2K and 4K prompts).
