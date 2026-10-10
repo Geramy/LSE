@@ -22,6 +22,19 @@ high-water capacity across a session restart to avoid allocation during the
 next request. Destroying the cache releases its fragments. An arena is freed
 when its final fragment lease is released.
 
+## Value layout
+
+Keys are stored per block as `[kv_heads, 16 tokens, width]`. With FP16 or BF16
+storage, values are stored dimension-major: `[kv_heads, width, 16 tokens]`,
+so one dimension's 16 values for a block are contiguous. That is the order a
+matrix fragment over keys reads them, so the flash attention tile reads each
+value fragment from the cache in one 16-byte read, with no staging in
+scratch, and the split decode kernels read four keys of a dimension at
+once. The value pool's shape says which layout it holds (`[blocks, kv_heads,
+width, 16]` against the keys' `[blocks, kv_heads, 16, width]`), and every
+reader computes the same values in the same order from either. FP32 and FP8
+value pools keep the key layout.
+
 ## Addressing and lifetime
 
 Each K/V tensor has a small device table of 64-bit fragment addresses. The

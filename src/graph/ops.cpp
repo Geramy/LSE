@@ -710,7 +710,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
                  const backend::DeviceInfo* device, kv::CacheDType storage,
                  ops::SparseAttentionPhase sparse) {
   const Shape& sq = q.shape();
-  Shape out{sq.dim(0), sq.dim(1), sq.dim(2), kv::logical_width(storage, v.shape().dim(3))};
+  // A dimension-major value pool (kv::dimension_major_values) keeps its width
+  // second to last.
+  const bool dim_major = dispatch::dimension_major_values(k.shape(), v.shape());
+  Shape out{sq.dim(0), sq.dim(1), sq.dim(2),
+            kv::logical_width(storage, dim_major ? v.shape().dim(2) : v.shape().dim(3))};
   auto n = make(OpKind::kAttention, out, q.dtype(),
                 {q.node(), k.node(), v.node(), meta.node(), table.node()});
   n->attrs[0] = scale;

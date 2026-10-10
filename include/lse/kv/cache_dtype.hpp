@@ -75,6 +75,18 @@ logical_width(CacheDType format, std::int64_t pitch) noexcept {
   return packed_cache(format) ? (pitch > 1 ? (pitch - 1) * 4 : 0) : pitch;
 }
 
+// A value pool of 16-bit storage keeps each block dimension-major: shape
+// [blocks, kv_heads, width, block] instead of the key pool's [blocks,
+// kv_heads, block, width], so one dimension's values for a block's keys are
+// contiguous -- the order a matrix fragment over keys reads them in. Readers
+// tell the two apart by the value pool's shape; each computes the same
+// values in the same order from either.
+[[nodiscard]] constexpr bool dimension_major_values(CacheDType format, std::int64_t block,
+                                                    std::int64_t width) noexcept {
+  return (format == CacheDType::kF16 || format == CacheDType::kBF16) && block == 16 &&
+         width > block && width % 16 == 0;
+}
+
 [[nodiscard]] constexpr bool valid_storage(DType storage, float tag) noexcept {
   switch (storage) {
   case DType::kF32:

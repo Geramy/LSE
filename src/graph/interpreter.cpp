@@ -983,13 +983,17 @@ Status eval_kv_page_write(Node& n) {
     return LSE_ERROR(kInvalidArgument,
                      "kv_page_write needs rank-4 pool and source");
   }
-  const auto bs = static_cast<std::size_t>(dst.shape.dim(2));
-  const auto kvh = static_cast<std::size_t>(dst.shape.dim(1));
   const auto format = kv::cache_dtype(dst.dtype, static_cast<float>(n.iattrs[1]));
   if (!kv::valid_storage(dst.dtype, static_cast<float>(n.iattrs[1])) || src.dtype != DType::kF32)
     return LSE_ERROR(kInvalidArgument, "invalid paged KV storage format");
-  const auto pitch = static_cast<std::size_t>(dst.shape.dim(3));
-  const auto width = static_cast<std::size_t>(kv::logical_width(format, dst.shape.dim(3)));
+  // A dimension-major value pool (kv::dimension_major_values).
+  const bool dim_major = dst.shape.dim(3) == n.iattrs[0] && dst.shape.dim(2) == src.shape.dim(3) &&
+                         dst.shape.dim(2) != dst.shape.dim(3) &&
+                         kv::dimension_major_values(format, dst.shape.dim(3), dst.shape.dim(2));
+  const auto bs = static_cast<std::size_t>(dim_major ? dst.shape.dim(3) : dst.shape.dim(2));
+  const auto kvh = static_cast<std::size_t>(dst.shape.dim(1));
+  const auto pitch = static_cast<std::size_t>(dim_major ? dst.shape.dim(2) : dst.shape.dim(3));
+  const auto width = static_cast<std::size_t>(kv::logical_width(format, pitch));
   const auto pool_blocks = static_cast<std::size_t>(dst.shape.dim(0));
   const auto batch = static_cast<std::size_t>(src.shape.dim(0));
   const auto t = static_cast<std::size_t>(src.shape.dim(2));
@@ -1051,6 +1055,9 @@ Status eval_kv_page_write(Node& n) {
           if (format == kv::CacheDType::kFP8)
             kv::pack_cache_vector<math::MatrixElem::kFp8>(values, {words, pitch});
           else kv::pack_cache_vector<math::MatrixElem::kBf8>(values, {words, pitch});
+        } else if (dim_major) {
+          for (std::size_t w = 0; w < width; ++w)
+            store_element(n, ((blk * kvh + h) * width + w) * bs + abs % bs, load_element(src, si + w));
         } else {
           for (std::size_t w = 0; w < width; ++w) store_element(n, di + w, load_element(src, si + w));
         }
@@ -1120,7 +1127,13 @@ Status eval_sdpa(Node& n) {
   const auto format = kv::cache_dtype(k.dtype, n.attrs[1]);
   if (!kv::valid_storage(k.dtype, n.attrs[1]) || v.dtype != k.dtype)
     return LSE_ERROR(kInvalidArgument, "invalid attention KV storage format");
-  const auto dv = static_cast<std::size_t>(kv::logical_width(format, v.shape.dim(3)));
+  // A dimension-major value pool (kv::dimension_major_values) swaps its
+  // last two extents.
+  const bool dim_major_values = n.inputs.size() == 5 && k.shape.rank() == 4 &&
+      v.shape.rank() == 4 && k.shape.dim(2) != k.shape.dim(3) &&
+      v.shape.dim(2) == k.shape.dim(3) && v.shape.dim(3) == k.shape.dim(2);
+  const auto dv = static_cast<std::size_t>(kv::logical_width(
+      format, dim_major_values ? v.shape.dim(2) : v.shape.dim(3)));
 
   const float scale = n.attrs[0];
   const auto mask = static_cast<int>(n.iattrs[0]);
@@ -1234,8 +1247,13 @@ Status eval_sdpa(Node& n) {
           double acc = 0.0;
           for (std::size_t j = 0; j < used; ++j) {
             if (logits[j] == 0.0f) continue;
+            std::size_t at = kv_base(b, kh, j, dv) + d;
+            if (dim_major_values) {
+              const auto blk = static_cast<std::size_t>(load_element(*table, b * stride + j / ts));
+              at = ((blk * kvh + kh) * dv + d) * ts + j % ts;
+            }
             acc += static_cast<double>(logits[j]) *
-                   static_cast<double>(load_kv_element(v, format, kv_base(b, kh, j, dv) + d, dv));
+                   static_cast<double>(load_kv_element(v, format, at, dv));
           }
           store_element(n, obase + d, static_cast<float>(acc / denom));
         }

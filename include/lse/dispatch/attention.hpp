@@ -14,7 +14,13 @@ struct FlashDims {
   float scale = 0.0f;
   int mask = 0;
   bool valid = false;
+  // The value pool is dimension-major (kv::dimension_major_values).
+  bool dim_major_values = false;
 };
+
+// Whether a paged value pool is dimension-major: its last two extents are the
+// key pool's, swapped.
+[[nodiscard]] bool dimension_major_values(const Shape& keys, const Shape& values);
 
 [[nodiscard]] bool paged_attention_inputs_valid(const graph::KernelShapes&);
 [[nodiscard]] AttentionPlan attention_plan(const graph::KernelShapes&);
