@@ -3,8 +3,11 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
+#include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/block.hpp"
+#include <cstdio>
+#include <string>
 #include <utility>
 
 namespace {
@@ -160,6 +163,77 @@ LSE_TEST(chain_passes_over_16_bit_kv_take_the_flash_split) {
   fx.v = leaf(fx.k.shape(), DType::kBF16);
   LSE_EXPECT(sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta, fx.table, 16,
                         &fx.gpu, kv::CacheDType::kBF16).node()->prim->name() != "attention.split_merge128.wg128c2.v1");
+}
+
+// A draft tree's flash split offers its tile with the scores kept in
+// registers through the softmax as a variant, measured per shape and
+// device: on gfx1201 the default and that one; on gfx1151 also the
+// half-staged values (the two-tile form writes no split records). A prefill
+// tile keeps what it had.
+LSE_TEST(flash_split_offers_scores_in_registers_as_a_variant) {
+  backend::LoomEmitter emitter;
+  for (const char* arch : {"gfx1201", "gfx1151"}) {
+    for (int queries : {4, 15, 31}) {
+      Fixture fx(queries, 4096);
+      fx.gpu.arch = arch;
+      backend::AmdDeviceInfo amd;
+      backend::apply_arch_defaults(fx.gpu, amd);
+      fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+      fx.gpu.extension = &amd;
+      fx.k = leaf(fx.k.shape(), DType::kBF16);
+      fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
+      fx.meta = leaf({kv::tree_meta_elems(1, queries)});
+      const auto out = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kTree, 0, fx.meta,
+                                  fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+      LSE_EXPECT(!out.node()->inputs.empty() && out.node()->inputs[0]->prim != nullptr);
+      if (out.node()->inputs.empty() || out.node()->inputs[0]->prim == nullptr) {
+        std::fprintf(stderr, "no split for %s rows %d: %s\n", arch, queries,
+                     out.node()->prim ? std::string(out.node()->prim->name()).c_str() : "?");
+        continue;
+      }
+      const NodePtr partial = out.node()->inputs[0];
+      LSE_EXPECT(partial->prim->name() == "attention.flash_split.wmma16.v1");
+      const NodePtr roots[]{partial};
+      auto groups = Partitioner::partition(roots, &fx.gpu);
+      LSE_EXPECT_EQ(groups.size(), 1u);
+      if (groups.size() != 1) continue;
+      const bool gfx1151 = std::string_view(arch) == "gfx1151";
+      const std::uint32_t offered = emitter.variants(groups[0], fx.gpu);
+      LSE_EXPECT_EQ(offered, gfx1151 ? 3u : 2u);
+      auto base = emitter.emit(groups[0], fx.gpu);
+      LSE_EXPECT(base.ok());
+      const EmissionVariantScope scope(offered - 1u);
+      auto kept = emitter.emit(groups[0], fx.gpu);
+      LSE_EXPECT(kept.ok());
+      if (!base.ok() || !kept.ok()) continue;
+      LSE_EXPECT(kept->source != base->source);
+      LSE_EXPECT(kept->binding_order == base->binding_order);
+      LSE_EXPECT(kept->dims.workgroup_size[0] == base->dims.workgroup_size[0] &&
+                 kept->dims.workgroup_count[0] == base->dims.workgroup_count[0]);
+      LSE_EXPECT(emitter.cache_key(groups[0], fx.gpu) != [&] {
+        const EmissionVariantScope zero(0);
+        return emitter.cache_key(groups[0], fx.gpu);
+      }());
+    }
+    // A prefill tile is not offered it: its shape changes with every chunk
+    // the cache grows by, and each new shape would be measured again.
+    Fixture fx(1024, 8192);
+    fx.gpu.arch = arch;
+    backend::AmdDeviceInfo amd;
+    backend::apply_arch_defaults(fx.gpu, amd);
+    fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    fx.gpu.extension = &amd;
+    fx.k = leaf(fx.k.shape(), DType::kBF16);
+    fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
+    const auto prefill = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta,
+                                    fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+    const NodePtr prefill_roots[]{prefill.node()};
+    auto prefill_groups = Partitioner::partition(prefill_roots, &fx.gpu);
+    LSE_EXPECT_EQ(prefill_groups.size(), 1u);
+    if (prefill_groups.size() == 1)
+      LSE_EXPECT_EQ(emitter.variants(prefill_groups[0], fx.gpu),
+                    std::string_view(arch) == "gfx1151" ? 3u : 1u);
+  }
 }
 
 // Without a matrix generation the device keeps the short split.

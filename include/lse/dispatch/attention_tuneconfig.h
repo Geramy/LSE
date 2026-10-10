@@ -83,7 +83,8 @@ struct FlashCacheRule {
   const auto padded = (static_cast<std::uint64_t>(head_dim) + 15u) / 16u * 16u;
   const std::uint64_t staging =
       value_dim == 0 ? 0 : 16u * (static_cast<std::uint64_t>(value_dim) + 8u) * 2u;
-  return kFlashQueryTile * (padded * 2u + kFlashKeyWindow * 4u + 3u * 4u) + staging;
+  // Query rows are padded by 16 bytes in scratch (flash_wmma_sdpa.cpp).
+  return kFlashQueryTile * ((padded + 8u) * 2u + kFlashKeyWindow * 4u + 3u * 4u) + staging;
 }
 
 struct DecodeRule {
