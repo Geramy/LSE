@@ -215,9 +215,9 @@ LSE_TEST(flash_wmma_policy_covers_kv_formats_ragged_tiles_and_matrix_resources) 
     }
   }
   // Query tile, scores, softmax state and the smallest value-staging block.
-  device.lds_bytes_per_workgroup = 33215;
+  device.lds_bytes_per_workgroup = 33471;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
-  device.lds_bytes_per_workgroup = 33216;
+  device.lds_bytes_per_workgroup = 33472;
   LSE_EXPECT(dispatch::flash_wmma_supported(s));
   device.extension = nullptr;
   LSE_EXPECT(!dispatch::flash_wmma_supported(s));
@@ -251,10 +251,11 @@ LSE_TEST(flash_wmma_typed_emission_and_capability_change_version_the_cache) {
   if(emitted.ok()) {
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],768u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    // 24768 for the query tile, scores and softmax state; 16896 to stage
+    // 25024 for the query tile (rows padded by 16 bytes), scores and
+    // softmax state; 16896 to stage
     // 32 keys of 256 f16 values in rows of 264; 8448 for the narrowed
     // probabilities in rows of 264.
-    LSE_EXPECT_EQ(emitted->lds_bytes,50112u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,50368u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf16>")!=std::string::npos);
     LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
@@ -313,7 +314,7 @@ LSE_TEST(flash_wmma_takes_each_generations_fragment_width) {
       LSE_EXPECT(emitted->source.find("vector<8xf32>")!=std::string::npos);
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
       // Both keep the window's probabilities narrowed in scratch.
-      LSE_EXPECT_EQ(emitted->lds_bytes, 50112u);
+      LSE_EXPECT_EQ(emitted->lds_bytes, 50368u);
       (void)gfx11;
     }
   }
@@ -350,7 +351,7 @@ LSE_TEST(flash_wmma_emits_typed_operands_for_packed_and_unequal_widths) {
     if(!emitted.ok()) continue;
     LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],24u);
     LSE_EXPECT_EQ(emitted->dims.workgroup_size[0],256u);
-    LSE_EXPECT_EQ(emitted->lds_bytes,17600u);
+    LSE_EXPECT_EQ(emitted->lds_bytes,17856u);
     LSE_EXPECT(emitted->source.find("vector.mma")!=std::string::npos);
     LSE_EXPECT(emitted->source.find(storage==kv::CacheDType::kF16
         ? "vector<8xf16>" : "vector<8xbf16>")!=std::string::npos);
@@ -389,7 +390,7 @@ LSE_TEST(flash_prefill_retains_a_page_loop_with_bounded_source_size) {
   if (!emitted.ok()) return;
   LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u);
   LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 256u);
-  LSE_EXPECT_EQ(emitted->lds_bytes, 24768u);
+  LSE_EXPECT_EQ(emitted->lds_bytes, 25024u);
   LSE_EXPECT(emitted->source.size() < 384u * 1024u);
   std::size_t loops = 0;
   for (auto at = emitted->source.find(" = scf.for "); at != std::string::npos;

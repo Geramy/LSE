@@ -611,6 +611,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
     const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
     const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    // Query rows in scratch are padded by 16 bytes, as the probability rows
+    // are: unpadded, the sixteen rows of a fragment read start on the same
+    // bank and the read serializes sixteen ways.
+    const std::uint32_t qrow_stride = padded_depth + 8u;
     const std::uint32_t qchunks = (QTile * padded_depth + kThreads - 1u) / kThreads;
     const std::uint32_t dpt = (d.dv + kThreads - 1u) / kThreads;
     const std::uint32_t value_tiles = (d.dv + 127u) / 128u;
@@ -622,7 +626,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
-    const auto qs = e.lds<Narrow>(QTile * padded_depth);
+    const auto qs = e.lds<Narrow>(QTile * qrow_stride);
     // The window's scores, then the window's probabilities in place.
     const auto sc = e.lds<kir::f32>(QTile * kKWin);
     const auto mrow = e.lds<kir::f32>(QTile);
@@ -775,10 +779,11 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         const auto r = e.let(idx / padded_depth);
         const auto dd = e.let(idx % padded_depth);
         const auto qrow = row_query(r);
-        qs[idx] = math::narrow<Narrow>(e.f32(0.0f));
+        const auto qslot = e.let(r * qrow_stride + dd);
+        qs[qslot] = math::narrow<Narrow>(e.f32(0.0f));
         if (auto g = e.when(row_live(r) && dd < d.dh)) {
           const auto qvalue = e.let(a.q[e.let(((b * d.qh + row_head(r)) * d.tq + qrow) * d.dh + dd)]);
-          qs[idx] = math::narrow<Narrow>(qvalue);
+          qs[qslot] = math::narrow<Narrow>(qvalue);
         }
       }
     }
@@ -901,7 +906,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               keys.push_back(e.load(a.k, e.let(kbase + depth), 16u));
             using Frag = lse::vec<Narrow, 8>;
             for (std::uint32_t step = 0; step < keys.size(); ++step) {
-              const auto qa = qs.load(e.let(lane_lo * padded_depth + step * 16u + lane_hi * 8u), 16u);
+              const auto qa = qs.load(e.let(lane_lo * qrow_stride + step * 16u + lane_hi * 8u), 16u);
               acc = math::mma<Mma>(kir::Val<Frag>(&k.types(), &k.ir(), qa.id()),
                                    kir::Val<Frag>(&k.types(), &k.ir(), keys[step].id()),
                                    acc.value());
@@ -931,7 +936,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
                 keys.push_back(k.load_elems<KvElement<Storage>>(
                     a.k.b.id(), e.let(kbase + step * 16u), 16u));
               for (std::uint32_t step = first; step < last; ++step) {
-                const auto qbase = e.let(lane_lo * padded_depth + step * 16u);
+                const auto qbase = e.let(lane_lo * qrow_stride + step * 16u);
                 const auto qlo = qs.load(qbase, 16u);
                 const auto qhi = qs.load(e.let(qbase + 8u), 16u);
                 auto qa = e.local<Narrow, 16>();
@@ -956,7 +961,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               else return e.let(depth + 0u);
             }();
             for (auto f : e.unroll(kFrag)) {
-              af[f] = qs[e.let(lane_lo * padded_depth + kk + f)].read();
+              af[f] = qs[e.let(lane_lo * qrow_stride + kk + f)].read();
               bf[f] = math::narrow<Narrow>(e.f32(0.0f));
             }
             if (auto key_live = e.when(key < row_len)) {
@@ -988,8 +993,27 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
           }
           }
-          for (auto f : e.unroll(8u))
-            write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
+          if (mask == 2) {
+            for (auto f : e.unroll(8u))
+              write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
+          } else {
+            // A window wholly before the pass's first position: every key
+            // in it lies inside each row and before each query position,
+            // so a live row's score is written as it is, with no per-key
+            // tests. The window that reaches the pass's own positions takes
+            // the full test. Uniform across the workgroup.
+            if (auto prior = e.when(wbase + kKWin <= offset)) {
+              for (auto f : e.unroll(8u)) {
+                const auto row = acc_row(f);
+                sc[e.let(row * kKWin + key - wbase)] =
+                    select(row_live(row), e.let(acc[f].read() * d.scale), math::neg_inf());
+              }
+            }
+            if (auto edge = e.when(wbase + kKWin > offset)) {
+              for (auto f : e.unroll(8u))
+                write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
+            }
+          }
         }
         e.barrier();
 
