@@ -137,6 +137,30 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     }
     return h;
   }
+  // The checks emit_two_tiles makes before it writes anything; the other
+  // variants emit wherever the default does.
+  bool variant_accepts(const KernelShapes& s, std::uint32_t v) const override {
+    KernelShapes at = s;
+    at.variant = v;
+    if (variant_of(at) != Variant::kTwoTiles) return true;
+    if (s.input_dtypes.size() < 2 ||
+        (s.input_dtypes[1] != DType::kF16 && s.input_dtypes[1] != DType::kBF16) ||
+        s.device == nullptr)
+      return false;
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    constexpr std::uint32_t kT = 16u * 32u, QR = QTile * 2u;
+    constexpr std::uint32_t kProbRow = 64u + 8u, kVsub = 16u;
+    if (!d.valid || d.dh % 16u != 0 || d.dv % 16u != 0 || d.dv > 256u ||
+        s.device->max_threads_per_workgroup < kT)
+      return false;
+    const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
+    if (mask == 3 || d.dim_major_values) return false;
+    const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    const std::uint64_t bytes = std::uint64_t{QR} * padded_depth * 2u +
+        std::uint64_t{QR} * kKWin * 4u + 4u * QR * 4u + kVsub * d.dv * 2u +
+        std::uint64_t{QR} * kProbRow * 2u + 256u;
+    return bytes <= workgroup_lds_bytes(s.device);
+  }
   std::uint32_t variants(const KernelShapes& s) const override {
     const auto contiguous = contiguous_rows(s);
     if (!contiguous) return 1u;

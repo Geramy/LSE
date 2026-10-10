@@ -176,6 +176,12 @@ class KernelPrimitiveBase : public Primitive {
     return false;
   }
 
+  // Whether variant `v` (< variants(shapes)) emits for these shapes: the
+  // scratch fit, divisibility and other checks the primitive makes when it
+  // emits. Part of a shape's class (variant_class), so a decision only ever
+  // applies to shapes that accept it. Every variant by default.
+  virtual bool variant_accepts(const KernelShapes&, std::uint32_t) const { return true; }
+
   // The shape class a variant decision covers: what can change which
   // variant is fastest, and nothing that only grows with the workload (a KV
   // pool, a block table, a prefill chunk). A decision measured once carries
