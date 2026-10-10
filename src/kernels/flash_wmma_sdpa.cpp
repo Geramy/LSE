@@ -857,13 +857,18 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             } else if (mask == 3) {
               // A tree pass: keys before it are visible, its own rows only
               // where the ancestor mask says so (kv::tree_meta_elems).
+              // The mask is read only for the pass's own keys, which the
+              // last window alone holds.
               const auto before = e.let(key < offset);
-              const auto column = e.let(kir::cast<kir::u32>(select(before, kir::cast<std::int64_t>(e.u32(0)),
-                  kir::cast<std::int64_t>(key) - kir::cast<std::int64_t>(offset))));
-              const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
-                                                   query_row * d.tq + column)]);
-              if (auto visible = e.when(signed_key <= position && (before || seen != 0.0f)))
-                sc[slot] = value;
+              if (auto prior = e.when(before)) {
+                if (auto visible = e.when(signed_key <= position)) sc[slot] = value;
+              }
+              if (auto own = e.when(key >= offset)) {
+                const auto column = e.let(key - offset);
+                const auto seen = e.let(a.meta[e.let(e.u32(static_cast<std::uint32_t>(kv::tree_mask_offset(1))) +
+                                                     query_row * d.tq + column)]);
+                if (auto visible = e.when(signed_key <= position && seen != 0.0f)) sc[slot] = value;
+              }
             } else {
               const auto distance = e.let(position - signed_key);
               if (auto sliding = e.when(signed_key <= position && distance < kir::cast<std::int64_t>(e.u32(d.window))))
