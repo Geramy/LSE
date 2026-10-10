@@ -627,7 +627,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     env::Emit e{&k};
 
     const auto qs = e.lds<Narrow>(QTile * qrow_stride);
-    // The window's scores, then the window's probabilities in place.
+    // The window's scores, then (for the unstaged value product) the
+    // window's probabilities in place.
     const auto sc = e.lds<kir::f32>(QTile * kKWin);
     const auto mrow = e.lds<kir::f32>(QTile);
     const auto drow = e.lds<kir::f32>(QTile);
@@ -1047,12 +1048,19 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         // Uniform across the workgroup: every nested barrier is convergent.
         if (auto retained = e.when(retain.read() != 0.0f)) {
         // A wave owns two rows; each lane owns eight contiguous-bank keys.
+        // The value products read the probabilities from the narrowed rows
+        // wherever values are staged or read directly; only the unstaged
+        // product reads them back from the scores.
+        const bool scores_take_probabilities = !pb || !(stage_values && vsub != 0);
         for (std::uint32_t wave_row = 0; wave_row < 2; ++wave_row) {
           const auto row = e.let(wave * 2u + wave_row);
+          // A lane's eight scores are read once and kept for the exponent.
+          auto score = e.local<kir::f32, 8>();
           auto maximum = e.var(math::neg_inf());
           for (auto f : e.unroll(8u)) {
             const auto slot = e.let(lane + f * 32u);
-            maximum = math::max(maximum.read(), sc[e.let(row * kKWin + slot)].read());
+            score[f] = sc[e.let(row * kKWin + slot)].read();
+            maximum = math::max(maximum.read(), score[f].read());
           }
           for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
             maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
@@ -1065,8 +1073,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
           for (auto f : e.unroll(8u)) {
             const auto slot = e.let(lane + f * 32u);
             const auto index = e.let(row * kKWin + slot);
-            const auto probability = e.let(math::exp(sc[index].read() - safe_max));
-            sc[index] = probability;
+            const auto probability = e.let(math::exp(score[f].read() - safe_max));
+            if (scores_take_probabilities) sc[index] = probability;
             if (pb) (*pb)[e.let(row * kProbRow + slot)] = math::narrow<Narrow>(probability);
             total = total.read() + probability;
           }
