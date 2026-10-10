@@ -694,6 +694,42 @@ LSE_TEST(draft_width_policy_returning_to_an_unfinished_context_explores_nothing)
   LSE_EXPECT_NEAR(policy.verify_ns(1), 29e6, 1.0);
 }
 
+LSE_TEST(draft_width_policy_does_not_probe_depths_that_cannot_pay) {
+  // A slow device: 20 ms per chained draft pass, 60 ms for one verify row
+  // and 4 ms per further row, every proposal accepted three times in four.
+  // Two deep is best, and no deeper chain pays even at the measured
+  // acceptance, so the positions it never reaches are not probed for.
+  DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 1);
+  policy.observe_step(2, static_cast<std::uint64_t>(100e6));
+  const auto verify = [](std::uint32_t rows) { return 60e6 + 4e6 * (rows - 1); };
+  const auto draft = [](std::uint32_t depth) { return 20e6 * depth; };
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass)
+    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
+      policy.observe_verify(rows, static_cast<std::uint64_t>(verify(rows)));
+      policy.observe_draft(static_cast<std::uint64_t>(draft(rows - 1)), rows - 1);
+    }
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  int deep = 0;
+  for (int step = 0; step < 400; ++step) {
+    const std::uint32_t depth = policy.depth(DraftWidthPolicy::kMaxProposals, 2);
+    std::uint32_t tokens = 1;
+    for (std::uint32_t p = 0; p < depth; ++p) {
+      const bool ok = unit(rng) < 0.75;
+      policy.observe_acceptance(0.99, p, ok);
+      if (!ok) break;
+      ++tokens;
+    }
+    policy.observe_verify(depth + 1, static_cast<std::uint64_t>(verify(depth + 1)));
+    policy.observe_draft(static_cast<std::uint64_t>(draft(depth)), depth);
+    policy.observe_step(tokens, static_cast<std::uint64_t>(verify(depth + 1) + draft(depth)));
+    if (step >= 50 && depth > 3) ++deep;
+  }
+  LSE_EXPECT_EQ(deep, 0);
+}
+
 LSE_TEST(draft_width_policy_verifies_what_pays_for_its_rows) {
   // 32 ms for one row, 1 ms per further row, an 8 ms draft, 50 tok/s.
   DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
