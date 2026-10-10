@@ -22,6 +22,19 @@
 namespace lse::runtime {
 
 namespace {
+// A process measures kernel variants during its warm-up only: its first
+// kTrialWarmupSteps decode steps, which hold the width policy's warm-up and
+// its first measurement of every verify width and tree rung. After that a
+// kernel whose variants are still undecided runs variant 0, so no variant
+// trial lands in a decode step that is being timed. Decisions are kept by
+// shape class, so a grown cache needs none.
+constexpr std::uint64_t kTrialWarmupSteps = 128;
+std::atomic<std::uint64_t> g_decode_steps{0};
+void count_decode_step() {
+  if (g_decode_steps.fetch_add(1, std::memory_order_relaxed) + 1 == kTrialWarmupSteps)
+    if (graph::Scheduler* sched = graph::default_scheduler()) sched->set_variant_trials(false);
+}
+
 // Widest top-k the verify pass reads from the device instead of whole rows
 // (topk_pairs bound).
 constexpr std::size_t kSpecTopLimit = 32;
@@ -90,7 +103,8 @@ constexpr std::size_t kRaggedRun = 16;
 // streams all the weights, so one padded pass costs what its width costs,
 // where the power-of-two split paid a whole weight pass per set bit. The
 // widths stay on a ladder of kRaggedRun, so the engine compiles at most
-// chunk / kRaggedRun prefill shapes.
+// chunk / kRaggedRun prefill shapes. An MTP session runs the same passes, its
+// module at each pass's width (mtp_prefill_chunk).
 using PassPlan = Generator::PassPlan;
 std::vector<PassPlan> padded_plan(std::size_t n, std::size_t chunk) {
   std::vector<PassPlan> plan;
@@ -254,20 +268,27 @@ Result<std::uint32_t> Generator::greedy_step(Session& session,
 }
 
 // Shift target rows by one position, retaining the previous chunk's last row.
+// A padded pass (`valid` real rows of `tokens.size()`) runs the module at the
+// pass's width too, so its kernels follow the width as the target's do: its
+// real rows attend only to keys before them, the padded rows' keys land past
+// the last real position, and the module is cut back to that position, where
+// the next pass overwrites them.
 Status Generator::mtp_prefill_chunk(const Array& hidden,
                                     std::span<const std::uint32_t> tokens,
-                                    std::int32_t first, Array* carry) {
+                                    std::int64_t valid, std::int32_t first, Array* carry) {
+  const auto rows = static_cast<std::int64_t>(tokens.size());
   if (!hidden.valid() || hidden.dtype() != DType::kF32 ||
       hidden.shape().rank() != 3 || hidden.shape().dim(0) != 1 ||
-      hidden.shape().dim(1) != static_cast<std::int64_t>(tokens.size())) {
+      hidden.shape().dim(1) != rows || valid < 1 || valid > rows) {
     return LSE_ERROR(kInvalidArgument, "invalid target hidden rows for MTP");
   }
-  const auto rows = static_cast<std::int64_t>(tokens.size());
   Array shifted = rows == 1 ? *carry
                             : graph::concat(
                                   {*carry, graph::slice(hidden, 1, 0, rows - 1)}, 1);
   LSE_RETURN_IF_ERROR(mtp_->draft(shifted, tokens, first).status());
-  Array last = graph::slice(hidden, 1, rows - 1, rows);
+  if (valid < rows)
+    LSE_RETURN_IF_ERROR(mtp_->truncate(first + static_cast<std::int32_t>(valid)));
+  Array last = graph::slice(hidden, 1, valid - 1, valid);
   LSE_RETURN_IF_ERROR(last.materialize_owned());
   // Detach the retained value from a target graph that the next chunk replays.
   *carry = Array::from_buffer(last.node()->buffer, last.shape(), last.dtype());
@@ -276,7 +297,7 @@ Status Generator::mtp_prefill_chunk(const Array& hidden,
 
 std::vector<PassPlan> Generator::prefill_passes(std::size_t tokens) const {
   std::vector<PassPlan> passes;
-  if (mtp_ == nullptr && prefill_batch_.batch_size % prefill_batch_.ubatch_size == 0) {
+  if (prefill_batch_.batch_size % prefill_batch_.ubatch_size == 0) {
     passes = padded_plan(tokens, prefill_batch_.ubatch_size);
   } else {
     for (const auto batch : prefill_plan(tokens, prefill_batch_.batch_size)) {
@@ -506,7 +527,7 @@ Result<std::vector<float>> Generator::step(
     }
     if (mtp_ != nullptr) {
       LSE_RETURN_IF_ERROR(mtp_prefill_chunk(
-          hidden, std::span<const std::uint32_t>(&*first, take),
+          hidden, pass_ids, static_cast<std::int64_t>(take),
           base + static_cast<std::int32_t>(at), &carry));
     }
     at += take;
@@ -1288,6 +1309,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       // context it attended over, the next one chosen at its own.
       widths->set_context(step_at);
       if (step_top != 0) {
+        count_decode_step();
         const std::uint64_t period = now - step_top;
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
         const bool quiet = step_counters == counters;
@@ -1753,6 +1775,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     }
     next = *advanced;
     session.advance(1);
+    count_decode_step();
   }
   stats_.decode_ns = decode_start == 0 ? 0 : now_ns() - decode_start;
   snapshot_trace(&stats_, &host_reasons_);

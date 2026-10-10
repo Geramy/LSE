@@ -83,33 +83,62 @@ std::size_t DraftWidthPolicy::context_bucket(std::int64_t tokens) noexcept {
   return bucket;
 }
 
+template <std::size_t N>
+void DraftWidthPolicy::seed_from(Ladder<N>& ladder, const Ladder<N>& from) {
+  ladder = from;
+  if (!ladder.live) return;
+  ladder.seeded = true;
+  ladder.seed = ladder.offset;
+  ladder.seed_known = ladder.known;
+  ladder.samples.fill(0);
+  ladder.entered.fill(false);
+}
+
+template <std::size_t N>
+bool DraftWidthPolicy::complete(const Ladder<N>& ladder, std::size_t first) noexcept {
+  if (!ladder.live) return false;
+  for (std::size_t i = first; i < N; ++i)
+    if (!ladder.known[i]) return false;
+  return true;
+}
+
 void DraftWidthPolicy::set_context(std::int64_t tokens) noexcept {
   const std::size_t bucket = context_bucket(tokens);
   if (bucket == bucket_) return;
   bucket_ = bucket;
   Costs& here = costs_[bucket];
-  if (here.verify.live || here.tree.live) return;
-  // Nearest bucket holding costs, the shorter context on a tie.
-  const Costs* from = nullptr;
-  for (std::size_t d = 1; d < kContextBuckets && from == nullptr; ++d) {
-    if (bucket >= d && (costs_[bucket - d].verify.live || costs_[bucket - d].tree.live))
-      from = &costs_[bucket - d];
-    else if (bucket + d < kContextBuckets &&
-             (costs_[bucket + d].verify.live || costs_[bucket + d].tree.live))
-      from = &costs_[bucket + d];
+  // Nearest other bucket whose ladder `pick` selects passes `usable`, the
+  // shorter context on a tie.
+  const auto nearest = [&](auto pick, auto usable) -> const Costs* {
+    for (std::size_t d = 1; d < kContextBuckets; ++d) {
+      if (bucket >= d && usable(pick(costs_[bucket - d]))) return &costs_[bucket - d];
+      if (bucket + d < kContextBuckets && usable(pick(costs_[bucket + d])))
+        return &costs_[bucket + d];
+    }
+    return nullptr;
+  };
+  if (here.verify.live || here.tree.live) {
+    // A bucket left before its own measurements were finished (a process's
+    // first request is mostly warm-up) would explore every width again on
+    // its return, a forced width a step. While another bucket holds every
+    // width, it starts from that one instead and measures only what that
+    // one lacks, as a newly reached bucket does.
+    const auto renew = [&](auto pick, std::size_t first) {
+      auto& ladder = pick(here);
+      if (!ladder.live || ladder.seeded || complete(ladder, first)) return;
+      const auto usable = [&](const auto& l) { return complete(l, first); };
+      if (const Costs* from = nearest(pick, usable)) seed_from(ladder, pick(*from));
+    };
+    renew([](auto& c) -> auto& { return c.verify; }, 1);
+    renew([](auto& c) -> auto& { return c.tree; }, 0);
+    return;
   }
+  const Costs* from = nearest([](const Costs& c) -> const Costs& { return c; },
+                              [](const Costs& c) { return c.verify.live || c.tree.live; });
   if (from == nullptr) return;
   here = *from;
-  auto seed = [](auto& ladder) {
-    if (!ladder.live) return;
-    ladder.seeded = true;
-    ladder.seed = ladder.offset;
-    ladder.seed_known = ladder.known;
-    ladder.samples.fill(0);
-    ladder.entered.fill(false);
-  };
-  seed(here.verify);
-  seed(here.tree);
+  seed_from(here.verify, from->verify);
+  seed_from(here.tree, from->tree);
   here.draft_seed = here.draft;
   here.draft_samples.fill(0);
   here.draft_entered.fill(false);

@@ -658,6 +658,42 @@ LSE_TEST(draft_width_policy_entering_a_context_forces_no_measurements) {
   }
 }
 
+LSE_TEST(draft_width_policy_returning_to_an_unfinished_context_explores_nothing) {
+  // A process's first request (1K) is mostly warm-up: it measures one width
+  // before the next request (16K) moves on, which measures every width and
+  // rung. Returning to 1K must not explore every width again there, a forced
+  // width a step (44 steps instead of 33 on the R9700).
+  DraftWidthPolicy policy;
+  policy.set_context(1000);
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_tree_step(DraftWidthPolicy::kTreeRows[1], 1);
+  policy.observe_step(4, static_cast<std::uint64_t>(40e6));
+  policy.observe_verify(1, static_cast<std::uint64_t>(31e6));
+  policy.observe_tree_step(DraftWidthPolicy::kTreeRows[1], static_cast<std::uint64_t>(41e6));
+  LSE_EXPECT(policy.exploring() != 0u);
+  policy.set_context(16384);
+  for (int step = 0; step < 200; ++step) {
+    if (const std::uint32_t rows = policy.exploring(); rows != 0) {
+      policy.observe_verify(rows, static_cast<std::uint64_t>(32e6 + 1e6 * rows));
+    } else if (const std::uint32_t rows = policy.tree_exploring(); rows != 0) {
+      policy.observe_tree_step(rows, static_cast<std::uint64_t>(40e6 + 0.5e6 * rows));
+    } else {
+      policy.observe_verify(DraftWidthPolicy::kMaxRows, static_cast<std::uint64_t>(40e6));
+    }
+    policy.observe_step(6, static_cast<std::uint64_t>(45e6));
+  }
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_EQ(policy.tree_exploring(), 0u);
+  policy.set_context(1000);
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_EQ(policy.tree_exploring(), 0u);
+  LSE_EXPECT(policy.verify_ns(8) > 0.0);
+  // Its costs start from 16K's and follow what it measures from then on.
+  policy.observe_verify(1, static_cast<std::uint64_t>(29e6));
+  policy.observe_verify(1, static_cast<std::uint64_t>(29e6));
+  LSE_EXPECT_NEAR(policy.verify_ns(1), 29e6, 1.0);
+}
+
 LSE_TEST(draft_width_policy_verifies_what_pays_for_its_rows) {
   // 32 ms for one row, 1 ms per further row, an 8 ms draft, 50 tok/s.
   DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);

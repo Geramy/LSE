@@ -654,6 +654,11 @@ class Scheduler {
     std::uint64_t variant_trials = 0;
   };
   [[nodiscard]] JitStats jit_stats() const noexcept;
+  // Whether a kernel whose variants are undecided may be measured now (open
+  // by default). Closed, it runs variant 0 and stays undecided: a runtime
+  // closes it once a process's warm-up is over, so no measurement lands in
+  // a decode step that is being timed.
+  void set_variant_trials(bool open) noexcept;
   [[nodiscard]] const Trace& last_trace() const noexcept { return trace_; }
   [[nodiscard]] const Trace& accumulated_trace() const noexcept { return acc_; }
   void reset_accumulated_trace() noexcept { acc_ = {}; }

@@ -52,6 +52,27 @@ LSE_TEST(variant_book_decisions_outlive_the_process_and_holds_do_not) {
   std::filesystem::remove_all(dir);
 }
 
+LSE_TEST(variant_book_lives_in_the_cache_set_after_it_is_made) {
+  // A server makes its scheduler (and so the book) before it applies
+  // --cache-dir; the decisions still go beside that cache's kernels.
+  const std::string first = fresh_cache_dir();
+  VariantBook book;
+  const auto chosen = std::filesystem::path(first) / "chosen";
+  std::filesystem::create_directories(chosen);
+  ::setenv("LSE_CACHE_DIR", chosen.c_str(), 1);
+  book.record(7, 1, "0=2.0us 1=1.0us");
+  bool beside = false, elsewhere = false;
+  for (const auto& e : std::filesystem::directory_iterator(chosen))
+    beside = beside || e.path().filename().string().rfind("variants-", 0) == 0;
+  for (const auto& e : std::filesystem::directory_iterator(first))
+    elsewhere = elsewhere || e.path().filename().string().rfind("variants-", 0) == 0;
+  LSE_EXPECT(beside);
+  LSE_EXPECT(!elsewhere);
+  VariantBook next;
+  LSE_EXPECT(next.decided(7).value_or(9) == 1u);
+  std::filesystem::remove_all(first);
+}
+
 LSE_TEST(variant_book_off_and_budget) {
   const std::string dir = fresh_cache_dir();
   ::setenv("LSE_AUTOTUNE", "off", 1);

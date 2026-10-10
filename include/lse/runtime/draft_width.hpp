@@ -140,6 +140,9 @@ class DraftWidthPolicy {
   // The width the next step must take for its first measurements, or 0
   // (also 0 while warming up).
   [[nodiscard]] std::uint32_t exploring() const noexcept;
+  // The tree rung (rows) the next tree step must take for its first
+  // measurements, or 0.
+  [[nodiscard]] std::uint32_t tree_exploring() const noexcept;
   // A stale width (unmeasured for kRefreshSteps) cheap enough to measure on
   // this step, or 0. `chained`: the draft costs a pass per proposal (MTP).
   [[nodiscard]] std::uint32_t refresh(std::uint32_t max, bool chained) const noexcept;
@@ -154,7 +157,10 @@ class DraftWidthPolicy {
   // starts from the nearest measured one; its first measured width moves its
   // level, each width measured there takes its own cost at once, and widths
   // not yet measured there follow the growth the measured ones show, linear
-  // in rows. Without a call every cost sits in the first bucket.
+  // in rows. A bucket left before it had measured every width (a process's
+  // first request is mostly warm-up) starts over the same way when another
+  // bucket holds every width, so returning to it explores nothing again.
+  // Without a call every cost sits in the first bucket.
   void set_context(std::int64_t tokens) noexcept;
   static constexpr std::size_t kContextBuckets = 9;
   // 0 below 2K tokens, then one per doubling: 2K, 4K, ... 128K, 256K and up.
@@ -238,6 +244,12 @@ class DraftWidthPolicy {
   static void follow_growth(Ladder<N>& ladder, Rows rows_of);
   template <std::size_t N>
   [[nodiscard]] static bool needs_sample(const Ladder<N>& ladder, std::size_t i) noexcept;
+  // Starts `ladder` from `from`'s costs, measuring only what that one lacks.
+  template <std::size_t N>
+  static void seed_from(Ladder<N>& ladder, const Ladder<N>& from);
+  // Whether a ladder holds a cost for every width (or rung) it covers.
+  template <std::size_t N>
+  [[nodiscard]] static bool complete(const Ladder<N>& ladder, std::size_t first) noexcept;
   [[nodiscard]] Costs& costs() noexcept { return costs_[bucket_]; }
   [[nodiscard]] const Costs& costs() const noexcept { return costs_[bucket_]; }
   std::array<Costs, kContextBuckets> costs_{};
@@ -251,7 +263,6 @@ class DraftWidthPolicy {
   std::uint32_t skipped_ = 0;
 
   [[nodiscard]] static std::size_t tree_rung(std::uint32_t rows) noexcept;
-  [[nodiscard]] std::uint32_t tree_exploring() const noexcept;
   static constexpr std::size_t kCandidateBins = 20;
   std::array<Bin, kCandidateBins> candidates_{};
 };

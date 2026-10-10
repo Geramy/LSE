@@ -139,6 +139,7 @@ enum class DispatchStage : std::uint8_t { kEmit, kCompileOrLaunch };
 struct Scheduler::Impl {
   std::shared_ptr<kv::MemoryManager> kv_memory = kv::MemoryManager::create();
   std::uint64_t variant_trials = 0;
+  bool variant_trials_open = true;
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
   // One per stream: a persistent-grid kernel spins on this counter across its
@@ -222,13 +223,15 @@ struct Scheduler::Impl {
     // A draft's kernel may take variants a target's may not, so the two keep
     // separate decisions even where their kernels are otherwise one.
     pick.proposal = proposal_only(group);
-    pick.key = detail::VariantBook::key(emitter.cache_key(group, info) ^
+    // Keyed by shape class, not by the kernel's identity: a decision made
+    // once covers a KV pool's growth and a prefill's chunk lengths.
+    pick.key = detail::VariantBook::key(emitter.variant_class(group, info) ^
                                             (pick.proposal ? 0x70726f706f73616cull : 0ull),
                                         pick.offered, it->second);
     if (const auto chosen = variants.decided(pick.key)) {
       if (*chosen < pick.offered) pick.variant = *chosen;
     } else {
-      pick.trial = true;
+      pick.trial = variant_trials_open;
     }
     return pick;
   }
@@ -274,6 +277,8 @@ Scheduler::~Scheduler() = default;
 std::shared_ptr<kv::MemoryManager> Scheduler::kv_memory() const {
   return impl_->kv_memory;
 }
+
+void Scheduler::set_variant_trials(bool open) noexcept { impl_->variant_trials_open = open; }
 
 Scheduler::JitStats Scheduler::jit_stats() const noexcept {
   if (impl_->jit == nullptr) return {};
@@ -646,7 +651,7 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
   }
   if (candidates.size() > 1) {
     // Enough launches per sample that a sample is ~2 ms of device time, then
-    // the best of three interleaved rounds: what is kept is each variant's
+    // the best of four interleaved rounds: what is kept is each variant's
     // speed, not the moment it happened to run in.
     auto sample = [&](Candidate& c, std::uint32_t reps) -> Result<double> {
       LSE_RETURN_IF_ERROR(t.be.synchronize());
@@ -659,8 +664,14 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
     LSE_ASSIGN_OR(const double once, sample(candidates[0], 1));
     const auto reps = static_cast<std::uint32_t>(
         std::clamp(2000.0 / std::max(once, 1.0), 1.0, 64.0));
-    for (int round = 0; round < 3; ++round) {
-      for (Candidate& c : candidates) {
+    // One untimed sample of each first, then rounds in alternating order:
+    // measured first in every round, variant 0 caught the clocks still
+    // settling after the host's gap and lost to an identical kernel by up
+    // to a fifth.
+    for (Candidate& c : candidates) LSE_RETURN_IF_ERROR(sample(c, reps).status());
+    for (int round = 0; round < 4; ++round) {
+      for (std::size_t i = 0; i < candidates.size(); ++i) {
+        Candidate& c = candidates[round % 2 == 0 ? i : candidates.size() - 1 - i];
         LSE_ASSIGN_OR(const double us, sample(c, reps));
         c.best_us = round == 0 ? us : std::min(c.best_us, us);
       }
@@ -727,6 +738,14 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
         impl_->jit->try_get(member, ident, emitter->dialect()) != nullptr;
     auto generated = resident ? emitter->emit_launch(group, be.device_info())
                               : emitter->emit(group, be.device_info());
+    if (!generated.ok() && pick.variant != 0) {
+      // A decision covers only shapes whose class says they accept it
+      // (KernelPrimitiveBase::variant_accepts), so a decline here is a bug in
+      // that check, never a case to route around.
+      return LSE_ERROR(kInternal, "variant ", pick.variant, " of ", describe_group(group, 0),
+                       " was decided for this shape's class and declined it: ",
+                       generated.status().to_string());
+    }
     if (!generated.ok()) {
       trace_.spans.emit.add(elapsed_ns(t_emit, SpanClock::now()));
       return generated.status();
@@ -1537,7 +1556,11 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
       auto emitted = m.emitter->emit(*g, info);
       if (!emitted.ok()) {
         return Status(emitted.status().code(), ::lse::detail::concat(
-            "preparing ", describe_group(*g, 0), ": ", emitted.status().to_string()));
+            "preparing ", describe_group(*g, 0),
+            m.variants[i] != 0 ? ::lse::detail::concat(" (variant ", m.variants[i],
+                                                       ", decided for its class)")
+                               : std::string(),
+            ": ", emitted.status().to_string()));
       }
       kernels.push_back(emitted.release());
     }

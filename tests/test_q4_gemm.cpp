@@ -171,6 +171,70 @@ LSE_TEST(q4_gemm_emits_for_every_tile_and_width_on_a_described_device) {
   }
 }
 
+// A variant decision is kept by shape class, and a class carries which
+// variants accept its shapes: on gfx1151 and gfx1201 a 544-row pass (144-row tile, a
+// burst of steps) declines the double-buffered layout and a 1024-row one
+// (the wide tile, one step a loop) takes it. Both round up to the same size,
+// so they are different classes only because of what they accept, and a
+// decision for one never lands on the other: every variant a shape accepts
+// emits for it, and every variant it declines does not.
+LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
+  for (const char* arch : {"gfx1151", "gfx1201"}) {
+  backend::DeviceInfo device;
+  backend::AmdDeviceInfo amd;
+  device.arch = arch;
+  backend::apply_arch_defaults(device, amd);
+  device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  device.extension = &amd;
+  backend::LoomEmitter emitter;
+  const std::int64_t n = 17408, k = 5120;
+  struct Seen {
+    std::uint64_t cls = 0;
+    std::vector<bool> accepts;
+  };
+  const auto at = [&](std::int64_t m) {
+    Seen out;
+    auto x = leaf({1, m, k}, DType::kF32);
+    auto panel_node = std::make_shared<Node>();
+    panel_node->shape = Shape{m, k};
+    panel_node->dtype = DType::kF16;
+    panel_node->materialized = true;
+    auto gemm = std::make_shared<Node>();
+    gemm->set_kind(OpKind::kCustom);
+    gemm->dtype = DType::kF32;
+    gemm->inputs = {x.node(), leaf({n, k / 8}, DType::kU32).node(),
+                    leaf({n, k / 64}, DType::kBF16).node(),
+                    leaf({n, k / 64}, DType::kBF16).node(), panel_node};
+    gemm->iattrs[0] = 4;
+    gemm->iattrs[1] = 64;
+    gemm->shape = Shape{1, m, n};
+    gemm->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+    if (!gemm->prim) return out;
+    gemm->fclass = gemm->prim->fusion_class();
+    const NodePtr roots[]{gemm};
+    const auto groups = Partitioner::partition(roots, &device);
+    LSE_EXPECT_EQ(groups.size(), 1u);
+    if (groups.size() != 1) return out;
+    out.cls = emitter.variant_class(groups[0], device);
+    const std::uint32_t offered = emitter.variants(groups[0], device);
+    for (std::uint32_t v = 0; v < offered; ++v) {
+      const EmissionVariantScope scope(v);
+      out.accepts.push_back(emitter.emit(groups[0], device).ok());
+    }
+    return out;
+  };
+  const Seen short_pass = at(544), wide_pass = at(1024);
+  LSE_EXPECT(short_pass.accepts.size() > 2 && wide_pass.accepts.size() > 2);
+  if (short_pass.accepts.size() <= 2 || wide_pass.accepts.size() <= 2) continue;
+  // Layout 2, the double-buffered one: declined at 544 rows, taken at 1024.
+  LSE_EXPECT(!short_pass.accepts[2]);
+  LSE_EXPECT(wide_pass.accepts[2]);
+  LSE_EXPECT(short_pass.cls != wide_pass.cls);
+  // Another 544-row-class shape (the same tile) is the same class.
+  LSE_EXPECT_EQ(at(528).cls, short_pass.cls);
+  }
+}
+
 LSE_TEST(q4_gemm_slices_fill_the_device_without_starving_a_slice) {
   // 64 compute units: a narrow M=32 projection over K=17408 is sliced, a
   // full M=1024 one is not, and every slice keeps at least the minimum steps.

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string_view>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
@@ -67,22 +68,104 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return MeanCorrection ? 7 : 5; }
-  // Variant 1 stages values 16 keys at a time where 32 fit (emit_storage),
-  // and variant 2 takes two query tiles per workgroup (emit_two_tiles), on a
-  // contiguous-fragment generation; a split pass, whose records the two-tile
-  // form does not write, offers only the first two. Each output is the same
-  // value either way.
+  // The variants. Each output is the same value either way.
+  //  - kStageHalf: values staged 16 keys at a time where 32 fit
+  //    (emit_storage); offered on a contiguous-fragment generation.
+  //  - kTwoTiles: two query tiles per workgroup (emit_two_tiles), on a
+  //    contiguous-fragment generation; not for a split pass, whose records
+  //    the two-tile form does not write.
+  //  - kScoresInRegisters: a lane's scores are read from scratch once and
+  //    kept in registers through the softmax, and probabilities are written
+  //    back only where the value product reads them from the scores. Fewer
+  //    scratch round trips for more registers: faster on wide tree tiles,
+  //    slower where registers are what limits the tile, so it is measured
+  //    per shape and device. Offered for a split pass only: a prefill
+  //    tile's shape changes with every chunk the cache grows by, and each
+  //    new shape's measurement (1.4 to 1.9 s at 1024 rows on the R9700)
+  //    cost more than the variant ever won there.
+  enum class Variant { kBase, kStageHalf, kTwoTiles, kScoresInRegisters };
+  // Whether the device's 16x16x16 wave32 row carries a whole K step per
+  // lane (gfx11), or nothing when the device has no such row.
+  static std::optional<bool> contiguous_rows(const KernelShapes& s) {
+    if (s.device == nullptr || !matrix_target(*s.device)) return std::nullopt;
+    for (const auto& r : math::matrix_core_table())
+      if (r.target == *matrix_target(*s.device) && r.wave == 32 && r.m == 16 &&
+          r.n == 16 && r.k_step == 16 && r.acc == math::MatrixElem::kF32)
+        return r.a_len == 16;
+    return std::nullopt;
+  }
+  static Variant variant_of(const KernelShapes& s) {
+    if (s.variant == 0u) return Variant::kBase;
+    if (contiguous_rows(s).value_or(false)) {
+      if (s.variant == 1u) return Variant::kStageHalf;
+      return Split ? Variant::kScoresInRegisters : Variant::kTwoTiles;
+    }
+    return Variant::kScoresInRegisters;
+  }
+  // A decision covers the tile's kind and geometry: rows (exact for a split
+  // pass, whose rows are a draft's width; rounded up to a power of two for
+  // prefill, whose chunk lengths vary), heads, head and value widths, the KV
+  // format and layout, the mask, batch rows and FlashPrefill V2 settings.
+  // Not the KV pool's blocks, the block table's length or the split's
+  // parts, which grow with the context: a grown cache asks for nothing new.
+  std::uint64_t variant_class(const KernelShapes& s) const override {
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    if (!d.valid) return KernelPrimitiveBase::variant_class(s);
+    const auto pow2 = [](std::uint32_t v) {
+      std::uint32_t p = 1;
+      while (p < v) p <<= 1;
+      return p;
+    };
+    std::uint64_t h = 0x666c617368ull;
+    const auto mix = [&](std::uint64_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      h *= 0xff51afd7ed558ccdull;
+    };
+    for (const char c : kName) mix(static_cast<unsigned char>(c));
+    for (const std::uint64_t v :
+         {std::uint64_t{d.bsz}, std::uint64_t{Split ? d.tq : pow2(d.tq)}, std::uint64_t{d.qh},
+          std::uint64_t{d.kvh}, std::uint64_t{d.dh}, std::uint64_t{d.dv}, std::uint64_t{d.ts},
+          std::uint64_t{d.window}, static_cast<std::uint64_t>(d.mask),
+          std::uint64_t{d.dim_major_values}})
+      mix(v);
+    for (const DType t : s.input_dtypes) mix(static_cast<std::uint64_t>(t));
+    mix(static_cast<std::uint64_t>(s.output_dtype));
+    for (const float a : {s.attrs[1], s.attrs[2], s.attrs[3]}) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &a, sizeof bits);
+      mix(bits);
+    }
+    return h;
+  }
+  // The checks emit_two_tiles makes before it writes anything; the other
+  // variants emit wherever the default does.
+  bool variant_accepts(const KernelShapes& s, std::uint32_t v) const override {
+    KernelShapes at = s;
+    at.variant = v;
+    if (variant_of(at) != Variant::kTwoTiles) return true;
+    if (s.input_dtypes.size() < 2 ||
+        (s.input_dtypes[1] != DType::kF16 && s.input_dtypes[1] != DType::kBF16) ||
+        s.device == nullptr)
+      return false;
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    constexpr std::uint32_t kT = 16u * 32u, QR = QTile * 2u;
+    constexpr std::uint32_t kProbRow = 64u + 8u, kVsub = 16u;
+    if (!d.valid || d.dh % 16u != 0 || d.dv % 16u != 0 || d.dv > 256u ||
+        s.device->max_threads_per_workgroup < kT)
+      return false;
+    const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
+    if (mask == 3 || d.dim_major_values) return false;
+    const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    const std::uint64_t bytes = std::uint64_t{QR} * padded_depth * 2u +
+        std::uint64_t{QR} * kKWin * 4u + 4u * QR * 4u + kVsub * d.dv * 2u +
+        std::uint64_t{QR} * kProbRow * 2u + 256u;
+    return bytes <= workgroup_lds_bytes(s.device);
+  }
   std::uint32_t variants(const KernelShapes& s) const override {
-    if (s.device == nullptr || !matrix_target(*s.device)) return 1;
-    const auto* row = [&]() -> const math::MatrixCoreRow* {
-      for (const auto& r : math::matrix_core_table())
-        if (r.target == *matrix_target(*s.device) && r.wave == 32 && r.m == 16 &&
-            r.n == 16 && r.k_step == 16 && r.acc == math::MatrixElem::kF32)
-          return &r;
-      return nullptr;
-    }();
-    if (row == nullptr || row->a_len != 16) return 1u;
-    return Split ? 2u : 3u;
+    const auto contiguous = contiguous_rows(s);
+    if (!contiguous) return 1u;
+    if (*contiguous) return 3u;
+    return Split ? 2u : 1u;
   }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
@@ -138,8 +221,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
                                          16, 16).wave != 32) {
                   return {};
                 } else {
-                  return s.variant == 2u ? emit_two_tiles<Storage, G>(s)
-                                         : emit_storage<Storage, G>(s);
+                  return variant_of(s) == Variant::kTwoTiles ? emit_two_tiles<Storage, G>(s)
+                                                             : emit_storage<Storage, G>(s);
                 }
               });
         });
@@ -611,6 +694,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
     const std::uint32_t ntiles = (d.tq + QTile - 1u) / QTile;
     const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    // Query rows in scratch are padded by 16 bytes, as the probability rows
+    // are: unpadded, the sixteen rows of a fragment read start on the same
+    // bank and the read serializes sixteen ways.
+    const std::uint32_t qrow_stride = padded_depth + 8u;
     const std::uint32_t qchunks = (QTile * padded_depth + kThreads - 1u) / kThreads;
     const std::uint32_t dpt = (d.dv + kThreads - 1u) / kThreads;
     const std::uint32_t value_tiles = (d.dv + 127u) / 128u;
@@ -622,8 +709,9 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
 
-    const auto qs = e.lds<Narrow>(QTile * padded_depth);
-    // The window's scores, then the window's probabilities in place.
+    const auto qs = e.lds<Narrow>(QTile * qrow_stride);
+    // The window's scores, then the window's probabilities in place (with
+    // Variant::kScoresInRegisters, only for the unstaged value product).
     const auto sc = e.lds<kir::f32>(QTile * kKWin);
     const auto mrow = e.lds<kir::f32>(QTile);
     const auto drow = e.lds<kir::f32>(QTile);
@@ -653,7 +741,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       // Variant 1 stages 16 keys where 32 fit: less scratch per workgroup,
       // so more of them resident, for twice the staging rounds.
       for (std::uint32_t keys : {32u, 16u})
-        if (vsub == 0 && !(s.variant == 1u && keys == 32u) &&
+        if (vsub == 0 && !(variant_of(s) == Variant::kStageHalf && keys == 32u) &&
             used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
     }
     // A dimension-major value pool (kv::dimension_major_values) holds each
@@ -775,10 +863,11 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         const auto r = e.let(idx / padded_depth);
         const auto dd = e.let(idx % padded_depth);
         const auto qrow = row_query(r);
-        qs[idx] = math::narrow<Narrow>(e.f32(0.0f));
+        const auto qslot = e.let(r * qrow_stride + dd);
+        qs[qslot] = math::narrow<Narrow>(e.f32(0.0f));
         if (auto g = e.when(row_live(r) && dd < d.dh)) {
           const auto qvalue = e.let(a.q[e.let(((b * d.qh + row_head(r)) * d.tq + qrow) * d.dh + dd)]);
-          qs[idx] = math::narrow<Narrow>(qvalue);
+          qs[qslot] = math::narrow<Narrow>(qvalue);
         }
       }
     }
@@ -901,7 +990,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               keys.push_back(e.load(a.k, e.let(kbase + depth), 16u));
             using Frag = lse::vec<Narrow, 8>;
             for (std::uint32_t step = 0; step < keys.size(); ++step) {
-              const auto qa = qs.load(e.let(lane_lo * padded_depth + step * 16u + lane_hi * 8u), 16u);
+              const auto qa = qs.load(e.let(lane_lo * qrow_stride + step * 16u + lane_hi * 8u), 16u);
               acc = math::mma<Mma>(kir::Val<Frag>(&k.types(), &k.ir(), qa.id()),
                                    kir::Val<Frag>(&k.types(), &k.ir(), keys[step].id()),
                                    acc.value());
@@ -931,7 +1020,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
                 keys.push_back(k.load_elems<KvElement<Storage>>(
                     a.k.b.id(), e.let(kbase + step * 16u), 16u));
               for (std::uint32_t step = first; step < last; ++step) {
-                const auto qbase = e.let(lane_lo * padded_depth + step * 16u);
+                const auto qbase = e.let(lane_lo * qrow_stride + step * 16u);
                 const auto qlo = qs.load(qbase, 16u);
                 const auto qhi = qs.load(e.let(qbase + 8u), 16u);
                 auto qa = e.local<Narrow, 16>();
@@ -956,7 +1045,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               else return e.let(depth + 0u);
             }();
             for (auto f : e.unroll(kFrag)) {
-              af[f] = qs[e.let(lane_lo * padded_depth + kk + f)].read();
+              af[f] = qs[e.let(lane_lo * qrow_stride + kk + f)].read();
               bf[f] = math::narrow<Narrow>(e.f32(0.0f));
             }
             if (auto key_live = e.when(key < row_len)) {
@@ -988,8 +1077,27 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
             acc = math::mma<Mma>(af.value(), bf.value(), acc.value());
           }
           }
-          for (auto f : e.unroll(8u))
-            write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
+          if (mask == 2) {
+            for (auto f : e.unroll(8u))
+              write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
+          } else {
+            // A window wholly before the pass's first position: every key
+            // in it lies inside each row and before each query position,
+            // so a live row's score is written as it is, with no per-key
+            // tests. The window that reaches the pass's own positions takes
+            // the full test. Uniform across the workgroup.
+            if (auto prior = e.when(wbase + kKWin <= offset)) {
+              for (auto f : e.unroll(8u)) {
+                const auto row = acc_row(f);
+                sc[e.let(row * kKWin + key - wbase)] =
+                    select(row_live(row), e.let(acc[f].read() * d.scale), math::neg_inf());
+              }
+            }
+            if (auto edge = e.when(wbase + kKWin > offset)) {
+              for (auto f : e.unroll(8u))
+                write_score(acc_row(f), key, e.let(acc[f].read() * d.scale));
+            }
+          }
         }
         e.barrier();
 
@@ -1023,12 +1131,25 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         // Uniform across the workgroup: every nested barrier is convergent.
         if (auto retained = e.when(retain.read() != 0.0f)) {
         // A wave owns two rows; each lane owns eight contiguous-bank keys.
+        // Variant::kScoresInRegisters reads a lane's scores once and keeps
+        // them for the exponent, and writes the probabilities back only for
+        // the unstaged value product (the staged and direct ones read the
+        // narrowed rows). The values and their order are the same.
+        const bool keep_scores = variant_of(s) == Variant::kScoresInRegisters;
+        const bool scores_take_probabilities =
+            !keep_scores || !pb || !(stage_values && vsub != 0);
         for (std::uint32_t wave_row = 0; wave_row < 2; ++wave_row) {
           const auto row = e.let(wave * 2u + wave_row);
+          auto score = e.local<kir::f32, 8>();
+          const auto score_at = [&](auto f) {
+            return keep_scores ? score[f].read()
+                               : sc[e.let(row * kKWin + lane + f * 32u)].read();
+          };
           auto maximum = e.var(math::neg_inf());
           for (auto f : e.unroll(8u)) {
             const auto slot = e.let(lane + f * 32u);
-            maximum = math::max(maximum.read(), sc[e.let(row * kKWin + slot)].read());
+            if (keep_scores) score[f] = sc[e.let(row * kKWin + slot)].read();
+            maximum = math::max(maximum.read(), score_at(f));
           }
           for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
             maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
@@ -1041,8 +1162,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
           for (auto f : e.unroll(8u)) {
             const auto slot = e.let(lane + f * 32u);
             const auto index = e.let(row * kKWin + slot);
-            const auto probability = e.let(math::exp(sc[index].read() - safe_max));
-            sc[index] = probability;
+            const auto probability = e.let(math::exp(score_at(f) - safe_max));
+            if (scores_take_probabilities) sc[index] = probability;
             if (pb) (*pb)[e.let(row * kProbRow + slot)] = math::narrow<Narrow>(probability);
             total = total.read() + probability;
           }
@@ -1387,9 +1508,11 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
     const std::uint32_t parts =
         Split && s.output.rank() == 5 ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
-    // Variant 2 takes two query tiles per workgroup, on sixteen waves.
-    const std::uint32_t tiles = s.variant == 2u ? (ntiles + 1u) / 2u : ntiles;
-    tp.workgroup_size[0] = s.variant == 2u ? 2u * kThreads : kThreads;
+    // The two-tile variant takes two query tiles per workgroup, on sixteen
+    // waves.
+    const bool two_tiles = variant_of(s) == Variant::kTwoTiles;
+    const std::uint32_t tiles = two_tiles ? (ntiles + 1u) / 2u : ntiles;
+    tp.workgroup_size[0] = two_tiles ? 2u * kThreads : kThreads;
     tp.workgroup_count[0] = d.valid ? d.bsz * (d.qh / split_heads_per_tile(d)) * tiles * parts : 1u;
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
