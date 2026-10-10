@@ -8,6 +8,7 @@
 // conv tail and the path K/V write against host references, and the
 // tree-masked attention (flash and split) against a double reference.
 #include "harness.hpp"
+#include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
@@ -169,7 +170,13 @@ LSE_TEST(tree_kernels_emit_for_a_described_device) {
 }
 
 LSE_TEST(tree_mask_takes_the_flash_split_and_flash_paths) {
+  // The split's tile is matrix instructions: the part's matrix generation
+  // comes with its architecture description.
   auto gpu = described_gfx1201();
+  backend::AmdDeviceInfo amd;
+  backend::apply_arch_defaults(gpu, amd);
+  gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+  gpu.extension = &amd;
   gpu.max_threads_per_workgroup = 256;
   for (const std::int64_t n : {4, 8, 16, 32}) {
     for (const int capacity : {256, 4096}) {

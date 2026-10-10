@@ -222,6 +222,9 @@ bool flash_split_scope(const KernelShapes& s) {
   // A draft tree's pass, or a causal pass of a few rows: an MTP or DFlash2
   // chain's verify pass, an MTP draft's first pass.
   if (!paged_inputs(s) || !s.device || (s.iattrs[0] != 3 && s.iattrs[0] != 1)) return false;
+  // The tile is matrix instructions: a device with no matrix generation
+  // keeps the scalar kernels.
+  if (!kernels::matrix_target(*s.device)) return false;
   // A chain takes it with 16-bit K/V, whose values the tile multiplies as
   // they are stored; other storage keeps the short split.
   if (s.iattrs[0] == 1) {
