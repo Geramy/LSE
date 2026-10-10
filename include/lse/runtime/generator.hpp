@@ -403,7 +403,7 @@ class Generator {
   static constexpr std::size_t kTreeHeadKey = std::size_t{1} << 20;
   std::size_t spec_key_ = 0;
   Status mtp_prefill_chunk(const graph::Array& hidden,
-                           std::span<const std::uint32_t> tokens,
+                           std::span<const std::uint32_t> tokens, std::int64_t valid,
                            std::int32_t first, graph::Array* carry);
   Result<std::vector<std::uint32_t>> speculate(
       Session& session, std::vector<float>& prefill_logits,
