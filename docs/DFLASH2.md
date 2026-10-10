@@ -112,7 +112,10 @@ second (`src/runtime/draft_width.cpp`):
   longer the context. A context first reached starts from the nearest one
   measured; the first width measured there moves the level, every width
   measured there takes its own cost at once, and the widths not yet measured
-  there follow the growth the measured ones show, linear in rows. A step
+  there follow the growth the measured ones show, linear in rows. A context
+  left before it had measured every width (a process's first request is
+  mostly warm-up) starts over that way on its return, so it explores nothing
+  again. A step
   that recorded a program (a width's first pass in a request), compiled or
   loaded a kernel, or tried a kernel's variants on the device is left out,
   and so is each width's first pass in a newly reached context. While a
