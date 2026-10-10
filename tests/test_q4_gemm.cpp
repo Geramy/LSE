@@ -172,16 +172,17 @@ LSE_TEST(q4_gemm_emits_for_every_tile_and_width_on_a_described_device) {
 }
 
 // A variant decision is kept by shape class, and a class carries which
-// variants accept its shapes: on gfx1151 a 544-row pass (144-row tile, a
+// variants accept its shapes: on gfx1151 and gfx1201 a 544-row pass (144-row tile, a
 // burst of steps) declines the double-buffered layout and a 1024-row one
 // (the wide tile, one step a loop) takes it. Both round up to the same size,
 // so they are different classes only because of what they accept, and a
 // decision for one never lands on the other: every variant a shape accepts
 // emits for it, and every variant it declines does not.
 LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
+  for (const char* arch : {"gfx1151", "gfx1201"}) {
   backend::DeviceInfo device;
   backend::AmdDeviceInfo amd;
-  device.arch = "gfx1151";
+  device.arch = arch;
   backend::apply_arch_defaults(device, amd);
   device.extension_id = backend::AmdDeviceInfo::kExtensionId;
   device.extension = &amd;
@@ -224,13 +225,14 @@ LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
   };
   const Seen short_pass = at(544), wide_pass = at(1024);
   LSE_EXPECT(short_pass.accepts.size() > 2 && wide_pass.accepts.size() > 2);
-  if (short_pass.accepts.size() <= 2 || wide_pass.accepts.size() <= 2) return;
+  if (short_pass.accepts.size() <= 2 || wide_pass.accepts.size() <= 2) continue;
   // Layout 2, the double-buffered one: declined at 544 rows, taken at 1024.
   LSE_EXPECT(!short_pass.accepts[2]);
   LSE_EXPECT(wide_pass.accepts[2]);
   LSE_EXPECT(short_pass.cls != wide_pass.cls);
   // Another 544-row-class shape (the same tile) is the same class.
   LSE_EXPECT_EQ(at(528).cls, short_pass.cls);
+  }
 }
 
 LSE_TEST(q4_gemm_slices_fill_the_device_without_starving_a_slice) {

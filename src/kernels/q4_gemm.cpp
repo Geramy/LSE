@@ -1237,17 +1237,14 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
   // 8060S (test_q4_gemm --gpu, M 1024, us): N17408 K5120 5196 -> 4957
   // (variant 3), N10240 K5120 2862 -> 2743, N12288 K5120 3604 -> 3472; the
   // down and output projections keep variant 0.
-  // The checks emit_body makes: a layout reading A from the panel needs a
-  // part whose fragments are whole loads, and the double-buffered layout
-  // needs a single-step K loop and an even number of steps.
+  // The checks emit_body makes: the double-buffered layout needs a
+  // single-step K loop and an even number of steps.
   bool variant_accepts(const KernelShapes& s, std::uint32_t v) const override {
     const Dims d = dims_of(s, Sliced);
     if (!d.valid || !device_fits(s, d)) return v == 0u;
     const auto* row = f16_row(s);
     if (row == nullptr) return v == 0u;
     const std::uint32_t layout = gemm_variant(v, gemm_layouts(s)).layout;
-    const bool direct = layout == 1u || layout == 2u;
-    if (direct && row->a_len != 16) return false;
     if (layout == 2u && !b_double_fits(d, tile_for(s, d))) return false;
     return layout <= 3u;
   }
