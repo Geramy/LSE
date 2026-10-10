@@ -707,8 +707,9 @@ int trials() {
   scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
   std::mt19937 rng(11);
   std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
-  const std::uint32_t n = 15;
-  const runtime::DraftTree tree = make_tree(n, 5);
+  // Fourteen drafted nodes and the root: a 15-row pass.
+  const runtime::DraftTree tree = make_tree(14, 5);
+  const std::uint32_t n = tree.rows();
   const std::int64_t kvh = 4, qh = 24, hd = 256, bs = 16;
   std::vector<std::uint64_t> measured;
   for (const std::int64_t capacity : {std::int64_t{4096}, std::int64_t{8192}, std::int64_t{16384}}) {
