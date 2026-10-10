@@ -19,8 +19,12 @@ constexpr double kPositionPrior = 0.6;
 constexpr double kCalibrationDecay = 1.0 - 0.6931471805599453 / 512.0;
 // Each position's mean acceptance decides how deep an MTP chain goes before
 // any proposal exists, so it has to follow a change of text within a request
-// (code to prose): half weight after 64 more checks, about 20 steps.
-constexpr double kPositionDecay = 1.0 - 0.6931471805599453 / 64.0;
+// (code to prose): half weight after 20 more checks of that position, about
+// 20 steps for the first one. A position fades only when it is checked
+// itself: one that a shallow chain stops checking keeps what it last showed
+// instead of sliding back to the prior, which would price every deeper chain
+// at the prior and keep the chain shallow for good.
+constexpr double kPositionDecay = 1.0 - 0.6931471805599453 / 20.0;
 constexpr double kBiasRate = 0.1;
 // Cost tracking. The level follows the context quickly; a width's offset
 // (what its extra rows cost) changes slowly.
@@ -36,9 +40,12 @@ constexpr double kValueRate = 1.0 / 16.0;
 constexpr double kOutlierClamp = 0.25;
 
 double clamp_step(double residual, double scale) {
-  // Scales below a millisecond clamp as one millisecond does.
+  // Only a rise is clamped. A stall can make one step slow, but nothing makes
+  // a step faster than its work, so a fall says the estimate was high (it
+  // may hold a step that compiled) and is taken whole. Scales below a
+  // millisecond clamp as one millisecond does.
   const double bound = kOutlierClamp * std::max(scale, 1e6);
-  return std::clamp(residual, -bound, bound);
+  return std::min(residual, bound);
 }
 }  // namespace
 
@@ -59,9 +66,15 @@ double DraftWidthPolicy::acceptance(double confidence) const noexcept {
 }
 
 double DraftWidthPolicy::position_mean(std::uint32_t position) const noexcept {
-  if (position >= kMaxProposals) return kPositionPrior;
-  const Bin& b = positions_[position];
-  return (b.accepted + kPriorWeight * kPositionPrior) / (b.tested + kPriorWeight);
+  // A position starts at the one before it (the first at kPositionPrior), so
+  // one never checked is priced like the deepest position that was and the
+  // chain reaches it to find out.
+  double mean = kPositionPrior;
+  for (std::uint32_t p = 0; p <= position && p < kMaxProposals; ++p) {
+    const Bin& b = positions_[p];
+    mean = (b.accepted + kPriorWeight * mean) / (b.tested + kPriorWeight);
+  }
+  return mean;
 }
 
 std::size_t DraftWidthPolicy::context_bucket(std::int64_t tokens) noexcept {
@@ -93,11 +106,13 @@ void DraftWidthPolicy::set_context(std::int64_t tokens) noexcept {
     ladder.seed = ladder.offset;
     ladder.seed_known = ladder.known;
     ladder.samples.fill(0);
+    ladder.entered.fill(false);
   };
   seed(here.verify);
   seed(here.tree);
   here.draft_seed = here.draft;
   here.draft_samples.fill(0);
+  here.draft_entered.fill(false);
   here.draft_seeded = true;
 }
 
@@ -131,6 +146,11 @@ template <std::size_t N, class Rows>
 void DraftWidthPolicy::observe_cost(Ladder<N>& ladder, std::size_t i, double t, Rows rows_of) {
   bool any = false;
   for (const auto count : ladder.samples) any = any || count != 0;
+  if (ladder.seeded && !ladder.entered[i]) {
+    ladder.entered[i] = true;
+    ladder.last_seen[i] = steps_;
+    return;
+  }
   if (ladder.seeded && ladder.samples[i] == 0) {
     // The first measurement of this width in a bucket started from another
     // one: the first moves the level, each later one sets its own offset.
@@ -140,6 +160,11 @@ void DraftWidthPolicy::observe_cost(Ladder<N>& ladder, std::size_t i, double t, 
     ladder.base = t;
     ladder.offset[i] = 0.0;
   } else if (ladder.samples[i] == 0) {
+    ladder.offset[i] = t - ladder.base;
+  } else if (ladder.samples[i] < kTrustedSamples && t < ladder.base + ladder.offset[i]) {
+    // While a cost rests on few samples, a lower one replaces it: early
+    // samples err high (a step that compiled, clocks still ramping), so the
+    // estimate is their minimum until the width is trusted.
     ladder.offset[i] = t - ladder.base;
   } else {
     const double predicted = ladder.base + ladder.offset[i];
@@ -194,10 +219,13 @@ std::uint32_t DraftWidthPolicy::refresh(std::uint32_t max, bool chained) const n
     best = std::max(best, value[d]);
   }
   const auto& last_seen = costs().verify.last_seen;
+  const auto& samples = costs().verify.samples;
   std::uint32_t stalest = 0;
   for (std::uint32_t rows = 1; rows <= max + 1; ++rows) {
     const std::uint64_t age = steps_ - last_seen[rows];
-    if (age <= kRefreshSteps || (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps))
+    const bool shaky = samples[rows] < kTrustedSamples && age > kEarlyRefreshSteps;
+    if (!shaky && (age <= kRefreshSteps ||
+                   (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps)))
       continue;
     if (stalest == 0 || last_seen[rows] < last_seen[stalest]) stalest = rows;
   }
@@ -305,13 +333,13 @@ void DraftWidthPolicy::observe_acceptance(double confidence, std::uint32_t posit
   const double predicted = acceptance(confidence);
   bias_ = std::clamp(bias_ + kBiasRate * ((accepted ? 1.0 : 0.0) - predicted), -4.0, 4.0);
   for (Bin& b : bins_) { b.accepted *= kCalibrationDecay; b.tested *= kCalibrationDecay; }
-  for (Bin& b : positions_) { b.accepted *= kPositionDecay; b.tested *= kPositionDecay; }
   Bin& b = bins_[bin_of(confidence)];
   b.tested += 1.0;
   b.accepted += accepted ? 1.0 : 0.0;
   if (position < kMaxProposals) {
-    positions_[position].tested += 1.0;
-    positions_[position].accepted += accepted ? 1.0 : 0.0;
+    Bin& at = positions_[position];
+    at.accepted = at.accepted * kPositionDecay + (accepted ? 1.0 : 0.0);
+    at.tested = at.tested * kPositionDecay + 1.0;
   }
 }
 
@@ -327,6 +355,10 @@ void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
   if (depth > kMaxProposals || steps_ <= kWarmupSteps) return;
   const auto t = static_cast<double>(ns);
   Costs& c = costs();
+  if (c.draft_seeded && !c.draft_entered[depth]) {
+    c.draft_entered[depth] = true;
+    return;
+  }
   double& d = c.draft[depth];
   if (c.draft_samples[depth]++ == 0) {
     d = t;
@@ -337,6 +369,9 @@ void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
       for (std::uint32_t e = 0; e <= kMaxProposals; ++e)
         if (c.draft_samples[e] == 0) c.draft[e] = c.draft_seed[e] * scale;
     }
+  } else if (c.draft_samples[depth] <= kTrustedSamples && t < d) {
+    // A lower early sample replaces the estimate, as a width's does.
+    d = t;
   } else {
     d += kDraftRate * clamp_step(t - d, d);
   }
@@ -365,6 +400,17 @@ std::uint32_t DraftWidthPolicy::depth(std::uint32_t max, std::uint32_t initial) 
       best_value = value;
       best = d;
     }
+  }
+  // Evidence a position can be expected to hold scales with how often a
+  // chain reaches it: one behind weak positions is not probed for.
+  double reach = 1.0;
+  for (std::uint32_t p = 0; p < max; ++p) {
+    if (p >= best && positions_[p].tested < kPositionTrusted * reach) {
+      if (steps_ - position_probe_ < kPositionProbeSteps) break;
+      position_probe_ = steps_;
+      return max;
+    }
+    reach *= position_mean(p);
   }
   return best;
 }
@@ -453,9 +499,14 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
   if (steps_ < kWarmupSteps) return fit(kTreeRows[1]);
   if (const std::uint32_t rows = tree_exploring(); rows != 0) return fit(rows);
   if (chain && exploring() != 0) return 0;
-  // A rung unmeasured for long enough is measured again, whatever it costs.
-  for (std::size_t r = 0; r < kTreeRows.size(); ++r)
-    if (steps_ - costs().tree.last_seen[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
+  // A rung unmeasured for long enough is measured again, whatever it costs,
+  // and sooner while its cost rests on few measurements.
+  for (std::size_t r = 0; r < kTreeRows.size(); ++r) {
+    const std::uint64_t age = steps_ - costs().tree.last_seen[r];
+    if (age > kHardRefreshSteps ||
+        (costs().tree.samples[r] < kTrustedSamples && age > kEarlyRefreshSteps))
+      return fit(kTreeRows[r]);
+  }
   const double draft = draft_ns(kMaxProposals);
   std::uint32_t best = fit(kTreeRows[0]);
   double best_rate = -1.0;

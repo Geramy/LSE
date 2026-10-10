@@ -112,8 +112,15 @@ second (`src/runtime/draft_width.cpp`):
   longer the context. A context first reached starts from the nearest one
   measured; the first width measured there moves the level, every width
   measured there takes its own cost at once, and the widths not yet measured
-  there follow the growth the measured ones show, linear in rows. A step that recorded a program (a width's
-  first pass in a request) or compiled a kernel is left out. Nothing is
+  there follow the growth the measured ones show, linear in rows. A step
+  that recorded a program (a width's first pass in a request), compiled or
+  loaded a kernel, or tried a kernel's variants on the device is left out,
+  and so is each width's first pass in a newly reached context. While a
+  cost rests on fewer than two samples a lower sample replaces it, and after
+  128 steps it is measured again whatever it is priced at; a slow outlier
+  moves an estimate by at most a quarter, a fast one moves it whole. A cold
+  first request (kernels compiling and variants being tried) therefore
+  cannot price the wide widths or tree rungs out for good. Nothing is
   hard-coded, so each GPU tunes itself: on the R9700 the step costs of 1 to 8
   rows measured 33.7, 35.3, 36.2, 35.9, 36.1, 36.5, 38.1 and 38.7 ms (verify
   pass, acceptance walk and context append; 640-token essay, warm), and
@@ -194,6 +201,12 @@ on MTP at that scale; a two-seed run of the essay was still about 3 to 4%
 below depth 3. An MTP chain's draft cost climbs in steps (about 3.6, 6.4,
 11.7, 11.9 and 15.7 ms for 1 to 5 proposals), so the depth choice is
 close; on prose `--adaptive-mtp=off` is the faster setting today.
+The chain depth is chosen from each position's mean acceptance. A position
+fades only when it is checked (half weight after 20 checks), one never
+checked starts at the mean of the position before it, and a position
+holding little evidence for how often chains reach it gets a full-depth
+chain at most every 16 steps; without this, a process whose first chains
+were 3 deep priced every deeper position at the prior and stayed at depth 3.
 
 Greedy requests produced byte-identical text to master with the policy on
 and off (essay, code, 2K and 4K prompts).

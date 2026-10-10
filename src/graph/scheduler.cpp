@@ -138,6 +138,7 @@ enum class DispatchStage : std::uint8_t { kEmit, kCompileOrLaunch };
 
 struct Scheduler::Impl {
   std::shared_ptr<kv::MemoryManager> kv_memory = kv::MemoryManager::create();
+  std::uint64_t variant_trials = 0;
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
   // One per stream: a persistent-grid kernel spins on this counter across its
@@ -278,7 +279,7 @@ Scheduler::JitStats Scheduler::jit_stats() const noexcept {
   if (impl_->jit == nullptr) return {};
   const JitCache::Stats& s = impl_->jit->stats();
   return JitStats{s.memory_hits, s.disk_hits, s.compiles, s.compile_ns,
-                  s.index_hits, s.index_misses, s.index_rejects};
+                  s.index_hits, s.index_misses, s.index_rejects, impl_->variant_trials};
 }
 
 std::string Scheduler::device_gap(const Node& node,
@@ -1133,6 +1134,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       LSE_ASSIGN_OR(chosen, run_variant_trial(trial, why));
     }
     const std::uint64_t trial_ns = elapsed_ns(t_trial, SpanClock::now());
+    ++impl_->variant_trials;
     impl_->variants.spend(trial_ns);
     trace_.spans.host_wait.add(trial_ns);
     if (why == "unmeasurable") impl_->variants.hold(pick.key, 0);

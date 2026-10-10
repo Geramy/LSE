@@ -1246,8 +1246,11 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
   bool step_tree = false;
   std::int32_t step_at = 0;
   std::string step_trace;
+  // What a step did besides its passes' work: kernels compiled or loaded,
+  // kernels whose variants were tried on the device, target passes built,
+  // groups run on the host.
   struct StepWork {
-    std::uint64_t compiles = 0, disk_loads = 0, builds = 0, host_groups = 0;
+    std::uint64_t compiles = 0, disk_loads = 0, variant_trials = 0, builds = 0, host_groups = 0;
     bool operator==(const StepWork&) const = default;
   };
   StepWork step_counters;
@@ -1255,10 +1258,17 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
     StepWork c;
     if (graph::Scheduler* sched = graph::default_scheduler()) {
       const auto jit = sched->jit_stats();
-      c = {jit.compiles, jit.disk_hits, model_.builds(), sched->accumulated_trace().host_groups};
+      c = {jit.compiles, jit.disk_hits, jit.variant_trials, model_.builds(),
+           sched->accumulated_trace().host_groups};
     }
     return c;
   };
+  // A step whose counters moved did one-time work (a kernel compiled or
+  // loaded, a pass built) and is not priced. Work that moves them on every
+  // step is not one-time: after kColdRun such steps in a row, steps are
+  // priced anyway, so the width policy cannot stay in its warm-up for good.
+  constexpr std::uint32_t kColdRun = 32;
+  std::uint32_t cold_run = 0;
   while (running) {
     m = row_in.size();
     const auto at = static_cast<std::int32_t>(session.position());
@@ -1280,7 +1290,10 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       if (step_top != 0) {
         const std::uint64_t period = now - step_top;
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
-        const bool warm = step_counters == counters;
+        const bool quiet = step_counters == counters;
+        cold_run = quiet ? 0u : cold_run + 1u;
+        const bool warm = quiet || cold_run > kColdRun;
+        if (!warm) widths->observe_unpriced_step();
         if (warm && step_tree) {
           widths->observe_tree_step(static_cast<std::uint32_t>(step_rows), period);
           widths->observe_step(static_cast<std::uint32_t>(step_tokens), period);
@@ -1293,10 +1306,16 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
         }
         if (lse::debug())
           std::fprintf(stderr, "[spec-width] position=%d rows=%zu tokens=%zu verify_ms=%.3f "
-                       "draft_ms=%.3f warm=%d next_rows=%zu rate_tps=%.2f estimates=%s\n",
+                       "draft_ms=%.3f warm=%d work=%llu/%llu/%llu/%llu/%llu next_rows=%zu "
+                       "rate_tps=%.2f estimates=%s\n",
                        step_at, step_rows, step_tokens, static_cast<double>(verify_ns) / 1e6,
-                       static_cast<double>(last_draft_ns) / 1e6, warm ? 1 : 0, m,
-                       widths->rate() * 1e9, step_trace.c_str());
+                       static_cast<double>(last_draft_ns) / 1e6, warm ? 1 : 0,
+                       static_cast<unsigned long long>(counters.compiles - step_counters.compiles),
+                       static_cast<unsigned long long>(counters.disk_loads - step_counters.disk_loads),
+                       static_cast<unsigned long long>(counters.variant_trials - step_counters.variant_trials),
+                       static_cast<unsigned long long>(counters.builds - step_counters.builds),
+                       static_cast<unsigned long long>(counters.host_groups - step_counters.host_groups),
+                       m, widths->rate() * 1e9, step_trace.c_str());
       }
       if (lse::debug() && stats_.spec_steps % 64 == 0)
         std::fprintf(stderr, "[spec-width-policy] position=%d %s\n", at, widths->describe().c_str());
