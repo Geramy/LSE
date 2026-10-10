@@ -739,17 +739,12 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     auto generated = resident ? emitter->emit_launch(group, be.device_info())
                               : emitter->emit(group, be.device_info());
     if (!generated.ok() && pick.variant != 0) {
-      // A decision is kept by shape class, and a variant can decline a shape
-      // of its class another shape took it for (its buffers do not fit
-      // there): this shape then runs variant 0.
-      variant_scope.reset();
-      variant_scope.emplace(0);
-      pick.variant = 0;
-      ident = emitter->cache_key(group, be.device_info());
-      const bool resident0 =
-          impl_->jit->try_get(member, ident, emitter->dialect()) != nullptr;
-      generated = resident0 ? emitter->emit_launch(group, be.device_info())
-                            : emitter->emit(group, be.device_info());
+      // A decision covers only shapes whose class says they accept it
+      // (KernelPrimitiveBase::variant_accepts), so a decline here is a bug in
+      // that check, never a case to route around.
+      return LSE_ERROR(kInternal, "variant ", pick.variant, " of ", describe_group(group, 0),
+                       " was decided for this shape's class and declined it: ",
+                       generated.status().to_string());
     }
     if (!generated.ok()) {
       trace_.spans.emit.add(elapsed_ns(t_emit, SpanClock::now()));
@@ -1530,14 +1525,8 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
     // A decided variant is the kernel the step will launch, so it is the one
     // prepared; an undecided one prepares variant 0 and is measured when it
     // first runs.
-    std::uint32_t variant =
+    const std::uint32_t variant =
         impl_->pick_variant(*memitter, mtc->compiler, g, be.device_info()).variant;
-    if (variant != 0) {
-      // The class's decision may be one this shape declines (see
-      // try_dispatch_group): then variant 0 is the kernel it will launch.
-      const EmissionVariantScope probe(variant);
-      if (!memitter->emit_launch(g, be.device_info()).ok()) variant = 0;
-    }
     const EmissionVariantScope scope(variant);
     const std::uint64_t ident = memitter->cache_key(g, be.device_info());
     if (impl_->jit->try_get(member, ident, memitter->dialect()) != nullptr) continue;
@@ -1567,7 +1556,11 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
       auto emitted = m.emitter->emit(*g, info);
       if (!emitted.ok()) {
         return Status(emitted.status().code(), ::lse::detail::concat(
-            "preparing ", describe_group(*g, 0), ": ", emitted.status().to_string()));
+            "preparing ", describe_group(*g, 0),
+            m.variants[i] != 0 ? ::lse::detail::concat(" (variant ", m.variants[i],
+                                                       ", decided for its class)")
+                               : std::string(),
+            ": ", emitted.status().to_string()));
       }
       kernels.push_back(emitted.release());
     }
