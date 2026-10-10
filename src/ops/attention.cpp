@@ -478,7 +478,7 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
 
   const backend::DeviceInfo* split_device = nullptr;
   const auto table_capacity = paged ? cache->table.shape().dim(1) * kv::kBlockSize : 0;
-  // A tree pass may take the flash split (dispatch::flash_split_scope).
+  // A tree or chain pass may take the flash split (dispatch::flash_split_scope).
   if (paged && (tree || dispatch::split_decode_scope(q.shape(), offset, table_capacity) ||
                 dispatch::split_short_scope(q.shape(), offset, table_capacity))) {
     if (auto* scheduler = graph::default_scheduler()) {

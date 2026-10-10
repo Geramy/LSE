@@ -22,16 +22,38 @@ inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;
 // are scalar: at 4K context on gfx1201, 8 rows take 0.40 ms split, 15 rows
 // 0.26 ms flash, against 0.17 ms for 15 rows here.
 inline constexpr std::uint32_t kFlashSplitMinRows = 2, kFlashSplitMaxRows = 64;
+// Chain passes (causal, one sequence) take the flash split up to this many
+// rows: an MTP or DFlash2 verify chain, an MTP draft's first pass. Their K/V
+// windows are read once per tile of every query head and row of a key head,
+// where the scalar short split read them once per tile of two heads and four
+// rows and spent its time on per-row reductions.
+inline constexpr std::uint32_t kFlashSplitChainMaxRows = 8;
 inline constexpr std::uint64_t kFlashSplitMinKeys = 1024;
+// Query heads of one key head that share a split pass's tile: the most that
+// divide the group and whose rows fit the tile's sixteen (eight rows of two
+// heads, four of three, two of six).
+[[nodiscard]] constexpr std::uint32_t flash_split_pack(std::uint32_t group,
+                                                        std::uint32_t rows) noexcept {
+  std::uint32_t pack = 1;
+  for (std::uint32_t n = 2; n <= group && n * rows <= kFlashQueryTile; ++n)
+    if (group % n == 0) pack = n;
+  return pack;
+}
+// Workgroups per share of the windows: one per tile of every key head.
+[[nodiscard]] constexpr std::uint32_t flash_split_units(std::uint32_t heads,
+    std::uint32_t key_heads, std::uint32_t rows) noexcept {
+  if (key_heads == 0 || heads % key_heads != 0) return heads;
+  const std::uint32_t group = heads / key_heads;
+  return key_heads * (group / flash_split_pack(group, rows)) *
+         ((rows + kFlashQueryTile - 1u) / kFlashQueryTile);
+}
 // Shares of a rung's windows: enough that the live half of the rung (a KV
 // rung doubles as it grows) still gives every compute unit four workgroups.
 [[nodiscard]] constexpr std::uint32_t flash_split_parts(std::uint64_t capacity,
-    std::uint32_t heads, std::uint32_t rows, std::uint32_t compute_units) noexcept {
+    std::uint32_t units, std::uint32_t compute_units) noexcept {
   const auto windows = (capacity + kFlashKeyWindow - 1u) / kFlashKeyWindow;
-  const std::uint64_t per_part =
-      std::uint64_t{heads} * ((rows + kFlashQueryTile - 1u) / kFlashQueryTile);
-  if (windows == 0 || per_part == 0) return 1;
-  const auto want = (8u * std::uint64_t{compute_units} + per_part - 1u) / per_part;
+  if (windows == 0 || units == 0) return 1;
+  const auto want = (8u * std::uint64_t{compute_units} + units - 1u) / units;
   const auto parts = want == 0 ? 1u : want < windows ? want : windows;
   const auto share = (windows + parts - 1u) / parts;
   return static_cast<std::uint32_t>((windows + share - 1u) / share);

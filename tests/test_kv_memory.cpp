@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <vector>
+
 #include "harness.hpp"
 #include "lse/backends/cpu/cpu_backend.hpp"
 #include "lse/kv/memory.hpp"
@@ -105,6 +108,36 @@ LSE_TEST(kv_fragment_growth_preserves_addresses_and_cross_fragment_data) {
   LSE_EXPECT_EQ(manager->stats().arenas, 1u);
   first = {};
   LSE_EXPECT_EQ(manager->stats().arenas, 0u);
+}
+
+// Attention reads cache values for keys past a row under a zero weight, which
+// is exact only for finite values: a fragment the cache grows into must hold
+// zeros even when its slot last held something else (here, all NaN bytes).
+LSE_TEST(kv_fragment_growth_zeroes_reused_slots) {
+  backend::BackendAdapter<backend::CpuBackend> cpu;
+  LSE_EXPECT_OK(cpu.init(0));
+  auto manager = kv::MemoryManager::create();
+  auto keep_arena = manager->acquire(cpu, backend::kDefaultStream);
+  auto dirty = manager->acquire(cpu, backend::kDefaultStream);
+  LSE_EXPECT_OK(keep_arena.status());
+  LSE_EXPECT_OK(dirty.status());
+  if (!keep_arena.ok() || !dirty.ok()) return;
+  auto held = keep_arena.release();
+  auto slot = dirty.release();
+  const auto released_offset = slot.offset;
+  const std::vector<std::uint8_t> nan_bytes(kv::kFragmentBytes, 0xff);
+  LSE_EXPECT_OK(cpu.copy_h2d(nan_bytes.data(), slot, nan_bytes.size(), 0));
+  slot = {};
+  auto storage = std::make_shared<kv::FragmentStorage>(manager, cpu, backend::kDefaultStream);
+  LSE_EXPECT_OK(storage->reserve(kv::kFragmentBytes));
+  LSE_EXPECT_OK(storage->grow(kv::kFragmentBytes));
+  LSE_EXPECT_EQ(manager->stats().arenas, 1u);
+  std::vector<std::uint8_t> got(kv::kFragmentBytes, 0x5a);
+  LSE_EXPECT_OK(storage->read(got.data(), got.size(), 0));
+  LSE_EXPECT(std::all_of(got.begin(), got.end(), [](std::uint8_t b) { return b == 0; }));
+  (void)released_offset;
+  storage.reset();
+  held = {};
 }
 
 LSE_TEST(kv_block_growth_consumes_existing_free_blocks_first) {

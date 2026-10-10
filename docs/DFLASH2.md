@@ -244,9 +244,14 @@ Fast wide passes make trees pay. Every projection of a 9 to 31-row tree pass
 runs on the 16-row int8 matrix panel, one workgroup applying each weight load
 to every 16-row tile (9 to 14 rows run as 15, 17 to 30 as 31); attention takes
 `attention.flash_split.wmma16.v1`, the flash tile over a share of the key
-windows per workgroup, merged by the split merge. These are tree-only
-(`graph::TreePassScope`): chain and prompt passes keep their kernels and their
-output.
+windows per workgroup, merged by the split merge. The matrix panel widths are
+tree-only (`graph::TreePassScope`). The flash split also serves chain passes
+of 2 to 8 rows over FP16 or BF16 K/V (MTP and DFlash2 verify chains, an MTP
+draft's first pass): every query head and row of a key head shares its tiles,
+so each window of keys and values is read once per tile instead of once per
+two heads and four rows. A chain's logits differ from the scalar split's in
+their last bits (BF16 matrix operands); one-row decode keeps the scalar
+kernel.
 
 Verify pass time on the Linux R9700 (gfx1201), ms, median of 7 per width
 after a warm request, master's chain passes against the same widths as tree
