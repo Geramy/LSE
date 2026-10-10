@@ -350,6 +350,7 @@ add_library(lse_runtime
   src/runtime/generator.cpp
   src/runtime/perplexity.cpp
   src/runtime/session.cpp
+  src/runtime/sparse_decode_calibration.cpp
 )
 add_library(lse::runtime ALIAS lse_runtime)
 lse_apply_common_flags(lse_runtime)

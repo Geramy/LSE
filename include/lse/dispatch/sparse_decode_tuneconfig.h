@@ -30,9 +30,11 @@ inline constexpr std::uint32_t kRefreshSlackTokens = 64;
 // row's bound over the newest pages (always read), so heads with large and
 // small logits compete on attention mass rather than on raw scale.
 inline constexpr std::uint32_t kReferencePages = 8;
-// Score kernel: one thread per page, query rows staged in LDS this many at a
-// time (48 rows of 256 floats is 48 KiB).
+// Score kernel: kScorePages pages per workgroup, each scored by
+// kScoreThreads / kScorePages threads that split the query rows, which are
+// staged in LDS this many at a time (48 rows of 256 floats is 48 KiB).
 inline constexpr std::uint32_t kScoreThreads = 256;
+inline constexpr std::uint32_t kScorePages = 64;
 inline constexpr std::uint32_t kScoreRowChunk = 48;
 // Select kernel: one workgroup per sequence and key head.
 inline constexpr std::uint32_t kSelectThreads = 256;

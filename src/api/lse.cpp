@@ -61,6 +61,7 @@
 #include "lse/probe/pool.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/runtime/perplexity.hpp"
+#include "lse/runtime/sparse_decode_calibration.hpp"
 #include "lse/server/http_server.hpp"
 #include "lse/server/in_process.hpp"
 #include "lse/server/router.hpp"
@@ -746,6 +747,42 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   }
   if (const Status s = e.binder->finish("model"); !s.ok()) {
     return fail(s, "uploading the weights");
+  }
+  if (config.sparse_attention.sparse_decode.summaries()) {
+    // What this device's sparse decode kernels cost, measured once per
+    // device, build and geometry, and the context each pass width switches
+    // at under auto.
+    progress::begin("calibrating_sparse_decode");
+    const auto& info = devices->device(0).device_info();
+    char build[17];
+    std::snprintf(build, sizeof(build), "%016llx",
+                  static_cast<unsigned long long>(hash_bytes(graph::engine_build_identity())));
+    runtime::SparseDecodeGeometry geometry{config.attn_q_heads, config.attn_kv_heads, config.attn_head_dim,
+                                           config.sparse_attention.sparse_decode.budget_tokens};
+    const std::string path = graph::default_cache_dir() + "/profiles/" + build + "/sparse-decode-" +
+                             info.arch + "-" + std::to_string(int(info.ordinal)) + ".txt";
+    auto calibrated = runtime::calibrate_sparse_decode(info, geometry, path);
+    if (!calibrated.ok()) {
+      if (config.sparse_attention.sparse_decode.mode == ops::SparseDecodeMode::kAuto)
+        std::fprintf(stderr, "lse-server: sparse decode not calibrated (%s); every pass stays exact\n",
+                     calibrated.status().to_string().c_str());
+      else
+        return fail(calibrated.status(), "calibrating sparse decode");
+    } else {
+      dispatch::SparseDecodeShape shape;
+      shape.query_heads = static_cast<std::uint32_t>(config.attn_q_heads);
+      shape.key_heads = static_cast<std::uint32_t>(config.attn_kv_heads);
+      shape.head_dim = static_cast<std::uint32_t>(config.attn_head_dim);
+      shape.budget = static_cast<std::uint32_t>(config.sparse_attention.sparse_decode.budget_tokens);
+      std::string at;
+      for (std::uint32_t rows : {1u, 4u, 8u, 16u}) {
+        shape.rows = rows;
+        const auto live = dispatch::sparse_decode_crossover(&info, shape, static_cast<std::uint64_t>(config.kv_capacity()));
+        at += (at.empty() ? "" : ", ") + std::to_string(rows) + (rows == 1 ? " row " : " rows ") +
+              (live ? std::to_string(live) + " tokens" : std::string("never"));
+      }
+      std::fprintf(stderr, "lse-server: sparse decode crossover on %s: %s\n", info.arch.c_str(), at.c_str());
+    }
   }
 
   progress::begin("loading_tokenizer");

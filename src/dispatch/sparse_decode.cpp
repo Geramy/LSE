@@ -57,14 +57,14 @@ SparseDecodePlan sparse_decode_predict(const backend::DeviceInfo* device,
   const double kv_token = 2.0 * shape.key_heads * shape.head_dim * shape.element_bytes;
   const double bw = roof->stream_bytes_per_s * cal->exact_efficiency;
   // Exact: the split/flash partial and the merge over every live token.
-  plan.exact_ns = 2.0 * roof->launch_ns + static_cast<double>(live) * kv_token * 1e9 / bw;
+  plan.exact_ns = cal->exact_fixed_ns + static_cast<double>(live) * kv_token * 1e9 / bw;
   // Sparse: scores over the far pages, the selection, the descriptor, and
   // the same kernels over the budget.
   const double pages = static_cast<double>((live + sd::kPage - 1) / sd::kPage);
   const double group_rows = static_cast<double>(shape.query_heads / shape.key_heads) * shape.rows;
   const double score = cal->score_fixed_ns + pages * shape.key_heads * group_rows * cal->score_ns_per_row_page;
   const double select = cal->select_fixed_ns + pages * cal->select_ns_per_page;
-  const double attend = 2.0 * roof->launch_ns +
+  const double attend = cal->exact_fixed_ns +
                         static_cast<double>(shape.budget) * kv_token * 1e9 / bw;
   plan.sparse_ns = score + select + attend;
   plan.priced = true;

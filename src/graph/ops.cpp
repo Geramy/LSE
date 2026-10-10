@@ -4,6 +4,7 @@
 #include "lse/dispatch/quant.hpp"
 #include "lse/dispatch/q8_matrix.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/kernels/wmma.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -850,7 +851,11 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
                      {q.node(), summary.node(), meta.node(), table.node()});
   scores->attrs[0] = scale;
   scores->iattrs[0] = budget_pages;
-  scores->prim = find_primitive("attention.sparse_decode.score.v1");
+  // Many rows per key head (verify passes) take the matrix-core scores.
+  const bool many_rows = sq.dim(1) / kvh * sq.dim(2) >= 16;
+  scores->prim = find_primitive(many_rows && kernels::matrix_target(*device)
+                                    ? "attention.sparse_decode.score_mma.v1"
+                                    : "attention.sparse_decode.score.v1");
   auto selected = make(OpKind::kCustom, Shape{batch * kvh, budget_pages}, DType::kF32,
                        {scores, meta.node(), table.node()});
   selected->iattrs[0] = budget_pages;

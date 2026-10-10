@@ -36,6 +36,8 @@ struct SparseDecodeCalibration {
   // Achieved share of the streaming rate: exact split/flash attention over
   // live K/V, and the score kernel over summaries.
   double exact_efficiency = 0.0;
+  // Exact attention's cost beyond its stream (launches, merge, tails).
+  double exact_fixed_ns = 0.0;
   // Score kernel time per (page, key head, query row of the group).
   double score_ns_per_row_page = 0.0;
   double score_fixed_ns = 0.0;
