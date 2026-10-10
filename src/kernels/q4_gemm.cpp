@@ -234,8 +234,17 @@ Dims dims_of(const KernelShapes& s, bool sliced) {
 }
 
 std::uint32_t burst_steps(const Dims& d, const struct Tile& t);
-// The part's tile (its tuning header picks the wide-pass one).
+// The part's tile for this pass's rows (dispatch::q4_gemm_kernel_tile: its
+// tuning header's measured band, else the shape-only tile).
 Tile tile_for(const KernelShapes& s, const Dims& d) {
+  const auto t = dispatch::q4_gemm_kernel_tile(
+      d.m, dispatch::arch::tuning(s.device ? std::string_view(s.device->arch)
+                                           : std::string_view{}));
+  return {t.bm, t.bn, t.wm, t.wn};
+}
+// The gate/up pair's tile: the shape-only one. The bands were measured on the
+// plain GEMM, and the pair stages two matrices' columns per tile.
+Tile pair_tile_for(const KernelShapes& s, const Dims& d) {
   const auto t = dispatch::q4_gemm_tile(
       d.m, dispatch::arch::tuning(s.device ? std::string_view(s.device->arch)
                                            : std::string_view{}));
@@ -321,9 +330,8 @@ std::uint32_t variant_lds_bytes(const Tile& t, std::uint32_t variant) {
   return (kDirectAHalves + t.bn * kRowHalves * (variant == 2u ? 2u : 1u)) * 2u;
 }
 
-bool device_fits(const KernelShapes& s, const Dims& d) {
+bool device_fits(const KernelShapes& s, const Dims& d, const Tile& t) {
   if (!d.valid || !s.device || !s.intrinsics) return false;
-  const Tile t = tile_for(s, d);
   // Every thread stages the same number of activation pieces.
   if (s.device->wavefront_size != 32u ||
       s.device->max_threads_per_workgroup < t.wm * t.wn * 32u ||
@@ -332,8 +340,11 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
   if (device_load_bytes(s.device) < 16u) return false;
   for (const auto symbol : {"barrier", d.bits == 8 ? "q8x8.f16" : "q4x8.f16"})
     if (s.intrinsics->find(symbol).empty()) return false;
-  return backend::workgroup_lds_bytes(s.device) >= lds_bytes(tile_for(s, d)) &&
+  return backend::workgroup_lds_bytes(s.device) >= lds_bytes(t) &&
          f16_row(s) != nullptr;
+}
+bool device_fits(const KernelShapes& s, const Dims& d) {
+  return d.valid && device_fits(s, d, tile_for(s, d));
 }
 
 // The layouts a part's fragments allow (Q4GemmKernel::variants).
@@ -802,7 +813,7 @@ std::string emit_pair_body(const KernelShapes& s, const Dims& d) {
   constexpr std::uint32_t kLaneK = kGeo.lane_k;
   static_assert(kLaneK % kRun == 0u, "fragments load in whole runs");
 
-  const Tile t = tile_for(s, d);
+  const Tile t = pair_tile_for(s, d);
   if (!pair_fits(s, d, t)) return {};
   const std::uint32_t M = d.m, N = d.n, K = d.k;
   const std::uint32_t KT = K / kBK;
@@ -1056,7 +1067,8 @@ struct Q4GemmPairKernel final : graph::KernelPrimitive<Q4GemmPairKernel> {
     KernelShapes g = s;
     g.inputs = shapes;
     g.input_dtypes = dtypes;
-    if (!device_fits(g, p.d) || !pair_fits(g, p.d, tile_for(g, p.d))) return {};
+    const Tile t = pair_tile_for(g, p.d);
+    if (!device_fits(g, p.d, t) || !pair_fits(g, p.d, t)) return {};
     const auto* row = f16_row(g);
     return with_matrix_target<std::string>(
         row->target, [&]<math::MatrixTarget G>() -> std::string {
@@ -1089,9 +1101,8 @@ struct Q4GemmPairKernel final : graph::KernelPrimitive<Q4GemmPairKernel> {
     KernelShapes g = s;
     g.inputs = shapes;
     g.input_dtypes = dtypes;
-    if (!device_fits(g, p.d)) return tp;
-    const Tile t = tile_for(g, p.d);
-    if (!pair_fits(g, p.d, t)) return tp;
+    const Tile t = pair_tile_for(g, p.d);
+    if (!device_fits(g, p.d, t) || !pair_fits(g, p.d, t)) return tp;
     tp.workgroup_size[0] = t.wm * t.wn * 32u;
     tp.workgroup_count[0] =
         ((p.d.m + t.bm - 1u) / t.bm) * ((p.d.n + t.bn / 2u - 1u) / (t.bn / 2u));
@@ -1239,6 +1250,17 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
   // down and output projections keep variant 0.
   // The checks emit_body makes: the double-buffered layout needs a
   // single-step K loop and an even number of steps.
+  // A class per tile as well as per shape: which layout is fastest follows
+  // the tile, and widths of one rounded size can take different tiles.
+  std::uint64_t variant_class(const KernelShapes& s) const override {
+    std::uint64_t h = graph::KernelPrimitiveBase::variant_class(s);
+    const Dims d = dims_of(s, Sliced);
+    if (!d.valid || !s.device) return h;
+    const Tile t = tile_for(s, d);
+    for (const std::uint32_t v : {t.bm, t.bn, t.wm, t.wn})
+      h = (h ^ (0x74696c65ull + v)) * 0x100000001b3ull;
+    return h;
+  }
   bool variant_accepts(const KernelShapes& s, std::uint32_t v) const override {
     const Dims d = dims_of(s, Sliced);
     if (!d.valid || !device_fits(s, d)) return v == 0u;

@@ -111,6 +111,34 @@ inline constexpr std::array kQ4MatrixPanelShapes{
     Q4MatrixPanelShape{kArch, 32, 4, 64, 256, 1024, 12288, 5120, 64, 1152},
 };
 
+// The prefill GEMM's tile by pass rows (q4_gemm_kernel_tile). A pass pays
+// for whole row tiles, so each band takes the tile that pads it least for
+// the time per row it costs. Measured at every 16-row width from 256 to 1104
+// on the four projection shapes of a Qwen3.5 27B layer (N x K 17408 x 5120,
+// 5120 x 17408, 10240 x 5120, 6144 x 5120), weighted by how often a pass runs
+// each, against the shape-only tile; every candidate tile wrote the same
+// bytes. Weighted GEMM time per pass, ms, shape-only -> band:
+//   304 184.6 -> 138.1, 320 226.3 -> 139.2   (160 rows on 5 x 2 waves)
+//   352 162.1 -> 146.8, 384 163.8 -> 146.5   (192 rows on 4 x 4 waves)
+//   496 219.8 -> 192.3                       (256 rows on 4 x 2 waves)
+//   608 298.3 -> 265.2, 640 295.4 -> 264.5   (160 rows on 5 x 2 waves)
+//   736 335.6 -> 285.4, 752 336.8 -> 283.6   (192 rows on 4 x 4 waves)
+//   832 372.3 -> 314.2, 864 373.3 -> 317.0   (288 rows on 6 x 2 waves)
+inline constexpr std::array kQ4GemmRowTiles{
+    Q4GemmRowTile{241, 256, {256, 128, 4, 2}},
+    Q4GemmRowTile{289, 320, {160, 128, 5, 2}},
+    Q4GemmRowTile{321, 384, {192, 128, 4, 4}},
+    Q4GemmRowTile{433, 464, {160, 128, 5, 2}},
+    Q4GemmRowTile{465, 512, {256, 128, 4, 2}},
+    Q4GemmRowTile{513, 576, {288, 128, 6, 2}},
+    Q4GemmRowTile{577, 640, {160, 128, 5, 2}},
+    Q4GemmRowTile{641, 672, {192, 128, 4, 4}},
+    Q4GemmRowTile{721, 768, {192, 128, 4, 4}},
+    Q4GemmRowTile{769, 800, {160, 128, 5, 2}},
+    Q4GemmRowTile{801, 864, {288, 128, 6, 2}},
+    Q4GemmRowTile{1025, 1056, {96, 128, 2, 4}},
+};
+
 // -- 8-bit matrix panels --------------------------------------------------
 inline constexpr std::array kQ8MatrixRules{
     q8_shapes::MatrixRule{kArch, 32, 8, 16, 1664, 256, 4},
@@ -156,6 +184,7 @@ inline constexpr Tuning kTuning{
     // 256 x 128 on 4 x 2 waves of 64 x 64 (q4_gemm_tile's comment has the
     // numbers): the generic wide tile, named here because it is this part's.
     .q4_gemm_wide = kQ4GemmWideTile,
+    .q4_gemm_rows = kQ4GemmRowTiles,
 };
 
 static_assert(rows_name(kQuantMatrixShapes, kArch) &&

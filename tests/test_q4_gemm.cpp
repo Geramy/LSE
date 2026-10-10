@@ -3,7 +3,9 @@
 // Without arguments this checks only the graph-construction contract, which
 // needs no device. `--gpu M N K [reps]` runs one contraction on the device,
 // compares a sample of outputs against the oracle and reports the mean time
-// of `reps` replays.
+// of `reps` replays. `--bands` checks, on the device, that every measured
+// band of the part's tile table (arch::Tuning::q4_gemm_rows) writes the bytes
+// the shape-only tile writes.
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
@@ -171,13 +173,84 @@ LSE_TEST(q4_gemm_emits_for_every_tile_and_width_on_a_described_device) {
   }
 }
 
+// Every band of every part's tile table (arch::Tuning::q4_gemm_rows) takes
+// the tile the band names and emits a GEMM for it, plain and K-sliced, at
+// both ends of the band: a band tile the kernel declined would leave the
+// shape to the legacy contraction.
+LSE_TEST(q4_gemm_every_band_emits_its_tile_on_its_part) {
+  for (const char* arch : {"gfx1201", "gfx1151"}) {
+    backend::DeviceInfo device;
+    backend::AmdDeviceInfo amd;
+    device.arch = arch;
+    backend::apply_arch_defaults(device, amd);
+    device.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    device.extension = &amd;
+    const auto& tune = dispatch::arch::tuning(arch);
+    for (const auto& band : tune.q4_gemm_rows) {
+      LSE_EXPECT(band.lo <= band.hi && band.lo >= dispatch::kQ4GemmMinRows);
+      for (const std::uint64_t mm : {band.lo, band.hi}) {
+        const auto t = dispatch::q4_gemm_kernel_tile(mm, tune);
+        LSE_EXPECT(t.bm == band.tile.bm && t.bn == band.tile.bn && t.wm == band.tile.wm &&
+                   t.wn == band.tile.wn);
+        const auto m = static_cast<std::int64_t>(mm);
+        for (const auto& [n, k] : {std::pair<std::int64_t, std::int64_t>{17408, 5120}, {5120, 17408}}) {
+          auto x = leaf({1, m, k}, DType::kF32);
+          auto panel_node = std::make_shared<Node>();
+          panel_node->shape = Shape{m, k};
+          panel_node->dtype = DType::kF16;
+          panel_node->materialized = true;
+          for (const std::int32_t slices : {1, 2}) {
+            auto gemm = std::make_shared<Node>();
+            gemm->set_kind(OpKind::kCustom);
+            gemm->dtype = DType::kF32;
+            gemm->inputs = {x.node(), leaf({n, k / 8}, DType::kU32).node(),
+                            leaf({n, k / 64}, DType::kBF16).node(),
+                            leaf({n, k / 64}, DType::kBF16).node(), panel_node};
+            gemm->iattrs[0] = 4;
+            gemm->iattrs[1] = 64;
+            gemm->shape = Shape{1, m, n};
+            gemm->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+            if (slices > 1) {
+              gemm->prim = find_primitive("quant_linear.q4_gemm_f16.slices.v1");
+              gemm->shape = Shape{slices, 1, m, n};
+              gemm->iattrs[2] = slices;
+            }
+            LSE_EXPECT(gemm->prim != nullptr);
+            if (!gemm->prim) continue;
+            gemm->fclass = gemm->prim->fusion_class();
+            const NodePtr roots[]{gemm};
+            const auto groups = Partitioner::partition(roots, &device);
+            LSE_EXPECT_EQ(groups.size(), 1u);
+            if (groups.size() != 1) continue;
+            auto emitted = backend::LoomEmitter{}.emit(groups[0], device);
+            if (!emitted.ok())
+              std::fprintf(stderr, "q4 gemm band %s M%lld N%lld slices %d: %s\n", arch,
+                           static_cast<long long>(m), static_cast<long long>(n), slices,
+                           std::string(emitted.status().message()).c_str());
+            LSE_EXPECT(emitted.ok());
+            if (!emitted.ok()) continue;
+            LSE_EXPECT(emitted->source.find("vector.mma") != std::string::npos);
+            // The band's own grid: its waves, one workgroup per row tile,
+            // column tile and slice.
+            const auto rows = (mm + t.bm - 1) / t.bm;
+            const auto cols = (static_cast<std::uint64_t>(n) + t.bn - 1) / t.bn;
+            LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], t.wm * t.wn * 32u);
+            LSE_EXPECT_EQ(static_cast<std::uint64_t>(emitted->dims.workgroup_count[0]),
+                          rows * cols * static_cast<std::uint64_t>(slices));
+          }
+        }
+      }
+    }
+  }
+}
+
 // A variant decision is kept by shape class, and a class carries which
-// variants accept its shapes: on gfx1151 and gfx1201 a 544-row pass (144-row tile, a
+// variants accept its shapes: on gfx1151 and gfx1201 a 704-row pass (144-row tile, a
 // burst of steps) declines the double-buffered layout and a 1024-row one
 // (the wide tile, one step a loop) takes it. Both round up to the same size,
-// so they are different classes only because of what they accept, and a
-// decision for one never lands on the other: every variant a shape accepts
-// emits for it, and every variant it declines does not.
+// so they are different classes because of their tiles and what they accept,
+// and a decision for one never lands on the other: every variant a shape
+// accepts emits for it, and every variant it declines does not.
 LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
   for (const char* arch : {"gfx1151", "gfx1201"}) {
   backend::DeviceInfo device;
@@ -223,15 +296,15 @@ LSE_TEST(q4_gemm_classes_carry_what_each_shape_accepts) {
     }
     return out;
   };
-  const Seen short_pass = at(544), wide_pass = at(1024);
+  const Seen short_pass = at(704), wide_pass = at(1024);
   LSE_EXPECT(short_pass.accepts.size() > 2 && wide_pass.accepts.size() > 2);
   if (short_pass.accepts.size() <= 2 || wide_pass.accepts.size() <= 2) continue;
-  // Layout 2, the double-buffered one: declined at 544 rows, taken at 1024.
+  // Layout 2, the double-buffered one: declined at 704 rows, taken at 1024.
   LSE_EXPECT(!short_pass.accepts[2]);
   LSE_EXPECT(wide_pass.accepts[2]);
   LSE_EXPECT(short_pass.cls != wide_pass.cls);
-  // Another 544-row-class shape (the same tile) is the same class.
-  LSE_EXPECT_EQ(at(528).cls, short_pass.cls);
+  // Another 704-row-class shape (the same tile) is the same class.
+  LSE_EXPECT_EQ(at(688).cls, short_pass.cls);
   }
 }
 
@@ -426,9 +499,105 @@ int gpu(std::size_t m, std::size_t n, std::size_t k, int reps) {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
+// Every output row of a band's pass against the same row of a pass at
+// another width that takes another tile and cuts K into the same slices:
+// an output's bytes depend on its row's inputs, its K order and its slice,
+// never on which tile computed it, so the rows the two passes share must
+// match exactly. The reference width is the nearest one no band names
+// where there is one.
+int bands() {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  const backend::DeviceInfo& info = scheduler->backend().device_info();
+  const auto& tune = dispatch::arch::tuning(info.arch);
+  if (tune.q4_gemm_rows.empty()) {
+    std::printf("q4_gemm bands: %s names none\n", info.arch.c_str());
+    return 0;
+  }
+  const auto same = [](const dispatch::Q4GemmTile& a, const dispatch::Q4GemmTile& b) {
+    return a.bm == b.bm && a.bn == b.bn && a.wm == b.wm && a.wn == b.wn;
+  };
+  const auto banded = [&](std::uint64_t m) {
+    for (const auto& band : tune.q4_gemm_rows)
+      if (m >= band.lo && m <= band.hi) return true;
+    return false;
+  };
+  struct NK { std::size_t n, k; };
+  const NK shapes[] = {{17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}};
+  std::size_t checked = 0, failed = 0;
+  for (const NK nk : shapes) {
+    const std::size_t groups = nk.k / 64;
+    std::mt19937 rng(static_cast<unsigned>(nk.n * 31 + nk.k));
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    std::vector<std::uint32_t> w(nk.n * nk.k / 8);
+    for (auto& v : w) v = static_cast<std::uint32_t>(rng());
+    std::vector<bfloat16_t> sc(nk.n * groups), bi(nk.n * groups);
+    for (std::size_t i = 0; i < sc.size(); ++i) {
+      sc[i] = bfloat16_t(0.002f + 0.01f * std::abs(uni(rng)));
+      bi[i] = bfloat16_t(-8.0f * static_cast<float>(sc[i]) + 0.01f * uni(rng));
+    }
+    auto aw = filled(Shape{static_cast<std::int64_t>(nk.n), static_cast<std::int64_t>(nk.k / 8)},
+                     DType::kU32, w);
+    auto as = filled(Shape{static_cast<std::int64_t>(nk.n), static_cast<std::int64_t>(groups)},
+                     DType::kBF16, sc);
+    auto ab = filled(Shape{static_cast<std::int64_t>(nk.n), static_cast<std::int64_t>(groups)},
+                     DType::kBF16, bi);
+    for (const auto& band : tune.q4_gemm_rows) {
+      for (const std::uint64_t m : {band.lo, band.hi}) {
+        const auto slices = dispatch::q4_gemm_slices(m, nk.n, nk.k, info.compute_units, tune);
+        const auto tile = dispatch::q4_gemm_kernel_tile(m, tune);
+        std::uint64_t ref = 0;
+        for (const bool want_unbanded : {true, false}) {
+          for (std::uint64_t step = 1; step <= 1024 && ref == 0; ++step)
+            for (const std::uint64_t m2 : {m + step, m - std::min(m, step)})
+              if (ref == 0 && m2 >= 64 && m2 != m && (!want_unbanded || !banded(m2)) &&
+                  dispatch::q4_gemm_slices(m2, nk.n, nk.k, info.compute_units, tune) == slices &&
+                  !same(dispatch::q4_gemm_kernel_tile(m2, tune), tile))
+                ref = m2;
+          if (ref != 0) break;
+        }
+        LSE_EXPECT(ref != 0);
+        if (ref == 0) continue;
+        const std::uint64_t rows = std::max(m, ref), shared = std::min(m, ref);
+        std::vector<float> x(rows * nk.k);
+        for (auto& v : x) v = uni(rng) * 2.0f;
+        auto x_ref = filled(Shape{1, static_cast<std::int64_t>(ref), static_cast<std::int64_t>(nk.k)},
+                            DType::kF32, std::vector<float>(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(ref * nk.k)));
+        auto x_band = filled(Shape{1, static_cast<std::int64_t>(m), static_cast<std::int64_t>(nk.k)},
+                             DType::kF32, std::vector<float>(x.begin(), x.begin() + static_cast<std::ptrdiff_t>(m * nk.k)));
+        auto y_band = quant_linear(x_band, aw, as, ab, 4, 64);
+        auto y_ref = quant_linear(x_ref, aw, as, ab, 4, 64);
+        const NodePtr roots[]{y_band.node(), y_ref.node()};
+        LSE_EXPECT_OK(scheduler->eval(roots, false));
+        LSE_EXPECT_OK(scheduler->drain());
+        const auto got = read<float>(y_band);
+        const auto want = read<float>(y_ref);
+        std::size_t differ = 0;
+        for (std::size_t i = 0; i < shared * nk.n; ++i)
+          differ += std::memcmp(&got[i], &want[i], sizeof(float)) != 0;
+        const auto rt = dispatch::q4_gemm_kernel_tile(ref, tune);
+        std::printf("q4_gemm band %llu-%llu: M%llu (%ux%u on %ux%u) against M%llu (%ux%u on %ux%u), "
+                    "N%zu K%zu, %u slice(s): %zu of %llu outputs differ\n",
+                    static_cast<unsigned long long>(band.lo), static_cast<unsigned long long>(band.hi),
+                    static_cast<unsigned long long>(m), tile.bm, tile.bn, tile.wm, tile.wn,
+                    static_cast<unsigned long long>(ref), rt.bm, rt.bn, rt.wm, rt.wn, nk.n, nk.k,
+                    slices, differ, static_cast<unsigned long long>(shared * nk.n));
+        LSE_EXPECT_EQ(differ, 0u);
+        ++checked;
+        failed += differ != 0;
+      }
+    }
+  }
+  std::printf("q4_gemm bands on %s: %zu checked, %zu differ\n", info.arch.c_str(), checked, failed);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::string_view(argv[1]) == "--bands") return bands();
   if (argc >= 5 && std::string_view(argv[1]) == "--gpu") {
     int rc = 0;
     const int reps = argc >= 6 ? std::atoi(argv[5]) : 20;

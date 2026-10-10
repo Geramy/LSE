@@ -129,6 +129,35 @@ inline constexpr std::array kQ4DecodePanelShapes{
 //   256x128 on 4x2 waves (spills, plain GEMM only): M1024 8.6 / 8.8
 inline constexpr Q4GemmTile kQ4GemmWide{256, 128, 4, 4};
 
+// The prefill GEMM's tile by pass rows (q4_gemm_kernel_tile), measured as on
+// gfx1201 (gfx1201.hpp) and on this part's own: every wave tile here is at
+// most the wide tile's 64 x 32. Weighted GEMM time per pass on the 8060S, ms,
+// shape-only -> band; every candidate wrote the same bytes:
+//   256 386.7 -> 339.0                         (256 rows on 4 x 4 waves)
+//   304 520.4 -> 420.6, 320 526.9 -> 428.3     (320 rows on 5 x 4 waves)
+//   368 542.7 -> 496.6, 384 543.6 -> 501.7     (192 rows on 4 x 4 waves)
+//   448 687.7 -> 590.7                         (224 rows on 7 x 4 waves)
+//   496 728.5 -> 626.7, 512 729.2 -> 636.2     (256 rows on 4 x 4 waves)
+//   608 948.4 -> 835.5, 640 955.4 -> 826.2     (320 rows on 5 x 4 waves)
+//   736 1077.2 -> 937.4, 752 1090.6 -> 939.2   (256 rows on 4 x 4 waves)
+//   784 1208.8 -> 1041.6, 800 1214.1 -> 1053.4 (160 rows on 5 x 4 waves)
+//   832 1219.6 -> 1081.0, 864 1218.6 -> 1101.5 (144 rows on 3 x 4 waves)
+inline constexpr std::array kQ4GemmRowTiles{
+    Q4GemmRowTile{241, 256, {256, 128, 4, 4}},
+    Q4GemmRowTile{289, 320, {320, 128, 5, 4}},
+    Q4GemmRowTile{337, 384, {192, 128, 4, 4}},
+    Q4GemmRowTile{433, 448, {224, 128, 7, 4}},
+    Q4GemmRowTile{449, 464, {160, 128, 5, 4}},
+    Q4GemmRowTile{465, 512, {256, 128, 4, 4}},
+    Q4GemmRowTile{593, 640, {320, 128, 5, 4}},
+    Q4GemmRowTile{641, 672, {224, 128, 7, 4}},
+    Q4GemmRowTile{721, 767, {256, 128, 4, 4}},
+    Q4GemmRowTile{769, 800, {160, 128, 5, 4}},
+    Q4GemmRowTile{817, 864, {144, 128, 3, 4}},
+    Q4GemmRowTile{865, 896, {224, 128, 7, 4}},
+    Q4GemmRowTile{1073, 1104, {224, 128, 7, 4}},
+};
+
 // -- 8-bit contractions ---------------------------------------------------
 // The 8-row decode form on the shared panel (quant_matrix_panel.cpp, the
 // DFlash2 draft's 8-row passes) at the scratch and threads it takes on every
@@ -198,6 +227,7 @@ inline constexpr Tuning kTuning{
     // unchanged (attention is a small share of a short prefill here).
     .flash_prefill = true,
     .q4_gemm_wide = kQ4GemmWide,
+    .q4_gemm_rows = kQ4GemmRowTiles,
 };
 
 static_assert(rows_name(kQuantInt8Rows, kArch) &&

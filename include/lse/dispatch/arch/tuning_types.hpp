@@ -66,6 +66,10 @@ struct Tuning {
   // The prefill GEMM's tile for wide passes (q4_gemm_tile, M >= 768); unset
   // takes the generic 256 x 128 tile of 64x64 wave tiles.
   Q4GemmTile q4_gemm_wide{};
+  // The prefill GEMM's tile for bands of pass rows, measured at every
+  // 16-row width (q4_gemm_kernel_tile); a width no band names takes
+  // q4_gemm_tile's.
+  std::span<const Q4GemmRowTile> q4_gemm_rows;
 };
 
 // One part's rows followed by the generic ones, as one array.
