@@ -738,6 +738,19 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
         impl_->jit->try_get(member, ident, emitter->dialect()) != nullptr;
     auto generated = resident ? emitter->emit_launch(group, be.device_info())
                               : emitter->emit(group, be.device_info());
+    if (!generated.ok() && pick.variant != 0) {
+      // A decision is kept by shape class, and a variant can decline a shape
+      // of its class another shape took it for (its buffers do not fit
+      // there): this shape then runs variant 0.
+      variant_scope.reset();
+      variant_scope.emplace(0);
+      pick.variant = 0;
+      ident = emitter->cache_key(group, be.device_info());
+      const bool resident0 =
+          impl_->jit->try_get(member, ident, emitter->dialect()) != nullptr;
+      generated = resident0 ? emitter->emit_launch(group, be.device_info())
+                            : emitter->emit(group, be.device_info());
+    }
     if (!generated.ok()) {
       trace_.spans.emit.add(elapsed_ns(t_emit, SpanClock::now()));
       return generated.status();
@@ -1517,8 +1530,14 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
     // A decided variant is the kernel the step will launch, so it is the one
     // prepared; an undecided one prepares variant 0 and is measured when it
     // first runs.
-    const std::uint32_t variant =
+    std::uint32_t variant =
         impl_->pick_variant(*memitter, mtc->compiler, g, be.device_info()).variant;
+    if (variant != 0) {
+      // The class's decision may be one this shape declines (see
+      // try_dispatch_group): then variant 0 is the kernel it will launch.
+      const EmissionVariantScope probe(variant);
+      if (!memitter->emit_launch(g, be.device_info()).ok()) variant = 0;
+    }
     const EmissionVariantScope scope(variant);
     const std::uint64_t ident = memitter->cache_key(g, be.device_info());
     if (impl_->jit->try_get(member, ident, memitter->dialect()) != nullptr) continue;
