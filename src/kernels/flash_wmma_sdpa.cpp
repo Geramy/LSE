@@ -78,7 +78,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   //    back only where the value product reads them from the scores. Fewer
   //    scratch round trips for more registers: faster on wide tree tiles,
   //    slower where registers are what limits the tile, so it is measured
-  //    per shape and device.
+  //    per shape and device. Offered for a split pass only: a prefill
+  //    tile's shape changes with every chunk the cache grows by, and each
+  //    new shape's measurement (1.4 to 1.9 s at 1024 rows on the R9700)
+  //    cost more than the variant ever won there.
   enum class Variant { kBase, kStageHalf, kTwoTiles, kScoresInRegisters };
   // Whether the device's 16x16x16 wave32 row carries a whole K step per
   // lane (gfx11), or nothing when the device has no such row.
@@ -94,15 +97,15 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     if (s.variant == 0u) return Variant::kBase;
     if (contiguous_rows(s).value_or(false)) {
       if (s.variant == 1u) return Variant::kStageHalf;
-      if (!Split && s.variant == 2u) return Variant::kTwoTiles;
+      return Split ? Variant::kScoresInRegisters : Variant::kTwoTiles;
     }
     return Variant::kScoresInRegisters;
   }
   std::uint32_t variants(const KernelShapes& s) const override {
     const auto contiguous = contiguous_rows(s);
     if (!contiguous) return 1u;
-    if (*contiguous) return Split ? 3u : 4u;
-    return 2u;
+    if (*contiguous) return 3u;
+    return Split ? 2u : 1u;
   }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }

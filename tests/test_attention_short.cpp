@@ -167,9 +167,9 @@ LSE_TEST(chain_passes_over_16_bit_kv_take_the_flash_split) {
 
 // A draft tree's flash split offers its tile with the scores kept in
 // registers through the softmax as a variant, measured per shape and
-// device: on gfx1201 the
-// default and that one; on gfx1151 also the half-staged values (the
-// two-tile form writes no split records).
+// device: on gfx1201 the default and that one; on gfx1151 also the
+// half-staged values (the two-tile form writes no split records). A prefill
+// tile keeps what it had.
 LSE_TEST(flash_split_offers_scores_in_registers_as_a_variant) {
   backend::LoomEmitter emitter;
   for (const char* arch : {"gfx1201", "gfx1151"}) {
@@ -215,6 +215,24 @@ LSE_TEST(flash_split_offers_scores_in_registers_as_a_variant) {
         return emitter.cache_key(groups[0], fx.gpu);
       }());
     }
+    // A prefill tile is not offered it: its shape changes with every chunk
+    // the cache grows by, and each new shape would be measured again.
+    Fixture fx(1024, 8192);
+    fx.gpu.arch = arch;
+    backend::AmdDeviceInfo amd;
+    backend::apply_arch_defaults(fx.gpu, amd);
+    fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    fx.gpu.extension = &amd;
+    fx.k = leaf(fx.k.shape(), DType::kBF16);
+    fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
+    const auto prefill = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta,
+                                    fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+    const NodePtr prefill_roots[]{prefill.node()};
+    auto prefill_groups = Partitioner::partition(prefill_roots, &fx.gpu);
+    LSE_EXPECT_EQ(prefill_groups.size(), 1u);
+    if (prefill_groups.size() == 1)
+      LSE_EXPECT_EQ(emitter.variants(prefill_groups[0], fx.gpu),
+                    std::string_view(arch) == "gfx1151" ? 3u : 1u);
   }
 }
 
