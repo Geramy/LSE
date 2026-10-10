@@ -219,10 +219,19 @@ bool split_decode_merge_supported(const KernelShapes& s) {
 }
 
 bool flash_split_scope(const KernelShapes& s) {
-  if (!paged_inputs(s) || !s.device || s.iattrs[0] != 3) return false;
+  // A draft tree's pass, or a causal pass of a few rows: an MTP or DFlash2
+  // chain's verify pass, an MTP draft's first pass.
+  if (!paged_inputs(s) || !s.device || (s.iattrs[0] != 3 && s.iattrs[0] != 1)) return false;
+  // A chain takes it with 16-bit K/V, whose values the tile multiplies as
+  // they are stored; other storage keeps the short split.
+  if (s.iattrs[0] == 1) {
+    const auto storage = kv::cache_dtype(s.input_dtypes[1], s.attrs[1]);
+    if (storage != kv::CacheDType::kF16 && storage != kv::CacheDType::kBF16) return false;
+  }
   const auto d = flash_dimensions(s);
   if (!d.valid || d.bsz != 1 || d.tq < shapes::kFlashSplitMinRows ||
-      d.tq > shapes::kFlashSplitMaxRows || d.dv != shapes::kSplitRecord - 2u ||
+      d.tq > (s.iattrs[0] == 3 ? shapes::kFlashSplitMaxRows : shapes::kFlashSplitChainMaxRows) ||
+      d.dv != shapes::kSplitRecord - 2u ||
       std::uint64_t{d.stride} * d.ts < shapes::kFlashSplitMinKeys) return false;
   for (const auto& rule : arch::tuning(s.device->arch).flash_wmma)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&

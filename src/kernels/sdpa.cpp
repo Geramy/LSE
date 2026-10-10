@@ -624,13 +624,18 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
                                                   math::widen(quad_values[1][static_cast<int>(q)])}
               : value_pair<Storage>(e, a.v, false, blk, kvheads, kh, block, e.let(j % block),
                                     e.let(lane * 2u), 256u);
+          // A key a row may not see has weight exactly zero (the weight pass
+          // wrote it so). Adding zero, or zero times a finite value, to a sum
+          // that started at +0 and only grows leaves it bit for bit as it was,
+          // so every row takes every key of the quad without a branch per
+          // row. Cache memory is zeroed when it is allocated or grown
+          // (kv::FragmentStorage::grow, ops::alloc_pool), so a value read for
+          // a key past a row is finite.
           for (std::uint32_t r = 0; r < row_tile; ++r) {
-            if (auto row_live = e.when(valid[r])) {
-              const auto weight = e.let(quad_weights[r][static_cast<int>(q)]);
-              denom[r] = denom[r].read() + weight;
-              acc0[r] = math::fma(weight, values[0], acc0[r].read());
-              acc1[r] = math::fma(values[1], weight, acc1[r].read());
-            }
+            const auto weight = e.let(quad_weights[r][static_cast<int>(q)]);
+            denom[r] = denom[r].read() + weight;
+            acc0[r] = math::fma(weight, values[0], acc0[r].read());
+            acc1[r] = math::fma(values[1], weight, acc1[r].read());
           }
         }
       }

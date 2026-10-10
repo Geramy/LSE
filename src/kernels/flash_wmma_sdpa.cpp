@@ -52,7 +52,8 @@ struct FlashMeanArgs {
 // Q/P and decoded KV use F16 operands for F16 storage, BF16 otherwise.
 // Both matrix accumulators, softmax state and output remain FP32.
 //
-// `Split`: a draft tree's pass (dispatch::flash_split_scope). Each workgroup
+// `Split`: a draft tree's pass or a chain of a few rows
+// (dispatch::flash_split_scope). Each workgroup
 // takes one share of the key windows and writes, per query row, the share's
 // running maximum, sum and unnormalized output as one split record
 // [B, H, T, parts, 258] for attention.split_merge128.wg128c2.v1.
@@ -91,10 +92,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   static std::uint32_t split_heads_per_tile(const Dims& d) {
     if constexpr (!Split) return 1u;
     if (!d.valid || d.tq == 0 || d.group == 0) return 1u;
-    std::uint32_t pack = 1;
-    for (std::uint32_t n = 2; n <= d.group && n * d.tq <= QTile; ++n)
-      if (d.group % n == 0) pack = n;
-    return pack;
+    return dispatch::attention_shapes::flash_split_pack(d.group, d.tq);
   }
 
   static KernelShapes dense_request(const KernelShapes& s) {

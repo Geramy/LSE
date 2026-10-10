@@ -768,14 +768,15 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
           ? "attention.blasst.partial1024.v2" : "attention.flash.wmma16.v3");
       return Array(n);
     }
-    if (dispatch::split_short_default_supported(request) ||
-        dispatch::split_decode_supported(request))
-      return split_paged_attention(n);
-    if (mask == MaskKind::kTree && dispatch::flash_split_scope(request))
+    if (dispatch::split_decode_supported(request)) return split_paged_attention(n);
+    // A tree pass, or a chain of a few rows (dispatch::flash_split_scope).
+    if (dispatch::flash_split_scope(request))
       return split_paged_attention(n, false, dispatch::attention_shapes::flash_split_parts(
           static_cast<std::uint64_t>(table.shape().dim(1)) * static_cast<std::uint64_t>(block_size),
-          static_cast<std::uint32_t>(sq.dim(1)), static_cast<std::uint32_t>(sq.dim(2)),
+          dispatch::attention_shapes::flash_split_units(static_cast<std::uint32_t>(sq.dim(1)),
+              static_cast<std::uint32_t>(k.shape().dim(1)), static_cast<std::uint32_t>(sq.dim(2))),
           static_cast<std::uint32_t>(device->compute_units)));
+    if (dispatch::split_short_default_supported(request)) return split_paged_attention(n);
   }
   return Array(n);
 }

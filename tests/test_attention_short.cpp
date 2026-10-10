@@ -133,6 +133,25 @@ LSE_TEST(short_split_scope_uses_actual_capacity_and_known_prefix) {
     LSE_EXPECT(fx.split(mask, window).node()->prim->name() == "attention");
 }
 
+// A chain pass of one sequence over 16-bit K/V takes the flash split that
+// tree passes take; other storage keeps the short split.
+LSE_TEST(chain_passes_over_16_bit_kv_take_the_flash_split) {
+  for (int queries : {2, 3, 4, 8}) {
+    Fixture fx(queries, 4096);
+    fx.k = leaf(fx.k.shape(), DType::kBF16);
+    fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
+    const auto out = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta,
+                                fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+    LSE_EXPECT(out.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
+    LSE_EXPECT(out.node()->inputs[0]->prim->name() == "attention.flash_split.wmma16.v1");
+  }
+  Fixture fx(9, 4096);
+  fx.k = leaf(fx.k.shape(), DType::kBF16);
+  fx.v = leaf(fx.k.shape(), DType::kBF16);
+  LSE_EXPECT(sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta, fx.table, 16,
+                        &fx.gpu, kv::CacheDType::kBF16).node()->prim->name() != "attention.split_merge128.wg128c2.v1");
+}
+
 LSE_TEST(short_split_merge_covers_more_partitions_than_weight_writers) {
   backend::LoomEmitter emitter;
   Fixture fx(6, 16384);
