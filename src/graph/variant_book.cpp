@@ -37,7 +37,11 @@ std::uint64_t VariantBook::key(std::uint64_t base_identity, std::uint32_t offere
   std::uint64_t h = mix(0x76617269616e7473ull, base_identity);
   h = mix(h, offered);
   for (const char c : compiler_identity) h = mix(h, static_cast<unsigned char>(c));
-  return mix(h, compiler_identity.size());
+  h = mix(h, compiler_identity.size());
+  // The engine build: a primitive edited within a release lays out its
+  // variants differently, so its decisions are measured again.
+  for (const char c : engine_build_identity()) h = mix(h, static_cast<unsigned char>(c));
+  return h;
 }
 
 void VariantBook::load_locked() {
