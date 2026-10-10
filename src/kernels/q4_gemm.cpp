@@ -339,7 +339,236 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
 // The layouts a part's fragments allow (Q4GemmKernel::variants).
 std::uint32_t gemm_layouts(const KernelShapes& s) {
   const auto* row = f16_row(s);
-  return row != nullptr ? 4u : 1u;
+  return row != nullptr ? 5u : 1u;
+}
+
+// Layout 4 walks K in half steps of kHalfK with two buffers of each tile:
+// a half step's tiles are written while the previous half step's are read,
+// so a workgroup waits at one barrier per half step and its next half
+// step's reads and weight decode run beside this one's matrix work. Each
+// accumulator still takes the same matrix instructions over the same halves
+// in the same order (both halves of a step make its four 16-wide K slices).
+constexpr std::uint32_t kHalfK = kBK / 2u;
+constexpr std::uint32_t kHalfRow = kHalfK + kPad;
+
+bool halves_fit(const KernelShapes& s, const Dims& d, const Tile& t) {
+  if (!d.valid || d.bits != 4u || s.device == nullptr) return false;
+  const std::uint32_t threads = t.wm * t.wn * 32u;
+  return threads != 0u && t.bn * 2u <= threads &&
+         backend::workgroup_lds_bytes(s.device) >= 2u * (t.bm + t.bn) * kHalfRow * 2u;
+}
+
+template <class S, math::MatrixTarget G>
+std::string emit_halves_body(const KernelShapes& s, const Dims& d) {
+  using Op = math::op::Mma<G, math::MatrixElem::kF32, math::MatrixElem::kF16,
+                           16, 16, 16>;
+  constexpr math::MatrixCoreRow kRow = Op::kRow;
+  constexpr TileGeometry kGeo = geometry_of(kRow);
+  constexpr int kFrag = kRow.a_len;
+  constexpr int kSlots = kRow.c_len;
+  constexpr std::uint32_t kLaneK = kGeo.lane_k;
+
+  const Tile t = tile_for(s, d);
+  if (!halves_fit(s, d, t)) return {};
+  const std::uint32_t M = d.m, N = d.n, K = d.k;
+  const std::uint32_t KT = K / kBK;
+  const std::uint32_t tiles_n = (N + t.bn - 1u) / t.bn;
+  const std::uint32_t TM = t.bm / t.wm, TN = t.bn / t.wn;
+  const std::uint32_t FM = TM / 16u, FN = TN / 16u;
+
+  kir::KernelBody kb(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+  const GemmVariant variant = gemm_variant(s.variant, gemm_layouts(s));
+  kb.set_store(s.store);
+  if (variant.grouped) kb.set_split_store(s.split_store);
+  Args<S> a;
+  if (!env::bind(kb, a, s)) return {};
+  env::Emit e{&kb};
+  const std::array<kir::Tile<lse::f16>, 2> As{e.lds<lse::f16>(t.bm * kHalfRow),
+                                              e.lds<lse::f16>(t.bm * kHalfRow)};
+  const std::array<kir::Tile<lse::f16>, 2> Bs{e.lds<lse::f16>(t.bn * kHalfRow),
+                                              e.lds<lse::f16>(t.bn * kHalfRow)};
+  if (!As[0] || !As[1] || !Bs[0] || !Bs[1]) return {};
+
+  const auto lid = e.let(math::local_id());
+  const auto wave = e.let(lid / 32u);
+  const auto lane = e.let(lid % 32u);
+  const auto lane_lo = e.let(lane % 16u);
+  const auto lane_hi = e.let(lane / 16u);
+  const auto wg = e.let(math::workgroup_id_x());
+  const std::uint32_t tiles_m = (M + t.bm - 1u) / t.bm;
+  const auto tn = e.let(wg % tiles_n);
+  const auto tm = e.let((wg / tiles_n) % tiles_m);
+  const std::uint32_t slice_steps = KT / d.slices;
+  const auto ks = e.let(wg / (tiles_n * tiles_m));
+  const auto k_begin = e.let(ks * slice_steps);
+  const auto k_end = e.let(k_begin + slice_steps);
+  const auto plane = e.let(ks * (M * N));
+  const auto m0 = e.let(tm * t.bm);
+  const auto n0 = e.let(tn * t.bn);
+  const auto wave_m = e.let(wave / t.wn);
+  const auto wave_n = e.let(wave % t.wn);
+  const std::uint32_t threads = t.wm * t.wn * 32u;
+
+  // A half step's activation runs, row-major over the tile; a tile with more
+  // runs than threads gives the first threads a second one, and the threads
+  // past the last run repeat one (the same values to the same place).
+  constexpr std::uint32_t kARuns = kHalfK / kRun;
+  const std::uint32_t a_total = t.bm * kARuns;
+  const std::uint32_t a_pieces = (a_total + threads - 1u) / threads;
+  std::vector<kir::Val<kir::u32>> a_src, a_dst;
+  for (std::uint32_t c = 0; c < a_pieces; ++c) {
+    const auto f = a_total % threads == 0u ? e.let(lid + c * threads)
+                                           : e.let((lid + c * threads) % a_total);
+    const auto r = e.let(f / kARuns);
+    const auto run = e.let(f % kARuns);
+    const auto grow = e.let(m0 + r);
+    const auto safe = e.let(select(grow < M, grow, e.u32(M - 1u)));
+    a_src.push_back(e.let(safe * K + run * kRun));
+    a_dst.push_back(e.let(r * kHalfRow + run * kRun));
+  }
+  // A half step's weights: two packed words (eight bytes, sixteen codes) per
+  // piece, two pieces a column. Only each piece's first thread decodes it.
+  constexpr std::uint32_t kCodesPerWord = 8u;
+  constexpr std::uint32_t kWordsPerHalf = kHalfK / kCodesPerWord;
+  constexpr std::uint32_t kBPerCol = kWordsPerHalf / 2u;
+  const std::uint32_t b_total = t.bn * kBPerCol;
+  std::vector<kir::Val<kir::u32>> b_src, b_dst, b_aff;
+  {
+    const auto f = e.let(select(lid < b_total, lid, e.u32(b_total - 1u)));
+    const auto col = e.let(f / kBPerCol);
+    const auto part = e.let(f % kBPerCol);
+    const auto gcol = e.let(n0 + col);
+    const auto safe = e.let(select(gcol < N, gcol, e.u32(N - 1u)));
+    b_src.push_back(e.let(safe * d.lanes + part * 2u));
+    b_dst.push_back(e.let(col * kHalfRow + part * 2u * kCodesPerWord));
+    b_aff.push_back(e.let(safe * d.groups));
+  }
+
+  using F16x8 = lse::vec<lse::f16, 8>;
+  struct Staged {
+    std::vector<kir::Pack<lse::f16>> av;
+    std::vector<kir::Pack<std::uint32_t>> bv;
+    std::vector<kir::Val<S>> scale, bias;
+  };
+  // Half step h: step h / 2, its first or second kHalfK of K.
+  const auto issue = [&](const kir::Val<kir::u32>& h) {
+    Staged st;
+    const auto kt = e.let(h / 2u);
+    const auto koff = e.let(kt * kBK + (h % 2u) * kHalfK);
+    for (std::uint32_t c = 0; c < a_pieces; ++c)
+      st.av.push_back(e.load(a.panel, e.let(a_src[c] + koff), 16u));
+    const auto woff = e.let(koff / kCodesPerWord);
+    const auto g = e.let((kt * kBK) / d.gsize);
+    st.bv.push_back(e.load(a.packed, e.let(b_src[0] + woff), 8u));
+    const auto at = e.let(b_aff[0] + g);
+    st.scale.push_back(e.let(a.scales[at]));
+    st.bias.push_back(e.let(a.biases[at]));
+    return st;
+  };
+  const auto store8 = [&](const kir::Tile<lse::f16>& tile, const kir::Val<kir::u32>& at,
+                          const kir::Pack<lse::f16>& v) {
+    kb.store_pack<lse::f16>(tile.id(), at, v, 16u);
+  };
+  const auto commit = [&](const Staged& st, std::uint32_t buf) {
+    for (std::uint32_t c = 0; c < a_pieces; ++c) store8(As[buf], a_dst[c], st.av[c]);
+    const auto decode = [&] {
+      const auto scale = e.let(math::widen(st.scale[0]));
+      const auto bias = e.let(math::widen(st.bias[0]));
+      for (std::uint32_t w = 0; w < 2u; ++w) {
+        const auto word = e.let(st.bv[0][static_cast<int>(w)]);
+        const auto v = kb.call<F16x8>("q4x8.f16", word, scale, bias);
+        store8(Bs[buf], e.let(b_dst[0] + w * kCodesPerWord),
+               kir::Pack<lse::f16>(v.types(), v.body(), v.id(), 8));
+      }
+    };
+    if (b_total < threads) {
+      if (auto first = e.when(lid < b_total)) decode();
+    } else {
+      decode();
+    }
+  };
+
+  std::vector<kir::Local<lse::f32, kSlots>> acc;
+  acc.reserve(FM * FN);
+  for (std::uint32_t i = 0; i < FM * FN; ++i) {
+    acc.push_back(e.local<lse::f32, kSlots>());
+    for (int z = 0; z < kSlots; ++z) acc[i][z] = e.f32(0.0f);
+  }
+  const auto lane_k0 = e.let(lane_hi * (kGeo.split_k ? kLaneK : 0u));
+  std::vector<kir::Val<kir::u32>> a_frag_base, b_frag_base;
+  for (std::uint32_t fm = 0; fm < FM; ++fm)
+    a_frag_base.push_back(e.let((wave_m * TM + fm * 16u + lane_lo) * kHalfRow + lane_k0));
+  for (std::uint32_t fn = 0; fn < FN; ++fn)
+    b_frag_base.push_back(e.let((wave_n * TN + fn * 16u + lane_lo) * kHalfRow + lane_k0));
+  using FragVec = lse::vec<lse::f16, kFrag>;
+  const auto fragment = [&](const kir::Tile<lse::f16>& tile,
+                            const kir::Val<kir::u32>& at) -> kir::Val<FragVec> {
+    const auto p = kFrag == 8 ? tile.load(at, 16u)
+                              : tile.load_elems(at, static_cast<std::uint32_t>(kFrag));
+    return kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id());
+  };
+  const auto compute = [&](std::uint32_t buf) {
+    for (std::uint32_t kk = 0; kk < kHalfK / 16u; ++kk) {
+      std::vector<kir::Val<FragVec>> af, bf;
+      for (std::uint32_t fm = 0; fm < FM; ++fm)
+        af.push_back(fragment(As[buf], e.let(a_frag_base[fm] + kk * 16u)));
+      for (std::uint32_t fn = 0; fn < FN; ++fn)
+        bf.push_back(fragment(Bs[buf], e.let(b_frag_base[fn] + kk * 16u)));
+      for (std::uint32_t fm = 0; fm < FM; ++fm)
+        for (std::uint32_t fn = 0; fn < FN; ++fn) {
+          auto& c = acc[fm * FN + fn];
+          c = math::mma<Op>(af[fm], bf[fn], c.value());
+        }
+    }
+  };
+
+  // One step per iteration, its two halves in the two buffers: each half
+  // reads the next half step's operands before its matrix work and writes
+  // them into the other buffer after it, then waits once.
+  commit(issue(e.let(k_begin * 2u)), 0u);
+  e.barrier();
+  for (auto kt : e.range(k_begin, k_end, 1u)) {
+    {
+      const Staged st = issue(e.let(kt * 2u + 1u));
+      compute(0u);
+      commit(st, 1u);
+      e.barrier();
+    }
+    {
+      // The last step reads its second half again: written into a buffer
+      // nothing reads after it.
+      const auto next = e.let(select(kt + 1u < k_end, kt * 2u + 2u, kt * 2u + 1u));
+      const Staged st = issue(next);
+      compute(1u);
+      commit(st, 0u);
+      e.barrier();
+    }
+  }
+
+  std::vector<std::pair<kir::Val<kir::u32>, kir::Val<kir::f32>>> group;
+  for (std::uint32_t fm = 0; fm < FM; ++fm) {
+    for (std::uint32_t fn = 0; fn < FN; ++fn) {
+      const auto col = e.let(n0 + wave_n * TN + fn * 16u + lane_lo);
+      for (int z = 0; z < kSlots; ++z) {
+        const auto row = e.let(m0 + wave_m * TM + fm * 16u +
+                               static_cast<std::uint32_t>(z) * kGeo.slot_step +
+                               lane_hi * kGeo.half_rows);
+        const auto value = acc[fm * FN + fn][z].read();
+        if (M % t.bm == 0 && N % t.bn == 0) {
+          if (variant.grouped) group.emplace_back(e.let(plane + row * N + col), e.let(value));
+          else e.store(plane + row * N + col, value);
+        } else if (N % t.bn == 0) {
+          if (auto in = e.when(row < M)) e.store(plane + row * N + col, value);
+        } else {
+          if (auto in = e.when(row < M && col < N))
+            e.store(plane + row * N + col, value);
+        }
+      }
+    }
+  }
+  e.store_group(group);
+  if (!kb.lds().ok()) return {};
+  return kb.str();
 }
 
 template <class S, math::MatrixTarget G>
@@ -377,6 +606,7 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   // keeps A in workgroup memory and reads it a fragment at a time. Each
   // feeds the matrix instructions the same halves in the same order.
   const std::uint32_t layout = variant.layout;
+  if (layout == 4u) return emit_halves_body<S, G>(s, d);
   const bool a_direct = layout == 1u || layout == 2u;
   const bool b_double = a_direct && layout == 2u;
   if (layout > 3u || ((layout == 1u || layout == 2u) && !a_direct) ||
@@ -1246,7 +1476,8 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
     if (row == nullptr) return v == 0u;
     const std::uint32_t layout = gemm_variant(v, gemm_layouts(s)).layout;
     if (layout == 2u && !b_double_fits(d, tile_for(s, d))) return false;
-    return layout <= 3u;
+    if (layout == 4u) return halves_fit(s, d, tile_for(s, d));
+    return layout <= 4u;
   }
   std::uint32_t variants(const KernelShapes& s) const override {
     const Dims d = dims_of(s, Sliced);
