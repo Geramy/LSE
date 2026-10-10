@@ -69,10 +69,25 @@ class DraftWidthPolicy {
   // ... and whatever it costs after this many, so an estimate that came out
   // high (and so is never cheap) cannot keep its width out of use for good.
   static constexpr std::uint64_t kHardRefreshSteps = 2048;
+  // Until a cost rests on kTrustedSamples measurements in its context bucket,
+  // a lower sample replaces it (early samples err high: a step whose wall
+  // time was mostly a first compile, clocks still ramping), and once it is
+  // kEarlyRefreshSteps old it is measured again whatever it is priced at --
+  // the widths a new bucket inherited from another start this way. One bad
+  // early sample cannot price a width out for good.
+  static constexpr std::uint32_t kTrustedSamples = kExploreSamples;
+  static constexpr std::uint64_t kEarlyRefreshSteps = 128;
   // Measured steps before the first measurements of every width: the GPU's
   // clocks ramp up over a process's first steps, and a width measured then
   // would be priced high. Until then the full width is used.
   static constexpr std::uint64_t kWarmupSteps = 32;
+  // A position's mean resting on fewer than kPositionTrusted checks, scaled
+  // by the chance a chain reaches it (a chain shallower than it never does),
+  // has the next chain drafted to the full depth at most every
+  // kPositionProbeSteps steps until it holds that much evidence: a few
+  // unlucky early checks cannot price the deeper chains out for good.
+  static constexpr double kPositionTrusted = 8.0;
+  static constexpr std::uint64_t kPositionProbeSteps = 16;
   // Skipped (draft-free) steps before a probing draft.
   static constexpr std::uint32_t kProbeAfter = 4;
 
@@ -99,6 +114,12 @@ class DraftWidthPolicy {
   void observe_draft(std::uint64_t ns, std::uint32_t depth = kMaxProposals);
   // A whole step: tokens it emitted and its wall time, draft included.
   void observe_step(std::uint32_t tokens, std::uint64_t ns);
+  // A step left unpriced (it compiled, loaded or tried kernels): it still
+  // counts toward the warm-up, whose steps are not priced either, so a cold
+  // first request does not push the first measurements back.
+  void observe_unpriced_step() noexcept {
+    if (steps_ < kWarmupSteps) ++steps_;
+  }
   // After a draft was verified with `estimates` for its chosen prefix of
   // `proposals`: the expected value of having drafted, used to decide
   // whether drafting pays (draft_next).
@@ -187,6 +208,7 @@ class DraftWidthPolicy {
   std::array<Bin, kBins> bins_{};
   double bias_ = 0;
   std::array<Bin, kMaxProposals> positions_{};
+  std::uint64_t position_probe_ = 0;  // step of the last full-depth probe
   // cost(i) = base + offset[i]: one level that follows the context within a
   // bucket, and per-width (or per-rung) offsets that hold what the extra
   // rows cost.
@@ -197,6 +219,9 @@ class DraftWidthPolicy {
     double base = 0;
     std::array<double, N> offset{}, seed{};
     std::array<bool, N> known{}, seed_known{};
+    // A width's first pass in a bucket started from another one is not
+    // priced (it pays for whatever that bucket's first passes load).
+    std::array<bool, N> entered{};
     std::array<std::uint32_t, N> samples{};  // measured in this bucket
     std::array<std::uint64_t, N> last_seen{};
   };
@@ -205,6 +230,7 @@ class DraftWidthPolicy {
     Ladder<kTreeRows.size()> tree;        // by rung
     std::array<double, kMaxRows> draft{}, draft_seed{};
     std::array<std::uint32_t, kMaxRows> draft_samples{};
+    std::array<bool, kMaxRows> draft_entered{};
     bool draft_seeded = false;
   };
   template <std::size_t N, class Rows>

@@ -521,6 +521,90 @@ LSE_TEST(draft_width_policy_measures_every_width_first) {
   LSE_EXPECT_NEAR(policy.verify_ns(1), 31e6, 1.0);
 }
 
+// A cold first launch: the first measurements of the deeper chains include a
+// one-second compile. The policy must still come to draft deep once those
+// widths are measured again at their real cost.
+LSE_TEST(draft_width_policy_recovers_from_compiling_first_samples) {
+  DraftWidthPolicy policy;
+  // Real costs: 30 ms for one row, 1 ms per further row; 2 ms per chained
+  // draft pass; every proposal accepted.
+  const auto verify_cost = [](std::uint32_t rows) { return 30e6 + 1e6 * (rows - 1); };
+  const auto draft_cost = [](std::uint32_t depth) { return 2e6 * (depth + 1); };
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 1);
+  policy.observe_step(4, static_cast<std::uint64_t>(40e6));
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass)
+    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
+      const double compile = pass == 0 && rows >= 5 ? 1e9 : 0.0;
+      policy.observe_verify(rows, static_cast<std::uint64_t>(verify_cost(rows) + compile));
+      policy.observe_draft(static_cast<std::uint64_t>(draft_cost(rows - 1) + compile), rows - 1);
+    }
+  std::uint32_t deepest = 0, last = 0;
+  for (int step = 0; step < 600; ++step) {
+    const std::uint32_t depth = policy.depth(DraftWidthPolicy::kMaxProposals, 3);
+    for (std::uint32_t p = 0; p < depth; ++p) policy.observe_acceptance(0.99, p, true);
+    policy.observe_verify(depth + 1, static_cast<std::uint64_t>(verify_cost(depth + 1)));
+    policy.observe_draft(static_cast<std::uint64_t>(draft_cost(depth)), depth);
+    policy.observe_step(depth + 1, static_cast<std::uint64_t>(verify_cost(depth + 1) + draft_cost(depth)));
+    deepest = std::max(deepest, depth);
+    last = depth;
+  }
+  LSE_EXPECT(deepest > 3u);
+  LSE_EXPECT_EQ(last, DraftWidthPolicy::kMaxProposals);
+}
+
+LSE_TEST(draft_width_policy_reaches_positions_a_shallow_chain_stopped_checking) {
+  // Costs measured on an R9700 at 1K tokens (ms), every width explored, but
+  // the first steps ran at depth 3 so positions 4..7 were never checked. The
+  // draft is accepted 98, 97, 92 then 90 percent of the time per position: a
+  // chain of 7 makes the most tokens per millisecond. An unchecked position
+  // has to be reached to be measured, not priced at the prior forever.
+  const std::array<double, 9> verify_ms{0.0, 30.4, 31.5, 34.2, 32.8, 36.0, 37.7, 37.0, 38.4};
+  const std::array<double, 8> draft_ms{0.0, 4.1, 8.1, 10.5, 14.0, 19.2, 22.8, 26.0};
+  const auto mean_depth = [&](const std::array<double, 7>& accept, unsigned seed) {
+  DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 1);
+  policy.observe_step(4, static_cast<std::uint64_t>(40e6));
+  for (std::uint32_t pass = 0; pass <= DraftWidthPolicy::kExploreSamples; ++pass)
+    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
+      policy.observe_verify(rows, static_cast<std::uint64_t>(verify_ms[rows] * 1e6));
+      policy.observe_draft(static_cast<std::uint64_t>(draft_ms[rows - 1] * 1e6), rows - 1);
+    }
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> unit(0.0, 1.0);
+  for (int step = 0; step < 40; ++step)
+    for (std::uint32_t p = 0; p < 3; ++p) {
+      const bool ok = unit(rng) < accept[p];
+      policy.observe_acceptance(0.99, p, ok);
+      if (!ok) break;
+    }
+  std::uint64_t depths = 0;
+  constexpr int kSteps = 400;
+  for (int step = 0; step < 2 * kSteps; ++step) {
+    const std::uint32_t depth = policy.depth(DraftWidthPolicy::kMaxProposals, 3);
+    std::uint32_t tokens = 1;
+    for (std::uint32_t p = 0; p < depth; ++p) {
+      const bool ok = unit(rng) < accept[p];
+      policy.observe_acceptance(0.99, p, ok);
+      if (!ok) break;
+      ++tokens;
+    }
+    policy.observe_verify(depth + 1, static_cast<std::uint64_t>(verify_ms[depth + 1] * 1e6));
+    policy.observe_draft(static_cast<std::uint64_t>(draft_ms[depth] * 1e6), depth);
+    policy.observe_step(tokens, static_cast<std::uint64_t>((verify_ms[depth + 1] + draft_ms[depth]) * 1e6));
+    if (step >= kSteps) depths += depth;
+  }
+  return static_cast<double>(depths) / kSteps;
+  };
+  const std::array<double, 7> strong{0.98, 0.97, 0.92, 0.90, 0.90, 0.90, 0.90};
+  for (unsigned seed = 1; seed <= 8; ++seed) LSE_EXPECT(mean_depth(strong, seed) > 5.0);
+  // Deep proposals that really are weak keep the chain shallow: probing for
+  // them stops costing steps once they are rarely reached.
+  const std::array<double, 7> weak{0.98, 0.97, 0.92, 0.30, 0.30, 0.30, 0.30};
+  for (unsigned seed = 1; seed <= 8; ++seed) LSE_EXPECT(mean_depth(weak, seed) < 3.5);
+}
+
 LSE_TEST(draft_width_policy_costs_follow_the_context) {
   // Measured at a short context: 32 ms for one row, 1 ms per further row.
   DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
@@ -535,16 +619,21 @@ LSE_TEST(draft_width_policy_costs_follow_the_context) {
   LSE_EXPECT_NEAR(policy.verify_ns(8), 39e6, 1.0);
   LSE_EXPECT_EQ(policy.exploring(), 0u);
   LSE_EXPECT_NEAR(policy.draft_ns(), 8e6, 1.0);
-  // At 64K one row costs 40 ms: the level moves.
+  // At 64K one row costs 40 ms: the level moves. A width's first pass in
+  // the new bucket is not priced (it paid for that bucket's first loads).
+  policy.observe_verify(1, 900'000'000);
+  LSE_EXPECT_NEAR(policy.verify_ns(1), 32e6, 1.0);
   policy.observe_verify(1, 40'000'000);
   LSE_EXPECT_NEAR(policy.verify_ns(1), 40e6, 1.0);
   LSE_EXPECT_NEAR(policy.verify_ns(8), 47e6, 1.0);
   // Eight rows cost 61 ms: 14 ms more than carried, 2 ms per row past the
   // first, and the widths not measured here follow that growth.
+  policy.observe_verify(8, 900'000'000);
   policy.observe_verify(8, 61'000'000);
   LSE_EXPECT_NEAR(policy.verify_ns(8), 61e6, 1.0);
   LSE_EXPECT_NEAR(policy.verify_ns(5), 52e6, 1.0);
   // A draft measured here scales the depths not measured here.
+  policy.observe_draft(900'000'000, 3);
   policy.observe_draft(12'000'000, 3);
   LSE_EXPECT_NEAR(policy.draft_ns(3), 12e6, 1.0);
   // The short context keeps its own costs.
@@ -716,6 +805,34 @@ LSE_TEST(draft_width_policy_sizes_trees_by_measured_cost) {
   LSE_EXPECT_EQ(mid.tree_nodes(prefix), best);
   // A short expansion caps the tree.
   LSE_EXPECT_EQ(flat.tree_nodes(std::span(prefix).first(6)), 5u);
+}
+
+LSE_TEST(draft_width_policy_recovers_trees_from_compiling_first_samples) {
+  // The wide rungs' first passes compiled their kernels (a second each). The
+  // rows really cost nothing, so the widest tree is the best one, and it
+  // has to come back into use once measured again.
+  std::vector<double> prefix{0.0};
+  for (std::uint32_t b = 1; b <= DraftWidthPolicy::kMaxTreeNodes; ++b)
+    prefix.push_back(prefix.back() + 0.8 * std::pow(0.85, b - 1));
+  const double draft = 8e6, base = 40e6;
+  DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_tree_step(DraftWidthPolicy::kTreeRows[0], 1);
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
+    policy.observe_verify(1, static_cast<std::uint64_t>(base));
+    for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
+      policy.observe_tree_step(rows, static_cast<std::uint64_t>(
+                                         draft + base + (pass == 0 && rows >= 15 ? 1e9 : 0.0)));
+  }
+  policy.observe_draft(static_cast<std::uint64_t>(draft));
+  policy.observe_step(3, static_cast<std::uint64_t>(60e6));
+  std::uint32_t last = 0;
+  for (int step = 0; step < 600; ++step) {
+    last = policy.tree_nodes(prefix);
+    policy.observe_tree_step(last + 1, static_cast<std::uint64_t>(draft + base));
+    policy.observe_step(3, static_cast<std::uint64_t>(draft + base));
+  }
+  LSE_EXPECT_EQ(last, DraftWidthPolicy::kMaxTreeNodes);
 }
 
 LSE_TEST(draft_width_policy_prefers_a_chain_that_decodes_faster) {

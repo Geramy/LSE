@@ -649,6 +649,9 @@ class Scheduler {
     std::uint64_t index_hits = 0;
     std::uint64_t index_misses = 0;
     std::uint64_t index_rejects = 0;
+    // Kernels whose variants were tried on the device (each trial launches
+    // and times every variant).
+    std::uint64_t variant_trials = 0;
   };
   [[nodiscard]] JitStats jit_stats() const noexcept;
   [[nodiscard]] const Trace& last_trace() const noexcept { return trace_; }
