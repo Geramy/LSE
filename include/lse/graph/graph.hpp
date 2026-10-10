@@ -365,6 +365,12 @@ struct CpuFallbackEvent {
 };
 void set_cpu_fallback_allowed(bool allowed) noexcept;
 [[nodiscard]] bool cpu_fallback_allowed() noexcept;
+// Fallback refused by an option (--no-cpu-fallback, lse_config's
+// disable_cpu_fallback, LSE_REQUIRE_DEVICE_KERNELS=1). Beyond what a refused
+// default refuses, this also refuses a step on a scheduler built directly on
+// a backend with no code generator. Setting it disallows fallback.
+void set_cpu_fallback_disabled(bool disabled) noexcept;
+[[nodiscard]] bool cpu_fallback_disabled() noexcept;
 // LSE_REQUIRE_DEVICE_KERNELS=1, the qualification switch that predates
 // --no-cpu-fallback and means the same thing. Fallback is refused when it is
 // set, even for a run that chose the CPU backend.

@@ -299,7 +299,7 @@ other run refuses it:
 | Case | Default (no CPU backend chosen) | CPU backend chosen |
 |---|---|---|
 | No `--pool`, and no device backend comes up | Startup fails: `no device backend came up and CPU fallback is disabled (--no-cpu-fallback)`, followed by each backend and its reason | The CPU backend runs the model |
-| `--pool` names a CPU device (`cpu:0`) | (the CPU backend is chosen) | The CPU device is a pool member |
+| `--pool` names a CPU device (`cpu:0`) | Naming it chooses the CPU backend: it is a pool member | The CPU device is a pool member |
 | `--pool hrx:0` and that device does not come up | Startup fails, naming the device | The same |
 | An operation has no device kernel | The request fails with an error that starts with `CPU fallback disabled:` and names the operation group | It runs on the CPU and is reported as below |
 

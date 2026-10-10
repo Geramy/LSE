@@ -680,6 +680,8 @@ int main(int argc, char** argv) {
   // Before anything opens a device: the device set reads it to refuse a
   // host-interpreter member.
   // Refused unless this run chose the CPU backend (graph::cpu_fallback_default).
+  graph::set_cpu_fallback_disabled(opt.no_cpu_fallback ||
+                                   graph::device_kernels_required_by_environment());
   graph::set_cpu_fallback_allowed(
       !opt.no_cpu_fallback &&
       graph::cpu_fallback_default(std::getenv("LSE_BACKEND"),
