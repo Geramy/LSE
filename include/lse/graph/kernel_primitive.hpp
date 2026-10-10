@@ -176,6 +176,15 @@ class KernelPrimitiveBase : public Primitive {
     return false;
   }
 
+  // The shape class a variant decision covers: what can change which
+  // variant is fastest, and nothing that only grows with the workload (a KV
+  // pool, a block table, a prefill chunk). A decision measured once carries
+  // over to every shape in its class, so growth asks for no new measurement.
+  // By default every dimension is rounded up to a power of two, beside the
+  // primitive's name, dtypes and attributes; a primitive that knows which of
+  // its dimensions are sizes says so here.
+  virtual std::uint64_t variant_class(const KernelShapes& shapes) const;
+
   // Whether the primitive maps threads to work itself instead of computing one
   // output element per thread.
   //

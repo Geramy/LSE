@@ -139,6 +139,7 @@ enum class DispatchStage : std::uint8_t { kEmit, kCompileOrLaunch };
 struct Scheduler::Impl {
   std::shared_ptr<kv::MemoryManager> kv_memory = kv::MemoryManager::create();
   std::uint64_t variant_trials = 0;
+  bool variant_trials_open = true;
   std::unique_ptr<JitCache> jit;
   std::vector<backend::DeviceBuffer> phase_tables;
   // One per stream: a persistent-grid kernel spins on this counter across its
@@ -222,13 +223,15 @@ struct Scheduler::Impl {
     // A draft's kernel may take variants a target's may not, so the two keep
     // separate decisions even where their kernels are otherwise one.
     pick.proposal = proposal_only(group);
-    pick.key = detail::VariantBook::key(emitter.cache_key(group, info) ^
+    // Keyed by shape class, not by the kernel's identity: a decision made
+    // once covers a KV pool's growth and a prefill's chunk lengths.
+    pick.key = detail::VariantBook::key(emitter.variant_class(group, info) ^
                                             (pick.proposal ? 0x70726f706f73616cull : 0ull),
                                         pick.offered, it->second);
     if (const auto chosen = variants.decided(pick.key)) {
       if (*chosen < pick.offered) pick.variant = *chosen;
     } else {
-      pick.trial = true;
+      pick.trial = variant_trials_open;
     }
     return pick;
   }
@@ -274,6 +277,8 @@ Scheduler::~Scheduler() = default;
 std::shared_ptr<kv::MemoryManager> Scheduler::kv_memory() const {
   return impl_->kv_memory;
 }
+
+void Scheduler::set_variant_trials(bool open) noexcept { impl_->variant_trials_open = open; }
 
 Scheduler::JitStats Scheduler::jit_stats() const noexcept {
   if (impl_->jit == nullptr) return {};

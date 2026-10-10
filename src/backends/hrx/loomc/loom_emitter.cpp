@@ -446,6 +446,19 @@ bool LoomEmitter::variant_reassociates(const FusionGroup& group,
       });
 }
 
+std::uint64_t LoomEmitter::variant_class(const FusionGroup& group,
+                                         const DeviceInfo& device) const {
+  const std::uint64_t own = cache_key(group, device);
+  return with_self_indexed<std::uint64_t>(
+      group, device, own, [&](const KernelPrimitiveBase& p, const KernelShapes& s) {
+        // The device's architecture beside the primitive's class: one book
+        // serves every device a process drives.
+        std::uint64_t h = p.variant_class(s);
+        for (const char c : device.arch) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ull;
+        return h;
+      });
+}
+
 bool LoomEmitter::joins_run(std::span<const NodePtr> run,
                             const DeviceInfo& device) const {
   if (run.size() < 2) return true;

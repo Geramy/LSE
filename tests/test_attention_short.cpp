@@ -236,6 +236,55 @@ LSE_TEST(flash_split_offers_scores_in_registers_as_a_variant) {
   }
 }
 
+// A variant decision is kept by shape class: a tree pass's class is the
+// same however large the KV pool and block table have grown, and differs by
+// the tree's rows; a prefill tile's chunk lengths share a class up to the
+// next power of two.
+LSE_TEST(variant_classes_ignore_kv_growth) {
+  backend::LoomEmitter emitter;
+  backend::AmdDeviceInfo amd;
+  const auto tree_class = [&](int rows, int capacity) {
+    Fixture fx(rows, capacity);
+    backend::apply_arch_defaults(fx.gpu, amd);
+    fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    fx.gpu.extension = &amd;
+    fx.k = leaf(fx.k.shape(), DType::kBF16);
+    fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
+    fx.meta = leaf({kv::tree_meta_elems(1, rows)});
+    const auto out = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kTree, 0, fx.meta,
+                                fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+    const NodePtr roots[]{out.node()->inputs[0]};
+    auto groups = Partitioner::partition(roots, &fx.gpu);
+    LSE_EXPECT_EQ(groups.size(), 1u);
+    return groups.size() == 1 ? emitter.variant_class(groups[0], fx.gpu) : 0ull;
+  };
+  const auto c15 = tree_class(15, 4096);
+  LSE_EXPECT(c15 != 0u);
+  LSE_EXPECT_EQ(tree_class(15, 8192), c15);
+  LSE_EXPECT_EQ(tree_class(15, 69632), c15);
+  LSE_EXPECT(tree_class(31, 4096) != c15);
+  LSE_EXPECT(tree_class(8, 4096) != c15);
+  const auto prefill_class = [&](int rows, int capacity) {
+    Fixture fx(rows, capacity);
+    fx.gpu.arch = "gfx1151";
+    backend::apply_arch_defaults(fx.gpu, amd);
+    fx.gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
+    fx.gpu.extension = &amd;
+    fx.k = leaf(fx.k.shape(), DType::kBF16);
+    fx.v = leaf({fx.k.shape().dim(0), 4, 256, 16}, DType::kBF16);
+    const auto out = sdpa_paged(fx.q, fx.k, fx.v, 0.0625f, MaskKind::kCausal, 0, fx.meta,
+                                fx.table, 16, &fx.gpu, kv::CacheDType::kBF16);
+    const NodePtr roots[]{out.node()};
+    auto groups = Partitioner::partition(roots, &fx.gpu);
+    LSE_EXPECT_EQ(groups.size(), 1u);
+    return groups.size() == 1 ? emitter.variant_class(groups[0], fx.gpu) : 0ull;
+  };
+  const auto p1024 = prefill_class(1024, 8192);
+  LSE_EXPECT_EQ(prefill_class(1024, 16384), p1024);
+  LSE_EXPECT_EQ(prefill_class(700, 16384), p1024);
+  LSE_EXPECT(prefill_class(256, 8192) != p1024);
+}
+
 // Without a matrix generation the device keeps the short split.
 LSE_TEST(chain_passes_on_a_device_without_matrix_instructions_keep_the_short_split) {
   Fixture fx(4, 4096);
