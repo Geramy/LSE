@@ -115,6 +115,9 @@ void usage() {
       "      --perplexity-method M  chunks (default; llama.cpp's method: chunks of\n"
       "                       ctx tokens, second half scored) or sliding\n"
       "      --perplexity-ctx N  tokens per chunk or window (default 512)\n"
+      "      --perplexity-tail N  score only the last N tokens of each window\n"
+      "      --perplexity-step N  run the scored tokens through decode passes (1)\n"
+      "                       or verify passes of N rows instead of the prefill\n"
       "      --perplexity-stride N  sliding: tokens between windows (default: ctx)\n"
       "      --perplexity-chunks N  score only the first N chunks (default all)\n"
       "      --perplexity-kld-base-out FILE  record a KL-divergence base\n"
@@ -160,6 +163,7 @@ int main(int argc, char** argv) {
   std::string perplexity_text, perplexity_tokens, perplexity_output, perplexity_method = "chunks";
   std::string perplexity_kld_out, perplexity_kld;
   std::size_t perplexity_ctx = 512, perplexity_stride = 0, perplexity_chunks = 0, perplexity_top_k = 32;
+  std::size_t perplexity_tail = 0, perplexity_step = 0;
   bool perplexity_ids = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -347,7 +351,8 @@ int main(int argc, char** argv) {
     else if (a == "--perplexity-kld-base-out") perplexity_kld_out = value(a.c_str());
     else if (a == "--perplexity-kld") perplexity_kld = value(a.c_str());
     else if (a == "--perplexity-ctx" || a == "--perplexity-stride" ||
-             a == "--perplexity-chunks" || a == "--perplexity-kld-top-k") {
+             a == "--perplexity-chunks" || a == "--perplexity-kld-top-k" ||
+             a == "--perplexity-tail" || a == "--perplexity-step") {
       const auto text = value(a.c_str());
       std::size_t n = 0;
       const auto parsed = std::from_chars(text.data(), text.data() + text.size(), n);
@@ -360,6 +365,8 @@ int main(int argc, char** argv) {
       (a == "--perplexity-ctx"      ? perplexity_ctx
        : a == "--perplexity-stride" ? perplexity_stride
        : a == "--perplexity-chunks" ? perplexity_chunks
+       : a == "--perplexity-tail"   ? perplexity_tail
+       : a == "--perplexity-step"   ? perplexity_step
                                     : perplexity_top_k) = n;
     }
     else if (a == "--model-info") model_info = true;
@@ -464,6 +471,8 @@ int main(int argc, char** argv) {
     perplexity_request["ctx"] = perplexity_ctx;
     perplexity_request["stride"] = perplexity_stride;
     perplexity_request["chunks"] = perplexity_chunks;
+    perplexity_request["tail"] = perplexity_tail;
+    perplexity_request["step"] = perplexity_step;
     perplexity_request["include_token_ids"] = perplexity_ids;
     if (!perplexity_kld_out.empty()) {
       perplexity_request["kld_base_out"] = perplexity_kld_out;

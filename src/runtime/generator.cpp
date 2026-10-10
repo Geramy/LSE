@@ -552,7 +552,7 @@ Result<std::vector<float>> Generator::step(
 Result<TokenScores> Generator::score(Session& session, std::span<const std::uint32_t> tokens,
                                      std::size_t first_target, std::size_t top_k,
                                      std::span<const std::uint32_t> probe_ids,
-                                     std::size_t probe_k) {
+                                     std::size_t probe_k, std::size_t step_rows) {
   if (mtp_ != nullptr || dflash2_ != nullptr)
     return LSE_ERROR(kInvalidArgument, "scoring runs the target model alone; detach the draft module");
   if (session.position() != 0)
@@ -597,32 +597,18 @@ Result<TokenScores> Generator::score(Session& session, std::span<const std::uint
   std::size_t at = 0;
   std::size_t previous_width = 0;
   Array hidden;
-  // The same pass plan and per-pass call step() makes for a prompt of n tokens.
-  for (const PassPlan& pass : prefill_passes(n)) {
-    const std::size_t take = pass.valid;
-    if (previous_width != 0) {
-      hidden = {};
-      if (pass.width != previous_width)
-        LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
-    }
-    previous_width = pass.width;
-    std::vector<std::uint32_t> pass_ids(tokens.begin() + static_cast<std::ptrdiff_t>(at),
-                                        tokens.begin() + static_cast<std::ptrdiff_t>(at + take));
-    pass_ids.resize(pass.width, 0u);  // padding past the last real token
-    LSE_ASSIGN_OR(Array ids, token_array(pass_ids));
-    LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr, nullptr, nullptr, false,
-                                       nullptr, false, ops::AttentionExecutionPhase::kPrefill,
-                                       static_cast<std::int32_t>(take)));
-    // Row j of the sequence predicts token j + 1. This pass holds rows
-    // [at, at + take); the scored ones predict a token at or past first_target.
+  // Row j of the sequence predicts token j + 1. A pass holds rows
+  // [at, at + take) of `hidden`, which is pass_width wide; the scored ones
+  // predict a token at or past first_target.
+  const auto score_pass = [&](std::size_t take, std::size_t pass_width) -> Status {
     const std::size_t lo = std::max(at, first_target - 1);
     const std::size_t hi = std::min(at + take, n - 1);
-    const std::size_t width = std::min(kScoreRows, pass.width);
+    const std::size_t width = std::min(kScoreRows, pass_width);
     for (std::size_t row = lo; row < hi;) {
       // A fixed-width slice wherever the pass is wide enough, so the head
       // compiles one shape; rows past the scored range are read and ignored.
       std::size_t start = row - at;
-      if (start + width > pass.width) start = pass.width - width;
+      if (start + width > pass_width) start = pass_width - width;
       const Array rows = graph::slice(hidden, 1, static_cast<std::int64_t>(start),
                                       static_cast<std::int64_t>(start + width));
       LSE_ASSIGN_OR(Array logits, model_.lm_head(rows));
@@ -671,10 +657,52 @@ Result<TokenScores> Generator::score(Session& session, std::span<const std::uint
       }
       row = last;
     }
+    return OkStatus();
+  };
+  // The same pass plan and per-pass call step() makes for a prompt of n
+  // tokens; with step_rows, only the context before the scored tokens.
+  const std::size_t prefilled = step_rows == 0 ? n : first_target - 1;
+  for (const PassPlan& pass : prefilled == 0 ? std::vector<PassPlan>{} : prefill_passes(prefilled)) {
+    const std::size_t take = pass.valid;
+    if (previous_width != 0) {
+      hidden = {};
+      if (pass.width != previous_width)
+        LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
+    }
+    previous_width = pass.width;
+    std::vector<std::uint32_t> pass_ids(tokens.begin() + static_cast<std::ptrdiff_t>(at),
+                                        tokens.begin() + static_cast<std::ptrdiff_t>(at + take));
+    pass_ids.resize(pass.width, 0u);  // padding past the last real token
+    LSE_ASSIGN_OR(Array ids, token_array(pass_ids));
+    LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr, nullptr, nullptr, false,
+                                       nullptr, false, ops::AttentionExecutionPhase::kPrefill,
+                                       static_cast<std::int32_t>(take)));
+    LSE_RETURN_IF_ERROR(score_pass(take, pass.width));
     at += take;
+  }
+  if (step_rows != 0) {
+    // The scored tokens as generation runs them: decode passes of one row,
+    // or verify passes of step_rows (the speculative phase).
+    hidden = {};
+    if (previous_width != 0) LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
+    while (at < n - 1) {
+      const std::size_t take = std::min(step_rows, n - 1 - at);
+      std::vector<std::uint32_t> pass_ids(tokens.begin() + static_cast<std::ptrdiff_t>(at),
+                                          tokens.begin() + static_cast<std::ptrdiff_t>(at + take));
+      LSE_ASSIGN_OR(Array ids, token_array(pass_ids));
+      LSE_ASSIGN_OR(hidden, model_.hidden(ids, &session.states(), nullptr, nullptr, nullptr, false,
+                                         nullptr, false,
+                                         take == 1 ? ops::AttentionExecutionPhase::kDecode
+                                                   : ops::AttentionExecutionPhase::kSpeculative,
+                                         static_cast<std::int32_t>(take)));
+      LSE_RETURN_IF_ERROR(score_pass(take, take));
+      hidden = {};
+      at += take;
+    }
   }
   hidden = {};
   LSE_RETURN_IF_ERROR(model_.retire_prefill(session.states()));
+  LSE_RETURN_IF_ERROR(model_.retire_completed_passes(session.states()));
   return out;
 }
 

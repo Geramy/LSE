@@ -275,12 +275,15 @@ class Generator {
   // a time. The log-softmax statistics are reduced on the device
   // (logits.lse_pick.v1) and the top k is selected there (topk_pairs, which
   // needs a vocabulary of at least 4096). No draft module may be attached:
-  // scoring is the target model alone.
+  // scoring is the target model alone. With `step_rows`, the context before
+  // first_target is prefilled and the scored tokens run as generation runs
+  // them: decode passes of one row, or verify passes of step_rows rows (the
+  // speculative phase), so decode-time attention is what is scored.
   static constexpr std::size_t kScoreRows = 128;
   Result<TokenScores> score(Session& session, std::span<const std::uint32_t> tokens,
                             std::size_t first_target, std::size_t top_k = 0,
                             std::span<const std::uint32_t> probe_ids = {},
-                            std::size_t probe_k = 0);
+                            std::size_t probe_k = 0, std::size_t step_rows = 0);
 
   // Last position of a [.., T, D] hidden state, reshaped to [.., D].
   // `valid` rows of the sequence axis are real (0: all of them).

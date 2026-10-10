@@ -1108,6 +1108,8 @@ lse_result lse_perplexity(lse_engine* e, const char* request_json, char** json_o
     options.ctx = request.value("ctx", std::size_t{512});
     options.stride = request.value("stride", std::size_t{0});
     options.max_windows = request.value("chunks", std::size_t{0});
+    options.tail = request.value("tail", std::size_t{0});
+    options.step_rows = request.value("step", std::size_t{0});
     const bool include_windows = request.value("include_windows", true);
     const bool include_ids = request.value("include_token_ids", false);
     const std::string kld_out = request.value("kld_base_out", std::string());
@@ -1177,6 +1179,16 @@ lse_result lse_perplexity(lse_engine* e, const char* request_json, char** json_o
                {"batch_size", opt.prefill.batch_size},
                {"ubatch_size", opt.prefill.ubatch_size},
                {"head_rows", runtime::Generator::kScoreRows},
+               {"scored_tail", options.tail},
+               {"scored_through", options.step_rows == 0 ? std::string("prefill")
+                                  : options.step_rows == 1 ? std::string("decode passes")
+                                  : "verify passes of " + std::to_string(options.step_rows) + " rows"},
+               {"sparse_decode", config.sparse_attention.sparse_decode.mode == ops::SparseDecodeMode::kOff
+                                     ? std::string("off")
+                                 : config.sparse_attention.sparse_decode.mode == ops::SparseDecodeMode::kOn
+                                     ? std::string("on") : std::string("auto")},
+               {"sparse_decode_budget", config.sparse_attention.sparse_decode.budget_tokens},
+               {"sparse_decode_joint_heads", config.sparse_attention.sparse_decode.joint_heads},
                {"cpu_fallback_allowed", graph::cpu_fallback_allowed()}}}};
     if (report->recorded) out["kld_base_out"] = {{"path", kld_out}, {"top_k", report->recorded->top_k}};
     if (report->kld) {

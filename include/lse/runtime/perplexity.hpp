@@ -150,6 +150,13 @@ struct PerplexityOptions {
   const KldBase* compare = nullptr;
   // The token ids' SHA-256, checked against a base and stored in a new one.
   std::string token_ids_sha256;
+  // Score only the last `tail` tokens of each window (0: as the method says).
+  std::size_t tail = 0;
+  // 0: the scored tokens run through the prompt prefill. N: the context is
+  // prefilled and the scored tokens run through decode passes (N = 1) or
+  // verify passes of N rows, so decode-time attention (exact or sparse) is
+  // what is scored.
+  std::size_t step_rows = 0;
 };
 
 struct PerplexityReport {

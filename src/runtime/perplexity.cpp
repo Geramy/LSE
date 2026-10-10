@@ -154,6 +154,8 @@ Result<PerplexityReport> score_perplexity(Generator& gen, model::HybridLM& model
     LSE_ASSIGN_OR(plan, perplexity_windows(tokens.size(), options.ctx, stride));
   }
   if (options.max_windows != 0 && plan.size() > options.max_windows) plan.resize(options.max_windows);
+  if (options.tail != 0)
+    for (PerplexityWindow& w : plan) w.first_target = std::max(w.first_target, w.end - std::min(options.tail, w.end - w.begin - 1));
   std::size_t total = 0;
   for (const PerplexityWindow& w : plan) total += w.scored();
 
@@ -220,7 +222,7 @@ Result<PerplexityReport> score_perplexity(Generator& gen, model::HybridLM& model
       // A fresh session per window, as a request without a session id gets.
       Session session("", model.state_slots());
       auto scored = gen.score(session, tokens.subspan(w.begin, w.end - w.begin), w.first_target - w.begin,
-                              top_k, probe, probe_k);
+                              top_k, probe, probe_k, options.step_rows);
       // What the model retained was built against this session's state.
       const Status dropped = model.drop_retained_passes();
       if (!scored.ok()) return scored.status();
