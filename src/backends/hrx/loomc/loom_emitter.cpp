@@ -446,6 +446,28 @@ bool LoomEmitter::variant_reassociates(const FusionGroup& group,
       });
 }
 
+std::uint64_t LoomEmitter::variant_class(const FusionGroup& group,
+                                         const DeviceInfo& device) const {
+  const std::uint64_t own = cache_key(group, device);
+  return with_self_indexed<std::uint64_t>(
+      group, device, own, [&](const KernelPrimitiveBase& p, const KernelShapes& s) {
+        // The device's architecture beside the primitive's class: one book
+        // serves every device a process drives.
+        std::uint64_t h = p.variant_class(s);
+        for (const char c : device.arch) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ull;
+        // Which variants accept this shape: two shapes of one size class
+        // that differ in what they accept are different classes, so a
+        // decision never lands on a shape that declines it.
+        const std::uint32_t offered = std::max<std::uint32_t>(1, p.variants(s));
+        for (std::uint32_t v = 0; v < offered; ++v) {
+          KernelShapes at = s;
+          at.variant = v;
+          h = (h ^ (p.variant_accepts(at, v) ? 0x5a5au + v : 0xa5a5u + v)) * 0x100000001b3ull;
+        }
+        return h;
+      });
+}
+
 bool LoomEmitter::joins_run(std::span<const NodePtr> run,
                             const DeviceInfo& device) const {
   if (run.size() < 2) return true;

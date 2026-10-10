@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string_view>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
@@ -100,6 +101,65 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       return Split ? Variant::kScoresInRegisters : Variant::kTwoTiles;
     }
     return Variant::kScoresInRegisters;
+  }
+  // A decision covers the tile's kind and geometry: rows (exact for a split
+  // pass, whose rows are a draft's width; rounded up to a power of two for
+  // prefill, whose chunk lengths vary), heads, head and value widths, the KV
+  // format and layout, the mask, batch rows and FlashPrefill V2 settings.
+  // Not the KV pool's blocks, the block table's length or the split's
+  // parts, which grow with the context: a grown cache asks for nothing new.
+  std::uint64_t variant_class(const KernelShapes& s) const override {
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    if (!d.valid) return KernelPrimitiveBase::variant_class(s);
+    const auto pow2 = [](std::uint32_t v) {
+      std::uint32_t p = 1;
+      while (p < v) p <<= 1;
+      return p;
+    };
+    std::uint64_t h = 0x666c617368ull;
+    const auto mix = [&](std::uint64_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+      h *= 0xff51afd7ed558ccdull;
+    };
+    for (const char c : kName) mix(static_cast<unsigned char>(c));
+    for (const std::uint64_t v :
+         {std::uint64_t{d.bsz}, std::uint64_t{Split ? d.tq : pow2(d.tq)}, std::uint64_t{d.qh},
+          std::uint64_t{d.kvh}, std::uint64_t{d.dh}, std::uint64_t{d.dv}, std::uint64_t{d.ts},
+          std::uint64_t{d.window}, static_cast<std::uint64_t>(d.mask),
+          std::uint64_t{d.dim_major_values}})
+      mix(v);
+    for (const DType t : s.input_dtypes) mix(static_cast<std::uint64_t>(t));
+    mix(static_cast<std::uint64_t>(s.output_dtype));
+    for (const float a : {s.attrs[1], s.attrs[2], s.attrs[3]}) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &a, sizeof bits);
+      mix(bits);
+    }
+    return h;
+  }
+  // The checks emit_two_tiles makes before it writes anything; the other
+  // variants emit wherever the default does.
+  bool variant_accepts(const KernelShapes& s, std::uint32_t v) const override {
+    KernelShapes at = s;
+    at.variant = v;
+    if (variant_of(at) != Variant::kTwoTiles) return true;
+    if (s.input_dtypes.size() < 2 ||
+        (s.input_dtypes[1] != DType::kF16 && s.input_dtypes[1] != DType::kBF16) ||
+        s.device == nullptr)
+      return false;
+    const Dims d = dispatch::flash_dimensions(dense_request(s));
+    constexpr std::uint32_t kT = 16u * 32u, QR = QTile * 2u;
+    constexpr std::uint32_t kProbRow = 64u + 8u, kVsub = 16u;
+    if (!d.valid || d.dh % 16u != 0 || d.dv % 16u != 0 || d.dv > 256u ||
+        s.device->max_threads_per_workgroup < kT)
+      return false;
+    const auto mask = d.mask == 2 && d.window == 0u ? 1 : d.mask;
+    if (mask == 3 || d.dim_major_values) return false;
+    const std::uint32_t padded_depth = (d.dh + 15u) / 16u * 16u;
+    const std::uint64_t bytes = std::uint64_t{QR} * padded_depth * 2u +
+        std::uint64_t{QR} * kKWin * 4u + 4u * QR * 4u + kVsub * d.dv * 2u +
+        std::uint64_t{QR} * kProbRow * 2u + 256u;
+    return bytes <= workgroup_lds_bytes(s.device);
   }
   std::uint32_t variants(const KernelShapes& s) const override {
     const auto contiguous = contiguous_rows(s);

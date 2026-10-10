@@ -22,6 +22,19 @@
 namespace lse::runtime {
 
 namespace {
+// A process measures kernel variants during its warm-up only: its first
+// kTrialWarmupSteps decode steps, which hold the width policy's warm-up and
+// its first measurement of every verify width and tree rung. After that a
+// kernel whose variants are still undecided runs variant 0, so no variant
+// trial lands in a decode step that is being timed. Decisions are kept by
+// shape class, so a grown cache needs none.
+constexpr std::uint64_t kTrialWarmupSteps = 128;
+std::atomic<std::uint64_t> g_decode_steps{0};
+void count_decode_step() {
+  if (g_decode_steps.fetch_add(1, std::memory_order_relaxed) + 1 == kTrialWarmupSteps)
+    if (graph::Scheduler* sched = graph::default_scheduler()) sched->set_variant_trials(false);
+}
+
 // Widest top-k the verify pass reads from the device instead of whole rows
 // (topk_pairs bound).
 constexpr std::size_t kSpecTopLimit = 32;
@@ -1288,6 +1301,7 @@ Result<std::vector<std::uint32_t>> Generator::speculate(
       // context it attended over, the next one chosen at its own.
       widths->set_context(step_at);
       if (step_top != 0) {
+        count_decode_step();
         const std::uint64_t period = now - step_top;
         const std::uint64_t verify_ns = period > last_draft_ns ? period - last_draft_ns : 0;
         const bool quiet = step_counters == counters;
@@ -1753,6 +1767,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
     }
     next = *advanced;
     session.advance(1);
+    count_decode_step();
   }
   stats_.decode_ns = decode_start == 0 ? 0 : now_ns() - decode_start;
   snapshot_trace(&stats_, &host_reasons_);

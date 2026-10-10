@@ -209,6 +209,13 @@ class IKernelEmitter {
   }
   [[nodiscard]] virtual std::uint64_t cache_key(
       const FusionGroup& group, const backend::DeviceInfo& device) const;
+  // The shape class a variant decision for the group covers on this device
+  // (KernelPrimitiveBase::variant_class): the same across a KV pool's growth
+  // and a prefill's chunk lengths. The group's own identity by default.
+  [[nodiscard]] virtual std::uint64_t variant_class(const FusionGroup& group,
+                                                    const backend::DeviceInfo& device) const {
+    return cache_key(group, device);
+  }
 
   // Dialect of EmittedKernel::source, and of the source a primitive must
   // supply to land in it.

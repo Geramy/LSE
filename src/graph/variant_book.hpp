@@ -28,9 +28,13 @@ class VariantBook {
   // Off (LSE_AUTOTUNE=off) runs variant 0 everywhere and measures nothing.
   [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
-  // The decision's name: the kernel's variant-0 identity, how many variants
-  // were on offer, and the compiler that builds them. A rebuilt compiler, an
-  // edited primitive (a new identity) or a changed menu asks again.
+  // The decision's name: the kernel's shape class on its device
+  // (IKernelEmitter::variant_class), how many variants were on offer, the
+  // compiler that builds them and the engine build (engine_build_identity).
+  // Decisions are appended to variants-<release>.txt in the kernel cache, so
+  // the next process starts with every decided class and measures only the
+  // undecided ones, in its warm-up. A rebuilt compiler or engine or a
+  // changed menu asks again; a shape grown within its class does not.
   [[nodiscard]] static std::uint64_t key(std::uint64_t base_identity,
                                          std::uint32_t offered,
                                          std::string_view compiler_identity);
