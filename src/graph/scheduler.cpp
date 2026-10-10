@@ -489,11 +489,33 @@ bool device_kernels_required_by_environment() noexcept {
   return strict != nullptr && std::string_view(strict) == "1";
 }
 
+bool cpu_backend_selected(const char* backend, const char* pool) noexcept {
+  if (backend != nullptr && std::string_view(backend) == "cpu") return true;
+  if (pool == nullptr) return false;
+  std::string_view rest(pool);
+  while (!rest.empty()) {
+    const std::size_t comma = rest.find(',');
+    std::string_view entry = rest.substr(0, comma);
+    while (!entry.empty() && entry.front() == ' ') entry.remove_prefix(1);
+    while (!entry.empty() && entry.back() == ' ') entry.remove_suffix(1);
+    if (entry == "cpu" || entry.starts_with("cpu:")) return true;
+    if (comma == std::string_view::npos) break;
+    rest.remove_prefix(comma + 1);
+  }
+  return false;
+}
+
+bool cpu_fallback_default(const char* backend, const char* pool) noexcept {
+  return cpu_backend_selected(backend, pool) && !device_kernels_required_by_environment();
+}
+
 namespace {
 struct CpuFallbacks {
   std::mutex mu;
-  // The old qualification switch still refuses CPU fallback.
-  bool allowed = !device_kernels_required_by_environment();
+  // Refused unless the run chose the CPU backend itself: a device run whose
+  // GPU backend did not come up, or whose op has no device kernel, fails
+  // with the cause instead of running on the host interpreter.
+  bool allowed = cpu_fallback_default(std::getenv("LSE_BACKEND"), std::getenv("LSE_POOL"));
   std::uint64_t sequence = 0;
   struct Event { std::uint64_t sequence; std::string cause; };
   std::vector<Event> recent;                    // the last kRecent events

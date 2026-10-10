@@ -104,12 +104,14 @@ typedef struct lse_config {
   uint32_t max_sessions;          /* --max-sessions (default 8) */
   uint64_t session_memory_budget; /* --session-memory-budget BYTES (default 0) */
 
-  /* --no-cpu-fallback: nothing runs on the CPU interpreter. lse_open fails
-   * when no device backend comes up or the pool names a device with no code
-   * generator (cpu:0), and a group the device cannot run fails the request
-   * (naming the cause). Without it every CPU fallback is logged, counted in
-   * lse_status (engine.cpu_fallback) and reported to the client as
-   * "lse_warnings". LSE_REQUIRE_DEVICE_KERNELS=1 has the same effect. */
+  /* --no-cpu-fallback: nothing runs on the CPU interpreter, even when the
+   * pool names a cpu device or LSE_BACKEND=cpu. Without it, CPU fallback is
+   * still refused unless the run chose the CPU backend (a cpu pool entry or
+   * LSE_BACKEND=cpu): lse_open fails when no device backend comes up, and a
+   * group the device cannot run fails the request, naming the cause. A run
+   * that chose the CPU backend logs every fallback, counts it in lse_status
+   * (engine.cpu_fallback) and reports it to the client as "lse_warnings".
+   * LSE_REQUIRE_DEVICE_KERNELS=1 has the same effect as this option. */
   int32_t disable_cpu_fallback;
 
   /* --adaptive-dflash2=on|off. With DFlash2, nonzero (lse_config_init's

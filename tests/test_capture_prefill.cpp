@@ -607,6 +607,13 @@ LSE_TEST(a_refused_device_dispatch_fails_the_request_and_the_engine_recovers) {
 
 LSE_TEST(a_group_with_no_device_kernel_runs_on_the_cpu_loudly_or_fails_when_disabled) {
   if (backend::CaptureBackend::hip_gfx1151) return;  // Loom-only knob
+  // Fallback allowed, as for a run that chose the CPU backend; refused by
+  // default (graph::cpu_fallback_default). Restored on every exit.
+  struct Allowed {
+    bool previous = graph::cpu_fallback_allowed();
+    Allowed() { graph::set_cpu_fallback_allowed(true); }
+    ~Allowed() { graph::set_cpu_fallback_allowed(previous); }
+  } allowed;
   LSE_EXPECT_OK(place::open_default_devices("capture:0"));
   Engine e;
   LSE_EXPECT_OK(e.open(8, 0));
