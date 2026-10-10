@@ -1,5 +1,6 @@
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
+#include "lse/dispatch/sparse_decode_tuneconfig.h"
 #include "lse/dispatch/quant.hpp"
 #include "lse/dispatch/q8_matrix.hpp"
 #include "lse/graph/ops.hpp"
@@ -779,6 +780,122 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     if (dispatch::split_short_default_supported(request)) return split_paged_attention(n);
   }
   return Array(n);
+}
+
+Array sparse_decode_summary(const Array& summary, const Array& keys, const Array& meta,
+                            const Array& table, int pass_rows, kv::CacheDType storage) {
+  auto n = make(OpKind::kCustom, summary.shape(), summary.dtype(),
+                {summary.node(), keys.node(), meta.node(), table.node()});
+  n->iattrs[0] = pass_rows;
+  n->attrs[1] = static_cast<float>(storage);
+  n->prim = find_primitive("attention.sparse_decode.summary.v1");
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  return Array(n);
+}
+
+namespace {
+// The shifted step descriptor is the same for every layer of a pass: built
+// once per pass and shared. A node from an earlier build has run (it holds a
+// buffer) and is never handed to a new one.
+struct SparseMetaMemo {
+  std::weak_ptr<Node> meta;
+  std::weak_ptr<Node> out;
+  int budget_pages = 0;
+  int batch = 0;
+};
+SparseMetaMemo& sparse_meta_memo() {
+  static thread_local SparseMetaMemo memo;
+  return memo;
+}
+
+NodePtr sparse_meta(const Array& meta, int budget_pages, int batch) {
+  SparseMetaMemo& memo = sparse_meta_memo();
+  if (auto held = memo.out.lock(); held && memo.meta.lock() == meta.node() &&
+      memo.budget_pages == budget_pages && memo.batch == batch && !held->materialized &&
+      !held->buffer.valid())
+    return held;
+  auto n = make(OpKind::kCustom, meta.shape(), DType::kF32, {meta.node()});
+  n->iattrs[0] = budget_pages;
+  n->iattrs[1] = batch;
+  n->prim = find_primitive("attention.sparse_decode.meta.v1");
+  if (n->prim != nullptr) n->fclass = n->prim->fusion_class();
+  memo = {meta.node(), n, budget_pages, batch};
+  return n;
+}
+}  // namespace
+
+Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Array& v,
+                                      float scale, MaskKind mask, const Array& meta,
+                                      const Array& table, int block_size,
+                                      const backend::DeviceInfo* device,
+                                      kv::CacheDType storage, const Array& summary,
+                                      int budget_tokens, bool joint_heads) {
+  namespace sd = dispatch::sparse_decode;
+  const Shape& sq = q.shape();
+  if (device == nullptr || block_size != static_cast<int>(sd::kPage) || sq.rank() != 4 ||
+      k.shape().rank() != 4 || summary.shape().rank() != 4 || !summary.valid())
+    return LSE_ERROR(kInvalidArgument, "sparse decode attention needs a device, 16-token pages "
+                     "and the key summaries");
+  if (budget_tokens % static_cast<int>(sd::kPage) != 0 ||
+      budget_tokens < static_cast<int>(sd::kMinBudgetTokens))
+    return LSE_ERROR(kInvalidArgument, "sparse decode budget must be a multiple of 16 tokens and at least ",
+                     std::to_string(sd::kMinBudgetTokens));
+  if (table.shape().dim(1) > static_cast<std::int64_t>(sd::kMaxPages))
+    return LSE_ERROR(kOutOfRange, "sparse decode selects among at most ", std::to_string(sd::kMaxPages),
+                     " pages (", std::to_string(sd::kMaxPages * sd::kPage), " tokens)");
+  const auto kvh = k.shape().dim(1);
+  const auto budget_pages = budget_tokens / static_cast<int>(sd::kPage);
+  const auto batch = sq.dim(0);
+  auto scores = make(OpKind::kCustom, Shape{batch * kvh, table.shape().dim(1)}, DType::kF32,
+                     {q.node(), summary.node(), meta.node(), table.node()});
+  scores->attrs[0] = scale;
+  scores->iattrs[0] = budget_pages;
+  scores->prim = find_primitive("attention.sparse_decode.score.v1");
+  auto selected = make(OpKind::kCustom, Shape{batch * kvh, budget_pages}, DType::kF32,
+                       {scores, meta.node(), table.node()});
+  selected->iattrs[0] = budget_pages;
+  selected->iattrs[1] = joint_heads ? 1 : 0;
+  selected->iattrs[2] = static_cast<std::int32_t>(kvh);
+  selected->prim = find_primitive("attention.sparse_decode.select.v1");
+  auto shifted = sparse_meta(meta, budget_pages, static_cast<int>(batch));
+  if (!scores->prim || !selected->prim || !shifted->prim)
+    return LSE_ERROR(kInternal, "sparse decode kernels are not registered");
+  scores->fclass = scores->prim->fusion_class();
+  selected->fclass = selected->prim->fusion_class();
+
+  const bool dim_major = dispatch::dimension_major_values(k.shape(), v.shape());
+  Shape out{sq.dim(0), sq.dim(1), sq.dim(2),
+            kv::logical_width(storage, dim_major ? v.shape().dim(2) : v.shape().dim(3))};
+  auto n = make(OpKind::kAttention, out, q.dtype(),
+                {q.node(), k.node(), v.node(), shifted, selected});
+  n->attrs[0] = scale;
+  n->attrs[1] = static_cast<float>(storage);
+  n->iattrs[0] = static_cast<std::int32_t>(mask);
+  n->iattrs[1] = 0;
+  // A block table per key head (row b * Hkv + h).
+  n->iattrs[2] = 1;
+  n->iattrs[3] = block_size;
+  n->prim = find_primitive("attention");
+  const Shape shapes[] = {q.shape(), k.shape(), v.shape(), meta.shape(), selected->shape};
+  const DType dtypes[] = {q.dtype(), k.dtype(), v.dtype(), DType::kF32, DType::kF32};
+  KernelShapes request;
+  request.inputs = shapes;
+  request.input_dtypes = dtypes;
+  request.output = out;
+  request.output_dtype = q.dtype();
+  request.attrs = n->attrs;
+  request.iattrs = n->iattrs;
+  request.device = device;
+  if (dispatch::split_decode_supported(request)) return split_paged_attention(n);
+  if (dispatch::flash_split_scope(request))
+    return split_paged_attention(n, false, dispatch::attention_shapes::flash_split_parts(
+        static_cast<std::uint64_t>(budget_pages) * static_cast<std::uint64_t>(block_size),
+        dispatch::attention_shapes::flash_split_units(static_cast<std::uint32_t>(sq.dim(1)),
+            static_cast<std::uint32_t>(kvh), static_cast<std::uint32_t>(sq.dim(2))),
+        static_cast<std::uint32_t>(device->compute_units)));
+  if (dispatch::split_short_supported(request)) return split_paged_attention(n);
+  return LSE_ERROR(kUnimplemented, "no exact attention kernel serves sparse decode for ",
+                   std::to_string(sq.dim(2)), " rows on ", device->arch);
 }
 
 Array kv_page_write(const Array& dst, const Array& src, const Array& meta,

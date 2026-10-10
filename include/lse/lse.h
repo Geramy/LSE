@@ -138,6 +138,19 @@ typedef struct lse_config {
    * adaptive_dflash2 is on, which then takes a tree or a chain each step
    * from this device's measured costs. */
   int32_t dflash2_tree;
+
+  /* --sparse-decode=auto|on|off. Decode and verify passes at long context
+   * read the sink pages, the recent window and the KV pages whose key
+   * summaries bound the query rows highest, up to sparse_decode_budget
+   * tokens, instead of the whole cache. Negative (the default) is auto: the
+   * engine takes it per KV rung and pass width where this device's measured
+   * bandwidth and kernel times predict a gain, so short contexts stay exact.
+   * 0 keeps every pass exact; positive takes it whenever the context exceeds
+   * the budget. Approximate: it changes output. */
+  int32_t sparse_decode;
+  /* --sparse-decode-budget N: tokens a sparse decode pass reads, sink and
+   * recent window included; a multiple of 16. 0: the default (4096). */
+  int32_t sparse_decode_budget;
 } lse_config;
 
 LSE_API void lse_config_init(lse_config *cfg);

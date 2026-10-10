@@ -196,6 +196,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   std::string emit_kernel(const KernelShapes& s) const override {
     if constexpr (Split)
       if (!dispatch::flash_split_scope(dense_request(s))) return {};
+    if (s.iattrs[2] == 1 && (MeanCorrection || s.inputs.size() < 5 ||
+        s.inputs[4].dim(0) < s.inputs[0].dim(0) * s.inputs[1].dim(1))) return {};
     if (s.input_dtypes.size() != (MeanCorrection ? 7 : 5) || !dispatch::flash_wmma_supported(dense_request(s)) || !s.store ||
         (s.attrs[3] == 1.0f && (!std::isfinite(s.attrs[2]) || s.attrs[2] < 0)))
       return {};
@@ -324,7 +326,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const auto capacity = e.u32(d.stride * d.ts);
     const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
     const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
-    const auto tb = e.let(b * d.stride);
+    // A sparse decode pass reads a block table per key head (iattrs[2] == 1).
+    const auto tb = s.iattrs[2] == 1 ? e.let((b * d.kvh + kh) * d.stride) : e.let(b * d.stride);
 
     for (std::uint32_t c = 0; c < qchunks; ++c) {
       const auto idx = e.let(lid + c * kT);
@@ -854,7 +857,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const auto capacity = e.u32(d.stride * d.ts);
     const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
     const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
-    const auto tb = e.let(b * d.stride);
+    // A sparse decode pass reads a block table per key head (iattrs[2] == 1).
+    const auto tb = s.iattrs[2] == 1 ? e.let((b * d.kvh + kh) * d.stride) : e.let(b * d.stride);
 
     // Stage each query once.
     for (std::uint32_t c = 0; c < qchunks; ++c) {

@@ -202,6 +202,7 @@ lse_apply_common_flags(lse_trace)
 add_library(lse_graph
   src/dispatch/attention.cpp
   src/dispatch/roofline.cpp
+  src/dispatch/sparse_decode.cpp
   src/dispatch/q8_matrix.cpp
   src/graph/quant_swiglu.cpp
   src/graph/graph.cpp
@@ -252,6 +253,7 @@ add_library(lse_kernels
   src/kernels/scatter.cpp
   src/kernels/flash_wmma_sdpa.cpp
   src/kernels/sdpa.cpp
+  src/kernels/sparse_decode.cpp
   src/kernels/slice.cpp
   src/kernels/topk.cpp
   src/kernels/transpose.cpp

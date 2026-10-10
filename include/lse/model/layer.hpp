@@ -41,6 +41,10 @@ struct MixerState {
   ops::PagedKvLayer paged;
   Array key_cache;
   Array value_cache;
+  // The last build's sparse decode summary refresh (ops::AttentionCache::
+  // summary_root), kept among the pass's roots. The summaries themselves
+  // live in paged.summary.
+  Array key_summary;
   // Shared per-step descriptor the decode program pokes: f32 [3] =
   // {first query position, live KV length, real rows}.
   Array kv_meta;

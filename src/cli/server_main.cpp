@@ -84,6 +84,11 @@ void usage() {
       "                       multi-token-prediction module\n"
       "      --tokenizer REPO HF repo for tokenizer.json when the model\n"
       "                       directory has none\n"
+      "      --sparse-decode=off  exact attention in every decode and verify pass\n"
+      "                       (auto/on/off; default auto: block-sparse attention over\n"
+      "                       the sink, recent window and top-scoring KV pages where\n"
+      "                       this device's measured roofline predicts a gain)\n"
+      "      --sparse-decode-budget N  tokens a sparse decode pass reads (default 4096)\n"
       "      --FlashPrefillV2=off  disable default FlashPrefill V2 prefill (on/off)\n"
       "                       default on for supported HRX/LOOM prompt prefill, including MTP/DFlash2\n"
       "      --attention-prefill MODE  dense, blasst, flashprefill-v2 (experimental)\n"
@@ -247,6 +252,26 @@ int main(int argc, char** argv) {
         return 2;
       }
       cfg.dflash2_tree = text == "on" ? 1 : 0;
+    }
+    else if (a == "--sparse-decode" || a.starts_with("--sparse-decode=")) {
+      const std::string text = a == "--sparse-decode"
+                                  ? value("--sparse-decode")
+                                  : a.substr(std::string("--sparse-decode=").size());
+      if (text != "auto" && text != "on" && text != "off") {
+        std::fputs("lse-server: --sparse-decode must be auto, on or off\n", stderr);
+        return 2;
+      }
+      cfg.sparse_decode = text == "auto" ? -1 : text == "on" ? 1 : 0;
+    }
+    else if (a == "--sparse-decode-budget") {
+      const std::string text = value("--sparse-decode-budget");
+      char* end = nullptr;
+      const long n = std::strtol(text.c_str(), &end, 10);
+      if (text.empty() || *end != '\0' || n <= 0 || n > (1L << 30)) {
+        std::fputs("lse-server: --sparse-decode-budget must be a positive token count\n", stderr);
+        return 2;
+      }
+      cfg.sparse_decode_budget = static_cast<std::int32_t>(n);
     }
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--pull") pull_missing = true;

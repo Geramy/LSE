@@ -98,6 +98,10 @@ struct PagedKvLayer {
   std::int32_t block_ceiling = 0;
   // `table` has not been re-uploaded since `tables` last changed.
   bool table_dirty = true;
+  // Sparse decode page summaries, [block ceiling, kv_heads, 2, head_dim] bf16
+  // (key center and radius per page), when the model keeps them. Sized to
+  // the pool's ceiling once, so it never moves; refreshed in place.
+  Array summary;
 
   [[nodiscard]] bool valid() const noexcept {
     return keys.valid() && values.valid() && table.valid();
@@ -137,6 +141,10 @@ struct AttentionCache {
   Array tree_positions;
   Array tree_keys;
   Array tree_values;
+  // Where the pass's summary refresh goes (ops::sparse_decode_summary), so
+  // the caller keeps it among the pass's roots: it runs even when the pass's
+  // own attention is exact. Null: this cache keeps no summaries.
+  Array* summary_root = nullptr;
 };
 
 // Tops each row's block list up to cover what `layer.row_tokens` asks for —

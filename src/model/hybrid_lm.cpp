@@ -1249,6 +1249,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
         st.key_cache = {};
         st.value_cache = {};
       }
+      st.key_summary = {};
     }
     for (ForwardCache& c : caches_) c = ForwardCache{};
     cache_.t_key = t_now;
@@ -1659,6 +1660,8 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       const bool grows = !st.paged.valid();
       add(st.key_cache, grows);
       add(st.value_cache, grows);
+      // Sparse decode summaries: refreshed in place, never carried.
+      add(st.key_summary, false);
     }
   }
   if (graph::Scheduler* sched = graph::default_scheduler()) {
@@ -1800,6 +1803,7 @@ Status HybridLM::retire_completed_passes(std::vector<MixerState>& states) {
       detach_state(state.key_cache);
       detach_state(state.value_cache);
     }
+    state.key_summary = {};
   }
   for (ForwardCache& cache : caches_) cache = ForwardCache{};
   next_cache_ = 0;

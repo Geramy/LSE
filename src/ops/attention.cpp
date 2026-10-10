@@ -1,4 +1,5 @@
 #include "lse/ops/attention.hpp"
+#include "lse/dispatch/sparse_decode.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +43,7 @@ std::size_t PagedKvLayer::pool_bytes() const noexcept {
         ? values.node()->kv_fragments->fragment_count() * kv::kFragmentBytes
         : dtype_storage_bytes(values.dtype(), values.shape().elem_count());
   }
+  if (summary.valid()) total += dtype_storage_bytes(summary.dtype(), summary.shape().elem_count());
   return total;
 }
 
@@ -448,6 +450,8 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
 
   Array k_attn = k;
   Array v_attn = v;
+  Array summary;
+  if (cache != nullptr && cache->summary_root != nullptr) *cache->summary_root = {};
   if (cache != nullptr) {
     if (paged) {
       if (!cache->meta.valid()) {
@@ -466,6 +470,22 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
                                     kv::kBlockSize, spec.kv_cache_dtype);
       v_attn = graph::kv_page_write(cache->values, v, cache->meta, cache->table,
                                     kv::kBlockSize, spec.kv_cache_dtype);
+      if (spec.sparse_attention.sparse_decode.summaries() && cache->summary_root != nullptr) {
+        PagedKvLayer& layer = *cache->paged;
+        if (!layer.summary.valid()) {
+          const Shape shape{pool_ceiling(layer, rows, static_cast<std::int32_t>(cache->capacity)),
+                            kvh, 2, hd};
+          const backend::ScopedAllocationSite site(backend::AllocationSite::kKvCache);
+          LSE_ASSIGN_OR(layer.summary, alloc_zeroed(shape, DType::kBF16));
+        }
+        if (layer.summary.shape().dim(0) < layer.keys.shape().dim(0))
+          return LSE_ERROR(kOutOfRange, "sparse decode summaries cover ",
+                           std::to_string(layer.summary.shape().dim(0)), " KV blocks; the pool grew to ",
+                           std::to_string(layer.keys.shape().dim(0)));
+        summary = graph::sparse_decode_summary(layer.summary, k_attn, cache->meta, cache->table,
+                                               t, spec.kv_cache_dtype);
+        *cache->summary_root = summary;
+      }
     } else {
       if (cache->keys.valid()) {
         k_attn = graph::concat({cache->keys, k}, 2);
@@ -488,6 +508,36 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
     }
   }
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  // Block-sparse decode attention: a decode or verify pass whose context the
+  // device reads faster through the summaries (dispatch::sparse_decode_plan).
+  if (summary.valid() && phase != AttentionExecutionPhase::kPrefill && !sparse.enabled() &&
+      (tree || spec.mask == graph::MaskKind::kCausal)) {
+    const auto& options = spec.sparse_attention.sparse_decode;
+    const auto rows_per_pass = static_cast<std::uint32_t>(q.shape().dim(2));
+    if (split_device == nullptr) {
+      if (auto* scheduler = graph::default_scheduler()) {
+        const auto member = graph::preferred_member();
+        if (member < scheduler->devices().size())
+          split_device = &scheduler->devices().device(member).device_info();
+      }
+    }
+    dispatch::SparseDecodeShape shape;
+    shape.query_heads = static_cast<std::uint32_t>(qh);
+    shape.key_heads = static_cast<std::uint32_t>(kvh);
+    shape.head_dim = static_cast<std::uint32_t>(hd);
+    shape.rows = rows_per_pass;
+    shape.capacity = static_cast<std::uint64_t>(table_capacity);
+    shape.budget = static_cast<std::uint32_t>(options.budget_tokens);
+    const auto plan = dispatch::sparse_decode_plan(split_device, shape,
+                                                   options.mode == SparseDecodeMode::kOn);
+    if (plan.sparse) {
+      LSE_ASSIGN_OR(Array sparse_o, graph::sparse_decode_attention(
+          q, k_attn, v_attn, scale, tree ? graph::MaskKind::kTree : spec.mask, cache->meta,
+          cache->table, kv::kBlockSize, split_device, spec.kv_cache_dtype, summary,
+          options.budget_tokens, options.joint_heads));
+      return graph::linear(merge_heads(sparse_o) * graph::sigmoid(gate_lin), w.o_proj);
+    }
+  }
   Array o = paged ? graph::sdpa_paged(q, k_attn, v_attn, scale,
                                       tree ? graph::MaskKind::kTree : spec.mask,
                                       spec.window, cache->meta, cache->table,

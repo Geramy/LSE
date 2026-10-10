@@ -56,6 +56,8 @@
 #include "lse/core/sha256.hpp"
 #include "lse/core/hash.hpp"
 #include "lse/dispatch/roofline.hpp"
+#include "lse/dispatch/sparse_decode.hpp"
+#include "lse/dispatch/sparse_decode_tuneconfig.h"
 #include "lse/probe/pool.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/runtime/perplexity.hpp"
@@ -677,6 +679,52 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     std::fputs("lse-server: FlashPrefillV2=off; prefill=dense\n", stderr);
   }
 
+  {
+    // Block-sparse decode attention (--sparse-decode): page summaries are
+    // kept, and each decode/verify pass reads its context through them where
+    // this device's measured roofline and kernel times predict a gain.
+    namespace sdt = dispatch::sparse_decode;
+    auto& sd = config.sparse_attention.sparse_decode;
+    const int budget = c.sparse_decode_budget > 0 ? c.sparse_decode_budget
+                                                  : static_cast<int>(sdt::kDefaultBudgetTokens);
+    if (c.sparse_decode < -1 || c.sparse_decode > 1)
+      return invalid("--sparse-decode must be auto, on or off");
+    if (budget % static_cast<int>(sdt::kPage) != 0 || budget < static_cast<int>(sdt::kMinBudgetTokens))
+      return invalid("--sparse-decode-budget must be a multiple of 16 and at least " +
+                     std::to_string(sdt::kMinBudgetTokens));
+    std::string why;
+    auto arch = model::detect_architecture(config, *e.weights);
+    if (!arch.ok() || (*arch)->name != "qwen3.5") why = "the model is not a Qwen3.5-family hybrid";
+    else if (config.attn_head_dim != 256) why = "attention heads are not 256 wide";
+    else if (config.kv_cache_dtype != kv::CacheDType::kBF16 && config.kv_cache_dtype != kv::CacheDType::kF16)
+      why = "the KV cache is not bf16 or fp16";
+    else if (devices->size() != 1) why = "the model spans more than one device";
+    else if (config.kv_capacity() <= budget) why = "the context never exceeds the budget";
+    else if (config.kv_capacity() > static_cast<std::int64_t>(sdt::kMaxPages * sdt::kPage))
+      why = "the context exceeds " + std::to_string(sdt::kMaxPages * sdt::kPage) + " tokens";
+    else {
+      const auto& info = devices->device(0).device_info();
+      const auto* tc = sched->toolchain(0);
+      if (info.wavefront_size != 32 || info.max_threads_per_workgroup < sdt::kSelectThreads ||
+          tc == nullptr || tc->dialect != graph::Dialect::kLoom)
+        why = "the device is not a Wave32 Loom part";
+    }
+    if (c.sparse_decode == 0) {
+      std::fputs("lse-server: sparse decode off; every decode and verify pass is exact\n", stderr);
+    } else if (!why.empty()) {
+      if (c.sparse_decode == 1) return invalid("--sparse-decode=on is unavailable: " + why);
+      std::fprintf(stderr, "lse-server: sparse decode inactive: %s\n", why.c_str());
+    } else {
+      sd.mode = c.sparse_decode == 1 ? ops::SparseDecodeMode::kOn : ops::SparseDecodeMode::kAuto;
+      sd.budget_tokens = budget;
+      if (const char* joint = std::getenv("LSE_SPARSE_DECODE_JOINT"); joint && *joint == '1')
+        sd.joint_heads = true;
+      std::fprintf(stderr, "lse-server: sparse decode %s, budget %d tokens%s; exact with --sparse-decode=off\n",
+                   sd.mode == ops::SparseDecodeMode::kOn ? "on" : "auto", budget,
+                   sd.joint_heads ? ", one page set for all key heads" : "");
+    }
+  }
+
   // The tokenizer is read and parsed on its own thread while the weights
   // load: it needs nothing from the device and nothing from the weights, and
   // on the main thread it added most of a second after the last upload.
@@ -887,6 +935,8 @@ void lse_config_init(lse_config* cfg) {
   cfg->adaptive_dflash2 = 1;
   cfg->adaptive_mtp = 1;
   cfg->dflash2_tree = -1;
+  cfg->sparse_decode = -1;
+  cfg->sparse_decode_budget = 0;
 }
 
 void lse_set_log_callback(lse_log_cb cb, void* user) { log_capture().set(cb, user); }

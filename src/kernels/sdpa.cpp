@@ -423,6 +423,8 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     const auto parts = static_cast<std::uint32_t>(
         dispatch::attention_shapes::split_partitions(capacity));
     const bool dim_major = dispatch::dimension_major_values(s.inputs[1], s.inputs[2]);
+    const bool per_head_table = s.iattrs[2] == 1;
+    if (per_head_table && s.inputs[4].dim(0) < s.inputs[0].dim(0) * s.inputs[1].dim(1)) return {};
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     SdpaArgs<env::Emit, Storage> a;
@@ -469,7 +471,10 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       const auto row_len = e.let(select(loaded_len < capacity, loaded_len, e.u32(capacity)));
       const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
       const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
-      const auto begin = e.let(part * kSplitKeys), tb = e.let(b * stride);
+      // A sparse decode pass reads a block table per key head (iattrs[2] == 1,
+      // ops::sparse_decode): row b * kvheads + kh.
+      const auto begin = e.let(part * kSplitKeys),
+                 tb = per_head_table ? e.let((b * kvheads + kh) * stride) : e.let(b * stride);
       auto row_live = [&](std::uint32_t r) {
         if constexpr (ShortQuery) return q0 + r % token_tile < queries;
         else return h + r < heads;
@@ -682,7 +687,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       }
       // Every lane publishes its empty record and takes the same exit before barriers.
       (void)e.ret_if(no_keys);
-      const auto tb = e.let(b * stride);
+      const auto tb = per_head_table ? e.let((b * kvheads + kh) * stride) : e.let(b * stride);
       const auto qb = [&] {
         if constexpr (ShortQuery) return e.let(((b * heads + h) * queries + query) * 256u);
         else return e.let((b * heads + h) * 256u);

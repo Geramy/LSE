@@ -18,9 +18,30 @@ struct SparseAttentionPhase {
 // rows are tree nodes rather than consecutive positions.
 enum class AttentionExecutionPhase { kDecode, kPrefill, kSpeculative, kTree };
 
+// Block-sparse decode attention (graph::sparse_decode_attention): decode and
+// verify passes read the sink pages, the recent window and the far pages
+// whose key summaries score highest, up to a token budget.
+enum class SparseDecodeMode : std::uint8_t {
+  kOff,   // exact attention always (--sparse-decode=off)
+  kAuto,  // where the device's measured roofline predicts a gain
+  kOn,    // every decode and verify pass with summaries
+};
+struct SparseDecodeOptions {
+  SparseDecodeMode mode = SparseDecodeMode::kOff;
+  std::int32_t budget_tokens = 0;
+  // One page set shared by every key head instead of one per key head.
+  bool joint_heads = false;
+  // The engine keeps page summaries for this model (mode is not off, the
+  // context can exceed the budget, and the device and KV format qualify).
+  [[nodiscard]] bool summaries() const noexcept {
+    return mode != SparseDecodeMode::kOff && budget_tokens > 0;
+  }
+};
+
 struct SparseAttentionOptions {
   SparseAttentionPhase prefill;
   SparseAttentionPhase decode;
+  SparseDecodeOptions sparse_decode;
 };
 // Singleton prompt tails use exact attention; the FlashPrefill schedule needs
 // multiple queries. Draft/verify calls always use exact attention at every width.

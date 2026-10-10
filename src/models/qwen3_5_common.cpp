@@ -265,6 +265,7 @@ class Qwen35Attention final : public IMixer {
     cache.capacity = spec_[m].kv_length;
     cache.used = st.position;
     cache.tree_positions = st.tree_positions;
+    cache.summary_root = &st.key_summary;
     LSE_ASSIGN_OR(Array y, ops::gated_attention(x, w_[m], spec_[m], rope_[m],
                                                 st.position, &cache, phase));
     st.key_cache = cache.keys;
