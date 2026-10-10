@@ -28,8 +28,6 @@ VariantBook::VariantBook() {
     budget_ms = std::strtoull(b, nullptr, 10);
   }
   budget_ns_ = budget_ms * 1000000ull;
-  path_ = default_cache_dir() + "/variants-" +
-          std::string(kernel_cache_version()) + ".txt";
 }
 
 std::uint64_t VariantBook::key(std::uint64_t base_identity, std::uint32_t offered,
@@ -47,6 +45,10 @@ std::uint64_t VariantBook::key(std::uint64_t base_identity, std::uint32_t offere
 void VariantBook::load_locked() {
   if (loaded_) return;
   loaded_ = true;
+  // Named at the first decision asked for, not when the scheduler is made:
+  // a server sets its kernel cache (--cache-dir) after the scheduler exists,
+  // and the book belongs beside that cache's kernels.
+  path_ = default_cache_dir() + "/variants-" + std::string(kernel_cache_version()) + ".txt";
   std::FILE* f = std::fopen(path_.c_str(), "r");
   if (f == nullptr) return;
   char line[512];
