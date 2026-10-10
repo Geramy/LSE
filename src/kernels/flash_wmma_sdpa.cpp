@@ -67,22 +67,42 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   static constexpr std::string_view kSource = {};
 
   std::size_t arity() const noexcept override { return MeanCorrection ? 7 : 5; }
-  // Variant 1 stages values 16 keys at a time where 32 fit (emit_storage),
-  // and variant 2 takes two query tiles per workgroup (emit_two_tiles), on a
-  // contiguous-fragment generation; a split pass, whose records the two-tile
-  // form does not write, offers only the first two. Each output is the same
-  // value either way.
+  // The variants. Each output is the same value either way.
+  //  - kStageHalf: values staged 16 keys at a time where 32 fit
+  //    (emit_storage); offered on a contiguous-fragment generation.
+  //  - kTwoTiles: two query tiles per workgroup (emit_two_tiles), on a
+  //    contiguous-fragment generation; not for a split pass, whose records
+  //    the two-tile form does not write.
+  //  - kScoresInRegisters: a lane's scores are read from scratch once and
+  //    kept in registers through the softmax, and probabilities are written
+  //    back only where the value product reads them from the scores. Fewer
+  //    scratch round trips for more registers: faster on wide tree tiles,
+  //    slower where registers are what limits the tile, so it is measured
+  //    per shape and device.
+  enum class Variant { kBase, kStageHalf, kTwoTiles, kScoresInRegisters };
+  // Whether the device's 16x16x16 wave32 row carries a whole K step per
+  // lane (gfx11), or nothing when the device has no such row.
+  static std::optional<bool> contiguous_rows(const KernelShapes& s) {
+    if (s.device == nullptr || !matrix_target(*s.device)) return std::nullopt;
+    for (const auto& r : math::matrix_core_table())
+      if (r.target == *matrix_target(*s.device) && r.wave == 32 && r.m == 16 &&
+          r.n == 16 && r.k_step == 16 && r.acc == math::MatrixElem::kF32)
+        return r.a_len == 16;
+    return std::nullopt;
+  }
+  static Variant variant_of(const KernelShapes& s) {
+    if (s.variant == 0u) return Variant::kBase;
+    if (contiguous_rows(s).value_or(false)) {
+      if (s.variant == 1u) return Variant::kStageHalf;
+      if (!Split && s.variant == 2u) return Variant::kTwoTiles;
+    }
+    return Variant::kScoresInRegisters;
+  }
   std::uint32_t variants(const KernelShapes& s) const override {
-    if (s.device == nullptr || !matrix_target(*s.device)) return 1;
-    const auto* row = [&]() -> const math::MatrixCoreRow* {
-      for (const auto& r : math::matrix_core_table())
-        if (r.target == *matrix_target(*s.device) && r.wave == 32 && r.m == 16 &&
-            r.n == 16 && r.k_step == 16 && r.acc == math::MatrixElem::kF32)
-          return &r;
-      return nullptr;
-    }();
-    if (row == nullptr || row->a_len != 16) return 1u;
-    return Split ? 2u : 3u;
+    const auto contiguous = contiguous_rows(s);
+    if (!contiguous) return 1u;
+    if (*contiguous) return Split ? 3u : 4u;
+    return 2u;
   }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
@@ -138,8 +158,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
                                          16, 16).wave != 32) {
                   return {};
                 } else {
-                  return s.variant == 2u ? emit_two_tiles<Storage, G>(s)
-                                         : emit_storage<Storage, G>(s);
+                  return variant_of(s) == Variant::kTwoTiles ? emit_two_tiles<Storage, G>(s)
+                                                             : emit_storage<Storage, G>(s);
                 }
               });
         });
@@ -627,8 +647,8 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     env::Emit e{&k};
 
     const auto qs = e.lds<Narrow>(QTile * qrow_stride);
-    // The window's scores, then (for the unstaged value product) the
-    // window's probabilities in place.
+    // The window's scores, then the window's probabilities in place (with
+    // Variant::kScoresInRegisters, only for the unstaged value product).
     const auto sc = e.lds<kir::f32>(QTile * kKWin);
     const auto mrow = e.lds<kir::f32>(QTile);
     const auto drow = e.lds<kir::f32>(QTile);
@@ -658,7 +678,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       // Variant 1 stages 16 keys where 32 fit: less scratch per workgroup,
       // so more of them resident, for twice the staging rounds.
       for (std::uint32_t keys : {32u, 16u})
-        if (vsub == 0 && !(s.variant == 1u && keys == 32u) &&
+        if (vsub == 0 && !(variant_of(s) == Variant::kStageHalf && keys == 32u) &&
             used + std::uint64_t{keys} * vrow * 2u <= budget) vsub = keys;
     }
     // A dimension-major value pool (kv::dimension_major_values) holds each
@@ -1048,19 +1068,25 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         // Uniform across the workgroup: every nested barrier is convergent.
         if (auto retained = e.when(retain.read() != 0.0f)) {
         // A wave owns two rows; each lane owns eight contiguous-bank keys.
-        // The value products read the probabilities from the narrowed rows
-        // wherever values are staged or read directly; only the unstaged
-        // product reads them back from the scores.
-        const bool scores_take_probabilities = !pb || !(stage_values && vsub != 0);
+        // Variant::kScoresInRegisters reads a lane's scores once and keeps
+        // them for the exponent, and writes the probabilities back only for
+        // the unstaged value product (the staged and direct ones read the
+        // narrowed rows). The values and their order are the same.
+        const bool keep_scores = variant_of(s) == Variant::kScoresInRegisters;
+        const bool scores_take_probabilities =
+            !keep_scores || !pb || !(stage_values && vsub != 0);
         for (std::uint32_t wave_row = 0; wave_row < 2; ++wave_row) {
           const auto row = e.let(wave * 2u + wave_row);
-          // A lane's eight scores are read once and kept for the exponent.
           auto score = e.local<kir::f32, 8>();
+          const auto score_at = [&](auto f) {
+            return keep_scores ? score[f].read()
+                               : sc[e.let(row * kKWin + lane + f * 32u)].read();
+          };
           auto maximum = e.var(math::neg_inf());
           for (auto f : e.unroll(8u)) {
             const auto slot = e.let(lane + f * 32u);
-            score[f] = sc[e.let(row * kKWin + slot)].read();
-            maximum = math::max(maximum.read(), score[f].read());
+            if (keep_scores) score[f] = sc[e.let(row * kKWin + slot)].read();
+            maximum = math::max(maximum.read(), score_at(f));
           }
           for (std::uint32_t shift = 16u; shift > 0; shift /= 2u)
             maximum = math::max(maximum.read(), math::shfl_xor(maximum.read(), e.u32(shift)));
@@ -1073,7 +1099,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
           for (auto f : e.unroll(8u)) {
             const auto slot = e.let(lane + f * 32u);
             const auto index = e.let(row * kKWin + slot);
-            const auto probability = e.let(math::exp(score[f].read() - safe_max));
+            const auto probability = e.let(math::exp(score_at(f) - safe_max));
             if (scores_take_probabilities) sc[index] = probability;
             if (pb) (*pb)[e.let(row * kProbRow + slot)] = math::narrow<Narrow>(probability);
             total = total.read() + probability;
@@ -1419,9 +1445,11 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const std::uint32_t ntiles = d.valid ? (d.tq + QTile - 1u) / QTile : 1u;
     const std::uint32_t parts =
         Split && s.output.rank() == 5 ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
-    // Variant 2 takes two query tiles per workgroup, on sixteen waves.
-    const std::uint32_t tiles = s.variant == 2u ? (ntiles + 1u) / 2u : ntiles;
-    tp.workgroup_size[0] = s.variant == 2u ? 2u * kThreads : kThreads;
+    // The two-tile variant takes two query tiles per workgroup, on sixteen
+    // waves.
+    const bool two_tiles = variant_of(s) == Variant::kTwoTiles;
+    const std::uint32_t tiles = two_tiles ? (ntiles + 1u) / 2u : ntiles;
+    tp.workgroup_size[0] = two_tiles ? 2u * kThreads : kThreads;
     tp.workgroup_count[0] = d.valid ? d.bsz * (d.qh / split_heads_per_tile(d)) * tiles * parts : 1u;
     tp.workgroup_count[1] = 1;
     tp.workgroup_count[2] = 1;
