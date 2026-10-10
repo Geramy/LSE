@@ -71,12 +71,11 @@ class DraftWidthPolicy {
   static constexpr std::uint64_t kHardRefreshSteps = 2048;
   // Until a cost rests on kTrustedSamples measurements in its context bucket,
   // a lower sample replaces it (early samples err high: a step whose wall
-  // time was mostly a first compile, clocks still ramping), and once it is
-  // kEarlyRefreshSteps old it is measured again whatever it is priced at --
-  // the widths a new bucket inherited from another start this way. One bad
-  // early sample cannot price a width out for good.
+  // time was mostly a first compile, clocks still ramping). It is not
+  // measured again any sooner than other costs: forced measurements of
+  // narrow widths throw away most of a step, and at long contexts, where a
+  // request is a few dozen steps, they cost more than they could find.
   static constexpr std::uint32_t kTrustedSamples = kExploreSamples;
-  static constexpr std::uint64_t kEarlyRefreshSteps = 128;
   // Measured steps before the first measurements of every width: the GPU's
   // clocks ramp up over a process's first steps, and a width measured then
   // would be priced high. Until then the full width is used.

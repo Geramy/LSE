@@ -642,6 +642,22 @@ LSE_TEST(draft_width_policy_costs_follow_the_context) {
   LSE_EXPECT_NEAR(policy.verify_ns(1), 32e6, 1.0);
 }
 
+LSE_TEST(draft_width_policy_entering_a_context_forces_no_measurements) {
+  // A bucket started from another one keeps the carried costs: steps at the
+  // full width there, with one other width measured once, force no width
+  // until the ordinary refresh is due. Forced narrow passes threw away most
+  // of a step each in a long-context request of a few dozen steps.
+  DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);
+  policy.set_context(131072);
+  for (int pass = 0; pass < 2; ++pass)
+    policy.observe_verify(4, static_cast<std::uint64_t>(80e6));
+  for (int step = 0; step < 400; ++step) {
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, static_cast<std::uint64_t>(90e6));
+    policy.observe_step(8, static_cast<std::uint64_t>(98e6));
+    LSE_EXPECT_EQ(policy.refresh(DraftWidthPolicy::kMaxProposals, false), 0u);
+  }
+}
+
 LSE_TEST(draft_width_policy_verifies_what_pays_for_its_rows) {
   // 32 ms for one row, 1 ms per further row, an 8 ms draft, 50 tok/s.
   DraftWidthPolicy policy = measured_policy(32e6, 1e6, 8e6, 50.0);

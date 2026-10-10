@@ -219,13 +219,10 @@ std::uint32_t DraftWidthPolicy::refresh(std::uint32_t max, bool chained) const n
     best = std::max(best, value[d]);
   }
   const auto& last_seen = costs().verify.last_seen;
-  const auto& samples = costs().verify.samples;
   std::uint32_t stalest = 0;
   for (std::uint32_t rows = 1; rows <= max + 1; ++rows) {
     const std::uint64_t age = steps_ - last_seen[rows];
-    const bool shaky = samples[rows] < kTrustedSamples && age > kEarlyRefreshSteps;
-    if (!shaky && (age <= kRefreshSteps ||
-                   (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps)))
+    if (age <= kRefreshSteps || (best - value[rows - 1] > kRefreshLoss && age <= kHardRefreshSteps))
       continue;
     if (stalest == 0 || last_seen[rows] < last_seen[stalest]) stalest = rows;
   }
@@ -499,14 +496,9 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
   if (steps_ < kWarmupSteps) return fit(kTreeRows[1]);
   if (const std::uint32_t rows = tree_exploring(); rows != 0) return fit(rows);
   if (chain && exploring() != 0) return 0;
-  // A rung unmeasured for long enough is measured again, whatever it costs,
-  // and sooner while its cost rests on few measurements.
-  for (std::size_t r = 0; r < kTreeRows.size(); ++r) {
-    const std::uint64_t age = steps_ - costs().tree.last_seen[r];
-    if (age > kHardRefreshSteps ||
-        (costs().tree.samples[r] < kTrustedSamples && age > kEarlyRefreshSteps))
-      return fit(kTreeRows[r]);
-  }
+  // A rung unmeasured for long enough is measured again, whatever it costs.
+  for (std::size_t r = 0; r < kTreeRows.size(); ++r)
+    if (steps_ - costs().tree.last_seen[r] > kHardRefreshSteps) return fit(kTreeRows[r]);
   const double draft = draft_ns(kMaxProposals);
   std::uint32_t best = fit(kTreeRows[0]);
   double best_rate = -1.0;
