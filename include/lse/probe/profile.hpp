@@ -146,6 +146,10 @@ struct DeviceProfile {
   // Wall time one dispatch costs when the kernel does nothing, on the
   // submission path the engine actually uses.
   Measured launch_overhead_ns;
+  // Achieved FP32 vector multiply-add rate over the whole device, in flop/s
+  // (two per multiply-add): what scalar work beside a stream costs, such as
+  // scoring block summaries. Matrix-core rates are the rows below.
+  Measured vector_flops;
   Measured h2d_bytes_per_s;
   Measured d2h_bytes_per_s;
 

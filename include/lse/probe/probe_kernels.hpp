@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -62,6 +63,43 @@ void stream_read(E& e, StreamArgs<E>& a, std::uint32_t elems,
   }
   if constexpr (StoreThroughHook) e.store(tid, acc.read());
   else a.out[tid] = acc;
+}
+
+template <class E>
+struct FmaArgs {
+  env::In<kir::f32, E> in;
+  env::Out<kir::f32, E> out;
+};
+
+// Vector FP32 throughput: kFmaChains independent multiply-add chains per
+// thread, `iterations` deep. The multiplier and addend come from the input so
+// nothing folds; the chains are independent so the rate measured is issue
+// throughput, not one chain's latency. Every thread stores its sum, which the
+// caller checks: with in = {1, y} each thread ends at kFmaChains*iterations*y.
+// `iterations` must be a multiple of four.
+inline constexpr std::uint32_t kFmaChains = 16;
+
+template <class E, bool StoreThroughHook = false>
+void fma_rate(E& e, FmaArgs<E>& a, std::uint32_t iterations) {
+  const auto tid = e.thread_id();
+  const auto x = e.let(a.in[0u]);
+  const auto y = e.let(a.in[1u]);
+  std::vector<decltype(e.var(0.0f))> acc;
+  acc.reserve(kFmaChains);
+  for (std::uint32_t c = 0; c < kFmaChains; ++c) acc.push_back(e.var(0.0f));
+  // Unrolled by four so loop control is a small share of the issue slots.
+  for (auto i : e.range(iterations / 4u)) {
+    (void)i;
+    for (auto u : e.unroll(4u)) {
+      (void)u;
+      for (std::uint32_t c = 0; c < kFmaChains; ++c)
+        acc[c] = lse::math::fma(acc[c].read(), x, y);
+    }
+  }
+  auto sum = e.var(0.0f);
+  for (std::uint32_t c = 0; c < kFmaChains; ++c) sum = sum.read() + acc[c].read();
+  if constexpr (StoreThroughHook) e.store(tid, sum.read());
+  else a.out[tid] = sum;
 }
 
 template <class E>

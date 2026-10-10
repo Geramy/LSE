@@ -201,6 +201,7 @@ lse_apply_common_flags(lse_trace)
 
 add_library(lse_graph
   src/dispatch/attention.cpp
+  src/dispatch/roofline.cpp
   src/dispatch/q8_matrix.cpp
   src/graph/quant_swiglu.cpp
   src/graph/graph.cpp

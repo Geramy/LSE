@@ -227,6 +227,8 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     if (!retired_) return OkStatus();
     if (const Status s = measure_launch(out); !s.ok()) note(s);
     if (!retired_) return OkStatus();
+    if (const Status s = measure_vector(out); !s.ok()) note(s);
+    if (!retired_) return OkStatus();
     if (const Status s = measure_matrix(out); !s.ok()) note(s);
     if (!retired_) return OkStatus();
     fill_paths(out);
@@ -376,16 +378,29 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     if (status.ok()) status = validate_output(dst, threads, expected);
     if (status.ok()) status = poison_output(dst, threads);
     if (status.ok()) {
-      const auto t0 = Clock::now();
-      for (int r = 0; r < kStreamReps && status.ok(); ++r) {
-        status = be_.launch(kernel, dims, args);
+      // Warm the clocks, then time a window long enough that neither the
+      // ramp nor one batch's submission is a large share of it: four reps
+      // of the working set alone were a few milliseconds, and repeated
+      // starts read 476 to 530 GB/s on one gfx1201.
+      constexpr double kWarmNs = 40e6, kMinNs = 30e6;
+      const auto warm0 = Clock::now();
+      while (status.ok() && ns_since(warm0) < kWarmNs) {
+        for (int r = 0; r < kStreamReps && status.ok(); ++r) status = be_.launch(kernel, dims, args);
+        if (status.ok()) status = be_.synchronize();
       }
+      if (status.ok()) status = poison_output(dst, threads);
       if (status.ok()) status = be_.synchronize();
+      int reps = 0;
+      const auto t0 = Clock::now();
+      while (status.ok() && ns_since(t0) < kMinNs) {
+        for (int r = 0; r < kStreamReps && status.ok(); ++r, ++reps) status = be_.launch(kernel, dims, args);
+        if (status.ok()) status = be_.synchronize();
+      }
       const double ns = ns_since(t0);
       if (status.ok()) status = validate_output(dst, threads, expected);
-      if (status.ok() && ns > 0.0) {
+      if (status.ok() && ns > 0.0 && reps > 0) {
         out.dram_bytes_per_s = probe::Measured::measured(
-            static_cast<double>(elems) * sizeof(float) * kStreamReps * 1e9 / ns);
+            static_cast<double>(elems) * sizeof(float) * reps * 1e9 / ns);
       }
     }
     status = finish_buffers(buffers, status);
@@ -445,6 +460,87 @@ class HrxDeviceProbe final : public probe::IDeviceProbe {
     }
     status = finish_buffers(buffers, status);
     if (!status.ok()) out.launch_overhead_ns = {};
+    return status;
+  }
+
+  // --- vector rate -------------------------------------------------------
+  // Loom only: the HIP dialect is not extended, so a HIP-only build leaves the
+  // rate unknown and says so.
+  Status measure_vector(probe::DeviceProfile& out) {
+    const DeviceInfo& info = be_.device_info();
+    if (!use_loom_) return LSE_ERROR(kUnimplemented, "vector-rate probe is Loom-only");
+    if (info.compute_units == 0 || info.max_threads_per_workgroup < kBlock)
+      return LSE_ERROR(kUnimplemented, "vector-rate probe needs known device geometry");
+    // Eight workgroups of 256 per compute unit keep every SIMD busy; 4096
+    // iterations of eight chains is ~16 MFLOP per workgroup, so one launch is
+    // far longer than its dispatch.
+    constexpr std::uint32_t kIterations = 4096;
+    const std::uint32_t groups = info.compute_units * 8u;
+    const std::uint32_t threads = groups * kBlock;
+    LSE_ASSIGN_OR(const KernelHandle kernel,
+                  compiled_loom(emit_loom_fma_probe(info, threads, kIterations)));
+    ProbeRetirement<DeviceBuffer> buffers;
+    if (!buffers.available()) return LSE_ERROR(kDeviceError, "probe retirement capacity unavailable");
+    auto in = be_.allocate(16 * sizeof(float), MemoryClass::kDevice);
+    if (!in.ok()) return in.status();
+    DeviceBuffer src = in.release();
+    buffers.track(src);
+    auto sink = be_.allocate((static_cast<std::size_t>(threads) + 16) * sizeof(float),
+                             MemoryClass::kDevice);
+    if (!sink.ok()) return finish_buffers(buffers, sink.status());
+    DeviceBuffer dst = sink.release();
+    buffers.track(dst);
+    // x = 1 and y = 2^-10 keep every partial sum exact in FP32.
+    const float addend = 1.0f / 1024.0f;
+    {
+      std::vector<float> seed(16, 0.0f);
+      seed[0] = 1.0f;
+      seed[1] = addend;
+      const Status s = be_.copy_h2d(seed.data(), src, seed.size() * sizeof(float), 0);
+      if (!s.ok()) return finish_buffers(buffers, s);
+    }
+    LaunchDims dims;
+    dims.workgroup_size[0] = kBlock;
+    dims.workgroup_count[0] = groups;
+    dims.subgroup_size = wavefront();
+    const BufferRef refs[] = {{&src, 0, 2 * sizeof(float)},
+                              {&dst, 0, static_cast<std::size_t>(threads) * sizeof(float)}};
+    DispatchArgs args;
+    args.bindings = refs;
+    const std::uint32_t count = threads;
+    args.constants = std::as_bytes(std::span(&count, 1));
+    const float expected = static_cast<float>(probe::kFmaChains * kIterations) * addend;
+    Status status = poison_output(dst, threads);
+    if (status.ok()) status = be_.launch(kernel, dims, args);
+    if (status.ok()) status = be_.synchronize();
+    if (status.ok()) status = validate_output(dst, threads, expected);
+    double rate = 0.0;
+    if (status.ok()) {
+      // Warm the clocks first (see measure_one_row), then time a window long
+      // enough that the ramp is outside it.
+      constexpr double kWarmNs = 40e6, kMinNs = 20e6;
+      const auto warm0 = Clock::now();
+      while (status.ok() && ns_since(warm0) < kWarmNs) {
+        status = be_.launch(kernel, dims, args);
+        if (status.ok()) status = be_.synchronize();
+      }
+      if (status.ok()) status = poison_output(dst, threads);
+      if (status.ok()) status = be_.synchronize();
+      int reps = 0;
+      const auto t0 = Clock::now();
+      while (status.ok() && ns_since(t0) < kMinNs) {
+        for (int r = 0; r < 4 && status.ok(); ++r, ++reps) status = be_.launch(kernel, dims, args);
+        if (status.ok()) status = be_.synchronize();
+      }
+      const double ns = ns_since(t0);
+      if (status.ok()) status = validate_output(dst, threads, expected);
+      if (status.ok() && ns > 0.0 && reps > 0)
+        rate = 2.0 * probe::kFmaChains * kIterations * static_cast<double>(threads) *
+               static_cast<double>(reps) * 1e9 / ns;
+    }
+    status = finish_buffers(buffers, status);
+    out.vector_flops = status.ok() && rate > 0.0 ? probe::Measured::measured(rate)
+                                                 : probe::Measured{};
     return status;
   }
 

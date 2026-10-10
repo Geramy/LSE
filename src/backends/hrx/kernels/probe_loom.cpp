@@ -42,6 +42,35 @@ struct StreamProbe final : KernelPrimitive<StreamProbe> {
   }
 };
 
+struct FmaProbe final : KernelPrimitive<FmaProbe> {
+  static constexpr std::string_view kName = "probe.fma";
+  static constexpr std::string_view kEntry = "lse_probe_fma";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 1; }
+  bool owns_indexing() const noexcept override { return true; }
+  Result<Shape> infer_shape(std::span<const Shape> shapes) const override {
+    return shapes.empty() ? Shape{} : shapes[0];
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (s.inputs.size() != 1 || s.iattrs.size() < 2 || !s.intrinsics) return {};
+    kir::KernelBody k(s.types, *s.intrinsics);
+    k.set_store(s.store);
+    probe::FmaArgs<env::Emit> args;
+    if (!env::bind(k, args, s)) return {};
+    env::Emit e{&k};
+    probe::fma_rate<env::Emit, true>(e, args, static_cast<std::uint32_t>(s.iattrs[1]));
+    return k.str();
+  }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan p;
+    p.workgroup_size[0] = static_cast<std::uint32_t>(s.iattrs[0]);
+    p.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count()) /
+                            p.workgroup_size[0];
+    return p;
+  }
+};
+
 struct TouchProbe final : KernelPrimitive<TouchProbe> {
   static constexpr std::string_view kName = "probe.touch";
   static constexpr std::string_view kEntry = "lse_probe_touch";
@@ -130,6 +159,19 @@ Result<graph::EmittedKernel> emit_loom_stream_probe(
   auto out = node(Shape{threads}, &primitive);
   out->inputs = {node(Shape{elements})};
   out->iattrs = {256, static_cast<std::int32_t>(load_bytes)};
+  return emit(out, device);
+}
+
+Result<graph::EmittedKernel> emit_loom_fma_probe(
+    const DeviceInfo& device, std::uint32_t threads, std::uint32_t iterations) {
+  if (device.max_threads_per_workgroup < 256 || device.wavefront_size == 0 ||
+      threads == 0 || threads % 256 != 0 || iterations == 0) {
+    return LSE_ERROR(kInvalidArgument, "unsupported vector-rate probe geometry");
+  }
+  static const FmaProbe primitive;
+  auto out = node(Shape{threads}, &primitive);
+  out->inputs = {node(Shape{2})};
+  out->iattrs = {256, static_cast<std::int32_t>(iterations)};
   return emit(out, device);
 }
 

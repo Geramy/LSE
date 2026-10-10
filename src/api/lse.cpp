@@ -54,6 +54,9 @@
 #include "lse/models/thinking_controls.hpp"
 #include "lse/place/devices.hpp"
 #include "lse/core/sha256.hpp"
+#include "lse/core/hash.hpp"
+#include "lse/dispatch/roofline.hpp"
+#include "lse/probe/pool.hpp"
 #include "lse/runtime/generator.hpp"
 #include "lse/runtime/perplexity.hpp"
 #include "lse/server/http_server.hpp"
@@ -514,6 +517,43 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   const Status cache_status = graph::prepare_cache_dir(cache_dir);
   if (!cache_status.ok()) return fail(cache_status, "kernel cache");
   std::fprintf(stderr, "lse-server: kernel cache %s\n", graph::default_cache_dir().c_str());
+  {
+    // The device roofline (streaming bandwidth, dispatch cost, vector and
+    // matrix rates), measured once per device and engine build and kept in
+    // the kernel cache. Dispatch prices bandwidth-for-compute trades against
+    // it (sparse decode attention). Measured before the weights load, while
+    // the device is idle and its memory free for the streaming probe.
+    progress::begin("measuring_devices");
+    char build[17];
+    std::snprintf(build, sizeof(build), "%016llx",
+                  static_cast<unsigned long long>(hash_bytes(graph::engine_build_identity())));
+    probe::PoolOptions qualify;
+    qualify.profile_dir = graph::default_cache_dir() + "/profiles/" + build;
+    const auto started = std::chrono::steady_clock::now();
+    if (const Status q = devices->qualify(qualify); !q.ok()) {
+      std::fprintf(stderr, "lse-server: device roofline not measured: %s\n", q.to_string().c_str());
+    } else {
+      const auto& pool = devices->profile();
+      for (std::size_t i = 0; i < devices->size() && i < pool.devices.size(); ++i) {
+        const auto& d = pool.devices[i];
+        dispatch::Roofline r;
+        if (d.dram_bytes_per_s.known()) r.stream_bytes_per_s = d.dram_bytes_per_s.value;
+        if (d.launch_overhead_ns.known()) r.launch_ns = d.launch_overhead_ns.value;
+        if (d.vector_flops.known()) r.vector_flops = d.vector_flops.value;
+        if (const auto* path = d.path_for(math::MatrixElem::kBF16);
+            path != nullptr && path->native && path->flops.known())
+          r.matrix_flops = path->flops.value;
+        dispatch::publish_roofline(devices->device(i).device_info(), r);
+        std::fprintf(stderr,
+                     "lse-server: roofline %s %s: stream %.1f GB/s, launch %.2f us, vector %.2f TFLOP/s, "
+                     "bf16 matrix %.2f TFLOP/s (%s in %.0f ms)\n",
+                     d.id.str().c_str(), d.arch.c_str(), r.stream_bytes_per_s / 1e9, r.launch_ns / 1e3,
+                     r.vector_flops / 1e12, r.matrix_flops / 1e12,
+                     r.valid() ? "complete" : "incomplete",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+      }
+    }
+  }
   auto paths = model::resolve_model(model);
   if (!paths.ok()) return fail(paths.status(), "resolving the model");
 

@@ -14,9 +14,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// 2 added DeviceProfile::free_memory to the device record. A stale entry then
-// fails the version check, which is the re-measure path rather than an error.
-constexpr int kFormatVersion = 2;
+// 2 added DeviceProfile::free_memory to the device record, 3 added
+// DeviceProfile::vector_flops. A stale entry then fails the version check,
+// which is the re-measure path rather than an error.
+constexpr int kFormatVersion = 3;
 // A field with no text. Spaces separate fields, so an empty one needs a mark.
 constexpr std::string_view kNone = "-";
 
@@ -82,6 +83,7 @@ void write_device(std::ostringstream& out, const DeviceProfile& d) {
       << d.compute_units << ' ' << (d.unified_memory ? 1 : 0);
   append_measured(out, d.dram_bytes_per_s);
   append_measured(out, d.launch_overhead_ns);
+  append_measured(out, d.vector_flops);
   append_measured(out, d.h2d_bytes_per_s);
   append_measured(out, d.d2h_bytes_per_s);
   append_measured(out, d.free_memory);
@@ -117,6 +119,7 @@ bool read_device_line(std::istringstream& in, DeviceProfile* d) {
   d->arch = std::string(token_or_empty(arch));
   if (!read_measured(in, &d->dram_bytes_per_s)) return false;
   if (!read_measured(in, &d->launch_overhead_ns)) return false;
+  if (!read_measured(in, &d->vector_flops)) return false;
   if (!read_measured(in, &d->h2d_bytes_per_s)) return false;
   if (!read_measured(in, &d->d2h_bytes_per_s)) return false;
   if (!read_measured(in, &d->free_memory)) return false;

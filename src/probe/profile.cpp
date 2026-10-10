@@ -241,16 +241,18 @@ bool PoolProfile::complete() const noexcept {
 
 std::string PoolProfile::describe() const {
   std::string out = "pool " + fingerprint + "\n";
-  char line[256];
+  char line[384];
   for (const DeviceProfile& d : devices) {
     std::snprintf(line, sizeof(line),
                   "  %-8s %-10s  stream %8.1f GB/s (%s)  launch %7.2f us (%s)"
-                  "  free %7.1f GB (%s)\n",
+                  "  vector %6.2f TFLOP/s (%s)  free %7.1f GB (%s)\n",
                   d.id.str().c_str(), d.arch.c_str(),
                   d.dram_bytes_per_s.value / 1e9,
                   std::string(to_string(d.dram_bytes_per_s.provenance)).c_str(),
                   d.launch_overhead_ns.value / 1e3,
                   std::string(to_string(d.launch_overhead_ns.provenance)).c_str(),
+                  d.vector_flops.value / 1e12,
+                  std::string(to_string(d.vector_flops.provenance)).c_str(),
                   d.free_memory.value / 1e9,
                   std::string(to_string(d.free_memory.provenance)).c_str());
     out += line;
