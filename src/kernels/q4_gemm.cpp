@@ -339,7 +339,7 @@ bool device_fits(const KernelShapes& s, const Dims& d) {
 // The layouts a part's fragments allow (Q4GemmKernel::variants).
 std::uint32_t gemm_layouts(const KernelShapes& s) {
   const auto* row = f16_row(s);
-  return row != nullptr && row->a_len == 16 ? 4u : 1u;
+  return row != nullptr ? 4u : 1u;
 }
 
 template <class S, math::MatrixTarget G>
@@ -369,13 +369,15 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
   Args<S> a;
   if (!env::bind(kb, a, s)) return {};
   env::Emit e{&kb};
-  // Variants (Q4GemmKernel::variants): 1 reads each A fragment straight
-  // from the panel instead of through workgroup memory; 2 does that and
+  // Variants (Q4GemmKernel::variants), on every generation: 1 reads each A
+  // fragment straight from the panel instead of through workgroup memory
+  // (a half-wave's eight halves from lane_k0 on a split-K layout); 2 does
+  // that and
   // double-buffers B, so a K step waits at one barrier instead of two; 3
   // keeps A in workgroup memory and reads it a fragment at a time. Each
   // feeds the matrix instructions the same halves in the same order.
   const std::uint32_t layout = variant.layout;
-  const bool a_direct = kFrag == 16 && (layout == 1u || layout == 2u);
+  const bool a_direct = layout == 1u || layout == 2u;
   const bool b_double = a_direct && layout == 2u;
   if (layout > 3u || ((layout == 1u || layout == 2u) && !a_direct) ||
       (b_double && !b_double_fits(d, t)))
@@ -502,11 +504,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       };
       // A tile with fewer weight pieces than threads: only each piece's
       // first thread decodes it; the repeats would write the same values
-      // and spend the step's VALU on it. Taken on the gfx11 generation,
-      // where it was measured (gfx1151, test_q4_gemm --gpu, 256 x 128 on
-      // 4 x 4 waves: M1024 N17408 K5120 5.48 -> 5.28 ms, N5120 K17408
-      // 6.05 -> 5.49 ms); RDNA4 keeps its form pending its own measurement.
-      if (kFrag == 16 && b_total % threads != 0u && c + 1u == b_pieces) {
+      // and spend the step's VALU on it (gfx1151, test_q4_gemm --gpu,
+      // 256 x 128 on 4 x 4 waves: M1024 N17408 K5120 5.48 -> 5.28 ms,
+      // N5120 K17408 6.05 -> 5.49 ms; gfx1201, 144 x 128 on 3 x 4 waves,
+      // where a third of the threads repeat: M288 N17408 K5120 527 -> 482 us,
+      // N5120 K17408 531 -> 492, M544 N17408 1003 -> 914).
+      if (b_total % threads != 0u && c + 1u == b_pieces) {
         if (auto first = e.when(lid + c * threads < b_total)) decode();
       } else {
         decode();
@@ -577,8 +580,12 @@ std::string emit_body(const KernelShapes& s, const Dims& d) {
       std::vector<kir::Val<FragVec>> af, bf;
       for (std::uint32_t fm = 0; fm < FM; ++fm) {
         if (a_direct) {
+          // A lane's slice of the step: its row's sixteen halves on a
+          // contiguous layout, the half-wave's eight from lane_k0 on a
+          // split-K one -- one 16-byte read either way on RDNA4.
           const auto p = kb.load_elems<lse::f16>(
-              a.panel.b.id(), e.let(a_glob_base[fm] + *cur_k * kBK + kk * 16u), 16u);
+              a.panel.b.id(), e.let(a_glob_base[fm] + *cur_k * kBK + kk * 16u + lane_k0),
+              static_cast<std::uint32_t>(kFrag));
           af.push_back(kir::Val<FragVec>(&kb.types(), &kb.ir(), p.id()));
         } else {
           af.push_back(fragment(As, e.let(a_frag_base[fm] + kk * 16u)));
@@ -1225,7 +1232,8 @@ struct Q4GemmKernel final : graph::KernelPrimitive<Q4GemmKernel<Sliced>> {
 
   // A from workgroup memory (0), A from the panel (1), and that with B
   // double-buffered (2), and A from workgroup memory a fragment at a time
-  // (3), on a part whose fragments are whole 16-half loads. Measured on the
+  // (3), on every part (gfx1201, M288: 3 takes the down projection 474 ->
+  // 445 us; M1152: 2 takes the gate 1881 -> 1816). Measured on the
   // 8060S (test_q4_gemm --gpu, M 1024, us): N17408 K5120 5196 -> 4957
   // (variant 3), N10240 K5120 2862 -> 2743, N12288 K5120 3604 -> 3472; the
   // down and output projections keep variant 0.
