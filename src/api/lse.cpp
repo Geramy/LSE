@@ -328,10 +328,16 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
   opt.max_sessions = c.max_sessions;
   // Set either way, before any device is opened: the device set reads it to
   // refuse a host-interpreter member, and an earlier lse_open in this process
-  // must not leave its choice behind. LSE_REQUIRE_DEVICE_KERNELS=1 means the
-  // same as the option and is not overridden by its absence.
-  graph::set_cpu_fallback_allowed(c.disable_cpu_fallback == 0 &&
-                                  !graph::device_kernels_required_by_environment());
+  // must not leave its choice behind. It is refused unless the run chose the
+  // CPU backend (graph::cpu_fallback_default); --no-cpu-fallback and
+  // LSE_REQUIRE_DEVICE_KERNELS=1 refuse it even then.
+  graph::set_cpu_fallback_disabled(c.disable_cpu_fallback != 0 ||
+                                   graph::device_kernels_required_by_environment());
+  graph::set_cpu_fallback_allowed(
+      c.disable_cpu_fallback == 0 &&
+      graph::cpu_fallback_default(std::getenv("LSE_BACKEND"),
+                                  c.pool != nullptr && c.pool[0] != '\0' ? c.pool
+                                                                         : std::getenv("LSE_POOL")));
   opt.session_memory_budget = static_cast<std::size_t>(c.session_memory_budget);
   opt.adaptive_dflash2 = c.adaptive_dflash2 != 0;
   opt.dflash2_tree = c.dflash2_tree;

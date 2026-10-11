@@ -489,11 +489,36 @@ bool device_kernels_required_by_environment() noexcept {
   return strict != nullptr && std::string_view(strict) == "1";
 }
 
+bool cpu_backend_selected(const char* backend, const char* pool) noexcept {
+  if (backend != nullptr && std::string_view(backend) == "cpu") return true;
+  if (pool == nullptr) return false;
+  std::string_view rest(pool);
+  while (!rest.empty()) {
+    const std::size_t comma = rest.find(',');
+    std::string_view entry = rest.substr(0, comma);
+    while (!entry.empty() && entry.front() == ' ') entry.remove_prefix(1);
+    while (!entry.empty() && entry.back() == ' ') entry.remove_suffix(1);
+    if (entry == "cpu" || entry.starts_with("cpu:")) return true;
+    if (comma == std::string_view::npos) break;
+    rest.remove_prefix(comma + 1);
+  }
+  return false;
+}
+
+bool cpu_fallback_default(const char* backend, const char* pool) noexcept {
+  return cpu_backend_selected(backend, pool) && !device_kernels_required_by_environment();
+}
+
 namespace {
 struct CpuFallbacks {
   std::mutex mu;
-  // The old qualification switch still refuses CPU fallback.
-  bool allowed = !device_kernels_required_by_environment();
+  // Refused unless the run chose the CPU backend itself: a device run whose
+  // GPU backend did not come up, or whose op has no device kernel, fails
+  // with the cause instead of running on the host interpreter.
+  bool allowed = cpu_fallback_default(std::getenv("LSE_BACKEND"), std::getenv("LSE_POOL"));
+  // Refused by option (--no-cpu-fallback, LSE_REQUIRE_DEVICE_KERNELS=1), which
+  // also refuses a scheduler built on a backend with no code generator.
+  bool disabled = device_kernels_required_by_environment();
   std::uint64_t sequence = 0;
   struct Event { std::uint64_t sequence; std::string cause; };
   std::vector<Event> recent;                    // the last kRecent events
@@ -514,6 +539,17 @@ void set_cpu_fallback_allowed(bool allowed) noexcept {
 bool cpu_fallback_allowed() noexcept {
   std::lock_guard lock(cpu_fallbacks().mu);
   return cpu_fallbacks().allowed;
+}
+
+void set_cpu_fallback_disabled(bool disabled) noexcept {
+  std::lock_guard lock(cpu_fallbacks().mu);
+  cpu_fallbacks().disabled = disabled;
+  if (disabled) cpu_fallbacks().allowed = false;
+}
+
+bool cpu_fallback_disabled() noexcept {
+  std::lock_guard lock(cpu_fallbacks().mu);
+  return cpu_fallbacks().disabled;
 }
 
 void record_cpu_fallback(const std::string& cause) {
@@ -2260,10 +2296,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   const IKernelEmitter* const emitter =
       primary_tc != nullptr ? primary_tc->emitter : nullptr;
   const bool device_first = mode_ == Mode::kDeviceFirst && emitter != nullptr;
-  // No code generator at all: every group of this step would run on the host
-  // interpreter, which is the whole-run CPU fallback. Asked only on this
-  // branch, so a device step pays nothing for it.
-  if (primary_tc == nullptr && !cpu_fallback_allowed()) {
+  // No code generator at all: every group of this step runs on the host
+  // interpreter. A scheduler is built on such a backend only by a caller that
+  // chose it (the device set refuses one unless the run chose the CPU
+  // backend), so this is refused only when an option disabled fallback.
+  // Asked only on this branch, so a device step pays nothing for it.
+  if (primary_tc == nullptr && cpu_fallback_disabled()) {
     const Status refused(StatusCode::kUnimplemented, ::lse::detail::concat(
         "CPU fallback disabled: ", std::string(backend().name()),
         " has no device code generator, so every op would run on the host interpreter"));

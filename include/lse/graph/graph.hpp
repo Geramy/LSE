@@ -365,11 +365,28 @@ struct CpuFallbackEvent {
 };
 void set_cpu_fallback_allowed(bool allowed) noexcept;
 [[nodiscard]] bool cpu_fallback_allowed() noexcept;
+// Fallback refused by an option (--no-cpu-fallback, lse_config's
+// disable_cpu_fallback, LSE_REQUIRE_DEVICE_KERNELS=1). Beyond what a refused
+// default refuses, this also refuses a step on a scheduler built directly on
+// a backend with no code generator. Setting it disallows fallback.
+void set_cpu_fallback_disabled(bool disabled) noexcept;
+[[nodiscard]] bool cpu_fallback_disabled() noexcept;
 // LSE_REQUIRE_DEVICE_KERNELS=1, the qualification switch that predates
-// --no-cpu-fallback and means the same thing. The process starts with fallback
-// disallowed when it is set, and an option that leaves fallback allowed does
-// not override it.
+// --no-cpu-fallback and means the same thing. Fallback is refused when it is
+// set, even for a run that chose the CPU backend.
 [[nodiscard]] bool device_kernels_required_by_environment() noexcept;
+// Whether a run chose the CPU backend itself: `backend` (LSE_BACKEND) is
+// "cpu", or an entry of `pool` (--pool or LSE_POOL) is "cpu" or "cpu:N".
+// Either may be null.
+[[nodiscard]] bool cpu_backend_selected(const char* backend, const char* pool) noexcept;
+// CPU fallback by default: allowed only for a run that chose the CPU backend
+// (cpu_backend_selected) and does not set LSE_REQUIRE_DEVICE_KERNELS=1. A run
+// that did not choose it never lands on the host interpreter: no device
+// backend coming up, a pool member with no code generator, or a group with no
+// device kernel is an error that names the cause. The process starts with
+// this value from LSE_BACKEND and LSE_POOL; lse_open and the CLI set it again
+// from their own --pool.
+[[nodiscard]] bool cpu_fallback_default(const char* backend, const char* pool) noexcept;
 void record_cpu_fallback(const std::string& cause);
 // Events so far, process-wide; a request takes it before and asks for the
 // events after.

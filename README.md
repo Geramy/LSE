@@ -127,9 +127,9 @@ Model commands: `lse-server models` lists cached MLX models, `lse-server pull OR
 | `LSE_MODEL` | none | Default for `--model`. |
 | `LSE_POOL` | none | Default for `--pool`. |
 | `LSE_DEVICE` | `0` | Device ordinal when no pool is given. |
-| `LSE_BACKEND` | `hrx`, then `cpu` | Use only the named backend. |
+| `LSE_BACKEND` | `hrx` | Use only the named backend; `cpu` allows the CPU interpreter. |
 | `LSE_CACHE_DIR` | `~/.lse/cache` | Kernel cache; `--cache-dir` takes precedence. |
-| `LSE_REQUIRE_DEVICE_KERNELS` | unset | `1` is the same as `--no-cpu-fallback`. |
+| `LSE_REQUIRE_DEVICE_KERNELS` | unset | `1` is the same as `--no-cpu-fallback`. Without either, CPU fallback is already refused unless `LSE_BACKEND=cpu` or the pool names a `cpu` device. |
 | `LSE_AUTOTUNE` | on | `off` or `0` disables kernel variant trials. |
 | `LSE_AUTOTUNE_BUDGET_MS` | `20000` | Time budget for kernel variant trials. |
 | `LSE_CHECK_BINDINGS` | unset | Any value checks each launch's buffers for liveness, bounds and signature. |

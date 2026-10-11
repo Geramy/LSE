@@ -1675,6 +1675,16 @@ LSE_TEST(a_tiny_qwen_of_each_kind_runs_a_forward_pass) {
   // routed experts, the shared expert and its sigmoid gate are exercised here:
   // a wrong shape or a router that indexes past the stack fails or NaNs, and
   // neither shows up in a load-only test.
+  //
+  // The tiny configs' Gated DeltaNet shapes have no device kernel
+  // (gdn_chunk_scan declines them), so this test's groups may run on the host
+  // interpreter: it checks the model's wiring, not the device kernels. CPU
+  // fallback is refused by default, so it is allowed here for this scope.
+  struct Allowed {
+    bool previous = graph::cpu_fallback_allowed();
+    Allowed() { graph::set_cpu_fallback_allowed(!graph::cpu_fallback_disabled()); }
+    ~Allowed() { graph::set_cpu_fallback_allowed(previous); }
+  } allowed;
   for (const bool moe : {false, true}) {
     const Config c = tiny_qwen_config(moe);
     const std::vector<NamedShape> t = qwen_checkpoint(c);
