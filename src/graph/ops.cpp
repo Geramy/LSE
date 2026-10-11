@@ -742,6 +742,13 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     selected->prim = find_primitive("attention.flashprefill.select.v2");
     selected->fclass = selected->prim->fusion_class();
     selected->attrs = n->attrs; selected->iattrs = n->iattrs;
+    // An experiment knob, read once: LSE_FLASHPREFILL_MIN_KEEP=P keeps at least
+    // P% of each tile's visible blocks.
+    static const int min_keep = [] {
+      const char* v = std::getenv("LSE_FLASHPREFILL_MIN_KEEP");
+      return v && *v ? std::atoi(v) : 0;
+    }();
+    selected->iattrs[2] = min_keep;
     auto inputs = n->inputs; inputs.push_back(pooled); inputs.push_back(selected);
     auto result = make(OpKind::kCustom, out, DType::kF32, inputs);
     result->prim = find_primitive("attention.flashprefill.wmma.v1");

@@ -366,6 +366,45 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     const auto safe=e.let(select(global.read()==math::neg_inf(),e.f32(0),global.read()));
     for(auto block:e.range(blocks))
       peak=math::max(peak.read(),totals[block].read()*math::exp(maxima[block].read()-safe));
+    // iattrs[2] = P > 0: every tile also keeps the P% of its visible blocks
+    // with the most mass, whatever alpha says: the threshold is the lower of
+    // alpha times the peak and the mass of the ceil(P% * visible)-th block,
+    // found by a bitwise bisection over the masses' bits (masses are >= 0,
+    // so their bits order as they do).
+    auto threshold=e.var(e.let(peak.read()*s.attrs[2]));
+    if(s.iattrs[2]>0) {
+      const auto share=static_cast<float>(s.iattrs[2])/100.0f;
+      const auto partial=e.lds<kir::f32>(threads/32u);
+      const auto wl2=e.let(lane%32u),wv=e.let(lane/32u);
+      auto reduce=[&](const kir::Val<kir::f32>& v) {
+        auto x=e.var(v);
+        for(std::uint32_t bit=16;bit;bit/=2) x=x.read()+math::shfl_xor(x.read(),e.u32(bit));
+        e.barrier();
+        if(auto lead=e.when(wl2==0u)) partial[wv]=x.read();
+        e.barrier();
+        auto total=e.var(0.0f);
+        for(std::uint32_t w=0;w<threads/32u;++w) total=total.read()+partial[e.u32(w)].read();
+        return e.let(total.read());
+      };
+      auto visible_count=e.var(0.0f);
+      for(auto block:e.range(lane,e.u32(blocks),threads))
+        visible_count=visible_count.read()+select(maxima[block].read()!=math::neg_inf(),e.f32(1.0f),e.f32(0.0f));
+      const auto visible_total=e.let(reduce(visible_count.read()));
+      const auto want=e.let(math::rint(visible_total*share+0.4999f));
+      auto bits=e.var(e.u32(0));
+      for(int bit=30;bit>=0;--bit) {
+        const auto candidate=e.let(bits.read()+(1u<<bit));
+        auto count=e.var(0.0f);
+        for(auto block:e.range(lane,e.u32(blocks),threads)) {
+          const auto w=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
+          const auto kb=e.let(math::bits_of<lse::f32>(w));
+          count=count.read()+select(kb>=candidate,e.f32(1.0f),e.f32(0.0f));
+        }
+        const auto total=reduce(count.read());
+        bits=select(total>=want,candidate,bits.read());
+      }
+      threshold=math::min(threshold.read(),math::from_bits<lse::f32>(bits.read()));
+    }
     for(auto block:e.range(lane,e.u32(blocks),threads)) {
       const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
       const auto weight=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
@@ -377,7 +416,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
       // went from 4 of 6 to 6 of 6 with no change in prefill time.
       const auto answer_tile=e.let(last_position+1u>=live);
       const auto exact=e.let(block==0u || (block+2u)*256u>first_position ||
-          a.pooled[pool+512u]!=256.0f || weight>=peak.read()*s.attrs[2] || answer_tile);
+          a.pooled[pool+512u]!=256.0f || weight>=threshold.read() || answer_tile);
       e.store(wg*blocks+block,select(exact,e.f32(1),e.f32(0)));
     }
     return k.lds().ok()?k.str():std::string{};
@@ -389,7 +428,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan p;p.workgroup_size[0]=dispatch::attention_shapes::kFlashPrefillSelectorThreads;
     p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/static_cast<std::uint64_t>(s.output.dim(3)));
-    p.lds_bytes=static_cast<std::uint32_t>(s.output.dim(3)*8);
+    p.lds_bytes=static_cast<std::uint32_t>(s.output.dim(3)*8)+dispatch::attention_shapes::kFlashPrefillSelectorThreads/32u*4u;
     return p;
   }
 };
