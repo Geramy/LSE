@@ -1911,6 +1911,10 @@ std::vector<FusionGroup> Scheduler::launch_groups(std::span<const NodePtr> roots
             join_pointwise_chain(phase_groups.back(), n, roots, emitter.sources())) {
           continue;
         }
+        if (staging == nullptr && phase_groups.size() > phase_begin &&
+            join_epilogue_output(phase_groups.back(), n, emitter, backend().device_info())) {
+          continue;
+        }
         FusionGroup one;
         one.nodes.push_back(n);
         one.outputs.push_back(n);

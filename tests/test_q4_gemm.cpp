@@ -5,7 +5,8 @@
 // compares a sample of outputs against the oracle and reports the mean time
 // of `reps` replays. `--bands` checks, on the device, that every measured
 // band of the part's tile table (arch::Tuning::q4_gemm_rows) writes the bytes
-// the shape-only tile writes.
+// the shape-only tile writes. `--panel-epilogue` checks a norm that stores
+// the f16 activation panel from its own epilogue.
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
@@ -13,6 +14,7 @@
 #include "lse/dispatch/quant.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/graph/primitive.hpp"
 #include "lse/graph/program.hpp"
 
 #include <algorithm>
@@ -594,10 +596,71 @@ int bands() {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
+// A norm whose output feeds the f16 activation panel stores the panel from its
+// own epilogue (graph::join_epilogue_output). On the device: the panel the
+// fused launch wrote against the panel the host makes from the norm's output,
+// byte for byte, at a decode-sized and two prefill-sized row counts.
+int panel_epilogue() {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  std::size_t checked = 0, failed = 0;
+  for (const std::int64_t m : {9, 304, 1024}) {
+    const std::int64_t k = 5120;
+    std::mt19937 rng(static_cast<unsigned>(m));
+    std::uniform_real_distribution<float> uni(-3.0f, 3.0f);
+    std::vector<float> x(static_cast<std::size_t>(m * k));
+    for (auto& v : x) v = uni(rng);
+    std::vector<bfloat16_t> w(static_cast<std::size_t>(k));
+    for (auto& v : w) v = bfloat16_t(0.5f + 0.25f * uni(rng));
+    auto ax = filled(Shape{1, m, k}, DType::kF32, x);
+    auto aw = filled(Shape{k}, DType::kBF16, w);
+    auto norm = rms_norm(ax, aw, 1e-6f);
+    auto panel = std::make_shared<Node>();
+    panel->set_kind(OpKind::kCustom);
+    panel->prim = find_primitive("quant_activation.f16_panel.v1");
+    panel->fclass = panel->prim->fusion_class();
+    panel->shape = Shape{m, k};
+    panel->dtype = DType::kF16;
+    panel->inputs = {norm.node()};
+    ++norm.node()->consumer_count;
+    Program program;
+    const NodePtr roots[]{norm.node(), panel};
+    LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
+    LSE_EXPECT_OK(scheduler->drain());
+    bool fused = false;
+    for (const FusionGroup& g : program.groups())
+      fused = fused || (g.outputs.size() == 2 && g.outputs[1] == panel);
+    LSE_EXPECT(fused);
+    const auto values = read<float>(norm);
+    std::vector<std::uint16_t> got(static_cast<std::size_t>(m * k));
+    LSE_EXPECT_OK(Array(panel).to_host(got.data(), got.size() * sizeof(std::uint16_t)));
+    std::size_t differ = 0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      const float16_t h = static_cast<float16_t>(values[i]);
+      std::uint16_t want = 0;
+      std::memcpy(&want, &h, sizeof want);
+      const std::size_t base = i & ~std::size_t{7}, r = i & 7;
+      const std::size_t slot = base + (r < 4 ? 2 * r : 2 * (r - 4) + 1);
+      differ += got[slot] != want;
+    }
+    std::printf("norm + panel M%lld K%lld: %s, %zu of %zu panel halves differ\n",
+                static_cast<long long>(m), static_cast<long long>(k),
+                fused ? "one launch" : "NOT FUSED", differ, values.size());
+    LSE_EXPECT_EQ(differ, 0u);
+    ++checked;
+    failed += differ != 0 || !fused;
+  }
+  std::printf("norm + panel: %zu checked, %zu differ\n", checked, failed);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc >= 2 && std::string_view(argv[1]) == "--bands") return bands();
+  if (argc >= 2 && std::string_view(argv[1]) == "--panel-epilogue") return panel_epilogue();
   if (argc >= 5 && std::string_view(argv[1]) == "--gpu") {
     int rc = 0;
     const int reps = argc >= 6 ? std::atoi(argv[5]) : 20;

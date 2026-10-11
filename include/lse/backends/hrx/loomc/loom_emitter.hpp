@@ -68,6 +68,12 @@ class LoomEmitter final : public graph::IKernelEmitter {
   [[nodiscard]] bool joins_run(std::span<const graph::NodePtr> run,
                                const DeviceInfo& device) const override;
 
+  // When the anchor's chosen specialization owns its indexing and takes an
+  // epilogue: its store hook then stores the output too.
+  [[nodiscard]] bool stores_epilogue_output(const graph::FusionGroup& group,
+                                            const graph::Node& output,
+                                            const DeviceInfo& device) const override;
+
   // Loom has no header: a `.loom` file is a bare sequence of top-level ops,
   // with no module wrapper and nothing to include. A primitive that owns a
   // whole translation unit has nothing to be prefixed with, which is also why

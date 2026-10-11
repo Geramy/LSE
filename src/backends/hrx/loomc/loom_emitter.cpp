@@ -499,6 +499,44 @@ bool LoomEmitter::joins_run(std::span<const NodePtr> run,
   return true;
 }
 
+bool LoomEmitter::stores_epilogue_output(const FusionGroup& group, const Node& output,
+                                         const DeviceInfo& device) const {
+  const auto* layout = dynamic_cast<const KernelPrimitiveBase*>(output.prim);
+  if (layout == nullptr ||
+      layout->epilogue_output() == KernelPrimitiveBase::EpilogueLayout::kNone ||
+      group.nodes.empty() || group.is_phase)
+    return false;
+  const NodePtr& anchor = group.nodes.front();
+  const auto* kp = anchor ? dynamic_cast<const KernelPrimitiveBase*>(anchor->prim) : nullptr;
+  // Row reductions only: their epilogue runs once per element with little
+  // else live. A matrix or attention body already near its register budget
+  // has no room for a second output's store (an attention tile fed to the
+  // output projection's panel failed allocation, gfx1201: 250 of 256).
+  if (kp == nullptr || anchor->fclass != graph::FusionClass::kReduction) return false;
+  const DialectSourceTable spellings = sources();
+  const kir::TypeTable type_table = loom_types();
+  std::vector<Shape> shp;
+  std::vector<DType> dts;
+  for (const NodePtr& in : anchor->inputs) {
+    shp.push_back(in->shape);
+    dts.push_back(in->dtype);
+  }
+  KernelShapes s;
+  s.inputs = shp;
+  s.input_dtypes = dts;
+  s.output = anchor->shape;
+  s.output_dtype = anchor->dtype;
+  s.attrs = anchor->attrs;
+  s.iattrs = anchor->iattrs;
+  s.device = &device;
+  s.types = type_table;
+  s.intrinsics = &spellings;
+  const KernelPrimitiveBase* chosen = kp->specialize(s);
+  if (chosen == nullptr) chosen = kp;
+  return chosen->owns_indexing() && chosen->supports_epilogue() &&
+         chosen->inplace_input() < 0;
+}
+
 Result<EmittedKernel> LoomEmitter::emit(const FusionGroup& group,
                                         const DeviceInfo& device) const {
   return emit_kernel(group, device, true);
@@ -584,13 +622,23 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
   std::vector<Shape> si_storage;
   std::vector<DType> si_dtypes;
   KernelShapes si_shapes;
+  // Every output past the first an epilogue output of the value before it
+  // (graph::join_epilogue_output): the anchor's epilogue stores them all.
+  bool epilogue_outputs = group.outputs.size() > 1;
+  for (std::size_t o = 1; o < group.outputs.size() && epilogue_outputs; ++o) {
+    const NodePtr& out = group.outputs[o];
+    const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(out->prim);
+    epilogue_outputs = kp != nullptr && out->inputs.size() == 1 &&
+        kp->epilogue_output() != KernelPrimitiveBase::EpilogueLayout::kNone &&
+        std::ranges::count(group.nodes, out->inputs.front()) != 0;
+  }
   for (const NodePtr& n : group.nodes) {
     const auto* kp = dynamic_cast<const KernelPrimitiveBase*>(n->prim);
     if (kp == nullptr) continue;
     KernelShapes probe = shapes_for(n, si_storage, si_dtypes);
     const KernelPrimitiveBase* chosen = kp->specialize(probe);
     if (chosen == nullptr || !chosen->owns_indexing()) continue;
-    if (group.outputs.size() != 1) break;
+    if (group.outputs.size() != 1 && !epilogue_outputs) break;
     self_indexed = chosen;
     anchor = n;
     si_shapes = probe;
@@ -717,8 +765,12 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
                        "type");
     }
     const bool is_out = gdn_pair ? n == gdn_pair.output : output_set.count(n.get()) != 0;
+    // A self-indexed body writes its own output, `out`; an epilogue output
+    // (graph::join_epilogue_output) is stored by the epilogue alone.
+    const bool extra_out = si && !gdn_pair && is_out && n != group.outputs.front();
     const std::string name =
-        si ? (is_out ? std::string("out") : "in" + std::to_string(i))
+        si ? (extra_out ? "out" + std::to_string(i)
+                        : is_out ? std::string("out") : "in" + std::to_string(i))
            : "b" + std::to_string(i);
     names.push_back(name);
     params.push_back("%" + name + ": buffer");
@@ -911,10 +963,55 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
           narrow_from_f32(it->second, sink->dtype, hook_mint, s);
       const std::string dst =
           bounded(idx, sink->element_count(), hook_mint, s);
-      return {std::move(s),
-              "  view.store " + narrowed + ", %out_view[" + dst + "] : " +
-                  std::string(loom_storage_type(elem_of(sink->dtype))) + ", " +
-                  loom_view_type(elem_of(sink->dtype), sink->element_count()) + "\n"};
+      std::string stores =
+          "  view.store " + narrowed + ", %out_view[" + dst + "] : " +
+          std::string(loom_storage_type(elem_of(sink->dtype))) + ", " +
+          loom_view_type(elem_of(sink->dtype), sink->element_count()) + "\n";
+      // Epilogue outputs: the value they narrow, stored where their layout
+      // puts this element.
+      for (const NodePtr& o : group.outputs) {
+        if (gdn_pair || o == sink) continue;
+        const auto* kernel = dynamic_cast<const KernelPrimitiveBase*>(o->prim);
+        if (kernel == nullptr || o->inputs.size() != 1 ||
+            kernel->epilogue_output() == KernelPrimitiveBase::EpilogueLayout::kNone) {
+          epilogue_error = LSE_ERROR(kUnimplemented, "output ", std::string(to_string(o->kind)),
+                                     " of a self-indexed group is not an epilogue output");
+          return {};
+        }
+        const auto source = value_of.find(o->inputs.front().get());
+        if (source == value_of.end()) {
+          epilogue_error = LSE_ERROR(kInternal, "the value an epilogue output stores was never computed");
+          return {};
+        }
+        std::string at = idx;
+        if (kernel->epilogue_output() ==
+            KernelPrimitiveBase::EpilogueLayout::kInterleavedRuns8) {
+          // base + 2 * (r % 4) + r / 4 for r = idx % 8 and base = idx - r.
+          const std::string c8 = hook_mint("eo"), c4 = hook_mint("eo"), c2 = hook_mint("eo");
+          const std::string q = hook_mint("eo"), base = hook_mint("eo"), r = hook_mint("eo");
+          const std::string lo = hook_mint("eo"), hi = hook_mint("eo"), two = hook_mint("eo");
+          const std::string t = hook_mint("eo"), pos = hook_mint("eo");
+          s += "  " + c8 + " = index.constant 8 : index\n";
+          s += "  " + c4 + " = index.constant 4 : index\n";
+          s += "  " + c2 + " = index.constant 2 : index\n";
+          s += "  " + q + " = index.div " + idx + ", " + c8 + " : index\n";
+          s += "  " + base + " = index.mul " + q + ", " + c8 + " : index\n";
+          s += "  " + r + " = index.rem " + idx + ", " + c8 + " : index\n";
+          s += "  " + lo + " = index.rem " + r + ", " + c4 + " : index\n";
+          s += "  " + hi + " = index.div " + r + ", " + c4 + " : index\n";
+          s += "  " + two + " = index.mul " + lo + ", " + c2 + " : index\n";
+          s += "  " + t + " = index.add " + base + ", " + two + " : index\n";
+          s += "  " + pos + " = index.add " + t + ", " + hi + " : index\n";
+          at = pos;
+        }
+        const std::string value = narrow_from_f32(source->second, o->dtype, hook_mint, s);
+        const std::string where = bounded(at, o->element_count(), hook_mint, s);
+        stores += "  view.store " + value + ", %" + names[binding_of.at(o.get())] +
+                  "_view[" + where + "] : " +
+                  std::string(loom_storage_type(elem_of(o->dtype))) + ", " +
+                  loom_view_type(elem_of(o->dtype), o->element_count()) + "\n";
+      }
+      return {std::move(s), std::move(stores)};
     };
     auto epilogue_store = [&](std::string_view index,
                               std::string_view value) -> std::string {

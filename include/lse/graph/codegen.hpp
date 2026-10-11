@@ -277,6 +277,19 @@ class IKernelEmitter {
     return {};
   }
 
+  // Whether this emitter can store `output` (a node with an epilogue layout,
+  // KernelPrimitiveBase::epilogue_output) from the epilogue of `group`'s
+  // anchor, as one more output of that group (graph::join_epilogue_output).
+  // False unless the emitter can.
+  [[nodiscard]] virtual bool stores_epilogue_output(const FusionGroup& group,
+                                                    const Node& output,
+                                                    const backend::DeviceInfo& device) const {
+    (void)group;
+    (void)output;
+    (void)device;
+    return false;
+  }
+
   // Whether this emitter can write `run` -- sibling nodes reading one input --
   // as one multi-output body. Asked by the planner before it joins them, so a
   // run the emitter cannot express is never planned as one group. True unless

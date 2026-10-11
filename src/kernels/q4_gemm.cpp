@@ -106,6 +106,10 @@ struct F16PanelKernel final : graph::KernelPrimitive<F16PanelKernel> {
   std::size_t arity() const noexcept override { return 1; }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
+  // panel_slot's order: the producer's epilogue can store the panel.
+  EpilogueLayout epilogue_output() const noexcept override {
+    return EpilogueLayout::kInterleavedRuns8;
+  }
   bool has_typed_host_impl() const noexcept override { return true; }
   DType infer_dtype(std::span<const DType>) const override {
     return DType::kF16;

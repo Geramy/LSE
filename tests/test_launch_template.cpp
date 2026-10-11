@@ -15,6 +15,7 @@
 #include "lse/graph/graph.hpp"
 #include "lse/graph/launch_template.hpp"
 #include "lse/graph/ops.hpp"
+#include "lse/graph/primitive.hpp"
 #include "lse/graph/program.hpp"
 
 using namespace lse;
@@ -30,6 +31,10 @@ struct RecordingEmitter final : IKernelEmitter {
   Result<EmittedKernel> emit_launch(const FusionGroup& g,
                                     const backend::DeviceInfo& d) const override {
     return real.emit_launch(g, d);
+  }
+  bool stores_epilogue_output(const FusionGroup& g, const Node& o,
+                              const backend::DeviceInfo& d) const override {
+    return real.stores_epilogue_output(g, o, d);
   }
   Dialect dialect() const noexcept override { return Dialect::kLoom; }
   std::string_view prelude() const noexcept override { return {}; }
@@ -197,6 +202,62 @@ LSE_TEST(a_prepared_shape_takes_its_template_at_the_first_eval) {
   const NodePtr plain_roots[] = {p.out.node()};
   check(plain.eval(plain_roots, false, &plain_program));
   LSE_EXPECT(plain_be.impl().launched == be.impl().launched);
+}
+
+// A norm feeding a prefill GEMM stores the GEMM's f16 activation panel from
+// its own epilogue (graph::join_epilogue_output): the norm and the panel are
+// one launch, the GEMM the other. Without a norm in front, the panel is a
+// launch of its own. The panel and the GEMM are built as graph::quant_linear
+// builds them for a device with the tiled GEMM.
+LSE_TEST(a_norm_stores_the_panel_its_gemm_reads) {
+  for (const bool norm_first : {true, false}) {
+    backend::BackendAdapter<RecordingDevice> be;
+    check(be.init(0));
+    Scheduler scheduler(be);
+    scheduler.set_dialect(Dialect::kLoom);
+    const auto leaf = [&](Shape sh, DType dt = DType::kF32) {
+      auto b = be.allocate(sh.elem_count() * 4, backend::MemoryClass::kDevice,
+                           backend::kDefaultStream);
+      if (!b.ok()) throw std::runtime_error(b.status().to_string());
+      return Array::from_buffer(std::move(*b), sh, dt);
+    };
+    const std::int64_t m = 64, k = 256, n = 512;
+    auto x = leaf({1, m, k});
+    auto activation = norm_first ? rms_norm(x, leaf({k}), 1e-6f) : neg(x);
+    auto panel = std::make_shared<Node>();
+    panel->set_kind(OpKind::kCustom);
+    panel->prim = find_primitive("quant_activation.f16_panel.v1");
+    LSE_EXPECT(panel->prim != nullptr);
+    if (panel->prim == nullptr) return;
+    panel->fclass = panel->prim->fusion_class();
+    panel->shape = Shape{m, k};
+    panel->dtype = DType::kF16;
+    panel->inputs = {activation.node()};
+    ++activation.node()->consumer_count;
+    auto gemm = std::make_shared<Node>();
+    gemm->set_kind(OpKind::kCustom);
+    gemm->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+    gemm->fclass = gemm->prim->fusion_class();
+    gemm->shape = Shape{1, m, n};
+    gemm->dtype = DType::kF32;
+    gemm->iattrs[0] = 4;
+    gemm->iattrs[1] = 64;
+    gemm->inputs = {activation.node(), leaf({n, k / 8}, DType::kU32).node(),
+                    leaf({n, k / 64}, DType::kBF16).node(),
+                    leaf({n, k / 64}, DType::kBF16).node(), panel};
+    ++activation.node()->consumer_count;
+    ++panel->consumer_count;
+    Program program;
+    const NodePtr roots[] = {gemm};
+    check(scheduler.eval(roots, false, &program));
+    LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+    LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, norm_first ? 2u : 3u);
+    bool fused = false;
+    for (const FusionGroup& g : program.groups())
+      fused = fused || (g.outputs.size() == 2 && g.outputs[0] == activation.node() &&
+                        g.outputs[1] == panel);
+    LSE_EXPECT_EQ(fused, norm_first);
+  }
 }
 
 // Another width is another key: no template crosses shapes.

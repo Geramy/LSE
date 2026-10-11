@@ -74,4 +74,35 @@ inline bool join_pointwise_chain(FusionGroup &previous, const NodePtr &next,
   return true;
 }
 
+// A node whose result is its producer's value narrowed and stored at a mapped
+// position (KernelPrimitiveBase::epilogue_output) joins the group computing
+// that value as one more output: the anchor's epilogue stores the value twice,
+// once for each output, instead of a second launch reading it back. Only
+// where the emitter can (IKernelEmitter::stores_epilogue_output), over the
+// value's own index space; the value stays an output of the group.
+inline bool join_epilogue_output(FusionGroup &previous, const NodePtr &next,
+                                 const IKernelEmitter &emitter,
+                                 const backend::DeviceInfo &device) {
+  const auto *kernel = next ? dynamic_cast<const KernelPrimitiveBase *>(next->prim) : nullptr;
+  if (kernel == nullptr ||
+      kernel->epilogue_output() == KernelPrimitiveBase::EpilogueLayout::kNone ||
+      next->materialized || next->inputs.size() != 1 || previous.is_phase ||
+      previous.nodes.empty())
+    return false;
+  const NodePtr &value = next->inputs.front();
+  if (!value || value->dtype != DType::kF32 || value->materialized ||
+      value->element_count() != next->element_count() || value->member != next->member ||
+      std::find(previous.outputs.begin(), previous.outputs.end(), value) ==
+          previous.outputs.end())
+    return false;
+  const NodePtr &anchor = previous.nodes.front();
+  if (!anchor || anchor->element_count() != value->element_count()) return false;
+  for (const NodePtr &out : previous.outputs)
+    if (out->element_count() != value->element_count()) return false;
+  if (!emitter.stores_epilogue_output(previous, *next, device)) return false;
+  previous.nodes.push_back(next);
+  previous.outputs.push_back(next);
+  return true;
+}
+
 } // namespace lse::graph

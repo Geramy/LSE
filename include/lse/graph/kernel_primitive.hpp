@@ -159,6 +159,18 @@ class KernelPrimitiveBase : public Primitive {
   // epilogue after the call rather than relying on the body to run it.
   virtual bool supports_epilogue() const noexcept { return true; }
 
+  // Whether this primitive's result is its one input, narrowed to its own
+  // dtype, stored at a position the layout names: then it can be one more
+  // output of its producer's epilogue (graph::join_epilogue_output), the
+  // producer's kernel storing a value it already holds instead of a launch
+  // reading it back. kNone for everything else.
+  enum class EpilogueLayout : std::uint8_t {
+    kNone,
+    // Within each aligned run of eight, elements 0,4,1,5,2,6,3,7.
+    kInterleavedRuns8,
+  };
+  virtual EpilogueLayout epilogue_output() const noexcept { return EpilogueLayout::kNone; }
+
   // How many ways this primitive can lay out the same computation for these
   // shapes: operand placement, buffering, tiling -- choices that change
   // where data waits and how work is shared, never the arithmetic. Every
