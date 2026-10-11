@@ -1,4 +1,5 @@
 #include "lse/dispatch/attention.hpp"
+#include "lse/core/debug.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/dispatch/sparse_decode_tuneconfig.h"
 #include "lse/dispatch/quant.hpp"
@@ -812,7 +813,7 @@ SparseMetaMemo& sparse_meta_memo() {
 
 float sparse_decode_radius_weight() {
   static const float weight = [] {
-    const char* v = std::getenv("LSE_SPARSE_DECODE_RADIUS");
+    const char* v = (::lse::debug() ? std::getenv("LSE_SPARSE_DECODE_RADIUS") : nullptr);
     return v && *v ? static_cast<float>(std::atof(v)) : 1.0f;
   }();
   return weight;
@@ -945,7 +946,7 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   partial->iattrs = n->iattrs;
   // LSE_SPARSE_DECODE_TAIL=0 leaves the correction out (an experiment knob).
   static const bool with_tail = [] {
-    const char* v = std::getenv("LSE_SPARSE_DECODE_TAIL");
+    const char* v = (::lse::debug() ? std::getenv("LSE_SPARSE_DECODE_TAIL") : nullptr);
     return !(v && *v == '0');
   }();
   Array records(partial);

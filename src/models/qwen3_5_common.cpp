@@ -18,6 +18,7 @@
 //     head's second head_dim is its gate
 //   - RoPE is HF rotate_half over a quarter of a 256-wide head
 #include "lse/model/qwen3_5_common.hpp"
+#include "lse/core/debug.hpp"
 
 #include <cmath>
 #include <optional>
@@ -216,7 +217,7 @@ class Qwen35Attention final : public IMixer {
       // An experiment knob, read once: LSE_SPARSE_DECODE_EXACT_LAYERS lists the
       // layers (0-based, comma separated) whose decode attention stays exact.
       static const std::string exact_layers = [] {
-        const char* v = std::getenv("LSE_SPARSE_DECODE_EXACT_LAYERS");
+        const char* v = (::lse::debug() ? std::getenv("LSE_SPARSE_DECODE_EXACT_LAYERS") : nullptr);
         return v ? "," + std::string(v) + "," : std::string();
       }();
       if (!exact_layers.empty() &&
@@ -225,7 +226,7 @@ class Qwen35Attention final : public IMixer {
       // An experiment knob, read once: LSE_FLASHPREFILL_LAYERS lists the only
       // layers (0-based) whose prompt prefill takes FlashPrefill V2.
       static const std::string prefill_layers = [] {
-        const char* v = std::getenv("LSE_FLASHPREFILL_LAYERS");
+        const char* v = (::lse::debug() ? std::getenv("LSE_FLASHPREFILL_LAYERS") : nullptr);
         return v ? "," + std::string(v) + "," : std::string();
       }();
       if (!prefill_layers.empty() &&

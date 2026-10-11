@@ -3,6 +3,7 @@
 // request to the same Router the HTTP server forwards to.
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#include "lse/core/debug.hpp"
 #include <mach/mach.h>
 #include <malloc/malloc.h>
 #if TARGET_OS_IOS
@@ -724,7 +725,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
       sd.mode = c.sparse_decode == 1 ? ops::SparseDecodeMode::kOn : ops::SparseDecodeMode::kAuto;
       sd.budget_tokens = budget;
       sd.budget_share = share;
-      if (const char* joint = std::getenv("LSE_SPARSE_DECODE_JOINT"); joint && *joint == '1')
+      if (const char* joint = (::lse::debug() ? std::getenv("LSE_SPARSE_DECODE_JOINT") : nullptr); joint && *joint == '1')
         sd.joint_heads = true;
       const std::string what = share > 0.0f
           ? std::to_string(static_cast<int>(share * 100.0f + 0.5f)) + "% of the context, at least " +
