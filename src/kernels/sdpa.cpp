@@ -252,17 +252,25 @@ struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
       const bool dim_major=dispatch::dimension_major_values(s.inputs[1],s.inputs[2]);
       const auto lane=e.let(math::local_id()),wg=e.let(math::workgroup_id_x());
       const auto block=e.let(wg%blocks),head=e.let((wg/blocks)%heads),batch=e.let(wg/(blocks*heads));
+      constexpr auto subs=dispatch::attention_shapes::kFlashPrefillSubBlocks;
+      constexpr auto stride_out=dispatch::attention_shapes::kFlashPrefillPooled;
       auto sumk=e.var(0.0f),sumv=e.var(0.0f),count=e.var(0.0f);
+      std::vector<kir::LValue<kir::f32>> subk;
+      for(std::uint32_t i=0;i<subs;++i) subk.push_back(e.var(0.0f));
       const auto rows=e.let(kir::cast<kir::u32>(a.meta[2u]));
       if(auto real=e.when(batch<rows)) {
         const auto mb=e.let(e.u32(kv::kStepMetaHeader)+batch*e.u32(kv::kStepMetaPerRow));
         const auto len=e.let(kir::cast<kir::u32>(a.meta[mb+1u]));
-        for(auto slot:e.range(256u)) {
+        for(std::uint32_t sub=0;sub<subs;++sub)
+        for(auto inner:e.range(256u/subs)) {
+          const auto slot=e.let(inner+sub*(256u/subs));
           const auto key=e.let(block*256u+slot);
           if(auto live=e.when(key<len && key<stride*page_size)) {
             const auto page=e.let(kv_block_index<Storage>(a.table[batch*stride+key/page_size]));
             const auto base=e.let(((page*heads+head)*page_size+key%page_size)*256u+lane);
-            sumk=sumk.read()+kv_load<Storage>(e,a.k,base,256u);
+            const auto kval=e.let(kv_load<Storage>(e,a.k,base,256u));
+            sumk=sumk.read()+kval;
+            subk[sub]=subk[sub].read()+kval;
             sumv=sumv.read()+(dim_major
                 ? value_at<Storage>(e,a.v,true,page,heads,head,page_size,e.let(key%page_size),lane,256u)
                 : kv_load<Storage>(e,a.v,base,256u));
@@ -271,9 +279,12 @@ struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
         }
       }
       const auto denominator=e.let(select(count.read()>0.0f,count.read(),e.f32(1)));
-      e.store(wg*513u+lane,sumk.read()/denominator);
-      e.store(wg*513u+256u+lane,sumv.read()/denominator);
-      if(auto first=e.when(lane==0u)) e.store(wg*513u+512u,count.read());
+      e.store(wg*stride_out+lane,sumk.read()/denominator);
+      e.store(wg*stride_out+256u+lane,sumv.read()/denominator);
+      if(auto first=e.when(lane==0u)) e.store(wg*stride_out+512u,count.read());
+      // Sub-block means of a complete block (a partial block is always read).
+      for(std::uint32_t sub=0;sub<subs;++sub)
+        e.store(wg*stride_out+513u+sub*256u+lane,subk[sub].read()*(static_cast<float>(subs)/256.0f));
       return k.str();
     });
   }
@@ -283,7 +294,7 @@ struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan p; p.workgroup_size[0]=256;
-    p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/513);
+    p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/dispatch::attention_shapes::kFlashPrefillPooled);
     return p;
   }
 };
@@ -336,27 +347,51 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     const auto wave=e.let(lane/32u),wl=e.let(lane%32u);
     // A wave cooperates on each 256-wide probe dot product. Retain the
     // pooled key in registers across all query rows in this tile.
+    constexpr auto subs=dispatch::attention_shapes::kFlashPrefillSubBlocks;
+    constexpr auto pooled_stride=dispatch::attention_shapes::kFlashPrefillPooled;
     for(auto block:e.range(wave,e.u32(blocks),threads/32u)) {
-      const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
+      const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*pooled_stride);
       auto maximum=e.var(math::neg_inf()),sum=e.var(0.0f);
       auto scores=e.local<kir::f32,16>();
+      auto mults=e.local<kir::f32,16>();
       const auto visible=e.let(block*256u<=last_position && a.pooled[pool+512u]>0.0f);
+      const auto complete=e.let(a.pooled[pool+512u]==256.0f);
       std::vector<kir::Val<kir::f32>> pooled_key;
       for(std::uint32_t c=0;c<8;++c) pooled_key.push_back(e.let(a.pooled[pool+wl+c*32u]));
+      std::vector<std::vector<kir::Val<kir::f32>>> sub_key(subs);
+      for(std::uint32_t sb=0;sb<subs;++sb)
+        for(std::uint32_t c=0;c<8;++c) sub_key[sb].push_back(e.let(a.pooled[pool+513u+sb*256u+wl+c*32u]));
       for(auto r:e.unroll(16u)) {
         scores[r]=math::neg_inf();
+        mults[r]=e.f32(0.0f);
         if(auto valid=e.when(q0+r<queries && visible)) {
           auto dot=e.var(0.0f);
           const auto qb=e.let(((batch*heads+head)*queries+q0+r)*256u);
-          for(std::uint32_t c=0;c<8;++c)
-            dot=math::fma(a.q[qb+wl+c*32u],pooled_key[c],dot.read());
-          for(std::uint32_t bit=16;bit;bit/=2)
+          std::vector<kir::Val<kir::f32>> qv;
+          for(std::uint32_t c=0;c<8;++c) qv.push_back(e.let(a.q[qb+wl+c*32u]));
+          for(std::uint32_t c=0;c<8;++c) dot=math::fma(qv[c],pooled_key[c],dot.read());
+          std::vector<kir::LValue<kir::f32>> sdot;
+          for(std::uint32_t sb=0;sb<subs;++sb) {
+            sdot.push_back(e.var(0.0f));
+            for(std::uint32_t c=0;c<8;++c) sdot[sb]=math::fma(qv[c],sub_key[sb][c],sdot[sb].read());
+          }
+          for(std::uint32_t bit=16;bit;bit/=2) {
             dot=dot.read()+math::shfl_xor(dot.read(),e.u32(bit));
-          scores[r]=dot.read()*s.attrs[0]; maximum=math::max(maximum.read(),scores[r].read());
+            for(std::uint32_t sb=0;sb<subs;++sb) sdot[sb]=sdot[sb].read()+math::shfl_xor(sdot[sb].read(),e.u32(bit));
+          }
+          // A complete block: log-mean-exp of its sub-blocks' logits.
+          auto top=e.var(math::neg_inf());
+          for(std::uint32_t sb=0;sb<subs;++sb) top=math::max(top.read(),e.let(sdot[sb].read()*s.attrs[0]));
+          auto spread=e.var(0.0f);
+          for(std::uint32_t sb=0;sb<subs;++sb) spread=spread.read()+math::exp(e.let(sdot[sb].read()*s.attrs[0]-top.read()));
+          // The block's mass for this row is mults[r] * exp(scores[r]).
+          scores[r]=select(complete,top.read(),e.let(dot.read()*s.attrs[0]));
+          mults[r]=select(complete,e.let(spread.read()*(1.0f/static_cast<float>(subs))),e.f32(1.0f));
+          maximum=math::max(maximum.read(),scores[r].read());
         }
       }
       if(auto nonempty=e.when(maximum.read()!=math::neg_inf()))
-        for(auto r:e.unroll(16u)) sum=sum.read()+math::exp(scores[r].read()-maximum.read());
+        for(auto r:e.unroll(16u)) sum=math::fma(mults[r].read(),math::exp(scores[r].read()-maximum.read()),sum.read());
       if(auto leader=e.when(wl==0u)) { maxima[block]=maximum.read(); totals[block]=sum.read(); }
     }
     e.barrier();
@@ -367,7 +402,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     for(auto block:e.range(blocks))
       peak=math::max(peak.read(),totals[block].read()*math::exp(maxima[block].read()-safe));
     for(auto block:e.range(lane,e.u32(blocks),threads)) {
-      const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
+      const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*pooled_stride);
       const auto weight=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
       // Sink, recent block, diagonal band and partial block always exact. So
       // is every block for the tile holding the pass's last live row: its

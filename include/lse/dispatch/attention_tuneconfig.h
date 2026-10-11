@@ -11,6 +11,13 @@ namespace lse::dispatch::attention_shapes {
 inline constexpr std::uint32_t kFlashThreads = 256, kFlashKeyWindow = 256;
 inline constexpr std::uint32_t kFlashQueryTile = 16;
 inline constexpr std::uint32_t kFlashPrefillSelectorThreads = 128;
+// FlashPrefill's pooled record per 256-key block: mean key, mean value, count,
+// then the mean key of each of kFlashPrefillSubBlocks equal sub-blocks. The
+// selector scores a complete block by the log-mean-exp of its sub-blocks'
+// logits, so a few keys a query aligns with are not averaged away over the
+// whole block; the correction path still reads the block means.
+inline constexpr std::uint32_t kFlashPrefillSubBlocks = 4;
+inline constexpr std::uint32_t kFlashPrefillPooled = 513 + kFlashPrefillSubBlocks * 256;
 static_assert(kFlashPrefillSelectorThreads % 32 == 0 &&
               kFlashPrefillSelectorThreads >= 32 && kFlashPrefillSelectorThreads <= 1024);
 inline constexpr std::uint32_t kSplitRecord = 258, kShortKeyWindow = 128;

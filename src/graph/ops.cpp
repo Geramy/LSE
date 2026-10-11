@@ -732,7 +732,8 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
   if (sparse.flashprefill) {
     const auto blocks = (table.shape().dim(1) * block_size + 255) / 256;
     const auto tiles = (sq.dim(2) + 15) / 16;
-    auto pooled = make(OpKind::kCustom, Shape{sq.dim(0), k.shape().dim(1), blocks, 513},
+    auto pooled = make(OpKind::kCustom, Shape{sq.dim(0), k.shape().dim(1), blocks,
+                                             dispatch::attention_shapes::kFlashPrefillPooled},
                        DType::kF32, n->inputs);
     pooled->prim = find_primitive("attention.flashprefill.pool.v1");
     pooled->fclass = pooled->prim->fusion_class();

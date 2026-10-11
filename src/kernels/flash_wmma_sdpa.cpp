@@ -601,7 +601,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         }  // exact block
         if constexpr (MeanCorrection) {
           const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
-          const auto pool = e.let(((b * d.kvh + kh) * blocks + w) * 513u);
+          const auto pool = e.let(((b * d.kvh + kh) * blocks + w) * dispatch::attention_shapes::kFlashPrefillPooled);
           // Per tile, as its own workgroup would have: a block it visits and
           // did not select takes the pooled correction.
           const auto corrects0 = e.let(visits0 && sel0 == 0.0f);
@@ -1421,7 +1421,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         }  // exact block
         if constexpr(MeanCorrection) {
           const auto blocks=e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
-          const auto pool=e.let(((b*d.kvh+kh)*blocks+w)*513u);
+          const auto pool=e.let(((b*d.kvh+kh)*blocks+w)*dispatch::attention_shapes::kFlashPrefillPooled);
           if(auto correction=e.when(selected==0.0f)) {
             // Selector only omits complete blocks visible to every query.
             // log(256) accounts for their full mass in both softmax sums.

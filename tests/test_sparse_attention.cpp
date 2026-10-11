@@ -349,7 +349,7 @@ int gpu_check() {
       LSE_EXPECT_OK(pool_array.to_host(pooled.data(),pooled.size()*4));
       for(int kh=0;kh<kvheads;++kh) for(int block=0;block<5;++block) {
         const int count=std::max(0,std::min(256,length-block*256));
-        const int destination=(kh*5+block)*513;
+        const int destination=(kh*5+block)*int(dispatch::attention_shapes::kFlashPrefillPooled);
         LSE_EXPECT_EQ(pooled[destination+512],float(count));
         for(int c=0;c<width;++c) {
           double mean_k=0,mean_v=0;
@@ -359,6 +359,14 @@ int gpu_check() {
           }
           LSE_EXPECT(std::abs(pooled[destination+c]-mean_k/count)<1e-6);
           LSE_EXPECT(std::abs(pooled[destination+256+c]-mean_v/count)<1e-6);
+          // Sub-block key means of a complete block.
+          constexpr int subs=int(dispatch::attention_shapes::kFlashPrefillSubBlocks), span=256/subs;
+          if(count==256) for(int sb=0;sb<subs;++sb) {
+            double sub_k=0;
+            for(int j=block*256+sb*span;j<block*256+(sb+1)*span;++j)
+              sub_k+=k[(((79-j/16)*kvheads+kh)*16+j%16)*width+c];
+            LSE_EXPECT(std::abs(pooled[destination+513+sb*256+c]-sub_k/span)<1e-5);
+          }
         }
       }
       const int tiles=(queries+15)/16;
@@ -412,15 +420,20 @@ int gpu_check() {
   for(auto [blocks,live_rows]:{std::pair{5,17},std::pair{129,17},std::pair{129,10}}) {
     constexpr int heads=2,queries=17,width=256,tiles=2;
     const int length=blocks*256-7,offset=length-live_rows;
-    std::vector<float> q(2*heads*queries*width),pool(2*blocks*513);
+    constexpr int stride=int(dispatch::attention_shapes::kFlashPrefillPooled);
+    std::vector<float> q(2*heads*queries*width),pool(2*blocks*stride);
     for(int h=0;h<heads;++h) for(int r=0;r<queries;++r) for(int c=0;c<width;++c)
       q[(h*queries+r)*width+c]=float(c%11-5)*.125f+float((r+h)%3)*.0625f;
     for(int b=0;b<blocks;++b) {
-      pool[b*513+512]=float(b==blocks-1?249:256);
-      for(int c=0;c<width;++c)
-        pool[b*513+c]=float(b%9-4)*.25f*float(c%11-5)+float((c+b)%7-3)*.03125f;
+      pool[b*stride+512]=float(b==blocks-1?249:256);
+      for(int c=0;c<width;++c) {
+        pool[b*stride+c]=float(b%9-4)*.25f*float(c%11-5)+float((c+b)%7-3)*.03125f;
+        // Equal sub-block means: the sub-block score is then the block's.
+        for(int sb=0;sb<int(dispatch::attention_shapes::kFlashPrefillSubBlocks);++sb)
+          pool[b*stride+513+sb*256+c]=pool[b*stride+c];
+      }
     }
-    auto aq=upload({2,heads,queries,width},q),ap=upload({2,1,blocks,513},pool);
+    auto aq=upload({2,heads,queries,width},q),ap=upload({2,1,blocks,stride},pool);
     auto am=upload({7},{float(offset),float(length),1,float(offset),float(length),0,0});
     auto node=std::make_shared<Node>();node->kind=OpKind::kCustom;
     node->shape={2,heads,tiles,blocks};node->dtype=DType::kF32;
@@ -438,7 +451,7 @@ int gpu_check() {
       std::vector<double> mass(blocks);double maximum=-INFINITY;
       std::vector<double> logits(blocks*16,-INFINITY);
       for(int b=0;b<blocks;++b) for(int r=t*16;r<std::min(t*16+16,queries);++r) {
-        double score=0;for(int c=0;c<width;++c) score+=double(q[(h*queries+r)*width+c])*pool[b*513+c];
+        double score=0;for(int c=0;c<width;++c) score+=double(q[(h*queries+r)*width+c])*pool[b*stride+c];
         logits[b*16+r-t*16]=score*.0625;maximum=std::max(maximum,score*.0625);
       }
       for(int b=0;b<blocks;++b) for(int r=0;r<16;++r) mass[b]+=std::exp(logits[b*16+r]-maximum);
