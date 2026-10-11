@@ -654,35 +654,63 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
 
 Status Workgroup::bind_slots(backend::IBackend& backend,
                              backend::Stream stream) {
-  // Every unbound slot is a window of one allocation: a prefill pass's 78
-  // slots cost 8.9 ms as 78 allocations (gfx1201, 304 rows). The windows are
-  // disjoint and each starts on a kSlotAlign boundary, so what a kernel sees
-  // is a buffer of its own; the allocation is released with its last window.
+  // Unbound slots are packed, in order, as disjoint 256-byte-aligned windows
+  // of allocations of at most kSlotChunk bytes; a slot that size or larger
+  // takes an allocation of its own. A prefill pass's 78 slots cost 8.9 ms as
+  // 78 allocations (gfx1201, 304 rows). One allocation for all of them is
+  // all-or-nothing: at 128K tokens a phase's slots came to one 2.8 GB block,
+  // which the allocator refused with 2.5 GB free in other blocks, where the
+  // same slots one by one fit. A window is a buffer of its own to a kernel,
+  // but its allocation is released only with its last window, so a window
+  // that outlives its pass holds the rest of its chunk: with 256 MiB chunks
+  // a fresh 128K DFlash2 request peaked at 2.93 GiB of workspace against
+  // 2.84 one slot per allocation; with 32 MiB, 2.84.
   constexpr std::size_t kSlotAlign = 256;
+  constexpr std::size_t kSlotChunk = std::size_t{32} << 20;
   const auto aligned = [](std::size_t bytes) {
     return (bytes + kSlotAlign - 1) / kSlotAlign * kSlotAlign;
   };
-  std::size_t total = 0;
-  for (const Slot& s : slots_)
-    if (!s.buffer.valid()) total += aligned(s.bytes);
-  if (total != 0) {
+  const auto allocate = [&](std::size_t bytes) -> Result<backend::DeviceBuffer> {
     // Through the caller's stream: on a device spanning several GPUs the
     // stream is what places the bytes, and the default stream put every
     // member's phase activations in the primary's VRAM.
     const backend::ScopedAllocationSite site(backend::AllocationSite::kWorkspace);
-    auto buf = backend.allocate(total, backend::MemoryClass::kDevice, stream);
+    auto buf = backend.allocate(bytes, backend::MemoryClass::kDevice, stream);
     if (!buf.ok()) {
       const auto available = backend.sample_free_memory();
       return Status(buf.status().code(), detail::concat(
-          "workgroup slot allocation (", std::to_string(total), " bytes; available ",
+          "workgroup slot allocation (", std::to_string(bytes), " bytes; available ",
           available.ok() ? std::to_string(*available) : "unknown", "): ",
           buf.status().message()));
     }
-    const backend::DeviceBuffer arena = buf.release();
+    return buf;
+  };
+  // The slots each chunk holds, decided before anything is allocated, so a
+  // refusal leaves every slot unbound.
+  std::vector<std::vector<std::size_t>> chunks;
+  std::vector<std::size_t> chunk_bytes;
+  for (std::size_t i = 0; i < slots_.size(); ++i) {
+    if (slots_[i].buffer.valid()) continue;
+    const std::size_t bytes = aligned(slots_[i].bytes);
+    if (bytes >= kSlotChunk || chunks.empty() || chunk_bytes.back() + bytes > kSlotChunk ||
+        chunk_bytes.back() >= kSlotChunk) {
+      chunks.emplace_back();
+      chunk_bytes.push_back(0);
+    }
+    chunks.back().push_back(i);
+    chunk_bytes.back() += bytes;
+  }
+  std::vector<backend::DeviceBuffer> held(chunks.size());
+  for (std::size_t c = 0; c < chunks.size(); ++c) {
+    auto buf = allocate(chunk_bytes[c]);
+    if (!buf.ok()) return buf.status();
+    held[c] = buf.release();
+  }
+  for (std::size_t c = 0; c < chunks.size(); ++c) {
     std::size_t at = 0;
-    for (Slot& s : slots_) {
-      if (s.buffer.valid()) continue;
-      s.buffer = arena;
+    for (const std::size_t i : chunks[c]) {
+      Slot& s = slots_[i];
+      s.buffer = held[c];
       s.buffer.offset += at;
       s.buffer.size_bytes = s.bytes;
       at += aligned(s.bytes);
