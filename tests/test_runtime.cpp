@@ -534,6 +534,13 @@ LSE_TEST(draft_width_policy_measures_the_ends_and_prices_the_widths_between) {
   policy.observe_verify(4, static_cast<std::uint64_t>(40e6));
   LSE_EXPECT_NEAR(policy.verify_ns(4), 40e6, 1.0);
   LSE_EXPECT_EQ(policy.exploring(), 0u);
+  // An MTP chain's depths between the measured shallowest and deepest are
+  // priced between them.
+  policy.observe_draft(static_cast<std::uint64_t>(2e6), 0);
+  policy.observe_draft(static_cast<std::uint64_t>(16e6), DraftWidthPolicy::kMaxProposals);
+  LSE_EXPECT_NEAR(policy.draft_ns(0), 2e6, 1.0);
+  LSE_EXPECT_NEAR(policy.draft_ns(3), 8e6, 1.0);
+  LSE_EXPECT_NEAR(policy.draft_ns(DraftWidthPolicy::kMaxProposals), 16e6, 1.0);
 }
 
 // A cold first launch: the first measurements of the deeper chains include a

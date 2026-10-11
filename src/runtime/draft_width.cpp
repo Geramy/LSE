@@ -452,7 +452,21 @@ void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
 }
 
 double DraftWidthPolicy::draft_ns(std::uint32_t depth) const noexcept {
-  return depth <= kMaxProposals ? costs().draft[depth] : 0.0;
+  if (depth > kMaxProposals) return 0.0;
+  const Costs& c = costs();
+  if (c.draft[depth] > 0.0) return c.draft[depth];
+  // A depth not measured (the forced widths measure the shallowest and the
+  // deepest chain): linear between the nearest depths that are, as an MTP
+  // chain costs a pass per proposal.
+  std::int32_t below = -1, above = -1;
+  for (std::int32_t d = static_cast<std::int32_t>(depth) - 1; d >= 0 && below < 0; --d)
+    if (c.draft[static_cast<std::size_t>(d)] > 0.0) below = d;
+  for (std::uint32_t d = depth + 1; d <= kMaxProposals && above < 0; ++d)
+    if (c.draft[d] > 0.0) above = static_cast<std::int32_t>(d);
+  if (below < 0 || above < 0) return 0.0;
+  const double lo = c.draft[static_cast<std::size_t>(below)];
+  const double hi = c.draft[static_cast<std::size_t>(above)];
+  return lo + (hi - lo) * (static_cast<double>(depth) - below) / (above - below);
 }
 
 std::uint32_t DraftWidthPolicy::depth(std::uint32_t max, std::uint32_t initial) {
