@@ -368,9 +368,8 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
       peak=math::max(peak.read(),totals[block].read()*math::exp(maxima[block].read()-safe));
     // iattrs[2] = P > 0: every tile also keeps the P% of its visible blocks
     // with the most mass, whatever alpha says: the threshold is the lower of
-    // alpha times the peak and the mass of the ceil(P% * visible)-th block,
-    // found by a bitwise bisection over the masses' bits (masses are >= 0,
-    // so their bits order as they do).
+    // alpha times the peak and (to within the bisection) the mass of the
+    // ceil(P% * visible)-th block.
     auto threshold=e.var(e.let(peak.read()*s.attrs[2]));
     if(s.iattrs[2]>0) {
       const auto share=static_cast<float>(s.iattrs[2])/100.0f;
@@ -391,19 +390,24 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
         visible_count=visible_count.read()+select(maxima[block].read()!=math::neg_inf(),e.f32(1.0f),e.f32(0.0f));
       const auto visible_total=e.let(reduce(visible_count.read()));
       const auto want=e.let(math::rint(visible_total*share+0.4999f));
-      auto bits=e.var(e.u32(0));
-      for(int bit=30;bit>=0;--bit) {
-        const auto candidate=e.let(bits.read()+(1u<<bit));
+      // Bisection on the depth below the peak (masses are peak * exp(-x)):
+      // the largest x whose threshold still has at most `want` blocks above
+      // it is the shallowest cut keeping at least `want`.
+      auto lo=e.var(0.0f), hi=e.var(60.0f);
+      for(int step=0;step<24;++step) {
+        const auto mid=e.let((lo.read()+hi.read())*0.5f);
+        const auto cut=e.let(peak.read()*math::exp(e.let(math::neg(mid))));
         auto count=e.var(0.0f);
         for(auto block:e.range(lane,e.u32(blocks),threads)) {
           const auto w=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
-          const auto kb=e.let(math::bits_of<lse::f32>(w));
-          count=count.read()+select(kb>=candidate,e.f32(1.0f),e.f32(0.0f));
+          count=count.read()+select(w>=cut,e.f32(1.0f),e.f32(0.0f));
         }
         const auto total=reduce(count.read());
-        bits=select(total>=want,candidate,bits.read());
+        // Enough blocks at this depth: try a shallower cut; otherwise deeper.
+        hi=select(total>=want,mid,hi.read());
+        lo=select(total>=want,lo.read(),mid);
       }
-      threshold=math::min(threshold.read(),math::from_bits<lse::f32>(bits.read()));
+      threshold=math::min(threshold.read(),e.let(peak.read()*math::exp(e.let(math::neg(hi.read())))));
     }
     for(auto block:e.range(lane,e.u32(blocks),threads)) {
       const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
