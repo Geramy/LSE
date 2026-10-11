@@ -582,6 +582,50 @@ LSE_TEST(slot_allocation_failure_keeps_original_status_and_size_context) {
   LSE_EXPECT(first->buffer.offset != second->buffer.offset);
 }
 
+namespace {
+class CountingAllocationCpu : public backend::CpuBackend {
+ public:
+  Result<backend::DeviceBuffer> allocate(std::size_t bytes,
+      backend::MemoryClass cls, backend::Stream stream) {
+    sizes.push_back(bytes);
+    return backend::CpuBackend::allocate(bytes, cls, stream);
+  }
+  std::vector<std::size_t> sizes;
+};
+}
+
+// Slots share allocations of at most 32 MiB, and a slot that large takes one
+// of its own: one block for every slot is all-or-nothing, and at 128K tokens
+// a phase's slots came to 2.8 GB, refused where the same slots one by one fit.
+LSE_TEST(slot_allocations_stay_within_a_bounded_chunk) {
+  backend::BackendAdapter<CountingAllocationCpu> backend;
+  LSE_EXPECT_OK(backend.init(0));
+  AllocationTestKernel ordinary;
+  constexpr std::int64_t kBig = std::int64_t{40} << 18;  // 40 MiB of f32
+  auto input = Array::full({4}, DType::kF32, 0).node();
+  auto big1 = make_test_node(&ordinary, {kBig}, {input});
+  auto small1 = make_test_node(&ordinary, {256}, {big1});
+  auto small2 = make_test_node(&ordinary, {256}, {small1});
+  auto big2 = make_test_node(&ordinary, {kBig}, {small2});
+  auto small3 = make_test_node(&ordinary, {256}, {big2});
+  const std::vector<NodePtr> order{big1, small1, small2, big2, small3};
+  Workgroup workgroup;
+  for (const auto& node : order) LSE_EXPECT(workgroup.try_add(node));
+  const NodePtr roots[]{big1, small1, small2, big2, small3};
+  workgroup.plan_slots(roots, separate_launches(order));
+  LSE_EXPECT_OK(workgroup.bind_slots(backend));
+  const auto& sizes = backend.impl().sizes;
+  // big1 alone; small1 and small2 together; big2 alone; small3.
+  LSE_EXPECT_EQ(sizes.size(), 4u);
+  for (const std::size_t bytes : sizes)
+    LSE_EXPECT(bytes <= (std::size_t{32} << 20) || bytes == static_cast<std::size_t>(kBig) * 4);
+  for (const auto& node : order) LSE_EXPECT(node->buffer.valid());
+  LSE_EXPECT(small1->buffer.storage == small2->buffer.storage);
+  LSE_EXPECT(small1->buffer.offset != small2->buffer.offset);
+  LSE_EXPECT(big1->buffer.storage != big2->buffer.storage);
+  LSE_EXPECT(big1->buffer.storage != small1->buffer.storage);
+}
+
 LSE_TEST_MAIN()
 
 LSE_TEST(repeated_operand_does_not_hide_an_external_consumer) {
