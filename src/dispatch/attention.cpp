@@ -180,10 +180,12 @@ bool split_decode_scope(const Shape& query, std::int64_t offset, std::int64_t ca
       [&](const auto& rule) { return query.dim(2) == rule.query_rows; });
 }
 
-bool split_decode_supported(const KernelShapes& s) {
+namespace {
+
+const shapes::DecodeRule* split_decode_rule(const KernelShapes& s) {
   if (!paged_inputs(s) || !s.device || !attention_ops(s) ||
       (s.inputs[1] != s.inputs[2] && !dimension_major_values(s.inputs[1], s.inputs[2])) ||
-      !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return false;
+      !std::isfinite(s.attrs[0]) || s.attrs[0] <= 0.0f) return nullptr;
   const auto& q = s.inputs[0];
   const auto block = s.inputs[1].dim(2);
   const auto capacity = s.inputs[4].dim(1) * block;
@@ -200,9 +202,20 @@ bool split_decode_supported(const KernelShapes& s) {
     const auto merge_bytes = (static_cast<std::uint64_t>(parts) * sizeof(float) + 15u) / 16u * 16u;
     const Shape partial{q.dim(0), q.dim(1), parts, shapes::kSplitRecord};
     return merge_bytes <= backend::workgroup_lds_bytes(s.device) &&
-        positive_shape(partial) && (s.output == q || s.output == partial);
+        positive_shape(partial) && (s.output == q || s.output == partial) ? &rule : nullptr;
   }
-  return false;
+  return nullptr;
+}
+
+}  // namespace
+
+bool split_decode_supported(const KernelShapes& s) { return split_decode_rule(s) != nullptr; }
+
+std::uint32_t split_decode_key_batch(const KernelShapes& s) {
+  const auto* rule = split_decode_rule(s);
+  if (rule == nullptr || rule->key_batch <= 1) return 1u;
+  const auto keys = static_cast<std::uint64_t>(s.inputs[4].dim(1) * s.inputs[1].dim(2));
+  return keys >= rule->key_batch_min_keys ? rule->key_batch : 1u;
 }
 
 bool split_decode_merge_supported(const KernelShapes& s) {
