@@ -637,6 +637,16 @@ struct VariantTrial {
 // wrong kernel moves it by its own size.
 constexpr double kProposalTolerance = 1e-3;
 
+// A trial is timed cold (run_variant_trial) when its kernel's bound inputs
+// reach this many bytes and its launch is short (below), with this many launches a sample, each after a copy
+// of this many bytes (beyond any last-level cache: 64 MiB on the R9700, 32
+// MiB on the 8060S).
+constexpr std::size_t kColdTrialBytes = std::size_t{4} << 20;
+constexpr std::uint32_t kColdTrialLaunches = 8;
+// ... and its warm launch is shorter than this.
+constexpr double kColdTrialMaxUs = 1000.0;
+constexpr std::size_t kColdFlushBytes = std::size_t{128} << 20;
+
 // Whether `got` is variant 0's `want` up to reordered f32 sums.
 bool within_tolerance(std::span<const std::byte> want, std::span<const std::byte> got) {
   const std::size_t count = want.size() / sizeof(float);
@@ -707,31 +717,77 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
     candidates.push_back({v, *built, k.dims, 0.0});
   }
   if (candidates.size() > 1) {
-    // Enough launches per sample that a sample is ~2 ms of device time, then
-    // the best of four interleaved rounds: what is kept is each variant's
-    // speed, not the moment it happened to run in.
-    auto sample = [&](Candidate& c, std::uint32_t reps) -> Result<double> {
+    // A kernel that reads more than the device's caches keep between two of
+    // its launches in a decode step (a weight-streaming contraction) is
+    // timed cold. Back to back, its weights stay in the caches, so variants
+    // that differ in how they stream weights from memory time as a tie and
+    // the margin below keeps variant 0 (a decode panel kernel on the R9700
+    // lost 1.5 ms a dMTP step that way). Each cold launch follows a copy
+    // between two scratch buffers larger than any last-level cache, and the
+    // copies' own time, measured in the same rounds, is taken off.
+    std::size_t bound = 0;
+    for (const backend::BufferRef& b : t.args.bindings)
+      if (b.buffer != nullptr && b.buffer->handle != t.output.handle)
+        bound += b.length != 0 ? b.length : b.buffer->size_bytes;
+    bool cold = false;
+    backend::DeviceBuffer flush_from, flush_to;
+    struct Release {
+      backend::IBackend& be;
+      backend::DeviceBuffer& a;
+      backend::DeviceBuffer& b;
+      ~Release() {
+        (void)be.synchronize();
+        if (a.valid()) be.deallocate(a);
+        if (b.valid()) be.deallocate(b);
+      }
+    } release{t.be, flush_from, flush_to};
+    // Enough launches per sample that a sample is ~2 ms of device time (cold:
+    // a few, each after its copy), then the best of four interleaved rounds:
+    // what is kept is each variant's speed, not the moment it happened to
+    // run in.
+    auto sample = [&](Candidate* c, std::uint32_t reps) -> Result<double> {
       LSE_RETURN_IF_ERROR(t.be.synchronize());
       const auto t0 = SpanClock::now();
-      for (std::uint32_t r = 0; r < reps; ++r)
-        LSE_RETURN_IF_ERROR(t.be.launch(c.handle, c.dims, t.args, t.target));
+      for (std::uint32_t r = 0; r < reps; ++r) {
+        if (cold)
+          LSE_RETURN_IF_ERROR(t.be.copy_ordered(flush_from, flush_to, kColdFlushBytes, 0, 0));
+        if (c != nullptr) LSE_RETURN_IF_ERROR(t.be.launch(c->handle, c->dims, t.args, t.target));
+      }
       LSE_RETURN_IF_ERROR(t.be.synchronize());
       return static_cast<double>(elapsed_ns(t0, SpanClock::now())) / 1e3 / reps;
     };
-    LSE_ASSIGN_OR(const double once, sample(candidates[0], 1));
-    const auto reps = static_cast<std::uint32_t>(
-        std::clamp(2000.0 / std::max(once, 1.0), 1.0, 64.0));
+    LSE_ASSIGN_OR(const double once, sample(&candidates[0], 1));
+    // Cold where it can matter: a short launch over inputs the caches could
+    // hold (a decode contraction). A prefill GEMM, whose launch is
+    // milliseconds of compute, times the same either way, and timing it cold
+    // spent the trial budget before the decode kernels were reached.
+    cold = bound >= kColdTrialBytes && once < kColdTrialMaxUs;
+    if (cold) {
+      LSE_ASSIGN_OR(flush_from, t.be.allocate(kColdFlushBytes, backend::MemoryClass::kDevice));
+      LSE_ASSIGN_OR(flush_to, t.be.allocate(kColdFlushBytes, backend::MemoryClass::kDevice));
+    }
+    const auto reps = cold ? kColdTrialLaunches
+                           : static_cast<std::uint32_t>(std::clamp(2000.0 / std::max(once, 1.0), 1.0, 64.0));
     // One untimed sample of each first, then rounds in alternating order:
     // measured first in every round, variant 0 caught the clocks still
     // settling after the host's gap and lost to an identical kernel by up
     // to a fifth.
-    for (Candidate& c : candidates) LSE_RETURN_IF_ERROR(sample(c, reps).status());
+    for (Candidate& c : candidates) LSE_RETURN_IF_ERROR(sample(&c, reps).status());
+    double flush_us = 0.0;
     for (int round = 0; round < 4; ++round) {
+      if (cold) {
+        LSE_ASSIGN_OR(const double us, sample(nullptr, reps));
+        flush_us = round == 0 ? us : std::min(flush_us, us);
+      }
       for (std::size_t i = 0; i < candidates.size(); ++i) {
         Candidate& c = candidates[round % 2 == 0 ? i : candidates.size() - 1 - i];
-        LSE_ASSIGN_OR(const double us, sample(c, reps));
+        LSE_ASSIGN_OR(const double us, sample(&c, reps));
         c.best_us = round == 0 ? us : std::min(c.best_us, us);
       }
+    }
+    if (cold) {
+      for (Candidate& c : candidates) c.best_us = std::max(c.best_us - flush_us, 0.0);
+      note += " cold";
     }
   }
   const Candidate* best = &candidates[0];
