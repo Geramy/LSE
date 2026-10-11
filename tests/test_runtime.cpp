@@ -502,7 +502,7 @@ LSE_TEST(draft_width_policy_measures_the_ends_and_prices_the_widths_between) {
   LSE_EXPECT_EQ(policy.proposals(unsure), 7u);
   LSE_EXPECT_EQ(policy.depth(7, 3), 3u);
   for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
-    policy.observe_verify(DraftWidthPolicy::kMaxRows, 99'000'000);  // priced nothing
+    policy.observe_verify(DraftWidthPolicy::kMaxRows, 1'000'000);  // priced nothing
   // The narrowest width first; width 1 is a plain step, no draft at all.
   LSE_EXPECT_EQ(policy.exploring(), 1u);
   LSE_EXPECT(!policy.draft_next());
@@ -715,6 +715,24 @@ LSE_TEST(draft_width_policy_returning_to_an_unfinished_context_explores_nothing)
   policy.observe_verify(1, static_cast<std::uint64_t>(29e6));
   policy.observe_verify(1, static_cast<std::uint64_t>(29e6));
   LSE_EXPECT_NEAR(policy.verify_ns(1), 29e6, 1.0);
+}
+
+LSE_TEST(draft_width_policy_warm_up_ends_with_device_time) {
+  // A prompt that kept the device busy a second has ramped the clocks: the
+  // policy's warm-up ends without its 32 steps.
+  DraftWidthPolicy policy;
+  LSE_EXPECT(policy.warming());
+  policy.observe_busy(400'000'000);
+  for (int i = 0; i < 4; ++i) policy.observe_verify(DraftWidthPolicy::kMaxRows, 40'000'000);
+  LSE_EXPECT(policy.warming());
+  policy.observe_busy(500'000'000);
+  LSE_EXPECT(!policy.warming());
+  LSE_EXPECT_EQ(policy.exploring(), 1u);
+  // Steps alone end it as before.
+  DraftWidthPolicy steps;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    steps.observe_verify(DraftWidthPolicy::kMaxRows, 1);
+  LSE_EXPECT(!steps.warming());
 }
 
 LSE_TEST(draft_width_policy_after_a_short_warm_up_forces_few_widths) {

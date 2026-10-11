@@ -81,10 +81,15 @@ class DraftWidthPolicy {
   // narrow widths throw away most of a step, and at long contexts, where a
   // request is a few dozen steps, they cost more than they could find.
   static constexpr std::uint32_t kTrustedSamples = 2;
-  // Measured steps before the first measurements of every width: the GPU's
-  // clocks ramp up over a process's first steps, and a width measured then
-  // would be priced high. Until then the full width is used.
+  // The policy's warm-up: the GPU's clocks ramp up over a process's first
+  // work, and a width measured then would be priced high, so until it ends
+  // the full width is used and nothing is priced. It ends after kWarmupSteps
+  // steps, or sooner once the device has been busy kWarmupBusyNs (prompt
+  // passes included, observe_busy): a server's warm-up request ramps the
+  // clocks with its prompt, and a 32-step warm-up then covered most of the
+  // next request.
   static constexpr std::uint64_t kWarmupSteps = 32;
+  static constexpr std::uint64_t kWarmupBusyNs = 1'000'000'000;
   // A position's mean resting on fewer than kPositionTrusted checks, scaled
   // by the chance a chain reaches it (a chain shallower than it never does),
   // has the next chain drafted to the full depth at most every
@@ -122,7 +127,15 @@ class DraftWidthPolicy {
   // counts toward the warm-up, whose steps are not priced either, so a cold
   // first request does not push the first measurements back.
   void observe_unpriced_step() noexcept {
-    if (steps_ < kWarmupSteps) ++steps_;
+    if (warming()) ++steps_;
+  }
+  // Device time spent outside decode steps (a prompt's passes): it ramps the
+  // clocks as decode steps do, and counts toward the warm-up.
+  void observe_busy(std::uint64_t ns) noexcept {
+    if (warming()) busy_ns_ += ns;
+  }
+  [[nodiscard]] bool warming() const noexcept {
+    return steps_ < kWarmupSteps && busy_ns_ < kWarmupBusyNs;
   }
   // After a draft was verified with `estimates` for its chosen prefix of
   // `proposals`: the expected value of having drafted, used to decide
@@ -275,6 +288,8 @@ class DraftWidthPolicy {
   std::size_t bucket_ = 0;
   double rate_tokens_ = 0, rate_ns_ = 0;
   std::uint64_t steps_ = 0;
+  // Device time seen during the warm-up, steps and prompt passes.
+  std::uint64_t busy_ns_ = 0;
   // Expected tokens gained per drafted step minus what the draft and the
   // wider pass cost at the long-run rate, and how long drafting has been off.
   double draft_value_ = 0;

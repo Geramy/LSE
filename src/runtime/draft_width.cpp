@@ -265,7 +265,7 @@ double DraftWidthPolicy::rate() const noexcept {
 }
 
 std::uint32_t DraftWidthPolicy::exploring() const noexcept {
-  if (steps_ < kWarmupSteps || forced_recently()) return 0;
+  if (warming() || forced_recently()) return 0;
   const std::size_t rows = next_sample(costs().verify, 1);
   return rows <= kMaxRows ? static_cast<std::uint32_t>(rows) : 0u;
 }
@@ -310,7 +310,7 @@ std::uint32_t DraftWidthPolicy::proposals(std::span<const double> confidence,
     a[j] = acceptance(confidence[j]);
     if (j < estimates.size()) estimates[j] = a[j];
   }
-  if (steps_ < kWarmupSteps) return n;
+  if (warming()) return n;
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(n, rows - 1);
   if (const std::uint32_t rows = refresh(n, false); rows != 0) return rows - 1;
   // Verify proposal j + 1 when some prefix ending at or after it adds more
@@ -379,7 +379,7 @@ std::string DraftWidthPolicy::describe() const {
 bool DraftWidthPolicy::draft_next(bool tree) {
   if (tree) {
     // Trees take no chain widths: a plain step is the only one to measure.
-    if (steps_ >= kWarmupSteps && needs_sample(costs().verify, 1)) return false;
+    if (!warming() && needs_sample(costs().verify, 1)) return false;
     if (tree_exploring() != 0) return true;
   } else if (const std::uint32_t rows = exploring(); rows != 0) {
     return rows > 1;
@@ -415,18 +415,23 @@ void DraftWidthPolicy::observe_acceptance(double confidence, std::uint32_t posit
 
 void DraftWidthPolicy::observe_verify(std::uint32_t rows, std::uint64_t ns) {
   if (rows == 0 || rows > kMaxRows) return;
-  if (steps_ >= kWarmupSteps && rows == exploring()) {
+  if (!warming() && rows == exploring()) {
     last_forced_ = steps_;
     forced_any_ = true;
   }
   // Warm-up steps count toward the warm-up and price nothing.
-  if (steps_++ < kWarmupSteps) return;
+  if (warming()) {
+    ++steps_;
+    busy_ns_ += ns;
+    return;
+  }
+  ++steps_;
   observe_cost(costs().verify, rows, static_cast<double>(ns),
                [](std::size_t i) { return static_cast<double>(i); });
 }
 
 void DraftWidthPolicy::observe_draft(std::uint64_t ns, std::uint32_t depth) {
-  if (depth > kMaxProposals || steps_ <= kWarmupSteps) return;
+  if (depth > kMaxProposals || warming()) return;
   const auto t = static_cast<double>(ns);
   Costs& c = costs();
   if (c.draft_seeded && !c.draft_entered[depth]) {
@@ -471,7 +476,7 @@ double DraftWidthPolicy::draft_ns(std::uint32_t depth) const noexcept {
 
 std::uint32_t DraftWidthPolicy::depth(std::uint32_t max, std::uint32_t initial) {
   max = std::min(max, kMaxProposals);
-  if (steps_ < kWarmupSteps) return std::min(max, initial);
+  if (warming()) return std::min(max, initial);
   if (const std::uint32_t rows = exploring(); rows != 0) return std::min(max, rows - 1);
   if (const std::uint32_t rows = refresh(max, true); rows != 0) return rows - 1;
   const double rate_now = rate();
@@ -565,7 +570,7 @@ double DraftWidthPolicy::tree_step_ns(std::uint32_t rows) const noexcept {
 }
 
 std::uint32_t DraftWidthPolicy::tree_exploring() const noexcept {
-  if (steps_ < kWarmupSteps || forced_recently()) return 0;
+  if (warming() || forced_recently()) return 0;
   const std::size_t r = next_sample(costs().tree, 0);
   return r < kTreeRows.size() ? kTreeRows[r] : 0;
 }
@@ -579,7 +584,7 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
       std::min<std::size_t>(chain_prefix.size(), kMaxRows));
   const bool chain = chain_rows >= 2;
   // Warming up: the rung a chain would take.
-  if (steps_ < kWarmupSteps) return fit(kTreeRows[1]);
+  if (warming()) return fit(kTreeRows[1]);
   if (const std::uint32_t rows = tree_exploring(); rows != 0) return fit(rows);
   if (chain && exploring() != 0) return 0;
   // A rung unmeasured for long enough is measured again, whatever it costs,
@@ -617,11 +622,16 @@ std::uint32_t DraftWidthPolicy::tree_nodes(std::span<const double> value_prefix,
 void DraftWidthPolicy::observe_tree_step(std::uint32_t rows, std::uint64_t ns) {
   const std::size_t r = tree_rung(rows);
   if (r >= kTreeRows.size()) return;
-  if (steps_ >= kWarmupSteps && rows == tree_exploring()) {
+  if (!warming() && rows == tree_exploring()) {
     last_forced_ = steps_;
     forced_any_ = true;
   }
-  if (steps_++ < kWarmupSteps) return;
+  if (warming()) {
+    ++steps_;
+    busy_ns_ += ns;
+    return;
+  }
+  ++steps_;
   // A level of its own that follows the context, and per-rung offsets, as
   // the chain widths have.
   observe_cost(costs().tree, r, static_cast<double>(ns),
