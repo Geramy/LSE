@@ -207,6 +207,7 @@ add_library(lse_graph
   src/graph/ops.cpp
   src/graph/partitioner.cpp
   src/graph/workgroup.cpp
+  src/graph/launch_template.cpp
   src/graph/program.cpp
   src/graph/primitive.cpp
   src/graph/primitives_builtin.cpp

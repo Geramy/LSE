@@ -54,11 +54,16 @@ std::uint64_t program_signature(std::span<const NodePtr> order) noexcept {
 void Program::retain(std::span<const NodePtr> roots,
                      std::vector<Workgroup> phases,
                      std::vector<FusionGroup> groups,
-                     std::span<const NodePtr> compute_order) {
+                     std::span<const NodePtr> compute_order,
+                     std::span<const NodePtr> reachable) {
   roots_.assign(roots.begin(), roots.end());
   nodes_.clear();
-  std::unordered_set<const Node*> seen;
-  for (const NodePtr& r : roots_) collect_reachable(r, nodes_, seen);
+  if (!reachable.empty()) {
+    nodes_.assign(reachable.begin(), reachable.end());
+  } else {
+    std::unordered_set<const Node*> seen;
+    for (const NodePtr& r : roots_) collect_reachable(r, nodes_, seen);
+  }
   view_ownership_.clear();
   for (const auto& node : nodes_)
     if (node->kind == OpKind::kSlice || node->kind == OpKind::kReshape)
@@ -153,8 +158,13 @@ const EmittedKernel* Program::cached_emission(
   const EmissionCache& cached = emissions_[index];
   if (cached.group != &group || cached.backend != backend ||
       cached.emitter != emitter || cached.arch != arch ||
-      !cached.kernel.has_value() ||
+      (!cached.kernel.has_value() && !cached.make) ||
       cached.aliases != group_bindings_may_alias(group)) return nullptr;
+  if (!cached.kernel.has_value()) {
+    cached.kernel = cached.make(nodes_);
+    cached.make = nullptr;
+    if (!cached.kernel.has_value()) return nullptr;
+  }
   *key = cached.key;
   return &*cached.kernel;
 }
@@ -173,6 +183,33 @@ const EmittedKernel* Program::cache_emission(
   cached.arch = arch;
   cached.kernel.emplace(std::move(kernel));
   return &*cached.kernel;
+}
+
+const EmittedKernel* Program::cache_emission(
+    std::size_t index, const FusionGroup& group,
+    const backend::IBackend* backend, const IKernelEmitter* emitter,
+    std::uint64_t key, std::string_view arch, EmittedKernel kernel, bool aliases) {
+  const EmittedKernel* cached = cache_emission(index, group, backend, emitter, key, arch,
+                                               std::move(kernel));
+  if (cached != nullptr) emissions_[index].aliases = aliases;
+  return cached;
+}
+
+void Program::defer_emission(
+    std::size_t index, const FusionGroup& group,
+    const backend::IBackend* backend, const IKernelEmitter* emitter,
+    std::uint64_t key, std::string_view arch, bool aliases,
+    std::function<std::optional<EmittedKernel>(std::span<const NodePtr>)> make) {
+  if (index >= emissions_.size()) return;
+  EmissionCache& cached = emissions_[index];
+  cached.group = &group;
+  cached.backend = backend;
+  cached.emitter = emitter;
+  cached.key = key;
+  cached.aliases = aliases;
+  cached.arch = arch;
+  cached.kernel.reset();
+  cached.make = std::move(make);
 }
 
 bool Program::holds(std::span<const NodePtr> roots) const noexcept {

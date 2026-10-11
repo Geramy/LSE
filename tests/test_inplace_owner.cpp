@@ -14,6 +14,12 @@
 using namespace lse;
 using namespace lse::graph;
 namespace {
+// Where a buffer's bytes start: a slot is a window of a shared allocation,
+// so its address is the allocation's plus the window's offset.
+inline std::byte* bytes_of(const backend::DeviceBuffer& b) {
+  return static_cast<std::byte*>(b.ptr) + b.offset;
+}
+
 struct AllocationTestKernel final : KernelPrimitive<AllocationTestKernel> {
   static constexpr std::string_view kName = "allocation_test";
   static constexpr std::string_view kEntry = "allocation_test";
@@ -106,16 +112,16 @@ void check_alias_lifetime(bool nested, bool shorter, bool escapes, int index) {
   }
   LSE_EXPECT(stage->buffer.valid());
   LSE_EXPECT(view->buffer.valid());
-  LSE_EXPECT(stage->buffer.ptr == view->buffer.ptr);
+  LSE_EXPECT(bytes_of(stage->buffer) == bytes_of(view->buffer));
   LSE_EXPECT(view->buffer.size_bytes >= view->element_count() * sizeof(float));
-  LSE_EXPECT(stage->buffer.ptr != temporary->buffer.ptr);
-  LSE_EXPECT(stage->buffer.ptr != after->buffer.ptr);
-  LSE_EXPECT(stage->buffer.ptr != late->buffer.ptr);
-  auto *data = static_cast<float *>(stage->buffer.ptr);
+  LSE_EXPECT(bytes_of(stage->buffer) != bytes_of(temporary->buffer));
+  LSE_EXPECT(bytes_of(stage->buffer) != bytes_of(after->buffer));
+  LSE_EXPECT(bytes_of(stage->buffer) != bytes_of(late->buffer));
+  auto *data = reinterpret_cast<float *>(bytes_of(stage->buffer));
   std::fill(data, data + 1024, 3.25f);
-  auto *scratch = static_cast<float *>(temporary->buffer.ptr);
+  auto *scratch = reinterpret_cast<float *>(bytes_of(temporary->buffer));
   std::fill(scratch, scratch + 1024, -11.f);
-  auto *actual = static_cast<float *>(view->buffer.ptr);
+  auto *actual = reinterpret_cast<float *>(bytes_of(view->buffer));
   for (size_t i = 0; i < view->element_count(); ++i)
     LSE_EXPECT(actual[i] == 3.25f);
 }
@@ -289,10 +295,15 @@ LSE_TEST(escaped_contiguous_slice_pins_the_upstream_slot_owner) {
   const NodePtr roots[]{escaped, later};
   workgroup.plan_slots(roots, separate_launches(order));
   LSE_EXPECT_OK(workgroup.bind_slots(backend));
-  LSE_EXPECT(stage->buffer.storage != temporary->buffer.storage);
-  LSE_EXPECT(stage->buffer.storage != later->buffer.storage);
+  // Slots are windows of one allocation: distinct windows, not distinct
+  // allocations, are what keeps the escaped view's owner from being reused.
+  const auto disjoint = [](const backend::DeviceBuffer& x, const backend::DeviceBuffer& y) {
+    return x.offset + x.size_bytes <= y.offset || y.offset + y.size_bytes <= x.offset;
+  };
+  LSE_EXPECT(disjoint(stage->buffer, temporary->buffer));
+  LSE_EXPECT(disjoint(stage->buffer, later->buffer));
   LSE_EXPECT(escaped->buffer.storage == stage->buffer.storage);
-  LSE_EXPECT_EQ(escaped->buffer.offset, 512u * sizeof(float));
+  LSE_EXPECT_EQ(escaped->buffer.offset, stage->buffer.offset + 512u * sizeof(float));
   LSE_EXPECT_EQ(escaped->buffer.size_bytes, 256u * sizeof(float));
 }
 
@@ -533,7 +544,7 @@ class FailingAllocationCpu : public backend::CpuBackend {
  public:
   Result<backend::DeviceBuffer> allocate(std::size_t bytes,
       backend::MemoryClass cls, backend::Stream stream) {
-    if (++attempts == 2) return LSE_ERROR(kOutOfMemory, "injected allocation failure");
+    if (++attempts == 1) return LSE_ERROR(kOutOfMemory, "injected allocation failure");
     return backend::CpuBackend::allocate(bytes, cls, stream);
   }
   Result<std::size_t> sample_free_memory() const { return std::size_t{4096}; }
@@ -554,18 +565,21 @@ LSE_TEST(slot_allocation_failure_keeps_original_status_and_size_context) {
   const NodePtr roots[]{first, second};
   const std::vector<NodePtr> order{first, second};
   workgroup.plan_slots(roots, separate_launches(order));
+  // Both slots are windows of one allocation: 16 and 32 bytes, each rounded
+  // up to the 256-byte window alignment.
   const auto failed = workgroup.bind_slots(backend);
   LSE_EXPECT(!failed.ok());
   LSE_EXPECT(failed.code() == StatusCode::kOutOfMemory);
-  LSE_EXPECT(failed.message().find("32 bytes") != std::string::npos);
+  LSE_EXPECT(failed.message().find("512 bytes") != std::string::npos);
   LSE_EXPECT(failed.message().find("available 4096") != std::string::npos);
   LSE_EXPECT(failed.message().find("injected allocation failure") != std::string::npos);
-  LSE_EXPECT_EQ(backend.impl().attempts, 2);
+  LSE_EXPECT_EQ(backend.impl().attempts, 1);
   LSE_EXPECT(!first->buffer.valid() && !second->buffer.valid());
   LSE_EXPECT_OK(workgroup.bind_slots(backend));
-  LSE_EXPECT_EQ(backend.impl().attempts, 3);
+  LSE_EXPECT_EQ(backend.impl().attempts, 2);
   LSE_EXPECT(first->buffer.valid() && second->buffer.valid());
-  LSE_EXPECT(first->buffer.storage != second->buffer.storage);
+  LSE_EXPECT(first->buffer.storage == second->buffer.storage);
+  LSE_EXPECT(first->buffer.offset != second->buffer.offset);
 }
 
 LSE_TEST_MAIN()
@@ -587,8 +601,8 @@ LSE_TEST(repeated_operand_does_not_hide_an_external_consumer) {
   const NodePtr roots[]{final, outside};
   workgroup.plan_slots(roots, separate_launches(order));
   LSE_EXPECT_OK(workgroup.bind_slots(backend));
-  LSE_EXPECT(stage->buffer.ptr != scratch->buffer.ptr);
-  std::fill_n(static_cast<float*>(stage->buffer.ptr), 1024, 3.25f);
-  std::fill_n(static_cast<float*>(scratch->buffer.ptr), 1024, -11.0f);
-  LSE_EXPECT_EQ(static_cast<float*>(stage->buffer.ptr)[0], 3.25f);
+  LSE_EXPECT(bytes_of(stage->buffer) != bytes_of(scratch->buffer));
+  std::fill_n(reinterpret_cast<float*>(bytes_of(stage->buffer)), 1024, 3.25f);
+  std::fill_n(reinterpret_cast<float*>(bytes_of(scratch->buffer)), 1024, -11.0f);
+  LSE_EXPECT_EQ(reinterpret_cast<float*>(bytes_of(stage->buffer))[0], 3.25f);
 }

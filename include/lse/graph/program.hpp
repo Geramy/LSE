@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -27,9 +28,12 @@ class Program {
  public:
   Program() = default;
 
+  // `reachable`, when given, is every node reachable from `roots` in the
+  // order collect_reachable lists them (template_nodes), which spares the walk.
   void retain(std::span<const NodePtr> roots, std::vector<Workgroup> phases,
               std::vector<FusionGroup> groups,
-              std::span<const NodePtr> compute_order);
+              std::span<const NodePtr> compute_order,
+              std::span<const NodePtr> reachable = {});
   void destroy() noexcept;
 
   [[nodiscard]] bool empty() const noexcept { return roots_.empty(); }
@@ -66,6 +70,21 @@ class Program {
       std::size_t index, const FusionGroup& group,
       const backend::IBackend* backend, const IKernelEmitter* emitter,
       std::uint64_t key, std::string_view arch, EmittedKernel kernel);
+  // A description written the first time a dispatch asks for it, by `make`
+  // over this program's nodes (a launch template's, whose descriptions name
+  // nodes by position): the writing then overlaps the launches before it
+  // instead of delaying the first.
+  void defer_emission(std::size_t index, const FusionGroup& group,
+                      const backend::IBackend* backend, const IKernelEmitter* emitter,
+                      std::uint64_t key, std::string_view arch, bool aliases,
+                      std::function<std::optional<EmittedKernel>(std::span<const NodePtr>)> make);
+  // The same, for a description written when the group's buffers stood as
+  // `aliases` says (a launch template's, or a build's written before its
+  // buffers were final): a replay whose buffers alias otherwise misses.
+  [[nodiscard]] const EmittedKernel* cache_emission(
+      std::size_t index, const FusionGroup& group,
+      const backend::IBackend* backend, const IKernelEmitter* emitter,
+      std::uint64_t key, std::string_view arch, EmittedKernel kernel, bool aliases);
 
   // Replay launch cuts onto a newly built isomorphic DAG.
   [[nodiscard]] std::vector<FusionGroup> remap(
@@ -111,7 +130,9 @@ class Program {
     std::uint64_t key = 0;
     bool aliases = false;
     std::string arch;
-    std::optional<EmittedKernel> kernel;
+    mutable std::optional<EmittedKernel> kernel;
+    // Writes `kernel` over this program's nodes on first use (defer_emission).
+    mutable std::function<std::optional<EmittedKernel>(std::span<const NodePtr>)> make;
   };
   std::vector<EmissionCache> emissions_;
   std::vector<Carry> carries_;

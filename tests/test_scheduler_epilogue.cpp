@@ -140,6 +140,10 @@ LSE_TEST(final_launch_slots_keep_reduction_input_live_through_fused_epilogue) {
     backend.impl().audit_ranges = true;
     Scheduler scheduler(backend);
     scheduler.set_dialect(Dialect::kLoom);
+    // The audit reads which bindings a launch writes from the emitter's last
+    // emission, so every launch here has to be emitted: no launch template,
+    // whose first replay reads the build's descriptions instead.
+    scheduler.set_launch_templates(false);
     const Shape parent_shape{1, rows, 5 * heads * 128};
     auto buffer = backend.allocate(parent_shape.elem_count() * sizeof(float),
                                     backend::MemoryClass::kDevice,
@@ -163,7 +167,9 @@ LSE_TEST(final_launch_slots_keep_reduction_input_live_through_fused_epilogue) {
     LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 3u);
     LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
     LSE_EXPECT(!backend.impl().overlapped);
-    LSE_EXPECT(activation.node()->buffer.ptr != scaled.node()->buffer.ptr);
+    // Distinct windows; slots may share one allocation.
+    LSE_EXPECT(static_cast<char*>(activation.node()->buffer.ptr) + activation.node()->buffer.offset !=
+               static_cast<char*>(scaled.node()->buffer.ptr) + scaled.node()->buffer.offset);
     if (rows == 1) {
       // The contiguous slice has no temporary slot to recycle.
       LSE_EXPECT(is_buffer_view(*cut.node()));

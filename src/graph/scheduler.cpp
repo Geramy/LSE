@@ -25,6 +25,7 @@
 #include "lse/graph/fallback.hpp"
 #include "lse/graph/interpreter.hpp"
 #include "lse/graph/jit.hpp"
+#include "lse/graph/launch_template.hpp"
 #include "lse/graph/program.hpp"
 #include "lse/graph/stream_plan.hpp"
 #include "lse/graph/kernel_primitive.hpp"
@@ -156,6 +157,21 @@ struct Scheduler::Impl {
   std::optional<ConstKey> pending_constant;
   // Entry name of the kernel the last dispatch emitted, for failure reports.
   std::string last_entry;
+  // Launch templates by key, compared in full; at most kMaxTemplates, the
+  // least recently taken dropped first. Host memory only: a template holds no
+  // node and no buffer.
+  static constexpr std::size_t kMaxTemplates = 48;
+  struct TemplateEntry {
+    std::shared_ptr<const LaunchTemplate> plan;
+    std::uint64_t last_used = 0;
+  };
+  std::unordered_map<std::string, TemplateEntry> templates;
+  std::uint64_t template_clock = 0;
+  bool templates_on = true;
+  bool template_check = false;
+  // This step took a template and checks it (set_template_check).
+  bool template_step_check = false;
+  Scheduler::TemplateStats template_stats;
   // How far the last dispatch got: a group the emitter declines has no
   // device kernel (the CPU fallback's case); a failure after emission is a
   // compile or device error.
@@ -700,10 +716,22 @@ Result<std::uint32_t> run_variant_trial(const VariantTrial& t, std::string& note
 
 }  // namespace
 
+struct Scheduler::DispatchRecord {
+  bool kernel = false;
+  EmittedKernel emitted;
+  std::uint64_t ident = 0;
+  bool aliases = false;
+  std::uint64_t variant_key = 0;
+  std::uint32_t variant = 0;
+  // A variant trial could run: the decision was still to be made.
+  bool trial = false;
+};
+
 Status Scheduler::try_dispatch_group(const FusionGroup& group,
                                      backend::Stream stream,
                                      std::size_t member, Program* replay,
-                                     std::size_t group_index) {
+                                     std::size_t group_index,
+                                     DispatchRecord* record) {
   backend::IBackend& be = devices_.device(member);
   // The dialect this run asked for if this member declares it, and this
   // member's own first choice otherwise. Both halves come from the one
@@ -768,8 +796,37 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       emitted = &*transient;
     }
   }
+  if (impl_->template_step_check && replay != nullptr && !fresh_emission) {
+    // A step on a launch template under set_template_check: the description
+    // a fresh emission would write here, against the template's.
+    const auto fresh_pick = impl_->pick_variant(*emitter, tc->compiler, group, be.device_info());
+    const EmissionVariantScope fresh_scope(fresh_pick.variant);
+    auto fresh = emitter->emit_launch(group, be.device_info());
+    if (!fresh.ok()) return fresh.status();
+    EmittedKernel written = fresh.release();
+    written.source.clear();
+    EmittedKernel taken = *emitted;
+    taken.source.clear();
+    if (const std::string differs = emission_difference(written, taken); !differs.empty())
+      return LSE_ERROR(kInternal, "launch template: the description of ",
+                       describe_group(group, group_index),
+                       " differs from a fresh emission's in its ", differs);
+    if (emitter->cache_key(group, be.device_info()) != ident)
+      return LSE_ERROR(kInternal, "launch template: ", describe_group(group, group_index),
+                       " names another kernel than a fresh emission");
+  }
   const auto t_emitted = SpanClock::now();
   trace_.spans.emit.add(elapsed_ns(t_emit, t_emitted));
+  if (record != nullptr) {
+    record->kernel = true;
+    record->emitted = *emitted;
+    record->emitted.source.clear();
+    record->ident = ident;
+    record->aliases = group_bindings_may_alias(group);
+    record->variant_key = pick.offered > 1 ? pick.key : 0;
+    record->variant = pick.variant;
+    record->trial = pick.trial;
+  }
   impl_->last_entry = emitted->entry_name;
   impl_->dispatch_stage = DispatchStage::kCompileOrLaunch;
 
@@ -1501,8 +1558,52 @@ Status Scheduler::prepare(std::span<const NodePtr> roots) {
   // The same rewrite, phases and launch cut a first eval of these roots makes.
   optimize_quant_swiglu(roots, devices_.device(primary).device_info(), *emitter,
                         primary);
+  // The launch template a first eval of these roots would record, so that
+  // eval takes it instead (launch_template.hpp).
+  const bool templating = impl_->templates_on && devices_.size() == 1;
+  std::vector<NodePtr> tnodes;
+  std::string template_key;
+  if (templating) {
+    tnodes = template_nodes(roots);
+    template_key = launch_template_key(tnodes, roots, template_context());
+  }
   auto planned = Partitioner::phases(roots, &backend().device_info());
   const std::vector<FusionGroup> groups = launch_groups(roots, planned, *emitter);
+  if (templating && !impl_->templates.contains(template_key)) {
+    for (Workgroup& wg : planned) wg.plan_slots(roots, groups);
+    std::vector<DispatchRecord> records(groups.size());
+    bool complete = true;
+    backend::IBackend& be = devices_.device(primary);
+    for (std::size_t i = 0; i < groups.size() && complete; ++i) {
+      const FusionGroup& g = groups[i];
+      if (views_only(g)) continue;
+      const Impl::VariantPick pick =
+          impl_->pick_variant(*emitter, tc->compiler, g, be.device_info());
+      // A variant still to be measured is decided by the first eval, whose
+      // plan is the one to keep.
+      if (pick.trial) {
+        complete = false;
+        break;
+      }
+      const EmissionVariantScope scope(pick.variant);
+      auto described = emitter->emit_launch(g, be.device_info());
+      if (!described.ok()) {
+        complete = false;
+        break;
+      }
+      DispatchRecord& r = records[i];
+      r.kernel = true;
+      r.emitted = described.release();
+      r.emitted.source.clear();
+      r.ident = emitter->cache_key(g, be.device_info());
+      r.aliases = group_bindings_may_alias(g);
+      r.variant_key = pick.offered > 1 ? pick.key : 0;
+      r.variant = pick.variant;
+    }
+    if (complete)
+      record_launch_template(tnodes, std::move(template_key), groups, planned, records,
+                             *emitter, nullptr);
+  }
   // What is not yet resident, per member: restored from the launch index
   // when this exact set was prepared before, else emitted in full and loaded
   // together.
@@ -1907,9 +2008,251 @@ std::vector<FusionGroup> Scheduler::launch_groups(std::span<const NodePtr> roots
   return phase_groups;
 }
 
+Scheduler::TemplateStats Scheduler::template_stats() const noexcept {
+  return impl_->template_stats;
+}
+void Scheduler::set_launch_templates(bool on) noexcept {
+  impl_->templates_on = on;
+  if (!on) impl_->templates.clear();
+}
+void Scheduler::set_template_check(bool on) noexcept { impl_->template_check = on; }
+
+std::string Scheduler::template_context() const {
+  const std::size_t primary = devices_.primary();
+  const KernelToolchain* tc = toolchain(primary);
+  std::string c;
+  c += backend().device_info().arch;
+  c += '|';
+  c += std::to_string(devices_.size());
+  c += '|';
+  c += std::to_string(primary);
+  c += '|';
+  c += dialect_ ? std::string(to_string(*dialect_)) : std::string("-");
+  c += '|';
+  c += std::to_string(static_cast<int>(mode_));
+  c += '|';
+  c += std::to_string(reinterpret_cast<std::uintptr_t>(tc ? tc->emitter : nullptr));
+  c += '|';
+  if (tc != nullptr && tc->compiler != nullptr) {
+    auto [it, fresh] = impl_->compiler_ids.try_emplace(tc->compiler);
+    if (fresh) it->second = tc->compiler->identity();
+    c += it->second;
+  }
+  c += '|';
+  c += kernel_cache_version();
+  c += '|';
+  c += engine_build_identity();
+  return c;
+}
+
+Status Scheduler::bind_phase_slots(Workgroup& wg) {
+  // A workgroup is member-homogeneous by construction (the partitioner
+  // splits phases where a value changes members), so its slots belong on
+  // that member — allocated through the member's backend and stream, or
+  // every member's phase activations land on the primary and each launch
+  // reads them across the link.
+  std::size_t wg_member = devices_.primary();
+  for (const NodePtr& n : wg.members()) {
+    if (n && n->member != Node::kAnyMember &&
+        static_cast<std::size_t>(n->member) < devices_.size()) {
+      wg_member = static_cast<std::size_t>(n->member);
+      break;
+    }
+  }
+  const backend::Stream wg_stream =
+      devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
+  LSE_RETURN_IF_ERROR(wg.bind_slots(devices_.device(wg_member), wg_stream));
+  trace_.slots_reused += wg.reused_slots();
+  trace_.slots_allocated += wg.slot_count();
+  return OkStatus();
+}
+
+void Scheduler::record_launch_template(std::span<const NodePtr> nodes, std::string key,
+                                       std::span<const FusionGroup> groups,
+                                       std::span<const Workgroup> phases,
+                                       std::span<const DispatchRecord> records,
+                                       const IKernelEmitter& emitter, Program* rec) {
+  if (records.size() != groups.size()) return;
+  for (const DispatchRecord& r : records)
+    if (r.trial) return;
+  const auto at = node_positions(nodes);
+  const auto position = [&](const NodePtr& n, std::uint32_t& out) {
+    if (!n) {
+      out = 0xFFFFFFFEu;
+      return true;
+    }
+    const auto it = at.find(n.get());
+    if (it == at.end()) return false;
+    out = it->second;
+    return true;
+  };
+  LaunchTemplate t;
+  t.launches.reserve(groups.size());
+  backend::IBackend& be = devices_.device(devices_.primary());
+  for (std::size_t i = 0; i < groups.size(); ++i) {
+    const FusionGroup& g = groups[i];
+    const DispatchRecord& r = records[i];
+    LaunchTemplate::Launch l;
+    const auto take = [&](const std::vector<NodePtr>& from, std::vector<std::uint32_t>& to) {
+      to.reserve(from.size());
+      for (const NodePtr& n : from) {
+        std::uint32_t p = 0;
+        if (!n || !position(n, p)) return false;
+        to.push_back(p);
+      }
+      return true;
+    };
+    if (!take(g.nodes, l.nodes) || !take(g.inputs, l.inputs) || !take(g.outputs, l.outputs))
+      return;
+    l.anchor = g.anchor;
+    l.anchor_class = g.anchor_class;
+    l.launches = g.launches;
+    l.is_phase = g.is_phase;
+    if (r.kernel) {
+      l.kernel = true;
+      // The description without its text: a replay whose kernel is no longer
+      // resident writes the full emission again.
+      EmittedKernel described = r.emitted;
+      described.source.clear();
+      l.emitted = described;
+      l.emitted.binding_order.clear();
+      l.binding.reserve(described.binding_order.size());
+      for (const NodePtr& n : described.binding_order) {
+        std::uint32_t p = 0;
+        if (!position(n, p)) return;
+        l.binding.push_back(p);
+      }
+      l.ident = r.ident;
+      l.aliases = r.aliases;
+      l.variant_key = r.variant_key;
+      l.variant = r.variant;
+      // The first replay of this program reads the same description.
+      if (rec != nullptr)
+        (void)rec->cache_emission(i, g, &be, &emitter, r.ident, be.device_info().arch,
+                                  std::move(described), r.aliases);
+    }
+    t.launches.push_back(std::move(l));
+  }
+  for (const Workgroup& wg : phases) {
+    auto shape = wg.shape(at);
+    if (!shape) return;
+    t.phases.push_back(std::move(*shape));
+  }
+  t.key = key;
+  if (impl_->templates.size() >= Impl::kMaxTemplates) {
+    auto oldest = impl_->templates.begin();
+    for (auto it = impl_->templates.begin(); it != impl_->templates.end(); ++it)
+      if (it->second.last_used < oldest->second.last_used) oldest = it;
+    impl_->templates.erase(oldest);
+  }
+  impl_->templates.insert_or_assign(
+      std::move(key), Impl::TemplateEntry{std::make_shared<LaunchTemplate>(std::move(t)),
+                                          ++impl_->template_clock});
+  ++impl_->template_stats.recorded;
+}
+
+Result<bool> Scheduler::apply_launch_template(std::span<const NodePtr> roots,
+                                              std::span<const NodePtr> order,
+                                              std::span<const NodePtr> nodes,
+                                              const std::string& key, Program& rec,
+                                              const IKernelEmitter& emitter) {
+  const auto found = impl_->templates.find(key);
+  if (found == impl_->templates.end()) return false;
+  const std::shared_ptr<const LaunchTemplate> held = found->second.plan;
+  const LaunchTemplate& t = *held;
+  // Each launch's variant as a fresh emission would pick it now: decided,
+  // the decision; undecided, variant 0 once trials are closed, and a trial
+  // (which a template cannot run) while they are open.
+  for (const LaunchTemplate::Launch& l : t.launches) {
+    if (l.variant_key == 0) continue;
+    const auto decided = impl_->variants.decided(l.variant_key);
+    const bool holds = decided ? *decided == l.variant
+                               : !impl_->variant_trials_open && l.variant == 0;
+    if (!holds) {
+      ++impl_->template_stats.stale;
+      impl_->templates.erase(found);
+      return false;
+    }
+  }
+  std::vector<FusionGroup> groups;
+  groups.reserve(t.launches.size());
+  for (const LaunchTemplate::Launch& l : t.launches) {
+    auto g = template_group(l, nodes);
+    if (!g) return LSE_ERROR(kInternal, "a launch template names a node its graph does not have");
+    groups.push_back(std::move(*g));
+  }
+  std::vector<Workgroup> planned;
+  planned.reserve(t.phases.size());
+  for (const WorkgroupShape& shape : t.phases) {
+    auto wg = Workgroup::from_shape(shape, nodes);
+    if (!wg) return LSE_ERROR(kInternal, "a launch template's phase names a node its graph does not have");
+    planned.push_back(std::move(*wg));
+  }
+  if (impl_->template_check) {
+    // The fresh split, plan and descriptions of this graph, against the
+    // template's. Nothing is bound or dispatched for them.
+    auto fresh_planned = Partitioner::phases(roots, &backend().device_info());
+    const std::vector<FusionGroup> fresh = launch_groups(roots, fresh_planned, emitter);
+    if (fresh.size() != groups.size())
+      return LSE_ERROR(kInternal, "launch template: ", std::to_string(groups.size()),
+                       " launches against a fresh split's ", std::to_string(fresh.size()));
+    for (std::size_t i = 0; i < fresh.size(); ++i)
+      if (!same_launch_group(fresh[i], groups[i]))
+        return LSE_ERROR(kInternal, "launch template: launch ", std::to_string(i), " (",
+                         describe_group(groups[i], i), ") differs from a fresh split's (",
+                         describe_group(fresh[i], i), ")");
+    if (fresh_planned.size() != planned.size())
+      return LSE_ERROR(kInternal, "launch template: ", std::to_string(planned.size()),
+                       " phases against a fresh split's ", std::to_string(fresh_planned.size()));
+    const auto at = node_positions(nodes);
+    for (std::size_t i = 0; i < fresh_planned.size(); ++i) {
+      fresh_planned[i].plan_slots(roots, fresh);
+      const auto a = fresh_planned[i].shape(at);
+      const auto b = planned[i].shape(at);
+      auto slot_of_a = a ? a->slot_of : decltype(a->slot_of){};
+      auto slot_of_b = b ? b->slot_of : decltype(b->slot_of){};
+      std::sort(slot_of_a.begin(), slot_of_a.end());
+      std::sort(slot_of_b.begin(), slot_of_b.end());
+      auto inputs_a = a ? a->member_inputs : std::vector<std::uint32_t>{};
+      auto inputs_b = b ? b->member_inputs : std::vector<std::uint32_t>{};
+      std::sort(inputs_a.begin(), inputs_a.end());
+      std::sort(inputs_b.begin(), inputs_b.end());
+      if (!a || !b || a->members != b->members || inputs_a != inputs_b ||
+          a->lds_used != b->lds_used || a->job != b->job || a->rows != b->rows ||
+          a->reused != b->reused || a->slot_bytes != b->slot_bytes || slot_of_a != slot_of_b)
+        return LSE_ERROR(kInternal, "launch template: phase ", std::to_string(i),
+                         " or its slots differ from a fresh plan's");
+    }
+    for (std::size_t i = 0; i < fresh.size(); ++i)
+      if (views_only(fresh[i]) != !t.launches[i].kernel)
+        return LSE_ERROR(kInternal, "launch template: launch ", std::to_string(i), " is ",
+                         t.launches[i].kernel ? "a kernel" : "views only",
+                         " and a fresh split's is not");
+    // Each description is checked where a fresh one is written, at its
+    // dispatch, against the buffers the launches before it left
+    // (try_dispatch_group): what a description says depends on them.
+    impl_->template_step_check = true;
+  }
+  for (Workgroup& wg : planned) LSE_RETURN_IF_ERROR(bind_phase_slots(wg));
+  rec.retain(roots, std::move(planned), std::move(groups), order, nodes);
+  backend::IBackend& be = devices_.device(devices_.primary());
+  for (std::size_t i = 0; i < t.launches.size(); ++i) {
+    const LaunchTemplate::Launch& l = t.launches[i];
+    if (!l.kernel) continue;
+    rec.defer_emission(i, rec.groups()[i], &be, &emitter, l.ident, be.device_info().arch,
+                       l.aliases, [held, i](std::span<const NodePtr> program_nodes) {
+                         return template_emission(held->launches[i], program_nodes);
+                       });
+  }
+  found->second.last_used = ++impl_->template_clock;
+  ++impl_->template_stats.applied;
+  return true;
+}
+
 Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
                             Program* plan) {
   Program& rec = plan != nullptr ? *plan : impl_->program;
+  impl_->template_step_check = false;
   // Asked once. Four sites below need it and it is a virtual call on a
   // device-first step, and a compiler that cannot see through the repeat cannot
   // see that the null check already happened either.
@@ -1982,6 +2325,28 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
   // ones and pays none of it, which is why this and `schedule` are two spans
   // and not one.
   SpanTimer build_span(trace_.spans.partition, setup_span.close());
+  // A graph this scheduler has not run: the launch plan recorded for an
+  // earlier graph with the same key takes the place of splitting, planning
+  // and describing this one (launch_template.hpp). One device only; a set
+  // places groups per step.
+  std::vector<NodePtr> tnodes;
+  std::string template_key;
+  const bool templating =
+      device_first && !replayed && impl_->templates_on && devices_.size() == 1;
+  if (templating) {
+    tnodes = template_nodes(roots);
+    template_key = launch_template_key(tnodes, roots, template_context());
+    LSE_ASSIGN_OR(const bool applied, apply_launch_template(roots, order, tnodes,
+                                                            template_key, rec, *emitter));
+    if (applied) {
+      replayed = true;
+      trace_.replayed = true;
+      trace_.phase_groups = static_cast<std::uint32_t>(rec.phases().size());
+      if (trace_.phase_groups == 0) trace_.phase_groups = 1;
+      trace_.phase_ideal_launches = 1;
+    }
+  }
+  const bool recording = templating && !replayed;
   if (!replayed) ++trace_.partition_passes;
   auto planned = replayed
                      ? std::vector<Workgroup>{}
@@ -2006,26 +2371,11 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
       // present in Workgroup::cuts(). Plan against the launches we will issue,
       // otherwise a fused output can overwrite a still-live reduction input.
       wg.plan_slots(roots, phase_groups);
-      // A workgroup is member-homogeneous by construction (the partitioner
-      // splits phases where a value changes members), so its slots belong on
-      // that member — allocated through the member's backend and stream, or
-      // every member's phase activations land on the primary and each launch
-      // reads them across the link.
-      std::size_t wg_member = devices_.primary();
-      for (const NodePtr& n : wg.members()) {
-        if (n && n->member != Node::kAnyMember &&
-            static_cast<std::size_t>(n->member) < devices_.size()) {
-          wg_member = static_cast<std::size_t>(n->member);
-          break;
-        }
-      }
-      const backend::Stream wg_stream =
-          devices_.stream_for(wg_member).value_or(backend::kDefaultStream);
-      LSE_RETURN_IF_ERROR(wg.bind_slots(devices_.device(wg_member), wg_stream));
-      trace_.slots_reused += wg.reused_slots();
-      trace_.slots_allocated += wg.slot_count();
+      LSE_RETURN_IF_ERROR(bind_phase_slots(wg));
     }
   }
+  std::vector<DispatchRecord> records;
+  if (recording) records.resize(phase_groups.size());
 
   std::vector<FusionGroup> ran;
   // Back to per-step setup: the stream plan and the entry barriers.
@@ -2224,7 +2574,8 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
           if (seen != nullptr) *seen = j;
         }
         if (st.ok()) st = try_dispatch_group(
-            g, on, gm, replayed ? &rec : nullptr, gi);
+            g, on, gm, replayed ? &rec : nullptr, gi,
+            recording && gi < records.size() ? &records[gi] : nullptr);
         if (st.ok() && impl_->plan.record_after[gi] != 0) {
           auto ev = gbe.record_event(on);
           if (ev.ok()) {
@@ -2289,7 +2640,12 @@ Status Scheduler::eval_step(std::span<const NodePtr> roots, bool pull_host,
         ++done;
       }
       {
-        if (!replayed) rec.retain(roots, std::move(planned), ran, order);
+        if (!replayed) {
+          rec.retain(roots, std::move(planned), ran, order, tnodes);
+          if (recording && trace_.host_groups == 0 && trace_.host_fallbacks == 0)
+            record_launch_template(tnodes, std::move(template_key), rec.groups(), rec.phases(),
+                                   records, *emitter, &rec);
+        }
         if (pull_host) {
           const auto t_wait = SpanClock::now();
           const Status waited = backend().synchronize();

@@ -344,6 +344,12 @@ if(NOT TARGET lse_backend_hrx)
 endif()
 
 if(TARGET lse_backend_cpu)
+  lse_add_test(test_launch_template lse_graph lse_kernels lse_ir lse_backend_cpu)
+  target_sources(test_launch_template PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_print.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_sources.cpp)
   lse_add_test(test_scheduler_epilogue lse_graph lse_kernels lse_ir lse_backend_cpu)
   target_sources(test_scheduler_epilogue PRIVATE
     ${CMAKE_SOURCE_DIR}/src/backends/hrx/loomc/loom_emitter.cpp
