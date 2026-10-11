@@ -9,6 +9,7 @@
 #include "lse/backends/hrx/device_info.hpp"
 #include "lse/dispatch/attention.hpp"
 
+#include "lse/kernels/residual_norm.hpp"
 #include "lse/kernels/vec_mem.hpp"
 #include "lse/graph/kernel_args.hpp"
 #include "lse/graph/kernel_env.hpp"
@@ -212,6 +213,168 @@ struct CooperativeRmsNormKernel final : KernelPrimitive<CooperativeRmsNormKernel
   }
 };
 LSE_REGISTER_PRIMITIVE(CooperativeRmsNormKernel);
+
+// A residual sum and its norm in one launch (graph::exact_residual_norm):
+//   x = residual + sum over slices of partial, r = rms_norm(x), p = panel(r).
+// Logical inputs: the [slices, ...] partial, the residual, the gain, x and
+// (optionally) p; x and p are written in place, r through the store hook.
+// One workgroup per row, as the cooperative norm, each lane holding its
+// columns' x in registers: the partial sum is the slice sum's (slice 0 first),
+// x is its epilogue add, and the squares, the 256-lane tree and the scale are
+// the cooperative norm's, in its order, so every output is the separate
+// launches' value.
+template <class G>
+struct ResidualNormArgs {
+  env::In<kir::f32, env::Emit> partial;
+  env::In<kir::f32, env::Emit> residual;
+  env::In<G, env::Emit> g;
+  env::InOut<kir::f32, env::Emit> x;
+  env::Out<kir::f32, env::Emit> out;
+};
+template <class G>
+struct ResidualNormPanelArgs {
+  env::In<kir::f32, env::Emit> partial;
+  env::In<kir::f32, env::Emit> residual;
+  env::In<G, env::Emit> g;
+  env::InOut<kir::f32, env::Emit> x;
+  env::InOut<lse::f16, env::Emit> panel;
+  env::Out<kir::f32, env::Emit> out;
+};
+
+struct ResidualRmsNormKernel final : KernelPrimitive<ResidualRmsNormKernel> {
+  static constexpr std::string_view kName = "rms_norm.residual_slices.v1";
+  static constexpr std::string_view kEntry = "lse_rms_norm_residual_slices_v1";
+  static constexpr std::string_view kSource = {};
+  std::size_t arity() const noexcept override { return 4; }
+  FusionClass fusion_class() const noexcept override { return FusionClass::kReduction; }
+  bool owns_indexing() const noexcept override { return true; }
+
+  static bool supported(const KernelShapes& s) {
+    if ((s.inputs.size() != 4 && s.inputs.size() != 5) || s.input_dtypes.size() != s.inputs.size() ||
+        !s.device || !s.intrinsics || s.types.scalar == nullptr ||
+        s.device->wavefront_size != 32 || s.device->max_threads_per_workgroup < kRmsBlock ||
+        backend::workgroup_lds_bytes(s.device) < kRmsScratch)
+      return false;
+    const Shape& part = s.inputs[0];
+    if (part.rank() < 2 || part.dim(0) < 1 || s.input_dtypes[0] != DType::kF32 ||
+        s.input_dtypes[1] != DType::kF32 || s.input_dtypes[3] != DType::kF32 ||
+        s.output_dtype != DType::kF32)
+      return false;
+    const auto gain = s.input_dtypes[2];
+    if (gain != DType::kF32 && gain != DType::kF16 && gain != DType::kBF16) return false;
+    const auto d = s.output.dim(s.output.rank() - 1);
+    const std::uint64_t count = s.output.elem_count();
+    if (d <= 0 || d % kRmsBlock != 0 || d / kRmsBlock > kRmsCachedPerLane ||
+        s.inputs[1] != s.output || s.inputs[3] != s.output ||
+        s.inputs[2].elem_count() != static_cast<std::uint64_t>(d) ||
+        part.elem_count() != static_cast<std::uint64_t>(part.dim(0)) * count ||
+        part.elem_count() > UINT32_MAX)
+      return false;
+    if (s.inputs.size() == 5 &&
+        (s.input_dtypes[4] != DType::kF16 || s.inputs[4].elem_count() != count || d % 8 != 0))
+      return false;
+    for (const char* op : {"thread.local_id", "thread.workgroup_id.x", "barrier", "fma", "rsqrt",
+                           "wave.shfl_xor"})
+      if (s.intrinsics->find(op).empty()) return false;
+    return true;
+  }
+
+  std::string emit_kernel(const KernelShapes& s) const override {
+    if (!supported(s) || !s.store) return {};
+    const bool with_panel = s.inputs.size() == 5;
+    return with_elem(s.input_dtypes[2], [&]<class G>() -> std::string {
+      kir::KernelBody k(s.types, *s.intrinsics, backend::workgroup_lds_bytes(s.device));
+      k.set_store(s.store);
+      if (with_panel) {
+        ResidualNormPanelArgs<G> a;
+        if (!env::bind(k, a, s)) return {};
+        return body(k, s, a, &a.panel);
+      }
+      ResidualNormArgs<G> a;
+      if (!env::bind(k, a, s)) return {};
+      return body(k, s, a, static_cast<env::InOut<lse::f16, env::Emit>*>(nullptr));
+    });
+  }
+
+  template <class A>
+  static std::string body(kir::KernelBody& k, const KernelShapes& s, A& a,
+                          env::InOut<lse::f16, env::Emit>* panel) {
+    env::Emit e{&k};
+    const auto d = static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 1));
+    const auto count = static_cast<std::uint32_t>(s.output.elem_count());
+    const auto slices = static_cast<std::uint32_t>(s.inputs[0].dim(0));
+    const auto lane = e.let(math::local_id());
+    const auto row = e.let(math::workgroup_id_x() * d);
+    std::vector<kir::Val<kir::f32>> values;
+    using GainT = std::remove_cvref_t<decltype(a.g[e.u32(0)])>;
+    std::vector<GainT> gains;
+    for (std::uint32_t col = 0; col < d; col += kRmsBlock) {
+      const auto index = e.let(row + lane + col);
+      auto sum = e.let(a.partial[index]);
+      for (std::uint32_t sl = 1; sl < slices; ++sl)
+        sum = e.let(sum + a.partial[e.let(index + sl * count)]);
+      const auto x = e.let(a.residual[index] + sum);
+      a.x[index] = x;
+      values.push_back(x);
+      gains.push_back(e.let(a.g[e.let(lane + col)]));
+    }
+    auto partial = e.var(0.0f);
+    for (const auto& value : values) partial = math::fma(value, value, partial.read());
+    auto sums = e.lds<kir::f32>(kRmsBlock);
+    if (!sums) return {};
+    sums[lane] = partial.read();
+    e.barrier();
+    if (auto first_wave = e.when(lane < 32u)) {
+      const auto a0 = e.let(sums[lane].read() + sums[lane + 128u].read());
+      const auto a1 = e.let(sums[lane + 64u].read() + sums[lane + 192u].read());
+      const auto a2 = e.let(sums[lane + 32u].read() + sums[lane + 160u].read());
+      const auto a3 = e.let(sums[lane + 96u].read() + sums[lane + 224u].read());
+      auto total = e.let((a0 + a1) + (a2 + a3));
+      for (std::uint32_t offset = 16; offset > 0; offset >>= 1)
+        total = e.let(total + math::shfl_xor(total, e.u32(offset)));
+      if (auto lead = e.when(lane == 0u)) sums[0] = total;
+    }
+    e.barrier();
+    const auto scale = e.let(math::rsqrt(sums[0].read() / static_cast<float>(d) + s.attrs[0]));
+    for (std::uint32_t offset = 0; offset < d; offset += kRmsBlock) {
+      const auto col = e.let(lane + offset);
+      const auto gain = math::widen(gains[offset / kRmsBlock]);
+      const auto weight = s.iattrs[0] != 0 ? e.f32(1.0f) + gain : gain;
+      const auto r = e.let(values[offset / kRmsBlock] * scale * weight);
+      const auto index = e.let(row + col);
+      if (panel != nullptr) {
+        // The panel's position (q4_gemm.cpp panel_slot): within each run of
+        // eight, k0,k4,k1,k5,k2,k6,k3,k7.
+        const auto at = e.let(index % 8u);
+        const auto slot = e.let(index - at + (at % 4u) * 2u + at / 4u);
+        (*panel)[slot] = math::narrow<lse::f16>(r);
+      }
+      e.store(index, r);
+    }
+    if (!k.lds().ok()) return {};
+    return k.str();
+  }
+
+  Result<Shape> infer_shape(std::span<const Shape> in) const override {
+    if (in.size() < 4) return LSE_ERROR(kInvalidArgument, "residual norm takes 4 or 5 inputs");
+    return in[1];
+  }
+  DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
+  static ThreadPlan plan_impl(const KernelShapes& s) {
+    ThreadPlan tp;
+    if (!supported(s)) return tp;
+    const auto d = static_cast<std::uint32_t>(s.output.dim(s.output.rank() - 1));
+    tp.workgroup_size[0] = kRmsBlock;
+    tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / d);
+    tp.lds_bytes = kRmsScratch;
+    return tp;
+  }
+};
+
+const graph::KernelPrimitiveBase* residual_norm_kernel() {
+  static const ResidualRmsNormKernel k;
+  return &k;
+}
 
 // FP32 RMS reduction; zero-centered gains add one before scaling.
 struct RmsNormKernel final : KernelPrimitive<RmsNormKernel> {

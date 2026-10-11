@@ -1912,6 +1912,10 @@ std::vector<FusionGroup> Scheduler::launch_groups(std::span<const NodePtr> roots
           continue;
         }
         if (staging == nullptr && phase_groups.size() > phase_begin &&
+            join_reduction(phase_groups.back(), n, emitter, backend().device_info())) {
+          continue;
+        }
+        if (staging == nullptr && phase_groups.size() > phase_begin &&
             join_epilogue_output(phase_groups.back(), n, emitter, backend().device_info())) {
           continue;
         }

@@ -68,8 +68,15 @@ class LoomEmitter final : public graph::IKernelEmitter {
   [[nodiscard]] bool joins_run(std::span<const graph::NodePtr> run,
                                const DeviceInfo& device) const override;
 
+  // A residual sum's norm (graph::exact_residual_norm), written with the sum
+  // by the fused residual norm.
+  [[nodiscard]] bool joins_reduction(const graph::FusionGroup& group,
+                                     const graph::NodePtr& next,
+                                     const DeviceInfo& device) const override;
+
   // When the anchor's chosen specialization owns its indexing and takes an
-  // epilogue: its store hook then stores the output too.
+  // epilogue: its store hook then stores the output too; and the panel of a
+  // fused residual norm's norm.
   [[nodiscard]] bool stores_epilogue_output(const graph::FusionGroup& group,
                                             const graph::Node& output,
                                             const DeviceInfo& device) const override;

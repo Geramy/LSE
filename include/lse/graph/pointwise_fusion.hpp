@@ -105,4 +105,25 @@ inline bool join_epilogue_output(FusionGroup &previous, const NodePtr &next,
   return true;
 }
 
+// A reduction reading a group's one output joins the group as one more output
+// where the emitter writes both in one kernel (IKernelEmitter::joins_reduction:
+// a residual sum and its norm). The group's output stays an output.
+inline bool join_reduction(FusionGroup &previous, const NodePtr &next,
+                           const IKernelEmitter &emitter, const backend::DeviceInfo &device) {
+  if (!next || next->materialized || previous.is_phase || previous.outputs.size() != 1 ||
+      next->inputs.empty() || next->inputs[0] != previous.outputs.front() ||
+      next->member != previous.outputs.front()->member ||
+      !emitter.joins_reduction(previous, next, device))
+    return false;
+  previous.nodes.push_back(next);
+  previous.outputs.push_back(next);
+  for (const NodePtr &input : next->inputs) {
+    if (std::find(previous.nodes.begin(), previous.nodes.end(), input) != previous.nodes.end())
+      continue;
+    if (std::find(previous.inputs.begin(), previous.inputs.end(), input) == previous.inputs.end())
+      previous.inputs.push_back(input);
+  }
+  return true;
+}
+
 } // namespace lse::graph

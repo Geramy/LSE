@@ -6,7 +6,8 @@
 // of `reps` replays. `--bands` checks, on the device, that every measured
 // band of the part's tile table (arch::Tuning::q4_gemm_rows) writes the bytes
 // the shape-only tile writes. `--panel-epilogue` checks a norm that stores
-// the f16 activation panel from its own epilogue.
+// the f16 activation panel from its own epilogue; `--residual-norm` the fused
+// residual sum, norm and panel against the launches it replaces.
 #include "harness.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
@@ -656,9 +657,94 @@ int panel_epilogue() {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
+// The fused residual norm (graph::exact_residual_norm) against the launches
+// it replaces, on the device: x = residual + slice sum, its norm and the
+// norm's panel from one kernel, and the same from the slice sum with the add
+// in its epilogue followed by the norm and its panel. Every byte must agree.
+int residual_norm() {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  std::size_t checked = 0, failed = 0;
+  for (const std::int64_t m : {9, 304, 1024}) {
+    for (const std::int64_t slices : {2, 4}) {
+      const std::int64_t k = 5120;
+      std::mt19937 rng(static_cast<unsigned>(m * 31 + slices));
+      std::uniform_real_distribution<float> uni(-3.0f, 3.0f);
+      std::vector<float> p(static_cast<std::size_t>(slices * m * k)), r(static_cast<std::size_t>(m * k));
+      for (auto& v : p) v = uni(rng);
+      for (auto& v : r) v = uni(rng);
+      std::vector<bfloat16_t> w(static_cast<std::size_t>(k));
+      for (auto& v : w) v = bfloat16_t(0.5f + 0.25f * uni(rng));
+      auto ap = filled(Shape{slices, 1, m, k}, DType::kF32, p);
+      auto ar = filled(Shape{1, m, k}, DType::kF32, r);
+      auto aw = filled(Shape{k}, DType::kBF16, w);
+      struct Out { std::vector<float> x, norm; std::vector<std::uint16_t> panel; bool fused = false; };
+      const auto build = [&](bool apart) {
+        Out out;
+        auto sum = std::make_shared<Node>();
+        sum->set_kind(OpKind::kCustom);
+        sum->prim = find_primitive("quant_linear.q4_gemm_f16.slice_sum.v1");
+        sum->fclass = sum->prim->fusion_class();
+        sum->shape = Shape{1, m, k};
+        sum->dtype = DType::kF32;
+        sum->inputs = {ap.node()};
+        auto x = ar + Array(sum);
+        // The later residual add that keeps x an output of the step.
+        auto later = x + ar;
+        Program first;
+        if (apart) {
+          const NodePtr roots[]{x.node()};
+          LSE_EXPECT_OK(scheduler->eval(roots, false, &first));
+        }
+        auto norm = rms_norm(x, aw, 1e-6f);
+        auto panel = std::make_shared<Node>();
+        panel->set_kind(OpKind::kCustom);
+        panel->prim = find_primitive("quant_activation.f16_panel.v1");
+        panel->fclass = panel->prim->fusion_class();
+        panel->shape = Shape{m, k};
+        panel->dtype = DType::kF16;
+        panel->inputs = {norm.node()};
+        ++norm.node()->consumer_count;
+        Program program;
+        const NodePtr roots[]{norm.node(), panel, later.node()};
+        LSE_EXPECT_OK(scheduler->eval(roots, false, &program));
+        LSE_EXPECT_OK(scheduler->drain());
+        for (const FusionGroup& g : program.groups())
+          out.fused = out.fused || (g.nodes.size() == 4 && g.outputs.size() == 3);
+        out.x = read<float>(x);
+        out.norm = read<float>(norm);
+        out.panel.resize(static_cast<std::size_t>(m * k));
+        LSE_EXPECT_OK(Array(panel).to_host(out.panel.data(), out.panel.size() * 2));
+        return out;
+      };
+      const Out fused = build(false), apart = build(true);
+      LSE_EXPECT(fused.fused);
+      LSE_EXPECT(!apart.fused);
+      std::size_t differ = 0;
+      for (std::size_t i = 0; i < fused.x.size(); ++i) {
+        differ += std::memcmp(&fused.x[i], &apart.x[i], 4) != 0;
+        differ += std::memcmp(&fused.norm[i], &apart.norm[i], 4) != 0;
+        differ += fused.panel[i] != apart.panel[i];
+      }
+      std::printf("residual norm M%lld K%lld %lld slices: %s, %zu of %zu values differ\n",
+                  static_cast<long long>(m), static_cast<long long>(k),
+                  static_cast<long long>(slices), fused.fused ? "one launch" : "NOT FUSED",
+                  differ, 3 * fused.x.size());
+      LSE_EXPECT_EQ(differ, 0u);
+      ++checked;
+      failed += differ != 0 || !fused.fused;
+    }
+  }
+  std::printf("residual norm: %zu checked, %zu differ\n", checked, failed);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::string_view(argv[1]) == "--residual-norm") return residual_norm();
   if (argc >= 2 && std::string_view(argv[1]) == "--bands") return bands();
   if (argc >= 2 && std::string_view(argv[1]) == "--panel-epilogue") return panel_epilogue();
   if (argc >= 5 && std::string_view(argv[1]) == "--gpu") {

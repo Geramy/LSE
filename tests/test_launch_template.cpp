@@ -36,6 +36,10 @@ struct RecordingEmitter final : IKernelEmitter {
                               const backend::DeviceInfo& d) const override {
     return real.stores_epilogue_output(g, o, d);
   }
+  bool joins_reduction(const FusionGroup& g, const NodePtr& next,
+                       const backend::DeviceInfo& d) const override {
+    return real.joins_reduction(g, next, d);
+  }
   Dialect dialect() const noexcept override { return Dialect::kLoom; }
   std::string_view prelude() const noexcept override { return {}; }
   DialectSourceTable sources() const noexcept override { return real.sources(); }
@@ -258,6 +262,71 @@ LSE_TEST(a_norm_stores_the_panel_its_gemm_reads) {
                         g.outputs[1] == panel);
     LSE_EXPECT_EQ(fused, norm_first);
   }
+}
+
+// A layer's residual sum over a K-sliced projection, the norm of it and that
+// norm's panel are one launch (graph::exact_residual_norm), the next GEMM the
+// other; x stays an output for the next residual.
+LSE_TEST(a_residual_sum_its_norm_and_panel_are_one_launch) {
+  backend::BackendAdapter<RecordingDevice> be;
+  check(be.init(0));
+  Scheduler scheduler(be);
+  scheduler.set_dialect(Dialect::kLoom);
+  const auto leaf = [&](Shape sh, DType dt = DType::kF32) {
+    auto b = be.allocate(sh.elem_count() * 4, backend::MemoryClass::kDevice,
+                         backend::kDefaultStream);
+    if (!b.ok()) throw std::runtime_error(b.status().to_string());
+    return Array::from_buffer(std::move(*b), sh, dt);
+  };
+  const std::int64_t m = 64, k = 512, n = 256;
+  auto partial = leaf({2, 1, m, k});
+  auto sum = std::make_shared<Node>();
+  sum->set_kind(OpKind::kCustom);
+  sum->prim = find_primitive("quant_linear.q4_gemm_f16.slice_sum.v1");
+  LSE_EXPECT(sum->prim != nullptr);
+  if (sum->prim == nullptr) return;
+  sum->fclass = sum->prim->fusion_class();
+  sum->shape = Shape{1, m, k};
+  sum->dtype = DType::kF32;
+  sum->inputs = {partial.node()};
+  auto residual = leaf({1, m, k});
+  auto x = residual + Array(sum);
+  auto norm = rms_norm(x, leaf({k}), 1e-6f);
+  auto panel = std::make_shared<Node>();
+  panel->set_kind(OpKind::kCustom);
+  panel->prim = find_primitive("quant_activation.f16_panel.v1");
+  panel->fclass = panel->prim->fusion_class();
+  panel->shape = Shape{m, k};
+  panel->dtype = DType::kF16;
+  panel->inputs = {norm.node()};
+  ++norm.node()->consumer_count;
+  auto gemm = std::make_shared<Node>();
+  gemm->set_kind(OpKind::kCustom);
+  gemm->prim = find_primitive("quant_linear.q4_gemm_f16.v1");
+  gemm->fclass = gemm->prim->fusion_class();
+  gemm->shape = Shape{1, m, n};
+  gemm->dtype = DType::kF32;
+  gemm->iattrs[0] = 4;
+  gemm->iattrs[1] = 64;
+  gemm->inputs = {norm.node(), leaf({n, k / 8}, DType::kU32).node(),
+                  leaf({n, k / 64}, DType::kBF16).node(), leaf({n, k / 64}, DType::kBF16).node(),
+                  panel};
+  ++norm.node()->consumer_count;
+  ++panel->consumer_count;
+  // x is read again later, by the next residual add.
+  auto next = x + leaf({1, m, k});
+  Program program;
+  const NodePtr roots[] = {gemm, next.node()};
+  check(scheduler.eval(roots, false, &program));
+  LSE_EXPECT_EQ(scheduler.last_trace().host_groups, 0u);
+  bool fused = false;
+  for (const FusionGroup& g : program.groups())
+    fused = fused || (g.nodes.size() == 4 && g.outputs.size() == 3 &&
+                      g.outputs[0] == x.node() && g.outputs[1] == norm.node() &&
+                      g.outputs[2] == panel);
+  LSE_EXPECT(fused);
+  // The fused kernel, the GEMM and the later add.
+  LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched, 3u);
 }
 
 // Another width is another key: no template crosses shapes.

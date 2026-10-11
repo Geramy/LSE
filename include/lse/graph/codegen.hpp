@@ -277,6 +277,17 @@ class IKernelEmitter {
     return {};
   }
 
+  // Whether this emitter can write `next`, a reduction that reads `group`'s
+  // output, into `group`'s kernel as one more output (a residual sum and its
+  // norm, graph::join_reduction). False unless the emitter can.
+  [[nodiscard]] virtual bool joins_reduction(const FusionGroup& group, const NodePtr& next,
+                                             const backend::DeviceInfo& device) const {
+    (void)group;
+    (void)next;
+    (void)device;
+    return false;
+  }
+
   // Whether this emitter can store `output` (a node with an epilogue layout,
   // KernelPrimitiveBase::epilogue_output) from the epilogue of `group`'s
   // anchor, as one more output of that group (graph::join_epilogue_output).

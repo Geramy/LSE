@@ -22,6 +22,8 @@
 #include "lse/backends/hrx/loomc/loom_types.hpp"
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/gdn_pair.hpp"
+#include "lse/graph/residual_norm.hpp"
+#include "lse/kernels/residual_norm.hpp"
 #include "lse/kernels/gdn.hpp"
 #include "lse/graph/ops.hpp"
 
@@ -499,6 +501,44 @@ bool LoomEmitter::joins_run(std::span<const NodePtr> run,
   return true;
 }
 
+namespace {
+// Whether the fused residual norm takes this sum, add and norm (and panel)
+// on `device`: its plan is empty where its body would decline.
+bool residual_norm_fits(const ResidualNorm& rn, const Node* panel, const DeviceInfo& device) {
+  const DialectSourceTable spellings = LoomEmitter{}.sources();
+  const kir::TypeTable type_table = loom_types();
+  std::vector<Shape> shp{rn.sum->inputs[0]->shape, rn.residual->shape, rn.norm->inputs[1]->shape,
+                         rn.add->shape};
+  std::vector<DType> dts{rn.sum->inputs[0]->dtype, rn.residual->dtype, rn.norm->inputs[1]->dtype,
+                         rn.add->dtype};
+  if (panel != nullptr) {
+    shp.push_back(panel->shape);
+    dts.push_back(panel->dtype);
+  }
+  KernelShapes s;
+  s.inputs = shp;
+  s.input_dtypes = dts;
+  s.output = rn.norm->shape;
+  s.output_dtype = rn.norm->dtype;
+  s.attrs = rn.norm->attrs;
+  s.iattrs = rn.norm->iattrs;
+  s.device = &device;
+  s.types = type_table;
+  s.intrinsics = &spellings;
+  return kernels::residual_norm_kernel()->plan(s).workgroup_count[0] != 0;
+}
+}  // namespace
+
+bool LoomEmitter::joins_reduction(const FusionGroup& group, const NodePtr& next,
+                                  const DeviceInfo& device) const {
+  if (!next || group.nodes.size() != 2) return false;
+  FusionGroup with;
+  with.nodes = {group.nodes[0], group.nodes[1], next};
+  with.outputs = {group.nodes[1], next};
+  const ResidualNorm rn = exact_residual_norm(with);
+  return rn && residual_norm_fits(rn, nullptr, device);
+}
+
 bool LoomEmitter::stores_epilogue_output(const FusionGroup& group, const Node& output,
                                          const DeviceInfo& device) const {
   const auto* layout = dynamic_cast<const KernelPrimitiveBase*>(output.prim);
@@ -506,6 +546,15 @@ bool LoomEmitter::stores_epilogue_output(const FusionGroup& group, const Node& o
       layout->epilogue_output() == KernelPrimitiveBase::EpilogueLayout::kNone ||
       group.nodes.empty() || group.is_phase)
     return false;
+  // The panel of a fused residual norm's norm: the fused kernel writes it.
+  if (group.nodes.size() == 3 && output.inputs.size() == 1 && output.inputs[0] == group.nodes[2]) {
+    FusionGroup core;
+    core.nodes = group.nodes;
+    core.outputs = {group.nodes[1], group.nodes[2]};
+    const ResidualNorm rn = exact_residual_norm(core);
+    return rn && output.prim->name() == "quant_activation.f16_panel.v1" &&
+           residual_norm_fits(rn, &output, device);
+  }
   const NodePtr& anchor = group.nodes.front();
   const auto* kp = anchor ? dynamic_cast<const KernelPrimitiveBase*>(anchor->prim) : nullptr;
   // Row reductions only: their epilogue runs once per element with little
@@ -599,6 +648,8 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
     return s;
   };
 
+  // A residual sum and its norm (and panel): one fused kernel.
+  const ResidualNorm residual = exact_residual_norm(group);
   GdnPair gdn_pair;
   if (group.nodes.size() == 2 && group.outputs.size() == 2) {
     gdn_pair = exact_gdn_pair(group.nodes[0], group.nodes[1]);
@@ -646,7 +697,22 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
   }
 
   std::vector<NodePtr> logical_inputs;
-  if (gdn_pair) {
+  if (residual) {
+    self_indexed = kernels::residual_norm_kernel();
+    anchor = residual.norm;
+    logical_inputs = {residual.sum->inputs[0], residual.residual, residual.norm->inputs[1],
+                      residual.add};
+    if (residual.panel) logical_inputs.push_back(residual.panel);
+    si_storage.clear();
+    si_dtypes.clear();
+    for (const auto& input : logical_inputs) {
+      si_storage.push_back(input->shape);
+      si_dtypes.push_back(input->dtype);
+    }
+    si_shapes = shapes_for(anchor, storage, dtypes);
+    si_shapes.inputs = si_storage;
+    si_shapes.input_dtypes = si_dtypes;
+  } else if (gdn_pair) {
     self_indexed = kernels::gdn_pair_kernel();
     anchor = gdn_pair.output;
     logical_inputs = anchor->inputs;
@@ -764,10 +830,12 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
                        ", which is a block layout rather than a Loom element "
                        "type");
     }
-    const bool is_out = gdn_pair ? n == gdn_pair.output : output_set.count(n.get()) != 0;
+    const bool is_out = gdn_pair    ? n == gdn_pair.output
+                        : residual ? n == residual.norm
+                                   : output_set.count(n.get()) != 0;
     // A self-indexed body writes its own output, `out`; an epilogue output
     // (graph::join_epilogue_output) is stored by the epilogue alone.
-    const bool extra_out = si && !gdn_pair && is_out && n != group.outputs.front();
+    const bool extra_out = si && !gdn_pair && !residual && is_out && n != group.outputs.front();
     const std::string name =
         si ? (extra_out ? "out" + std::to_string(i)
                         : is_out ? std::string("out") : "in" + std::to_string(i))
@@ -853,7 +921,7 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
 
   if (si) {
     // ---- a primitive that owns its indexing -------------------------------
-    const NodePtr& sink = gdn_pair ? gdn_pair.output : group.outputs.front();
+    const NodePtr& sink = gdn_pair ? gdn_pair.output : residual ? residual.norm : group.outputs.front();
     Status epilogue_error;
     bool stored = false;
     Mint hook_mint;
@@ -863,6 +931,14 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
                               std::string_view value) -> kir::KernelBody::SplitStore {
       stored = true;
       std::string s;
+      if (residual) {
+        // The fused residual norm writes x and the panel itself; the hook
+        // stores the norm.
+        const std::string dst = bounded(std::string(index), sink->element_count(), hook_mint, s);
+        return {std::move(s), "  view.store " + std::string(value) + ", %out_view[" + dst + "] : " +
+                                  std::string(loom_storage_type(elem_of(sink->dtype))) + ", " +
+                                  loom_view_type(elem_of(sink->dtype), sink->element_count()) + "\n"};
+      }
       std::unordered_map<const Node*, std::string> value_of;
 
       value_of[anchor.get()] = std::string(value);
@@ -1044,7 +1120,7 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
                        "' declined to emit for this invocation");
     }
     if (!stored) {
-      if (gdn_pair || group.nodes.size() != 1 || group.outputs.size() != 1 ||
+      if (gdn_pair || residual || group.nodes.size() != 1 || group.outputs.size() != 1 ||
           sink != anchor || self_indexed->supports_epilogue())
         return LSE_ERROR(kInternal, "primitive '",
                          std::string(self_indexed->name()),
