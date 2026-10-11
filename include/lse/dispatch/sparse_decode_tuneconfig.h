@@ -26,9 +26,12 @@ inline constexpr std::uint32_t kSplitRecord = 258;
 inline constexpr std::uint32_t kSinkPages = 4;
 inline constexpr std::uint32_t kRecentPages = 32;
 // Default budget, sink and recent window included: this share of the
-// context, never below kDefaultBudgetTokens (0: the fixed count alone).
+// context, never below kDefaultBudgetTokens. Wikitext decode-pass KL
+// divergence against exact attention (Qwen3.8-27B Q4, bf16 KV, mean
+// correction on): 4096 tokens keeps it at 0.007 for 32K windows but 0.074 at
+// 128K; a quarter of the context keeps it at 0.006 (32K) and 0.019 (128K).
 inline constexpr std::uint32_t kDefaultBudgetTokens = 4096;
-inline constexpr float kDefaultBudgetShare = 0.0f;
+inline constexpr float kDefaultBudgetShare = 0.25f;
 inline constexpr std::uint32_t kMinBudgetTokens = (kSinkPages + kRecentPages + 4) * kPage;
 // Every pass that writes keys refreshes the summaries of the pages from this
 // many tokens before its first row to its last: a page's final summary is

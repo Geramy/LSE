@@ -8,6 +8,8 @@
 //   test_sparse_decode --gpu    the device reference cases
 #include "harness.hpp"
 #include "lse/dispatch/arch/tuning.hpp"
+#include "lse/dispatch/roofline.hpp"
+#include "lse/dispatch/sparse_decode.hpp"
 #include "lse/dispatch/sparse_decode_tuneconfig.h"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/block.hpp"
@@ -126,6 +128,48 @@ LSE_TEST(sparse_decode_refresh_window_covers_slack_and_rows) {
   LSE_EXPECT(sd::refresh_pages(1024) * sd::kPage >= 1024 + sd::kRefreshSlackTokens + sd::kPage);
   LSE_EXPECT(sd::kRecentPages * sd::kPage >= 64 + sd::kPage);
   LSE_EXPECT(sd::kMinBudgetTokens > (sd::kSinkPages + sd::kRecentPages) * sd::kPage);
+}
+
+// The optimizer's choice from a roofline and kernel costs: exact at short
+// context, sparse past the crossover, and a slower-memory device switching no
+// later than a faster one with the same kernel costs.
+LSE_TEST(sparse_decode_plan_follows_the_measured_costs) {
+  auto device = [](const char* arch, int ordinal) {
+    backend::DeviceInfo d;
+    d.arch = arch;
+    d.ordinal = static_cast<std::uint8_t>(ordinal);
+    return d;
+  };
+  const auto fast = device("gfx-test-fast", 0), slow = device("gfx-test-slow", 1);
+  dispatch::SparseDecodeCalibration cal;
+  cal.exact_efficiency = 0.8;
+  cal.exact_fixed_ns = 10e3;
+  cal.score_ns_per_row_page = 0.05;
+  cal.score_fixed_ns = 5e3;
+  cal.select_fixed_ns = 15e3;
+  cal.select_ns_per_page = 2.0;
+  cal.tail_ns_per_row_page = 0.1;
+  cal.tail_fixed_ns = 5e3;
+  dispatch::Roofline r{620e9, 5e3, 20e12, 100e12};
+  dispatch::publish_roofline(fast, r);
+  r.stream_bytes_per_s = 240e9;
+  dispatch::publish_roofline(slow, r);
+  dispatch::publish_sparse_decode_calibration(fast, cal);
+  dispatch::publish_sparse_decode_calibration(slow, cal);
+  dispatch::SparseDecodeShape shape;
+  shape.query_heads = 24; shape.key_heads = 4; shape.head_dim = 256; shape.rows = 1; shape.budget = 4096;
+  shape.capacity = 8192;
+  LSE_EXPECT(!dispatch::sparse_decode_plan(&fast, shape, false).sparse);
+  shape.capacity = 131072;
+  const auto at128 = dispatch::sparse_decode_plan(&fast, shape, false);
+  LSE_EXPECT(at128.priced && at128.sparse && at128.sparse_ns < at128.exact_ns);
+  const auto fast_at = dispatch::sparse_decode_crossover(&fast, shape, 262144);
+  const auto slow_at = dispatch::sparse_decode_crossover(&slow, shape, 262144);
+  LSE_EXPECT(fast_at > shape.budget && slow_at > shape.budget && slow_at <= fast_at);
+  // Nothing measured: nothing priced, never sparse under auto.
+  const auto none = device("gfx-test-none", 2);
+  LSE_EXPECT(!dispatch::sparse_decode_plan(&none, shape, false).priced);
+  LSE_EXPECT(!dispatch::sparse_decode_plan(&none, shape, false).sparse);
 }
 
 int gpu_check() {
