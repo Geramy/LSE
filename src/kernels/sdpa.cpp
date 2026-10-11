@@ -329,6 +329,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     (void)e.ret_if(batch>=rows);
     const auto mb=e.let(e.u32(kv::kStepMetaHeader)+batch*e.u32(kv::kStepMetaPerRow));
     const auto offset=e.let(kir::cast<kir::u32>(a.meta[mb]));
+    const auto live=e.let(kir::cast<kir::u32>(a.meta[mb+1u]));
     const auto first_position=e.let(offset+q0);
     const auto last_row=e.let(select(q0+15u<queries,q0+15u,e.u32(queries-1u)));
     const auto last_position=e.let(offset+last_row);
@@ -369,8 +370,11 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
       const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
       const auto weight=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
       // Sink, recent block, diagonal band and partial block always exact.
+      // iattrs[2] == 1: the tile holding the pass's last live row (the row
+      // that predicts the next token) reads every block exactly.
+      const auto answer_tile=e.let(s.iattrs[2]==1 ? last_position+1u>=live : e.u32(0)==e.u32(1));
       const auto exact=e.let(block==0u || (block+2u)*256u>first_position ||
-          a.pooled[pool+512u]!=256.0f || weight>=peak.read()*s.attrs[2]);
+          a.pooled[pool+512u]!=256.0f || weight>=peak.read()*s.attrs[2] || answer_tile);
       e.store(wg*blocks+block,select(exact,e.f32(1),e.f32(0)));
     }
     return k.lds().ok()?k.str():std::string{};

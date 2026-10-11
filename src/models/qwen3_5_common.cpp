@@ -222,6 +222,15 @@ class Qwen35Attention final : public IMixer {
       if (!exact_layers.empty() &&
           exact_layers.find("," + std::to_string(ctx.layer_index) + ",") != std::string::npos)
         sp.sparse_attention.sparse_decode.exact_layer = true;
+      // An experiment knob, read once: LSE_FLASHPREFILL_LAYERS lists the only
+      // layers (0-based) whose prompt prefill takes FlashPrefill V2.
+      static const std::string prefill_layers = [] {
+        const char* v = std::getenv("LSE_FLASHPREFILL_LAYERS");
+        return v ? "," + std::string(v) + "," : std::string();
+      }();
+      if (!prefill_layers.empty() &&
+          prefill_layers.find("," + std::to_string(ctx.layer_index) + ",") == std::string::npos)
+        sp.sparse_attention.prefill = {};
     }
     rope_.resize(spec_.size());
     for (std::size_t m = 0; m < spec_.size(); ++m) {
