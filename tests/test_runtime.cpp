@@ -642,9 +642,11 @@ LSE_TEST(draft_width_policy_costs_follow_the_context) {
   LSE_EXPECT_EQ(policy.exploring(), 0u);
   LSE_EXPECT_NEAR(policy.draft_ns(), 8e6, 1.0);
   // At 64K one row costs 40 ms: the level moves. A width's first pass in
-  // the new bucket is not priced (it paid for that bucket's first loads).
+  // the new bucket is priced at once, its rise bounded to twice the carried
+  // cost (it may have paid for that bucket's first loads), and a lower pass
+  // replaces it.
   policy.observe_verify(1, 900'000'000);
-  LSE_EXPECT_NEAR(policy.verify_ns(1), 32e6, 1.0);
+  LSE_EXPECT_NEAR(policy.verify_ns(1), 64e6, 1.0);
   policy.observe_verify(1, 40'000'000);
   LSE_EXPECT_NEAR(policy.verify_ns(1), 40e6, 1.0);
   LSE_EXPECT_NEAR(policy.verify_ns(8), 47e6, 1.0);
@@ -662,6 +664,43 @@ LSE_TEST(draft_width_policy_costs_follow_the_context) {
   policy.set_context(1000);
   LSE_EXPECT_NEAR(policy.verify_ns(8), 39e6, 1.0);
   LSE_EXPECT_NEAR(policy.verify_ns(1), 32e6, 1.0);
+}
+
+LSE_TEST(draft_width_policy_tree_costs_carried_to_a_longer_context_scale_with_it) {
+  // Rungs measured at 32K: the level (the narrowest rung) 100 ms, the wider
+  // ones 10, 30 and 100 ms more, their extra cost mostly attention.
+  const auto tree32 = [](std::uint32_t rows) {
+    return rows == 4 ? 100e6 : rows == 8 ? 110e6 : rows == 15 ? 130e6 : 200e6;
+  };
+  DraftWidthPolicy policy;
+  policy.set_context(32768);
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_tree_step(DraftWidthPolicy::kTreeRows[1], 1);
+  for (int step = 0; step < 200; ++step) {
+    if (const std::uint32_t rows = policy.tree_exploring(); rows != 0)
+      policy.observe_tree_step(rows, static_cast<std::uint64_t>(tree32(rows)));
+    else if (const std::uint32_t rows = policy.exploring(); rows != 0)
+      policy.observe_verify(rows, static_cast<std::uint64_t>(90e6 + 1e6 * rows));
+    else
+      for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
+        policy.observe_tree_step(rows, static_cast<std::uint64_t>(tree32(rows)));
+    policy.observe_step(6, static_cast<std::uint64_t>(110e6));
+  }
+  for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
+    LSE_EXPECT_NEAR(policy.tree_step_ns(rows), tree32(rows), 1e3);
+  // At 64K the carried offsets double: a 31-row rung is priced 200 ms over
+  // the narrowest, not the 100 ms 32K measured (which made trees look cheap
+  // and the policy take one nearly every step).
+  policy.set_context(65536);
+  LSE_EXPECT_NEAR(policy.tree_step_ns(4), 100e6, 1e3);
+  LSE_EXPECT_NEAR(policy.tree_step_ns(15), 160e6, 1e3);
+  LSE_EXPECT_NEAR(policy.tree_step_ns(31), 300e6, 1e3);
+  // A rung's first pass there prices it at once, and moves the level.
+  policy.observe_tree_step(8, 130'000'000);
+  LSE_EXPECT_NEAR(policy.tree_step_ns(8), 130e6, 1e3);
+  LSE_EXPECT_NEAR(policy.tree_step_ns(31), 310e6, 1e3);
+  policy.observe_tree_step(31, 330'000'000);
+  LSE_EXPECT_NEAR(policy.tree_step_ns(31), 330e6, 1e3);
 }
 
 LSE_TEST(draft_width_policy_entering_a_context_forces_no_measurements) {
