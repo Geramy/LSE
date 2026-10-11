@@ -528,14 +528,15 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
     shape.head_dim = static_cast<std::uint32_t>(hd);
     shape.rows = rows_per_pass;
     shape.capacity = static_cast<std::uint64_t>(table_capacity);
-    shape.budget = static_cast<std::uint32_t>(options.budget_tokens);
+    const std::int32_t budget = options.budget_for(table_capacity);
+    shape.budget = static_cast<std::uint32_t>(budget);
     const auto plan = dispatch::sparse_decode_plan(split_device, shape,
                                                    options.mode == SparseDecodeMode::kOn);
-    if (plan.sparse) {
+    if (plan.sparse && !options.exact_layer) {
       LSE_ASSIGN_OR(Array sparse_o, graph::sparse_decode_attention(
           q, k_attn, v_attn, scale, tree ? graph::MaskKind::kTree : spec.mask, cache->meta,
           cache->table, kv::kBlockSize, split_device, spec.kv_cache_dtype, summary,
-          options.budget_tokens, options.joint_heads));
+          budget, options.joint_heads));
       return graph::linear(merge_heads(sparse_o) * graph::sigmoid(gate_lin), w.o_proj);
     }
   }

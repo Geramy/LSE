@@ -25,8 +25,10 @@ inline constexpr std::uint32_t kSplitRecord = 258;
 // window, which also holds every row of a verify pass (up to 64).
 inline constexpr std::uint32_t kSinkPages = 4;
 inline constexpr std::uint32_t kRecentPages = 32;
-// Default token budget, sink and recent window included.
+// Default budget, sink and recent window included: this share of the
+// context, never below kDefaultBudgetTokens (0: the fixed count alone).
 inline constexpr std::uint32_t kDefaultBudgetTokens = 4096;
+inline constexpr float kDefaultBudgetShare = 0.0f;
 inline constexpr std::uint32_t kMinBudgetTokens = (kSinkPages + kRecentPages + 4) * kPage;
 // Every pass that writes keys refreshes the summaries of the pages from this
 // many tokens before its first row to its last: a page's final summary is

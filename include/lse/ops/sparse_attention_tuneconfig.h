@@ -28,9 +28,20 @@ enum class SparseDecodeMode : std::uint8_t {
 };
 struct SparseDecodeOptions {
   SparseDecodeMode mode = SparseDecodeMode::kOff;
+  // Tokens a pass reads: a fixed count, or (budget_share > 0) that share of
+  // the pass's KV rung, never below budget_tokens.
   std::int32_t budget_tokens = 0;
+  float budget_share = 0.0f;
+  // The budget for a pass over a table of `capacity` tokens: whole pages.
+  [[nodiscard]] std::int32_t budget_for(std::int64_t capacity) const noexcept {
+    if (budget_share <= 0.0f) return budget_tokens;
+    const auto share = static_cast<std::int64_t>(static_cast<double>(capacity) * budget_share) / 16 * 16;
+    return share > budget_tokens ? static_cast<std::int32_t>(share) : budget_tokens;
+  }
   // One page set shared by every key head instead of one per key head.
   bool joint_heads = false;
+  // This layer's decode attention stays exact (its summaries are still kept).
+  bool exact_layer = false;
   // The engine keeps page summaries for this model (mode is not off, the
   // context can exceed the budget, and the device and KV format qualify).
   [[nodiscard]] bool summaries() const noexcept {

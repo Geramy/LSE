@@ -686,8 +686,11 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     // this device's measured roofline and kernel times predict a gain.
     namespace sdt = dispatch::sparse_decode;
     auto& sd = config.sparse_attention.sparse_decode;
+    const bool by_share = c.sparse_decode_budget < 0;
     const int budget = c.sparse_decode_budget > 0 ? c.sparse_decode_budget
                                                   : static_cast<int>(sdt::kDefaultBudgetTokens);
+    const float share = by_share ? static_cast<float>(-c.sparse_decode_budget) / 100.0f
+                       : c.sparse_decode_budget == 0 ? sdt::kDefaultBudgetShare : 0.0f;
     if (c.sparse_decode < -1 || c.sparse_decode > 1)
       return invalid("--sparse-decode must be auto, on or off");
     if (budget % static_cast<int>(sdt::kPage) != 0 || budget < static_cast<int>(sdt::kMinBudgetTokens))
@@ -720,10 +723,15 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
     } else {
       sd.mode = c.sparse_decode == 1 ? ops::SparseDecodeMode::kOn : ops::SparseDecodeMode::kAuto;
       sd.budget_tokens = budget;
+      sd.budget_share = share;
       if (const char* joint = std::getenv("LSE_SPARSE_DECODE_JOINT"); joint && *joint == '1')
         sd.joint_heads = true;
-      std::fprintf(stderr, "lse-server: sparse decode %s, budget %d tokens%s; exact with --sparse-decode=off\n",
-                   sd.mode == ops::SparseDecodeMode::kOn ? "on" : "auto", budget,
+      const std::string what = share > 0.0f
+          ? std::to_string(static_cast<int>(share * 100.0f + 0.5f)) + "% of the context, at least " +
+                std::to_string(budget) + " tokens"
+          : std::to_string(budget) + " tokens";
+      std::fprintf(stderr, "lse-server: sparse decode %s, budget %s%s; exact with --sparse-decode=off\n",
+                   sd.mode == ops::SparseDecodeMode::kOn ? "on" : "auto", what.c_str(),
                    sd.joint_heads ? ", one page set for all key heads" : "");
     }
   }
@@ -776,6 +784,7 @@ std::optional<OpenError> open_engine(const lse_config& c, lse_engine& e) {
       shape.key_heads = static_cast<std::uint32_t>(config.attn_kv_heads);
       shape.head_dim = static_cast<std::uint32_t>(config.attn_head_dim);
       shape.budget = static_cast<std::uint32_t>(config.sparse_attention.sparse_decode.budget_tokens);
+      shape.budget_share = config.sparse_attention.sparse_decode.budget_share;
       std::string at;
       for (std::uint32_t rows : {1u, 4u, 8u, 16u}) {
         shape.rows = rows;
@@ -1190,6 +1199,7 @@ lse_result lse_perplexity(lse_engine* e, const char* request_json, char** json_o
                                  : config.sparse_attention.sparse_decode.mode == ops::SparseDecodeMode::kOn
                                      ? std::string("on") : std::string("auto")},
                {"sparse_decode_budget", config.sparse_attention.sparse_decode.budget_tokens},
+               {"sparse_decode_budget_share", config.sparse_attention.sparse_decode.budget_share},
                {"sparse_decode_joint_heads", config.sparse_attention.sparse_decode.joint_heads},
                {"cpu_fallback_allowed", graph::cpu_fallback_allowed()}}}};
     if (report->recorded) out["kld_base_out"] = {{"path", kld_out}, {"top_k", report->recorded->top_k}};

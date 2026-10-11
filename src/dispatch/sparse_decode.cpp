@@ -88,7 +88,12 @@ SparseDecodePlan sparse_decode_plan(const backend::DeviceInfo* device,
 std::uint64_t sparse_decode_crossover(const backend::DeviceInfo* device, SparseDecodeShape shape,
                                       std::uint64_t limit) {
   for (std::uint64_t live = shape.budget + sd::kPage; live <= limit; live += 256) {
-    const auto plan = sparse_decode_predict(device, shape, live);
+    SparseDecodeShape at = shape;
+    if (shape.budget_share > 0.0f) {
+      const auto share = static_cast<std::uint64_t>(static_cast<double>(live) * shape.budget_share) / 16 * 16;
+      at.budget = static_cast<std::uint32_t>(share > shape.budget ? share : shape.budget);
+    }
+    const auto plan = sparse_decode_predict(device, at, live);
     if (!plan.priced) return 0;
     if (plan.sparse) return live;
   }

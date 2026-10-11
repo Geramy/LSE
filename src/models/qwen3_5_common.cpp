@@ -213,6 +213,15 @@ class Qwen35Attention final : public IMixer {
       sp.kv_length = c.kv_capacity();
       sp.kv_cache_dtype = c.kv_cache_dtype;
       sp.sparse_attention = c.sparse_attention;
+      // An experiment knob, read once: LSE_SPARSE_DECODE_EXACT_LAYERS lists the
+      // layers (0-based, comma separated) whose decode attention stays exact.
+      static const std::string exact_layers = [] {
+        const char* v = std::getenv("LSE_SPARSE_DECODE_EXACT_LAYERS");
+        return v ? "," + std::string(v) + "," : std::string();
+      }();
+      if (!exact_layers.empty() &&
+          exact_layers.find("," + std::to_string(ctx.layer_index) + ",") != std::string::npos)
+        sp.sparse_attention.sparse_decode.exact_layer = true;
     }
     rope_.resize(spec_.size());
     for (std::size_t m = 0; m < spec_.size(); ++m) {

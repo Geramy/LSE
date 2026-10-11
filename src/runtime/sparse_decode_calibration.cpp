@@ -165,10 +165,13 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
     LSE_ASSIGN_OR(Array o, graph::sparse_decode_attention(q, keys, vals, scale, graph::MaskKind::kCausal,
                                                           meta, tab, kv::kBlockSize, &device, storage,
                                                           summary, g.budget, false));
-    // merge <- concat(partial, tail); partial's fifth input is the selection.
+    // merge <- concat(partial, tail), or the partial alone without the
+    // correction; the partial's fifth input is the selection.
     const NodePtr records = o.node()->inputs[0];
-    const NodePtr selected = records->inputs[0]->inputs[4];
-    return Stages{selected->inputs[0], selected, records->inputs[1]};
+    const bool tail = records->inputs.size() == 2;
+    const NodePtr partial = tail ? records->inputs[0] : records;
+    const NodePtr selected = partial->inputs[4];
+    return Stages{selected->inputs[0], selected, tail ? records->inputs[1] : selected};
   };
   double score1[2] = {0, 0}, both1[2] = {0, 0}, score8 = 0, tail1 = 0, select8 = 0, tail8 = 0;
   for (int i = 0; i < 2; ++i) {
@@ -199,7 +202,9 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
     LSE_ASSIGN_OR(Array o, graph::sparse_decode_attention(q, keys, vals, scale, graph::MaskKind::kCausal,
                                                           meta, tab, kv::kBlockSize, &device, storage,
                                                           summary, g.budget, false));
-    LSE_ASSIGN_OR(const double t, bench.time({o.node()->inputs[0]->inputs[0]->inputs[3]}));
+    const NodePtr records = o.node()->inputs[0];
+    const NodePtr partial = records->inputs.size() == 2 ? records->inputs[0] : records;
+    LSE_ASSIGN_OR(const double t, bench.time({partial->inputs[3]}));
     overhead = std::max(0.0, t - roof->launch_ns);
   }
   const double kv_token = 2.0 * static_cast<double>(kvh * hd) * 2.0;

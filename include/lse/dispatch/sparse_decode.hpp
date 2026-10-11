@@ -26,6 +26,9 @@ struct SparseDecodeShape {
   // Tokens the pass's block table covers (the KV rung).
   std::uint64_t capacity = 0;
   std::uint32_t budget = 0;
+  // For the crossover search: the budget follows the context at this share
+  // (never below `budget`). The plan itself takes the pass's own budget.
+  float budget_share = 0.0f;
   // Bytes per K or V element.
   std::uint32_t element_bytes = 2;
 };

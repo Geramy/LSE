@@ -148,8 +148,9 @@ typedef struct lse_config {
    * 0 keeps every pass exact; positive takes it whenever the context exceeds
    * the budget. Approximate: it changes output. */
   int32_t sparse_decode;
-  /* --sparse-decode-budget N: tokens a sparse decode pass reads, sink and
-   * recent window included; a multiple of 16. 0: the default (4096). */
+  /* --sparse-decode-budget N|P%: tokens a sparse decode pass reads, sink and
+   * recent window included (a multiple of 16), or, negative, -P: P percent of
+   * the pass's context, never below the default count. 0: the default. */
   int32_t sparse_decode_budget;
 } lse_config;
 

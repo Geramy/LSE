@@ -940,20 +940,20 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   partial->fclass = partial_prim->fusion_class();
   partial->attrs = n->attrs;
   partial->iattrs = n->iattrs;
-  auto tail = make(OpKind::kCustom, tail_shape, DType::kF32,
-                   {q.node(), summary.node(), meta.node(), table.node(), selected});
-  tail->prim = tail_prim;
-  tail->fclass = tail_prim->fusion_class();
-  tail->attrs[0] = scale;
+  // LSE_SPARSE_DECODE_TAIL=0 leaves the correction out (an experiment knob).
   static const bool with_tail = [] {
     const char* v = std::getenv("LSE_SPARSE_DECODE_TAIL");
     return !(v && *v == '0');
   }();
-  Array records = with_tail ? concat({Array(partial), Array(tail)}, static_cast<int>(partial_shape.rank()) - 2)
-                            : Array(partial);
-  if (!with_tail) --tail->inputs[0]->consumer_count, --tail->inputs[1]->consumer_count,
-                  --tail->inputs[2]->consumer_count, --tail->inputs[3]->consumer_count,
-                  --tail->inputs[4]->consumer_count;
+  Array records(partial);
+  if (with_tail) {
+    auto tail = make(OpKind::kCustom, tail_shape, DType::kF32,
+                     {q.node(), summary.node(), meta.node(), table.node(), selected});
+    tail->prim = tail_prim;
+    tail->fclass = tail_prim->fusion_class();
+    tail->attrs[0] = scale;
+    records = concat({Array(partial), Array(tail)}, static_cast<int>(partial_shape.rank()) - 2);
+  }
   auto merged = make(OpKind::kCustom, out, DType::kF32, {records.node()});
   merged->prim = merge_prim;
   merged->fclass = merge_prim->fusion_class();

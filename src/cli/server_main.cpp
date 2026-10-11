@@ -88,7 +88,8 @@ void usage() {
       "                       (auto/on/off; default auto: block-sparse attention over\n"
       "                       the sink, recent window and top-scoring KV pages where\n"
       "                       this device's measured roofline predicts a gain)\n"
-      "      --sparse-decode-budget N  tokens a sparse decode pass reads (default 4096)\n"
+      "      --sparse-decode-budget N|P%  tokens a sparse decode pass reads, or that\n"
+      "                       share of the context (never below the default count)\n"
       "      --FlashPrefillV2=off  disable default FlashPrefill V2 prefill (on/off)\n"
       "                       default on for supported HRX/LOOM prompt prefill, including MTP/DFlash2\n"
       "      --attention-prefill MODE  dense, blasst, flashprefill-v2 (experimental)\n"
@@ -268,14 +269,17 @@ int main(int argc, char** argv) {
       cfg.sparse_decode = text == "auto" ? -1 : text == "on" ? 1 : 0;
     }
     else if (a == "--sparse-decode-budget") {
+      // N tokens, or P% of the context (stored negative: -P).
       const std::string text = value("--sparse-decode-budget");
+      const bool share = !text.empty() && text.back() == '%';
+      const std::string digits = share ? text.substr(0, text.size() - 1) : text;
       char* end = nullptr;
-      const long n = std::strtol(text.c_str(), &end, 10);
-      if (text.empty() || *end != '\0' || n <= 0 || n > (1L << 30)) {
-        std::fputs("lse-server: --sparse-decode-budget must be a positive token count\n", stderr);
+      const long n = std::strtol(digits.c_str(), &end, 10);
+      if (digits.empty() || *end != '\0' || n <= 0 || n > (share ? 100L : (1L << 30))) {
+        std::fputs("lse-server: --sparse-decode-budget must be a positive token count or a share like 25%\n", stderr);
         return 2;
       }
-      cfg.sparse_decode_budget = static_cast<std::int32_t>(n);
+      cfg.sparse_decode_budget = static_cast<std::int32_t>(share ? -n : n);
     }
     else if (a == "--no-mtp") no_mtp = true;
     else if (a == "--pull") pull_missing = true;
