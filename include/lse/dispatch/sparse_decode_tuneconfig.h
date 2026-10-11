@@ -46,7 +46,7 @@ inline constexpr std::uint32_t kReferencePages = 8;
 // kScoreThreads / kScorePages threads that split the query rows, which are
 // staged in LDS this many at a time (48 rows of 256 floats is 48 KiB).
 inline constexpr std::uint32_t kScoreThreads = 256;
-inline constexpr std::uint32_t kScorePages = 16;
+inline constexpr std::uint32_t kScorePages = 64;
 // Mean-correction kernel: the pages each wave walks, writing one split
 // record per row for them.
 inline constexpr std::uint32_t kTailPagesPerWave = 32;
