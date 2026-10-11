@@ -1700,6 +1700,7 @@ Result<std::vector<std::uint32_t>> Generator::generate(
   LSE_ASSIGN_OR(std::vector<float> logits, step(session, fresh));
   session.advance(static_cast<std::int32_t>(fresh.size()));
   stats_.prefill_ns = now_ns() - prefill_start;
+  if (widths_ != nullptr) widths_->observe_busy(stats_.prefill_ns);
 
   std::vector<std::uint32_t> generated;
 

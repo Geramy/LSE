@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -123,6 +124,23 @@ struct WorkgroupCut {
   bool grid_linears = false;
 };
 
+// A Workgroup with its nodes named by their position in a node list rather
+// than by pointer: what a plan made for one graph says about an isomorphic one
+// (the scheduler's launch templates). Slots keep their sizes, not their
+// buffers.
+struct WorkgroupShape {
+  WorkgroupDevice device;
+  std::vector<std::uint32_t> members;
+  std::vector<std::uint32_t> member_inputs;
+  std::uint32_t lds_used = 0;
+  std::uint64_t job = 0;
+  std::uint32_t rows = 0;
+  std::uint32_t reused = 0;
+  std::vector<std::size_t> slot_bytes;
+  // (node, slot) for every node a slot holds.
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> slot_of;
+};
+
 class Workgroup {
  public:
   explicit Workgroup(WorkgroupDevice device = {});
@@ -174,6 +192,15 @@ class Workgroup {
     return static_cast<std::uint32_t>(slots_.size());
   }
   [[nodiscard]] std::uint32_t reused_slots() const noexcept { return reused_; }
+
+  // This workgroup with its nodes named by position in `index`; nullopt when
+  // it names a node `index` does not hold.
+  [[nodiscard]] std::optional<WorkgroupShape> shape(
+      const std::unordered_map<const Node*, std::uint32_t>& index) const;
+  // The workgroup `shape` describes over `nodes`, its slots planned and not
+  // yet bound; nullopt when it names a position past `nodes`.
+  [[nodiscard]] static std::optional<Workgroup> from_shape(
+      const WorkgroupShape& shape, std::span<const NodePtr> nodes);
 
   // Un-run every non-leaf. Buffers stay; the next dispatch overwrites them.
   // Leaves (weights, token ids, folded state) stay materialized.

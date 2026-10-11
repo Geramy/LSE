@@ -6,6 +6,7 @@
 #include "lse/kv/block.hpp"
 #include <algorithm>
 #include <bit>
+#include <utility>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -362,7 +363,9 @@ int gpu_check() {
       }
       const int tiles=(queries+15)/16;
       for(int h=0;h<heads;++h) for(int qt=0;qt<tiles;++qt) for(int block=0;block<5;++block)
-        LSE_EXPECT_EQ(selected[(h*tiles+qt)*5+block],threshold>0 && block>0 && (block+2)*256<=offset+qt*16?0.0f:1.0f);
+        // The tile holding the last live row reads every block.
+        LSE_EXPECT_EQ(selected[(h*tiles+qt)*5+block],threshold>0 && block>0 && (block+2)*256<=offset+qt*16 &&
+                      offset+std::min(qt*16+15,queries-1)+1<length?0.0f:1.0f);
       double max_error=0;
       for(int h=0;h<heads;++h) for(int row=0;row<queries;++row) {
         double maximum=-INFINITY,denom=0; std::vector<double> acc(width);
@@ -404,9 +407,11 @@ int gpu_check() {
     }
   // Dense 256-component probes and a block count above one workgroup width
   // catch lane ownership, wave reductions, and strided selector tails.
-  for(int blocks:{5,129}) {
+  // The second pass is padded: its last live row is in tile 0, so both tiles
+  // (the one holding it and the padding past it) read every block.
+  for(auto [blocks,live_rows]:{std::pair{5,17},std::pair{129,17},std::pair{129,10}}) {
     constexpr int heads=2,queries=17,width=256,tiles=2;
-    const int length=blocks*256-7,offset=length-queries;
+    const int length=blocks*256-7,offset=length-live_rows;
     std::vector<float> q(2*heads*queries*width),pool(2*blocks*513);
     for(int h=0;h<heads;++h) for(int r=0;r<queries;++r) for(int c=0;c<width;++c)
       q[(h*queries+r)*width+c]=float(c%11-5)*.125f+float((r+h)%3)*.0625f;
@@ -438,14 +443,17 @@ int gpu_check() {
       }
       for(int b=0;b<blocks;++b) for(int r=0;r<16;++r) mass[b]+=std::exp(logits[b*16+r]-maximum);
       const double peak=*std::max_element(mass.begin(),mass.end());
+      // The tile holding the last live row (or past it) keeps every block.
+      const bool answer_tile=offset+std::min(t*16+15,queries-1)+1>=length;
       for(int b=0;b<blocks;++b) {
-        const bool keep=b==0 || (b+2)*256>offset+t*16 || b==blocks-1 || mass[b]>=peak*.8;
+        const bool keep=b==0 || (b+2)*256>offset+t*16 || b==blocks-1 || mass[b]>=peak*.8 || answer_tile;
         LSE_EXPECT_EQ(actual[(h*tiles+t)*blocks+b],keep?1.0f:0.0f);omitted+=!keep;
+        if(answer_tile) LSE_EXPECT_EQ(actual[(h*tiles+t)*blocks+b],1.0f);
       }
     }
     for(size_t i=actual.size()/2;i<actual.size();++i) LSE_EXPECT_EQ(actual[i],0.0f);
-    LSE_EXPECT(omitted>0);++cases;
-    std::printf("FlashPrefill Wave32 selector blocks=%d omitted=%u\n",blocks,omitted);
+    LSE_EXPECT(live_rows<=16 || omitted>0);++cases;
+    std::printf("FlashPrefill Wave32 selector blocks=%d live_rows=%d omitted=%u\n",blocks,live_rows,omitted);
   }
   std::printf("Sparse attention GPU reference cases: %u\n",cases);
   return test::Registry::get().failures?1:0;

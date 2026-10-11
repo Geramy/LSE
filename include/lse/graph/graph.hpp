@@ -473,6 +473,24 @@ class Scheduler {
   // Why a node cannot run on `backend`, or empty if it can.
   static std::string device_gap(const Node& node, const backend::IBackend& backend);
 
+  // Launch templates (launch_template.hpp): a step that builds a new graph
+  // takes the launch plan recorded for an earlier graph with the same key
+  // instead of splitting and describing its own, and records its plan when it
+  // had none. On by default.
+  struct TemplateStats {
+    std::uint64_t recorded = 0;
+    std::uint64_t applied = 0;
+    // Found but not taken: a variant decision has changed since it was
+    // recorded, or one is still to be measured.
+    std::uint64_t stale = 0;
+  };
+  [[nodiscard]] TemplateStats template_stats() const noexcept;
+  void set_launch_templates(bool on) noexcept;
+  // When set, a step that takes a template also splits, plans and describes
+  // its graph afresh and fails, naming the first difference, unless both
+  // give the same launches, phases, slots and descriptions.
+  void set_template_check(bool on) noexcept;
+
   // Defaults to default_fallback_chain(); override per scheduler to route
   // declined nodes somewhere else entirely.
   void set_fallback_chain(FallbackChain* chain) noexcept { fallbacks_ = chain; }
@@ -484,9 +502,35 @@ class Scheduler {
   // path and a step that returned an error still reports where its time went.
   Status eval_step(std::span<const NodePtr> roots, bool pull_host,
                    Program* plan);
+  // What a dispatch emitted and under which variant decision, for a launch
+  // template (scheduler.cpp).
+  struct DispatchRecord;
   Status try_dispatch_group(const FusionGroup& group, backend::Stream stream,
                             std::size_t member, Program* replay = nullptr,
-                            std::size_t group_index = 0);
+                            std::size_t group_index = 0,
+                            DispatchRecord* record = nullptr);
+  // Takes the launch template recorded for `roots` into `rec` when there is
+  // one that still holds: phases, slots bound, launches and descriptions.
+  // Answers whether it did.
+  Result<bool> apply_launch_template(std::span<const NodePtr> roots,
+                                     std::span<const NodePtr> order,
+                                     std::span<const NodePtr> nodes,
+                                     const std::string& key, Program& rec,
+                                     const IKernelEmitter& emitter);
+  // Records a plan under `key`: its launches by position in `nodes`, its
+  // phases and slots, and each launch's description. Nothing is recorded
+  // where a variant was still to be decided or a node lies outside `nodes`.
+  // With `rec`, the program the plan was just built into also keeps the
+  // descriptions for its first replay.
+  void record_launch_template(std::span<const NodePtr> nodes, std::string key,
+                              std::span<const FusionGroup> groups,
+                              std::span<const Workgroup> phases,
+                              std::span<const DispatchRecord> records,
+                              const IKernelEmitter& emitter, Program* rec);
+  // The device, toolchain and build a template key is made under.
+  [[nodiscard]] std::string template_context() const;
+  // Binds a phase's slots on the member and stream its nodes belong to.
+  Status bind_phase_slots(Workgroup& wg);
   // The launches a step is cut into; shared by eval_step and prepare.
   std::vector<FusionGroup> launch_groups(std::span<const NodePtr> roots,
                                          std::vector<Workgroup>& planned,

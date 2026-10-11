@@ -75,6 +75,20 @@ struct QuantPlan {
 [[nodiscard]] constexpr bool q4_gemm_wave48(const Q4GemmTile& t) noexcept {
   return t.wm != 0 && t.bm == 48 * t.wm && t.wn == 4 && t.bn == 128;
 }
+// The tile the GEMM kernel computes an m-row pass on: the part's measured
+// band for m (arch::Tuning::q4_gemm_rows), else q4_gemm_tile's. A pass pays
+// for whole row tiles, so a width just past a tile multiple pays for a
+// tile's worth of padded rows: gfx1201, 304 rows on 96-row tiles compute
+// 384. K slicing keeps following q4_gemm_tile (q4_gemm_slices), so a band
+// changes which workgroup computes an output and nothing else: every output
+// takes the same matrix instructions in the same K order into the same
+// slice, and its bytes are those of q4_gemm_tile's kernel.
+[[nodiscard]] constexpr Q4GemmTile q4_gemm_kernel_tile(
+    std::uint64_t m, const arch::Tuning& tune = arch::generic::kTuning) noexcept {
+  for (const Q4GemmRowTile& band : tune.q4_gemm_rows)
+    if (m >= band.lo && m <= band.hi) return band.tile;
+  return q4_gemm_tile(m, tune);
+}
 // How many slices of K one contraction is cut into. A workgroup walks its K
 // range serially, so a grid with fewer workgroups than the device can seat
 // is bound by that walk, not by math or memory; slicing K multiplies the

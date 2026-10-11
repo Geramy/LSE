@@ -654,21 +654,67 @@ void Workgroup::plan_slots(std::span<const NodePtr> roots,
 
 Status Workgroup::bind_slots(backend::IBackend& backend,
                              backend::Stream stream) {
-  for (Slot& s : slots_) {
-    if (s.buffer.valid()) continue;
+  // Unbound slots are packed, in order, as disjoint 256-byte-aligned windows
+  // of allocations of at most kSlotChunk bytes; a slot that size or larger
+  // takes an allocation of its own. A prefill pass's 78 slots cost 8.9 ms as
+  // 78 allocations (gfx1201, 304 rows). One allocation for all of them is
+  // all-or-nothing: at 128K tokens a phase's slots came to one 2.8 GB block,
+  // which the allocator refused with 2.5 GB free in other blocks, where the
+  // same slots one by one fit. A window is a buffer of its own to a kernel,
+  // but its allocation is released only with its last window, so a window
+  // that outlives its pass holds the rest of its chunk: with 256 MiB chunks
+  // a fresh 128K DFlash2 request peaked at 2.93 GiB of workspace against
+  // 2.84 one slot per allocation; with 32 MiB, 2.84.
+  constexpr std::size_t kSlotAlign = 256;
+  constexpr std::size_t kSlotChunk = std::size_t{32} << 20;
+  const auto aligned = [](std::size_t bytes) {
+    return (bytes + kSlotAlign - 1) / kSlotAlign * kSlotAlign;
+  };
+  const auto allocate = [&](std::size_t bytes) -> Result<backend::DeviceBuffer> {
     // Through the caller's stream: on a device spanning several GPUs the
     // stream is what places the bytes, and the default stream put every
     // member's phase activations in the primary's VRAM.
     const backend::ScopedAllocationSite site(backend::AllocationSite::kWorkspace);
-    auto buf = backend.allocate(s.bytes, backend::MemoryClass::kDevice, stream);
+    auto buf = backend.allocate(bytes, backend::MemoryClass::kDevice, stream);
     if (!buf.ok()) {
       const auto available = backend.sample_free_memory();
       return Status(buf.status().code(), detail::concat(
-          "workgroup slot allocation (", std::to_string(s.bytes), " bytes; available ",
+          "workgroup slot allocation (", std::to_string(bytes), " bytes; available ",
           available.ok() ? std::to_string(*available) : "unknown", "): ",
           buf.status().message()));
     }
-    s.buffer = buf.release();
+    return buf;
+  };
+  // The slots each chunk holds, decided before anything is allocated, so a
+  // refusal leaves every slot unbound.
+  std::vector<std::vector<std::size_t>> chunks;
+  std::vector<std::size_t> chunk_bytes;
+  for (std::size_t i = 0; i < slots_.size(); ++i) {
+    if (slots_[i].buffer.valid()) continue;
+    const std::size_t bytes = aligned(slots_[i].bytes);
+    if (bytes >= kSlotChunk || chunks.empty() || chunk_bytes.back() + bytes > kSlotChunk ||
+        chunk_bytes.back() >= kSlotChunk) {
+      chunks.emplace_back();
+      chunk_bytes.push_back(0);
+    }
+    chunks.back().push_back(i);
+    chunk_bytes.back() += bytes;
+  }
+  std::vector<backend::DeviceBuffer> held(chunks.size());
+  for (std::size_t c = 0; c < chunks.size(); ++c) {
+    auto buf = allocate(chunk_bytes[c]);
+    if (!buf.ok()) return buf.status();
+    held[c] = buf.release();
+  }
+  for (std::size_t c = 0; c < chunks.size(); ++c) {
+    std::size_t at = 0;
+    for (const std::size_t i : chunks[c]) {
+      Slot& s = slots_[i];
+      s.buffer = held[c];
+      s.buffer.offset += at;
+      s.buffer.size_bytes = s.bytes;
+      at += aligned(s.bytes);
+    }
   }
   for (const auto& [node, id] : slot_of_) {
     if (node == nullptr || id >= slots_.size()) continue;
@@ -690,6 +736,68 @@ Status Workgroup::bind_slots(backend::IBackend& backend,
     LSE_RETURN_IF_ERROR(bind_buffer_view(*node, false));
   }
   return OkStatus();
+}
+
+std::optional<WorkgroupShape> Workgroup::shape(
+    const std::unordered_map<const Node*, std::uint32_t>& index) const {
+  WorkgroupShape out;
+  const auto at = [&](const Node* n, std::uint32_t& i) {
+    const auto it = index.find(n);
+    if (it == index.end()) return false;
+    i = it->second;
+    return true;
+  };
+  out.device = device_;
+  out.members.reserve(members_.size());
+  for (const NodePtr& n : members_) {
+    std::uint32_t i = 0;
+    if (!at(n.get(), i)) return std::nullopt;
+    out.members.push_back(i);
+  }
+  out.member_inputs.reserve(member_input_set_.size());
+  for (const Node* n : member_input_set_) {
+    std::uint32_t i = 0;
+    if (!at(n, i)) return std::nullopt;
+    out.member_inputs.push_back(i);
+  }
+  out.lds_used = lds_used_;
+  out.job = job_;
+  out.rows = rows_;
+  out.reused = reused_;
+  out.slot_bytes.reserve(slots_.size());
+  for (const Slot& s : slots_) out.slot_bytes.push_back(s.bytes);
+  out.slot_of.reserve(slot_of_.size());
+  for (const auto& [n, id] : slot_of_) {
+    std::uint32_t i = 0;
+    if (!at(n, i)) return std::nullopt;
+    out.slot_of.emplace_back(i, id);
+  }
+  return out;
+}
+
+std::optional<Workgroup> Workgroup::from_shape(const WorkgroupShape& shape,
+                                               std::span<const NodePtr> nodes) {
+  Workgroup wg(shape.device);
+  for (const std::uint32_t i : shape.members) {
+    if (i >= nodes.size()) return std::nullopt;
+    wg.member_set_.insert(nodes[i].get());
+    wg.members_.push_back(nodes[i]);
+  }
+  for (const std::uint32_t i : shape.member_inputs) {
+    if (i >= nodes.size()) return std::nullopt;
+    wg.member_input_set_.insert(nodes[i].get());
+  }
+  wg.lds_used_ = shape.lds_used;
+  wg.job_ = shape.job;
+  wg.rows_ = shape.rows;
+  wg.reused_ = shape.reused;
+  wg.slots_.reserve(shape.slot_bytes.size());
+  for (const std::size_t bytes : shape.slot_bytes) wg.slots_.push_back(Slot{bytes, {}});
+  for (const auto& [i, id] : shape.slot_of) {
+    if (i >= nodes.size() || id >= wg.slots_.size()) return std::nullopt;
+    wg.slot_of_[nodes[i].get()] = id;
+  }
+  return wg;
 }
 
 }  // namespace lse::graph

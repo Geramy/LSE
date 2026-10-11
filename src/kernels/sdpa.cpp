@@ -369,10 +369,13 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     for(auto block:e.range(lane,e.u32(blocks),threads)) {
       const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
       const auto weight=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
-      // Sink, recent block, diagonal band and partial block always exact.
-      // iattrs[2] == 1: the tile holding the pass's last live row (the row
-      // that predicts the next token) reads every block exactly.
-      const auto answer_tile=e.let(s.iattrs[2]==1 ? last_position+1u>=live : e.u32(0)==e.u32(1));
+      // Sink, recent block, diagonal band and partial block always exact. So
+      // is every block for the tile holding the pass's last live row: its
+      // rows produce the next token's logits, and a mean-pooled score drops
+      // a block whose few relevant keys (a fact the prompt asks about) sit
+      // among unrelated ones. Needle retrieval at 32K and 128K on gfx1201
+      // went from 4 of 6 to 6 of 6 with no change in prefill time.
+      const auto answer_tile=e.let(last_position+1u>=live);
       const auto exact=e.let(block==0u || (block+2u)*256u>first_position ||
           a.pooled[pool+512u]!=256.0f || weight>=peak.read()*s.attrs[2] || answer_tile);
       e.store(wg*blocks+block,select(exact,e.f32(1),e.f32(0)));

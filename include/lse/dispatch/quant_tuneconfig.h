@@ -22,6 +22,12 @@ struct Q4GemmTile {
 // The wide-pass tile a part without its own (arch::Tuning::q4_gemm_wide)
 // takes: 256 x 128 outputs on 4 x 2 waves of 64 x 64.
 inline constexpr Q4GemmTile kQ4GemmWideTile{256, 128, 4, 2};
+// A part's measured tile for passes of lo..hi rows (arch::Tuning::q4_gemm_rows,
+// q4_gemm_kernel_tile).
+struct Q4GemmRowTile {
+  std::uint64_t lo = 0, hi = 0;
+  Q4GemmTile tile{};
+};
 
 struct QuantMatrixShape {
   std::string_view arch;

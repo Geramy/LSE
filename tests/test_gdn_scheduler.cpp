@@ -61,7 +61,9 @@ LSE_TEST(scheduler_preserves_both_pair_outputs_and_replay) {
     LSE_EXPECT_EQ(backend.impl().emitter.failures,0u);
     LSE_EXPECT_EQ(backend.impl().emitter.pairs,1u);
     LSE_EXPECT(out.node()->buffer.valid());LSE_EXPECT(next.node()->buffer.valid());
-    LSE_EXPECT(out.node()->buffer.ptr!=next.node()->buffer.ptr);
+    // Distinct windows; slots may share one allocation.
+    LSE_EXPECT(static_cast<char*>(out.node()->buffer.ptr)+out.node()->buffer.offset!=
+               static_cast<char*>(next.node()->buffer.ptr)+next.node()->buffer.offset);
     program.reset_compute();check(scheduler.eval(roots,false,&program));
     LSE_EXPECT(scheduler.last_trace().replayed);
     LSE_EXPECT_EQ(scheduler.last_trace().kernels_launched,separated?2u:1u);
