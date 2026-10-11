@@ -159,13 +159,20 @@ bool DraftWidthPolicy::needs_sample(const Ladder<N>& ladder, std::size_t i) noex
 
 template <std::size_t N, class Rows>
 bool DraftWidthPolicy::estimate_unmeasured(Ladder<N>& ladder, std::size_t first, Rows rows_of) {
-  if (!ladder.live || first >= N || ladder.samples[first] == 0 || ladder.samples[N - 1] == 0)
-    return false;
-  const double x0 = rows_of(first), x1 = rows_of(N - 1);
+  // The narrowest measured width and the widest: an MTP chain capped at a
+  // depth never verifies the widest width the ladder covers, so the widest
+  // end is whatever it has taken. Widths past it are extrapolated, and are
+  // ones it does not take.
+  if (!ladder.live || first >= N || ladder.samples[first] == 0) return false;
+  std::size_t top = first;
+  for (std::size_t i = first + 1; i < N; ++i)
+    if (ladder.samples[i] != 0) top = i;
+  if (top == first) return false;
+  const double x0 = rows_of(first), x1 = rows_of(top);
   const double y0 = ladder.base + ladder.offset[first];
-  const double y1 = ladder.base + ladder.offset[N - 1];
+  const double y1 = ladder.base + ladder.offset[top];
   bool priced = false;
-  for (std::size_t i = first + 1; i + 1 < N; ++i) {
+  for (std::size_t i = first + 1; i < N; ++i) {
     if (ladder.samples[i] != 0) continue;
     // A carried cost (a bucket started from another) stays as follow_growth
     // moves it; only what nothing priced is estimated.
@@ -182,8 +189,12 @@ bool DraftWidthPolicy::estimate_unmeasured(Ladder<N>& ladder, std::size_t first,
 template <std::size_t N>
 std::size_t DraftWidthPolicy::next_sample(const Ladder<N>& ladder, std::size_t first) noexcept {
   // The two ends first: they are what the widths between are priced from.
+  // The widest is asked for only until a second width is measured: a chain
+  // capped below it takes its own widest instead.
   if (first < N && needs_sample(ladder, first) && ladder.samples[first] == 0) return first;
-  if (needs_sample(ladder, N - 1) && ladder.samples[N - 1] == 0) return N - 1;
+  bool second = false;
+  for (std::size_t i = first + 1; i < N && !second; ++i) second = ladder.samples[i] != 0;
+  if (!second && needs_sample(ladder, N - 1)) return N - 1;
   std::size_t fewest = N;
   for (std::size_t i = first; i < N; ++i)
     if (needs_sample(ladder, i) && (fewest == N || ladder.samples[i] < ladder.samples[fewest]))

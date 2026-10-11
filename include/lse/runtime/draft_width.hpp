@@ -269,9 +269,9 @@ class DraftWidthPolicy {
   template <std::size_t N>
   static void seed_from(Ladder<N>& ladder, const Ladder<N>& from);
   // Prices every width (or rung) from `first` up that has not been measured
-  // in this bucket from the narrowest and widest ones measured, linear in
-  // rows, once both are: a verify pass's cost grows with its rows about
-  // linearly, and a forced pass of a narrow width throws away most of a
+  // in this bucket from the narrowest width and the widest one measured,
+  // linear in rows, once both are: a verify pass's cost grows with its rows
+  // about linearly, and a forced pass of a narrow width throws away most of a
   // step. Returns whether it priced any.
   template <std::size_t N, class Rows>
   static bool estimate_unmeasured(Ladder<N>& ladder, std::size_t first, Rows rows_of);

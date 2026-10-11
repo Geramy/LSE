@@ -717,6 +717,28 @@ LSE_TEST(draft_width_policy_returning_to_an_unfinished_context_explores_nothing)
   LSE_EXPECT_NEAR(policy.verify_ns(1), 29e6, 1.0);
 }
 
+LSE_TEST(draft_width_policy_prices_a_capped_chain_from_its_own_widest) {
+  // An MTP chain capped at depth 3 never verifies more than four rows: the
+  // widths between one row and four are priced from those two, and nothing
+  // keeps forcing the eight-row width it cannot take.
+  const auto cost = [](std::uint32_t rows) { return 30e6 + 1e6 * rows; };
+  DraftWidthPolicy policy;
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
+    policy.observe_verify(4, 1);
+  std::uint32_t forced = 0;
+  for (int step = 0; step < 64; ++step) {
+    const std::uint32_t depth = policy.depth(3, 3);
+    if (policy.exploring() != 0) ++forced;
+    policy.observe_verify(depth + 1, static_cast<std::uint64_t>(cost(depth + 1)));
+    policy.observe_draft(static_cast<std::uint64_t>(2e6 * (depth + 1)), depth);
+    policy.observe_step(depth + 1, static_cast<std::uint64_t>(cost(depth + 1) + 2e6 * (depth + 1)));
+  }
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT(forced <= 2u);
+  for (std::uint32_t rows = 1; rows <= 4; ++rows)
+    LSE_EXPECT_NEAR(policy.verify_ns(rows), cost(rows), 1.0);
+}
+
 LSE_TEST(draft_width_policy_warm_up_ends_with_device_time) {
   // A prompt that kept the device busy a second has ramped the clocks: the
   // policy's warm-up ends without its 32 steps.
