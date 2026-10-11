@@ -11,8 +11,9 @@ Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or la
 2. **Variant decisions by shape class:** a decision covers every pool size and chunk length of its class, is keyed by the engine build, and is kept beside the kernel cache in use (`--cache-dir`), so a later start reuses it. Trials run only during a process's warm-up, warm every candidate, alternate their order, and fill the output before each candidate so only a variant that writes all of it is kept.
 3. **Prefill GEMM:** a tile per band of pass widths on gfx1201 and gfx1151, so a width just past a tile multiple no longer pays for a padded tile; each weight piece decoded once on RDNA4, and all four layouts offered there.
 4. **dMTP prefill** takes the padded one-pass-per-chunk plan of the other sessions.
-5. **Adaptive width policy:** returning to a context whose widths were not all measured starts from the nearest fully measured context instead of exploring every width again.
-6. **Launch templates:** a request's rebuilt pass graphs reuse the recorded split, plan and launch descriptions of the same graph, and a phase's workgroup slots share one allocation.
+5. **Adaptive width policy:** a ladder of verify widths or tree rungs is priced from its narrowest and widest measured entries, and widths in between are estimated and measured only when chosen. A newly reached or revisited context starts from the nearest priced context. The policy warm-up also ends after 1 s of device time. The first DFlash2 request after a short warm-up runs at the steady-state step count.
+6. **Launch templates:** a request's rebuilt pass graphs reuse the recorded split, plan and launch descriptions of the same graph. A phase's workgroup slots are packed into allocations of at most 32 MiB, so a 128K request never needs one large block.
+7. **FlashPrefill V2:** the query tile holding a pass's last live row reads every block exactly, so a short fact anywhere in a long prompt is no longer dropped from the answer. Needle retrieval at 32K and 128K: 6 of 6 (was 4 of 6). 128K prefill time is unchanged.
 
 ## v0.6.0: context-aware draft policy, long-context attention on one WMMA flash split
 

@@ -8,31 +8,31 @@ Multi-GPU and multi-node support is in progress. `--pool` can already name sever
 
 ## Performance
 
-Prefill, tok/s:
+Prefill, tok/s (prompt tokens / time to first token, measured by the client on a new prompt length):
 
 | GPU | OS | 256 | 1K | 2K | 4K | 32K |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Radeon 8060S (gfx1151) | Linux | 463 | 499 | 512 | 522 | 480 |
+| Radeon 8060S (gfx1151) | Linux | 460 | 501 | 526 | 538 | 480 |
 | Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | | | | |
-| Radeon AI PRO R9700 | Linux | 1,155 | 1,424 | 1,463 | 1,501 | 1,394 |
-| Radeon AI PRO R9700 | macOS | 1,393 | 1,489 | 1,536 | 1,666 | 1,563 |
+| Radeon AI PRO R9700 | Linux | 1,247 | 1,396 | 1,457 | 1,484 | 1,388 |
+| Radeon AI PRO R9700 | macOS | Results pending | | | | |
 
 Decode, code prompt, tok/s:
 
 | GPU | OS | Baseline | dMTP | DFlash2 |
 | --- | --- | ---: | ---: | ---: |
-| Radeon 8060S (gfx1151) | Linux | 14.1 | 46.2 | **63.2** |
+| Radeon 8060S (gfx1151) | Linux | 14.1 | 47.0 | **65.2** |
 | Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | | |
-| Radeon AI PRO R9700 | Linux | 32.5 | 114.3 | **140.1** |
-| Radeon AI PRO R9700 | macOS | 33.1 | 125.2 | **164.0** |
+| Radeon AI PRO R9700 | Linux | 32.3 | 108.9 | **152.8** |
+| Radeon AI PRO R9700 | macOS | Results pending | | |
 
-Model: Qwen3.8-27B, 4-bit (MLX); drafts: dMTP (dynamic MTP) 8-bit, DFlash2 8-bit.
+Model: Qwen3.8-27B, 4-bit (MLX); drafts: dMTP (dynamic MTP) 8-bit, DFlash2 8-bit. Temperature 0.6, median of 3, after a warm-up that completes kernel variant selection.
 
-![Prefill vs prompt length](docs/benchmarks/lse-0.6.0-prefill-vs-context.png)
+![Prefill vs prompt length](docs/benchmarks/lse-0.6.1-prefill-vs-context.png)
 
 Prefill vs prompt length
 
-![Decode vs context, code task](docs/benchmarks/lse-0.6.0-decode-vs-context.png)
+![Decode vs context, code task](docs/benchmarks/lse-0.6.1-decode-vs-context.png)
 
 Decode vs context, code task
 
