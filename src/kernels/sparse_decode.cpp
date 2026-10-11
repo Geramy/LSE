@@ -638,7 +638,7 @@ struct SparseDecodeSelect final : KernelPrimitive<SparseDecodeSelect> {
     const auto stride = static_cast<std::uint32_t>(s.inputs[2].dim(1));
     if (kvh == 0 || s.inputs[0].dim(0) % kvh || s.inputs[0].dim(1) != s.inputs[2].dim(1) ||
         stride > sd::kMaxPages || budget <= sd::kSinkPages + sd::kRecentPages ||
-        s.output != Shape{s.inputs[0].dim(0), static_cast<std::int64_t>(budget)})
+        s.output != Shape{s.inputs[0].dim(0), static_cast<std::int64_t>(budget) + s.inputs[2].dim(1)})
       return {};
     const bool joint = s.iattrs[1] != 0;
     const auto far_budget = budget - sd::kSinkPages - sd::kRecentPages;
@@ -660,7 +660,9 @@ struct SparseDecodeSelect final : KernelPrimitive<SparseDecodeSelect> {
     (void)e.ret_if(b >= rows);
     const auto m = row_meta(e, a.meta, b);
     const auto tb = e.let(b * stride);
-    const auto ob = e.let(row * budget);
+    // A row is the budget's block ids, then a flag per page: 1 where a far
+    // page was left out (the mean correction's pages).
+    const auto ob = e.let(row * (budget + stride));
     // Every page fits: the table as it is (slots past the row are never read).
     const auto all = e.let(m.pages <= budget);
     if (auto copy = e.when(all))
@@ -752,10 +754,14 @@ struct SparseDecodeSelect final : KernelPrimitive<SparseDecodeSelect> {
     auto slot = e.var(kir::cast<kir::u32>(e.let(inclusive - kept.read())));
     for (int i = 0; i < static_cast<int>(per); ++i) {
       const auto p = e.let(lane * per + static_cast<std::uint32_t>(i));
-      if (auto take = e.when(key[i].read() >= threshold.read())) {
+      const auto take = e.let(key[i].read() >= threshold.read());
+      if (auto kept_page = e.when(take)) {
         e.store(e.let(ob + sd::kSinkPages + slot.read()), a.table[e.let(tb + p)]);
         slot = slot.read() + 1u;
       }
+      if (auto real = e.when(p < stride))
+        e.store(e.let(ob + budget + p),
+                select(far(p) && key[i].read() < threshold.read(), e.f32(1.0f), e.f32(0.0f)));
     }
     if (auto sink = e.when(lane < sd::kSinkPages))
       e.store(e.let(ob + lane), a.table[e.let(tb + lane)]);
@@ -803,15 +809,17 @@ struct SparseDecodeTail final : KernelPrimitive<SparseDecodeTail> {
   static constexpr std::string_view kName = "attention.sparse_decode.tail.v1";
   static constexpr std::string_view kEntry = "lse_sparse_decode_tail_v1";
   static constexpr std::string_view kSource = {};
-  static constexpr std::uint32_t kThreads = 256, kWaves = kThreads / 32u, kPagesPer = 256;
-  // Rows whose logits over the tile's pages fit in LDS at once.
-  static constexpr std::uint32_t kRowChunk = 48;
+  static constexpr std::uint32_t kThreads = 256, kWaves = kThreads / 32u;
+  // Pages a wave walks (one split record per row each), and the rows it
+  // carries in registers at a time.
+  static constexpr std::uint32_t kPagesPerWave = sd::kTailPagesPerWave, kRowGroup = 6;
   std::size_t arity() const noexcept override { return 5; }
   bool owns_indexing() const noexcept override { return true; }
   bool supports_epilogue() const noexcept override { return false; }
 
-  static std::uint32_t tiles(std::int64_t stride) {
-    return static_cast<std::uint32_t>((stride + kPagesPer - 1) / kPagesPer);
+  // Split records per row: one per workgroup (eight waves' runs of pages).
+  static std::uint32_t records(std::int64_t stride) {
+    return static_cast<std::uint32_t>((stride + kPagesPerWave * kWaves - 1) / (kPagesPerWave * kWaves));
   }
 
   std::string emit_kernel(const KernelShapes& s) const override {
@@ -828,144 +836,149 @@ struct SparseDecodeTail final : KernelPrimitive<SparseDecodeTail> {
     const auto queries = static_cast<std::uint32_t>(s.inputs[0].dim(2));
     const auto kvh = static_cast<std::uint32_t>(s.inputs[1].dim(1));
     const auto group = heads / kvh;
-    const auto total_rows = group * queries;
+    
     const auto stride = static_cast<std::uint32_t>(s.inputs[3].dim(1));
-    const auto ntiles = tiles(stride);
-    const auto budget = static_cast<std::uint32_t>(s.inputs[4].dim(1));
-    if (budget <= sd::kSinkPages + sd::kRecentPages || s.inputs[4].dim(0) != batch * kvh) return {};
-    const auto far_budget = budget - sd::kSinkPages - sd::kRecentPages;
-    const Shape want = queries == 1 ? Shape{batch, heads, ntiles, sd::kSplitRecord}
-                                    : Shape{batch, heads, queries, ntiles, sd::kSplitRecord};
+    const auto nrecords = records(stride);
+    const auto width = static_cast<std::uint32_t>(s.inputs[4].dim(1));
+    if (width <= stride || s.inputs[4].dim(0) != batch * kvh) return {};
+    const auto budget = width - stride;
+    if (budget <= sd::kSinkPages + sd::kRecentPages) return {};
+    const Shape want = queries == 1 ? Shape{batch, heads, nrecords, sd::kSplitRecord}
+                                    : Shape{batch, heads, queries, nrecords, sd::kSplitRecord};
     if (s.output != want) return {};
-    const auto rc = std::min(kRowChunk, total_rows);
-    const auto chunks = (total_rows + rc - 1u) / rc;
+    // A verify pass's rows of one query head share one correction, from
+    // their mean query: the omitted pages' mass is a smooth correction, and
+    // per-row logits would cost the pass's width again.
+    const auto tail_rows = group;
+    const auto groups = (tail_rows + kRowGroup - 1u) / kRowGroup;
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     TailArgs<env::Emit> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
-    const auto chosen = e.lds<kir::f32>(far_budget);
-    const auto omit = e.lds<kir::f32>(kPagesPer);
-    const auto logits = e.lds<kir::f32>(rc * kPagesPer);
     const auto lane = e.let(math::local_id()), wg = e.let(math::workgroup_id_x());
     const auto wave = e.let(lane / 32u), wl = e.let(lane % 32u);
-    const auto tile = e.let(wg % ntiles);
-    const auto kh = e.let((wg / ntiles) % kvh);
-    const auto b = e.let(wg / (ntiles * kvh));
+    const auto tile = e.let(wg % nrecords);  // this workgroup's record
+    const auto run = e.let(tile * kWaves + wave);  // this wave's run of pages
+    const auto kh = e.let((wg / nrecords) % kvh);
+    const auto b = e.let(wg / (nrecords * kvh));
+    const auto partial = e.lds<kir::f32>(kWaves * kRowGroup * sd::kSplitRecord);
     const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
     const auto m = row_meta(e, a.meta, b);
+    const auto first_page = e.let(run * kPagesPerWave);
     const auto far_end = minus(e, m.pages, sd::kRecentPages);
-    const auto tile_begin = e.let(tile * kPagesPer);
-    // A record per row of this tile; empty (no mass) unless pages were left out.
+    const auto flags = e.let((b * kvh + kh) * width + budget);
     const auto record = [&](const kir::Val<kir::u32>& rr) {
       const auto h = e.let(kh * group + rr / queries), t = e.let(rr % queries);
-      return e.let((((b * heads + h) * queries + t) * ntiles + tile) * sd::kSplitRecord);
+      return e.let((((b * heads + h) * queries + t) * nrecords + tile) * sd::kSplitRecord);
     };
-    const auto dead = e.let(b >= rows || m.pages <= budget || tile_begin >= far_end);
-    if (auto empty = e.when(dead)) {
-      for (auto rr : e.range(wave, e.u32(total_rows), kWaves)) {
-        const auto base = record(rr);
-        for (std::uint32_t j = 0; j < 8; ++j) e.store(e.let(base + 2u + wl * 8u + j), e.f32(0.0f));
-        if (auto lead = e.when(wl == 0u)) {
-          e.store(base, math::neg_inf());
-          e.store(e.let(base + 1u), e.f32(0.0f));
-        }
-      }
-    }
-    (void)e.ret_if(dead);
-    for (auto j : e.range(lane, e.u32(far_budget), kThreads))
-      chosen[j] = a.selected[e.let((b * kvh + kh) * budget + sd::kSinkPages + j)];
-    e.barrier();
-    {
-      const auto page = e.let(tile_begin + lane);
-      const auto far = e.let(page >= sd::kSinkPages && page < far_end && page < stride);
-      auto left_out = e.var(0.0f);
-      if (auto candidate = e.when(far)) {
-        const auto blk = e.let(a.table[e.let(b * stride + page)]);
-        auto found = e.var(0.0f);
-        for (auto j : e.range(far_budget))
-          found = math::max(found.read(), select(chosen[j].read() == blk, e.f32(1.0f), e.f32(0.0f)));
-        left_out = e.let(1.0f - found.read());
-      }
-      omit[lane] = left_out.read();
-    }
-    e.barrier();
+    // No far page here (or every page is read): empty records.
+    const auto live = e.let(b < rows && m.pages > budget && first_page < far_end);
     const float log_count = std::log(static_cast<float>(sd::kPage));
     const auto channel = e.let(wl * 8u);
-    for (auto chunk : e.range(chunks)) {
-      const auto r0 = e.let(chunk * rc);
-      // Logits: a wave per omitted page, the rows' dot products over the lanes.
-      e.barrier();
-      for (auto i : e.range(wave, e.u32(kPagesPer), kWaves)) {
-        const auto out = e.let(omit[i].read() != 0.0f);
-        if (auto skip = e.when(omit[i].read() == 0.0f))
-          for (std::uint32_t r = 0; r < rc; ++r)
-            if (auto lead = e.when(wl == 0u)) logits[e.let(e.u32(r * kPagesPer) + i)] = math::neg_inf();
-        if (auto take = e.when(out)) {
-          const auto blk = e.let(kir::cast<kir::u32>(a.table[e.let(b * stride + tile_begin + i)]));
-          const auto sb = e.let((blk * kvh + kh) * sd::kSummaryRows * kWidth + sd::kRowKeyMean * kWidth + channel);
-          const auto km = e.load(a.summary, sb, 16u);
-          std::vector<kir::Val<kir::f32>> kf;
-          for (int j = 0; j < 8; ++j) kf.push_back(e.let(math::widen(km[j])));
-          for (std::uint32_t r = 0; r < rc; ++r) {
-            const auto rr = e.let(r0 + r);
-            const auto safe = e.let(select(rr < total_rows, rr, e.u32(0)));
-            const auto qb = e.let(((b * heads + kh * group + safe / queries) * queries + safe % queries) * kWidth + channel);
-            const auto lo = e.load(a.q, qb, 16u);
-            const auto hi = e.load(a.q, e.let(qb + 4u), 16u);
-            auto dot = e.var(0.0f);
-            for (int j = 0; j < 8; ++j)
-              dot = math::fma(e.let(j < 4 ? lo[j] : hi[j - 4]), kf[static_cast<std::size_t>(j)], dot.read());
-            for (std::uint32_t bit = 16; bit; bit /= 2) dot = dot.read() + math::shfl_xor(dot.read(), e.u32(bit));
-            if (auto lead = e.when(wl == 0u))
-              logits[e.let(e.u32(r * kPagesPer) + i)] = e.let(dot.read() * s.attrs[0] + log_count);
-          }
+    for (std::uint32_t g = 0; g < groups; ++g) {
+      const auto count = std::min(kRowGroup, tail_rows - g * kRowGroup);
+      std::vector<std::vector<kir::Val<kir::f32>>> qv;
+      std::vector<kir::LValue<kir::f32>> top, denom;
+      std::vector<std::vector<kir::LValue<kir::f32>>> num;
+      for (std::uint32_t r = 0; r < count; ++r) {
+        const auto h = e.u32(g * kRowGroup + r);  // query head within the group
+        std::vector<kir::LValue<kir::f32>> mean;
+        for (int j = 0; j < 8; ++j) mean.push_back(e.var(0.0f));
+        for (std::uint32_t t = 0; t < queries; ++t) {
+          const auto qb = e.let(((b * heads + kh * group + h) * queries + t) * kWidth + channel);
+          const auto lo = e.load(a.q, qb, 16u);
+          const auto hi = e.load(a.q, e.let(qb + 4u), 16u);
+          for (int j = 0; j < 8; ++j)
+            mean[static_cast<std::size_t>(j)] = mean[static_cast<std::size_t>(j)].read() +
+                                                 e.let(j < 4 ? lo[j] : hi[j - 4]) * (1.0f / static_cast<float>(queries));
         }
+        qv.emplace_back();
+        for (int j = 0; j < 8; ++j) qv.back().push_back(e.let(mean[static_cast<std::size_t>(j)].read()));
+        top.push_back(e.var(math::neg_inf()));
+        denom.push_back(e.var(0.0f));
+        num.emplace_back();
+        for (int j = 0; j < 8; ++j) num.back().push_back(e.var(0.0f));
       }
-      e.barrier();
-      // Per row: the maximum and the weights, then the numerators with the
-      // channels over the lanes.
-      for (auto r : e.range(wave, e.u32(rc), kWaves)) {
-        const auto rr = e.let(r0 + r);
-        const auto row = e.let(r * kPagesPer);
-        auto top = e.var(math::neg_inf());
-        for (std::uint32_t j = 0; j < kPagesPer / 32u; ++j)
-          top = math::max(top.read(), logits[e.let(row + wl + j * 32u)].read());
-        for (std::uint32_t bit = 16; bit; bit /= 2) top = math::max(top.read(), math::shfl_xor(top.read(), e.u32(bit)));
-        const auto peak = e.let(top.read());
-        const auto finite = e.let(peak != math::neg_inf());
-        const auto safe_peak = e.let(select(finite, peak, e.f32(0.0f)));
-        auto denom = e.var(0.0f);
-        for (std::uint32_t j = 0; j < kPagesPer / 32u; ++j) {
-          const auto at = e.let(row + wl + j * 32u);
-          const auto w = e.let(math::exp(logits[at].read() - safe_peak));
-          logits[at] = w;
-          denom = denom.read() + w;
-        }
-        for (std::uint32_t bit = 16; bit; bit /= 2) denom = denom.read() + math::shfl_xor(denom.read(), e.u32(bit));
-        std::vector<kir::LValue<kir::f32>> num;
-        for (int j = 0; j < 8; ++j) num.push_back(e.var(0.0f));
-        if (auto any = e.when(finite)) {
-          for (auto i : e.range(kPagesPer)) {
-            if (auto out = e.when(omit[i].read() != 0.0f)) {
-              const auto w = e.let(logits[e.let(row + i)].read());
-              const auto blk = e.let(kir::cast<kir::u32>(a.table[e.let(b * stride + tile_begin + i)]));
-              const auto vb = e.let((blk * kvh + kh) * sd::kSummaryRows * kWidth + sd::kRowValueMean * kWidth + channel);
-              const auto vm = e.load(a.summary, vb, 16u);
-              for (int j = 0; j < 8; ++j)
-                num[static_cast<std::size_t>(j)] = math::fma(w, math::widen(vm[j]), num[static_cast<std::size_t>(j)].read());
+      if (auto any = e.when(live)) {
+        // Four pages per step, their loads issued before any arithmetic, so a
+        // wave keeps several reads in flight instead of one.
+        constexpr std::uint32_t kStep = 4;
+        for (auto i0 : e.range(0u, kPagesPerWave, kStep)) {
+          std::vector<kir::Val<kir::boolean>> out;
+          std::vector<std::vector<kir::Val<kir::f32>>> kf, vf;
+          for (std::uint32_t u = 0; u < kStep; ++u) {
+            const auto page = e.let(first_page + i0 + u);
+            const auto real = e.let(page < stride);
+            const auto safe = e.let(select(real, page, e.u32(0)));
+            const auto flag = e.let(a.selected[e.let(flags + safe)]);
+            out.push_back(e.let(real && flag != 0.0f));
+            const auto blk = e.let(kir::cast<kir::u32>(a.table[e.let(b * stride + safe)]));
+            const auto sb = e.let((blk * kvh + kh) * sd::kSummaryRows * kWidth + channel);
+            const auto km = e.load(a.summary, e.let(sb + sd::kRowKeyMean * kWidth), 16u);
+            const auto vm = e.load(a.summary, e.let(sb + sd::kRowValueMean * kWidth), 16u);
+            kf.emplace_back();
+            vf.emplace_back();
+            for (int j = 0; j < 8; ++j) {
+              kf.back().push_back(e.let(math::widen(km[j])));
+              vf.back().push_back(e.let(math::widen(vm[j])));
+            }
+          }
+          for (std::uint32_t u = 0; u < kStep; ++u) {
+            if (auto take = e.when(out[u])) {
+              for (std::uint32_t r = 0; r < count; ++r) {
+                auto dot = e.var(0.0f);
+                for (std::size_t j = 0; j < 8; ++j) dot = math::fma(qv[r][j], kf[u][j], dot.read());
+                for (std::uint32_t bit = 16; bit; bit /= 2) dot = dot.read() + math::shfl_xor(dot.read(), e.u32(bit));
+                const auto logit = e.let(dot.read() * s.attrs[0] + log_count);
+                const auto updated = e.let(math::max(top[r].read(), logit));
+                const auto alpha = e.let(math::exp(top[r].read() - updated));
+                const auto weight = e.let(math::exp(logit - updated));
+                top[r] = updated;
+                denom[r] = math::fma(denom[r].read(), alpha, weight);
+                for (std::size_t j = 0; j < 8; ++j)
+                  num[r][j] = math::fma(num[r][j].read(), alpha, e.let(weight * vf[u][j]));
+              }
             }
           }
         }
-        if (auto real = e.when(rr < total_rows)) {
-          const auto base = record(rr);
-          for (std::uint32_t j = 0; j < 8; ++j) e.store(e.let(base + 2u + channel + j), num[j].read());
+      }
+      // The eight waves' records of each row, combined in LDS into the
+      // workgroup's one (stable rescaling to the largest maximum).
+      for (std::uint32_t r = 0; r < count; ++r) {
+        const auto at = e.let((wave * kRowGroup + r) * sd::kSplitRecord);
+        for (std::uint32_t j = 0; j < 8; ++j) partial[e.let(at + 2u + channel + j)] = num[r][j].read();
+        if (auto lead = e.when(wl == 0u)) {
+          partial[at] = top[r].read();
+          partial[e.let(at + 1u)] = denom[r].read();
+        }
+      }
+      e.barrier();
+      if (auto owner = e.when(wave < count)) {
+        auto peak = e.var(math::neg_inf());
+        for (std::uint32_t w = 0; w < kWaves; ++w)
+          peak = math::max(peak.read(), partial[e.let(e.u32(w * kRowGroup) * sd::kSplitRecord + wave * sd::kSplitRecord)].read());
+        const auto safe = e.let(select(peak.read() != math::neg_inf(), peak.read(), e.f32(0.0f)));
+        auto d = e.var(0.0f);
+        std::vector<kir::LValue<kir::f32>> n;
+        for (int j = 0; j < 8; ++j) n.push_back(e.var(0.0f));
+        for (std::uint32_t w = 0; w < kWaves; ++w) {
+          const auto at = e.let((e.u32(w * kRowGroup) + wave) * sd::kSplitRecord);
+          const auto scale_w = e.let(math::exp(partial[at].read() - safe));
+          d = math::fma(partial[e.let(at + 1u)].read(), scale_w, d.read());
+          for (std::uint32_t j = 0; j < 8; ++j)
+            n[j] = math::fma(partial[e.let(at + 2u + channel + j)].read(), scale_w, n[j].read());
+        }
+        for (std::uint32_t t = 0; t < queries; ++t) {
+          const auto base = record(e.let((e.u32(g * kRowGroup) + wave) * queries + t));
+          for (std::uint32_t j = 0; j < 8; ++j) e.store(e.let(base + 2u + channel + j), n[j].read());
           if (auto lead = e.when(wl == 0u)) {
-            e.store(base, peak);
-            e.store(e.let(base + 1u), denom.read());
+            e.store(base, peak.read());
+            e.store(e.let(base + 1u), d.read());
           }
         }
       }
+      e.barrier();
     }
     return k.lds().ok() ? k.str() : std::string{};
   }
@@ -976,11 +989,9 @@ struct SparseDecodeTail final : KernelPrimitive<SparseDecodeTail> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan p;
     p.workgroup_size[0] = kThreads;
-    p.workgroup_count[0] = static_cast<std::uint32_t>(s.inputs[0].dim(0) * s.inputs[1].dim(1)) *
-                           tiles(s.inputs[3].dim(1));
-    const auto rows = static_cast<std::uint32_t>(s.inputs[0].dim(1) / s.inputs[1].dim(1) * s.inputs[0].dim(2));
-    p.lds_bytes = (static_cast<std::uint32_t>(s.inputs[4].dim(1)) + kPagesPer +
-                   std::min(kRowChunk, rows) * kPagesPer) * 4u;
+    const auto n = records(s.inputs[3].dim(1));
+    p.workgroup_count[0] = static_cast<std::uint32_t>(s.inputs[0].dim(0) * s.inputs[1].dim(1)) * n;
+    p.lds_bytes = kWaves * kRowGroup * sd::kSplitRecord * 4u;
     return p;
   }
 };

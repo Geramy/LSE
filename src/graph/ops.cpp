@@ -867,8 +867,10 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   scores->prim = find_primitive(many_rows && kernels::matrix_target(*device)
                                     ? "attention.sparse_decode.score_mma.v1"
                                     : "attention.sparse_decode.score.v1");
-  auto selected = make(OpKind::kCustom, Shape{batch * kvh, budget_pages}, DType::kF32,
-                       {scores, meta.node(), table.node()});
+  // The selection's rows: the budget's block ids, then a flag per page for
+  // the omitted far pages; the attention reads the ids alone.
+  auto selected = make(OpKind::kCustom, Shape{batch * kvh, budget_pages + table.shape().dim(1)},
+                       DType::kF32, {scores, meta.node(), table.node()});
   selected->iattrs[0] = budget_pages;
   selected->iattrs[1] = joint_heads ? 1 : 0;
   selected->iattrs[2] = static_cast<std::int32_t>(kvh);
@@ -879,11 +881,12 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   scores->fclass = scores->prim->fusion_class();
   selected->fclass = selected->prim->fusion_class();
 
+  const Array compact = slice(Array(selected), 1, 0, budget_pages);
   const bool dim_major = dispatch::dimension_major_values(k.shape(), v.shape());
   Shape out{sq.dim(0), sq.dim(1), sq.dim(2),
             kv::logical_width(storage, dim_major ? v.shape().dim(2) : v.shape().dim(3))};
   auto n = make(OpKind::kAttention, out, q.dtype(),
-                {q.node(), k.node(), v.node(), shifted, selected});
+                {q.node(), k.node(), v.node(), shifted, compact.node()});
   n->attrs[0] = scale;
   n->attrs[1] = static_cast<float>(storage);
   n->iattrs[0] = static_cast<std::int32_t>(mask);
@@ -892,7 +895,7 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   n->iattrs[2] = 1;
   n->iattrs[3] = block_size;
   n->prim = find_primitive("attention");
-  const Shape shapes[] = {q.shape(), k.shape(), v.shape(), meta.shape(), selected->shape};
+  const Shape shapes[] = {q.shape(), k.shape(), v.shape(), meta.shape(), compact.shape()};
   const DType dtypes[] = {q.dtype(), k.dtype(), v.dtype(), DType::kF32, DType::kF32};
   KernelShapes request;
   request.inputs = shapes;
@@ -930,7 +933,7 @@ Result<Array> sparse_decode_attention(const Array& q, const Array& k, const Arra
   const bool short_query = sq.dim(2) > 1;
   const std::int64_t capacity = static_cast<std::int64_t>(budget_pages) * block_size;
   const std::int64_t parts = flash_parts ? flash_parts : (capacity + 127) / 128;
-  const std::int64_t tiles = (table.shape().dim(1) + 255) / 256;
+  const std::int64_t tiles = (table.shape().dim(1) + sd::kTailPagesPerWave * 8 - 1) / (sd::kTailPagesPerWave * 8);
   const Shape partial_shape = short_query ? Shape{sq.dim(0), sq.dim(1), sq.dim(2), parts, 258}
                                           : Shape{sq.dim(0), sq.dim(1), parts, 258};
   const Shape tail_shape = short_query ? Shape{sq.dim(0), sq.dim(1), sq.dim(2), tiles, 258}

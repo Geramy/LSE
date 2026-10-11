@@ -303,7 +303,10 @@ int gpu_check() {
               for (int c = 0; c < kWidth; ++c) {
                 float ks = 0, vs = 0;
                 for (int s2 = 0; s2 < 16; ++s2) { ks += key_at(f, g, p * 16 + s2, c); vs += value_at(f, g, p * 16 + s2, c); }
-                dot += double(f.q[(std::size_t(h) * rows + t) * kWidth + c]) * round_bf16(ks * (1.0f / 16));
+                // The correction takes the head's mean query over the pass's rows.
+                float qm = 0;
+                for (int r2 = 0; r2 < rows; ++r2) qm += f.q[(std::size_t(h) * rows + r2) * kWidth + c] * (1.0f / float(rows));
+                dot += double(qm) * round_bf16(ks * (1.0f / 16));
                 vm[c] = round_bf16(vs * (1.0f / 16));
               }
               mean_logits.push_back(dot * kScale + std::log(16.0));

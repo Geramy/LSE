@@ -170,7 +170,8 @@ Result<dispatch::SparseDecodeCalibration> calibrate_sparse_decode(
     const NodePtr records = o.node()->inputs[0];
     const bool tail = records->inputs.size() == 2;
     const NodePtr partial = tail ? records->inputs[0] : records;
-    const NodePtr selected = partial->inputs[4];
+    // The partial reads the selection's block ids through a slice.
+    const NodePtr selected = partial->inputs[4]->inputs[0];
     return Stages{selected->inputs[0], selected, tail ? records->inputs[1] : selected};
   };
   double score1[2] = {0, 0}, both1[2] = {0, 0}, score8 = 0, tail1 = 0, select8 = 0, tail8 = 0;
