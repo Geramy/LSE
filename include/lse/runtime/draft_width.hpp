@@ -56,10 +56,12 @@ class DraftWidthPolicy {
   static constexpr std::size_t kBins = 24;
   static constexpr double kBinsPerDecade = 4.0;
   [[nodiscard]] static std::size_t bin_of(double confidence) noexcept;
-  // Observations of every verify width before the policy trusts its costs,
-  // taken round-robin so a clock ramp at the start of a process does not
-  // favor whichever widths come last.
-  static constexpr std::uint32_t kExploreSamples = 2;
+  // Forced observations of the narrowest and widest verify widths (and tree
+  // rungs) before the policy trusts its costs; the widths between are priced
+  // from them (estimate_unmeasured), and every width is measured again when
+  // the policy takes it. One: a forced narrow pass throws away most of a
+  // step, and a 300-token request after a short warm-up is a few dozen.
+  static constexpr std::uint32_t kExploreSamples = 1;
   // Steps after which a width's cost is measured again, on a step where that
   // costs at most kRefreshLoss expected tokens by the position means (on
   // code at the full block a narrower width never qualifies; it would throw
@@ -69,13 +71,16 @@ class DraftWidthPolicy {
   // ... and whatever it costs after this many, so an estimate that came out
   // high (and so is never cheap) cannot keep its width out of use for good.
   static constexpr std::uint64_t kHardRefreshSteps = 2048;
+  // ... and a cost resting on fewer than kTrustedSamples measurements after
+  // this many: a single first sample may have paid for a compile.
+  static constexpr std::uint64_t kUntrustedRefreshSteps = 64;
   // Until a cost rests on kTrustedSamples measurements in its context bucket,
   // a lower sample replaces it (early samples err high: a step whose wall
   // time was mostly a first compile, clocks still ramping). It is not
   // measured again any sooner than other costs: forced measurements of
   // narrow widths throw away most of a step, and at long contexts, where a
   // request is a few dozen steps, they cost more than they could find.
-  static constexpr std::uint32_t kTrustedSamples = kExploreSamples;
+  static constexpr std::uint32_t kTrustedSamples = 2;
   // Measured steps before the first measurements of every width: the GPU's
   // clocks ramp up over a process's first steps, and a width measured then
   // would be priced high. Until then the full width is used.
@@ -229,6 +234,9 @@ class DraftWidthPolicy {
     std::array<bool, N> entered{};
     std::array<std::uint32_t, N> samples{};  // measured in this bucket
     std::array<std::uint64_t, N> last_seen{};
+    // Priced from the widths measured around it (estimate_unmeasured) before
+    // it was measured: measured when the policy takes it, never forced.
+    std::array<bool, N> estimated{};
   };
   struct Costs {
     Ladder<kMaxRows + 1> verify;          // by rows
@@ -247,6 +255,17 @@ class DraftWidthPolicy {
   // Starts `ladder` from `from`'s costs, measuring only what that one lacks.
   template <std::size_t N>
   static void seed_from(Ladder<N>& ladder, const Ladder<N>& from);
+  // Prices every width (or rung) from `first` up that has not been measured
+  // in this bucket from the narrowest and widest ones measured, linear in
+  // rows, once both are: a verify pass's cost grows with its rows about
+  // linearly, and a forced pass of a narrow width throws away most of a
+  // step. Returns whether it priced any.
+  template <std::size_t N, class Rows>
+  static bool estimate_unmeasured(Ladder<N>& ladder, std::size_t first, Rows rows_of);
+  // The width (or rung) a ladder must measure next: the narrowest, then the
+  // widest, then whatever has fewest samples; N when none.
+  template <std::size_t N>
+  [[nodiscard]] static std::size_t next_sample(const Ladder<N>& ladder, std::size_t first) noexcept;
   // Whether a ladder holds a cost for every width (or rung) it covers.
   template <std::size_t N>
   [[nodiscard]] static bool complete(const Ladder<N>& ladder, std::size_t first) noexcept;
@@ -261,6 +280,14 @@ class DraftWidthPolicy {
   double draft_value_ = 0;
   bool draft_value_known_ = false;
   std::uint32_t skipped_ = 0;
+  // Forced measurements are at least kForcedEvery steps apart: between them
+  // the policy prices widths from what it has.
+  static constexpr std::uint64_t kForcedEvery = 4;
+  std::uint64_t last_forced_ = 0;
+  bool forced_any_ = false;
+  [[nodiscard]] bool forced_recently() const noexcept {
+    return forced_any_ && steps_ - last_forced_ < kForcedEvery;
+  }
 
   [[nodiscard]] static std::size_t tree_rung(std::uint32_t rows) noexcept;
   static constexpr std::size_t kCandidateBins = 20;

@@ -477,14 +477,15 @@ LSE_TEST(greedy_sampling_ignores_every_other_knob) {
 }
 
 namespace {
-// A policy that has measured every verify width: `base` ns for one row and
+// A policy that has measured every verify width, each kTrustedSamples
+// times: `base` ns for one row and
 // `per_row` more for each further row, drafts of `draft` ns, and a long-run
 // rate of `rate_tps` tokens per second.
 DraftWidthPolicy measured_policy(double base, double per_row, double draft, double rate_tps) {
   DraftWidthPolicy policy;
   for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
     policy.observe_verify(DraftWidthPolicy::kMaxRows, 1);  // warm-up: priced nothing
-  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass)
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kTrustedSamples; ++pass)
     for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows)
       policy.observe_verify(rows, static_cast<std::uint64_t>(base + per_row * (rows - 1)));
   if (draft > 0) policy.observe_draft(static_cast<std::uint64_t>(draft));
@@ -493,7 +494,7 @@ DraftWidthPolicy measured_policy(double base, double per_row, double draft, doub
 }
 }  // namespace
 
-LSE_TEST(draft_width_policy_measures_every_width_first) {
+LSE_TEST(draft_width_policy_measures_the_ends_and_prices_the_widths_between) {
   DraftWidthPolicy policy;
   // While the clocks ramp up: the full width, no measuring.
   const std::array<double, 7> unsure{0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1};
@@ -502,23 +503,37 @@ LSE_TEST(draft_width_policy_measures_every_width_first) {
   LSE_EXPECT_EQ(policy.depth(7, 3), 3u);
   for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
     policy.observe_verify(DraftWidthPolicy::kMaxRows, 99'000'000);  // priced nothing
-  // Width 1 is a plain step: no draft at all.
+  // The narrowest width first; width 1 is a plain step, no draft at all.
   LSE_EXPECT_EQ(policy.exploring(), 1u);
   LSE_EXPECT(!policy.draft_next());
-  const std::array<double, 7> sure{1, 1, 1, 1, 1, 1, 1};
-  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
-    for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows) {
-      LSE_EXPECT_EQ(policy.exploring(), rows);
-      if (rows > 1) {
-        LSE_EXPECT(policy.draft_next());
-        LSE_EXPECT_EQ(policy.proposals(sure), rows - 1);
-      }
-      policy.observe_verify(rows, 30'000'000 + 1'000'000 * rows);
+  // Then the widest; the widths between are priced from those two, linear
+  // in rows, and never forced. Forced widths are kForcedEvery steps apart,
+  // the full width in between.
+  const auto cost = [](std::uint32_t rows) { return 30e6 + 1e6 * rows; };
+  std::vector<std::uint32_t> forced;
+  std::uint64_t step = 0, last_forced = 0;
+  for (; step < 64; ++step) {
+    const std::uint32_t rows = policy.exploring();
+    if (rows != 0) {
+      if (!forced.empty()) LSE_EXPECT(step - last_forced >= 4u);
+      forced.push_back(rows);
+      last_forced = step;
     }
+    const std::uint32_t taken = rows != 0 ? rows : DraftWidthPolicy::kMaxRows;
+    policy.observe_verify(taken, static_cast<std::uint64_t>(cost(taken)));
   }
+  // The widest is the width it takes between forced steps, so it is measured
+  // without being forced: only the plain step is.
+  LSE_EXPECT((forced == std::vector<std::uint32_t>{1u}));
   LSE_EXPECT_EQ(policy.exploring(), 0u);
   LSE_EXPECT_NEAR(policy.verify_ns(8), 38e6, 1.0);
   LSE_EXPECT_NEAR(policy.verify_ns(1), 31e6, 1.0);
+  for (std::uint32_t rows = 2; rows < 8; ++rows)
+    LSE_EXPECT_NEAR(policy.verify_ns(rows), cost(rows), 1.0);
+  // A priced width the policy takes is measured, and keeps its own cost.
+  policy.observe_verify(4, static_cast<std::uint64_t>(40e6));
+  LSE_EXPECT_NEAR(policy.verify_ns(4), 40e6, 1.0);
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
 }
 
 // A cold first launch: the first measurements of the deeper chains include a
@@ -670,7 +685,8 @@ LSE_TEST(draft_width_policy_returning_to_an_unfinished_context_explores_nothing)
   policy.observe_step(4, static_cast<std::uint64_t>(40e6));
   policy.observe_verify(1, static_cast<std::uint64_t>(31e6));
   policy.observe_tree_step(DraftWidthPolicy::kTreeRows[1], static_cast<std::uint64_t>(41e6));
-  LSE_EXPECT(policy.exploring() != 0u);
+  // Unfinished: one width and one rung measured, nothing between priced.
+  LSE_EXPECT_EQ(policy.verify_ns(4), 0.0);
   policy.set_context(16384);
   for (int step = 0; step < 200; ++step) {
     if (const std::uint32_t rows = policy.exploring(); rows != 0) {
@@ -692,6 +708,46 @@ LSE_TEST(draft_width_policy_returning_to_an_unfinished_context_explores_nothing)
   policy.observe_verify(1, static_cast<std::uint64_t>(29e6));
   policy.observe_verify(1, static_cast<std::uint64_t>(29e6));
   LSE_EXPECT_NEAR(policy.verify_ns(1), 29e6, 1.0);
+}
+
+LSE_TEST(draft_width_policy_after_a_short_warm_up_forces_few_widths) {
+  // A server's warm-up request (1.5K tokens) ends a few steps past the
+  // policy's own warm-up; the next request (300 tokens) ran 46 steps instead
+  // of 33 on the R9700, a forced narrow width a step. Now only the ends of
+  // the chain and rung ladders are forced, kForcedEvery steps apart, and the
+  // rest is priced from them.
+  const auto verify = [](std::uint32_t rows) { return 30e6 + 1e6 * rows; };
+  const auto tree = [](std::uint32_t rows) { return 38e6 + 0.5e6 * rows; };
+  DraftWidthPolicy policy;
+  policy.set_context(1536);
+  std::uint32_t forced = 0;
+  const auto step = [&] {
+    if (const std::uint32_t rows = policy.exploring(); rows != 0) {
+      ++forced;
+      policy.observe_verify(rows, static_cast<std::uint64_t>(verify(rows)));
+    } else if (const std::uint32_t rows = policy.tree_exploring(); rows != 0) {
+      ++forced;
+      policy.observe_tree_step(rows, static_cast<std::uint64_t>(tree(rows)));
+    } else {
+      policy.observe_verify(DraftWidthPolicy::kMaxRows,
+                            static_cast<std::uint64_t>(verify(DraftWidthPolicy::kMaxRows)));
+    }
+    policy.observe_step(6, static_cast<std::uint64_t>(45e6));
+  };
+  for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps + 4; ++i) step();
+  policy.set_context(321);
+  forced = 0;
+  for (int i = 0; i < 33; ++i) step();
+  // At most the plain step and both ends of the rung ladder; the old policy
+  // forced every width and rung twice (24 steps).
+  LSE_EXPECT(forced <= 3u);
+  LSE_EXPECT_EQ(policy.exploring(), 0u);
+  LSE_EXPECT_EQ(policy.tree_exploring(), 0u);
+  for (std::uint32_t rows = 1; rows <= DraftWidthPolicy::kMaxRows; ++rows)
+    LSE_EXPECT_NEAR(policy.verify_ns(rows), verify(rows), 1.0);
+  for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
+    LSE_EXPECT_NEAR(policy.tree_step_ns(rows), tree(rows), 1.0);
+  std::printf("       forced %u of 33 steps after the warm-up\n", forced);
 }
 
 LSE_TEST(draft_width_policy_verifies_what_pays_for_its_rows) {
@@ -822,7 +878,7 @@ DraftWidthPolicy measured_tree_policy(double base, double per_row, double draft)
   DraftWidthPolicy policy;
   for (std::uint64_t i = 0; i < DraftWidthPolicy::kWarmupSteps; ++i)
     policy.observe_tree_step(DraftWidthPolicy::kTreeRows[0], 1);
-  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kExploreSamples; ++pass) {
+  for (std::uint32_t pass = 0; pass < DraftWidthPolicy::kTrustedSamples; ++pass) {
     policy.observe_verify(1, static_cast<std::uint64_t>(base));
     for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows)
       policy.observe_tree_step(rows, static_cast<std::uint64_t>(draft + base + per_row * (rows - 4)));
@@ -899,8 +955,6 @@ LSE_TEST(draft_width_policy_prefers_a_chain_that_decodes_faster) {
     return c;
   };
   DraftWidthPolicy policy = measured_tree_policy(40e6, 1e6, 8e6);
-  // The chain widths are measured before they are compared.
-  LSE_EXPECT_EQ(policy.tree_nodes(prefix, chain(0.98)), 0u);
   for (std::uint32_t i = 0; i < DraftWidthPolicy::kExploreSamples; ++i)
     for (std::uint32_t rows = 2; rows <= DraftWidthPolicy::kMaxRows; ++rows)
       policy.observe_verify(rows, static_cast<std::uint64_t>(40e6 + 0.3e6 * (rows - 1)));
