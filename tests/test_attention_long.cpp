@@ -200,9 +200,29 @@ int time_passes(std::int64_t live, const std::vector<std::string>& passes, int r
       LSE_EXPECT_OK(run(roots));
       us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / count;
     }
-    std::printf("%-5s rows %2lld at %lld: %9.1f us  %6.1f GB/s  hash %016llx  [%s]\n",
+    // The merge alone, over the partial records the first pass left.
+    double merge_us = 0;
+    if (!first_out.node()->inputs.empty()) {
+      const Array records(first_out.node()->inputs[0]);
+      for (int round = 0; round < 2; ++round) {
+        std::vector<Array> keep;
+        std::vector<NodePtr> roots;
+        const int count = round == 0 ? 3 : reps;
+        for (int i = 0; i < count; ++i) {
+          auto merged = custom(first_out.node()->prim->name(), {records});
+          LSE_EXPECT_OK(merged.status());
+          if (!merged.ok()) break;
+          keep.push_back(*merged);
+          roots.push_back(keep.back().node());
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        LSE_EXPECT_OK(run(roots));
+        merge_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / count;
+      }
+    }
+    std::printf("%-5s rows %2lld at %lld: %9.1f us (merge %6.1f)  %6.1f GB/s  hash %016llx  [%s]\n",
                 tree ? "tree" : n == 1 ? "dec" : "chain", static_cast<long long>(n),
-                static_cast<long long>(live), us, layer_bytes / us / 1e3,
+                static_cast<long long>(live), us, merge_us, layer_bytes / us / 1e3,
                 static_cast<unsigned long long>(fnv(out)), kernels.c_str());
     std::fflush(stdout);
   }

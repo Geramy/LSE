@@ -117,6 +117,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
   // format and layout, the mask, batch rows and FlashPrefill V2 settings.
   // Not the KV pool's blocks, the block table's length or the split's
   // parts, which grow with the context: a grown cache asks for nothing new.
+  // (So a decision made at a process's warm-up context holds at 128K; the
+  // split's pair form, which wins only at longer contexts, is chosen by the
+  // part's FlashSplitPairRule instead. A KV-length rung in this key would let
+  // trials decide it.)
   std::uint64_t variant_class(const KernelShapes& s) const override {
     const Dims d = dispatch::flash_dimensions(dense_request(s));
     if (!d.valid) return KernelPrimitiveBase::variant_class(s);

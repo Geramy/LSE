@@ -188,13 +188,19 @@ inline constexpr std::array kFlashWmmaRules{
 // A draft tree's verify attention two tiles to a workgroup (the flash split's
 // pair form): a 15-row tree is six tiles of one key head, a 31-row one
 // twelve, and each tile read the key head's share on its own. Output bit for
-// bit the same. One layer, test_attention_long (single-tile -> pair, us):
-//   15 rows:  2K 62 -> 73,   4K 121 -> 108,  16K 641 -> 456,  64K 2518 -> 1700
-//   31 rows:  2K 110 -> 119, 4K 204 -> 198,  16K 1104 -> 937, 64K 4557 -> 3814
+// bit the same. One layer, test_attention_long (single tile -> pair, us):
+//   15 rows:  2K 62 -> 73,   4K 121 -> 108,  16K 641 -> 456,  64K 2591 -> 1850,
+//             128K 5077 -> 3730
+//   31 rows:  2K 110 -> 119, 4K 204 -> 198,  16K 1104 -> 1030, 64K 4656 -> 4008,
+//             128K 9189 -> 8210
+// (a block table of 4096 keys at 2K live, 8192 at 4K, hence the threshold).
 // Chains (two or three tiles of a key head) gain under 3% at 64K and lose at
-// short contexts: not taken. 128K: 15 rows 4900 -> 3616, 31 rows 8783 -> 7779.
+// short contexts: not taken. A group form keeping three or four tiles a
+// workgroup, scores in registers, measured slower: a split's shares are
+// sized for one tile a workgroup and must stay so for the records to be the
+// same, which leaves a third as many workgroups (8 rows at 64K 1535 -> 2149).
 inline constexpr std::array kFlashSplitPairRules{
-    attention_shapes::FlashSplitPairRule{kArch, 4, 4096},
+    attention_shapes::FlashSplitPairRule{kArch, 4, 8192},
 };
 
 // Decode-time attention (sdpa.cpp, attention.cpp). Without these rules a
@@ -213,6 +219,9 @@ inline constexpr std::array kFlashSplitPairRules{
 //   16K keys    488 ->  447 us
 //   64K keys   1628 -> 1469 us (165 -> 183 GB/s of K/V; batch 2: 1542)
 //   128K keys  3103 -> 2876 us (173 -> 187 GB/s; batch 8 no faster than 4)
+// With the batch, 16-bit keys arrive through the wave's scratch (one 16-byte
+// read a lane): 64K 1482 -> 1458 us, 128K 2900 -> 2843. Two or four
+// partitions a workgroup measured slower (64K 1517, 1501).
 // against 235 GB/s for a plain streaming read on the part; at 4K keys
 // (98 -> 106 us) the batch is slower.
 inline constexpr std::array kDecodeRules{

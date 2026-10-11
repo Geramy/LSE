@@ -547,10 +547,18 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       // same lanes' products in the same order at any batch.
       const std::uint32_t key_batch = ShortQuery ? 1u : dispatch::split_decode_key_batch(s);
       if (key_batch > 1u) {
+        // 16-bit keys arrive as one 16-byte read a lane (eight dimensions,
+        // a wave the whole key) into the wave's own scratch, and each lane
+        // takes its dimensions wl, wl + 32, ... from there: the values the
+        // eight two-byte reads a lane gave, for an eighth of the reads.
+        constexpr bool kStaged =
+            Storage == kv::CacheDType::kBF16 || Storage == kv::CacheDType::kF16;
+        const auto staged = e.lds<KvElement<Storage>>(kStaged ? 4u * key_batch * 256u : 8u);
         for (auto tile : e.range(kSplitKeys / (4u * key_batch))) {
           std::vector<kir::Val<kir::u32>> lanes, keys;
           std::vector<std::vector<kir::Val<kir::boolean>>> valids;
           std::vector<std::vector<kir::Val<kir::f32>>> loaded;
+          std::vector<kir::Val<kir::u32>> slots;
           for (std::uint32_t u = 0; u < key_batch; ++u) {
             lanes.push_back(e.let((tile * key_batch + u) * 4u + wi));
             keys.push_back(e.let(begin + lanes.back()));
@@ -561,9 +569,19 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
             const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
             const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
             loaded.emplace_back();
-            for (std::uint32_t d = 0; d < 8u; ++d)
-              loaded.back().push_back(e.let(kv_load<Storage>(e, a.k, kb + wl + d * 32u, 256u)));
+            if constexpr (kStaged) {
+              slots.push_back(e.let((wi * key_batch + u) * 256u));
+              const auto row = e.load(a.k, e.let(kb + wl * 8u), 16u);
+              k.store_pack<KvElement<Storage>>(staged.id(), e.let(slots.back() + wl * 8u), row, 16u);
+            } else {
+              for (std::uint32_t d = 0; d < 8u; ++d)
+                loaded.back().push_back(e.let(kv_load<Storage>(e, a.k, kb + wl + d * 32u, 256u)));
+            }
           }
+          if constexpr (kStaged)
+            for (std::uint32_t u = 0; u < key_batch; ++u)
+              for (std::uint32_t d = 0; d < 8u; ++d)
+                loaded[u].push_back(e.let(math::widen(staged[e.let(slots[u] + wl + d * 32u)].read())));
           for (std::uint32_t u = 0; u < key_batch; ++u) {
             std::vector<kir::LValue<kir::f32>> row_scores;
             for (std::uint32_t r = 0; r < row_tile; ++r) row_scores.push_back(e.var(0.0f));
@@ -648,25 +666,30 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       if (key_batch > 1u && dim_major && block % 4u == 0u) {
         for (auto group : e.range(kSplitKeys / (4u * key_batch))) {
           std::vector<std::vector<kir::Pack<kir::f32>>> weights_of(key_batch);
+          // Two quads of one block are one 16-byte read per dimension.
+          const bool wide = key_batch % 2u == 0u && block % 8u == 0u;
           std::vector<std::vector<kir::Pack<KvElement<Storage>>>> values_of(key_batch);
           for (std::uint32_t u = 0; u < key_batch; ++u) {
             const auto quad = e.let(group * key_batch + u);
             for (std::uint32_t r = 0; r < row_tile; ++r)
               weights_of[u].push_back(scores.load(e.let(e.u32(r * kSplitKeys) + quad * 4u), 16u));
+            if (wide && u % 2u == 1u) continue;
             const auto blk = e.let(kv_block_index<Storage>(a.table[tb + (begin + quad * 4u) / block]));
             const auto vb = e.let(((blk * kvheads + kh) * 256u + lane * 2u) * block +
                                   (begin + quad * 4u) % block);
-            values_of[u].push_back(e.load(a.v, vb, 8u));
-            values_of[u].push_back(e.load(a.v, e.let(vb + block), 8u));
+            values_of[u].push_back(e.load(a.v, vb, wide ? 16u : 8u));
+            values_of[u].push_back(e.load(a.v, e.let(vb + block), wide ? 16u : 8u));
           }
           for (std::uint32_t u = 0; u < key_batch; ++u)
             for (std::uint32_t q = 0; q < 4u; ++q) {
               const auto j = e.let(begin + (group * key_batch + u) * 4u + q);
               const auto valid = valid_rows(j);
+              const std::uint32_t from = wide ? u / 2u * 2u : u;
+              const int at = static_cast<int>((wide ? u % 2u * 4u : 0u) + q);
               if (auto live = e.when(any_valid(valid))) {
                 const std::array<kir::Val<kir::f32>, 2> values{
-                    math::widen(values_of[u][0][static_cast<int>(q)]),
-                    math::widen(values_of[u][1][static_cast<int>(q)])};
+                    math::widen(values_of[from][0][at]),
+                    math::widen(values_of[from][1][at])};
                 for (std::uint32_t r = 0; r < row_tile; ++r) {
                   const auto weight = e.let(weights_of[u][r][static_cast<int>(q)]);
                   denom[r] = denom[r].read() + weight;

@@ -76,6 +76,12 @@ struct FlashWmmaRule {
 // pass's tiles read one key head and the block table holds at least min_keys
 // keys. Below that the pass has too few windows per tile for the pair's
 // fewer, wider workgroups to fill the part.
+//
+// A rule rather than a variant decision: variant decisions are keyed by
+// shape class without the KV length (a grown cache asks for nothing new) and
+// trials run in a process's first steps, at its warm-up context, where the
+// pair loses. A class key with a KV-length rung would let trials decide this
+// per context instead.
 struct FlashSplitPairRule {
   std::string_view arch;
   std::uint32_t min_tiles;
