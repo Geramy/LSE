@@ -82,3 +82,31 @@ which prefills each window's context and then runs its last N tokens through
 decode (S = 1) or verify (S = 8) passes. Decode-time attention is therefore
 what gets scored, against an exact base recorded with `--sparse-decode=off`.
 See [PERPLEXITY.md](../PERPLEXITY.md).
+
+Results for Qwen3.8-27B Q4 with bf16 KV at the default budget, against exact
+attention (gfx1201):
+
+| Window | Passes | Scored tokens | Mean KLD | Same top token | Perplexity change |
+|---|---|---:|---:|---:|---:|
+| 32K | decode | 1024 | 0.0040 | 97.8% | +0.05% |
+| 32K | verify, 8 rows | 1024 | 0.0074 | 96.6% | -0.14% |
+| 128K | decode | 2560 | 0.016 | 97.8% | +0.13% |
+| 128K | verify, 8 rows | 2560 | 0.044 | 96.5% | +0.07% |
+
+Budget sweeps at 128K (decode passes):
+
+| Budget | Mean KLD |
+|---|---:|
+| 4096 tokens | 0.074 |
+| 8192 tokens | 0.052 |
+| 16384 tokens | 0.047 |
+| 25% (32768 tokens) | 0.016–0.019 |
+| 25% without the mean correction | 0.034 |
+
+Selection per key head beats one page set shared by all key heads at equal
+budget: 0.052 against 0.057 at 8192 tokens, 128K.
+
+Needle-in-a-haystack (five needles at 10–90% depth; dense prefill so that the
+needles reach the KV exactly) passes 10/10 at 32K and 128K, matching exact
+decode. Greedy code output at 16K and 128K is identical to exact. At 64K it
+diverges at character 215 of 1120, a different but equally valid docstring.
