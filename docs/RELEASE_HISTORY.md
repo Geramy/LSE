@@ -3,6 +3,17 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.6.1: faster tree tiles, prefill tiles by pass width, variant decisions by shape class, launch templates
+
+Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
+
+1. **Flash tile:** query rows padded in scratch, scores written without per-key tests before the pass's own positions, and scores kept in registers through the softmax as a measured variant. At a 64K-key cache on gfx1201 the 31-row tree pass takes 1368 us (was 2655) and the 15-row pass 730 us (1372). Outputs are byte-identical.
+2. **Variant decisions by shape class:** a decision covers every pool size and chunk length of its class, is keyed by the engine build, and is kept beside the kernel cache in use (`--cache-dir`), so a later start reuses it. Trials run only during a process's warm-up, warm every candidate, alternate their order, and fill the output before each candidate so only a variant that writes all of it is kept.
+3. **Prefill GEMM:** a tile per band of pass widths on gfx1201 and gfx1151, so a width just past a tile multiple no longer pays for a padded tile; each weight piece decoded once on RDNA4, and all four layouts offered there.
+4. **dMTP prefill** takes the padded one-pass-per-chunk plan of the other sessions.
+5. **Adaptive width policy:** returning to a context whose widths were not all measured starts from the nearest fully measured context instead of exploring every width again.
+6. **Launch templates:** a request's rebuilt pass graphs reuse the recorded split, plan and launch descriptions of the same graph, and a phase's workgroup slots share one allocation.
+
 ## v0.6.0: context-aware draft policy, long-context attention on one WMMA flash split
 
 Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
