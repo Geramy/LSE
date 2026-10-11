@@ -38,6 +38,9 @@ constexpr double kValueRate = 1.0 / 16.0;
 // One stalled step (a host hiccup, a clock change) moves an estimate by at
 // most this share of it.
 constexpr double kOutlierClamp = 0.25;
+// A width's first pass in a bucket started from another is taken at most at
+// this multiple of the carried cost.
+constexpr double kFirstPassRise = 2.0;
 
 double clamp_step(double residual, double scale) {
   // Only a rise is clamped. A stall can make one step slow, but nothing makes
@@ -84,14 +87,14 @@ std::size_t DraftWidthPolicy::context_bucket(std::int64_t tokens) noexcept {
 }
 
 template <std::size_t N>
-void DraftWidthPolicy::seed_from(Ladder<N>& ladder, const Ladder<N>& from) {
+void DraftWidthPolicy::seed_from(Ladder<N>& ladder, const Ladder<N>& from, double scale) {
   ladder = from;
   if (!ladder.live) return;
+  for (auto& offset : ladder.offset) offset *= scale;
   ladder.seeded = true;
   ladder.seed = ladder.offset;
   ladder.seed_known = ladder.known;
   ladder.samples.fill(0);
-  ladder.entered.fill(false);
 }
 
 template <std::size_t N>
@@ -107,6 +110,18 @@ void DraftWidthPolicy::set_context(std::int64_t tokens) noexcept {
   if (bucket == bucket_) return;
   bucket_ = bucket;
   Costs& here = costs_[bucket];
+  // A tree rung's cost over the narrowest is mostly its attention, which
+  // reads the whole cache once per row tile: carried from a bucket of another
+  // KV length, the offsets scale with the lengths' ratio (a doubling a
+  // bucket). Copied unscaled, a 64K bucket started from 32K priced the wide
+  // rungs at half their attention, and the policy took trees nearly every
+  // step until each rung had been measured.
+  const auto kv_scale = [&](const Costs* from) {
+    const auto at = static_cast<std::size_t>(from - costs_.data());
+    // Bucket 0 holds everything below 2K: priced as 1K.
+    const auto tokens_of = [](std::size_t b) { return b == 0 ? 1024.0 : 1024.0 * std::exp2(static_cast<double>(b)); };
+    return tokens_of(bucket) / tokens_of(at);
+  };
   // Nearest other bucket whose ladder `pick` selects passes `usable`, the
   // shorter context on a tie.
   const auto nearest = [&](auto pick, auto usable) -> const Costs* {
@@ -123,17 +138,18 @@ void DraftWidthPolicy::set_context(std::int64_t tokens) noexcept {
     // its return, a forced width a step. While another bucket holds every
     // width, it starts from that one instead and measures only what that
     // one lacks, as a newly reached bucket does.
-    const auto renew = [&](auto pick, std::size_t first) {
+    const auto renew = [&](auto pick, std::size_t first, double scale) {
       auto& ladder = pick(here);
       if (!ladder.live || ladder.seeded || complete(ladder, first)) return;
       const auto usable = [&](const auto& l) { return complete(l, first); };
-      if (const Costs* from = nearest(pick, usable)) seed_from(ladder, pick(*from));
+      if (const Costs* from = nearest(pick, usable))
+        seed_from(ladder, pick(*from), scale < 0.0 ? kv_scale(from) : scale);
       // Nothing complete to start from: what this bucket lacks is priced
       // from its own ends once both are measured (estimate_unmeasured),
       // which observe_cost already did as they were.
     };
-    renew([](auto& c) -> auto& { return c.verify; }, 1);
-    renew([](auto& c) -> auto& { return c.tree; }, 0);
+    renew([](auto& c) -> auto& { return c.verify; }, 1, 1.0);
+    renew([](auto& c) -> auto& { return c.tree; }, 0, -1.0);
     return;
   }
   const Costs* from = nearest([](const Costs& c) -> const Costs& { return c; },
@@ -141,7 +157,7 @@ void DraftWidthPolicy::set_context(std::int64_t tokens) noexcept {
   if (from == nullptr) return;
   here = *from;
   seed_from(here.verify, from->verify);
-  seed_from(here.tree, from->tree);
+  seed_from(here.tree, from->tree, kv_scale(from));
   here.draft_seed = here.draft;
   here.draft_samples.fill(0);
   here.draft_entered.fill(false);
@@ -215,12 +231,14 @@ template <std::size_t N, class Rows>
 void DraftWidthPolicy::observe_cost(Ladder<N>& ladder, std::size_t i, double t, Rows rows_of) {
   bool any = false;
   for (const auto count : ladder.samples) any = any || count != 0;
-  if (ladder.seeded && !ladder.entered[i]) {
-    ladder.entered[i] = true;
-    ladder.last_seen[i] = steps_;
-    return;
-  }
+  // A width's first pass in a bucket started from another is priced at once:
+  // until it is, the policy acts on the carried cost. Its rise is bounded to
+  // kFirstPassRise times the carried cost (a pass that paid for one of the
+  // bucket's first loads errs high), and a lower pass replaces it while the
+  // width is untrusted (below).
   if (ladder.seeded && ladder.samples[i] == 0) {
+    const double carried = ladder.base + ladder.offset[i];
+    if (ladder.known[i] && carried > 0.0) t = std::min(t, kFirstPassRise * carried);
     // The first measurement of this width in a bucket started from another
     // one: the first moves the level, each later one sets its own offset.
     if (!any && ladder.known[i]) ladder.base = t - ladder.offset[i];
@@ -233,8 +251,13 @@ void DraftWidthPolicy::observe_cost(Ladder<N>& ladder, std::size_t i, double t, 
   } else if (ladder.samples[i] < kTrustedSamples && t < ladder.base + ladder.offset[i]) {
     // While a cost rests on few samples, a lower one replaces it: early
     // samples err high (a step that compiled, clocks still ramping), so the
-    // estimate is their minimum until the width is trusted.
-    ladder.offset[i] = t - ladder.base;
+    // estimate is their minimum until the width is trusted. In a bucket
+    // started from another, while this is its only measured width, it is
+    // the level the carried widths follow.
+    bool only = true;
+    for (std::size_t j = 0; j < N; ++j) only = only && (j == i || ladder.samples[j] == 0);
+    if (ladder.seeded && only) ladder.base = t - ladder.offset[i];
+    else ladder.offset[i] = t - ladder.base;
   } else {
     const double predicted = ladder.base + ladder.offset[i];
     ladder.base += kBaseRate * clamp_step(t - predicted, predicted);

@@ -172,10 +172,11 @@ class DraftWidthPolicy {
   // the whole cache once per row tile, so the extra rows of a wide pass cost
   // more the longer the context, and costs measured at 2K priced a 64K pass's
   // 31-row tree as if it cost what it did there. A bucket first entered
-  // starts from the nearest measured one; its first measured width moves its
-  // level, each width measured there takes its own cost at once, and widths
-  // not yet measured there follow the growth the measured ones show, linear
-  // in rows. A bucket left before it had measured every width (a process's
+  // starts from the nearest measured one, its tree rungs' offsets scaled by
+  // the ratio of the KV lengths (a rung's extra cost is mostly attention);
+  // its first measured width moves its level, each width measured there
+  // takes its own cost at once (from its first pass), and widths not yet
+  // measured there follow the growth the measured ones show, linear in rows. A bucket left before it had measured every width (a process's
   // first request is mostly warm-up) starts over the same way when another
   // bucket holds every width, so returning to it explores nothing again.
   // Without a call every cost sits in the first bucket.
@@ -242,9 +243,6 @@ class DraftWidthPolicy {
     double base = 0;
     std::array<double, N> offset{}, seed{};
     std::array<bool, N> known{}, seed_known{};
-    // A width's first pass in a bucket started from another one is not
-    // priced (it pays for whatever that bucket's first passes load).
-    std::array<bool, N> entered{};
     std::array<std::uint32_t, N> samples{};  // measured in this bucket
     std::array<std::uint64_t, N> last_seen{};
     // Priced from the widths measured around it (estimate_unmeasured) before
@@ -265,9 +263,11 @@ class DraftWidthPolicy {
   static void follow_growth(Ladder<N>& ladder, Rows rows_of);
   template <std::size_t N>
   [[nodiscard]] static bool needs_sample(const Ladder<N>& ladder, std::size_t i) noexcept;
-  // Starts `ladder` from `from`'s costs, measuring only what that one lacks.
+  // Starts `ladder` from `from`'s costs, measuring only what that one lacks,
+  // with each width's offset from the level multiplied by `scale` (the ratio
+  // of the two buckets' KV lengths, for costs that grow with the cache).
   template <std::size_t N>
-  static void seed_from(Ladder<N>& ladder, const Ladder<N>& from);
+  static void seed_from(Ladder<N>& ladder, const Ladder<N>& from, double scale = 1.0);
   // Prices every width (or rung) from `first` up that has not been measured
   // in this bucket from the narrowest and widest ones measured, linear in
   // rows, once both are: a verify pass's cost grows with its rows about
