@@ -1,4 +1,5 @@
 #include "lse/ops/attention.hpp"
+#include "lse/core/debug.hpp"
 #include "lse/dispatch/sparse_decode.hpp"
 #include "lse/dispatch/sparse_decode_tuneconfig.h"
 
@@ -528,7 +529,15 @@ Result<Array> gated_attention(const Array& x, const GatedAttentionWeights& w,
     shape.head_dim = static_cast<std::uint32_t>(hd);
     shape.rows = rows_per_pass;
     shape.capacity = static_cast<std::uint64_t>(table_capacity);
-    const std::int32_t budget = options.budget_for(table_capacity);
+    // An experiment knob (debug mode only): LSE_SPARSE_DECODE_VERIFY_SHARE sets
+    // the budget's share of the context for passes of more than one row.
+    static const float verify_share = [] {
+      const char* v = ::lse::debug() ? std::getenv("LSE_SPARSE_DECODE_VERIFY_SHARE") : nullptr;
+      return v && *v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
+    SparseDecodeOptions effective = options;
+    if (rows_per_pass > 1 && verify_share > 0.0f) effective.budget_share = verify_share;
+    const std::int32_t budget = effective.budget_for(table_capacity);
     shape.budget = static_cast<std::uint32_t>(budget);
     const auto plan = dispatch::sparse_decode_plan(split_device, shape,
                                                    options.mode == SparseDecodeMode::kOn);
