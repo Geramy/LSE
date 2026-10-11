@@ -468,6 +468,40 @@ int gpu_check() {
     LSE_EXPECT(live_rows<=16 || omitted>0);++cases;
     std::printf("FlashPrefill Wave32 selector blocks=%d live_rows=%d omitted=%u\n",blocks,live_rows,omitted);
   }
+  // Sub-block scoring: a block whose mean key scores like the rest, with one
+  // 64-key sub-block aligned with the queries, is kept; its mean alone would
+  // drop it (sub-block logits 10, -2, -2, -2 average to the cold blocks' 1).
+  {
+    constexpr int heads=1,queries=32,width=256,blocks=12,stride=int(dispatch::attention_shapes::kFlashPrefillPooled);
+    constexpr int subs=int(dispatch::attention_shapes::kFlashPrefillSubBlocks),hot=3;
+    const int length=blocks*256+64,offset=length-queries;
+    std::vector<float> q(2*heads*queries*width),pool(2*blocks*stride);
+    for(int r=0;r<queries;++r) q[r*width]=1.0f;
+    for(int b=0;b<blocks;++b) {
+      pool[b*stride+512]=256.0f;
+      // Channel 0: block means equal, so every block's mean logit is the same.
+      pool[b*stride]=b==0?6.0f:1.0f;
+      for(int sb=0;sb<subs;++sb) pool[b*stride+513+sb*256]=b==hot ? (sb==1?10.0f:-2.0f) : pool[b*stride];
+    }
+    auto aq=upload({2,heads,queries,width},q),ap=upload({2,1,blocks,stride},pool);
+    auto am=upload({7},{float(offset),float(length),1,float(offset),float(length),0,0});
+    auto node=std::make_shared<Node>();node->kind=OpKind::kCustom;
+    node->shape={2,heads,2,blocks};node->dtype=DType::kF32;
+    node->prim=find_primitive("attention.flashprefill.select.v2");
+    node->fclass=node->prim->fusion_class();node->attrs={1.0f,0,.1f,2};
+    node->inputs={aq.node(),ap.node(),am.node()};
+    for(auto& input:node->inputs) ++input->consumer_count;
+    Array selected_array(node);const NodePtr roots[]{node};
+    if(auto status=scheduler->eval(roots,false);!status.ok()) { std::fprintf(stderr,"sub-block selector: %s\n",status.to_string().c_str());return 1; }
+    LSE_EXPECT_OK(scheduler->drain());
+    std::vector<float> actual(node->shape.elem_count());LSE_EXPECT_OK(selected_array.to_host(actual.data(),actual.size()*4));
+    // Tile 0 is not the one holding the last live row (tile 1 reads every
+    // block): the hot block is kept, a cold one beside it is not.
+    LSE_EXPECT_EQ(actual[hot],1.0f);
+    LSE_EXPECT_EQ(actual[5],0.0f);
+    for(int b=0;b<blocks;++b) LSE_EXPECT_EQ(actual[blocks+b],1.0f);
+    ++cases;
+  }
   std::printf("Sparse attention GPU reference cases: %u\n",cases);
   return test::Registry::get().failures?1:0;
 }
