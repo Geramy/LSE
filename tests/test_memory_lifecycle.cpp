@@ -340,6 +340,37 @@ LSE_TEST(one_shot_requests_return_the_device_to_its_post_load_baseline) {
   LSE_EXPECT(e.sessions().empty());
 }
 
+// Many short requests, each in a session of its own, then a long one: the
+// short ones leave the live device buffers flat, count and bytes, and the long
+// one still finds its memory. A 0.6.1 candidate failed a 128K request after
+// about 150 short ones on the R9700.
+LSE_TEST(many_short_sessions_stay_flat_and_a_long_request_still_fits) {
+  Engine e;
+  LSE_EXPECT_OK(e.open(8, 0));
+  if (!e.router) return;
+  // The first few settle whatever a process keeps after its first passes
+  // (interned constants, compiled programs).
+  for (unsigned r = 0; r < 4; ++r) LSE_EXPECT_EQ(e.complete("", prompt(20 + 37 * r, r)), 200);
+  const auto settled = backend::allocation_totals(backend::MemoryClass::kDevice);
+  std::uint64_t most_bytes = 0, most_buffers = 0;
+  for (unsigned r = 0; r < 40; ++r) {
+    LSE_EXPECT_EQ(e.complete("", prompt(20 + (r * 53) % 280, 100 + r)), 200);
+    const auto now = backend::allocation_totals(backend::MemoryClass::kDevice);
+    most_bytes = std::max(most_bytes, now.live);
+    most_buffers = std::max(most_buffers, now.allocations);
+  }
+  std::printf("       40 short sessions: live %llu bytes in %llu buffers at most, settled %llu in %llu\n",
+              static_cast<unsigned long long>(most_bytes), static_cast<unsigned long long>(most_buffers),
+              static_cast<unsigned long long>(settled.live),
+              static_cast<unsigned long long>(settled.allocations));
+  LSE_EXPECT(most_bytes <= settled.live);
+  LSE_EXPECT(most_buffers <= settled.allocations);
+  LSE_EXPECT(e.sessions().empty());
+  // A request near the engine length after all of them.
+  LSE_EXPECT_EQ(e.complete("", prompt(3800, 7), 4), 200);
+  LSE_EXPECT(live() <= e.baseline);
+}
+
 LSE_TEST(sessions_hold_their_kv_until_closed_and_closing_all_returns_to_baseline) {
   Engine e;
   LSE_EXPECT_OK(e.open(8, 0));
