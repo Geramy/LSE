@@ -28,13 +28,7 @@ Decode, code prompt, tok/s:
 
 Model: Qwen3.8-27B, 4-bit (MLX); drafts: dMTP (dynamic MTP) 8-bit, DFlash2 8-bit. Temperature 0.6, median of 3, after a warm-up that completes kernel variant selection.
 
-![Prefill vs prompt length](docs/benchmarks/lse-0.6.2-prefill-vs-context.png)
-
-Prefill vs prompt length
-
-![Decode vs context, code task](docs/benchmarks/lse-0.6.2-decode-vs-context.png)
-
-Decode vs context, code task
+![Decode and prefill vs context](docs/benchmarks/lse-0.6.2-performance.png)
 
 ## Install
 
