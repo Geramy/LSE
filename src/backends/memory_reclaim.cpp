@@ -6,6 +6,11 @@
 
 namespace lse::backend {
 
+namespace {
+// This thread is running the trimmers for make_room.
+thread_local bool t_trimming = false;
+}  // namespace
+
 bool BufferRecycler::keep(std::uint64_t handle, std::size_t size) {
   std::vector<std::uint64_t> evicted;
   {
@@ -88,6 +93,14 @@ Status DeviceHeadroom::make_room(std::size_t bytes, const Hooks& hooks) {
     }
   }
   if (!hooks.sample_free) return OkStatus();
+  // The trim below runs every trimmer on this thread under pressure_mu_. A
+  // trimmer that allocates device memory comes back here and would wait on
+  // that lock forever.
+  if (t_trimming) {
+    return LSE_ERROR(kInternal, "a memory trimmer allocated ", std::to_string(bytes),
+                     " bytes of device memory while the trimmers were making room "
+                     "for another allocation; trimmers may only release memory");
+  }
 
   const std::lock_guard lock(pressure_mu_);
   const auto sample = [&]() -> Result<std::size_t> {
@@ -114,13 +127,19 @@ Status DeviceHeadroom::make_room(std::size_t bytes, const Hooks& hooks) {
   if (hooks.trim && releases != releases_at_trim_) {
     releases_at_trim_ = releases;
     trims_.fetch_add(1, std::memory_order_relaxed);
-    std::size_t released = hooks.trim();
+    const auto trim = [&] {
+      t_trimming = true;
+      const std::size_t n = hooks.trim();
+      t_trimming = false;
+      return n;
+    };
+    std::size_t released = trim();
     if (hooks.settle) {
       // Buffers the trim let go that device work still referenced reach the
       // runtime's pools only once that work retires; a second trim then
       // hands what they freed in those pools to the driver.
       LSE_RETURN_IF_ERROR(hooks.settle());
-      released += hooks.trim();
+      released += trim();
     }
     released_.fetch_add(released, std::memory_order_relaxed);
     if (auto again = sample(); again.ok()) free_bytes = *again;

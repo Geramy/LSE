@@ -85,7 +85,9 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
   std::vector<WeightSlab>& slabs = weight_slabs();
   const std::size_t need = (bytes + kAlign - 1) & ~(kAlign - 1);
 
-  const std::lock_guard lock(slab_mutex());
+  // Never locked across the allocation: one the device cannot cover runs
+  // the memory trimmers on this thread (backend::ReclaimLock).
+  backend::ReclaimLock lock(slab_mutex(), "the weight slabs");
   WeightSlab* use = nullptr;
   for (WeightSlab& s : slabs) {
     if (s.be == &be && s.stream == at.index &&
@@ -98,9 +100,11 @@ Result<backend::DeviceBuffer> slab_window(std::size_t bytes,
     // A tensor bigger than the slab gets its own exact-sized one rather than
     // rounding a single embedding table up to the next slab boundary.
     const std::size_t want = need > kSlab ? need : kSlab;
+    lock.unlock();
     const backend::ScopedAllocationSite site(backend::AllocationSite::kWeights);
     auto got = be.allocate(want, backend::MemoryClass::kDevice, at);
     if (!got.ok()) return got.status();
+    lock.lock();
     WeightSlab made;
     made.be = &be;
     made.stream = at.index;
@@ -154,7 +158,7 @@ std::size_t packed_q8_matrix_bytes(std::int64_t rows,
 std::size_t release_weight_slabs() {
   std::vector<WeightSlab> released;
   {
-    const std::lock_guard lock(slab_mutex());
+    backend::ReclaimLock lock(slab_mutex(), "the weight slabs");
     released.swap(weight_slabs());
   }
   std::size_t bytes = 0;

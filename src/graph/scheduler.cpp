@@ -190,13 +190,13 @@ struct Scheduler::Impl {
   }
   std::uint64_t trimmer = backend::register_memory_trimmer(
       [this] {
-        std::lock_guard lock(constants_mu);
+        backend::ReclaimLock lock(constants_mu, "the scheduler's constants");
         const std::size_t released = unshared_constant_bytes();
         constants.clear();
         return released;
       },
       [this] {
-        std::lock_guard lock(constants_mu);
+        backend::ReclaimLock lock(constants_mu, "the scheduler's constants");
         return unshared_constant_bytes();
       });
   ~Impl() { backend::unregister_memory_trimmer(trimmer); }
@@ -1018,7 +1018,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
     if (fresh && n->kind == OpKind::kConstant && !produced.contains(n.get())) {
       const ConstKey key{n->attrs.empty() ? 0.0 : n->attrs[0], n->dtype,
                          n->element_count(), member, stream.index};
-      std::unique_lock constants_lock(impl_->constants_mu);
+      backend::ReclaimLock constants_lock(impl_->constants_mu, "the scheduler's constants");
       if (const auto it = impl_->constants.find(key);
           it != impl_->constants.end()) {
         n->buffer = it->second;
@@ -1074,7 +1074,7 @@ Status Scheduler::try_dispatch_group(const FusionGroup& group,
       // next step's copy of this constant binds the same allocation and pays
       // neither the 646 us allocation nor the refill.
       if (impl_->pending_constant.has_value()) {
-        std::lock_guard constants_lock(impl_->constants_mu);
+        backend::ReclaimLock constants_lock(impl_->constants_mu, "the scheduler's constants");
         impl_->constants.emplace(*impl_->pending_constant, n->buffer);
         impl_->pending_constant.reset();
       }
@@ -1532,7 +1532,7 @@ Status Scheduler::release_device_memory() {
   impl_->peer_mirrors.clear();
   impl_->member_dirty.clear();
   {
-    std::lock_guard lock(impl_->constants_mu);
+    backend::ReclaimLock lock(impl_->constants_mu, "the scheduler's constants");
     impl_->constants.clear();
   }
   impl_->pending_constant.reset();

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -186,6 +187,29 @@ std::size_t trim_device_memory();
 // may drop what is worth keeping otherwise (an idle session's K/V).
 std::size_t trim_device_memory_under_pressure();
 [[nodiscard]] bool device_memory_pressure() noexcept;
+
+// A lock that memory reclaim takes again: a trimmer takes it, or frees memory
+// whose release takes it (an evicted session's K/V fragments go back to the
+// K/V memory manager under its lock). The trimmers run on the thread whose
+// allocation the device could not cover, so that thread must not hold one
+// across a device allocation. Holding it through ReclaimLock lets debug runs
+// (LSE_DEBUG) check that: a trim on a thread that holds one stops the process
+// naming the lock, where a release build would deadlock on it.
+class ReclaimLock {
+ public:
+  ReclaimLock(std::mutex& mu, const char* name);
+  ~ReclaimLock();
+  ReclaimLock(const ReclaimLock&) = delete;
+  ReclaimLock& operator=(const ReclaimLock&) = delete;
+  void lock();
+  void unlock();
+
+ private:
+  std::mutex& mu_;
+  const char* name_;
+  bool owns_ = false;
+  bool tracked_ = false;
+};
 // The bytes every registered cache reports holding (MemoryHeld), summed.
 [[nodiscard]] std::size_t cached_device_memory();
 // What the device runtime under a backend holds from its driver, by its own

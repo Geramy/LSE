@@ -321,7 +321,7 @@ add_library(lse_kv
   src/kv/policy.cpp
 )
 add_library(lse::kv ALIAS lse_kv)
-target_link_libraries(lse_kv PUBLIC lse_core)
+target_link_libraries(lse_kv PUBLIC lse_core lse_backend_registry)
 target_link_libraries(lse_graph PUBLIC lse_kv)
 lse_apply_common_flags(lse_kv)
 

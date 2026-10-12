@@ -281,7 +281,7 @@ struct Router::Impl {
 
   // What the sessions evict_idle could release hold.
   std::size_t idle_bytes() const {
-    std::lock_guard held(sessions_lock);
+    backend::ReclaimLock held(sessions_lock, "the server's sessions");
     std::size_t total = 0;
     for (const auto& [id, e] : sessions) {
       if ((active_live && id == active) || (bound_live && id == bound)) continue;
@@ -298,7 +298,7 @@ struct Router::Impl {
     std::vector<std::unique_ptr<SessionEntry>> evicted;
     std::size_t released = 0;
     {
-      std::lock_guard held(sessions_lock);
+      backend::ReclaimLock held(sessions_lock, "the server's sessions");
       for (;;) {
         std::size_t total = 0;
         for (const auto& [id, e] : sessions) total += e->bytes;
@@ -335,7 +335,7 @@ struct Router::Impl {
       if ((mtp != nullptr || dflash2 != nullptr) ||
           !model.retire_completed_passes(survivor->states()).ok())
         survivor->clear();
-      std::lock_guard held(sessions_lock);
+      backend::ReclaimLock held(sessions_lock, "the server's sessions");
       for (auto& [id, e] : sessions)
         if (&e->session == survivor) e->snapshot();
     }
@@ -353,7 +353,7 @@ struct Router::Impl {
     std::unique_ptr<SessionEntry> closing;
     bool empty = false;
     {
-      std::lock_guard held(sessions_lock);
+      backend::ReclaimLock held(sessions_lock, "the server's sessions");
       auto it = sessions.find(id);
       if (it == sessions.end()) return false;
       closing = std::move(it->second);
@@ -370,7 +370,7 @@ struct Router::Impl {
 
   json sessions_json() const {
     json list = json::array();
-    std::lock_guard held(sessions_lock);
+    backend::ReclaimLock held(sessions_lock, "the server's sessions");
     for (const auto& [id, e] : sessions) {
       list.push_back({{"id", id},
                       {"tokens", e->tokens},
@@ -677,13 +677,13 @@ Result<Outcome> Router::Impl::generate(
     // least recently used idle sessions go.
     bool known = false;
     {
-      std::lock_guard sessions_held(impl.sessions_lock);
+      backend::ReclaimLock sessions_held(impl.sessions_lock, "the server's sessions");
       known = impl.sessions.count(r.session_id) != 0;
     }
     const std::size_t cap = impl.opt.max_sessions == 0 ? SIZE_MAX
                             : known ? impl.opt.max_sessions : impl.opt.max_sessions - 1;
     (void)impl.evict_idle(cap, impl.opt.session_memory_budget);
-    std::lock_guard sessions_held(impl.sessions_lock);
+    backend::ReclaimLock sessions_held(impl.sessions_lock, "the server's sessions");
     auto& slot = impl.sessions[r.session_id];
     if (!slot) slot = std::make_unique<SessionEntry>(r.session_id, impl.model.state_slots());
     entry = slot.get();
@@ -695,7 +695,7 @@ Result<Outcome> Router::Impl::generate(
   struct ActiveScope {
     Router::Impl& impl;
     ~ActiveScope() {
-      std::lock_guard held(impl.sessions_lock);
+      backend::ReclaimLock held(impl.sessions_lock, "the server's sessions");
       impl.active_live = false;
       impl.active.clear();
     }
@@ -707,7 +707,7 @@ Result<Outcome> Router::Impl::generate(
   if (impl.bound_live && (ephemeral || impl.bound != r.session_id)) {
     std::unique_ptr<SessionEntry>* previous = nullptr;
     {
-      std::lock_guard sessions_held(impl.sessions_lock);
+      backend::ReclaimLock sessions_held(impl.sessions_lock, "the server's sessions");
       auto it = impl.sessions.find(impl.bound);
       if (it != impl.sessions.end()) previous = &it->second;
     }
@@ -758,7 +758,7 @@ Result<Outcome> Router::Impl::generate(
     one_shot.reset();
     bool none_left = false;
     {
-      std::lock_guard sessions_held(impl.sessions_lock);
+      backend::ReclaimLock sessions_held(impl.sessions_lock, "the server's sessions");
       none_left = impl.sessions.empty();
     }
     // A failed request leaves nothing behind: what it built is released
@@ -766,7 +766,7 @@ Result<Outcome> Router::Impl::generate(
     if (!ids.ok() || none_left) (void)backend::trim_device_memory();
   }
   if (!ephemeral) {
-    std::lock_guard sessions_held(impl.sessions_lock);
+    backend::ReclaimLock sessions_held(impl.sessions_lock, "the server's sessions");
     entry->snapshot();
   }
   if (!ids.ok()) return ids.status();
@@ -1186,7 +1186,7 @@ Result<runtime::PerplexityReport> Router::perplexity(
   if (impl.bound_live) {
     std::unique_ptr<Impl::SessionEntry>* previous = nullptr;
     {
-      std::lock_guard sessions_held(impl.sessions_lock);
+      backend::ReclaimLock sessions_held(impl.sessions_lock, "the server's sessions");
       auto it = impl.sessions.find(impl.bound);
       if (it != impl.sessions.end()) previous = &it->second;
     }
@@ -1332,7 +1332,7 @@ std::string Router::metrics_json() const {
                          {"events", std::move(events)}};
   }
   {
-    std::lock_guard sessions_held(impl_->sessions_lock);
+    backend::ReclaimLock sessions_held(impl_->sessions_lock, "the server's sessions");
     m["session_evictions"] = impl_->evictions;
   }
   return m.dump();
