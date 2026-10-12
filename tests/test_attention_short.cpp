@@ -3,6 +3,8 @@
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
+
+#include <algorithm>
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/graph/ops.hpp"
 #include "lse/kv/block.hpp"
@@ -75,13 +77,14 @@ LSE_TEST(short_split_derives_capacity_and_two_ordered_native_stages) {
         const auto head_tile = dispatch::attention_shapes::short_head_tile(
             static_cast<std::uint32_t>(queries), 24u, 4u, static_cast<std::uint32_t>(capacity),
             fx.gpu.compute_units);
-        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], partial
+        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0] * emitted->dims.workgroup_count[1] *
+                      emitted->dims.workgroup_count[2], partial
                       ? (24u / head_tile) * ((static_cast<unsigned>(queries) + tile - 1u) / tile) * static_cast<unsigned>(capacity / 128)
                       : 24u * static_cast<unsigned>(queries) * slices);
         LSE_EXPECT_EQ(emitted->lds_bytes, partial
             ? (tile * head_tile > 1u ? tile * head_tile * 528u : 512u)
-            : static_cast<unsigned>(std::max(capacity / 32, 512)));
-        LSE_EXPECT_EQ(emitted->binding_order.size(), partial ? 6u : 2u);
+            : dispatch::attention_shapes::kSplitMergeLdsBytes);
+        LSE_EXPECT_EQ(emitted->binding_order.size(), partial ? 6u : 3u);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
       }
       const auto split_key = emitter.cache_key(groups[0], fx.gpu);
@@ -301,9 +304,12 @@ LSE_TEST(short_split_merge_covers_more_partitions_than_weight_writers) {
   Fixture fx(6, 16384);
   for (int partitions : {64, 65, 128, 129, 256, 512, 544, 1024, 2048}) {
     auto partial = leaf({1, 24, 6, partitions, 258});
-    auto merged = custom("attention.split_merge128.wg128c2.v1", {partial});
+    auto merged = custom("attention.split_merge128.wg128c2.v1", {partial, fx.meta});
     LSE_EXPECT(merged.ok());
     if (!merged.ok()) return;
+    partial.node()->kv_elastic = true;
+    merged->node()->attrs[1] = 128.0f;  // partitions of 128 keys
+    merged->node()->iattrs[0] = 16;     // of 16-key blocks
     const NodePtr roots[]{merged->node()};
     auto groups = Partitioner::partition(roots, &fx.gpu);
     LSE_EXPECT_EQ(groups.size(), 1u);
@@ -313,7 +319,8 @@ LSE_TEST(short_split_merge_covers_more_partitions_than_weight_writers) {
     if (emitted.ok()) {
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], 24u * 6u);
-      LSE_EXPECT_EQ(emitted->lds_bytes, static_cast<unsigned>(((std::max(partitions, 128) * 4 + 15) / 16) * 16));
+      // One maximum per lane, whatever the count (read at run time).
+      LSE_EXPECT_EQ(emitted->lds_bytes, dispatch::attention_shapes::kSplitMergeLdsBytes);
     }
   }
 }
@@ -346,8 +353,9 @@ LSE_TEST(short_split_large_declared_limit_uses_actual_table_geometry) {
   auto merge = emitter.emit(groups[1], ragged.gpu);
   LSE_EXPECT(partial.ok() && merge.ok());
   if (!partial.ok() || !merge.ok()) return;
-  LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 12u * 2u * 65u);
-  LSE_EXPECT_EQ(merge->lds_bytes, 512u);
+  LSE_EXPECT_EQ(partial->dims.workgroup_count[0] * partial->dims.workgroup_count[1] *
+                partial->dims.workgroup_count[2], 12u * 2u * 65u);
+  LSE_EXPECT_EQ(merge->lds_bytes, dispatch::attention_shapes::kSplitMergeLdsBytes);
 }
 
 LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
@@ -359,9 +367,13 @@ LSE_TEST(short_split_signed_masks_handle_query_offsets_at_u32_boundary) {
     LSE_EXPECT(partial.ok());
     if (!partial.ok()) return;
     partial->node()->iattrs = {static_cast<int>(mask), 7, 0, 16};
-    auto merged = custom("attention.split_merge128.wg128c2.v1", {*partial});
+    partial->node()->kv_elastic = true;
+    partial->node()->kv_elastic_grid = true;
+    auto merged = custom("attention.split_merge128.wg128c2.v1", {*partial, fx.meta});
     LSE_EXPECT(merged.ok());
     if (!merged.ok()) return;
+    merged->node()->attrs[1] = 128.0f;
+    merged->node()->iattrs[0] = 16;
     auto out = *merged;
     const NodePtr roots[]{out.node()};
     auto groups = Partitioner::partition(roots, &fx.gpu);
@@ -407,13 +419,15 @@ LSE_TEST(short_split_query_tile_uses_width_and_matching_lds_contract) {
   // workgroups) and a rung of 512 does not (48).
   LSE_EXPECT_EQ(dispatch::attention_shapes::short_query_tile(8u, 24u, 4u, 1024u, 64u), 4u);
   LSE_EXPECT_EQ(dispatch::attention_shapes::short_query_tile(8u, 24u, 4u, 512u, 64u), 1u);
+  // The partial's tile needs 4224 bytes; the merge its fixed scratch.
+  const unsigned need = std::max<unsigned>(4224u, dispatch::attention_shapes::kSplitMergeLdsBytes);
   for (int capacity : {8192, 16384})
-    for (unsigned lds : {512u, 2048u, 4223u, 4224u}) {
+    for (unsigned lds : {512u, 2048u, 4223u, 4224u, need - 1u, need}) {
       Fixture fx(4, capacity);
       fx.gpu.lds_bytes_per_workgroup = lds;
       auto out = fx.split();
       LSE_EXPECT(out.node()->prim->name() ==
-          (lds >= 4224u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+          (lds >= need ? "attention.split_merge128.wg128c2.v1" : "attention"));
     }
 }
 LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
@@ -425,18 +439,19 @@ LSE_TEST(short_split_empty_partition_shortcut_follows_query_tile) {
 }
 
 LSE_TEST(short_split_checks_merge_lds_before_selecting_both_stages) {
-  // An eight-row tile needs 8 x 128 scores and 4 x 8 wave maxima.
-  for (unsigned lds : {2048u, 2175u, 2176u, 4223u, 4224u, 8192u}) {
+  // An eight-row tile needs 8 x 128 scores and 4 x 8 wave maxima; the merge
+  // needs its fixed scratch (kSplitMergeLdsBytes).
+  const unsigned need = std::max<unsigned>(4224u, dispatch::attention_shapes::kSplitMergeLdsBytes);
+  for (unsigned lds : {2048u, 2175u, 2176u, 4223u, 4224u, need - 1u, need, 65536u}) {
     Fixture fx(8, 69632);
     fx.gpu.lds_bytes_per_workgroup = lds;
     const auto output = fx.split();
     LSE_EXPECT(output.node()->prim->name() ==
-        (lds >= 4224u ? "attention.split_merge128.wg128c2.v1" : "attention"));
+        (lds >= need ? "attention.split_merge128.wg128c2.v1" : "attention"));
   }
+  // The merge's scratch does not grow with the cache.
   Fixture fx(8, 262144);
-  fx.gpu.lds_bytes_per_workgroup = 8191;
-  LSE_EXPECT(fx.split().node()->prim->name() == "attention");
-  fx.gpu.lds_bytes_per_workgroup = 8192;
+  fx.gpu.lds_bytes_per_workgroup = need;
   LSE_EXPECT(fx.split().node()->prim->name() == "attention.split_merge128.wg128c2.v1");
 }
 

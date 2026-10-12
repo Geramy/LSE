@@ -1,3 +1,4 @@
+#include "lse/kv/block.hpp"
 #include "harness.hpp"
 #include "lse/backends/cpu/cpu_backend.hpp"
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
@@ -78,14 +79,14 @@ LSE_TEST(fragmented_host_writes_refresh_other_aliases) {
   LSE_EXPECT_OK(interpreter::sync_from_device(*alias.node(), cpu));
   auto table = upload(cpu, {1, 2}, {1, 0});
   auto src = upload(cpu, {1, 1, 1, 8}, std::vector<float>(8, 3.0f));
-  auto write = kv_page_write(first, src, upload(cpu, {5}, {0, 1, 1, 0, 1}),
+  auto write = kv_page_write(first, src, upload(cpu, {6}, {0, 1, 1, 0, 1, 2}),
                              table, 16, kv::CacheDType::kF32);
   LSE_EXPECT_OK(interpreter::evaluate(write.node(), cpu));
   LSE_EXPECT_OK(interpreter::sync_from_device(*alias.node(), cpu));
   LSE_EXPECT_EQ(interpreter::load_element(*alias.node(), 16 * 8), 3.0f);
   auto next = kv_page_write(alias,
       upload(cpu, {1, 1, 1, 8}, std::vector<float>(8, 7.0f)),
-      upload(cpu, {5}, {0, 2, 1, 1, 2}), table, 16, kv::CacheDType::kF32);
+      upload(cpu, {6}, {0, 2, 1, 1, 2, 2}), table, 16, kv::CacheDType::kF32);
   LSE_EXPECT_OK(interpreter::evaluate(next.node(), cpu));
   LSE_EXPECT_OK(interpreter::sync_from_device(*first.node(), cpu));
   LSE_EXPECT_EQ(interpreter::load_element(*first.node(), 16 * 8), 3.0f);
@@ -193,7 +194,7 @@ LSE_TEST(paged_storage_cpu_write_and_attention_read_use_logical_pitch) {
   for (auto format : formats) {
     auto ksrc = upload(cpu, {1, 1, 2, 8}, key),
          vsrc = upload(cpu, {1, 1, 2, 8}, value);
-    auto meta = upload(cpu, {5}, {0, 2, 1, 0, 2}),
+    auto meta = upload(cpu, {6}, {0, 2, 1, 0, 2, 1}),
          table = upload(cpu, {1, 1}, {1});
     auto kp = pool(cpu, format), vp = pool(cpu, format);
     auto k = kv_page_write(kp, ksrc, meta, table, 16, format),
@@ -265,7 +266,7 @@ LSE_TEST(
       auto q = leaf({1, 24, rows, 256});
       auto k = leaf({65, 4, 16, kv::storage_width(format, 256)},
                     kv::storage_dtype(format));
-      auto v = leaf(k.shape(), k.dtype()), meta = leaf({5}),
+      auto v = leaf(k.shape(), k.dtype()), meta = leaf({kv::step_meta_elems(1)}),
            table = leaf({1, 64});
       auto out = sdpa_paged(q, k, v, .0625f, MaskKind::kCausal, 0, meta, table,
                             16, &gpu, format);
@@ -374,7 +375,7 @@ LSE_TEST(packed_attention_rejects_mismatched_storage_tags_and_invalid_pitch) {
   for (int variant = 0; variant < 5; ++variant) {
     auto q = leaf({1, 24, 4, 256});
     auto k = leaf({65, 4, 16, 65}, DType::kU32), v = leaf(k.shape(), k.dtype());
-    auto meta = leaf({5}), table = leaf({1, 64});
+    auto meta = leaf({kv::step_meta_elems(1)}), table = leaf({1, 64});
     if (variant == 1)
       k = v = leaf({65, 4, 16, 64}, DType::kU32);
     if (variant == 2)
@@ -399,7 +400,7 @@ LSE_TEST(packed_repeated_writes_preserve_padding_and_overwrite_the_scale_word) {
   for (auto format : formats) {
     auto dst = pool(cpu, format), table = upload(cpu, {1, 1}, {1});
     auto input = upload(cpu, {1, 1, 1, 8}, {1, -2, 3, -4, 5, -6, 7, -8});
-    auto empty = kv_page_write(dst, input, upload(cpu, {5}, {0, 0, 0, 0, 0}),
+    auto empty = kv_page_write(dst, input, upload(cpu, {6}, {0, 0, 0, 0, 0, 1}),
                                table, 16, format);
     LSE_EXPECT_OK(interpreter::evaluate(empty.node(), cpu));
     const auto bytes =
@@ -407,14 +408,14 @@ LSE_TEST(packed_repeated_writes_preserve_padding_and_overwrite_the_scale_word) {
     std::vector<std::byte> zero(bytes), first(bytes), second(bytes);
     LSE_EXPECT(std::memcmp(interpreter::host_bytes(*empty.node()), zero.data(),
                            bytes) == 0);
-    auto written = kv_page_write(dst, input, upload(cpu, {5}, {0, 1, 1, 0, 1}),
+    auto written = kv_page_write(dst, input, upload(cpu, {6}, {0, 1, 1, 0, 1, 1}),
                                  table, 16, format);
     LSE_EXPECT_OK(interpreter::evaluate(written.node(), cpu));
     std::memcpy(first.data(), interpreter::host_bytes(*written.node()), bytes);
     auto next = upload(cpu, {1, 1, 1, 8},
                        {.01f, -.02f, .03f, -.04f, .05f, -.06f, .07f, -.08f});
     auto overwritten = kv_page_write(
-        written, next, upload(cpu, {5}, {0, 1, 1, 0, 1}), table, 16, format);
+        written, next, upload(cpu, {6}, {0, 1, 1, 0, 1, 1}), table, 16, format);
     LSE_EXPECT_OK(interpreter::evaluate(overwritten.node(), cpu));
     std::memcpy(second.data(), interpreter::host_bytes(*overwritten.node()),
                 bytes);
@@ -472,12 +473,20 @@ LSE_TEST(pool_growth_copies_physical_storage_and_refuses_live_format_changes) {
     std::vector<float> inputs(127 * 8);
     for (std::size_t i = 0; i < inputs.size(); ++i)
       inputs[i] = std::sin(float(i) * .13f) * .4f;
-    cache.meta = upload(backend, {5}, {0, 127, 1, 0, 127});
+    // The descriptor's last slot is the block table's stride, which the
+    // layer knows once the pass has sized its table.
+    const auto describe = [&](std::vector<float> values) {
+      values.push_back(static_cast<float>(layer.stride()));
+      LSE_EXPECT_OK(backend.copy(cache.meta.node()->buffer, values.data(),
+                                 values.size() * sizeof(float)));
+    };
+    cache.meta = upload(backend, {6}, {0, 127, 1, 0, 127, 0});
     auto first = ops::gated_attention(upload(backend, {1, 127, 8}, inputs),
                                       weights, spec, *rope, 0, &cache);
     LSE_EXPECT(first.ok());
     if (!first.ok())
       return;
+    describe({0, 127, 1, 0, 127});
     evaluate(*first);
     LSE_EXPECT(layer.keys.dtype() == kv::storage_dtype(format));
     LSE_EXPECT_EQ(layer.keys.shape().dim(3), kv::storage_width(format, 8));
@@ -490,13 +499,14 @@ LSE_TEST(pool_growth_copies_physical_storage_and_refuses_live_format_changes) {
     const auto blocks = std::vector<kv::BlockId>(
         layer.tables[0].blocks().begin(), layer.tables[0].blocks().end());
     cache.used = 127;
-    cache.meta = upload(backend, {5}, {127, 129, 1, 127, 129});
+    cache.meta = upload(backend, {6}, {127, 129, 1, 127, 129, 0});
     auto second = ops::gated_attention(
         upload(backend, {1, 2, 8}, std::vector<float>(16, .37f)), weights, spec,
         *rope, 127, &cache);
     LSE_EXPECT(second.ok());
     if (!second.ok())
       return;
+    describe({127, 129, 1, 127, 129});
     evaluate(*second);
     LSE_EXPECT_EQ(layer.keys.shape().dim(0), 16);
     LSE_EXPECT(layer.storage == format);

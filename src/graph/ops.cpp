@@ -674,7 +674,7 @@ namespace {
 // `flash_parts`: a tree pass's flash split into that many shares of the key
 // windows (dispatch::attention_shapes::flash_split_parts).
 Array split_paged_attention(const NodePtr& baseline, bool blasst=false,
-                            std::uint32_t flash_parts = 0) {
+                            std::uint32_t flash_parts = 0, std::uint32_t flash_units = 0) {
   const auto* partial_prim = find_primitive(
       flash_parts ? "attention.flash_split.wmma16.v1"
       : blasst ? "attention.blasst.partial1024.v2" : "attention.split_partial128.wg128c2.v1");
@@ -693,9 +693,18 @@ Array split_paged_attention(const NodePtr& baseline, bool blasst=false,
   partial->fclass = partial_prim->fusion_class();
   partial->attrs = baseline->attrs;
   partial->iattrs = baseline->iattrs;
-  auto merged = make(OpKind::kCustom, baseline->shape, DType::kF32, {partial});
+  // Its partition count follows the cache: its kernels read it at run time.
+  partial->kv_elastic = true;
+  partial->kv_elastic_grid = true;
+  // The merge reads the step descriptor for the block table's size, and how
+  // the partial cut it: the flash split's workgroups per share, or keys per
+  // partition (kernels/split_parts.hpp).
+  auto merged = make(OpKind::kCustom, baseline->shape, DType::kF32, {partial, baseline->inputs[3]});
   merged->prim = merge_prim;
   merged->fclass = merge_prim->fusion_class();
+  merged->attrs[0] = flash_parts ? static_cast<float>(flash_units) : 0.0f;
+  merged->attrs[1] = flash_parts ? 0.0f : static_cast<float>(partition_keys);
+  merged->iattrs[0] = static_cast<std::int32_t>(baseline->inputs[1]->shape.dim(2));
   const auto& inputs = baseline->inputs;
   for (std::size_t i = 0; i < inputs.size(); ++i)
     if (std::find(inputs.begin(), inputs.begin() + static_cast<std::ptrdiff_t>(i), inputs[i]) ==
@@ -715,6 +724,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
   const bool dim_major = dispatch::dimension_major_values(k.shape(), v.shape());
   Shape out{sq.dim(0), sq.dim(1), sq.dim(2),
             kv::logical_width(storage, dim_major ? v.shape().dim(2) : v.shape().dim(3))};
+  // The pools and the block table grow with the cache; every kernel that
+  // reads them takes their live size from the step descriptor.
+  k.node()->kv_elastic = true;
+  v.node()->kv_elastic = true;
+  table.node()->kv_elastic = true;
   auto n = make(OpKind::kAttention, out, q.dtype(),
                 {q.node(), k.node(), v.node(), meta.node(), table.node()});
   n->attrs[0] = scale;
@@ -734,11 +748,14 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     const auto tiles = (sq.dim(2) + 15) / 16;
     auto pooled = make(OpKind::kCustom, Shape{sq.dim(0), k.shape().dim(1), blocks, 513},
                        DType::kF32, n->inputs);
+    pooled->kv_elastic = true;
+    pooled->kv_elastic_grid = true;
     pooled->prim = find_primitive("attention.flashprefill.pool.v1");
     pooled->fclass = pooled->prim->fusion_class();
     pooled->attrs = n->attrs; pooled->iattrs = n->iattrs;
     auto selected = make(OpKind::kCustom, Shape{sq.dim(0), sq.dim(1), tiles, blocks},
                          DType::kF32, {q.node(), pooled, meta.node()});
+    selected->kv_elastic = true;
     selected->prim = find_primitive("attention.flashprefill.select.v2");
     selected->fclass = selected->prim->fusion_class();
     selected->attrs = n->attrs; selected->iattrs = n->iattrs;
@@ -770,12 +787,13 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
     }
     if (dispatch::split_decode_supported(request)) return split_paged_attention(n);
     // A tree pass, or a chain of a few rows (dispatch::flash_split_scope).
-    if (dispatch::flash_split_scope(request))
+    if (dispatch::flash_split_scope(request)) {
+      const auto units = dispatch::attention_shapes::flash_split_units(static_cast<std::uint32_t>(sq.dim(1)),
+          static_cast<std::uint32_t>(k.shape().dim(1)), static_cast<std::uint32_t>(sq.dim(2)));
       return split_paged_attention(n, false, dispatch::attention_shapes::flash_split_parts(
           static_cast<std::uint64_t>(table.shape().dim(1)) * static_cast<std::uint64_t>(block_size),
-          dispatch::attention_shapes::flash_split_units(static_cast<std::uint32_t>(sq.dim(1)),
-              static_cast<std::uint32_t>(k.shape().dim(1)), static_cast<std::uint32_t>(sq.dim(2))),
-          static_cast<std::uint32_t>(device->compute_units)));
+          units, static_cast<std::uint32_t>(device->compute_units)), units);
+    }
     if (dispatch::split_short_default_supported(request)) return split_paged_attention(n);
   }
   return Array(n);
@@ -783,8 +801,11 @@ Array sdpa_paged(const Array& q, const Array& k, const Array& v, float scale,
 
 Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
                     const Array& table, int block_size, kv::CacheDType storage) {
+  dst.node()->kv_elastic = true;
+  table.node()->kv_elastic = true;
   auto n = make(OpKind::kKvPageWrite, dst.shape(), dst.dtype(),
                 {dst.node(), src.node(), meta.node(), table.node()});
+  n->kv_elastic = true;
   n->iattrs[0] = block_size;
   n->iattrs[1] = static_cast<std::int32_t>(storage);
   n->prim = find_primitive("kv_page_write");
@@ -795,8 +816,11 @@ Array kv_page_write(const Array& dst, const Array& src, const Array& meta,
 
 Array kv_page_write_rows(const Array& dst, const Array& src, const Array& table,
                          const Array& path, int block_size, kv::CacheDType storage) {
+  dst.node()->kv_elastic = true;
+  table.node()->kv_elastic = true;
   auto n = make(OpKind::kCustom, dst.shape(), dst.dtype(),
                 {dst.node(), src.node(), table.node(), path.node()});
+  n->kv_elastic = true;
   n->iattrs[0] = block_size;
   n->iattrs[1] = static_cast<std::int32_t>(storage);
   n->prim = find_primitive("kv_page_write.rows.v1");

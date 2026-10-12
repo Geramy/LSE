@@ -66,9 +66,9 @@ int main(int argc, char** argv) {
     backend::LoomEmitter emitter;
     backend::LoomcCompiler compiler;
     std::vector<float> additions(1 * 4 * 3 * 256, 0.3125f);
-    const float write_metadata[]{127.f, 130.f, 1.f, 127.f, 130.f};
+    const float write_metadata[]{127.f, 130.f, 1.f, 127.f, 130.f, static_cast<float>(capacity / 16)};
     LSE_ASSIGN_OR(auto source, leaf({1, 4, 3, 256}, DType::kF32, additions.data()));
-    LSE_ASSIGN_OR(auto write_meta, leaf({5}, DType::kF32, write_metadata));
+    LSE_ASSIGN_OR(auto write_meta, leaf({6}, DType::kF32, write_metadata));
     for (auto* destination : {&kc, &kf}) {
       auto written = kv_page_write(*destination, source, write_meta, blocks, 16, kv::CacheDType::kBF16);
       written.node()->buffer = destination->node()->buffer;
@@ -106,9 +106,10 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < data.size(); ++i)
         data[i] = static_cast<float>(static_cast<int>(i % 71) - 35) / 64.f;
       const float metadata[]{static_cast<float>(live - queries), static_cast<float>(live), 1.f,
-                             static_cast<float>(live - queries), static_cast<float>(live)};
+                             static_cast<float>(live - queries), static_cast<float>(live),
+                             static_cast<float>(capacity / 16)};
       LSE_ASSIGN_OR(auto q, leaf(qshape, DType::kF32, data.data()));
-      LSE_ASSIGN_OR(auto meta, leaf({5}, DType::kF32, metadata));
+      LSE_ASSIGN_OR(auto meta, leaf({6}, DType::kF32, metadata));
       std::vector<float> reference;
       for (bool fragmented : {false, true}) {
         auto output = sdpa_paged(q, fragmented ? kf : kc, fragmented ? vf : vc,

@@ -76,6 +76,12 @@ inline constexpr std::int32_t kLargePoolStart = 2048;
 //   [3 + 2r]   row r's first query position
 //   [4 + 2r]   row r's KV positions live after the pass; 0 when row r holds no
 //              sequence
+//   [3 + 2R]   (after the R rows) the block table's row stride in blocks: the
+//              cache's current rung. Kernels take every extent that grows with
+//              the cache from here rather than from a shape, so one compiled
+//              kernel serves every rung (the cache grows by a rung every 4K
+//              tokens, and each new shape used to compile its attention kernels
+//              in the middle of a decode).
 //
 // The split is the whole point. [0] and [1] are the same for every thread, so
 // they are the only two a kernel may take as a loop bound — which is what
@@ -92,8 +98,19 @@ inline constexpr std::int32_t kLargePoolStart = 2048;
 inline constexpr std::int32_t kStepMetaHeader = 3;
 inline constexpr std::int32_t kStepMetaPerRow = 2;
 
-[[nodiscard]] constexpr std::int32_t step_meta_elems(std::int32_t rows) noexcept {
+// Where a descriptor for `rows` rows holds the block table's row stride.
+// The block table strides a step descriptor can carry: kernels take the
+// stride modulo this, which is what bounds their address arithmetic to 32
+// bits, so a writer refuses a larger one (2^20 blocks is 16M keys at 16-key
+// blocks).
+inline constexpr std::int32_t kMaxTableStride = 1 << 20;
+
+[[nodiscard]] constexpr std::int32_t step_meta_stride_index(std::int32_t rows) noexcept {
   return kStepMetaHeader + kStepMetaPerRow * (rows > 0 ? rows : 0);
+}
+
+[[nodiscard]] constexpr std::int32_t step_meta_elems(std::int32_t rows) noexcept {
+  return step_meta_stride_index(rows) + 1;
 }
 
 // A tree verify pass (graph::MaskKind::kTree) is one sequence whose query

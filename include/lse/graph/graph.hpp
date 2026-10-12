@@ -165,6 +165,16 @@ class Node {
 
   backend::DeviceBuffer buffer;
   std::shared_ptr<kv::FragmentStorage> kv_fragments;
+  // Its extents grow with the KV cache (a K/V pool, a block table, a split
+  // pass's partition records): the kernels that read it take its live size at
+  // run time (kv::step_meta_stride_index), so an emitter declares its view at
+  // the largest extent an address may reach and one compiled kernel serves
+  // every size.
+  bool kv_elastic = false;
+  // Its kernel's grid grows with the KV cache too (one workgroup per
+  // partition or per block): the emitter states the grid's bound rather than
+  // the grid, and the dispatch carries the real one.
+  bool kv_elastic_grid = false;
   bool materialized = false;
   // Persistent state requests an independent output, rather than a view.
   bool requires_owned_storage = false;

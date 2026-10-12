@@ -426,6 +426,12 @@ Status MtpModule::submit_pass(
   if (state_.paged.valid()) {
     LSE_ASSIGN_OR(pool_moved, ops::extend_paged(state_.paged, after));
   }
+  // The block table's row stride (kv::step_meta_stride_index); the first
+  // pass sizes the table while it records, so that one stamps it again below.
+  const auto stride_at = static_cast<std::size_t>(kv::step_meta_stride_index(1));
+  if (state_.paged.stride() >= kv::kMaxTableStride)
+    return LSE_ERROR(kOutOfRange, "the MTP module's block table is past the step descriptor's limit");
+  meta[stride_at] = static_cast<float>(state_.paged.stride());
 
   if (pass_.rows != rows && pass_.rows != 0) {
     Pass parked = std::move(passes_[rows]);
@@ -473,6 +479,10 @@ Status MtpModule::submit_pass(
                                       : poke(pass_.hidden, hidden));
     pass_.token_slot = pass_.tokens.node()->buffer;
     LSE_RETURN_IF_ERROR(feed_tokens(pass_, ids, device_token));
+    if (meta[stride_at] != static_cast<float>(state_.paged.stride())) {
+      meta[stride_at] = static_cast<float>(state_.paged.stride());
+      LSE_RETURN_IF_ERROR(poke(pass_.meta, meta));
+    }
 
     std::vector<graph::NodePtr> roots{pass_.pick.node()};
     if (pass_.last.valid()) roots.push_back(pass_.last.node());

@@ -146,6 +146,10 @@ struct WorkgroupIdY {
   static constexpr std::string_view key = "thread.workgroup_id.y";
   using result = ir::u32;
 };
+struct WorkgroupIdZ {
+  static constexpr std::string_view key = "thread.workgroup_id.z";
+  using result = ir::u32;
+};
 struct WorkgroupSize {
   static constexpr std::string_view key = "thread.workgroup_size";
   using result = ir::u32;
@@ -313,6 +317,9 @@ inline Val<ir::u32> workgroup_id_x() {
 }
 inline Val<ir::u32> workgroup_id_y() {
   return emit<op::WorkgroupIdY>();
+}
+inline Val<ir::u32> workgroup_id_z() {
+  return emit<op::WorkgroupIdZ>();
 }
 inline Val<ir::u32> workgroup_size() {
   return emit<op::WorkgroupSize>();

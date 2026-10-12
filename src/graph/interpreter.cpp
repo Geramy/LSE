@@ -971,6 +971,22 @@ float load_kv_element(const Node& node, kv::CacheDType format,
                                   width, logical_index % width);
 }
 
+// The block table's row stride travels in the step descriptor
+// (kv::step_meta_stride_index) so the device kernels do not bake the table's
+// shape. The reference reads the shape; a descriptor that disagrees with it
+// would send the device to other blocks, so it is refused here too.
+Status check_table_stride(const Node& meta, std::size_t rows, std::size_t stride,
+                          const char* op) {
+  const auto at = static_cast<std::size_t>(
+      kv::step_meta_stride_index(static_cast<std::int32_t>(rows)));
+  const float got = load_element(meta, at);
+  if (got != static_cast<float>(stride) || stride >= static_cast<std::size_t>(kv::kMaxTableStride)) {
+    return LSE_ERROR(kInvalidArgument, op, " step descriptor says the block table's stride is ",
+                     std::to_string(got), ", the table has ", std::to_string(stride));
+  }
+  return OkStatus();
+}
+
 Status eval_kv_page_write(Node& n) {
   if (n.inputs.size() != 4) {
     return LSE_ERROR(kInvalidArgument, "kv_page_write takes 4 inputs");
@@ -1011,6 +1027,7 @@ Status eval_kv_page_write(Node& n) {
                      std::to_string(meta.element_count()), " for ",
                      std::to_string(batch), " rows");
   }
+  LSE_RETURN_IF_ERROR(check_table_stride(meta, batch, stride, "kv_page_write"));
 
   const auto rows = static_cast<std::size_t>(load_element(meta, 2));
 
@@ -1165,6 +1182,7 @@ Status eval_sdpa(Node& n) {
                      std::to_string(n.inputs[3]->element_count()), " for ",
                      std::to_string(batch), " rows");
   }
+  if (paged) LSE_RETURN_IF_ERROR(check_table_stride(*n.inputs[3], batch, stride, "sdpa"));
   const std::size_t group = qh / kvh;  // GQA: several q heads share one kv head
 
   // Element offset of key/value j of (b, kh). Paged form walks the block table;

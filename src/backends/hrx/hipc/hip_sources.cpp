@@ -14,7 +14,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 76> kHipSources{{
+constexpr std::array<graph::PrimitiveSource, 77> kHipSources{{
     {"add", "$0 + $1"},
     {"sub", "$0 - $1"},
     {"mul", "$0 * $1"},
@@ -178,6 +178,7 @@ constexpr std::array<graph::PrimitiveSource, 76> kHipSources{{
     {"thread.local_id", "threadIdx.x"},
     {"thread.workgroup_id.x", "blockIdx.x"},
     {"thread.workgroup_id.y", "blockIdx.y"},
+    {"thread.workgroup_id.z", "blockIdx.z"},
     {"thread.workgroup_size", "blockDim.x"},
     {"thread.grid_dim.x", "gridDim.x"},
     {"wave.shfl_xor", "__shfl_xor($0, (int)($1))"},

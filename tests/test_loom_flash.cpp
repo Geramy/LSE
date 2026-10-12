@@ -4,6 +4,7 @@
 #include "lse/backends/hrx/hipc/hip_emitter.hpp"
 #include "lse/backends/hrx/loomc/loom_emitter.hpp"
 #include "lse/backends/hrx/loomc/loom_types.hpp"
+#include "lse/dispatch/attention_tuneconfig.h"
 #include "lse/dispatch/cache.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/graph/ops.hpp"
@@ -129,11 +130,12 @@ LSE_TEST(split_decode_attention_orders_two_barriers_and_versions_both_kernels) {
         LSE_EXPECT(emitted.ok());
         if (!emitted.ok()) continue;
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
-        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0],
+        // The partial's partitions are its grid's y extent.
+        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0] * emitted->dims.workgroup_count[1] *
+                      emitted->dims.workgroup_count[2],
             i == 0 ? 8u * static_cast<unsigned>((capacity + 127) / 128) : 48u);
         LSE_EXPECT_EQ(emitted->lds_bytes,
-            i == 0 ? 3072u + 4u * 6u * 4u
-                   : (4u * std::max(static_cast<unsigned>((capacity + 127) / 128), 128u) + 15u) / 16u * 16u);
+            i == 0 ? 3072u + 4u * 6u * 4u : dispatch::attention_shapes::kSplitMergeLdsBytes);
         LSE_EXPECT(emitted->source.find("kernel.barrier") != std::string::npos);
       }
       auto baseline = sdpa_paged(q, k, v, 0.0625f, mask, 65, meta, table, 16);
@@ -417,7 +419,7 @@ LSE_TEST(long_prefill_cache_policy_follows_the_shape_table) {
       auto q = leaf({1, 24, rows, 256}, DType::kF32);
       auto k = leaf({capacity / 16, 4, 16, 256}, DType::kBF16);
       auto v = leaf(k.shape(), DType::kBF16);
-      auto meta = leaf({5}, DType::kF32);
+      auto meta = leaf({kv::step_meta_elems(1)}, DType::kF32);
       auto table = leaf({1, capacity / 16}, DType::kF32);
       auto output = sdpa_paged(q, k, v, 0.0625f, MaskKind::kCausal,
           0, meta, table, 16, &device, kv::CacheDType::kBF16);

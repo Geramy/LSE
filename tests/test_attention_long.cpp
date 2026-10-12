@@ -16,6 +16,8 @@
 // variants compare bit for bit. Run with an empty LSE_CACHE_DIR to have the
 // scheduler measure every variant a kernel offers (its stderr names them).
 #include "harness.hpp"
+#include "lse/backends/hrx/loomc/loom_emitter.hpp"
+#include "lse/backends/hrx/loomc/loomc_compiler.hpp"
 #include "lse/backends/hrx/arch_database.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
@@ -166,6 +168,7 @@ int time_passes(std::int64_t live, const std::vector<std::string>& passes, int r
     meta[2] = 1;
     meta[3] = static_cast<float>(first);
     meta[4] = static_cast<float>(live);
+    meta[static_cast<std::size_t>(kv::step_meta_stride_index(1))] = static_cast<float>(atable.shape().dim(1));
     if (tree) {
       const runtime::DraftTree t = make_tree(static_cast<std::uint32_t>(n - 1), 11);
       if (t.rows() != static_cast<std::uint32_t>(n)) return 3;
@@ -209,9 +212,11 @@ int time_passes(std::int64_t live, const std::vector<std::string>& passes, int r
         std::vector<NodePtr> roots;
         const int count = round == 0 ? 3 : reps;
         for (int i = 0; i < count; ++i) {
-          auto merged = custom(first_out.node()->prim->name(), {records});
+          auto merged = custom(first_out.node()->prim->name(), {records, ameta});
           LSE_EXPECT_OK(merged.status());
           if (!merged.ok()) break;
+          merged->node()->attrs = first_out.node()->attrs;
+          merged->node()->iattrs = first_out.node()->iattrs;
           keep.push_back(*merged);
           roots.push_back(keep.back().node());
         }
@@ -279,6 +284,7 @@ int check_passes() {
     meta[2] = 1;
     meta[3] = static_cast<float>(first);
     meta[4] = static_cast<float>(live);
+    meta[static_cast<std::size_t>(kv::step_meta_stride_index(1))] = static_cast<float>(atable.shape().dim(1));
     if (tree)
       for (std::uint32_t r = 0; r < t.rows(); ++r)
         for (std::uint32_t c = 0; c < t.rows(); ++c)
@@ -324,13 +330,14 @@ int check_passes() {
   return lse::test::Registry::get().failures ? 1 : 0;
 }
 
-backend::DeviceInfo described_gfx1151(backend::AmdDeviceInfo& amd) {
+backend::DeviceInfo described_gfx1151(backend::AmdDeviceInfo& amd, const char* arch = "gfx1151",
+                                      std::uint32_t compute_units = 40) {
   backend::DeviceInfo gpu;
-  gpu.arch = "gfx1151";
+  gpu.arch = arch;
   gpu.wavefront_size = 32;
   gpu.max_threads_per_workgroup = 1024;
   gpu.lds_bytes_per_workgroup = 65536;
-  gpu.compute_units = 40;
+  gpu.compute_units = compute_units;
   backend::apply_arch_defaults(gpu, amd);
   gpu.extension_id = backend::AmdDeviceInfo::kExtensionId;
   gpu.extension = &amd;
@@ -361,7 +368,196 @@ LSE_TEST(long_context_passes_take_the_split_kernels_on_gfx1151) {
   }
 }
 
+// The kernels a pass of `n` rows (a tree when `tree`) emits at a cache of
+// `keys`, on `gpu`: their sources, by group, with the self-export name
+// canonical.
+std::vector<std::string> pass_sources(const backend::DeviceInfo& gpu, std::int64_t n, bool tree,
+                                      std::int64_t keys, std::vector<std::string>* names = nullptr) {
+  const std::int64_t blocks = rung_blocks(keys);
+  auto q = leaf({1, kQh, n, kHd});
+  auto k = leaf({blocks, kKvh, kBs, kHd}, DType::kBF16), v = leaf({blocks, kKvh, kHd, kBs}, DType::kBF16);
+  auto meta = leaf({tree ? kv::tree_meta_elems(1, static_cast<std::int32_t>(n)) : kv::step_meta_elems(1)});
+  auto table = leaf({1, blocks});
+  // A pass of more than 64 rows is a prompt chunk, here with FlashPrefill's
+  // pool and selector when FLASHPREFILL is set.
+  ops::SparseAttentionPhase sparse;
+  if (n > 64 && std::getenv("FLASHPREFILL")) sparse = {false, 0.1f, true};
+  auto o = sdpa_paged(q, k, v, 0.0625f, tree ? MaskKind::kTree : MaskKind::kCausal, 0, meta, table,
+                      static_cast<int>(kBs), &gpu, kv::CacheDType::kBF16, sparse);
+  const NodePtr roots[]{o.node()};
+  backend::LoomEmitter emitter;
+  std::vector<std::string> out;
+  for (const auto& group : Partitioner::partition(roots, &gpu)) {
+    auto emitted = emitter.emit(group, gpu);
+    LSE_EXPECT_OK(emitted.status());
+    if (!emitted.ok()) continue;
+    std::string text = emitted->source;
+    for (std::size_t at = text.find(emitted->entry_name); at != std::string::npos;
+         at = text.find(emitted->entry_name, at))
+      text.replace(at, emitted->entry_name.size(), "self");
+    out.push_back(std::move(text));
+    if (names) names->push_back(std::string(group.nodes.back()->prim ? group.nodes.back()->prim->name() : "?"));
+  }
+  return out;
+}
+
+int emit_diff(std::int64_t n, bool tree, std::int64_t a, std::int64_t b) {
+  backend::AmdDeviceInfo amd;
+  const auto gpu = described_gfx1151(amd);
+  std::vector<std::string> names;
+  const auto x = pass_sources(gpu, n, tree, a, &names), y = pass_sources(gpu, n, tree, b);
+  for (std::size_t g = 0; g < x.size() && g < y.size(); ++g) {
+    std::printf("group %zu %s: %s\n", g, names[g].c_str(), x[g] == y[g] ? "same" : "differs");
+    if (x[g] == y[g]) continue;
+    // The first lines that differ.
+    std::size_t i = 0, j = 0, shown = 0;
+    while (shown < 12 && i < x[g].size() && j < y[g].size()) {
+      const auto ei = x[g].find('\n', i), ej = y[g].find('\n', j);
+      const std::string li = x[g].substr(i, ei - i), lj = y[g].substr(j, ej - j);
+      if (li != lj) {
+        std::printf("  - %s\n  + %s\n", li.substr(0, 200).c_str(), lj.substr(0, 200).c_str());
+        ++shown;
+      }
+      if (ei == std::string::npos || ej == std::string::npos) break;
+      i = ei + 1;
+      j = ej + 1;
+    }
+  }
+  return 0;
+}
+
+// The cache's size is a run-time value of every attention kernel: from the
+// last code-shape bucket on (dispatch::attention_kv_buckets), a pass at any
+// rung emits the same text, so a session that grows compiles nothing.
+LSE_TEST(attention_kernel_text_is_the_same_at_every_cache_rung) {
+  for (const auto& [arch, units] : {std::pair{"gfx1151", 40u}, std::pair{"gfx1201", 64u}}) {
+    backend::AmdDeviceInfo amd;
+    const auto gpu = described_gfx1151(amd, arch, units);
+    std::int64_t from = 4096;
+    for (const std::int64_t keys : dispatch::attention_kv_buckets(gpu)) from = std::max(from, keys);
+    for (const char* pass : {"1", "2", "4", "8", "t8", "t15", "t31"}) {
+      const bool tree = pass[0] == 't';
+      const std::int64_t n = std::atoll(pass + (tree ? 1 : 0));
+      std::vector<std::string> names;
+      const auto base = pass_sources(gpu, n, tree, from, &names);
+      LSE_EXPECT(!base.empty());
+      for (const std::int64_t keys : {from * 2, std::int64_t{65536}, std::int64_t{131072}, std::int64_t{262144}}) {
+        const auto at = pass_sources(gpu, n, tree, keys);
+        LSE_EXPECT_EQ(at.size(), base.size());
+        for (std::size_t g = 0; g < at.size() && g < base.size(); ++g) {
+          if (at[g] != base[g])
+            std::fprintf(stderr, "%s pass %s group %zu (%s) differs at %lld keys from %lld\n", arch, pass,
+                         g, names[g].c_str(), static_cast<long long>(keys), static_cast<long long>(from));
+          LSE_EXPECT(at[g] == base[g]);
+        }
+      }
+    }
+  }
+}
+
+namespace {
+
+// `--grow`: on the device, every pass width once at 4K keys and once at each
+// code-shape bucket (what a server prepares at load), then at 16K to 128K
+// keys with the pools at each rung. Counts the kernels compiled or loaded
+// after the first two: a session that grows should need none.
+int grow_passes() {
+  auto* scheduler = default_scheduler();
+  if (!scheduler) return 1;
+  scheduler->set_mode(Scheduler::Mode::kDeviceFirst);
+  scheduler->set_dialect(Dialect::kLoom);
+  const std::size_t member = preferred_member();
+  const auto* device = member < scheduler->devices().size()
+      ? &scheduler->devices().device(member).device_info() : nullptr;
+  if (!device) return 1;
+  std::vector<std::int64_t> lives{4096};
+  for (const std::int64_t keys : dispatch::attention_kv_buckets(*device)) lives.push_back(keys);
+  const std::size_t prepared = lives.size();
+  for (const std::int64_t keys : {16384, 32768, 65536, 131072}) lives.push_back(keys);
+  Scheduler::JitStats after_load{};
+  for (std::size_t li = 0; li < lives.size(); ++li) {
+    const std::int64_t live = lives[li];
+    const std::int64_t blocks = rung_blocks(live + 64);
+    std::vector<std::uint16_t> pool(static_cast<std::size_t>(blocks * kKvh * kBs * kHd), 0x3c00);
+    std::vector<float> table(static_cast<std::size_t>(blocks));
+    for (std::int64_t b = 0; b < blocks; ++b) table[static_cast<std::size_t>(b)] = static_cast<float>(b);
+    auto akp = filled(Shape{blocks, kKvh, kBs, kHd}, DType::kBF16, pool);
+    auto avp = filled(Shape{blocks, kKvh, kHd, kBs}, DType::kBF16, pool);
+    auto atable = filled(Shape{1, blocks}, DType::kF32, table);
+    pool = {};
+    for (const char* pass : {"1", "2", "3", "4", "5", "6", "7", "8", "t8", "t15", "t31"}) {
+      const bool tree = pass[0] == 't';
+      const std::int64_t n = std::atoll(pass + (tree ? 1 : 0));
+      std::vector<float> meta(tree ? kv::tree_meta_elems(1, static_cast<std::int32_t>(n))
+                                   : kv::step_meta_elems(1), 0.0f);
+      meta[0] = meta[3] = static_cast<float>(live - n);
+      meta[1] = meta[4] = static_cast<float>(live);
+      meta[2] = 1;
+      meta[static_cast<std::size_t>(kv::step_meta_stride_index(1))] = static_cast<float>(blocks);
+      if (tree)  // a star: each row sees the root and itself
+        for (std::int64_t r = 0; r < n; ++r) {
+          meta[static_cast<std::size_t>(kv::tree_mask_offset(1) + r * n)] = 1.0f;
+          meta[static_cast<std::size_t>(kv::tree_mask_offset(1) + r * n + r)] = 1.0f;
+        }
+      auto q = filled(Shape{1, kQh, n, kHd}, DType::kF32, std::vector<float>(static_cast<std::size_t>(kQh * n * kHd), 0.5f));
+      auto ameta = filled(Shape{static_cast<std::int64_t>(meta.size())}, DType::kF32, meta);
+      auto out = sdpa_paged(q, akp, avp, 0.0625f, tree ? MaskKind::kTree : MaskKind::kCausal, 0,
+                            ameta, atable, static_cast<int>(kBs), device, kv::CacheDType::kBF16);
+      LSE_EXPECT_OK(run({out.node()}));
+    }
+    const auto jit = scheduler->jit_stats();
+    std::printf("at %6lld keys (pool %lld blocks): %llu compiled, %llu loaded, %llu variant trials\n",
+                static_cast<long long>(live), static_cast<long long>(blocks),
+                static_cast<unsigned long long>(jit.compiles), static_cast<unsigned long long>(jit.disk_hits),
+                static_cast<unsigned long long>(jit.variant_trials));
+    if (li + 1 == prepared) after_load = jit;
+  }
+  const auto jit = scheduler->jit_stats();
+  const auto grown = (jit.compiles - after_load.compiles) + (jit.disk_hits - after_load.disk_hits);
+  std::printf("kernels compiled or loaded after load: %llu\n", static_cast<unsigned long long>(grown));
+  LSE_EXPECT_EQ(grown, 0u);
+  return lse::test::Registry::get().failures ? 1 : 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--grow") return grow_passes();
+  if (argc == 5 && std::string_view(argv[1]) == "--compile") {
+    // `--compile ARCH [t]N KEYS`: each kernel of the pass compiled for a
+    // described device, without one.
+    const bool tree = argv[3][0] == 't';
+    backend::AmdDeviceInfo amd;
+    const auto gpu = described_gfx1151(amd, argv[2], std::string_view(argv[2]) == "gfx1201" ? 64u : 40u);
+    std::vector<std::string> names;
+    const auto sources = pass_sources(gpu, std::atoll(argv[3] + (tree ? 1 : 0)), tree, std::atoll(argv[4]), &names);
+    backend::LoomcCompiler compiler;
+    int bad = 0;
+    for (std::size_t g = 0; g < sources.size(); ++g) {
+      auto code = compiler.compile(sources[g], gpu.arch);
+      std::printf("%s: %s\n", names[g].c_str(), code.ok() ? "compiled" : code.status().to_string().substr(0, 600).c_str());
+      if (!code.ok()) {
+        ++bad;
+        const std::string path = "/tmp/lc-" + std::to_string(g) + ".loom";
+        if (FILE* f = std::fopen(path.c_str(), "w")) { std::fputs(sources[g].c_str(), f); std::fclose(f); }
+      }
+    }
+    return bad;
+  }
+  if (argc == 4 && std::string_view(argv[1]) == "--emit") {
+    const bool tree = argv[2][0] == 't';
+    backend::AmdDeviceInfo amd;
+    const auto gpu = described_gfx1151(amd);
+    std::vector<std::string> names;
+    const auto sources = pass_sources(gpu, std::atoll(argv[2] + (tree ? 1 : 0)), tree, std::atoll(argv[3]), &names);
+    for (std::size_t g = 0; g < sources.size(); ++g)
+      std::printf("// group %zu %s\n%s\n", g, names[g].c_str(), sources[g].c_str());
+    return 0;
+  }
+  if (argc == 5 && std::string_view(argv[1]) == "--emit-diff") {
+    const bool tree = argv[2][0] == 't';
+    return emit_diff(std::atoll(argv[2] + (tree ? 1 : 0)), tree, std::atoll(argv[3]), std::atoll(argv[4]));
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--check") return check_passes();
   if (argc >= 3 && std::string_view(argv[1]) == "--time") {
     const auto live = std::strtoll(argv[2], nullptr, 10);

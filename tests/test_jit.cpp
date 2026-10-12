@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 
+#include "lse/kv/block.hpp"
 #include "harness.hpp"
 #include "lse/backend/backend.hpp"
 #include "lse/core/debug.hpp"
@@ -579,7 +580,7 @@ LSE_TEST(a_phase_wmma_flash_stage_walks_every_head_and_query_tile) {
     Array scaled = mul(q, Array::full(Shape{1}, DType::kF32, 2.0f));
     Array keys = Array::full(Shape{1, heads / 2, 16, 16}, DType::kF32, 0.2f);
     Array values = Array::full(keys.shape(), DType::kF32, 0.3f);
-    Array meta = Array::full(Shape{5}, DType::kF32, 1.0f);
+    Array meta = Array::full(Shape{kv::step_meta_elems(1)}, DType::kF32, 1.0f);
     Array table = Array::full(Shape{1, 1}, DType::kF32, 0.0f);
     Array output = sdpa_paged(scaled, keys, values, 0.25f, MaskKind::kCausal,
                               0, meta, table, 16);

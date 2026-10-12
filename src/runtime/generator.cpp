@@ -11,6 +11,7 @@
 #include <cmath>
 
 #include "lse/core/debug.hpp"
+#include "lse/dispatch/attention.hpp"
 #include "lse/graph/graph.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/graph/interpreter.hpp"
@@ -391,8 +392,19 @@ Status Generator::prepare_kernels() {
     for (std::uint32_t m = 1; m <= widest; ++m) passes.emplace_back(m, false);
     if (dflash2_ != nullptr && tree_)
       for (const std::uint32_t rows : DraftWidthPolicy::kTreeRows) passes.emplace_back(rows, true);
+    // Each pass fresh, and again at every KV length where the attention
+    // kernels change code shape (dispatch::attention_kv_buckets): past those
+    // the cache's size is a run-time value, so a session that grows into
+    // them later compiles nothing.
+    std::vector<std::int64_t> depths{0};
+    for (const std::int64_t keys : dispatch::attention_kv_buckets(sched->backend().device_info()))
+      if (keys < model_.config().kv_capacity()) depths.push_back(keys);
+    for (const std::int64_t depth : depths)
     for (const auto& [m, tree_pass] : passes) {
       Session scratch("", model_.state_slots());
+      if (depth != 0)
+        for (model::MixerState& state : scratch.states())
+          state.position = static_cast<std::int32_t>(depth);
       // Held as verify() holds them: a device buffer of m ids.
       auto buffer = sched->backend().allocate(dtype_storage_bytes(DType::kF32, m),
                                               backend::MemoryClass::kDevice);

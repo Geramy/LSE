@@ -82,9 +82,12 @@ LSE_TEST(decode_attention_uses_split_stages_at_short_and_long_capacities) {
       LSE_EXPECT(emitted.ok());
       if (!emitted.ok()) return;
       LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
-      LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], i == 0 ? 8u * parts : 48u);
+      // The partial's partitions are its grid's y extent.
+      LSE_EXPECT_EQ(emitted->dims.workgroup_count[0] * emitted->dims.workgroup_count[1] *
+                    emitted->dims.workgroup_count[2], i == 0 ? 8u * parts : 48u);
+      if (i == 0) LSE_EXPECT_EQ(emitted->dims.workgroup_count[1], parts);
       // The partial's scores for six rows, then four wave maxima per row.
-      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u + 4u * 6u * 4u : (std::max(parts, 128u) * 4u + 15u) / 16u * 16u);
+      LSE_EXPECT_EQ(emitted->lds_bytes, i == 0 ? 3072u + 4u * 6u * 4u : dispatch::attention_shapes::kSplitMergeLdsBytes);
     }
   }
   LSE_EXPECT(find_primitive("attention.decode_shared") == nullptr);
@@ -139,19 +142,21 @@ LSE_TEST(decode_attention_merge_initializes_partitions_beyond_one_wavegroup) {
   LSE_EXPECT(merge != nullptr);
   if (!merge) return;
   for (int parts : {1, 64, 128, 129, 256, 2048, 16384, 16385}) {
-    const std::array<Shape, 1> inputs{Shape{1, 24, parts, 258}};
-    const std::array<DType, 1> dtypes{DType::kF32};
+    // The records and the step descriptor that says how many there are.
+    const std::array<Shape, 2> inputs{Shape{1, 24, parts, 258}, Shape{kv::step_meta_elems(1)}};
+    const std::array<DType, 2> dtypes{DType::kF32, DType::kF32};
     KernelShapes request;
     request.inputs = inputs;
     request.input_dtypes = dtypes;
     request.output = Shape{1, 24, 1, 256};
     request.device = &fx.gpu;
-    LSE_EXPECT(dispatch::split_decode_merge_supported(request) == (parts <= 16384));
-    if (parts <= 16384) {
+    // The merge's scratch is one maximum per lane whatever the count.
+    LSE_EXPECT(dispatch::split_decode_merge_supported(request));
+    {
       const auto plan = merge->plan(request);
       LSE_EXPECT_EQ(plan.workgroup_size[0], 128u);
       LSE_EXPECT_EQ(plan.workgroup_count[0], 24u);
-      LSE_EXPECT_EQ(plan.lds_bytes, (static_cast<unsigned>(std::max(parts, 128)) * 4u + 15u) / 16u * 16u);
+      LSE_EXPECT_EQ(plan.lds_bytes, dispatch::attention_shapes::kSplitMergeLdsBytes);
     }
   }
 }
@@ -170,8 +175,9 @@ LSE_TEST(decode_attention_masks_keep_binding_and_launch_abi) {
         const auto emitted = emitter.emit(groups[stage], fx.gpu);
         LSE_EXPECT(emitted.ok());
         if (!emitted.ok()) return;
-        LSE_EXPECT_EQ(emitted->binding_order.size(), stage == 0 ? 6u : 2u);
-        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0], stage == 0 ? 8u * 64u : 48u);
+        LSE_EXPECT_EQ(emitted->binding_order.size(), stage == 0 ? 6u : 3u);
+        LSE_EXPECT_EQ(emitted->dims.workgroup_count[0] * emitted->dims.workgroup_count[1] *
+                      emitted->dims.workgroup_count[2], stage == 0 ? 8u * 64u : 48u);
         LSE_EXPECT_EQ(emitted->dims.workgroup_size[0], 128u);
         LSE_EXPECT(emitted->source.find("kernel.barrier<workgroup>") != std::string::npos);
         LSE_EXPECT(emitted->source.find("scalar.fmaf") != std::string::npos);
@@ -288,14 +294,15 @@ LSE_TEST(decode_attention_narrow_storage_uses_wave_qk_and_preserves_partial_abi)
       LSE_EXPECT(merge.ok());
       if (!partial.ok() || !merge.ok()) return;
       LSE_EXPECT_EQ(partial->dims.workgroup_size[0], 128u);
-      LSE_EXPECT_EQ(partial->dims.workgroup_count[0], 4u * parts);
+      LSE_EXPECT_EQ(partial->dims.workgroup_count[0] * partial->dims.workgroup_count[1] *
+                    partial->dims.workgroup_count[2], 4u * parts);
       LSE_EXPECT_EQ(partial->lds_bytes, 3072u + 4u * 6u * 4u);
       LSE_EXPECT_EQ(partial->binding_order.size(), 6u);
       LSE_EXPECT(partial->source.find("kernel.subgroup.shuffle<xor>") != std::string::npos);
       LSE_EXPECT(partial->source.find("scalar.fmaf") != std::string::npos);
       LSE_EXPECT(partial->source.find(storage == kv::CacheDType::kF16 ? "xf16" : "xbf16") != std::string::npos);
       LSE_EXPECT_EQ(merge->dims.workgroup_count[0], 24u);
-      LSE_EXPECT_EQ(merge->lds_bytes, std::max(parts, 128u) * sizeof(float));
+      LSE_EXPECT_EQ(merge->lds_bytes, dispatch::attention_shapes::kSplitMergeLdsBytes);
     }
   }
 }
