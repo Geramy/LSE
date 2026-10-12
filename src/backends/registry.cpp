@@ -3,6 +3,7 @@
 
 #include "lse/backend/backend.hpp"
 #include "lse/backends/hrx/device_info.hpp"
+#include "lse/core/debug.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -10,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <type_traits>
 
 namespace lse::backend {
@@ -219,7 +221,52 @@ void unregister_memory_trimmer(std::uint64_t id) noexcept {
   t.all.erase(id);
 }
 
+namespace {
+// The reclaim locks this thread holds (ReclaimLock), tracked in debug runs
+// only: the innermost few by name, the rest counted.
+constexpr int kTrackedReclaimLocks = 8;
+thread_local const char* t_reclaim_locks[kTrackedReclaimLocks];
+thread_local int t_reclaim_depth = 0;
+
+[[noreturn]] void reclaim_lock_held() {
+  std::string held;
+  for (int i = 0; i < t_reclaim_depth && i < kTrackedReclaimLocks; ++i)
+    held += std::string(held.empty() ? "" : ", ") + t_reclaim_locks[i];
+  std::fprintf(stderr,
+               "lse: memory reclaim ran on a thread holding %s, which reclaim takes again; "
+               "a release build deadlocks here. Release the lock before the device "
+               "allocation.\n",
+               held.c_str());
+  std::fflush(stderr);
+  std::abort();
+}
+}  // namespace
+
+ReclaimLock::ReclaimLock(std::mutex& mu, const char* name) : mu_(mu), name_(name) { lock(); }
+
+ReclaimLock::~ReclaimLock() {
+  if (owns_) unlock();
+}
+
+void ReclaimLock::lock() {
+  mu_.lock();
+  owns_ = true;
+  tracked_ = ::lse::debug();
+  if (tracked_) {
+    if (t_reclaim_depth < kTrackedReclaimLocks) t_reclaim_locks[t_reclaim_depth] = name_;
+    ++t_reclaim_depth;
+  }
+}
+
+void ReclaimLock::unlock() {
+  if (tracked_) --t_reclaim_depth;
+  tracked_ = false;
+  owns_ = false;
+  mu_.unlock();
+}
+
 std::size_t trim_device_memory() {
+  if (t_reclaim_depth != 0) reclaim_lock_held();
   // Copied out: a trimmer may release buffers whose owners unregister others.
   // Caches first, then the backends' pools, which only then hold everything
   // the caches let go.

@@ -1,6 +1,7 @@
 #include "lse/kv/memory.hpp"
 
 #include <algorithm>
+#include <optional>
 
 namespace lse::kv {
 
@@ -11,64 +12,99 @@ struct MemoryManager::Lease {
   ~Lease() { manager->release(arena, slot); }
 };
 
+// The lock is never held across a device allocation or free. An allocation
+// the device cannot cover runs the memory trimmers on this thread, and under
+// pressure they evict idle sessions, whose fragments come back through
+// release() and take this lock: held here, the allocating thread waited on
+// itself. So a new arena is allocated unlocked, and the slot is taken from
+// whichever arena has one once the lock is held again.
 Result<backend::DeviceBuffer> MemoryManager::acquire(
     backend::IBackend& backend, backend::Stream stream) {
-  const std::lock_guard lock(mutex_);
-  std::size_t selected = arenas_.size();
-  std::size_t empty = arenas_.size();
-  for (std::size_t i = 0; i < arenas_.size(); ++i) {
-    const auto& arena = arenas_[i];
-    if (!arena.buffer.valid() && empty == arenas_.size()) empty = i;
-    if (arena.backend == &backend && arena.stream == stream &&
-        arena.buffer.valid() && !arena.available.empty()) {
-      selected = i;
-      break;
+  backend::DeviceBuffer fresh;
+  // An arena allocation that failed: the trimmers it ran may still have
+  // returned fragments to an arena this manager holds, so the arenas are
+  // looked at once more before the failure is the answer.
+  std::optional<Status> refused;
+  for (;;) {
+    backend::ReclaimLock lock(mutex_, "the K/V memory manager");
+    std::size_t selected = arenas_.size();
+    std::size_t empty = arenas_.size();
+    for (std::size_t i = 0; i < arenas_.size(); ++i) {
+      const auto& arena = arenas_[i];
+      if (!arena.buffer.valid() && empty == arenas_.size()) empty = i;
+      if (arena.backend == &backend && arena.stream == stream &&
+          arena.buffer.valid() && !arena.available.empty()) {
+        selected = i;
+        break;
+      }
     }
-  }
-  if (selected == arenas_.size()) {
+    if (selected == arenas_.size() && fresh.valid()) {
+      Arena arena;
+      arena.buffer = std::move(fresh);
+      fresh = {};
+      arena.backend = &backend;
+      arena.stream = stream;
+      for (std::uint32_t i = kArenaBytes / kFragmentBytes; i != 0; --i)
+        arena.available.push_back(i - 1);
+      if (empty < arenas_.size()) {
+        arenas_[empty] = std::move(arena);
+        selected = empty;
+      } else {
+        arenas_.push_back(std::move(arena));
+        selected = arenas_.size() - 1;
+      }
+    }
+    if (selected != arenas_.size()) {
+      auto& arena = arenas_[selected];
+      const auto slot = arena.available.back();
+      arena.available.pop_back();
+      ++arena.assigned;
+      auto view = arena.buffer;
+      view.offset += slot * kFragmentBytes;
+      view.size_bytes = kFragmentBytes;
+      view.storage = std::shared_ptr<Lease>(
+          new Lease{shared_from_this(), selected, slot});
+      lock.unlock();
+      // An arena allocated while another thread freed slots elsewhere is not
+      // needed after all; it goes back to the device unlocked.
+      if (fresh.valid()) backend.deallocate(fresh);
+      return view;
+    }
+    if (refused.has_value()) return *refused;
+    lock.unlock();
     // Charged to the K/V cache whoever grows it: a pass that extends resident
     // fragments has no site of its own, and the arenas showed up as "other".
     const backend::ScopedAllocationSite site(backend::AllocationSite::kKvCache);
-    LSE_ASSIGN_OR(auto buffer, backend.allocate(kArenaBytes,
-        backend::MemoryClass::kDevice, stream));
-    Arena arena;
-    arena.buffer = std::move(buffer);
-    arena.backend = &backend;
-    arena.stream = stream;
-    for (std::uint32_t i = kArenaBytes / kFragmentBytes; i != 0; --i)
-      arena.available.push_back(i - 1);
-    if (empty < arenas_.size()) {
-      arenas_[empty] = std::move(arena);
-      selected = empty;
+    auto allocated = backend.allocate(kArenaBytes, backend::MemoryClass::kDevice, stream);
+    if (allocated.ok()) {
+      fresh = allocated.release();
     } else {
-      arenas_.push_back(std::move(arena));
-      selected = arenas_.size() - 1;
+      refused = allocated.status();
     }
   }
-  auto& arena = arenas_[selected];
-  const auto slot = arena.available.back();
-  arena.available.pop_back();
-  ++arena.assigned;
-  auto view = arena.buffer;
-  view.offset += slot * kFragmentBytes;
-  view.size_bytes = kFragmentBytes;
-  view.storage = std::shared_ptr<Lease>(
-      new Lease{shared_from_this(), selected, slot});
-  return view;
 }
 
 void MemoryManager::release(std::size_t index, std::uint32_t slot) {
-  const std::lock_guard lock(mutex_);
-  auto& arena = arenas_[index];
-  arena.available.push_back(slot);
-  if (--arena.assigned == 0) {
-    arena.backend->deallocate(arena.buffer);
-    arena.available.clear();
+  backend::DeviceBuffer emptied;
+  backend::IBackend* owner = nullptr;
+  {
+    backend::ReclaimLock lock(mutex_, "the K/V memory manager");
+    auto& arena = arenas_[index];
+    arena.available.push_back(slot);
+    if (--arena.assigned == 0) {
+      emptied = std::move(arena.buffer);
+      arena.buffer = {};
+      owner = arena.backend;
+      arena.available.clear();
+    }
   }
+  // Freed unlocked, as acquire allocates: what a free does in the backend is
+  // not this manager's to hold its lock across.
+  if (owner != nullptr) owner->deallocate(emptied);
 }
 
 MemoryManager::Stats MemoryManager::stats() const {
-  const std::lock_guard lock(mutex_);
+  backend::ReclaimLock lock(mutex_, "the K/V memory manager");
   Stats result;
   for (const auto& arena : arenas_) {
     if (!arena.buffer.valid()) continue;
