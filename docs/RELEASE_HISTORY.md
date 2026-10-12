@@ -3,6 +3,17 @@
 These records describe their original source, requests and sampling settings.
 Use the current README and final mode report for the latest controlled comparison.
 
+## v0.6.2: gfx1151 long-context DFlash2, no hang on idle-session eviction, no compiles mid-decode
+
+Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
+
+1. **Idle-session eviction no longer hangs the server:** no K/V lock is held across a device allocation or free, so evicting an idle session to make room for a growing one completes; when the device refuses a new arena, the arenas are checked again for what the eviction freed.
+2. **No kernel compiles mid-decode:** attention kernels read the KV cache's size at run time, so a session that grows past a new cache rung runs the kernels it already has.
+3. **gfx1151 long-context attention:** draft-tree verify passes of four or more tiles per key head take a pair form (two tiles a workgroup sharing every key and value read), and one-row decode issues several keys' reads per iteration. Output is byte-identical.
+4. **Width policy:** tree costs carried to a longer context scale with its cache length, and a rung's first pass there is priced at once, so DFlash2 no longer verifies wide trees on most steps at 64K and beyond.
+5. **Variant trials:** kernels that stream large weights are timed cold, so layouts that differ in how they stream weights are compared fairly.
+6. **No silent CPU fallback:** a run whose GPU backend is unavailable, or whose op has no device kernel, fails unless the run chose the CPU backend.
+
 ## v0.6.1: faster tree tiles, prefill tiles by pass width, variant decisions by shape class, launch templates
 
 Requires a mac_linuxgpu HSA runtime with `hsa_amd_queue_create` (build 267 or later) on macOS. The Linux archive bundles its HSA runtime.
