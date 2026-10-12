@@ -12,27 +12,27 @@ Prefill, tok/s (prompt tokens / time to first token, measured by the client on a
 
 | GPU | OS | 256 | 1K | 2K | 4K | 32K |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Radeon 8060S (gfx1151) | Linux | 460 | 501 | 526 | 538 | 480 |
+| Radeon 8060S (gfx1151) | Linux | 437 | 479 | 511 | 539 | 482 |
 | Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | | | | |
-| Radeon AI PRO R9700 | Linux | 1,247 | 1,396 | 1,457 | 1,484 | 1,388 |
+| Radeon AI PRO R9700 | Linux | 1,231 | 1,399 | 1,458 | 1,484 | 1,385 |
 | Radeon AI PRO R9700 | macOS | Results pending | | | | |
 
 Decode, code prompt, tok/s:
 
 | GPU | OS | Baseline | dMTP | DFlash2 |
 | --- | --- | ---: | ---: | ---: |
-| Radeon 8060S (gfx1151) | Linux | 14.1 | 47.0 | **65.2** |
+| Radeon 8060S (gfx1151) | Linux | 14.3 | 47.7 | **63.8** |
 | Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | | |
-| Radeon AI PRO R9700 | Linux | 32.3 | 108.9 | **152.8** |
+| Radeon AI PRO R9700 | Linux | 32.6 | 113.8 | **159.6** |
 | Radeon AI PRO R9700 | macOS | Results pending | | |
 
 Model: Qwen3.8-27B, 4-bit (MLX); drafts: dMTP (dynamic MTP) 8-bit, DFlash2 8-bit. Temperature 0.6, median of 3, after a warm-up that completes kernel variant selection.
 
-![Prefill vs prompt length](docs/benchmarks/lse-0.6.1-prefill-vs-context.png)
+![Prefill vs prompt length](docs/benchmarks/lse-0.6.2-prefill-vs-context.png)
 
 Prefill vs prompt length
 
-![Decode vs context, code task](docs/benchmarks/lse-0.6.1-decode-vs-context.png)
+![Decode vs context, code task](docs/benchmarks/lse-0.6.2-decode-vs-context.png)
 
 Decode vs context, code task
 
