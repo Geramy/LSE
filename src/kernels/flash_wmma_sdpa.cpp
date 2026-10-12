@@ -20,6 +20,7 @@
 #include "lse/kernels/wmma.hpp"
 #include "lse/kernels/kv_storage.hpp"
 #include "lse/kernels/sdpa.hpp"
+#include "lse/kernels/split_parts.hpp"
 
 namespace lse::kernels {
 
@@ -374,10 +375,13 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
               b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
     const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
-    const auto capacity = e.u32(d.stride * d.ts);
+    // The block table's stride is the cache's current rung, read at run time
+    // (kv/block.hpp): one compiled kernel serves every cache size.
+    const auto table_row = table_stride(e, a.meta, d.bsz);
+    const auto capacity = e.let(table_row * d.ts);
     const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
     const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
-    const auto tb = e.let(b * d.stride);
+    const auto tb = e.let(b * table_row);
 
     for (std::uint32_t c = 0; c < qchunks; ++c) {
       const auto idx = e.let(lid + c * kT);
@@ -424,7 +428,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         "kv_len", select(loaded_max < capacity, loaded_max, capacity));
     const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
     const auto loop_windows = [&] {
-      if constexpr (MeanCorrection) return e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+      if constexpr (MeanCorrection) return e.let((capacity + (kKWin - 1u)) / kKWin);
       else return nwin;
     }();
     for (auto w : e.range(loop_windows)) {
@@ -440,7 +444,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         const auto visits1 = e.let(has1);
         const auto sel0 = [&] {
           if constexpr (MeanCorrection) {
-            const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+            const auto blocks = e.let((capacity + (kKWin - 1u)) / kKWin);
             return e.let(select(visits0, a.selected[((b * d.qh + h) * ntiles + qt0) * blocks + w],
                                 e.f32(0.0f)));
           } else {
@@ -449,7 +453,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         }();
         const auto sel1 = [&] {
           if constexpr (MeanCorrection) {
-            const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+            const auto blocks = e.let((capacity + (kKWin - 1u)) / kKWin);
             const auto qt1 = e.let(select(has1, qt0 + 1u, qt0));
             return e.let(select(visits1, a.selected[((b * d.qh + h) * ntiles + qt1) * blocks + w],
                                 e.f32(0.0f)));
@@ -653,7 +657,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
           }
         }  // exact block
         if constexpr (MeanCorrection) {
-          const auto blocks = e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+          const auto blocks = e.let((capacity + (kKWin - 1u)) / kKWin);
           const auto pool = e.let(((b * d.kvh + kh) * blocks + w) * 513u);
           // Per tile, as its own workgroup would have: a block it visits and
           // did not select takes the pooled correction.
@@ -763,15 +767,19 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const std::uint32_t qrow_stride = padded_depth + 8u;
     const std::uint32_t qchunks = (QR * padded_depth + kT - 1u) / kT;
     const std::uint32_t value_tiles = (d.dv / 16u + kW - 1u) / kW;
-    const std::uint32_t parts = static_cast<std::uint32_t>(s.output.dim(3));
-    const std::uint32_t share = dispatch::attention_shapes::flash_split_share(
-        std::uint64_t{d.stride} * d.ts, parts);
-
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     FlashArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
+    // The shares of the windows follow the cache's size, read at run time
+    // as the host computes them for the records (kernels/split_parts.hpp).
+    const auto split = flash_split_parts(
+        e, e.let(table_stride(e, a.meta, d.bsz) * d.ts),
+        dispatch::attention_shapes::flash_split_units(d.qh, d.kvh, d.tq),
+        static_cast<std::uint32_t>(s.device->compute_units));
+    const auto parts = split.parts;
+    const auto share = split.share;
     const auto qs = e.lds<Narrow>(QR * qrow_stride);
     const auto sc = e.lds<kir::f32>(QR * kKWin);
     const auto mrow = e.lds<kir::f32>(QR);
@@ -784,10 +792,15 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const auto wg = e.let(math::workgroup_id_x());
     // Ordered as variant 0 orders its tiles: share by share, key head by key
     // head, so the pairs reading one key head's share run together.
+    // The grid is (pairs x key heads, shares, batch), x fastest: that same
+    // order, with the share count (read at run time) a grid extent rather
+    // than a divisor.
     const auto pair = e.let(wg % pairs);
     const auto kh = e.let((wg / pairs) % d.kvh);
-    const auto part = e.let((wg / (pairs * d.kvh)) % parts);
-    const auto b = e.let(wg / (pairs * d.kvh * parts));
+    const auto part = e.let(math::workgroup_id_y() %
+        flash_split_part_bound(dispatch::attention_shapes::flash_split_units(d.qh, d.kvh, d.tq),
+                               static_cast<std::uint32_t>(s.device->compute_units)));
+    const auto b = e.let(math::workgroup_id_z());
     const auto ti0 = e.let(pair * kTiles);
     const auto has1 = e.let(ti0 + 1u < per_key_head);
     const auto ti1 = e.let(select(has1, ti0 + 1u, ti0));
@@ -836,10 +849,13 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         e.let(e.u32(static_cast<std::uint32_t>(kv::kStepMetaHeader)) +
               b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
     const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
-    const auto capacity = e.u32(d.stride * d.ts);
+    // The block table's stride is the cache's current rung, read at run time
+    // (kv/block.hpp): one compiled kernel serves every cache size.
+    const auto table_row = table_stride(e, a.meta, d.bsz);
+    const auto capacity = e.let(table_row * d.ts);
     const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
     const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
-    const auto tb = e.let(b * d.stride);
+    const auto tb = e.let(b * table_row);
 
     for (std::uint32_t c = 0; c < qchunks; ++c) {
       const auto idx = e.let(lid + c * kT);
@@ -884,7 +900,10 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         "kv_len", select(loaded_max < capacity, loaded_max, capacity));
     const auto nwin = e.let((kv_len + e.u32(kKWin - 1u)) / e.u32(kKWin));
     const auto first_window = e.let(part * share);
-    for (auto w : e.range(first_window, e.let(first_window + share), 1u)) {
+    // Ends at the table's last window: past it every window is past the
+    // live length (w < nwin below), and the bound keeps the keys' arithmetic
+    // provably 32-bit.
+    for (auto w : e.range(first_window, bounded_min(e, e.let(first_window + share), split.windows), 1u)) {
       const auto wbase = e.let(w * kKWin);
       const auto signed_start = e.let(kir::cast<std::int64_t>(wbase));
       // Whether each tile visits the window, as its own workgroup would.
@@ -1175,10 +1194,16 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
 
     const auto lid = e.let(math::local_id());
     const auto wg = e.let(math::workgroup_id_x());
-    // A split's workgroups are its shares of each tile's windows.
-    const std::uint32_t parts = Split ? static_cast<std::uint32_t>(s.output.dim(3)) : 1u;
-    const std::uint32_t share = Split ? dispatch::attention_shapes::flash_split_share(
-        std::uint64_t{d.stride} * d.ts, parts) : 0u;
+    // A split's workgroups are its shares of each tile's windows, which
+    // follow the cache's size, read at run time as the host computes them for
+    // the records (kernels/split_parts.hpp).
+    const auto split = Split
+        ? flash_split_parts(e, e.let(table_stride(e, a.meta, d.bsz) * d.ts),
+                            dispatch::attention_shapes::flash_split_units(d.qh, d.kvh, d.tq),
+                            static_cast<std::uint32_t>(s.device->compute_units))
+        : FlashSplitParts{e.u32(1), e.u32(0), e.u32(0)};
+    const auto parts = split.parts;
+    const auto share = split.share;
     // A split numbers its workgroups share by share, and within a share key
     // head by key head: the tiles of every query head reading one key head's
     // windows are neighbours, so they run together and the share's keys and
@@ -1201,8 +1226,14 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       if constexpr (Split) return e.let(wg % per_key_head);
       else return wg;
     }();
+    // A split's grid is (tiles x key heads, shares, batch), x fastest: the
+    // order above, with the share count (read at run time) a grid extent
+    // rather than a divisor.
     const auto part = [&] {
-      if constexpr (Split) return e.let((wg / (per_key_head * d.kvh)) % parts);
+      if constexpr (Split)
+        return e.let(math::workgroup_id_y() %
+            flash_split_part_bound(dispatch::attention_shapes::flash_split_units(d.qh, d.kvh, d.tq),
+                                   static_cast<std::uint32_t>(s.device->compute_units)));
       else return wg;
     }();
     (void)part;
@@ -1213,7 +1244,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       else return e.let((tile_wg / ntiles) % d.qh);
     }();
     const auto b = [&] {
-      if constexpr (Split) return e.let(wg / (per_key_head * d.kvh * parts));
+      if constexpr (Split) return e.let(math::workgroup_id_z());
       else return e.let(tile_wg / (ntiles * d.qh));
     }();
     const auto kh = e.let(h / d.group);
@@ -1268,10 +1299,13 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
               b * e.u32(static_cast<std::uint32_t>(kv::kStepMetaPerRow)));
     const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
     // Clamp live metadata to the block-table capacity.
-    const auto capacity = e.u32(d.stride * d.ts);
+    // The block table's stride is the cache's current rung, read at run time
+    // (kv/block.hpp): one compiled kernel serves every cache size.
+    const auto table_row = table_stride(e, a.meta, d.bsz);
+    const auto capacity = e.let(table_row * d.ts);
     const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
     const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
-    const auto tb = e.let(b * d.stride);
+    const auto tb = e.let(b * table_row);
 
     // Stage each query once.
     for (std::uint32_t c = 0; c < qchunks; ++c) {
@@ -1327,13 +1361,14 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     // A static capacity bound keeps pooled address arithmetic provably narrow.
     // Runtime metadata still gates every live window.
     const auto loop_windows = [&] {
-      if constexpr (MeanCorrection) return e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+      if constexpr (MeanCorrection) return e.let((capacity + (kKWin - 1u)) / kKWin);
       else return nwin;
     }();
     auto windows = [&] {
       if constexpr (Split) {
+        // Ends at the table's last window, as the pair form's loop does.
         const auto first_window = e.let(part * share);
-        return e.range(first_window, e.let(first_window + share), 1u);
+        return e.range(first_window, bounded_min(e, e.let(first_window + share), split.windows), 1u);
       } else {
         return e.range(loop_windows);
       }
@@ -1347,7 +1382,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
       if (auto live_window = e.when(useful && w < nwin)) {
         const auto selected=[&] {
           if constexpr(MeanCorrection) {
-            const auto blocks=e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+            const auto blocks=e.let((capacity + (kKWin - 1u)) / kKWin);
             return e.let(a.selected[((b*d.qh+h)*ntiles+qt)*blocks+w]);
           } else return e.f32(1);
         }();
@@ -1837,7 +1872,7 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
         e.barrier();
         }  // exact block
         if constexpr(MeanCorrection) {
-          const auto blocks=e.u32(static_cast<std::uint32_t>(s.inputs[5].dim(2)));
+          const auto blocks=e.let((capacity + (kKWin - 1u)) / kKWin);
           const auto pool=e.let(((b*d.kvh+kh)*blocks+w)*513u);
           if(auto correction=e.when(selected==0.0f)) {
             // Selector only omits complete blocks visible to every query.
@@ -1930,15 +1965,17 @@ struct FlashWmmaImpl final : KernelPrimitive<FlashWmmaImpl<MeanCorrection, Split
     const bool two_tiles = variant_of(s) == Variant::kTwoTiles;
     const std::uint32_t tiles = two_tiles ? (ntiles + 1u) / 2u : ntiles;
     tp.workgroup_size[0] = two_tiles ? 2u * kThreads : kThreads;
-    tp.workgroup_count[0] = d.valid ? d.bsz * (d.qh / split_heads_per_tile(d)) * tiles * parts : 1u;
+    // A split's shares and batch are the y and z extents (see the emitters).
+    const std::uint32_t outer = d.valid && Split ? d.bsz : 1u;
+    tp.workgroup_count[0] = d.valid ? (Split ? 1u : d.bsz) * (d.qh / split_heads_per_tile(d)) * tiles : 1u;
     if (variant_of(s) == Variant::kSplitPair && d.valid) {
       // Pairs of each key head's tiles, an odd count's last pair half empty.
       const std::uint32_t per_key_head = d.group / split_heads_per_tile(d) * ntiles;
       tp.workgroup_size[0] = 2u * kThreads;
-      tp.workgroup_count[0] = d.bsz * d.kvh * ((per_key_head + 1u) / 2u) * parts;
+      tp.workgroup_count[0] = d.kvh * ((per_key_head + 1u) / 2u);
     }
-    tp.workgroup_count[1] = 1;
-    tp.workgroup_count[2] = 1;
+    tp.workgroup_count[1] = parts;
+    tp.workgroup_count[2] = outer;
     return tp;
   }
 };

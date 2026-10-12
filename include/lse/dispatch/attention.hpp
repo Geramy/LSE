@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "lse/graph/kernel_primitive.hpp"
 
@@ -34,6 +35,12 @@ struct FlashDims {
 [[nodiscard]] bool split_decode_supported(const graph::KernelShapes&);
 // The decode rule's key batch for a pass split_decode_supported accepts.
 [[nodiscard]] std::uint32_t split_decode_key_batch(const graph::KernelShapes&);
+// The KV lengths at which a device's attention kernels change code shape
+// (a decode key batch, the flash split's pair form), ascending. Between them
+// one compiled kernel serves every cache size, since the cache's size is read
+// at run time; a server prepares each of these at load so that a growing
+// session compiles nothing.
+[[nodiscard]] std::vector<std::int64_t> attention_kv_buckets(const backend::DeviceInfo&);
 [[nodiscard]] bool split_decode_merge_supported(const graph::KernelShapes&);
 [[nodiscard]] bool split_short_scope(const Shape& query, std::int64_t offset,
                                     std::int64_t capacity);

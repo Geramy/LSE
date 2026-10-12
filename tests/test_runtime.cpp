@@ -140,8 +140,8 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
       for (int i = 0; i < stride; ++i)
         table_values[row * stride + i] = static_cast<float>((i * 13 + 7 + row * 126) % blocks);
     LSE_ASSIGN_OR(auto table, upload({rows, stride}, DType::kF32, table_values.data()));
-    const float write_values[]{255, 258, rows, 255, 258, 127, 130};
-    LSE_ASSIGN_OR(auto write_meta, upload({7}, DType::kF32, write_values));
+    const float write_values[]{255, 258, rows, 255, 258, 127, 130, stride};
+    LSE_ASSIGN_OR(auto write_meta, upload({8}, DType::kF32, write_values));
     std::vector<float> additions(rows * kvheads * 3 * dim);
     for (std::size_t i = 0; i < additions.size(); ++i)
       additions[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 32.f;
@@ -159,8 +159,8 @@ LSE_TEST(fragmented_f16_scalar_attention_matches_contiguous_and_reference) {
     for (std::size_t i = 0; i < query.size(); ++i)
       query[i] = static_cast<float>(static_cast<int>(i % 71) - 35) / 64.f;
     LSE_ASSIGN_OR(auto q, upload({rows, heads, 1, dim}, DType::kF32, query.data()));
-    const float metadata[]{272, 273, rows, 272, 273, 129, 130};
-    LSE_ASSIGN_OR(auto meta, upload({7}, DType::kF32, metadata));
+    const float metadata[]{272, 273, rows, 272, 273, 129, 130, stride};
+    LSE_ASSIGN_OR(auto meta, upload({8}, DType::kF32, metadata));
     std::vector<float> contiguous;
     for (bool fragmented : {false, true}) {
       // Q=1 and D=32 deliberately select scalar attention on both gfx11 and
@@ -281,9 +281,9 @@ LSE_TEST(native_partial_rope_to_paged_keys_matches_reference) {
       for (const int heads : {1, 2, 4}) for (const int queries : {1, 4}) {
         constexpr int first = 4;
         const int live = first + queries;
-        const float positions[]{first, static_cast<float>(live), 1, first, static_cast<float>(live)};
+        const float positions[]{first, static_cast<float>(live), 1, first, static_cast<float>(live), 1};
         const float block_id[]{0};
-        LSE_ASSIGN_OR(auto meta, upload({5}, DType::kF32, positions));
+        LSE_ASSIGN_OR(auto meta, upload({6}, DType::kF32, positions));
         LSE_ASSIGN_OR(auto table, upload({1, 1}, DType::kF32, block_id));
         const Shape shape{1, heads, queries, dim};
         std::vector<float> input(shape.elem_count()), gain(dim, 1.f);
@@ -379,8 +379,9 @@ LSE_TEST(native_f16_paged_prefill_and_decode_match_reference) {
         const int queries = first == 0 ? 4 : 1;
         const int live = first + queries;
         const float positions[]{static_cast<float>(first), static_cast<float>(live), 1,
-                                static_cast<float>(first), static_cast<float>(live)};
-        LSE_ASSIGN_OR(auto meta, upload({5}, DType::kF32, positions));
+                                static_cast<float>(first), static_cast<float>(live),
+                                static_cast<float>(blocks)};
+        LSE_ASSIGN_OR(auto meta, upload({6}, DType::kF32, positions));
         std::vector<float> q(heads * queries * dim), k(kvheads * queries * dim), v(k.size());
         for (std::size_t i = 0; i < q.size(); ++i)
           q[i] = static_cast<float>(static_cast<int>((i + first) % 31) - 15) / 32.f;
@@ -1863,8 +1864,10 @@ std::vector<float> read_all(graph::Array& a) {
 
 // The step descriptor kv/block.hpp specifies, from one {first query position,
 // live KV length} pair per row. A length of 0 is a row holding no sequence.
+// `stride` is the block table's row stride (kv::step_meta_stride_index).
 graph::Array step_meta(
-    const std::vector<std::pair<std::int32_t, std::int32_t>>& rows) {
+    const std::vector<std::pair<std::int32_t, std::int32_t>>& rows,
+    std::int32_t stride = 0) {
   const auto n = static_cast<std::int32_t>(rows.size());
   std::vector<float> m(
       static_cast<std::size_t>(kv::step_meta_elems(n)), 0.0f);
@@ -1884,7 +1887,17 @@ graph::Array step_meta(
   m[0] = static_cast<float>(pos);
   m[1] = static_cast<float>(len);
   m[2] = static_cast<float>(live);
+  m[static_cast<std::size_t>(kv::step_meta_stride_index(n))] = static_cast<float>(stride);
   return filled(Shape{static_cast<std::int64_t>(m.size())}, m);
+}
+
+// The table's stride into a descriptor after the pass that sized the table
+// was recorded, as HybridLM::forward does.
+void stamp_stride(graph::Array& meta, std::int32_t rows, std::int32_t stride) {
+  graph::Node& n = *meta.node();
+  graph::interpreter::store_element(
+      n, static_cast<std::size_t>(kv::step_meta_stride_index(rows)), static_cast<float>(stride));
+  LSE_EXPECT_OK(graph::interpreter::sync_to_device(n, graph::default_scheduler()->backend()));
 }
 
 // Deterministic and not symmetric, so an index mistake shows up as a value
@@ -1964,7 +1977,7 @@ LSE_TEST(a_paged_read_matches_a_contiguous_read_exactly) {
     for (std::int32_t i = 0; i < nblk; ++i) table[static_cast<std::size_t>(i)] =
         static_cast<float>(phys(i));
     graph::Array ta = filled(Shape{1, stride}, table);
-    graph::Array meta = step_meta({{offset, live}});
+    graph::Array meta = step_meta({{offset, live}}, stride);
 
     const float scale = 0.125f;
     graph::Array contig = graph::sdpa(qa, ka, va, scale,
@@ -2023,7 +2036,7 @@ LSE_TEST(a_padded_batch_row_reads_its_own_blocks_and_pad_rows_answer_zero) {
   table[static_cast<std::size_t>(stride)] = 5.0f;
   graph::Array ta = filled(Shape{bucket, stride}, table);
   graph::Array meta =
-      step_meta({{0, live}, {0, live}, {0, 0}, {0, 0}});
+      step_meta({{0, live}, {0, live}, {0, 0}, {0, 0}}, stride);
 
   std::vector<float> q(static_cast<std::size_t>(bucket * kQh * 1 * kHd));
   for (std::size_t i = 0; i < q.size(); ++i) q[i] = noise(i + 77);
@@ -2065,7 +2078,7 @@ LSE_TEST(a_padded_batch_row_reads_its_own_blocks_and_pad_rows_answer_zero) {
     one_table[0] = table[static_cast<std::size_t>(r) * stride];
     graph::Array q1 = filled(Shape{1, kQh, 1, kHd}, one_q);
     graph::Array t1 = filled(Shape{1, stride}, one_table);
-    graph::Array m1 = step_meta({{0, live}});
+    graph::Array m1 = step_meta({{0, live}}, stride);
     graph::Array o1 = graph::sdpa_paged(q1, kp, vp, 0.25f,
                                         graph::MaskKind::kCausal, 0, m1, t1, bs);
     LSE_EXPECT_OK(o1.eval());
@@ -2117,7 +2130,7 @@ std::vector<float> ragged_pass(const std::vector<RaggedRow>& rows,
     meta.push_back({rows[r].first, rows[r].len});
   }
   graph::Array ta = filled(Shape{bucket, kRagStride}, table);
-  graph::Array ma = step_meta(meta);
+  graph::Array ma = step_meta(meta, kRagStride);
   graph::Array qa = filled(Shape{bucket, kRagQh, 1, kRagHd}, q);
   graph::Array out = graph::sdpa_paged(qa, kp, vp, 0.25f,
                                        graph::MaskKind::kCausal, 0, ma, ta,
@@ -2254,7 +2267,7 @@ LSE_TEST(a_ragged_write_puts_each_row_at_its_own_position) {
   table[static_cast<std::size_t>(stride) + 1] = 4.0f;
   table[static_cast<std::size_t>(2 * stride)] = 3.0f;
   graph::Array ta = filled(Shape{3, stride}, table);
-  graph::Array meta = step_meta({{2, 3}, {17, 18}, {0, 0}});
+  graph::Array meta = step_meta({{2, 3}, {17, 18}, {0, 0}}, stride);
 
   graph::Array written = graph::kv_page_write(pool, sa, meta, ta, bs);
   LSE_EXPECT_OK(written.eval());
@@ -2312,7 +2325,7 @@ LSE_TEST(the_paged_write_lands_where_the_block_table_says) {
   table[static_cast<std::size_t>(stride)] = 2.0f;
   graph::Array ta = filled(Shape{2, stride}, table);
   graph::Array meta = step_meta(
-      {{pos, pos + static_cast<std::int32_t>(t)}, {0, 0}});
+      {{pos, pos + static_cast<std::int32_t>(t)}, {0, 0}}, stride);
 
   graph::Array written = graph::kv_page_write(pool, sa, meta, ta, bs);
   LSE_EXPECT_OK(written.eval());
@@ -3045,7 +3058,8 @@ static void check_split_attention_masks_and_replay(int queries) {
     auto t = filled(Shape{batch, stride}, table);
     std::vector<float> metadata{static_cast<float>(live - queries), static_cast<float>(capacity + 17), 2,
                                static_cast<float>(live - queries), static_cast<float>(lengths[0]),
-                               static_cast<float>(lengths[1] - queries), static_cast<float>(lengths[1]), 0, 0};
+                               static_cast<float>(lengths[1] - queries), static_cast<float>(lengths[1]), 0, 0,
+                               static_cast<float>(stride)};
     auto meta = filled(Shape{kv::step_meta_elems(batch)}, metadata);
     for (const auto [mask, window] : {
          std::pair{graph::MaskKind::kCausal, 0},
@@ -3060,9 +3074,14 @@ static void check_split_attention_masks_and_replay(int queries) {
         LSE_EXPECT_OK(made_partial.status());
         if (!made_partial.ok()) return;
         made_partial->node()->iattrs = {static_cast<int>(mask), window, 0, block};
-        auto made_out = graph::custom("attention.split_merge128.wg128c2.v1", {*made_partial});
+        made_partial->node()->kv_elastic = true;
+        made_partial->node()->kv_elastic_grid = true;
+        auto made_out = graph::custom("attention.split_merge128.wg128c2.v1", {*made_partial, meta});
         LSE_EXPECT_OK(made_out.status());
         if (!made_out.ok()) return;
+        // Partitions of 128 keys of `block`-key blocks.
+        made_out->node()->attrs[1] = 128.0f;
+        made_out->node()->iattrs[0] = block;
         out = *made_out;
       }
       LSE_EXPECT(out.node()->prim->name() == "attention.split_merge128.wg128c2.v1");
@@ -3127,7 +3146,10 @@ static void check_split_attention_masks_and_replay(int queries) {
       // partition must overwrite its complete record before the merge reads it.
       rewrite(partial, std::vector<float>(partial.shape().elem_count(), poison));
       rewrite(out, std::vector<float>(out.shape().elem_count(), poison));
-      rewrite(meta, std::vector<float>(metadata.size(), 0));
+      // No live rows; the table keeps its stride.
+      std::vector<float> no_rows(metadata.size(), 0);
+      no_rows.back() = metadata.back();
+      rewrite(meta, no_rows);
       program.reset_compute();
       const auto replay = scheduler->eval(roots, false, &program);
       LSE_EXPECT_OK(replay);
@@ -3199,7 +3221,7 @@ LSE_TEST(short_flash_queries_match_reference_with_ragged_and_padded_rows) {
     // The padded table row is deliberately invalid and must never be read.
     const std::vector<float> pages{2, 0, 3, 0, 1, 0, 0, 0, 99999, 99999, 99999, 99999};
     auto table = filled(Shape{kRows, kStride}, pages);
-    auto meta = step_meta({{32, lengths[0]}, {3, lengths[1]}, {0, 0}});
+    auto meta = step_meta({{32, lengths[0]}, {3, lengths[1]}, {0, 0}}, kStride);
     for (auto mask : {graph::MaskKind::kCausal, graph::MaskKind::kSlidingWindow}) {
       sched->set_mode(graph::Scheduler::Mode::kDeviceFirst);
       auto native = graph::sdpa_paged(qa, ka, va, scale, mask, 5, meta, table,
@@ -3383,12 +3405,12 @@ LSE_TEST(host_inplace_writes_preserve_opaque_pool_contents_and_owner_mirrors) {
   auto pool = upload({1, 1, 16, 2}, expected);
   auto table = upload({1, 1}, {0});
   auto first = graph::kv_page_write(pool, upload({1, 1, 2, 2}, {101, 102, 103, 104}),
-                                  upload({5}, {0, 2, 1, 0, 2}), table, 16);
+                                  upload({6}, {0, 2, 1, 0, 2, 1}), table, 16);
   expected[0] = 101; expected[1] = 102; expected[2] = 103; expected[3] = 104;
   LSE_EXPECT(read(first) == expected);
   LSE_EXPECT(read(pool) == expected);
   auto next = graph::kv_page_write(pool, upload({1, 1, 1, 2}, {201, 202}),
-                                  upload({5}, {3, 4, 1, 3, 4}), table, 16);
+                                  upload({6}, {3, 4, 1, 3, 4, 1}), table, 16);
   expected[6] = 201; expected[7] = 202;
   LSE_EXPECT(read(next) == expected);
   LSE_EXPECT(read(pool) == expected);
@@ -3471,6 +3493,7 @@ LSE_TEST(a_large_context_uses_small_paged_tables_and_grows_without_losing_keys) 
                                       weights, spec, *rope, at, &cache);
     LSE_EXPECT_OK(pass.status());
     if (!pass.ok()) return;
+    stamp_stride(cache.meta, 1, layer.stride());
     const auto got = read_all(*pass);
     LSE_EXPECT_EQ(got.size(), chunk.size());
     if (got.size() != chunk.size()) return;
@@ -3503,6 +3526,7 @@ LSE_TEST(a_large_context_uses_small_paged_tables_and_grows_without_losing_keys) 
   auto shorter = ops::gated_attention(filled(Shape{1, 1, 2}, {0.25f, -0.5f}),
                                      weights, spec, *rope, 0, &cache);
   LSE_EXPECT_OK(shorter.status());
+  stamp_stride(cache.meta, 1, layer.stride());
   LSE_EXPECT_EQ(layer.stride(), stride);
   LSE_EXPECT(layer.keys.node() == pool);
   LSE_EXPECT_EQ(layer.tables[0].size(), 1);
@@ -3522,6 +3546,7 @@ LSE_TEST(a_large_context_uses_small_paged_tables_and_grows_without_losing_keys) 
   auto first = ops::gated_attention(x, weights, spec, *rope, 16, &batch);
   LSE_EXPECT_OK(first.status());
   if (!first.ok()) return;
+  stamp_stride(batch.meta, 2, ragged.stride());
   LSE_EXPECT_EQ(ragged.stride(), kv::kMinPoolBlocks);
   LSE_EXPECT_EQ(ragged.tables[0].size(), 2);
   LSE_EXPECT(ragged.tables[1].empty());
@@ -3539,6 +3564,7 @@ LSE_TEST(a_large_context_uses_small_paged_tables_and_grows_without_losing_keys) 
   batch.meta = step_meta({{16, 17}, {128, 129}});
   auto grown = ops::gated_attention(x, weights, spec, *rope, 128, &batch);
   LSE_EXPECT_OK(grown.status());
+  stamp_stride(batch.meta, 2, ragged.stride());
   LSE_EXPECT_EQ(ragged.stride(), 16);
   LSE_EXPECT_EQ(ragged.keys.shape().dim(0), 16);
   LSE_EXPECT_EQ(ragged.tables[1].size(), 9);
@@ -3740,7 +3766,7 @@ RagPass rag_run(const std::vector<RaggedRow>& rows, const std::vector<float>& q,
   graph::Array vp =
       filled(Shape{kRagPool, kRagKvh, kv::kBlockSize, kRagHd}, vbuf);
   graph::Array ta = filled(Shape{bucket, kRagStride}, table);
-  graph::Array ma = step_meta(meta);
+  graph::Array ma = step_meta(meta, kRagStride);
   graph::Array qa = filled(Shape{bucket, kRagQh, 1, kRagHd}, q);
   graph::Array out =
       graph::sdpa_paged(qa, kp, vp, 0.25f, mask, window, ma, ta, kv::kBlockSize);
@@ -4276,7 +4302,7 @@ LSE_TEST(verify_a_multi_token_pass_is_ragged_too) {
       meta.push_back({rs[r].first, rs[r].len});
     }
     graph::Array ta = filled(Shape{n, kRagStride}, table);
-    graph::Array ma = step_meta(meta);
+    graph::Array ma = step_meta(meta, kRagStride);
     graph::Array qa = filled(Shape{n, kRagQh, kT, kRagHd}, qv);
     graph::Array o = graph::sdpa_paged(qa, kp, vp, 0.25f,
                                        graph::MaskKind::kCausal, 0, ma, ta,
@@ -4340,7 +4366,7 @@ LSE_TEST(verify_a_multi_token_write_covers_each_rows_own_span) {
   table[static_cast<std::size_t>(stride)] = 2.0f;      // row 1: 5,6,7 -> block 2
   table[static_cast<std::size_t>(2 * stride)] = 3.0f;  // row 2 holds nothing
   graph::Array ta = filled(Shape{3, stride}, table);
-  graph::Array meta = step_meta({{14, 17}, {5, 8}, {0, 0}});
+  graph::Array meta = step_meta({{14, 17}, {5, 8}, {0, 0}}, stride);
 
   graph::Array written = graph::kv_page_write(pool, sa, meta, ta, bs);
   LSE_EXPECT_OK(written.eval());

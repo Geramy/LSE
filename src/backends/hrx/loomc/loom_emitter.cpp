@@ -31,6 +31,17 @@ using namespace lse::graph;
 
 namespace {
 
+// The extent a binding's view declares. A tensor that grows with the KV cache
+// (Node::kv_elastic) is declared at the largest extent a 32-bit byte address
+// reaches, so the kernel text, and the code object compiled from it, is the
+// same at every cache size: its kernels read the live size at run time.
+std::uint64_t view_elements(const Node& n) {
+  if (!n.kv_elastic) return n.element_count();
+  const std::uint64_t bytes = std::max<std::uint64_t>(1, dtype_storage_bytes(n.dtype, 1));
+  return std::uint64_t{0xFFFFFFF0u} / bytes;
+}
+
+
 // Full structural identity, independent of graph addresses. The graph's
 // display signature omits edges and aliasing; those change argument indices
 // and cannot identify reusable source or JIT objects.
@@ -82,7 +93,7 @@ std::uint64_t emission_identity(const FusionGroup& group, const DeviceInfo& devi
   auto number = [&](std::uint64_t value) { key.number(value); };
   auto text = [&](std::string_view value) { key.text(value); };
   text("loom");
-  number(6);
+  number(7);
   number(dispatch::specialization_cache_key(0, group, device,
                                            loom_types(), loom_sources()));
   text(device.arch);
@@ -156,6 +167,8 @@ std::uint64_t emission_identity(const FusionGroup& group, const DeviceInfo& devi
     number(static_cast<std::uint64_t>(node->fclass));
     number(static_cast<std::uint64_t>(node->dtype));
     number(node->kv_fragments ? 1 : 0);
+    // An elastic node's view and grid bounds are spelled differently.
+    number((node->kv_elastic ? 1u : 0u) | (node->kv_elastic_grid ? 2u : 0u));
     number(node->shape.rank());
     for (std::size_t i = 0; i < node->shape.rank(); ++i) {
       number(static_cast<std::uint64_t>(node->shape.dim(i)));
@@ -361,8 +374,14 @@ std::string broadcast_index(const Shape& src, const Shape& out_shape,
 // buffers in binding order, then one by_value per ConstantsLayout field, both
 // packed with no padding on our side — so this and EmittedKernel must agree by
 // construction rather than by convention.
+//
+// A launch whose grid grows with the cache (Node::kv_elastic_grid), a split
+// pass's partitions, which such a kernel takes as its grid's y extent. That
+// extent is stated as 2^24, which bounds every grid it is dispatched with (the
+// dispatch carries the real one), so the text does not change with the cache.
 std::string kernel_header(const EmittedKernel& out,
-                          const std::vector<std::string>& params) {
+                          const std::vector<std::string>& params,
+                          bool elastic = false) {
   std::string s;
   s += "kernel.def export(\"" + out.entry_name + "\") @" + out.entry_name +
        "() {\n";
@@ -371,9 +390,11 @@ std::string kernel_header(const EmittedKernel& out,
     s += "  %cfg_wg" + std::to_string(d) + " = index.constant " +
          std::to_string(std::max(1u, out.dims.workgroup_size[d])) +
          " : index\n";
+    const std::uint32_t size = std::max(1u, out.dims.workgroup_size[d]);
+    const std::uint32_t count = elastic && d == 1 ? (1u << 24)
+                                                  : std::max(1u, out.dims.workgroup_count[d]);
     s += "  %cfg_n" + std::to_string(d) + " = index.constant " +
-         std::to_string(std::max(1u, out.dims.workgroup_count[d])) +
-         " : index\n";
+         std::to_string(count) + " : index\n";
   }
   s += "  kernel.launch.config workgroups(%cfg_n0, %cfg_n1, %cfg_n2) "
        "workgroup_size(%cfg_wg0, %cfg_wg1, %cfg_wg2) : index\n";
@@ -722,7 +743,7 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
            : "b" + std::to_string(i);
     names.push_back(name);
     params.push_back("%" + name + ": buffer");
-    views[name] = LoomBufferView{elem_of(n->dtype), n->element_count(),
+    views[name] = LoomBufferView{elem_of(n->dtype), view_elements(*n),
                                  "%" + name + "_view"};
     if (n->kv_fragments)
       views[name].kv_fragment_elements = kv::kFragmentBytes / dtype_storage_bytes(n->dtype, 1);
@@ -785,9 +806,9 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
                 "buffer -> " +
                 (n->kv_fragments
                      ? loom_view_type(kir::Scalar::kU64,
-                         (n->element_count() + views[names[i]].kv_fragment_elements - 1) /
+                         (view_elements(*n) + views[names[i]].kv_fragment_elements - 1) /
                          views[names[i]].kv_fragment_elements)
-                     : loom_view_type(elem_of(n->dtype), n->element_count())) + "\n";
+                     : loom_view_type(elem_of(n->dtype), view_elements(*n))) + "\n";
   }
   // blockIdx.x * blockDim.x + threadIdx.x, said once and shared by the guard
   // and by every body spliced below.
@@ -795,8 +816,14 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
   prologue += "  %ki_size = kernel.workgroup.size<x> : index\n";
   prologue += "  %ki_lane = kernel.workitem.id<x> : index\n";
   prologue += "  %ki_flat = index.madd %ki_wg, %ki_size, %ki_lane : index\n";
+  // A launch whose grid grows with the cache (Node::kv_elastic_grid, a split
+  // pass's partitions): its bound is the largest a 32-bit index takes, so the
+  // text does not change with the grid.
+  bool elastic_launch = false;
+  for (const NodePtr& n : group.nodes) elastic_launch = elastic_launch || n->kv_elastic_grid;
   prologue += "  %i = index.assume %ki_flat [range(%ki_flat, 0, " +
-              std::to_string(grid == 0 ? 0 : grid - 1) +
+              std::to_string(elastic_launch ? std::uint64_t{0x7FFFFFFF}
+                                            : grid == 0 ? 0 : grid - 1) +
               ")] : index\n";
 
   if (si) {
@@ -832,10 +859,10 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
         if (is_operand && !graph::needs_elementwise_input(group, n.get())) continue;
         const std::string at = bounded(
             broadcast_index(n->shape, sink->shape, idx, hook_mint, s),
-            n->element_count(), hook_mint, s);
+            view_elements(*n), hook_mint, s);
         const std::string raw = hook_mint("ep");
         s += "  " + raw + " = view.load %" + names[j] + "_view[" + at + "] : " +
-             loom_view_type(elem_of(n->dtype), n->element_count()) + " -> " +
+             loom_view_type(elem_of(n->dtype), view_elements(*n)) + " -> " +
              std::string(loom_storage_type(elem_of(n->dtype))) + "\n";
         value_of[n.get()] = widen_to_f32(raw, n->dtype, hook_mint, s);
       }
@@ -910,11 +937,11 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
       const std::string narrowed =
           narrow_from_f32(it->second, sink->dtype, hook_mint, s);
       const std::string dst =
-          bounded(idx, sink->element_count(), hook_mint, s);
+          bounded(idx, view_elements(*sink), hook_mint, s);
       return {std::move(s),
               "  view.store " + narrowed + ", %out_view[" + dst + "] : " +
                   std::string(loom_storage_type(elem_of(sink->dtype))) + ", " +
-                  loom_view_type(elem_of(sink->dtype), sink->element_count()) + "\n"};
+                  loom_view_type(elem_of(sink->dtype), view_elements(*sink)) + "\n"};
     };
     auto epilogue_store = [&](std::string_view index,
                               std::string_view value) -> std::string {
@@ -983,7 +1010,7 @@ Result<EmittedKernel> LoomEmitter::emit_kernel(const FusionGroup& group,
                        " bytes of workgroup scratch, device allows ",
                        std::to_string(budget));
     }
-    out.source = kernel_header(out, params) + prologue + printed->text +
+    out.source = kernel_header(out, params, elastic_launch) + prologue + printed->text +
                  "  kernel.return\n}\n";
     remember();
     return out;

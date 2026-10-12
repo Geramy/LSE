@@ -153,11 +153,11 @@ inline constexpr std::array kShortTileRules{
   return capacity / kShortKeyWindow + (capacity % kShortKeyWindow != 0);
 }
 
-// The merge's partition weights; before them, the same scratch holds one
-// partial maximum per lane (up to 128).
-[[nodiscard]] constexpr std::uint64_t split_merge_lds_bytes(std::uint64_t parts) noexcept {
-  return ((parts < 128u ? 128u : parts) * sizeof(float) + 15u) / 16u * 16u;
-}
+// The merge's scratch: one partial maximum per lane (up to 128), then the
+// weights of a chunk of this many partitions at a time, so no cache size
+// grows it.
+inline constexpr std::uint32_t kSplitMergeChunk = 2048;
+inline constexpr std::uint64_t kSplitMergeLdsBytes = kSplitMergeChunk * sizeof(float);
 
 struct ShortHeadRule {
   std::uint32_t queries_per_kv, query_tile, head_tile;

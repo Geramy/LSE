@@ -1233,6 +1233,29 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     }
   }
 
+  // The block table's row stride, which the attention kernels read from the
+  // descriptor (kv::step_meta_stride_index) instead of from a shape. Every
+  // layer's table has the one stride; 0 until the first pass sizes them.
+  const std::size_t stride_at = static_cast<std::size_t>(kv::step_meta_stride_index(bucket));
+  const auto stamp_stride = [&]() -> Status {
+    std::int32_t stride = 0;
+    if (states != nullptr)
+      for (const MixerState& st : *states) {
+        if (!st.paged.valid()) continue;
+        if (stride != 0 && st.paged.stride() != stride)
+          return LSE_ERROR(kInternal, "attention layers' block tables differ in stride (",
+                           std::to_string(stride), " and ", std::to_string(st.paged.stride()), ")");
+        stride = st.paged.stride();
+      }
+    if (stride >= kv::kMaxTableStride)
+      return LSE_ERROR(kOutOfRange, "a block table of ", std::to_string(stride),
+                       " blocks per row is past the step descriptor's limit of ",
+                       std::to_string(kv::kMaxTableStride));
+    meta[stride_at] = static_cast<float>(stride);
+    return OkStatus();
+  };
+  LSE_RETURN_IF_ERROR(stamp_stride());
+
   if (pool_moved && !replaces_previous) {
     if (graph::Scheduler* sched = graph::default_scheduler()) {
       LSE_RETURN_IF_ERROR(sched->release_program());
@@ -1686,6 +1709,11 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       LSE_RETURN_IF_ERROR(
           graph::interpreter::ensure_owned_output_buffer(*n, on, at));
     }
+    // The first pass sizes the layers' tables while it records: the stride
+    // it wrote before recording may have been 0.
+    const float recorded = meta[stride_at];
+    LSE_RETURN_IF_ERROR(stamp_stride());
+    if (meta[stride_at] != recorded) LSE_RETURN_IF_ERROR(poke_values(cache_.meta, meta));
     LSE_RETURN_IF_ERROR(sched->eval(roots, false, &cache_.program));
   }
   last_pass_host_groups_ = host_groups_so_far() - host_before;

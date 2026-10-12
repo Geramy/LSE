@@ -10,7 +10,7 @@ namespace lse::backend {
 
 namespace {
 
-constexpr std::array<graph::PrimitiveSource, 55> kLoomSources{{
+constexpr std::array<graph::PrimitiveSource, 56> kLoomSources{{
     {"add", "$r = scalar.addf $0, $1 : f32"},
     {"sub", "$r = scalar.subf $0, $1 : f32"},
     {"mul", "$r = scalar.mulf $0, $1 : f32"},
@@ -284,6 +284,7 @@ constexpr std::array<graph::PrimitiveSource, 55> kLoomSources{{
     {"thread.local_id", "$r = kernel.workitem.id<x> : index"},
     {"thread.workgroup_id.x", "$r = kernel.workgroup.id<x> : index"},
     {"thread.workgroup_id.y", "$r = kernel.workgroup.id<y> : index"},
+    {"thread.workgroup_id.z", "$r = kernel.workgroup.id<z> : index"},
     {"thread.workgroup_size", "$r = kernel.workgroup.size<x> : index"},
     {"thread.grid_dim.x", "$r = kernel.workgroup.count<x> : index"},
 
@@ -390,7 +391,7 @@ struct ResultType {
 };
 
 // Everything not listed produces f32, which is what every arithmetic row does.
-constexpr std::array<ResultType, 16> kNonFloatResults{{
+constexpr std::array<ResultType, 17> kNonFloatResults{{
     {"and.u32", "i32"},
     {"bits.f32", "i32"},
     {"bits.f16", "i32"},
@@ -402,6 +403,7 @@ constexpr std::array<ResultType, 16> kNonFloatResults{{
     {"thread.local_id", "index"},
     {"thread.workgroup_id.x", "index"},
     {"thread.workgroup_id.y", "index"},
+    {"thread.workgroup_id.z", "index"},
     {"thread.workgroup_size", "index"},
     {"thread.grid_dim.x", "index"},
     {"cvt8i.f16.f32", "vector<8xf16>"},

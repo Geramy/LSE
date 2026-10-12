@@ -4,6 +4,7 @@
 #include "lse/graph/kernel_primitive.hpp"
 #include "lse/kv/block.hpp"
 #include "lse/kernels/sdpa.hpp"
+#include "lse/kernels/split_parts.hpp"
 #include "lse/dispatch/attention.hpp"
 #include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
@@ -78,6 +79,9 @@ kir::Val<kir::f32> value_at(
 
 template<class E> struct SplitMergeArgs {
   env::In<kir::f32, E> partial;
+  // The pass's step descriptor: the block table's size, which decides how
+  // many partition records there are (kernels/split_parts.hpp).
+  env::In<kir::f32, E> meta;
   env::Out<kir::f32, E> out;
 };
 
@@ -245,13 +249,20 @@ struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
       kir::KernelBody k(s.types,*s.intrinsics,workgroup_lds_bytes(s.device)); k.set_store(s.store);
       SdpaArgs<env::Emit,Storage> a; if(!env::bind(k,a,s)) return std::string{};
       env::Emit e{&k};
-      const auto blocks=static_cast<std::uint32_t>(s.output.dim(2));
       const auto heads=static_cast<std::uint32_t>(s.inputs[1].dim(1));
       const auto page_size=static_cast<std::uint32_t>(s.inputs[1].dim(2));
-      const auto stride=static_cast<std::uint32_t>(s.inputs[4].dim(1));
+      // The table's size, and so the pooled blocks, follow the cache: read at
+      // run time (kv/block.hpp) so one kernel serves every size.
+      const auto stride=table_stride(e,a.meta,static_cast<std::uint32_t>(s.inputs[0].dim(0)));
+      const auto blocks=e.let((stride*page_size+255u)/256u);
       const bool dim_major=dispatch::dimension_major_values(s.inputs[1],s.inputs[2]);
-      const auto lane=e.let(math::local_id()),wg=e.let(math::workgroup_id_x());
-      const auto block=e.let(wg%blocks),head=e.let((wg/blocks)%heads),batch=e.let(wg/(blocks*heads));
+      // Grid (1, blocks, heads x batch): block by block within a head as
+      // always, with the block count (read at run time) a grid extent rather
+      // than a divisor.
+      const auto lane=e.let(math::local_id());
+      const auto block=e.let(math::workgroup_id_y()),outer=e.let(math::workgroup_id_z());
+      const auto head=e.let(outer%heads),batch=e.let(outer/heads);
+      const auto wg=e.let(outer*blocks+block);
       auto sumk=e.var(0.0f),sumv=e.var(0.0f),count=e.var(0.0f);
       const auto rows=e.let(kir::cast<kir::u32>(a.meta[2u]));
       if(auto real=e.when(batch<rows)) {
@@ -283,11 +294,21 @@ struct FlashPrefillPool final : KernelPrimitive<FlashPrefillPool> {
   DType infer_dtype(std::span<const DType>) const override { return DType::kF32; }
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan p; p.workgroup_size[0]=256;
-    p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/513);
+    p.workgroup_count[1]=static_cast<std::uint32_t>(s.output.dim(2));
+    p.workgroup_count[2]=static_cast<std::uint32_t>(s.output.dim(0)*s.output.dim(1));
     return p;
   }
 };
 LSE_REGISTER_PRIMITIVE(FlashPrefillPool);
+
+// The selector's per-block scratch: the power of two at or above the shape's
+// blocks, and at least 1024 (a 256K-key cache), so one kernel serves every
+// cache size up to that and a few beyond. Only `blocks` entries are used.
+inline std::uint32_t select_scratch_blocks(std::uint32_t blocks) {
+  std::uint32_t n = 1024;
+  while (n < blocks) n *= 2;
+  return n;
+}
 
 template<class E> struct FlashSelectArgs {
   env::In<kir::f32,E> q,pooled,meta;
@@ -308,24 +329,30 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     const auto heads=static_cast<std::uint32_t>(s.inputs[0].dim(1));
     const auto queries=static_cast<std::uint32_t>(s.inputs[0].dim(2));
     const auto kvheads=static_cast<std::uint32_t>(s.inputs[1].dim(1));
-    const auto blocks=static_cast<std::uint32_t>(s.inputs[1].dim(2));
+    const auto shape_blocks=static_cast<std::uint32_t>(s.inputs[1].dim(2));
     const auto tiles=(queries+15u)/16u;
     kir::KernelBody k(s.types,*s.intrinsics,workgroup_lds_bytes(s.device)); k.set_store(s.store);
     FlashSelectArgs<env::Emit> a; if(!env::bind(k,a,s)) return {};
     env::Emit e{&k};
     // The sole sink block is always exact. Avoid a masked single-iteration
     // selector loop during tiny-cache server warmup.
-    if(blocks==1u) {
+    if(shape_blocks==1u) {
       if(auto leader=e.when(math::local_id()==0u)) e.store(math::workgroup_id_x(),e.f32(1));
       return k.str();
     }
-    const auto maxima=e.lds<kir::f32>(blocks),totals=e.lds<kir::f32>(blocks);
+    // The blocks follow the cache and are read at run time (kv/block.hpp);
+    // only the scratch they need is sized from the shape, to the power of two
+    // above it, so a few kernels serve every cache size.
+    const auto blocks=e.let((table_stride(e,a.meta,static_cast<std::uint32_t>(s.inputs[0].dim(0)))*
+                             static_cast<std::uint32_t>(s.iattrs[3])+255u)/256u);
+    const auto scratch_blocks=select_scratch_blocks(shape_blocks);
+    const auto maxima=e.lds<kir::f32>(scratch_blocks),totals=e.lds<kir::f32>(scratch_blocks);
     const auto lane=e.let(math::local_id()),wg=e.let(math::workgroup_id_x());
     const auto qt=e.let(wg%tiles),head=e.let((wg/tiles)%heads),batch=e.let(wg/(tiles*heads));
     const auto q0=e.let(qt*16u),kh=e.let(head/(heads/kvheads));
     const auto rows=e.let(kir::cast<kir::u32>(a.meta[2u]));
     if(auto pad=e.when(batch>=rows))
-      for(auto block:e.range(lane,e.u32(blocks),threads)) e.store(wg*blocks+block,e.f32(0));
+      for(auto block:e.range(lane,blocks,threads)) e.store(wg*blocks+block,e.f32(0));
     (void)e.ret_if(batch>=rows);
     const auto mb=e.let(e.u32(kv::kStepMetaHeader)+batch*e.u32(kv::kStepMetaPerRow));
     const auto offset=e.let(kir::cast<kir::u32>(a.meta[mb]));
@@ -336,7 +363,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     const auto wave=e.let(lane/32u),wl=e.let(lane%32u);
     // A wave cooperates on each 256-wide probe dot product. Retain the
     // pooled key in registers across all query rows in this tile.
-    for(auto block:e.range(wave,e.u32(blocks),threads/32u)) {
+    for(auto block:e.range(wave,blocks,threads/32u)) {
       const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
       auto maximum=e.var(math::neg_inf()),sum=e.var(0.0f);
       auto scores=e.local<kir::f32,16>();
@@ -366,7 +393,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
     const auto safe=e.let(select(global.read()==math::neg_inf(),e.f32(0),global.read()));
     for(auto block:e.range(blocks))
       peak=math::max(peak.read(),totals[block].read()*math::exp(maxima[block].read()-safe));
-    for(auto block:e.range(lane,e.u32(blocks),threads)) {
+    for(auto block:e.range(lane,blocks,threads)) {
       const auto pool=e.let(((batch*kvheads+kh)*blocks+block)*513u);
       const auto weight=e.let(totals[block].read()*math::exp(maxima[block].read()-safe));
       // Sink, recent block, diagonal band and partial block always exact. So
@@ -389,7 +416,7 @@ struct FlashPrefillSelect final : KernelPrimitive<FlashPrefillSelect> {
   static ThreadPlan plan_impl(const KernelShapes& s) {
     ThreadPlan p;p.workgroup_size[0]=dispatch::attention_shapes::kFlashPrefillSelectorThreads;
     p.workgroup_count[0]=static_cast<std::uint32_t>(s.output.elem_count()/static_cast<std::uint64_t>(s.output.dim(3)));
-    p.lds_bytes=static_cast<std::uint32_t>(s.output.dim(3)*8);
+    p.lds_bytes=select_scratch_blocks(static_cast<std::uint32_t>(s.output.dim(3)))*8u;
     return p;
   }
 };
@@ -425,28 +452,32 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     const auto queries = ShortQuery ? static_cast<std::uint32_t>(s.inputs[0].dim(2)) : 1u;
     const auto kvheads = static_cast<std::uint32_t>(s.inputs[1].dim(1));
     const auto block = static_cast<std::uint32_t>(s.inputs[1].dim(2));
-    const auto stride = static_cast<std::uint32_t>(s.inputs[4].dim(1));
-    const auto capacity = stride * block;
-    const auto parts = static_cast<std::uint32_t>(
-        dispatch::attention_shapes::split_partitions(capacity));
+    // The block table's size at this shape decides only the short pass's
+    // tiling (a code shape, which stops changing past a few thousand keys);
+    // every extent the kernel walks is read at run time (kv::block.hpp), so
+    // one compiled kernel serves every cache size.
+    const auto shape_capacity = static_cast<std::uint32_t>(s.inputs[4].dim(1)) * block;
+    const auto bsz = static_cast<std::uint32_t>(s.inputs[0].dim(0));
     const bool dim_major = dispatch::dimension_major_values(s.inputs[1], s.inputs[2]);
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
     k.set_store(s.store);
     SdpaArgs<env::Emit, Storage> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
+    const auto stride = table_stride(e, a.meta, static_cast<std::uint32_t>(bsz));
+    const auto capacity = e.let(stride * block);
+    const auto parts = keyed_parts(e, capacity, kSplitKeys);
     const auto units = static_cast<std::uint32_t>(s.device->compute_units);
     const auto head_tile = ShortQuery
-        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, capacity, units)
+        ? dispatch::attention_shapes::short_head_tile(queries, heads, kvheads, shape_capacity, units)
         : dispatch::attention_shapes::decode_head_tile(heads, kvheads);
     const auto token_tile = ShortQuery
-        ? dispatch::attention_shapes::short_query_tile(queries, heads, kvheads, capacity, units)
+        ? dispatch::attention_shapes::short_query_tile(queries, heads, kvheads, shape_capacity, units)
         : 1u;
     const auto row_tile = token_tile * head_tile;
     if (row_tile > 1u) {
       const auto scores = e.lds<kir::f32>(row_tile * kSplitKeys);
       const auto lane = e.let(math::local_id());
-      const auto wg = e.let(math::workgroup_id_x());
       const auto row_tiles = ShortQuery ? (queries + token_tile - 1u) / token_tile : 1u;
       // Several rows: the workgroups go partition by partition, and within
       // one, key head by key head, so every tile of rows and query heads that
@@ -458,24 +489,27 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       const auto group = heads / kvheads;
       const bool shared_keys = ShortQuery && group % head_tile == 0u;
       const auto per_key_head = row_tiles * (group / head_tile);
-      const auto part = shared_keys ? e.let((wg / (per_key_head * kvheads)) % parts)
-                                    : e.let(wg % parts);
-      const auto q0 = shared_keys ? e.let((wg % row_tiles) * token_tile)
-                                  : e.let(((wg / parts) % row_tiles) * token_tile);
+      // The grid is (tiles within a partition, partitions, the rest), x
+      // fastest: the order the workgroups always ran in, with the partition
+      // count (read at run time) a grid extent rather than a divisor.
+      const auto inner = e.let(math::workgroup_id_x());
+      const auto part = e.let(math::workgroup_id_y());
+      const auto outer = e.let(math::workgroup_id_z());
+      const auto q0 = shared_keys ? e.let((inner % row_tiles) * token_tile)
+                                  : e.let((outer % row_tiles) * token_tile);
       const auto h = shared_keys
-          ? e.let(((wg / per_key_head) % kvheads) * group +
-                  ((wg / row_tiles) % (group / head_tile)) * head_tile)
-          : e.let(((wg / (parts * row_tiles)) % (heads / head_tile)) * head_tile);
-      const auto b = shared_keys ? e.let(wg / (per_key_head * kvheads * parts))
-                                 : e.let(wg / (parts * row_tiles * (heads / head_tile)));
+          ? e.let(((inner / per_key_head) % kvheads) * group +
+                  ((inner / row_tiles) % (group / head_tile)) * head_tile)
+          : e.let(((outer / row_tiles) % (heads / head_tile)) * head_tile);
+      const auto b = shared_keys ? outer : e.let(outer / (row_tiles * (heads / head_tile)));
       const auto kh = e.let(h / (heads / kvheads));
       const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
       const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
       const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
       const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
-      const auto row_len = e.let(select(loaded_len < capacity, loaded_len, e.u32(capacity)));
+      const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
       const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
-      const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
+      const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, capacity));
       const auto begin = e.let(part * kSplitKeys), tb = e.let(b * stride);
       auto row_live = [&](std::uint32_t r) {
         if constexpr (ShortQuery) return q0 + r % token_tile < queries;
@@ -486,7 +520,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
           return e.let((((b * heads + h + r / token_tile) * queries + q0 + r % token_tile) * parts + part) * kSplitRecord);
         else return e.let(((b * heads + h + r) * parts + part) * kSplitRecord);
       };
-      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, heads, kvheads, capacity, units)) {
+      if (!ShortQuery || dispatch::attention_shapes::short_skips_empty_partitions(queries, heads, kvheads, shape_capacity, units)) {
         const auto no_keys = e.let(begin >= kv_len);
         if (auto empty = e.when(no_keys)) {
           for (std::uint32_t r = 0; r < row_tile; ++r) {
@@ -565,7 +599,7 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
             valids.push_back(valid_rows(keys.back()));
             // In the table, whatever the live length: a runtime bound may not
             // reach an address.
-            const auto j = e.let(select(keys.back() < e.u32(capacity), keys.back(), begin));
+            const auto j = e.let(select(keys.back() < capacity, keys.back(), begin));
             const auto blk = e.let(kv_block_index<Storage>(a.table[tb + j / block]));
             const auto kb = e.let(((blk * kvheads + kh) * block + j % block) * 256u);
             loaded.emplace_back();
@@ -758,23 +792,21 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
     } else {
       const auto scores = e.lds<kir::f32>(kSplitKeys);
       const auto lane = e.let(math::local_id());
-      const auto wg = e.let(math::workgroup_id_x());
-      const auto part = e.let(wg % parts);
-      const auto query = [&] {
-        if constexpr (ShortQuery) return e.let((wg / parts) % queries);
-        else return wg;
-      }();
-      const auto h = e.let((wg / (parts * queries)) % heads);
-      const auto b = e.let(wg / (parts * queries * heads));
+      // Grid (1, partitions, rows x heads x batch), as above.
+      const auto part = e.let(math::workgroup_id_y());
+      const auto outer = e.let(math::workgroup_id_z());
+      const auto query = e.let(outer % queries);
+      const auto h = e.let((outer / queries) % heads);
+      const auto b = e.let(outer / (queries * heads));
       const auto kh = e.let(h / (heads / kvheads));
-      const auto output = e.let(wg * kSplitRecord);
+      const auto output = e.let((outer * parts + part) * kSplitRecord);
       const auto rows = e.runtime_extent("rows", kir::cast<kir::u32>(a.meta[2u]));
       const auto mb = e.let(e.u32(kv::kStepMetaHeader) + b * e.u32(kv::kStepMetaPerRow));
       const auto offset = e.let(kir::cast<kir::u32>(a.meta[mb]));
       const auto loaded_len = e.let(kir::cast<kir::u32>(a.meta[mb + 1u]));
-      const auto row_len = e.let(select(loaded_len < capacity, loaded_len, e.u32(capacity)));
+      const auto row_len = e.let(select(loaded_len < capacity, loaded_len, capacity));
       const auto loaded_max = e.let(kir::cast<kir::u32>(a.meta[1u]));
-      const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, e.u32(capacity)));
+      const auto kv_len = e.runtime_extent("kv_len", select(loaded_max < capacity, loaded_max, capacity));
       const auto begin = e.let(part * kSplitKeys);
       const auto no_keys = e.let(begin >= kv_len);
       if (auto empty = e.when(no_keys)) {
@@ -884,8 +916,13 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       const auto units = s.device ? static_cast<std::uint32_t>(s.device->compute_units) : 0u;
       query_tile = dispatch::attention_shapes::short_query_tile(rows, heads, kvheads, capacity, units);
       const auto head_tile = dispatch::attention_shapes::short_head_tile(rows, heads, kvheads, capacity, units);
-      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.dim(0) * (s.output.dim(1) / head_tile) *
-          ((s.output.dim(2) + query_tile - 1) / query_tile) * s.output.dim(3));
+      // (tiles within a partition, partitions, the rest): see emit_storage.
+      const auto row_tiles = static_cast<std::uint32_t>((s.output.dim(2) + query_tile - 1) / query_tile);
+      const bool shared_keys = query_tile * head_tile > 1u && (heads / kvheads) % head_tile == 0u;
+      const auto batch = static_cast<std::uint32_t>(s.output.dim(0));
+      tp.workgroup_count[0] = shared_keys ? row_tiles * (heads / head_tile) : 1u;
+      tp.workgroup_count[1] = static_cast<std::uint32_t>(s.output.dim(3));
+      tp.workgroup_count[2] = shared_keys ? batch : row_tiles * (heads / head_tile) * batch;
       query_tile *= head_tile;
       if (query_tile > 1u) {
         // The tiled kernel's row maxima pass four wave results per row.
@@ -896,7 +933,9 @@ struct SplitPartialWg128C2 final : KernelPrimitive<SplitPartialWg128C2> {
       query_tile = dispatch::attention_shapes::decode_head_tile(
           static_cast<std::uint32_t>(s.inputs[0].dim(1)),
           static_cast<std::uint32_t>(s.inputs[1].dim(1)));
-      tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / (kSplitRecord * query_tile));
+      // (1, partitions, head tiles x batch).
+      tp.workgroup_count[1] = static_cast<std::uint32_t>(s.output.dim(2));
+      tp.workgroup_count[2] = static_cast<std::uint32_t>(s.output.dim(0) * (s.output.dim(1) / query_tile));
     }
     tp.lds_bytes = query_tile * kSplitKeys * sizeof(float);
     return tp;
@@ -923,15 +962,20 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
   static constexpr std::string_view kName = "attention.split_merge128.wg128c2.v1";
   static constexpr std::string_view kEntry = "lse_sdpa_split_merge128_wg128c2_v1";
   static constexpr std::string_view kSource = {};
-  std::size_t arity() const noexcept override { return 1; }
+  // The partition records and the pass's step descriptor. attrs[0]: the flash
+  // split's workgroups per share of windows (flash_split_units), or 0 for
+  // partitions of attrs[1] keys each (the scalar split's 128, BLASST's 1024).
+  std::size_t arity() const noexcept override { return 2; }
   bool owns_indexing() const noexcept override { return true; }
   std::string emit_kernel(const KernelShapes& s) const override {
-    if (s.inputs.empty() ||
+    if (s.inputs.size() != 2 ||
         !(s.inputs[0].rank() == 5 ? dispatch::split_short_merge_supported(s)
                                  : dispatch::split_decode_merge_supported(s)) ||
-        !s.types.scalar || !s.intrinsics || !s.store)
+        !s.types.scalar || !s.intrinsics || !s.store || !s.device)
       return {};
-    const auto parts = static_cast<std::uint32_t>(s.inputs[0].dim(s.inputs[0].rank() - 2));
+    const auto units = static_cast<std::uint32_t>(s.attrs[0]);
+    const auto keys = static_cast<std::uint32_t>(s.attrs[1]);
+    if (units == 0 && keys == 0) return {};
     const auto slices = merge_slices(s);
     const auto lanes = 128u / slices;
     kir::KernelBody k(s.types, *s.intrinsics, workgroup_lds_bytes(s.device));
@@ -939,8 +983,18 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
     SplitMergeArgs<env::Emit> a;
     if (!env::bind(k, a, s)) return {};
     env::Emit e{&k};
-    // One scratch array: first each lane's partial maximum, then the weights.
-    const auto weights = e.lds<kir::f32>(std::max(parts, 128u));
+    // How many records each row has: a function of the block table's size,
+    // read at run time, so one kernel serves every cache size.
+    const auto capacity = e.let(table_stride(e, a.meta, static_cast<std::uint32_t>(s.inputs[0].dim(0))) *
+                                static_cast<std::uint32_t>(s.iattrs[0]));
+    const auto parts = units != 0
+        ? flash_split_parts(e, capacity, units, static_cast<std::uint32_t>(s.device->compute_units)).parts
+        : keyed_parts(e, capacity, keys);
+    // One scratch array: first each lane's partial maximum, then the weights
+    // of a chunk of partitions at a time (a fixed size, so no cache size
+    // grows the kernel's scratch).
+    constexpr std::uint32_t kChunk = dispatch::attention_shapes::kSplitMergeChunk;
+    const auto weights = e.lds<kir::f32>(kChunk);
     const auto& lane_max = weights;
     const auto lane = e.let(math::local_id()), wg = e.let(math::workgroup_id_x());
     const auto row = e.let(wg / slices), slice = e.let(wg % slices);
@@ -949,54 +1003,56 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
     // partition, then every lane reads the lane results. max is exact, so
     // any order gives the serial scan's answer.
     auto own = e.var(math::neg_inf());
-    for (auto p : e.range(lane, e.u32(parts), lanes))
+    for (auto p : e.range(lane, parts, lanes))
       if (auto valid = e.when(a.partial[base + p * kSplitRecord + 1u] > 0.0f))
         own = math::max(own.read(), a.partial[base + p * kSplitRecord]);
     lane_max[lane] = own.read();
     e.barrier();
     auto maximum = e.var(math::neg_inf());
     for (auto l : e.range(lanes)) maximum = math::max(maximum.read(), lane_max[l].read());
-    e.barrier();
-    auto write_weight = [&](auto part) {
-      const auto pb = e.let(base + part * kSplitRecord);
-      auto weight = e.var(0.0f);
-      // Empty partitions never subtract their sentinel maxima.
-      if (auto valid = e.when(a.partial[pb + 1u] > 0.0f))
-        weight = math::exp(a.partial[pb] - maximum.read());
-      weights[part] = weight.read();
-    };
-    for (auto part : e.range(lane, e.u32(parts), lanes)) write_weight(part);
-    e.barrier();
     // Each lane owns two output columns and adds the partitions into them in
     // partition order, as one lane always has. A batch of partitions' loads
     // issues before the batch's additions, so the loop waits on memory once
-    // per batch rather than once per partition.
+    // per batch rather than once per partition. The batches are the same at
+    // any chunking: a chunk is a whole number of them.
     const auto column = e.let(slice * (256u / slices) + lane * 2u);
     auto denom = e.var(0.0f), acc0 = e.var(0.0f), acc1 = e.var(0.0f);
-    constexpr std::uint32_t kBatch = 8;
+    constexpr std::uint32_t kBatch = 16;
+    static_assert(kChunk % kBatch == 0u);
     const auto add = [&](const auto& weight, const auto& sum, const auto& values) {
       denom = math::fma(weight, sum, denom.read());
       acc0 = math::fma(weight, values[0], acc0.read());
       acc1 = math::fma(values[1], weight, acc1.read());
     };
-    const std::uint32_t whole = parts / kBatch * kBatch;
-    if (whole != 0) {
-      for (auto p0 : e.range(0u, whole, kBatch)) {
+    const auto whole = e.let(parts / kBatch * kBatch);
+    for (auto c0 : e.range(e.u32(0), parts, kChunk)) {
+      const auto end = bounded_min(e, e.let(c0 + kChunk), parts);
+      // The chunk's weights, written once the previous chunk (or the lane
+      // maxima) has been read. Empty partitions never subtract their
+      // sentinel maxima.
+      e.barrier();
+      for (auto p : e.range(e.let(c0 + lane), end, lanes)) {
+        const auto pb = e.let(base + p * kSplitRecord);
+        auto weight = e.var(0.0f);
+        if (auto valid = e.when(a.partial[pb + 1u] > 0.0f))
+          weight = math::exp(a.partial[pb] - maximum.read());
+        weights[e.let(p % kChunk)] = weight.read();
+      }
+      e.barrier();
+      for (auto p0 : e.range(c0, bounded_min(e, end, whole), kBatch)) {
         std::vector<kir::Val<kir::f32>> w, sums;
         std::vector<kir::Pack<kir::f32>> values;
         for (std::uint32_t u = 0; u < kBatch; ++u) {
           const auto pb = e.let(base + (p0 + u) * kSplitRecord);
-          w.push_back(e.let(weights[e.let(p0 + u)].read()));
+          w.push_back(e.let(weights[e.let((p0 + u) % kChunk)].read()));
           sums.push_back(e.let(a.partial[pb + 1u]));
           values.push_back(e.load(a.partial, e.let(pb + 2u + column), 8u));
         }
         for (std::uint32_t u = 0; u < kBatch; ++u) add(w[u], sums[u], values[u]);
       }
-    }
-    if (whole != parts) {
-      for (auto p : e.range(whole, parts)) {
+      for (auto p : e.range(bounded_max(e, c0, whole), end, 1u)) {
         const auto pb = e.let(base + p * kSplitRecord);
-        add(e.let(weights[p].read()), e.let(a.partial[pb + 1u]),
+        add(e.let(weights[e.let(p % kChunk)].read()), e.let(a.partial[pb + 1u]),
             e.load(a.partial, e.let(pb + 2u + column), 8u));
       }
     }
@@ -1006,7 +1062,7 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
     return k.lds().ok() ? k.str() : std::string{};
   }
   Result<Shape> infer_shape(std::span<const Shape> in) const override {
-    if (in.size() != 1 || (in[0].rank() != 4 && in[0].rank() != 5) ||
+    if (in.size() != 2 || (in[0].rank() != 4 && in[0].rank() != 5) ||
         in[0].dim(in[0].rank() - 1) != kSplitRecord)
       return LSE_ERROR(kInvalidArgument, "split attention merge takes one partial record array");
     return Shape{in[0].dim(0), in[0].dim(1), in[0].rank() == 5 ? in[0].dim(2) : 1, 256};
@@ -1017,8 +1073,7 @@ struct SplitMergeWg128C2 final : KernelPrimitive<SplitMergeWg128C2> {
     const auto slices = merge_slices(s);
     tp.workgroup_size[0] = 128u / slices;
     tp.workgroup_count[0] = static_cast<std::uint32_t>(s.output.elem_count() / 256u) * slices;
-    tp.lds_bytes = static_cast<std::uint32_t>(dispatch::attention_shapes::split_merge_lds_bytes(
-        static_cast<std::uint64_t>(s.inputs[0].dim(s.inputs[0].rank() - 2))));
+    tp.lds_bytes = dispatch::attention_shapes::kSplitMergeChunk * sizeof(float);
     return tp;
   }
 };
@@ -1207,7 +1262,8 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
       // touches no key — so its accumulator sees the same terms in the same order
       // it would have seen decoding alone.
       const auto row_blk = e.let((row_len + e.u32(ts - 1)) / e.u32(ts));
-      const auto tb = e.let(b * stride);
+      // The table's row stride is the cache's current rung (kv/block.hpp).
+      const auto tb = e.let(b * table_stride(e, a.meta, bsz));
 
       const auto m = e.var(math::neg_inf());
       for (auto bi : e.range(nblk)) {
@@ -1418,8 +1474,11 @@ struct KvPageWriteKernel final : KernelPrimitive<KvPageWriteKernel> {
     // overwrite somebody else's slot.
     const auto pos = e.let(kir::cast<kir::u32>(a.meta[mb]));
     const auto abs = e.let(pos + tt);
+    // The table's row stride is the cache's current rung, read at run time
+    // (kv/block.hpp): one kernel serves every size of the cache.
+    const auto row_stride = table_stride(e, a.meta, static_cast<std::uint32_t>(src.dim(0)));
     const auto blk =
-        e.let(kv_block_index<Storage>(a.table[r * stride + abs / bs]));
+        e.let(kv_block_index<Storage>(a.table[r * row_stride + abs / bs]));
     const auto slot = e.let(abs % bs);
     const auto dest = dim_major ? e.let(((blk * kvh + h) * width + w) * bs + slot)
                                 : e.let(((blk * kvh + h) * bs + slot) * width + w);

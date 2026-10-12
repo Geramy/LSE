@@ -37,7 +37,7 @@ LSE_TEST(sparse_attention_routing_is_opt_in_and_phase_shape_specific) {
   backend::LoomEmitter emitter;
   for (int queries : {1,2,17}) {
     auto q=leaf({1,24,queries,256}), k=leaf({48,4,16,256}), v=leaf(k.shape());
-    auto meta=leaf({5}), table=leaf({1,48});
+    auto meta=leaf({kv::step_meta_elems(1)}), table=leaf({1,48});
     auto dense=sdpa_paged(q,k,v,.0625f,MaskKind::kCausal,0,meta,table,16,&d);
     auto sparse=sdpa_paged(q,k,v,.0625f,MaskKind::kCausal,0,meta,table,16,&d,
                            kv::CacheDType::kF32,{true,1.0f});
@@ -74,7 +74,7 @@ LSE_TEST(prompt_and_speculative_attention_use_explicit_phase) {
     LSE_EXPECT(!verify.enabled());
     LSE_EXPECT(ops::attention_for_phase(options, Phase::kDecode, queries).blasst);
     auto q = leaf({1, 4, queries, 256}), k = leaf({48, 2, 16, 256}), v = leaf(k.shape());
-    auto meta = leaf({5}), table = leaf({1, 48});
+    auto meta = leaf({kv::step_meta_elems(1)}), table = leaf({1, 48});
     auto p = sdpa_paged(q, k, v, .0625f, MaskKind::kCausal, 0, meta, table, 16,
                         &d, kv::CacheDType::kF32, prompt);
     auto verification = sdpa_paged(q, k, v, .0625f, MaskKind::kCausal, 0, meta, table,
@@ -88,7 +88,7 @@ LSE_TEST(prompt_and_speculative_attention_use_explicit_phase) {
 LSE_TEST(flashprefill_native_graph_has_pool_selector_and_correction) {
   const auto d=gpu(); backend::LoomEmitter emitter;
   auto q=leaf({2,4,2,256}),k=leaf({80,2,16,256}),v=leaf(k.shape());
-  auto meta=leaf({7}),table=leaf({2,80});
+  auto meta=leaf({kv::step_meta_elems(2)}),table=leaf({2,80});
   auto sparse=sdpa_paged(q,k,v,.0625f,MaskKind::kCausal,0,meta,table,16,&d,kv::CacheDType::kF32,{false,.8f,true});
   const NodePtr roots[]{sparse.node()}; auto groups=Partitioner::partition(roots,&d);
   LSE_EXPECT_EQ(groups.size(),3u);

@@ -2492,6 +2492,15 @@ void prep_state(MixerState& st, const Config& cfg, bool attn,
 }
 
 
+// The block table's stride into the descriptor (kv::step_meta_stride_index),
+// as HybridLM::forward does once a pass has sized the table.
+void stamp_stride(MixerState& st) {
+  if (!st.paged.valid() || !st.kv_meta.valid()) return;
+  graph::interpreter::store_element(*st.kv_meta.node(),
+                                    static_cast<std::size_t>(kv::step_meta_stride_index(1)),
+                                    static_cast<float>(st.paged.stride()));
+}
+
 void compare_paged_shard_contents(MixerState& whole,
                                   std::vector<MixerState>& shards,
                                   std::int32_t tokens, const char* stage) {
@@ -2711,6 +2720,8 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   auto yw = whole->forward(x, &w_st, cw);
   auto ps = split->forward_shards({x, x}, s_st.data(), cs);
   if (!yw.ok() || !ps.ok() || ps->empty()) return -1.0;
+  stamp_stride(w_st);
+  for (auto& st : s_st) stamp_stride(st);
   graph::Array sum = (*ps)[0];
   for (std::size_t i = 1; i < ps->size(); ++i) sum = graph::add(sum, (*ps)[i]);
   const auto a = drain(*yw);
@@ -2734,6 +2745,8 @@ double shard_state_step(std::unique_ptr<IMixer> whole,
   auto yw2 = whole->forward(x2, &w_st, cw);
   auto ps2 = split->forward_shards({x2, x2}, s_st.data(), cs);
   if (!yw2.ok() || !ps2.ok() || ps2->empty()) return -1.0;
+  stamp_stride(w_st);
+  for (auto& st : s_st) stamp_stride(st);
   graph::Array sum2 = (*ps2)[0];
   for (std::size_t i = 1; i < ps2->size(); ++i) {
     sum2 = graph::add(sum2, (*ps2)[i]);

@@ -2,6 +2,7 @@
 #include "lse/dispatch/arch/tuning.hpp"
 #include "lse/dispatch/attention_tuneconfig.h"
 
+#include <algorithm>
 #include <cmath>
 #include <initializer_list>
 #include <limits>
@@ -211,6 +212,20 @@ const shapes::DecodeRule* split_decode_rule(const KernelShapes& s) {
 
 bool split_decode_supported(const KernelShapes& s) { return split_decode_rule(s) != nullptr; }
 
+std::vector<std::int64_t> attention_kv_buckets(const backend::DeviceInfo& device) {
+  std::vector<std::int64_t> out;
+  const auto& tuning = arch::tuning(device.arch);
+  for (const auto& rule : tuning.decode)
+    if (rule.arch == device.arch && rule.key_batch > 1 && rule.key_batch_min_keys > 0)
+      out.push_back(static_cast<std::int64_t>(rule.key_batch_min_keys));
+  for (const auto& rule : tuning.flash_split_pair)
+    if (rule.arch == device.arch && rule.min_keys > 0)
+      out.push_back(static_cast<std::int64_t>(rule.min_keys));
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
 std::uint32_t split_decode_key_batch(const KernelShapes& s) {
   const auto* rule = split_decode_rule(s);
   if (rule == nullptr || rule->key_batch <= 1) return 1u;
@@ -218,16 +233,23 @@ std::uint32_t split_decode_key_batch(const KernelShapes& s) {
   return keys >= rule->key_batch_min_keys ? rule->key_batch : 1u;
 }
 
+// A split merge's second input is the pass's step descriptor, which carries
+// the block table's stride and so the number of partition records.
+static bool merge_meta(const KernelShapes& s) {
+  return s.inputs[1].rank() == 1 &&
+         s.inputs[1].elem_count() >= static_cast<std::size_t>(kv::step_meta_elems(
+             static_cast<std::int32_t>(s.inputs[0].dim(0))));
+}
+
 bool split_decode_merge_supported(const KernelShapes& s) {
-  if (s.inputs.size() != 1 || s.inputs[0].rank() != 4 ||
+  if (s.inputs.size() != 2 || s.inputs[0].rank() != 4 ||
       !positive_shape(s.inputs[0]) || s.inputs[0].dim(3) != shapes::kSplitRecord ||
-      !f32_inputs(s, 1) || !s.device || !attention_ops(s)) return false;
-  const auto bytes = static_cast<std::uint64_t>(s.inputs[0].dim(2)) * sizeof(float);
+      !f32_inputs(s, 2) || !merge_meta(s) || !s.device || !attention_ops(s)) return false;
   for (const auto& rule : arch::tuning(s.device->arch).decode)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1), 1, rule.head_dim} &&
-        ((bytes + 15u) / 16u) * 16u <= backend::workgroup_lds_bytes(s.device)) return true;
+        shapes::kSplitMergeLdsBytes <= backend::workgroup_lds_bytes(s.device)) return true;
   return false;
 }
 
@@ -290,8 +312,7 @@ bool split_short_supported(const KernelShapes& s) {
         s.inputs[0].dim(2) >= rule.min_rows && s.inputs[0].dim(2) <= rule.max_rows &&
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.inputs[0].dim(3) == rule.head_dim &&
-        shapes::split_merge_lds_bytes(shapes::split_partitions(capacity)) <=
-            backend::workgroup_lds_bytes(s.device) &&
+        shapes::kSplitMergeLdsBytes <= backend::workgroup_lds_bytes(s.device) &&
         backend::workgroup_lds_bytes(s.device) >= (rule.threads + 4u) * sizeof(float) *
             shapes::short_query_tile(rows, heads, kvheads, tile_capacity, units) *
             shapes::short_head_tile(rows, heads, kvheads, tile_capacity, units)) {
@@ -305,9 +326,9 @@ bool split_short_supported(const KernelShapes& s) {
 }
 
 bool split_short_merge_supported(const KernelShapes& s) {
-  if (s.inputs.size() != 1 || s.inputs[0].rank() != 5 ||
-      !positive_shape(s.inputs[0]) || s.inputs[0].dim(4) != shapes::kSplitRecord || !f32_inputs(s, 1) ||
-      !s.device || !attention_ops(s)) return false;
+  if (s.inputs.size() != 2 || s.inputs[0].rank() != 5 ||
+      !positive_shape(s.inputs[0]) || s.inputs[0].dim(4) != shapes::kSplitRecord || !f32_inputs(s, 2) ||
+      !merge_meta(s) || !s.device || !attention_ops(s)) return false;
   for (const auto& rule : arch::tuning(s.device->arch).split_short)
     if (s.device->arch == rule.arch && s.device->wavefront_size == rule.wave &&
         s.inputs[0].dim(2) >= rule.min_rows &&
@@ -317,8 +338,7 @@ bool split_short_merge_supported(const KernelShapes& s) {
         s.device->max_threads_per_workgroup >= rule.threads &&
         s.output == Shape{s.inputs[0].dim(0), s.inputs[0].dim(1),
                           s.inputs[0].dim(2), rule.head_dim} &&
-        shapes::split_merge_lds_bytes(s.inputs[0].dim(3)) <=
-            backend::workgroup_lds_bytes(s.device)) return true;
+        shapes::kSplitMergeLdsBytes <= backend::workgroup_lds_bytes(s.device)) return true;
   return false;
 }
 
