@@ -166,6 +166,7 @@ Result<Config> from_lfm3_json(const nlohmann::json& root) {
   c.mtp_layers = 0;
   // layer_types is authoritative; the interval rule is never consulted.
   c.full_attention_interval = 1;
+  c.global_attention_layers.clear();
 
   read(root, "tie_word_embeddings", c.tie_word_embeddings);
   read(t, "tie_word_embeddings", c.tie_word_embeddings);
