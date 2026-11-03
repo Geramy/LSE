@@ -1,5 +1,6 @@
 #include "lse/model/config.hpp"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <utility>
@@ -69,6 +70,111 @@ Status read_storage_config(const nlohmann::json& root, Config& c) {
     break;
   }
   return OkStatus();
+}
+
+// LFM3's text stack (Lfm3ForCausalLM, and the language model inside the
+// Lfm3Omni wrapper), read off LiquidAI/LFM3-1.7B-MLX-4bit and
+// LiquidAI/LFM3-Omni-2B-MLX-4bit and cross-checked against
+// transformers/models/lfm3/modeling_lfm3.py. A conv/attention hybrid:
+// `conv` layers are a gated depthwise width-7 convolution, attention layers
+// carry per-head q/k norms, a per-head sigmoid output gate and a
+// layer-type rotary profile.
+Result<Config> from_lfm3_json(const nlohmann::json& root) {
+  const auto nested = root.find("text_config");
+  const nlohmann::json& t =
+      nested != root.end() && nested->is_object() ? *nested : root;
+  Config c;
+
+  LSE_RETURN_IF_ERROR(need(t, "vocab_size", c.vocab_size));
+  LSE_RETURN_IF_ERROR(need(t, "hidden_size", c.hidden_size));
+  LSE_RETURN_IF_ERROR(need(t, "num_hidden_layers", c.num_layers));
+  LSE_RETURN_IF_ERROR(need(t, "norm_eps", c.rms_eps));
+  LSE_RETURN_IF_ERROR(need(t, "num_attention_heads", c.attn_q_heads));
+  LSE_RETURN_IF_ERROR(need(t, "num_key_value_heads", c.attn_kv_heads));
+  LSE_RETURN_IF_ERROR(need(t, "head_dim", c.attn_head_dim));
+  LSE_RETURN_IF_ERROR(need(t, "intermediate_size", c.mlp_intermediate));
+  // The conv mixer's kernel width; the stack carries the kernel-1 tail.
+  LSE_RETURN_IF_ERROR(need(t, "conv_L_cache", c.gdn_conv_kernel));
+
+  // layer_types is the whole schedule: `conv` gets the short conv,
+  // `full_attention`/`sliding_attention` get attention.
+  if (!t.contains("layer_types") || !t["layer_types"].is_array()) {
+    return LSE_ERROR(kNotFound, "model config is missing 'layer_types'");
+  }
+  c.layer_types = t["layer_types"].get<std::vector<std::string>>();
+  if (static_cast<std::int32_t>(c.layer_types.size()) != c.num_layers) {
+    return LSE_ERROR(kInvalidArgument, "layer_types has ",
+                     std::to_string(c.layer_types.size()), " entries but "
+                     "num_hidden_layers is ", std::to_string(c.num_layers));
+  }
+  for (const std::string& type : c.layer_types) {
+    if (type != "conv" && type != "full_attention" &&
+        type != "sliding_attention") {
+      return LSE_ERROR(kUnimplemented, "layer_types names '", type,
+                       "'; lfm3 mixers are conv, full_attention or "
+                       "sliding_attention");
+    }
+  }
+
+  // Each attention kind owns a rotary profile: theta plus how much of the
+  // head rotates. Sliding defaults to full's when unlisted.
+  const auto ropes = t.find("rope_parameters");
+  if (ropes == t.end() || !ropes->is_object()) {
+    return LSE_ERROR(kNotFound, "model config is missing 'rope_parameters'");
+  }
+  auto read_rope = [&c](const nlohmann::json& r, float& theta,
+                      std::int32_t& dim) -> Status {
+    LSE_RETURN_IF_ERROR(need(r, "rope_theta", theta));
+    float partial = 1.0f;
+    read(r, "partial_rotary_factor", partial);
+    const auto rotary = static_cast<std::int32_t>(
+        static_cast<float>(c.attn_head_dim) * partial + 0.5f);
+    if (rotary <= 0 || rotary % 2 != 0 || rotary > c.attn_head_dim) {
+      return LSE_ERROR(kInvalidArgument, "partial_rotary_factor ",
+                       std::to_string(partial), " of head_dim ",
+                       std::to_string(c.attn_head_dim), " gives a rope width "
+                       "of ", std::to_string(rotary),
+                       ", which must be even and positive");
+    }
+    dim = rotary;
+    return OkStatus();
+  };
+  if (!ropes->contains("full_attention")) {
+    return LSE_ERROR(kNotFound,
+                     "rope_parameters is missing 'full_attention'");
+  }
+  LSE_RETURN_IF_ERROR(
+      read_rope((*ropes)["full_attention"], c.rope_theta, c.rope_dim));
+  c.sliding_rope_theta = c.rope_theta;
+  c.sliding_rope_dim = c.rope_dim;
+  if (ropes->contains("sliding_attention") &&
+      (*ropes)["sliding_attention"].is_object()) {
+    LSE_RETURN_IF_ERROR(read_rope((*ropes)["sliding_attention"],
+                                  c.sliding_rope_theta, c.sliding_rope_dim));
+  }
+
+  read(t, "sliding_window", c.sliding_window);
+
+  // No delta-net layers, no experts: the non-attention mixer is the conv.
+  c.gdn_qk_heads = 0;
+  c.gdn_v_heads = 0;
+  c.gdn_head_dim = 0;
+  c.num_experts = 0;
+  c.num_active_experts = 0;
+  c.num_shared_experts = 0;
+  c.expert_intermediate = 0;
+  c.mtp_layers = 0;
+  // layer_types is authoritative; the interval rule is never consulted.
+  c.full_attention_interval = 1;
+  c.global_attention_layers.clear();
+
+  read(root, "tie_word_embeddings", c.tie_word_embeddings);
+  read(t, "tie_word_embeddings", c.tie_word_embeddings);
+  LSE_RETURN_IF_ERROR(read_storage_config(root, c));
+  read(t, "max_position_embeddings", c.train_seq_len);
+
+  LSE_RETURN_IF_ERROR(c.validate());
+  return c;
 }
 
 // Qwen3.5 (dense and MoE), read off Qwen/Qwen3.5-0.8B, Qwen/Qwen3.5-4B and
@@ -195,7 +301,8 @@ Result<Config> from_hf_json(const nlohmann::json& root) {
                        "num_hidden_layers is ", std::to_string(c.num_layers));
     }
     for (std::size_t i = 0; i < types.size(); ++i) {
-      const bool attends = types[i] == "full_attention";
+      const bool attends = types[i] == "full_attention" ||
+                           types[i] == "sliding_attention";
       if (attends != c.is_attention_layer(static_cast<std::int32_t>(i))) {
         return LSE_ERROR(kUnimplemented, "layer_types says layer ",
                          std::to_string(i), " is '", types[i],
@@ -204,6 +311,7 @@ Result<Config> from_hf_json(const nlohmann::json& root) {
                          " says otherwise");
       }
     }
+    c.layer_types = types;
   }
 
   LSE_RETURN_IF_ERROR(c.validate());
@@ -229,6 +337,29 @@ Result<Config> Config::from_json_string(const std::string& text) {
   LSE_ASSIGN_OR(quant::GroupAffineMap quantization,
                 quant::GroupAffineMap::from_config_json(text));
 
+  // LFM3 (and Lfm3Omni's text stack) parses differently enough to own a
+  // branch: its config is HF-shaped but flat-or-nested depending on whether
+  // the checkpoint is the wrapper, and its rope_parameters are keyed per
+  // layer type rather than global.
+  std::string model_type;
+  if (j.contains("model_type") && j["model_type"].is_string())
+    model_type = j["model_type"].get<std::string>();
+  if (model_type.empty() && j.contains("text_config") &&
+      j["text_config"].is_object() &&
+      j["text_config"].contains("model_type") &&
+      j["text_config"]["model_type"].is_string())
+    model_type = j["text_config"]["model_type"].get<std::string>();
+  std::string arch0;
+  if (j.contains("architectures") && j["architectures"].is_array() &&
+      !j["architectures"].empty() && j["architectures"][0].is_string())
+    arch0 = j["architectures"][0].get<std::string>();
+  if (model_type.rfind("lfm", 0) == 0 || arch0.rfind("Lfm", 0) == 0) {
+    LSE_ASSIGN_OR(Config lfm, from_lfm3_json(j));
+    lfm.quantization = std::move(quantization);
+    lfm.sampling_defaults = sampling;
+    return lfm;
+  }
+
   if (j.contains("text_config") && j["text_config"].is_object()) {
     LSE_ASSIGN_OR(Config hf, from_hf_json(j));
     hf.quantization = std::move(quantization);
@@ -251,6 +382,9 @@ Result<Config> Config::from_json_string(const std::string& text) {
   read(j, "attn_head_dim", c.attn_head_dim);
   read(j, "rope_dim", c.rope_dim);
   read(j, "rope_theta", c.rope_theta);
+  read(j, "sliding_rope_dim", c.sliding_rope_dim);
+  read(j, "sliding_rope_theta", c.sliding_rope_theta);
+  read(j, "layer_types", c.layer_types);
 
   read(j, "gdn_qk_heads", c.gdn_qk_heads);
   read(j, "gdn_v_heads", c.gdn_v_heads);
@@ -321,6 +455,9 @@ std::string Config::to_json() const {
   j["attn_head_dim"] = attn_head_dim;
   j["rope_dim"] = rope_dim;
   j["rope_theta"] = rope_theta;
+  j["sliding_rope_dim"] = sliding_rope_dim;
+  j["sliding_rope_theta"] = sliding_rope_theta;
+  j["layer_types"] = layer_types;
   j["gdn_qk_heads"] = gdn_qk_heads;
   j["gdn_v_heads"] = gdn_v_heads;
   j["gdn_head_dim"] = gdn_head_dim;
@@ -356,7 +493,7 @@ Status Config::validate() const {
     return LSE_ERROR(kInvalidArgument, "vocab_size, hidden_size and num_layers "
                                        "must all be positive");
   }
-  if (full_attention_interval <= 0) {
+  if (full_attention_interval <= 0 && layer_types.empty()) {
     return LSE_ERROR(kInvalidArgument, "full_attention_interval must be positive");
   }
   if (attn_q_heads % attn_kv_heads != 0) {
@@ -364,8 +501,15 @@ Status Config::validate() const {
                      std::to_string(attn_q_heads), ") to be a multiple of "
                      "attn_kv_heads (", std::to_string(attn_kv_heads), ")");
   }
-  if (gdn_qk_heads <= 0 || gdn_v_heads <= 0 ||
-      (gdn_qk_heads % gdn_v_heads != 0 && gdn_v_heads % gdn_qk_heads != 0)) {
+  // Only checked when the stack actually runs delta-net layers — either
+  // every non-attention layer (layer_types unset, lemonseed's layout) or the
+  // ones the schedule names. LFM3's conv layers carry no recurrent state.
+  const bool has_gdn = layer_types.empty() ||
+      std::find(layer_types.begin(), layer_types.end(),
+                "linear_attention") != layer_types.end();
+  if (has_gdn &&
+      (gdn_qk_heads <= 0 || gdn_v_heads <= 0 ||
+       (gdn_qk_heads % gdn_v_heads != 0 && gdn_v_heads % gdn_qk_heads != 0))) {
     // Either direction: lemonseed's layer runs v at the key width and reads
     // gdn_v_heads as a divisor of it, Qwen shares 16 key heads across 32 value
     // heads. Both are GQA over the same state, counted from opposite ends.

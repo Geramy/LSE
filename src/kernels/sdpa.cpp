@@ -1212,7 +1212,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
         } else if (mask == 1) {
           if (auto g = e.when(j <= abs_i)) take();
         } else {
-          if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
+          if (auto g = e.when(j <= abs_i && j + window > abs_i)) take();
         }
       }
 
@@ -1232,7 +1232,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
         } else if (mask == 1) {
           if (auto g = e.when(j <= abs_i)) apply();
         } else {
-          if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
+          if (auto g = e.when(j <= abs_i && j + window > abs_i)) apply();
         }
         denom = denom.read() + w.read();
         const auto vb = ((b * kvh + kh) * ts + j) * dv + d;
@@ -1290,7 +1290,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
               } else if (mask == 3) {
                 if (auto g = e.when(tree_visible(j))) take();
               } else {
-                if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) take();
+                if (auto g = e.when(j <= abs_i && j + window > abs_i)) take();
               }
             }
           }
@@ -1324,7 +1324,7 @@ struct SdpaKernel final : KernelPrimitive<SdpaKernel> {
               } else if (mask == 3) {
                 if (auto g = e.when(tree_visible(j))) apply();
               } else {
-                if (auto g = e.when(j <= abs_i && (abs_i - j) < window)) apply();
+                if (auto g = e.when(j <= abs_i && j + window > abs_i)) apply();
               }
               denom = denom.read() + w.read();
               acc = math::fma(w.read(), kv_load<Storage>(e, a.v, dim_major ? e.let(vb0 + jj)

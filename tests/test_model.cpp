@@ -681,6 +681,15 @@ const std::vector<std::string>& qwen_moe_names() {
   return v;
 }
 
+const std::vector<std::string>& lfm3_names() {
+  static const std::vector<std::string> v{
+      "language_model.model.layers.0.conv.conv.weight",
+      "language_model.model.layers.0.conv.in_proj.weight",
+      "language_model.model.layers.0.conv.out_proj.weight",
+      "language_model.model.embedding_norm.weight"};
+  return v;
+}
+
 // Detected name, or "" when nothing claims the fixture.
 std::string detect(const std::string& stem, const std::vector<std::string>& names) {
   auto st = SafeTensors::open(write_fixture(stem, names));
@@ -697,6 +706,7 @@ LSE_TEST(every_architecture_claims_only_its_own_checkpoint) {
   LSE_EXPECT(detect("lemonseed", lemonseed_names()) == "lemonseed");
   LSE_EXPECT(detect("q35", qwen_dense_names()) == "qwen3.5");
   LSE_EXPECT(detect("q35moe", qwen_moe_names()) == "qwen3.5-moe");
+  LSE_EXPECT(detect("lfm3", lfm3_names()) == "lfm3");
 }
 
 LSE_TEST(qwen_predicates_cannot_both_claim_a_checkpoint) {
@@ -734,6 +744,7 @@ LSE_TEST(an_unrecognized_checkpoint_names_what_was_tried) {
   LSE_EXPECT(msg.find("lemonseed") != std::string::npos);
   LSE_EXPECT(msg.find("qwen3.5") != std::string::npos);
   LSE_EXPECT(msg.find("qwen3.5-moe") != std::string::npos);
+  LSE_EXPECT(msg.find("lfm3") != std::string::npos);
 }
 
 // --- the two weight reorderings the Qwen kernels rely on ---------------------
@@ -1067,6 +1078,59 @@ LSE_TEST(layer_types_must_agree_with_the_interval_rule) {
   std::string good = R"(, "num_hidden_layers": 4, "layer_types":
       ["linear_attention", "linear_attention", "linear_attention", "full_attention"])";
   LSE_EXPECT(Config::from_json_string(hf_config(good)).ok());
+}
+
+LSE_TEST(lfm3_config_is_read_with_per_type_rope) {
+  std::string lfm_cfg = R"({
+    "model_type": "lfm3",
+    "dtype": "bfloat16",
+    "vocab_size": 32000,
+    "hidden_size": 2048,
+    "num_hidden_layers": 4,
+    "norm_eps": 1e-5,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "intermediate_size": 5632,
+    "conv_L_cache": 7,
+    "layer_types": ["conv", "full_attention", "conv", "sliding_attention"],
+    "rope_parameters": {
+      "full_attention": {"rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+      "sliding_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.5}
+    },
+    "sliding_window": 512,
+    "max_position_embeddings": 32768
+  })";
+  auto c = Config::from_json_string(lfm_cfg);
+  LSE_EXPECT(c.ok());
+  if (!c.ok()) return;
+  LSE_EXPECT_EQ(c->vocab_size, 32000);
+  LSE_EXPECT_EQ(c->hidden_size, 2048);
+  LSE_EXPECT_EQ(c->num_layers, 4);
+  LSE_EXPECT_EQ(c->attn_q_heads, 16);
+  LSE_EXPECT_EQ(c->attn_kv_heads, 4);
+  LSE_EXPECT_EQ(c->attn_head_dim, 128);
+  LSE_EXPECT_EQ(c->rope_dim, 128);
+  LSE_EXPECT_EQ(c->sliding_rope_dim, 64);
+  LSE_EXPECT_EQ(c->rope_theta, 10000.0f);
+  LSE_EXPECT_EQ(c->sliding_rope_theta, 1000000.0f);
+  LSE_EXPECT_EQ(c->gdn_conv_kernel, 7);
+  LSE_EXPECT_EQ(c->sliding_window, 512);
+  LSE_EXPECT(!c->is_attention_layer(0));
+  LSE_EXPECT(c->is_attention_layer(1));
+  LSE_EXPECT(!c->is_sliding_attention(1));
+  LSE_EXPECT(!c->is_attention_layer(2));
+  LSE_EXPECT(c->is_attention_layer(3));
+  LSE_EXPECT(c->is_sliding_attention(3));
+  LSE_EXPECT(c->global_attention_layers.empty());
+  LSE_EXPECT(!c->is_global_attention(1));
+
+  auto rt = Config::from_json_string(c->to_json());
+  LSE_EXPECT(rt.ok());
+  if (!rt.ok()) return;
+  LSE_EXPECT_EQ(rt->sliding_rope_dim, 64);
+  LSE_EXPECT_EQ(rt->sliding_rope_theta, 1000000.0f);
+  LSE_EXPECT_EQ(static_cast<std::int32_t>(rt->layer_types.size()), 4);
 }
 
 LSE_TEST(a_lemonseed_config_still_takes_the_native_path) {

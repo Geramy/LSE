@@ -183,6 +183,8 @@ ChatRequest prepare_chat(const ChatJson& body, const ChatFraming& framing) {
   if (!system.empty()) { if (!prefix.empty()) prefix += "\n\n"; prefix += system; }
   if (!prefix.empty()) messages.insert(messages.begin(), {"system", prefix});
   result.prompt = render_chatml(messages, false) + framing.generation_prompt;
+  if (std::getenv("LSE_DUMP_PROMPT") != nullptr)
+    std::fprintf(stderr, "LSE-CHAT-PROMPT>>>%s<<<\n", result.prompt.c_str());
   return result;
 }
 

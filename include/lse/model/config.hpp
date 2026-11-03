@@ -39,6 +39,16 @@ struct Config {
   std::int32_t attn_head_dim = 64;
   std::int32_t rope_dim = 64;
   float rope_theta = 10000.0f;
+  // RoPE profile for `sliding_attention` layers when it differs from full
+  // attention's (LFM3: theta 1e4 full-width vs 1e6 half-width). Zero/absent
+  // means sliding layers share the primary profile.
+  std::int32_t sliding_rope_dim = 0;
+  float sliding_rope_theta = 0.0f;
+  // The checkpoint's own layer schedule ("conv", "linear_attention",
+  // "full_attention", "sliding_attention"). Authoritative for mixer choice
+  // when populated; full_attention_interval is the fallback for configs that
+  // never declare it.
+  std::vector<std::string> layer_types;
 
   // Gated DeltaNet
   std::int32_t gdn_qk_heads = 4;
@@ -120,7 +130,17 @@ struct Config {
   }
 
   [[nodiscard]] bool is_attention_layer(std::int32_t layer_idx) const noexcept {
+    if (!layer_types.empty()) {
+      const std::string& t = layer_types[static_cast<std::size_t>(layer_idx)];
+      return t == "full_attention" || t == "sliding_attention";
+    }
     return (layer_idx + 1) % full_attention_interval == 0;
+  }
+
+  [[nodiscard]] bool is_sliding_attention(std::int32_t layer_idx) const noexcept {
+    return !layer_types.empty() &&
+           layer_types[static_cast<std::size_t>(layer_idx)] ==
+               "sliding_attention";
   }
 
   [[nodiscard]] bool is_global_attention(std::int32_t layer_idx) const noexcept {
