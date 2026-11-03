@@ -1085,7 +1085,7 @@ Result<Array> HybridLM::hidden(const Array& tokens,
       const graph::ScopedMember on(shards > 1
                                        ? i % shards
                                        : member_for_layer(layer));
-      if (!st.gdn_state.valid()) {
+      if (vh_m > 0 && vd > 0 && !st.gdn_state.valid()) {
         LSE_ASSIGN_OR(st.gdn_state, mutable_zeros(Shape{batch, vh_m, vd, vd}));
       }
       if (tail <= 0) continue;
@@ -1525,22 +1525,31 @@ Result<Array> HybridLM::hidden(const Array& tokens,
     if (t_live < t_now) {
       const auto heads = static_cast<std::int64_t>(config_.gdn_v_heads);
       const auto tail = static_cast<std::int64_t>(config_.gdn_conv_kernel) - 1;
-      if (heads <= 0 || tail <= 0 || t_live < tail)
+      if (heads <= 0 && tail <= 0)
         return LSE_ERROR(kInvalidArgument, "a padded pass needs at least ",
                          std::to_string(tail), " real tokens and GDN value heads");
-      std::vector<float> m(static_cast<std::size_t>(t_now * heads), 0.0f);
-      std::vector<float> u(m.size(), 1.0f);
-      for (std::int64_t t = 0; t < t_live; ++t)
-        for (std::int64_t h = 0; h < heads; ++h) {
-          m[static_cast<std::size_t>(t * heads + h)] = 1.0f;
-          u[static_cast<std::size_t>(t * heads + h)] = 0.0f;
-        }
-      std::vector<float> rows_of_tail(static_cast<std::size_t>(tail));
-      for (std::int64_t i = 0; i < tail; ++i)
-        rows_of_tail[static_cast<std::size_t>(i)] = static_cast<float>(t_live - tail + i);
-      LSE_ASSIGN_OR(mask, device_values(Shape{1, t_now, heads}, m));
-      LSE_ASSIGN_OR(unmask, device_values(Shape{1, t_now, heads}, u));
-      LSE_ASSIGN_OR(tail_rows, device_values(Shape{tail}, rows_of_tail));
+      if (t_live < tail)
+        return LSE_ERROR(kInvalidArgument, "a padded pass needs at least ",
+                         std::to_string(tail), " real tokens");
+      // Per-head write suppression is a GDN-only need; the tail rows are what
+      // every conv-tail state (GDN or LFM-style) gathers on a padded pass.
+      if (heads > 0) {
+        std::vector<float> m(static_cast<std::size_t>(t_now * heads), 0.0f);
+        std::vector<float> u(m.size(), 1.0f);
+        for (std::int64_t t = 0; t < t_live; ++t)
+          for (std::int64_t h = 0; h < heads; ++h) {
+            m[static_cast<std::size_t>(t * heads + h)] = 1.0f;
+            u[static_cast<std::size_t>(t * heads + h)] = 0.0f;
+          }
+        LSE_ASSIGN_OR(mask, device_values(Shape{1, t_now, heads}, m));
+        LSE_ASSIGN_OR(unmask, device_values(Shape{1, t_now, heads}, u));
+      }
+      if (tail > 0) {
+        std::vector<float> rows_of_tail(static_cast<std::size_t>(tail));
+        for (std::int64_t i = 0; i < tail; ++i)
+          rows_of_tail[static_cast<std::size_t>(i)] = static_cast<float>(t_live - tail + i);
+        LSE_ASSIGN_OR(tail_rows, device_values(Shape{tail}, rows_of_tail));
+      }
     }
     for (MixerState& st : *states) {
       st.pad_mask = mask;

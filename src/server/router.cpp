@@ -1010,6 +1010,14 @@ void Router::Impl::completion(bool chat, std::string_view req_body,
     return;
   }
   r.prompt = *encoded;
+  // Chat-formatted prompts carry the tokenizer's declared BOS, matching
+  // HF/vLLM's add_special_tokens behavior on the same path. The completions
+  // passthrough stays verbatim — no BOS — as llama.cpp/MLX/vLLM treat it.
+  if (chat) {
+    const std::uint32_t bos = impl.tok.bos_token_id();
+    if (bos != 0 && (r.prompt.empty() || r.prompt.front() != bos))
+      r.prompt.insert(r.prompt.begin(), bos);
+  }
 
   // The prompt must leave room for at least one generated token.
   const int context_length = impl.model.config().kv_capacity();

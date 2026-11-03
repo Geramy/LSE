@@ -50,11 +50,17 @@ class Tokenizer {
 
   [[nodiscard]] bool valid() const noexcept { return handle_ != nullptr; }
   [[nodiscard]] void* raw() const noexcept { return handle_; }
+  // The id tokenizer_config.json declares as bos_token, 0 when none is
+  // declared. GPT-2-family checkpoints (LFM3) expect a leading BOS that the
+  // ByteLevel post-processor never injects — chat prompts prepend it to match
+  // HF/vLLM's add_special_tokens behavior; raw completions stay verbatim.
+  [[nodiscard]] std::uint32_t bos_token_id() const noexcept { return bos_id_; }
 
   DecodeStream stream(bool skip_special_tokens = true) const;
 
  private:
   void* handle_ = nullptr;
+  std::uint32_t bos_id_ = 0;
 };
 
 // Incremental detokenization for streaming. Returns text only once a token

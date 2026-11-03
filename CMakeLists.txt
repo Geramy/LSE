@@ -369,6 +369,7 @@ add_library(lse_model
   src/models/qwen3_5.cpp
   src/models/qwen3_5_common.cpp
   src/models/qwen3_5_moe.cpp
+  src/models/lfm3.cpp
 )
 add_library(lse::model ALIAS lse_model)
 # Model kernels self-register from a TU nothing references.

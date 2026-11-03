@@ -1,7 +1,10 @@
 #include "lse/tokenizer/tokenizer.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <utility>
+
+#include <nlohmann/json.hpp>
 
 #include "fastokens_ffi.h"
 
@@ -25,12 +28,14 @@ Tokenizer::~Tokenizer() {
 }
 
 Tokenizer::Tokenizer(Tokenizer&& other) noexcept
-    : handle_(std::exchange(other.handle_, nullptr)) {}
+    : handle_(std::exchange(other.handle_, nullptr)),
+      bos_id_(std::exchange(other.bos_id_, 0)) {}
 
 Tokenizer& Tokenizer::operator=(Tokenizer&& other) noexcept {
   if (this != &other) {
     if (handle_) fk_free(as_tok(handle_));
     handle_ = std::exchange(other.handle_, nullptr);
+    bos_id_ = std::exchange(other.bos_id_, 0);
   }
   return *this;
 }
@@ -43,6 +48,27 @@ Result<Tokenizer> Tokenizer::from_file(const std::string& tokenizer_json) {
   }
   Tokenizer out;
   out.handle_ = t;
+  // tokenizer_config.json sits beside tokenizer.json; a declared bos_token
+  // marks checkpoints that expect a leading BOS the post-processor never adds.
+  // A missing or malformed config costs the marker, not the load.
+  std::ifstream in(fs::path(tokenizer_json).parent_path() /
+                   "tokenizer_config.json");
+  if (in) {
+    try {
+      const nlohmann::json cfg = nlohmann::json::parse(in);
+      std::string name;
+      if (const auto it = cfg.find("bos_token"); it != cfg.end()) {
+        if (it->is_string()) name = it->get<std::string>();
+        else if (it->is_object())
+          if (const auto c = it->find("content");
+              c != it->end() && c->is_string())
+            name = c->get<std::string>();
+      }
+      if (!name.empty())
+        if (auto id = out.token_to_id(name); id.ok()) out.bos_id_ = *id;
+    } catch (...) {
+    }
+  }
   return out;
 }
 
